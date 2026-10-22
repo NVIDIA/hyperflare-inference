@@ -800,13 +800,15 @@ Ignition exports each recipe's canonical model name as its default serving
 alias, such as `DeepSeek-V4.1-Flash`. Checkpoint selectors such as
 `deepseek-v4.1-flash` select preparation inputs and configuration sections;
 they do not set the advertised API name. A core serves the aliases embedded
-when it was exported or edited.
+when it was exported or edited, and generation responses carry the first
+non-empty one.
 
-`--served-model-name` changes the name advertised by `/v1/models` and accepted
-for requests. It replaces the core aliases; the canonical model ID remains
-accepted and appears as the model card's `root`. The override does not modify
-the core or change its identity. `flare run` accepts numeric IPv4 and IPv6 addresses through
-`--host`; use an unbracketed IPv6 address such as `--host ::1 --port 8001`.
+`--served-model-name` changes the name advertised by `/v1/models`, accepted
+for requests, and carried by generation responses. It replaces the core
+aliases; the canonical model ID remains accepted and appears as the model
+card's `root`. The override does not modify the core or change its identity.
+`flare run` accepts numeric IPv4 and IPv6 addresses through `--host`; use an
+unbracketed IPv6 address such as `--host ::1 --port 8001`.
 
 Selected concurrency and draft depth cannot exceed prepared capacity.
 Concurrency three requires the batch-four bucket. Fixed host allocation selects

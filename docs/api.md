@@ -52,7 +52,9 @@ The additional `flare` object reports prepared and selected serving metadata:
 | `output_modalities` | `text` |
 
 Generation requests always use the loaded model, regardless of the request's
-`model` string. Returned generation objects identify the loaded model.
+`model` string. Returned generation objects carry the first non-empty served
+name when one is configured, and the loaded model's identifier otherwise;
+`/v1/models` advertises that same name.
 
 ## Ollama model discovery
 
