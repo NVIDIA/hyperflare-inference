@@ -297,7 +297,8 @@ pub struct Frontend {
     prompt_encoder: PromptEncoder,
     image_placeholder_token_id: Option<u32>,
     tokenizer: Tokenizer,
-    ordinary_tokenizer: Option<Tokenizer>,
+    ordinary_tokenizer: std::sync::OnceLock<Tokenizer>,
+    segmented_template: bool,
     template: Option<jinja::CompiledTemplate>,
     template_source: String,
     bos_token_id: Option<u32>,
@@ -313,13 +314,92 @@ impl Frontend {
     }
     pub fn with_template_encoding(mut self, encoding: TemplateEncoding) -> Self {
         if self.prompt_encoder == PromptEncoder::Jinja {
-            self.ordinary_tokenizer = matches!(encoding, TemplateEncoding::TokenSegments).then(|| {
-                let mut tokenizer = self.tokenizer.clone();
-                tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
-                tokenizer
-            });
+            self.segmented_template = matches!(encoding, TemplateEncoding::TokenSegments);
         }
         self
+    }
+
+    fn ordinary_from(tokenizer: &Tokenizer) -> Tokenizer {
+        let mut tokenizer = tokenizer.clone();
+        tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
+        tokenizer
+    }
+
+    fn ordinary(&self) -> &Tokenizer {
+        self.ordinary_tokenizer.get_or_init(|| Self::ordinary_from(&self.tokenizer))
+    }
+
+    fn encode_splicing_untrusted_markers(
+        &self,
+        text: &str,
+        untrusted: &[(usize, usize)],
+    ) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
+        let encoding = self.tokenizer.encode(text, false).map_err(|error| {
+            Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+                error.to_string(),
+                error,
+            )))
+        })?;
+        let token_ids = encoding.get_ids().to_vec();
+        let offsets = encoding.get_offsets().to_vec();
+        if untrusted.is_empty() {
+            return Ok((token_ids, offsets));
+        }
+        let added = self.tokenizer.get_added_tokens_decoder();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut token = 0usize;
+        for &(run_start, run_end) in untrusted {
+            while token < offsets.len() && offsets[token].1 <= run_start {
+                token += 1;
+            }
+            if token == offsets.len() || offsets[token].0 >= run_end {
+                continue;
+            }
+            let mut span_end = token;
+            while span_end < offsets.len() && offsets[span_end].0 < run_end {
+                span_end += 1;
+            }
+            if !token_ids[token..span_end]
+                .iter()
+                .any(|id| added.contains_key(id))
+            {
+                continue;
+            }
+            match spans.last_mut() {
+                Some(previous) if token <= previous.1 => previous.1 = previous.1.max(span_end),
+                _ => spans.push((token, span_end)),
+            }
+        }
+        let mut spliced_ids = Vec::with_capacity(token_ids.len());
+        let mut spliced_offsets = Vec::with_capacity(offsets.len());
+        let mut cursor = 0usize;
+        for (span_start, span_end) in spans {
+            let byte_start = offsets[span_start].0;
+            let byte_end = offsets[span_end - 1].1;
+            if byte_end <= byte_start {
+                continue;
+            }
+            spliced_ids.extend_from_slice(&token_ids[cursor..span_start]);
+            spliced_offsets.extend_from_slice(&offsets[cursor..span_start]);
+            cursor = span_end;
+            let slice = text.get(byte_start..byte_end).unwrap_or("");
+            let replacement = self.ordinary().encode(slice, false).map_err(|error| {
+                Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+                    error.to_string(),
+                    error,
+                )))
+            })?;
+            spliced_ids.extend_from_slice(replacement.get_ids());
+            spliced_offsets.extend(
+                replacement
+                    .get_offsets()
+                    .iter()
+                    .map(|&(start, end)| (byte_start + start, byte_start + end)),
+            );
+        }
+        spliced_ids.extend_from_slice(&token_ids[cursor..]);
+        spliced_offsets.extend_from_slice(&offsets[cursor..]);
+        Ok((spliced_ids, spliced_offsets))
     }
     pub fn bos_token_id(&self) -> Option<u32> {
         self.bos_token_id
@@ -551,12 +631,6 @@ impl Frontend {
         defaults.insert("tools".into(), Json::Null);
         defaults.insert("documents".into(), Json::Null);
         defaults.extend(template_defaults);
-        // Programmatic encoders tokenize message text without the added vocabulary.
-        let ordinary_tokenizer = (prompt_encoder != PromptEncoder::Jinja).then(|| {
-            let mut ordinary = tokenizer.clone();
-            ordinary.with_added_vocabulary(tokenizers::AddedVocabulary::new());
-            ordinary
-        });
         let frontend = Self {
             prompt_encoder,
             image_placeholder_token_id,
@@ -565,7 +639,8 @@ impl Frontend {
             effort_levels: Default::default(),
             inline_system_messages: Default::default(),
             tokenizer,
-            ordinary_tokenizer,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: false,
             template,
             template_source,
             defaults,
@@ -709,11 +784,17 @@ impl Frontend {
             .map(|field| self.mark_continuation(&mut messages, &field))
             .transpose()?;
         context.insert("messages".into(), Json::Array(messages));
+        let trusted: std::collections::HashSet<String> = self
+            .defaults
+            .keys()
+            .filter(|name| !options.contains_key(*name) && name.as_str() != "messages")
+            .cloned()
+            .collect();
         let rendered = self
             .template
             .as_ref()
             .unwrap()
-            .render(&context, &checkpoint_hints)
+            .render_with_trust(&context, &checkpoint_hints, &trusted)
             .map_err(|error| {
                 Error::frontend(FrontendError::Template(Failure::caused_by(
                     error.message.clone(),
@@ -721,6 +802,7 @@ impl Frontend {
                 )))
             })?;
         let marks = rendered.marks;
+        let runs = rendered.runs;
         let rendered = rendered.text;
         let mut hint_bytes = marks
             .iter()
@@ -729,7 +811,7 @@ impl Frontend {
                 _ => None,
             })
             .collect();
-        let mut segments: Vec<TokenSegment> = if self.ordinary_tokenizer.is_some() {
+        let mut segments: Vec<TokenSegment> = if self.segmented_template {
             token_segments(&rendered, &mut hint_bytes).map_err(|error| {
                 Error::frontend(FrontendError::Template(Failure::caused_by(
                     "chat template must render an array of text and allow_special segments",
@@ -737,11 +819,7 @@ impl Frontend {
                 )))
             })?
         } else {
-            vec![TokenSegment {
-                text: rendered,
-                allow_special: true,
-                image_index: None,
-            }]
+            Vec::new()
         };
         order_segment_images(&segments, &mut image_sources, &mut image_checkpoint_hints)?;
         let mut segment_ends = Vec::with_capacity(segments.len() + 1);
@@ -753,13 +831,10 @@ impl Frontend {
         for mark in marks {
             match mark {
                 jinja::Mark::Hint(_) => {}
-                jinja::Mark::Byte(byte)
-                    if self.ordinary_tokenizer.is_none()
-                        && byte <= *segment_ends.last().unwrap() =>
-                {
+                jinja::Mark::Byte(byte) if !self.segmented_template && byte <= rendered.len() => {
                     byte_boundaries.push(byte);
                 }
-                jinja::Mark::Position(count) if self.ordinary_tokenizer.is_some() => {
+                jinja::Mark::Position(count) if self.segmented_template => {
                     byte_boundaries.push(*segment_ends.get(count).ok_or_else(|| {
                         deepseek::invalid("mark position exceeds the rendered segment count")
                     })?);
@@ -771,10 +846,14 @@ impl Frontend {
                 }
             }
         }
-        let mut text: String = segments
-            .iter()
-            .map(|segment| segment.text.as_str())
-            .collect();
+        let mut text: String = if self.segmented_template {
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect()
+        } else {
+            rendered
+        };
         if let Some(final_text) = final_text {
             let marker = "CONTINUE_FINAL_MESSAGE_TAG";
             let index = text.rfind(marker).filter(|_| text.contains(final_text.trim())).ok_or_else(|| Error::frontend(FrontendError::Input(Failure::new("continue_final_message is set but the final message does not appear in the chat after applying the chat template!"))))?;
@@ -784,32 +863,56 @@ impl Frontend {
                 text.truncate(text.trim_end().len());
             }
         }
-        let mut remaining = text.len();
         let mut token_ids = Vec::new();
         let mut offsets = Vec::new();
-        let mut byte_start = 0;
-        for segment in &mut segments {
-            segment.text.truncate(remaining.min(segment.text.len()));
-            remaining -= segment.text.len();
-            let tokenizer = if segment.allow_special {
-                &self.tokenizer
-            } else {
-                self.ordinary_tokenizer.as_ref().unwrap_or(&self.tokenizer)
-            };
-            let encoding = tokenizer
-                .encode(segment.text.as_str(), false)
-                .map_err(|error| {
-                    Error::frontend(FrontendError::Tokenizer(Failure::boxed(
-                        error.to_string(),
-                        error,
-                    )))
-                })?;
-            token_ids.extend_from_slice(encoding.get_ids());
-            offsets.extend(encoding.get_offsets().iter().map(|&(start,end)| (byte_start+start,byte_start+end)));
-            byte_start += segment.text.len();
-            if remaining == 0 {
-                break;
+        if self.segmented_template {
+            let mut remaining = text.len();
+            let mut byte_start = 0;
+            for segment in &mut segments {
+                segment.text.truncate(remaining.min(segment.text.len()));
+                remaining -= segment.text.len();
+                let tokenizer = if segment.allow_special {
+                    &self.tokenizer
+                } else {
+                    self.ordinary()
+                };
+                let encoding = tokenizer
+                    .encode(segment.text.as_str(), false)
+                    .map_err(|error| {
+                        Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+                            error.to_string(),
+                            error,
+                        )))
+                    })?;
+                token_ids.extend_from_slice(encoding.get_ids());
+                offsets.extend(
+                    encoding
+                        .get_offsets()
+                        .iter()
+                        .map(|&(start, end)| (byte_start + start, byte_start + end)),
+                );
+                byte_start += segment.text.len();
+                if remaining == 0 {
+                    break;
+                }
             }
+        } else {
+            let mut cursor = 0;
+            let mut untrusted: Vec<(usize, usize)> = Vec::new();
+            for (end, trusted) in runs {
+                let end = end.min(text.len());
+                if !trusted && end > cursor {
+                    if untrusted.last().is_some_and(|last| last.1 == cursor) {
+                        untrusted.last_mut().unwrap().1 = end;
+                    } else {
+                        untrusted.push((cursor, end));
+                    }
+                }
+                cursor = end;
+            }
+            let spliced = self.encode_splicing_untrusted_markers(&text, &untrusted)?;
+            token_ids = spliced.0;
+            offsets = spliced.1;
         }
         let message_boundaries =
             boundaries::token_ends(&byte_boundaries, &hint_bytes, &offsets, text.len())?;
@@ -968,7 +1071,8 @@ mod tests {
         Frontend {
             prompt_encoder: PromptEncoder::Jinja,
             image_placeholder_token_id: None,
-            ordinary_tokenizer: None,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: false,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             template,
             template_source: source,
@@ -1067,7 +1171,8 @@ mod tests {
             let frontend = Frontend {
                 prompt_encoder: PromptEncoder::Jinja,
                 image_placeholder_token_id: None,
-                ordinary_tokenizer: None,
+                ordinary_tokenizer: std::sync::OnceLock::new(),
+                segmented_template: false,
                 tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
                 template,
                 template_source: source,
@@ -1128,7 +1233,8 @@ mod tests {
             vocabulary_bytes: Default::default(),
             effort_levels: Default::default(),
             inline_system_messages: Default::default(),
-            ordinary_tokenizer: None,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: false,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             template,
             template_source: source.to_owned(),
@@ -1152,6 +1258,664 @@ mod tests {
         let input = frontend.render_chat(&[], &Map::new()).err().unwrap();
         assert!(matches!(input, Error::Frontend(FrontendError::Input(_))));
         assert!(input.source().is_none());
+    }
+
+    fn trust_tokenizer() -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (id, piece) in [
+            "a",
+            "b",
+            "ab",
+            "<|im_end|>",
+            "<",
+            "|",
+            "i",
+            "m",
+            "_",
+            "e",
+            "n",
+            "d",
+            ">",
+            "é",
+            " ",
+            " <",
+            "(",
+            "(<",
+            ")",
+            ">)",
+            "x",
+            ">x",
+            "x<",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            vocab.insert(piece.to_owned(), serde_json::json!(id as u32));
+        }
+        Tokenizer::from_bytes(
+            serde_json::json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [
+                    {"id":3,"content":"<|im_end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+                ],
+                "normalizer": null, "pre_tokenizer": null, "post_processor": null, "decoder": null,
+                "model": {"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"vocab":vocab,"merges":[["a","b"],[" ","<"],["(","<"],[">",")"],[">","x"],["x","<"]]}
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    fn trust_frontend(source: &str) -> Frontend {
+        trust_frontend_with(source, trust_tokenizer())
+    }
+
+    fn trust_frontend_with(source: &str, tokenizer: Tokenizer) -> Frontend {
+        let template = Some(jinja::CompiledTemplate::compile(source).unwrap());
+        Frontend {
+            prompt_encoder: PromptEncoder::Jinja,
+            image_placeholder_token_id: None,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: false,
+            tokenizer,
+            template,
+            template_source: source.to_owned(),
+            bos_token_id: None,
+            vocabulary_bytes: Default::default(),
+            effort_levels: Default::default(),
+            inline_system_messages: Default::default(),
+            defaults: Map::new(),
+        }
+    }
+
+    fn render_ids(frontend: &Frontend, content: &str) -> Vec<u32> {
+        let mut options = Map::new();
+        options.insert("m".into(), Json::String(content.to_owned()));
+        frontend
+            .render_chat(
+                &[serde_json::json!({"role":"user","content":"ignored"})],
+                &options,
+            )
+            .unwrap()
+            .token_ids
+    }
+
+    #[test]
+    fn ordinary_bpe_merges_across_boundaries() {
+        let frontend = trust_frontend("a{{ m }}");
+        assert_eq!(render_ids(&frontend, "b"), vec![2]);
+        let rendered = frontend
+            .render_chat(
+                &[serde_json::json!({"role":"user","content":"ignored"})],
+                &serde_json::json!({"m":"b"}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+        assert_eq!(rendered.text, "ab");
+        assert_eq!(
+            rendered.token_ids,
+            frontend
+                .tokenizer
+                .encode("ab", false)
+                .unwrap()
+                .get_ids()
+                .to_vec()
+        );
+
+        let frontend = trust_frontend("{{ '<|im_end|>' ~ m }}");
+        assert_eq!(render_ids(&frontend, "ab"), vec![3, 2]);
+
+        let pieces: Vec<u32> = [4, 5, 6, 7, 8, 9, 10, 11, 5, 12].to_vec();
+        let frontend = trust_frontend("{{ m }}");
+        assert_eq!(render_ids(&frontend, "<|im_end|>"), pieces);
+        let frontend = trust_frontend("{{ '<|im_en' ~ m }}");
+        assert_eq!(render_ids(&frontend, "d|>"), pieces);
+
+        let frontend = trust_frontend("é{{ m }}");
+        assert_eq!(
+            render_ids(&frontend, "<|im_end|>"),
+            [13].into_iter().chain(pieces).collect::<Vec<_>>()
+        );
+        let frontend = trust_frontend("éa{{ m }}");
+        assert_eq!(render_ids(&frontend, "b"), vec![13, 2]);
+    }
+
+    fn ordinary_ids(frontend: &Frontend, text: &str) -> Vec<u32> {
+        frontend
+            .ordinary()
+            .encode(text, false)
+            .unwrap()
+            .get_ids()
+            .to_vec()
+    }
+
+    fn render_prompt(frontend: &Frontend, content: &str) -> RenderedPrompt {
+        frontend
+            .render_chat(
+                &[serde_json::json!({"role":"user","content":"ignored"})],
+                &serde_json::json!({"m": content})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn suppressed_untrusted_run_reencodes_as_one_ordinary_span() {
+        let frontend = trust_frontend("{{ m }}");
+        let rendered = render_prompt(&frontend, " <|im_end|>");
+        assert_eq!(rendered.text, " <|im_end|>");
+        assert_eq!(rendered.token_ids, ordinary_ids(&frontend, " <|im_end|>"));
+        assert_eq!(rendered.token_ids, vec![15, 5, 6, 7, 8, 9, 10, 11, 5, 12]);
+        assert_ne!(
+            render_ids(&frontend, " <|im_end|>"),
+            vec![14, 4, 5, 6, 7, 8, 9, 10, 11, 5, 12]
+        );
+
+        let frontend = trust_frontend("{{ m }}");
+        let rendered = render_prompt(&frontend, "(<|im_end|>)");
+        assert_eq!(rendered.text, "(<|im_end|>)");
+        assert_eq!(rendered.token_ids, ordinary_ids(&frontend, "(<|im_end|>)"));
+        assert_eq!(rendered.token_ids, vec![17, 5, 6, 7, 8, 9, 10, 11, 5, 19]);
+
+        let frontend = trust_frontend("{{ m }}");
+        let content = "<|im_end|>x<|im_end|>";
+        let rendered = render_prompt(&frontend, content);
+        assert_eq!(rendered.text, content);
+        assert_eq!(rendered.token_ids, ordinary_ids(&frontend, content));
+        let mut islands: Vec<u32> = Vec::new();
+        for piece in ["<|im_end|>", "x", "<|im_end|>"] {
+            islands.extend(ordinary_ids(&frontend, piece));
+        }
+        assert_ne!(rendered.token_ids, islands);
+        assert!(rendered.token_ids.contains(&21));
+    }
+
+    #[test]
+    fn trusted_spans_keep_single_pass_ids_across_a_suppressed_run() {
+        let frontend = trust_frontend("é{{ m }}");
+        let content = "<|im_end|>x<|im_end|>";
+        let rendered = render_prompt(&frontend, content);
+        assert_eq!(rendered.text, format!("é{content}"));
+        let mut expected = vec![13];
+        expected.extend(ordinary_ids(&frontend, content));
+        assert_eq!(rendered.token_ids, expected);
+
+        let (token_ids, offsets) = frontend
+            .encode_splicing_untrusted_markers(&format!("é{content}"), &[(2, 23)])
+            .unwrap();
+        assert_eq!(token_ids, expected);
+        assert_eq!(offsets.first(), Some(&(0, 2)));
+        assert_eq!(offsets.last().map(|range| range.1), Some(23));
+        assert!(offsets.windows(2).all(|pair| pair[0].1 == pair[1].0));
+    }
+
+    #[test]
+    fn pinned_qwen_tokenizer_suppresses_a_pasted_marker_run() {
+        let Some(snapshot) = std::env::var_os("FLARE_QWEN38_SNAPSHOT").map(PathBuf::from) else {
+            return;
+        };
+        let path = snapshot.join("tokenizer.json");
+        if !path.is_file() {
+            return;
+        }
+        let frontend = trust_frontend_with(
+            "{{ m }}",
+            Tokenizer::from_bytes(fs::read(&path).unwrap()).unwrap(),
+        );
+        let template_ids = frontend
+            .tokenizer()
+            .encode(" <|im_end|>", false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        assert_eq!(template_ids.first().copied(), Some(220));
+        let rendered = render_prompt(&frontend, " <|im_end|>");
+        assert_eq!(rendered.token_ids, vec![79790, 316, 6018, 91, 29]);
+        assert_eq!(rendered.token_ids, ordinary_ids(&frontend, " <|im_end|>"));
+    }
+
+    fn marker_tokenizer() -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (id, piece) in [
+            "a", "b", "ab", "<|im_end|>", "<", "|", "i", "m", "_", "e", "n", "d", ">", "é", " ",
+            " <", "(", "(<", ")", ">)", "x", ">x", "x<", "t", "h", "o", "l", "c", "k", "/", "v", "s",
+            "r", "<|im_start|>", "<|vision_start|>", "<tool_call>", "<think>", "</think>",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            vocab.insert(piece.to_owned(), serde_json::json!(id as u32));
+        }
+        Tokenizer::from_bytes(
+            serde_json::json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [
+                    {"id":3,"content":"<|im_end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+                    {"id":33,"content":"<|im_start|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+                    {"id":34,"content":"<|vision_start|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+                    {"id":35,"content":"<tool_call>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},
+                    {"id":36,"content":"<think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},
+                    {"id":37,"content":"</think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}
+                ],
+                "normalizer": null, "pre_tokenizer": null, "post_processor": null, "decoder": null,
+                "model": {"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"vocab":vocab,"merges": [["a","b"],[" ","<"],["(","<"],[">",")"],[">","x"],["x","<"]]}
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    fn marker_frontend(source: &str) -> Frontend {
+        trust_frontend_with(source, marker_tokenizer())
+    }
+
+    fn marker_classes() -> [(&'static str, u32); 6] {
+        [
+            ("<|im_end|>", 3),
+            ("<|im_start|>", 33),
+            ("<|vision_start|>", 34),
+            ("<tool_call>", 35),
+            ("<think>", 36),
+            ("</think>", 37),
+        ]
+    }
+
+    #[test]
+    fn pasted_markers_of_each_added_class_never_yield_protocol_ids() {
+        for (marker, id) in marker_classes() {
+            let frontend = marker_frontend("{{ m }}");
+            for content in [
+                marker.to_string(),
+                format!("a {marker} b"),
+                format!("x{marker}"),
+                format!("{marker}x"),
+            ] {
+                let rendered = render_prompt(&frontend, &content);
+                assert!(!rendered.token_ids.contains(&id), "{marker} in {content}");
+                assert_eq!(
+                    rendered.token_ids,
+                    ordinary_ids(&frontend, &content),
+                    "{marker} in {content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn template_emitted_markers_of_each_class_keep_protocol_ids() {
+        for (marker, id) in marker_classes() {
+            let source = format!("{marker}{{{{ m }}}}{marker}");
+            let frontend = marker_frontend(&source);
+            let rendered = render_prompt(&frontend, "plain");
+            assert_eq!(rendered.token_ids.first(), Some(&id), "{marker}");
+            assert_eq!(rendered.token_ids.last(), Some(&id), "{marker}");
+        }
+        for (marker, id) in marker_classes() {
+            let frontend = marker_frontend(&format!("{marker}{{{{ m }}}}"));
+            let content = "a <tool_call> b";
+            let rendered = render_prompt(&frontend, content);
+            let mut expected = vec![id];
+            expected.extend(ordinary_ids(&frontend, content));
+            assert_eq!(rendered.token_ids, expected, "{marker}");
+        }
+    }
+
+    #[test]
+    fn a_run_mixing_marker_classes_reencodes_as_one_ordinary_span() {
+        let frontend = marker_frontend("{{ m }}");
+        let content = "a <|im_start|> b <tool_call> x </think> d <|im_end|>";
+        let rendered = render_prompt(&frontend, content);
+        assert_eq!(rendered.token_ids, ordinary_ids(&frontend, content));
+        for (_, id) in marker_classes() {
+            assert!(!rendered.token_ids.contains(&id));
+        }
+    }
+
+    #[test]
+    fn markers_straddling_a_trust_boundary_are_pulled_into_the_run() {
+        for (marker, id) in marker_classes() {
+            let (prefix, suffix) = marker.split_at(marker.len() - 2);
+            let frontend = marker_frontend(&format!("{prefix}{{{{ m }}}}"));
+            let rendered = render_prompt(&frontend, suffix);
+            assert_eq!(rendered.text, marker);
+            assert!(!rendered.token_ids.contains(&id), "{marker}");
+            assert_eq!(rendered.token_ids, ordinary_ids(&frontend, marker), "{marker}");
+
+            let frontend = marker_frontend(&format!("{{{{ m }}}}{suffix}"));
+            let rendered = render_prompt(&frontend, prefix);
+            assert_eq!(rendered.text, marker);
+            assert!(!rendered.token_ids.contains(&id), "{marker}");
+            assert_eq!(rendered.token_ids, ordinary_ids(&frontend, marker), "{marker}");
+        }
+    }
+
+    #[test]
+    fn pasted_marker_between_trusted_markers_is_suppressed() {
+        for (marker, id) in marker_classes() {
+            let frontend = marker_frontend(&format!("{marker}{{{{ m }}}}{marker}"));
+            let rendered = render_prompt(&frontend, marker);
+            let mut expected = vec![id];
+            expected.extend(ordinary_ids(&frontend, marker));
+            expected.push(id);
+            assert_eq!(rendered.token_ids, expected, "{marker}");
+        }
+    }
+
+    #[test]
+    fn pinned_qwen_tokenizer_suppresses_every_added_token_class() {
+        let Some(snapshot) = std::env::var_os("FLARE_QWEN38_SNAPSHOT").map(PathBuf::from) else {
+            return;
+        };
+        let path = snapshot.join("tokenizer.json");
+        if !path.is_file() {
+            return;
+        }
+        let bytes = fs::read(&path).unwrap();
+        let frontend = trust_frontend_with("{{ m }}", Tokenizer::from_bytes(&bytes).unwrap());
+        let mut inventory: Vec<(u32, String)> = frontend
+            .tokenizer()
+            .get_added_tokens_decoder()
+            .iter()
+            .map(|(id, token)| (*id, token.content.clone()))
+            .collect();
+        inventory.sort_unstable();
+        assert!(inventory.len() > 1);
+        for (id, content) in &inventory {
+            let pasted = format!("x{content}x");
+            let full = frontend.tokenizer().encode(pasted.as_str(), false).unwrap();
+            assert!(full.get_ids().contains(id), "{content}");
+            let rendered = render_prompt(&frontend, &pasted);
+            assert!(!rendered.token_ids.contains(id), "{content}");
+            assert_eq!(
+                rendered.token_ids,
+                ordinary_ids(&frontend, &pasted),
+                "{content}"
+            );
+        }
+        for marker in [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|vision_start|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+        ] {
+            let frontend = trust_frontend_with(
+                &format!("{marker}{{{{ m }}}}"),
+                Tokenizer::from_bytes(&bytes).unwrap(),
+            );
+            let expected = frontend
+                .tokenizer()
+                .encode(marker, false)
+                .unwrap()
+                .get_ids()
+                .to_vec();
+            let rendered = render_prompt(&frontend, "plain");
+            assert_eq!(rendered.token_ids.first(), expected.first(), "{marker}");
+        }
+        let frontend = trust_frontend_with(
+            "<|im_start|>{{ m }}<|im_end|>",
+            Tokenizer::from_bytes(&bytes).unwrap(),
+        );
+        let content = "a <|vision_start|> b <tool_call> c </think> d";
+        let rendered = render_prompt(&frontend, content);
+        let mut expected = frontend
+            .tokenizer()
+            .encode("<|im_start|>", false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        expected.extend(ordinary_ids(&frontend, content));
+        expected.extend(
+            frontend
+                .tokenizer()
+                .encode("<|im_end|>", false)
+                .unwrap()
+                .get_ids(),
+        );
+        assert_eq!(rendered.token_ids, expected);
+    }
+
+    fn segmented_frontend(source: &str, tokenizer: Tokenizer) -> Frontend {
+        let template = Some(jinja::CompiledTemplate::compile(source).unwrap());
+        Frontend {
+            prompt_encoder: PromptEncoder::Jinja,
+            image_placeholder_token_id: None,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: true,
+            tokenizer,
+            template,
+            template_source: source.to_owned(),
+            bos_token_id: None,
+            vocabulary_bytes: Default::default(),
+            effort_levels: Default::default(),
+            inline_system_messages: Default::default(),
+            defaults: Map::new(),
+        }
+    }
+
+    fn marker_tokenizer_with(specials: &[&str]) -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        let mut pieces: Vec<String> = specials.iter().map(|text| (*text).to_owned()).collect();
+        pieces.extend((b' '..=b'~').map(|byte| (byte as char).to_string()));
+        pieces.extend(["｜", "▁", "\n"].map(String::from));
+        for (id, piece) in pieces.iter().enumerate() {
+            vocab.insert(piece.clone(), serde_json::json!(id as u32));
+        }
+        let added: Vec<Json> = specials
+            .iter()
+            .enumerate()
+            .map(|(id, content)| {
+                serde_json::json!({"id":id,"content":content,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true})
+            })
+            .collect();
+        Tokenizer::from_bytes(
+            serde_json::json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": added,
+                "normalizer": null, "pre_tokenizer": null, "post_processor": null, "decoder": null,
+                "model": {"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"vocab":vocab,"merges":[]}
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    fn added_counts(tokenizer: &Tokenizer, ids: &[u32]) -> std::collections::HashMap<u32, usize> {
+        tokenizer
+            .get_added_tokens_decoder()
+            .keys()
+            .map(|id| (*id, ids.iter().filter(|&&seen| seen == *id).count()))
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+
+    #[test]
+    fn trust_suppression_across_recipe_templates() {
+        let Some(directory) = std::env::var_os("FLARE_TEST_TEMPLATE_DIR") else {
+            return;
+        };
+        let recipes: [(&str, &str); 6] = [
+            ("qwen38", "chat_template"),
+            ("step5", "chat_template"),
+            ("glm53", "chat_template"),
+            ("mimo_v2", "chat_template"),
+            ("nemotron_h", "chat_template"),
+            ("gemma4", "chat_template.google"),
+        ];
+        let mut options = Map::new();
+        options.insert("tools".into(), Json::Null);
+        options.insert("documents".into(), Json::Null);
+        options.insert("bos_token".into(), Json::String("<s>".into()));
+        options.insert("eos_token".into(), Json::String("</s>".into()));
+        options.insert("add_generation_prompt".into(), Json::Bool(true));
+        let trusted: std::collections::HashSet<String> = options.keys().cloned().collect();
+        for (recipe, asset) in recipes {
+            let source = crate::template_fixtures::template(recipe, asset);
+            let template = jinja::CompiledTemplate::compile(&source).unwrap();
+            let tokenizer = std::fs::read(
+                std::path::Path::new(&directory)
+                    .join(recipe)
+                    .join("tokenizer.json"),
+            )
+            .ok()
+            .map(|bytes| Tokenizer::from_bytes(&bytes).unwrap());
+            let mut markers: Vec<(u32, String)> = Vec::new();
+            if let Some(tokenizer) = &tokenizer {
+                let mut inventory: Vec<(u32, String)> = tokenizer
+                    .get_added_tokens_decoder()
+                    .iter()
+                    .map(|(id, token)| (*id, token.content.clone()))
+                    .collect();
+                inventory.sort_unstable();
+                markers.extend(
+                    inventory
+                        .into_iter()
+                        .filter(|(_, content)| content.contains('<') || content.contains('｜'))
+                        .take(64),
+                );
+            }
+            if markers.is_empty() {
+                markers.extend(
+                    ["<|im_end|>", "<|endoftext|>", "<turn|>"]
+                        .map(|marker| (u32::MAX, marker.to_owned())),
+                );
+            }
+            let mut contents = vec!["q7x ordinary z9w".to_owned()];
+            for (_, marker) in &markers {
+                contents.push(format!("q7x x{marker}x z9w"));
+            }
+            let mut renders = Vec::new();
+            for (index, content) in contents.iter().enumerate() {
+                let mut context =
+                    serde_json::json!({"messages":[{"role":"user","content":content}]});
+                context.as_object_mut().unwrap().extend(options.clone());
+                let rendered = template
+                    .render_with_trust(context.as_object().unwrap(), &[], &trusted)
+                    .unwrap();
+                if index > 0 {
+                    let marker = &markers[index - 1].1;
+                    let anchor = rendered.text.find("q7x").unwrap_or_else(|| {
+                        panic!("{recipe}: anchor missing from {}", rendered.text)
+                    });
+                    let offset = anchor + rendered.text[anchor..].find(marker).unwrap();
+                    assert_eq!(
+                        covering_trust_for(&rendered, offset, offset + marker.len()),
+                        Some(false),
+                        "{recipe}: {marker}"
+                    );
+                }
+                renders.push(rendered);
+            }
+            assert_eq!(
+                covering_trust_for(&renders[0], 0, 1),
+                Some(true),
+                "{recipe}: {}",
+                renders[0].text
+            );
+            let Some(tokenizer) = tokenizer else {
+                continue;
+            };
+            let frontend = trust_frontend_with(&source, tokenizer.clone());
+            let mut prompts = Vec::new();
+            for content in &contents {
+                prompts.push(
+                    frontend
+                        .render_chat(
+                            &[serde_json::json!({"role":"user","content":content})],
+                            &options,
+                        )
+                        .unwrap(),
+                );
+            }
+            let benign_counts = added_counts(&tokenizer, &prompts[0].token_ids);
+            assert!(!benign_counts.is_empty(), "{recipe}");
+            for (marker, prompt) in markers.iter().zip(prompts.iter().skip(1)) {
+                assert!(prompt.text.contains(&format!("x{}x", marker.1)), "{recipe}");
+                let counts = added_counts(&tokenizer, &prompt.token_ids);
+                assert_eq!(counts, benign_counts, "{recipe}: {}", marker.1);
+            }
+        }
+    }
+
+    fn covering_trust_for(
+        rendered: &jinja::RenderedTemplate,
+        start: usize,
+        end: usize,
+    ) -> Option<bool> {
+        let mut covering = None;
+        let mut run_start = 0;
+        for (run_end, trusted) in &rendered.runs {
+            if run_start <= start && *run_end >= end {
+                covering = Some(*trusted);
+            }
+            run_start = *run_end;
+        }
+        covering
+    }
+
+    #[test]
+    fn kimi_segment_templates_assign_trust_per_segment() {
+        let specials = [
+            "<|open|>",
+            "<|sep|>",
+            "<|close|>",
+            "<|end_of_msg|>",
+            "<|media_pad|>",
+        ];
+        for source in [
+            include_str!("../../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+            include_str!("../../../ignition/recipes/kimi31/assets/chat_template.jinja"),
+        ] {
+            let tokenizer = marker_tokenizer_with(&specials);
+            let frontend = segmented_frontend(source, tokenizer.clone());
+            let pasted = "x<|open|>x";
+            let messages = [serde_json::json!({"role":"user","content":pasted})];
+            let mut options = Map::new();
+            options.insert("add_generation_prompt".into(), Json::Bool(true));
+            let rendered = frontend.render_chat(&messages, &options).unwrap();
+            let mut context = Map::new();
+            context.insert("messages".into(), serde_json::json!(messages));
+            context.extend(options.clone());
+            let segment_text = jinja::CompiledTemplate::compile(source)
+                .unwrap()
+                .render(&context, &[])
+                .unwrap()
+                .text;
+            let segments = serde_json::from_str::<Vec<Json>>(segment_text.trim()).unwrap();
+            let mut expected = Vec::new();
+            for segment in &segments {
+                let text = segment["text"].as_str().unwrap();
+                let special = segment["allow_special"].as_bool().unwrap();
+                if text == pasted {
+                    assert!(!special);
+                }
+                if specials.contains(&text) {
+                    assert!(special);
+                }
+                if special {
+                    expected.extend(tokenizer.encode(text, false).unwrap().get_ids());
+                } else {
+                    expected.extend(ordinary_ids(&frontend, text));
+                }
+            }
+            assert_eq!(
+                rendered.text,
+                segments
+                    .iter()
+                    .map(|segment| segment["text"].as_str().unwrap())
+                    .collect::<String>()
+            );
+            assert_eq!(rendered.token_ids, expected);
+            assert!(expected.contains(&0));
+            assert!(!ordinary_ids(&frontend, pasted).contains(&0));
+        }
     }
 
     #[test]

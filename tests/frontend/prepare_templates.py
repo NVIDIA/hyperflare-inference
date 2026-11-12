@@ -43,6 +43,12 @@ def main():
         (output / f"{name}.source.jinja").write_bytes(original)
         (output / f"{name}.jinja").write_bytes(asset["text"].encode("utf-8"))
         print(output / f"{name}.jinja")
+        try:
+            path = hf_hub_download(source["repository"], "tokenizer.json",
+                                   revision=source["revision"], cache_dir=args.hub_cache)
+            (output / "tokenizer.json").write_bytes(Path(path).read_bytes())
+        except Exception as error:
+            print(f"tokenizer.json unavailable for {recipe}: {error}")
 
 
 if __name__ == "__main__":

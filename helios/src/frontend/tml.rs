@@ -231,11 +231,7 @@ impl Prompt<'_> {
     }
 
     fn ordinary(&mut self, text: &str) -> Result<()> {
-        let tokenizer = self
-            .frontend
-            .ordinary_tokenizer
-            .as_ref()
-            .expect("TMLv0 ordinary tokenizer is initialized");
+        let tokenizer = self.frontend.ordinary();
         let encoding = tokenizer.encode(text, false).map_err(|error| {
             Error::frontend(FrontendError::Tokenizer(Failure::boxed(error.to_string(), error)))
         })?;
