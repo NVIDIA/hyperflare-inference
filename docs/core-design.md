@@ -1529,21 +1529,24 @@ endpoints have the lowest role, earlier message checkpoints follow, and the
 conversation anchor has the highest role. Demand recency takes precedence over
 role, so an idle conversation's anchor can be reclaimed before a recently used
 endpoint. Each successfully admitted logical request receives a demand epoch;
-its captures inherit that epoch. Cache reuse touches only the matched checkpoint's
-snapshot. Successful completion refreshes the terminal checkpoint with a
-completion-time epoch, or the retained prefix when no terminal checkpoint was
-captured. Ancestor snapshots retain their own demand epochs: sharing their pages
-does not require restoring their rows. Older single-child ancestors can therefore
-be compacted under pressure without discarding the recently used descendant's
-page chain. Cancellation after completed inference also refreshes the retained
-prefix, including client stop sequences. This keeps a long-running conversation
-recent when its response ends. Cancellation before
-inference and execution failure do not refresh recency. Preemption carries the
-admission epoch into readmission without refreshing it. Duplicate publication
-retains the maximum role and epoch of the matching checkpoint only. A prompt-end
-or message checkpoint gains recency when reused directly; completion of a
-descendant does not refresh it. Branch points and direct pins still constrain
-which checkpoints are removable.
+its captures inherit that epoch. Cache reuse and promotion touch only the selected
+checkpoint's snapshot. Successful completion refreshes a published terminal and
+its direct parent with one completion-time epoch. The parent commonly holds the
+prompt end or last captured message boundary, which remains useful when a follow-up
+rewrites generated history. The parent comes from the published checkpoint's cache
+record, including duplicate publication; it need not have been captured by the
+completing request and may have been restored from a host tier.
+
+Completion refreshes at most two checkpoints. Grandparents retain their own demand
+epochs: sharing their pages does not require restoring their rows. Older single-child
+ancestors can therefore be compacted under pressure without discarding descendant
+pages. When no terminal is published, completion refreshes only the retained prefix.
+Cancellation after completed inference also refreshes only that prefix, including
+client stop sequences. Cancellation before inference and execution failure do not
+refresh recency. Preemption carries the admission epoch into readmission without
+refreshing it. Duplicate publication retains the maximum role and epoch of the
+matching checkpoint; successful retirement then refreshes it and its direct parent.
+Branch points and direct pins still constrain which checkpoints are removable.
 
 The global allocator compares victims for both snapshot rows and physical page
 backing. A removable checkpoint is an unpinned leaf or an ancestor with exactly

@@ -2890,6 +2890,10 @@ impl RequestScheduler {
         if refresh_recency && let Some(id) = result.map(PublishResult::id).or(prefix) {
             let epoch = self.cache.new_use_epoch()?;
             self.cache.touch(id, epoch)?;
+            // Duplicate publication can retain a different parent than the request's prefix.
+            if result.is_some() && let Some(parent) = self.cache.checkpoint(id)?.parent() {
+                self.cache.touch(parent, epoch)?;
+            }
         }
         let mut request = self.slots[handle.slot as usize].request.take().unwrap();
         if let Some(guard) = request.anchor_guard.take() { self.release_snapshot(guard); }

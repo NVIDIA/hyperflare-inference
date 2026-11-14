@@ -1295,7 +1295,7 @@ fn capture_under_reused_chain_pressure(alias_pages: u32) {
 }
 
 #[test]
-fn completion_refreshes_terminal_recency_without_refreshing_its_prompt_snapshot() {
+fn completion_refreshes_terminal_and_prompt_recency_after_other_requests_finish() {
     let mut scheduler = scheduler(2, 8, 4);
     let long = scheduler.admit(spec(64, 2)).unwrap();
     let mut other = spec(64, 1);
@@ -1366,6 +1366,13 @@ fn completion_refreshes_terminal_recency_without_refreshing_its_prompt_snapshot(
         .use_epoch;
     let long_checkpoint = scheduler.finish(long).unwrap().unwrap();
     let pages = scheduler.cache().page_chain(long_checkpoint).unwrap();
+    let completed_epoch = scheduler
+        .cache()
+        .checkpoint(long_checkpoint)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    assert!(completed_epoch > prompt_epoch);
     assert_eq!(
         scheduler
             .cache()
@@ -1373,19 +1380,9 @@ fn completion_refreshes_terminal_recency_without_refreshing_its_prompt_snapshot(
             .unwrap()
             .retention_rank()
             .use_epoch,
-        prompt_epoch
+        completed_epoch
     );
-    let compacted = scheduler.evict(EvictionTarget {
-        pages: 0,
-        snapshots: 1,
-    });
-    assert_eq!(compacted.retired[0].checkpoint, prompt);
-    assert_eq!(compacted.retired[0].heir, Some(long_checkpoint));
-    assert_eq!(
-        scheduler.cache().page_chain(long_checkpoint).unwrap(),
-        pages
-    );
-    // Completion recency protects the terminal even when its prompt snapshot is reclaimed.
+    // Both useful endpoints outlive a conversation that completed while this request ran.
     assert_eq!(
         scheduler.cache().eviction_candidate(None, false),
         Some(short_checkpoint)
@@ -1401,6 +1398,19 @@ fn completion_refreshes_terminal_recency_without_refreshing_its_prompt_snapshot(
                 .checkpoint(short_checkpoint)
                 .unwrap()
                 .retention_rank()
+    );
+    let evicted = scheduler.evict(EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    });
+    assert_eq!(evicted.retired[0].checkpoint, short_checkpoint);
+    assert_eq!(
+        scheduler.cache().lookup(&history(64)).unwrap().checkpoint,
+        Some(prompt)
+    );
+    assert_eq!(
+        scheduler.cache().page_chain(long_checkpoint).unwrap(),
+        pages
     );
 }
 

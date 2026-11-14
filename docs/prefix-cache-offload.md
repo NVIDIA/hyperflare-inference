@@ -259,6 +259,8 @@ GPU eviction ranks eligible checkpoints by logical-request demand epoch,
 retention role, consumed-token count, and identity, as specified in
 [checkpoint lifetime](core-design.md#branching-and-lifetime). GPU demand recency
 belongs to the selected snapshot, not every ancestor supplying its pages.
+Successful terminal retirement also refreshes its direct parent, including a
+shared or host-restored checkpoint, without refreshing earlier ancestors.
 Pressure can compact an older single-child ancestor while preserving the reused
 descendant's complete page chain and reporting its compaction heir. Direct
 copy-out pins and outstanding GPU-use fences still protect transfer resources.
