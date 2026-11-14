@@ -1180,7 +1180,122 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
 }
 
 #[test]
-fn a_request_that_finishes_last_outranks_requests_admitted_while_it_ran() {
+fn snapshot_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
+    capture_under_reused_chain_pressure(0);
+}
+
+#[test]
+fn page_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
+    capture_under_reused_chain_pressure(16);
+}
+
+fn capture_under_reused_chain_pressure(alias_pages: u32) {
+    let rows = if alias_pages == 0 { 9 } else { 10 };
+    let mut scheduler = scheduler(2, 64.max(32 + rows * alias_pages), rows);
+    scheduler.enable_publications();
+    scheduler.enable_evictions();
+    scheduler
+        .share_snapshot_pages(
+            &(0..rows)
+                .map(|row| 32 + row * alias_pages..32 + (row + 1) * alias_pages)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let long_history = history(512);
+    let mut chain = Vec::new();
+    for index in 0..8 {
+        let epoch = scheduler.cache.new_use_epoch().unwrap();
+        let snapshot = scheduler.reserve_snapshot(0).unwrap();
+        let page = scheduler.free_pages.pop_first().unwrap();
+        let consumed = (index + 1) * 64;
+        let id = scheduler
+            .cache
+            .publish_with_retention(
+                &long_history,
+                &Publication {
+                    parent: chain.last().copied(),
+                    consumed_tokens: consumed,
+                    tail_pages: vec![page],
+                    snapshot: StateSnapshot {
+                        id: snapshot,
+                        consumed_tokens: consumed,
+                    },
+                    ready_after: Fence(0),
+                },
+                RetentionRole::Anchor,
+                epoch,
+            )
+            .unwrap()
+            .id();
+        scheduler.record_publication(id);
+        chain.push(id);
+    }
+    let tip = *chain.last().unwrap();
+    let pages = scheduler.cache.page_chain(tip).unwrap();
+    let mut pending_spec = spec(64, 1);
+    pending_spec.prompt.fill(999);
+    let pending = scheduler.admit(pending_spec).unwrap();
+    let mut other_history = PrefixHistory::new([9; 32]);
+    other_history.append(&[888; 64], &[]).unwrap();
+    let epoch = scheduler.cache.new_use_epoch().unwrap();
+    let snapshot = scheduler.reserve_snapshot(0).unwrap();
+    let page = scheduler.free_pages.pop_first().unwrap();
+    let other = scheduler
+        .cache
+        .publish_with_retention(
+            &other_history,
+            &Publication {
+                parent: None,
+                consumed_tokens: 64,
+                tail_pages: vec![page],
+                snapshot: StateSnapshot {
+                    id: snapshot,
+                    consumed_tokens: 64,
+                },
+                ready_after: Fence(0),
+            },
+            RetentionRole::Endpoint,
+            epoch,
+        )
+        .unwrap()
+        .id();
+    let hot = scheduler.admit(spec(512, 1536)).unwrap();
+    assert_eq!(scheduler.request(hot).unwrap().prefix, Some(tip));
+    // The remaining free row aliases live output pages when rows share KV backing.
+    assert_eq!(
+        scheduler.free_snapshot_count(),
+        usize::from(alias_pages != 0)
+    );
+    assert!(scheduler.available_snapshot(0).is_none());
+    let capture = scheduler.allocate_terminal_capture(pending).unwrap();
+    assert!(
+        capture.is_some(),
+        "older interior rows must fund the pending capture"
+    );
+    assert_eq!(scheduler.stats().checkpoint_skip_storage, 0);
+    assert!(scheduler.cache.checkpoint(chain[0]).is_err());
+    assert!(scheduler.cache.checkpoint(other).is_ok());
+    assert_eq!(scheduler.cache.page_chain(tip).unwrap(), pages);
+    assert_eq!(
+        scheduler.cache.lookup(&long_history).unwrap().checkpoint,
+        Some(tip)
+    );
+    assert_eq!(
+        scheduler.cache.lookup(&other_history).unwrap().checkpoint,
+        Some(other)
+    );
+    let evictions = scheduler.take_evictions();
+    assert_eq!(evictions.len(), 1);
+    let heir = evictions[0].heir.as_ref().unwrap();
+    assert_eq!(heir.parent, None);
+    assert_eq!(heir.chain_pages, pages[..2]);
+    scheduler.release_snapshot(capture.unwrap());
+    scheduler.cancel(pending).unwrap();
+    scheduler.cancel(hot).unwrap();
+}
+
+#[test]
+fn completion_refreshes_terminal_recency_without_refreshing_its_prompt_snapshot() {
     let mut scheduler = scheduler(2, 8, 4);
     let long = scheduler.admit(spec(64, 2)).unwrap();
     let mut other = spec(64, 1);
@@ -1242,8 +1357,35 @@ fn a_request_that_finishes_last_outranks_requests_admitted_while_it_ran() {
         )
         .unwrap();
     freeze(&mut scheduler, long, 7);
+    let prompt = scheduler.request(long).unwrap().prefix.unwrap();
+    let prompt_epoch = scheduler
+        .cache()
+        .checkpoint(prompt)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
     let long_checkpoint = scheduler.finish(long).unwrap().unwrap();
-    // The request admitted first finished last, so its conversation is the most recent one.
+    let pages = scheduler.cache().page_chain(long_checkpoint).unwrap();
+    assert_eq!(
+        scheduler
+            .cache()
+            .checkpoint(prompt)
+            .unwrap()
+            .retention_rank()
+            .use_epoch,
+        prompt_epoch
+    );
+    let compacted = scheduler.evict(EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    });
+    assert_eq!(compacted.retired[0].checkpoint, prompt);
+    assert_eq!(compacted.retired[0].heir, Some(long_checkpoint));
+    assert_eq!(
+        scheduler.cache().page_chain(long_checkpoint).unwrap(),
+        pages
+    );
+    // Completion recency protects the terminal even when its prompt snapshot is reclaimed.
     assert_eq!(
         scheduler.cache().eviction_candidate(None, false),
         Some(short_checkpoint)

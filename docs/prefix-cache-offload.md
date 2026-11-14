@@ -257,9 +257,14 @@ unrestorable.
 
 GPU eviction ranks eligible checkpoints by logical-request demand epoch,
 retention role, consumed-token count, and identity, as specified in
-[checkpoint lifetime](core-design.md#branching-and-lifetime). Host-store eviction
-independently removes the least recently used unpinned leaf; when every leaf is
-pinned, it compacts the least recently used unpinned single-child ancestor by
+[checkpoint lifetime](core-design.md#branching-and-lifetime). GPU demand recency
+belongs to the selected snapshot, not every ancestor supplying its pages.
+Pressure can compact an older single-child ancestor while preserving the reused
+descendant's complete page chain and reporting its compaction heir. Direct
+copy-out pins and outstanding GPU-use fences still protect transfer resources.
+Host-store eviction independently removes the least recently used unpinned leaf;
+when every leaf is pinned, it compacts the least recently used unpinned
+single-child ancestor by
 dropping its row and keeping its pages. A compacted host node stays in the tree
 as page-only, no longer matches lookups, and continues to supply chain pages.
 A node is evictable only when its store's policy allows it: the memory store standalone evicts any unpinned node, the

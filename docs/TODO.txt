@@ -72,11 +72,12 @@
     catalogs, host copy-out pressure, and tensor-parallel execution. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.
 
-[ ] Qualify capacity-blocked host restores and completion-time checkpoint recency
+[ ] Qualify capacity-blocked host restores and demand recency for individual checkpoints
     through exported Kimi K3.1 cores under concurrent long prompts, immediate
     continuations, and aliased snapshot pressure. Compare reused tokens, request
-    latency, and throughput with equivalent clocks and cache budgets. Remove
-    after native serving confirms restoration progress and retention behavior;
+    latency, throughput, snapshot backing pages, and storage skips with equivalent
+    clocks and cache budgets; include prompt-end and message-boundary follow-ups.
+    Remove after native serving confirms restoration progress and retention behavior;
     CPU scheduler and worker tests do not establish serving performance.
 
 [ ] Correct the 10-byte core payload fixtures in Orbit agent tests

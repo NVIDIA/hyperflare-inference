@@ -1529,15 +1529,21 @@ endpoints have the lowest role, earlier message checkpoints follow, and the
 conversation anchor has the highest role. Demand recency takes precedence over
 role, so an idle conversation's anchor can be reclaimed before a recently used
 endpoint. Each successfully admitted logical request receives a demand epoch;
-its captures inherit that epoch. Cache reuse touches the matched checkpoint
-and its ancestors. Successful completion refreshes the terminal checkpoint and
-its ancestors with a completion-time epoch, or the retained prefix when no
-terminal checkpoint was captured. Cancellation after completed inference also
-refreshes the retained prefix, including client stop sequences. This keeps a
-long-running conversation recent when its response ends. Cancellation before
+its captures inherit that epoch. Cache reuse touches only the matched checkpoint's
+snapshot. Successful completion refreshes the terminal checkpoint with a
+completion-time epoch, or the retained prefix when no terminal checkpoint was
+captured. Ancestor snapshots retain their own demand epochs: sharing their pages
+does not require restoring their rows. Older single-child ancestors can therefore
+be compacted under pressure without discarding the recently used descendant's
+page chain. Cancellation after completed inference also refreshes the retained
+prefix, including client stop sequences. This keeps a long-running conversation
+recent when its response ends. Cancellation before
 inference and execution failure do not refresh recency. Preemption carries the
 admission epoch into readmission without refreshing it. Duplicate publication
-retains the maximum role and epoch.
+retains the maximum role and epoch of the matching checkpoint only. A prompt-end
+or message checkpoint gains recency when reused directly; completion of a
+descendant does not refresh it. Branch points and direct pins still constrain
+which checkpoints are removable.
 
 The global allocator compares victims for both snapshot rows and physical page
 backing. A removable checkpoint is an unpinned leaf or an ancestor with exactly
