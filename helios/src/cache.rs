@@ -249,6 +249,11 @@ impl PrefixCheckpointCache {
         })
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn has_pins(&self) -> bool {
+        self.nodes.values().any(|node| node.direct_pins != 0)
+    }
+
     pub(crate) fn single_child(&self, id: CheckpointId) -> Option<CheckpointId> {
         if self.nodes.get(&id)?.child_count != 1 {
             return None;

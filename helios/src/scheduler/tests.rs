@@ -1143,6 +1143,7 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
     let second = scheduler.admit(spec(64, 1)).unwrap();
     init(&mut scheduler, 1);
     let mut checkpoint = None;
+    let mut completion_epoch = 0;
     for (handle, fence) in [(first, 2), (second, 4)] {
         let step = scheduler.plan().unwrap();
         assert_eq!(step.lanes[0].request, handle);
@@ -1156,6 +1157,9 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
             .unwrap();
         freeze(&mut scheduler, handle, fence + 1);
         let result = scheduler.finish(handle).unwrap();
+        let epoch = scheduler.cache().checkpoint(result.unwrap()).unwrap().retention_rank().use_epoch;
+        assert!(epoch > completion_epoch);
+        completion_epoch = epoch;
         if checkpoint.is_none() {
             checkpoint = result;
         } else {
@@ -1173,6 +1177,174 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
     assert_eq!(scheduler.stats().snapshot_evictions, 1);
     assert_eq!(scheduler.stats().cached_checkpoints, 0);
     scheduler.admit(unrelated).unwrap();
+}
+
+#[test]
+fn a_request_that_finishes_last_outranks_requests_admitted_while_it_ran() {
+    let mut scheduler = scheduler(2, 8, 4);
+    let long = scheduler.admit(spec(64, 2)).unwrap();
+    let mut other = spec(64, 1);
+    other.prompt[0] = 999;
+    let short = scheduler.admit(other).unwrap();
+    init(&mut scheduler, 1);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Prefill, long)
+    );
+    scheduler.commit(&step, Fence(2)).unwrap();
+    scheduler
+        .complete(
+            Fence(2),
+            &records(long, 2, 64, 1, 88, 1),
+            Default::default(),
+        )
+        .unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Prefill, short)
+    );
+    scheduler.commit(&step, Fence(3)).unwrap();
+    scheduler
+        .complete(
+            Fence(3),
+            &records(short, 3, 64, 1, 89, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, short, 4);
+    let short_checkpoint = scheduler.finish(short).unwrap().unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Snapshot, long)
+    );
+    scheduler.commit(&step, Fence(5)).unwrap();
+    scheduler
+        .complete(
+            Fence(5),
+            &state_records(&scheduler, &step, 5),
+            Default::default(),
+        )
+        .unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Decode, long)
+    );
+    scheduler.commit(&step, Fence(6)).unwrap();
+    scheduler
+        .complete(
+            Fence(6),
+            &records(long, 6, 65, 2, 90, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, long, 7);
+    let long_checkpoint = scheduler.finish(long).unwrap().unwrap();
+    // The request admitted first finished last, so its conversation is the most recent one.
+    assert_eq!(
+        scheduler.cache().eviction_candidate(None, false),
+        Some(short_checkpoint)
+    );
+    assert!(
+        scheduler
+            .cache()
+            .checkpoint(long_checkpoint)
+            .unwrap()
+            .retention_rank()
+            > scheduler
+                .cache()
+                .checkpoint(short_checkpoint)
+                .unwrap()
+                .retention_rank()
+    );
+}
+
+#[test]
+fn cancellation_before_inference_and_preemption_preserve_checkpoint_demand_recency() {
+    for preempted in [false, true] {
+        let mut scheduler = scheduler(1, 8, 4);
+        let handle = scheduler.admit(spec(64, 4)).unwrap();
+        init(&mut scheduler, 1);
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(2)).unwrap();
+        scheduler
+            .complete(
+                Fence(2),
+                &records(handle, 2, 64, 1, 88, 1),
+                Default::default(),
+            )
+            .unwrap();
+        retain_prompt(&mut scheduler, 3);
+        let id = scheduler.request(handle).unwrap().prefix.unwrap();
+        let rank;
+        if preempted {
+            rank = scheduler.cache().checkpoint(id).unwrap().retention_rank();
+            scheduler.finish_early(handle, true).unwrap();
+            scheduler.finish(handle).unwrap();
+        } else {
+            scheduler.cancel(handle).unwrap();
+            let handle = scheduler.admit(spec(64, 4)).unwrap();
+            rank = scheduler.cache().checkpoint(id).unwrap().retention_rank();
+            scheduler.cancel(handle).unwrap();
+        }
+        assert_eq!(
+            scheduler.cache().checkpoint(id).unwrap().retention_rank(),
+            rank
+        );
+    }
+}
+
+#[test]
+fn completion_and_client_stop_refresh_the_retained_prefix_only_without_execution_errors() {
+    for (failed, cancelled) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut scheduler = scheduler(1, 8, 4);
+        let handle = scheduler.admit(spec(64, 4)).unwrap();
+        init(&mut scheduler, 1);
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(2)).unwrap();
+        scheduler
+            .complete(
+                Fence(2),
+                &records(handle, 2, 64, 1, 88, 1),
+                Default::default(),
+            )
+            .unwrap();
+        retain_prompt(&mut scheduler, 3);
+        let id = scheduler.request(handle).unwrap().prefix.unwrap();
+        let epoch = scheduler
+            .cache()
+            .checkpoint(id)
+            .unwrap()
+            .retention_rank()
+            .use_epoch;
+        if failed {
+            scheduler.request_mut(handle).unwrap().error_code = Some(1);
+        }
+        // Finishing at the retained endpoint needs no additional snapshot.
+        if cancelled {
+            scheduler.cancel(handle).unwrap();
+        } else {
+            scheduler.finish_early(handle, false).unwrap();
+            assert!(
+                scheduler
+                    .request(handle)
+                    .unwrap()
+                    .terminal_snapshot
+                    .is_none()
+            );
+            assert_eq!(scheduler.finish(handle).unwrap(), Some(id));
+        }
+        let completed_epoch = scheduler
+            .cache()
+            .checkpoint(id)
+            .unwrap()
+            .retention_rank()
+            .use_epoch;
+        assert_eq!(completed_epoch > epoch, !failed);
+    }
 }
 
 #[test]

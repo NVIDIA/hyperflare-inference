@@ -1528,10 +1528,16 @@ role, then consumed-token count, then checkpoint identity. Prompt and terminal
 endpoints have the lowest role, earlier message checkpoints follow, and the
 conversation anchor has the highest role. Demand recency takes precedence over
 role, so an idle conversation's anchor can be reclaimed before a recently used
-endpoint. One successfully admitted logical request receives one demand epoch;
-all its captures inherit that epoch. Cache reuse touches the matched checkpoint
-and its ancestors. Duplicate publication retains the maximum role and epoch.
-Preemption carries the epoch into readmission.
+endpoint. Each successfully admitted logical request receives a demand epoch;
+its captures inherit that epoch. Cache reuse touches the matched checkpoint
+and its ancestors. Successful completion refreshes the terminal checkpoint and
+its ancestors with a completion-time epoch, or the retained prefix when no
+terminal checkpoint was captured. Cancellation after completed inference also
+refreshes the retained prefix, including client stop sequences. This keeps a
+long-running conversation recent when its response ends. Cancellation before
+inference and execution failure do not refresh recency. Preemption carries the
+admission epoch into readmission without refreshing it. Duplicate publication
+retains the maximum role and epoch.
 
 The global allocator compares victims for both snapshot rows and physical page
 backing. A removable checkpoint is an unpinned leaf or an ancestor with exactly
