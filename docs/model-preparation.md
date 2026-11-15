@@ -1377,7 +1377,36 @@ ConnectX-7 ports. Ranks on one host reduce FP32 partial sums; ranks on separate
 hosts round each partial sum to BF16 before the reduction, because RoCEnante
 reduces BF16. One runtime carries the hidden reductions, the vocabulary gathers
 of FP32 logits as BF16 column pairs, the sampling and log-probability gathers,
-and the sampling broadcasts. Multi-host export requires the checkpoint
+and the sampling broadcasts.
+
+Across hosts, prefill graphs of at least 2048 rows shard their row-local stages
+by rows. Each rank owns an equal contiguous share of the chunk's rows, receives
+those rows of every attention and expert sum through a RoCEnante
+reduce-scatter, and computes the attention-residual mixtures with their norms,
+the output convolutions, the expert routing and the residual additions for
+those rows only. Shard gathers return every row to every rank where attention
+heads and experts, which are sharded by column, the drafter taps and the final
+normalized rows need them; the routes travel as one small message. After each
+reduce-scatter a column gather exchanges the three rows that precede each
+rank's rows and each request's last three rows, which the output convolutions
+and their replicated histories read. A reduce-scatter and a shard gather are
+the halves of the pipelined all-reduce they replace and reproduce its bits, and
+the gathers copy bytes, so the row-local values equal those of a forward that
+computes them on every rank. Row ownership follows the graph's capacity: a
+rank whose rows are padding computes inactive rows. Smaller prefill graphs,
+decode, verification, and ranks on one host compute these stages on every
+rank. Qualification: on one RTX PRO 6000, with the transport replaced by an
+in-process exchange between four ranks' forwards, every row-local value,
+route, gathered row and convolution history of a five-layer stack equals the
+replicated stack bit for bit, eagerly and through a compiled, captured and
+replayed forward (`tests/recipes/test_inkling2_row_shards_cuda.py`); the same
+test passes on a GB10. On four DGX Sparks at TP4 with 8192-row chunks, time to
+first token over three service launches is 2.07 to 2.34 s for a 7,668-token
+prompt, 18.4 to 20.1 s for 67,145 tokens and 40.7 to 43.1 s for 131,990 tokens.
+One launch of a core that computes these stages on every rank measured 2.59 to
+2.69 s, 22.4 to 23.0 s and 48.8 to 49.8 s.
+
+Multi-host export requires the checkpoint
 directory on rank zero only; peers read their tensor ranges from it. The recipe
 accepts up to 32 concurrent requests. On rank zero, whose preparation address
 is `10.200.0.13`, with `[memory] reserve = "4G"`:
