@@ -224,7 +224,6 @@ def test_prepared_attention_residual_reference_and_capture(tokens, streams, sour
             workload_schema='inkling2-residual', numerical_policy='default', autotune_effort='off') as session:
         operation = PreparedResidualMix(values[0], queries, norms, sources=sources, eps=1e-6,
                                         session=session, name='residual', addend=add)
-        session.tune()
         reference = residual_mix(values, queries, addend=addend)
         mixture = operation.mix(values, addend=addend)
         for actual, expected in zip(mixture, reference, strict=True):
@@ -234,11 +233,11 @@ def test_prepared_attention_residual_reference_and_capture(tokens, streams, sour
         for got, want in zip(actual, expected, strict=True):
             torch.testing.assert_close(got, want, rtol=2 ** -7, atol=2e-5)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
-        with session.capture(), torch.cuda.graph(graph):
+        with torch.cuda.graph(graph):
             outputs = operation(values, addend=addend)
         status, _, count = driver.cuGraphGetNodes(graph.raw_cuda_graph())
         assert status == driver.CUresult.CUDA_SUCCESS
-        assert count == 1 + streams
+        assert count == 1
         for _ in range(3):
             before = torch.cuda.memory_stats()['allocation.all.allocated']
             graph.replay()
@@ -276,7 +275,6 @@ def test_prepared_attention_residual_aot_restore_and_replay(tmp_path, tokens, st
             workload_schema='inkling2-residual-aot', numerical_policy='default') as session:
         operation = PreparedResidualMix(values[0], queries, norms, sources=sources, eps=1e-6,
                                         session=session, name='residual', addend=add)
-        session.tune()
         forward = _ResidualForward(operation, values, addend)
         expected = forward()
         compiled = aot_forward(forward)
@@ -289,9 +287,8 @@ def test_prepared_attention_residual_aot_restore_and_replay(tmp_path, tokens, st
             restored = torch.compiler.load_compiled_function(file)
         restored(forward)
         graph = torch.cuda.CUDAGraph()
-        with session.capture(), torch.cuda.graph(graph):
+        with torch.cuda.graph(graph):
             outputs = restored(forward)
-        session.freeze()
         for _ in range(3):
             for value in values:
                 value.normal_()
@@ -384,3 +381,42 @@ def test_shared_attention_gate_and_value_norm_compiled_replay(tokens, projection
             assert (((gated.double() - expected_gate).abs() - bound).max() <= 0).item()
             torch.testing.assert_close(normalized, expected_norm, rtol=2 ** -7, atol=2 ** -126)
         graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
+@pytest.mark.parametrize('effort', ['off', 'default'])
+@pytest.mark.parametrize('tokens,streams,sources,add', [(4096, 1, 5, True), (4096, 3, 9, False), (128, 1, 2, False)])
+@torch.no_grad()
+def test_fused_residual_norm_stays_within_the_norm_plans_variation(effort, tokens, streams, sources, add):
+    """The fused kernel against the FP32 mixture followed by `PreparedRMSNorm`.
+
+    The two differ only in the summation order of the mean square, as the norm's own tuned plans do
+    (85 of 37.7 million elements between two plans on a GB10): no element differs by more than one
+    BF16 unit, and at most ten elements per million differ.
+    """
+    from ignition.components.rms_norm import PreparedRMSNorm
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.inkling2.residual import PreparedResidualMix
+
+    torch.manual_seed(23)
+    device = torch.device('cuda', 0)
+    values = tuple(torch.randn(tokens, 4608, device=device).bfloat16() for _ in range(sources))
+    queries = torch.randn(streams, 4608, device=device) * 4608 ** -.5
+    norms = tuple((1 + .1 * torch.randn(4608, device=device)).bfloat16() for _ in range(streams))
+    addend = (.3 * torch.randn_like(values[-1].float())).bfloat16() if add else None
+    with RecordedPreparationSession(device=device, checkpoint='inkling2-residual-bound',
+            workload_schema='inkling2-residual-bound', numerical_policy='default', autotune_effort=effort) as session:
+        operation = PreparedResidualMix(values[0], queries, norms, sources=sources, eps=1e-6,
+                                        session=session, name='residual', addend=add)
+        mixture = torch.empty((tokens, 4608), dtype=torch.float32, device=device)
+        unfused = [PreparedRMSNorm(mixture, norm, torch.empty((tokens, 4608), dtype=torch.bfloat16, device=device),
+                                   eps=1e-6, session=session, name=f'norm{index}') for index, norm in enumerate(norms)]
+        session.tune()
+        fused = operation(values, addend=addend)
+        differing = 0
+        for got, value, norm in zip(fused, operation.mix(values, addend=addend), unfused, strict=True):
+            want = norm(value)
+            units = (got.view(torch.int16).int() - want.view(torch.int16).int()).abs()
+            assert int(units.max()) <= 1
+            differing += int((units != 0).sum())
+        assert differing <= max(1, streams * tokens * 4608 // 100_000)

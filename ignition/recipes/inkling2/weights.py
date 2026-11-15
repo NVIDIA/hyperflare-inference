@@ -15,6 +15,14 @@ from .attention import AttentionWeights, attention_weights
 from .config import ModelConfig, TEXT_PREFIX
 
 
+def load_exact_bfloat16(loader, name):
+    """An FP32 checkpoint tensor whose values are exact BF16 upcasts, delivered as BF16."""
+    narrowed = loader.load_tensor(name, dtype=torch.bfloat16)
+    if not torch.equal(narrowed.float(), loader.load_tensor(name, temporary=True)):
+        raise ValueError(f"{name}: FP32 values are not exact BF16 upcasts, so BF16 delivery would round them")
+    return narrowed
+
+
 def scaled_query(query, hidden):
     return persistent_copy(query.float().reshape(-1, hidden) * hidden ** -0.5)
 
@@ -160,7 +168,7 @@ class InklingWeightLoader(DirectWeightLoader):
         attention_query = None if index == 0 else scaled_query(
             self.load_tensor(prefix + ".attention_input.query"), c.hidden)
         return LayerWeights(attention, load_experts(self, index, shard=s),
-            self.load_tensor(prefix + ".mlp.gate.weight"),
+            load_exact_bfloat16(self, prefix + ".mlp.gate.weight"),
             self.load_tensor(prefix + ".mlp.gate.e_score_correction_bias"),
             self.load_tensor(prefix + ".post_attention_convolution.conv1d.weight"),
             self.load_tensor(prefix + ".post_mlp_convolution.conv1d.weight"), norms,

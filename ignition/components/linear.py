@@ -144,7 +144,13 @@ class UnquantizedProjection:
         session: PreparationSession,
         name: str,
         bias: torch.Tensor | None = None,
+        accumulation: str = "any",
     ) -> None:
+        """Declare `source @ weight.T` (plus `bias`) into `output`.
+
+        `accumulation="fp32"` admits only b12x plans that carry the whole sum of products in FP32, the
+        accuracy of the product of FP32 operands; `"any"` also admits tensor-core and library accumulation.
+        """
         if any(t.dtype not in (torch.bfloat16, torch.float32) for t in (source, weight, output)):
             raise TypeError("unquantized projections require BF16 or FP32 operands")
         for tensor in (weight, bias):
@@ -152,7 +158,7 @@ class UnquantizedProjection:
                 record_numeric_tensor(tensor)
         # FlashInfer's GEMMs read and write contiguous rows; column slices of wider rows keep b12x's GEMV.
         rows = source.numel() // source.shape[-1]
-        self.dense = (sm103_projection.is_sm103(source.device) and bias is None
+        self.dense = (sm103_projection.is_sm103(source.device) and bias is None and accumulation == "any"
                       and source.dtype == weight.dtype == torch.bfloat16
                       and source.is_contiguous() and output.is_contiguous()
                       and sm103_projection.dense_serves(rows, output.shape[-1]))
@@ -169,7 +175,8 @@ class UnquantizedProjection:
                                          session=session), weight=weight,
                                        bias=None)),))
             return
-        query = bf16_gemv.query_from_call(source, weight, out=output, bias=bias)
+        query = bf16_gemv.query_from_call(source, weight, out=output, bias=bias,
+                                          **({} if accumulation == "any" else {"accumulation": accumulation}))
         self.plan = bf16_gemv.plan(query)
         self.weight = weight
         self.bias = bias
