@@ -278,7 +278,11 @@ pages. DRAM retains these redundant rows while its free retention space exceeds
 two continuation rows. Reserved transfer intake does not count as retention
 headroom. When that threshold is reached, or an incoming record needs more
 space than is free, DRAM reclaims eligible redundant rows before evicting other
-records. Readers and spills delay row removal until their pins are released.
+records. It reclaims them in least-recently-used order and stops once the
+headroom is restored: a single child does not show that its parent's row is
+unused, because a request that branches from the parent leaves that row as the
+only resume point of the conversation it branched from. Readers and spills
+delay row removal until their pins are released.
 DRAM releases row slots, disk truncates at the row segment, and later spills
 omit removed rows. A rewind or later fork restores its retained endpoint when
 available; otherwise it restores the nearest row-bearing ancestor and
