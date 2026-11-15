@@ -1004,6 +1004,17 @@ impl Drop for Payload<'_> {
     }
 }
 
+/// Drop the clean page-cache pages of every core file the source read for a peer rank.
+///
+/// Rank zero reads each peer's core ranges through the page cache to send them. An integrated
+/// GPU such as GB10 allocates from system memory, where cached file pages are not free, so the
+/// pages of several rank cores can keep rank zero from creating its CUDA context.
+fn release_served_pages(files: &[Vec<Arc<File>>]) {
+    for file in files.iter().skip(1).flatten() {
+        flare_eos::release_page_cache(file);
+    }
+}
+
 struct Source {
     port: u16,
     stopping: Arc<AtomicBool>,
@@ -1024,7 +1035,7 @@ impl Source {
         let (stop, held) = (stopping.clone(), channels.clone());
         let worker = thread::spawn(move || {
             let slots = Mutex::new(std::collections::HashSet::new());
-            thread::scope(|scope| -> Result<(), Failure> {
+            let result = thread::scope(|scope| -> Result<(), Failure> {
                 let mut workers = Vec::new();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 let mut error = None;
@@ -1066,7 +1077,9 @@ impl Source {
                     }
                 }
                 error.map_or(Ok(()), Err)
-            })
+            });
+            release_served_pages(&files);
+            result
         });
         Ok(Self {
             port,
@@ -1393,6 +1406,71 @@ mod tests {
         }
         socket.shutdown(Shutdown::Both).unwrap();
         source.finish().unwrap();
+    }
+
+    /// Pages of `file` that the page cache holds.
+    #[cfg(target_os = "linux")]
+    fn resident_pages(file: &File, size: usize) -> usize {
+        use std::os::fd::AsRawFd;
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mut resident = vec![0u8; size.div_ceil(page)];
+        unsafe {
+            let map = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            );
+            assert_ne!(map, libc::MAP_FAILED);
+            assert_eq!(libc::mincore(map, size, resident.as_mut_ptr()), 0);
+            libc::munmap(map, size);
+        }
+        resident.iter().filter(|&&page| page & 1 != 0).count()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_releases_the_page_cache_of_peer_core_files_when_it_finishes() {
+        use std::os::unix::fs::MetadataExt;
+
+        // A memory-backed file system keeps its pages; the crate directory is on disk.
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let size = 4 << 20;
+        let path = directory.path().join("core");
+        fs::write(&path, vec![7u8; size]).unwrap();
+        let file = File::open(&path).unwrap();
+        file.sync_all().unwrap();
+        assert_ne!(file.metadata().unwrap().blocks(), 0);
+        let observer = File::open(&path).unwrap();
+        let spec = || {
+            vec![FileSpec {
+                name: "core".into(),
+                size: size as u64,
+                ranges: vec![(0, size as u64)],
+            }]
+        };
+        let source = Source::start(vec![Vec::new(), vec![Arc::new(file)]], vec![spec(), spec()], 1).unwrap();
+        let mut socket = TcpStream::connect(("127.0.0.1", source.port)).unwrap();
+        configure(&socket, IO_TIMEOUT).unwrap();
+        socket.write_all(&[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        write(
+            &mut socket,
+            &Request {
+                file: 0,
+                ranges: vec![(0, size as u64)],
+            },
+        )
+        .unwrap();
+        let mut bytes = vec![0; 8 + size];
+        socket.read_exact(&mut bytes).unwrap();
+        assert!(bytes[8..].iter().all(|&byte| byte == 7));
+        assert_ne!(resident_pages(&observer, size), 0);
+        socket.shutdown(Shutdown::Both).unwrap();
+        source.finish().unwrap();
+        assert_eq!(resident_pages(&observer, size), 0);
     }
 
     #[test]
