@@ -1439,6 +1439,20 @@ prompt, 18.4 to 20.1 s for 67,145 tokens and 40.7 to 43.1 s for 131,990 tokens.
 One launch of a core that computes these stages on every rank measured 2.59 to
 2.69 s, 22.4 to 23.0 s and 48.8 to 49.8 s.
 
+Serve a row-sharded core on four DGX Sparks with `--roce-switch-only` on every
+rank when the hosts are joined by a switch and pairs are also cabled directly.
+With the default routing a rank reaches one peer over its cable and two through
+the switch, and both ConnectX-7 ports share the host's PCIe links. In
+row-sharded chunks of 5,120 rows or more the switch then marks ECN, the
+senders' DCQCN rate control throttles the switch flows, and a mean of 2.8
+collectives per chunk take 7 to 72 ms against a 2 ms median: 110 ms of a
+2,072 ms chunk. With `--roce-switch-only`, 36 such chunks had no stalled
+collective and no host counted an ECN mark, CNP or pause frame; chunks at the
+same position of a 67,000-token prompt are 92 ms shorter, smaller chunks are
+1.3% longer, and a decode round is under 0.1 ms longer. Time to first token
+for 131,990 tokens is 40.4 to 42.0 s against 43.5 to 43.7 s with the default
+routing.
+
 Multi-host export requires the checkpoint
 directory on rank zero only; peers read their tensor ranges from it. The recipe
 accepts up to 32 concurrent requests. On rank zero, whose preparation address
