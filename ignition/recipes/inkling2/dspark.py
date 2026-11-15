@@ -9,7 +9,7 @@ import torch
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.embedding import PreparedEmbedding
-from ignition.components.linear import UnquantizedProjection
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.recurrent_proposal import PreparedRecurrentProposalHead
@@ -18,7 +18,8 @@ from ignition.components.speculation import SpeculativeRngState
 from ignition.components.state import gather_rows, save_hidden
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 
-from .dspark_state import context_slots, mix_features, rotary, stage_paged_tail, stage_window
+from .dspark_state import (block_inputs, context_slots, mix_features, rotary_table, rotate, stage, tail_plan,
+                           window_plan)
 
 
 def inverse_frequencies(draft, device):
@@ -66,11 +67,12 @@ class PreparedContext:
         m = metadata
         full_slots = context_slots(m, counts)
         local_slots = context_slots(m, counts, window=self.window)
+        table = rotary_table(m.positions, self.inverse)
         for index, (projection, key_norm, context_norm, writer, local) in enumerate(self.stages):
             context = mix_features(auxiliary, self.alpha[index], context_norm, self.eps)
             key, value = projection(context).chunk(2, -1)
             key = key_norm(key.contiguous().view(-1, self.key_shape[-1])).view(self.key_shape)
-            writer(rotary(key, m.positions, self.inverse), value.contiguous().view(self.key_shape),
+            writer(rotate(key, table), value.contiguous().view(self.key_shape),
                 local_slots if local else full_slots)
         indices = (m.query_start_loc[:-1].long() + counts.long() - 1).clamp(0, auxiliary.shape[0] - 1)
         context = mix_features(auxiliary[indices], self.alpha[-1], self.recurrent_norm, self.eps)
@@ -82,6 +84,8 @@ class PreparedContext:
 
 @dataclass(frozen=True)
 class DraftScratch:
+    # One row per request: the block's first position is the only one that embeds a token.
+    anchor: torch.Tensor
     hidden: torch.Tensor
     accumulator: torch.Tensor
     qkv: torch.Tensor
@@ -99,7 +103,9 @@ class DraftScratch:
         start, end = shard.padded_partition(config.vocabulary, alignment=64)
         def empty(*shape, dtype=torch.bfloat16):
             return torch.empty(shape, dtype=dtype, device=device)
-        return cls(empty(tokens, hidden), empty(tokens, hidden, dtype=torch.float32),
+        if tokens % block:
+            raise ValueError("Inkling2 DSpark scratch holds whole blocks")
+        return cls(empty(tokens // block, hidden), empty(tokens, hidden), empty(tokens, hidden, dtype=torch.float32),
             empty(tokens, (q + 2 * kv) * d.head_dim), empty(tokens, q, d.head_dim),
             empty(tokens, kv, d.head_dim), empty(tokens, q, d.head_dim), empty(tokens, hidden),
             MLPScratch.allocate(tokens, hidden, d.text["intermediate_size"] // shard.world_size, device),
@@ -108,7 +114,11 @@ class DraftScratch:
     def rows(self, tokens, samples):
         if samples != tokens:
             raise ValueError("Inkling2 DSpark projects every block position")
-        return type(self)(*(self.mlp.rows(tokens) if field == "mlp" else getattr(self, field)[:tokens]
+        block = self.hidden.shape[0] // self.anchor.shape[0]
+        if tokens % block:
+            raise ValueError("Inkling2 DSpark scratch holds whole blocks")
+        counts = {"mlp": None, "anchor": tokens // block}
+        return type(self)(*(self.mlp.rows(tokens) if field == "mlp" else getattr(self, field)[:counts.get(field, tokens)]
                            for field in self.__dataclass_fields__))
 
 
@@ -118,7 +128,6 @@ class DraftAttention:
         d = config.draft
         self.query_shape, self.key_shape = tuple(scratch.query.shape), tuple(scratch.key.shape)
         self.window, self.local = d.window, index in d.local_layers
-        self.inverse = inverse_frequencies(d, scratch.hidden.device)
         self.qkv = UnquantizedProjection(scratch.hidden, weights.qkv, scratch.qkv,
             session=session, name=name + ".qkv").functional(session=session)
         self.query_norm = norm(scratch.query.flatten(0, 1), weights.query_norm, scratch.query.flatten(0, 1),
@@ -134,6 +143,7 @@ class DraftAttention:
             shape = (rows * self.pages_per_row, 128, *self.key_shape[1:])
             key, value = (torch.empty(shape, dtype=torch.bfloat16, device=scratch.hidden.device) for _ in range(2))
             tail = {}
+            self.staging = (window_plan, d.window, self.pages_per_row)
         else:
             self.key_cache, self.value_cache = pool.key(index, draft=True), pool.value(index, draft=True)
             self.pages = None
@@ -142,6 +152,7 @@ class DraftAttention:
             shape = (rows * self.tail_pages, key.shape[1], *self.key_shape[1:])
             tail = {role: torch.empty(shape, dtype=key.dtype, device=key.device)
                     for role in ("tail_key", "tail_value")}
+            self.staging = (tail_plan, key.shape[1], self.tail_pages)
         self.attention = PreparedPagedAttention(scratch.query, key, value,
             self.pages if self.local else metadata.page_table, metadata.lengths, metadata.query_start_loc,
             scratch.attended, mode="verify", width=d.block_size, window=-1, causal=False,
@@ -155,26 +166,23 @@ class DraftAttention:
         self.reduce = PreparedAllReduce(scratch.partial, scratch.hidden, runtime=runtime, coordinator=coordinator,
             session=session, name=name + ".reduce").functional(session=session)
 
-    def __call__(self, hidden, metadata):
+    def __call__(self, hidden, metadata, plan, table):
+        """Attend with `plan`, this layer's staging plan, and `table`, the rows' rotary cosines and sines."""
         m = metadata
         q_width = self.query_shape[1] * self.query_shape[2]
         kv_width = self.key_shape[1] * self.key_shape[2]
         q, k, v = self.qkv(hidden).split((q_width, kv_width, kv_width), -1)
         q = self.query_norm(q.contiguous().view(-1, self.query_shape[-1])).view(self.query_shape)
         k = self.key_norm(k.contiguous().view(-1, self.key_shape[-1])).view(self.key_shape)
-        q, k = rotary(q, m.positions, self.inverse), rotary(k, m.positions, self.inverse)
+        q, k = rotate(q, table), rotate(k, table)
         v = v.contiguous().view(self.key_shape)
         if self.local:
-            key = stage_window(self.key_cache, k, m, self.pages_per_row)
-            value = stage_window(self.value_cache, v, m, self.pages_per_row)
-            lengths = torch.where(m.lengths > 0, m.starts.clamp(max=self.window).int() + m.lengths, 0)
+            key, value = stage(self.key_cache, k, plan), stage(self.value_cache, v, plan)
             tail = {}
         else:
             key, value = self.key_cache, self.value_cache
-            tail = dict(tail_key=stage_paged_tail(key, k, m, self.tail_pages),
-                        tail_value=stage_paged_tail(value, v, m, self.tail_pages))
-            lengths = torch.where(m.lengths > 0, m.starts.int() + m.lengths, 0)
-        attended = self.attention(q, k_cache=key, v_cache=value, cache_seqlens=lengths,
+            tail = dict(tail_key=stage(key, k, plan), tail_value=stage(value, v, plan))
+        attended = self.attention(q, k_cache=key, v_cache=value, cache_seqlens=plan.lengths,
             cu_seqlens_q=m.query_start_loc, **tail, **({} if self.local else {"page_table": m.page_table}))
         return self.reduce(self.output(attended.flatten(1)))
 
@@ -195,13 +203,13 @@ class DraftLayer:
         self.reduce = PreparedAllReduce(s.output, scratch.hidden, runtime=runtime, coordinator=coordinator,
             session=session, name=name + ".mlp.reduce").functional(session=session)
 
-    def __call__(self, hidden, residual, metadata):
+    def __call__(self, hidden, residual, metadata, plan, table):
         if residual is None:
             residual = hidden
         else:
             hidden = hidden.float() + residual.float()
             residual = hidden.bfloat16()
-        attended = self.attention(self.input_norm(hidden), metadata)
+        attended = self.attention(self.input_norm(hidden), metadata, plan, table)
         summed = attended.float() + residual.float()
         residual = summed.bfloat16()
         return self.reduce(self.mlp(self.post_norm(summed))), residual
@@ -221,36 +229,50 @@ class PreparedDraft:
         first, _ = weights.shard.padded_partition(weights.config.vocabulary, alignment=64)
         self.vocabulary_start = persistent_copy(torch.tensor([first], dtype=torch.int64, device=device))
         self.embedding_weight = weights.embedding
-        ids = metadata.token_ids.clamp(0, weights.embedding.shape[0] - 1)
-        self.embedding = PreparedEmbedding(weights.embedding, ids, scratch.hidden, session=session,
+        self.inverse = inverse_frequencies(d, device)
+        # Positions after the first take the learned mask, so only each request's first row is
+        # embedded, reduced across the vocabulary shards and normalized.
+        ids = metadata.token_ids[::self.block].clamp(0, weights.embedding.shape[0] - 1)
+        self.embedding = PreparedEmbedding(weights.embedding, ids, scratch.anchor, session=session,
             name=name + ".embed").functional(session=session, dynamic_inputs=True)
-        self.embed_reduce = PreparedAllReduce(scratch.hidden, scratch.hidden, runtime=runtime,
+        self.embed_reduce = PreparedAllReduce(scratch.anchor, scratch.anchor, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".embed.reduce").functional(session=session)
-        self.embed_norm = norm(scratch.hidden, weights.embedding_norm, scratch.hidden,
+        self.embed_norm = norm(scratch.anchor, weights.embedding_norm, scratch.anchor,
             eps=d.text["rms_norm_eps"], session=session, name=name + ".embed.norm")
         self.layers = [DraftLayer(i, layer, weights, scratch, metadata, pool,
             runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.{i}", workspace=workspace)
             for i, layer in enumerate(weights.draft.layers)]
+        # Layers with equal history geometry share one staging plan per forward.
+        self.staging = tuple(dict.fromkeys(layer.attention.staging for layer in self.layers))
+        self.layer_plans = tuple(self.staging.index(layer.attention.staging) for layer in self.layers)
         self.norm = norm(scratch.accumulator, weights.draft.norm, scratch.hidden,
             eps=d.text["rms_norm_eps"], session=session, name=name + ".norm")
-        self.head = UnquantizedProjection(scratch.hidden, weights.head, scratch.local_logits,
-            session=session, name=name + ".head").functional(session=session)
+        if weights.draft.draft_head is None:
+            self.head = UnquantizedProjection(scratch.hidden, weights.head, scratch.local_logits,
+                session=session, name=name + ".head").functional(session=session)
+        else:
+            # A quantized copy of the target's vocabulary shard serves proposals; verification keeps the target's.
+            self.head = QuantizedProjection(scratch.hidden, weights.draft.draft_head, scratch.local_logits,
+                session=session, name=name + ".head", activation_mode="a16",
+                workspace=workspace).functional(session=session)
         self.recurrent = PreparedRecurrentProposalHead(weights.draft.recurrent,
-            torch.zeros(metadata.lengths.numel(), dtype=torch.int64, device=device), session=session, name=name + ".recurrent")
+            torch.zeros(metadata.lengths.numel(), dtype=torch.int64, device=device),
+            positions=self.block - 1, session=session, name=name + ".recurrent")
 
     def release_outputs(self):
         return self
 
     def __call__(self, metadata):
-        ids = metadata.token_ids - self.vocabulary_start
+        ids = metadata.token_ids[::self.block] - self.vocabulary_start
         owned = (ids >= 0) & (ids < self.embedding_weight.shape[0])
         local = self.embedding(token_ids=ids.clamp(0, self.embedding_weight.shape[0] - 1))
-        hidden = self.embed_norm(self.embed_reduce(torch.where(owned[:, None], local, 0)))
-        positions = torch.arange(hidden.shape[0], device=hidden.device) % self.block
-        hidden = torch.where((positions == 0)[:, None], hidden, self.mask)
+        anchor = self.embed_norm(self.embed_reduce(torch.where(owned[:, None], local, 0)))
+        hidden = block_inputs(anchor, self.mask, self.block)
+        table = rotary_table(metadata.positions, self.inverse)
+        plans = [plan(metadata, *geometry) for plan, *geometry in self.staging]
         residual = None
-        for layer in self.layers:
-            hidden, residual = layer(hidden, residual, metadata)
+        for layer, plan in zip(self.layers, self.layer_plans):
+            hidden, residual = layer(hidden, residual, metadata, plans[plan], table)
         hidden = self.norm(hidden.float() + residual.float())[metadata.sample_indices]
         logits = self.head(hidden)
         context = torch.empty((metadata.state_rows.numel(), self.recurrent_context.shape[1]),

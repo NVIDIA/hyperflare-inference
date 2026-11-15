@@ -442,11 +442,11 @@ class PreparedParallelDraftRound:
                     hidden = features["hidden"].view(b, block, -1)
                     context = features["recurrent_context"]
                     state = self.recurrent.begin(context)
+                    # The draft states and target context do not depend on the draws: project them once.
+                    fixed = self.recurrent.project_context(hidden[:, o.logit_offset:], context)
                     scores = torch.empty_like(draft_logits)[:, o.logit_offset:o.logit_offset + w - 1]
                     for index in range(w - 1):
-                        state, logits = self.recurrent.step(state, markov_token,
-                            hidden[:, index + o.logit_offset].contiguous(), context,
-                            base[:, index])
+                        state, logits = self.recurrent.step(state, markov_token, fixed[:, index], base[:, index])
                         scores[:, index].copy_(logits)
                         self.full_proposal.run_step(index, scores, drafts, pending=markov_token,
                             seeds=seed, offsets=base_offset, probabilities=probabilities, valid=valid,

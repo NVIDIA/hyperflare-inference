@@ -75,6 +75,9 @@ class PreparationConfig:
     speculative_token_capacity: int | None = 64
     speculative_graph_budget: int = 64
     mtp_only: bool = False
+    # Proposal-only quantized copies derived from checkpoint values at load; None keeps BF16.
+    draft_head_quantization: str | None = None
+    markov_head_quantization: str | None = None
     benchmark_selection: object | None = None
 
     def __post_init__(self):
@@ -107,6 +110,13 @@ class PreparationConfig:
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.drafting and (not self.speculative_widths or not set(self.speculative_widths) <= set(range(1, 9))):
             raise ValueError("Inkling 2 verification widths must be in [1, 8]")
+        if self.draft_head_quantization not in (None, "nvfp4", "mxfp8"):
+            raise ValueError("Inkling 2 draft head quantization must be omitted, nvfp4 or mxfp8")
+        if self.markov_head_quantization not in (None, "fp8"):
+            raise ValueError("Inkling 2 recurrent correction head quantization must be omitted or fp8")
+        if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and (
+                not self.drafting or self.draft_tokens < 1):
+            raise ValueError("proposal head quantization requires learned speculation with positive draft depth")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency) if self.vision else 0)
@@ -217,7 +227,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         raise ValueError("a decoder-layer prefix must include a global-attention layer, whose K/V use pages")
     with phase(progress, "Load weights"):
         weights = ModelWeights.load(manifest, device, shard=shard, layers=config.decoder_layers,
-                                    progress=progress, drafting=config.drafting, vision=config.vision)
+                                    progress=progress, drafting=config.drafting, vision=config.vision,
+                                    draft_head_quantization=config.draft_head_quantization,
+                                    markov_head_quantization=config.markov_head_quantization)
         weights_bytes = torch.cuda.memory_allocated(device)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
@@ -406,7 +418,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         prefill_capacities=prefills, free_device_bytes=free, total_device_bytes=total,
         allocated_tensor_bytes=torch.cuda.memory_allocated(device),
         reserved_tensor_bytes=torch.cuda.memory_reserved(device), headroom_bytes=config.headroom_bytes,
-        tuning=tuning, compiled_decoder=config.compile_decoder)
+        tuning=tuning, compiled_decoder=config.compile_decoder,
+        draft_head_quantization=config.draft_head_quantization,
+        markov_head_quantization=config.markov_head_quantization)
     # Each decoder layer's weights form one stable payload; vocabulary shards, norms and the output query share misc.
     rebuild_weights = declare_weights(weights, components=("embedding", "embedding_norm", "final_norm", "output_query",
                                                            "unembedding", "draft", "vision"))

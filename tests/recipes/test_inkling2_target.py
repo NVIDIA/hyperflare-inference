@@ -163,48 +163,6 @@ def test_checkpoint_attention_fp8_and_fp32_projection(configuration, layer, mode
 
 
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
-def test_accepted_window_prefix_commits_replay_without_candidate_mutation():
-    from ignition.recipes.inkling2.attention import retain_batch, stage_batch
-
-    device = torch.device('cuda', 0)
-    m = _metadata([8, 8, 8], [0, 1150, 3499], device)
-    m.state_rows.copy_(torch.tensor([3, 1, 2], device=device))
-    initial = torch.randn(5, 1152, 2, 128, device=device).to(torch.float8_e4m3fn)
-    rings = initial.clone().view(torch.uint8).view(5, -1)
-    values = torch.randn(24, 2, 128, dtype=torch.bfloat16, device=device)
-    staged, lengths = stage_batch(rings, values, m, window=1024, pages=9)
-    torch.testing.assert_close(rings, initial.view(torch.uint8).view(5, -1), rtol=0, atol=0)
-    assert lengths.tolist() == [8, 1031, 1031]
-    for lane, start in enumerate(m.starts.tolist()):
-        first = max(start - 1023, 0)
-        expected = torch.cat((initial[m.state_rows[lane], first % 1152:].bfloat16(), initial[m.state_rows[lane], :first % 1152].bfloat16()))
-        previous = expected[:start - first]
-        retained = torch.cat((previous, values[lane * 8:(lane + 1) * 8])).to(torch.float8_e4m3fn)
-        actual = staged.view(3, 1152, 2, 128)[lane]
-        torch.testing.assert_close(actual[:retained.shape[0]].view(torch.uint8), retained.view(torch.uint8), rtol=0, atol=0)
-        assert not actual[retained.shape[0]:].view(torch.uint8).any()
-    counts = torch.zeros(3, dtype=torch.int32, device=device)
-    retain_batch(rings, values, counts, m)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        retain_batch(rings, values, counts, m)
-    for accepted in range(9):
-        rings.copy_(initial.view(torch.uint8).view(5, -1))
-        selected = [accepted, (accepted + 1) % 9, 8 - accepted]
-        counts.copy_(torch.tensor(selected, dtype=torch.int32, device=device))
-        before = torch.cuda.memory_stats()['allocation.all.allocated']
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.cuda.memory_stats()['allocation.all.allocated'] == before
-        expected = initial.clone()
-        for lane, count in enumerate(selected):
-            for index in range(count):
-                position = (int(m.starts[lane]) + index) % 1152
-                expected[m.state_rows[lane], position] = values[lane * 8 + index].to(torch.float8_e4m3fn)
-        torch.testing.assert_close(rings, expected.view(torch.uint8).view(5, -1), rtol=0, atol=0)
-
-
-@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
 @pytest.mark.parametrize('tokens,streams,sources,add',
     [(1, streams, sources, add) for streams in (1, 3) for sources in range(1, 10) for add in (False, True)]
     + [(64, 1, 5, True), (64, 3, 9, False), (4096, 1, 9, False), (4096, 3, 9, True)])

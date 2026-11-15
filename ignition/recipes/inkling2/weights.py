@@ -72,7 +72,8 @@ class ModelWeights:
         return self.embedding_norm
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None):
+    def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
+             draft_head_quantization=None, markov_head_quantization=None):
         before = torch.cuda.memory_allocated(device)
         with InklingWeightLoader(manifest, device, shard=shard, progress=progress, vision=vision) as loader:
             c = loader.config
@@ -105,7 +106,8 @@ class ModelWeights:
         draft = None
         if drafting:
             from .dspark_weights import DraftWeights
-            draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress)
+            draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress,
+                draft_head_quantization=draft_head_quantization, markov_head_quantization=markov_head_quantization)
         return cls(c, shard, loaded, embedding, embed_norm, norm, query, head,
                    torch.cuda.memory_allocated(device) - before, draft, tower)
 

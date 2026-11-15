@@ -1325,6 +1325,18 @@ reasoning, tool calls, and structured responses. Sampling defaults are
 temperature 1.0 and top-p 1.0; the prompt encoder defaults to reasoning effort
 0.9 when the request does not specify one.
 
+Each drafting round projects eight block rows through the vocabulary head and
+then, for each of up to seven draft positions, corrects those logits with the
+recurrent head: its output map folded through the vocabulary head, one
+vocabulary row by 256 values. Both read BF16 by default, 463 MB and 25.7 MB
+per rank. `--draft-head-quantization nvfp4` or `mxfp8` prepares a quantized
+copy of the target's vocabulary shard that only proposals read, and
+`--markov-head-quantization fp8` stores the folded correction head as E4M3
+values with one FP32 scale per vocabulary row. Both are computed at load from
+checkpoint values; target verification keeps the BF16 head, so a quantized
+proposal head changes which tokens are proposed and how often they are
+accepted, never the output distribution. The default omits both flags.
+
 Export with default tuning and Torch compilation:
 
 ```sh
