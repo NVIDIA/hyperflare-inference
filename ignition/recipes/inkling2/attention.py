@@ -23,8 +23,10 @@ from ignition.components.causal_convolution import PreparedCausalConvolution
 from ignition.components.head_gate import PreparedHeadGate
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
+from ignition.components.ring_commit import PreparedRingCommit
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, scatter_rows
+from ignition.components.window_staging import PreparedWindowStaging
 from ignition.preparation.persistent import persistent_empty
 
 from .arithmetic import l2_clip, log_scaling
@@ -125,7 +127,9 @@ class LayerCache:
 
     Local layers also expose each continuation row's K and V rings as bytes
     (`key_rings`, `value_rings`, `[rows, ring bytes]`), which prefill reads and
-    rewrites one request row at a time.
+    rewrites one request row at a time, and the continuation rows with the byte
+    offsets of the K and V rings (`rows`, `ring_offsets`), where verification
+    commits accepted positions.
     """
 
     key: torch.Tensor
@@ -135,13 +139,17 @@ class LayerCache:
     ring_row_pages: int = 0
     key_rings: torch.Tensor | None = None
     value_rings: torch.Tensor | None = None
+    rows: torch.Tensor | None = None
+    ring_offsets: tuple[int, int] | None = None
 
     @classmethod
     def of(cls, pool, layer):
         if pool.text.local(layer):
             return cls(pool.ring_pages(layer, "key"), pool.ring_pages(layer, "value"),
                        pool.history(layer, "key_convolution"), pool.history(layer, "value_convolution"),
-                       pool.ring_row_pages, pool.ring_rows(layer, "key"), pool.ring_rows(layer, "value"))
+                       pool.ring_row_pages, pool.ring_rows(layer, "key"), pool.ring_rows(layer, "value"),
+                       pool.reserved_backing,
+                       tuple(pool.layout.region(f"layer{layer}.{kind}").offset for kind in ("key", "value")))
         return cls(pool.cache(layer, "key"), pool.cache(layer, "value"), pool.history(layer, "key_convolution"),
                    pool.history(layer, "value_convolution"))
 
@@ -230,6 +238,16 @@ class PreparedAttention(torch.nn.Module):
             cache_value = example("inkling.attention.staged_value", (count, PAGE_TOKENS, self.kv_heads, self.dim), KV_DTYPE)
             pages = torch.arange(count, dtype=torch.int32, device=device).view(requests, self.staged_pages)
             self.staged_table = pages
+            if mode == "verify":
+                # One kernel stages each request's preceding window and its rows from the K and V rings;
+                # one kernel commits the accepted rows' records to both rings.
+                shape = (-1, self.ring, self.kv_heads, self.dim)
+                self.staging = PreparedWindowStaging(cache.key_rings.view(KV_DTYPE).view(shape),
+                    cache.value_rings.view(KV_DTYPE).view(shape), key, value, cache_key, cache_value, metadata,
+                    lookback=self.window - 1, session=session, name=f"{name}.staging").functional(session=session)
+                self.ring_commit = PreparedRingCommit(cache.rows, cache.ring_offsets, metadata.state_rows,
+                    metadata.starts, token_capacity=metadata.max_query_tokens, window_tokens=self.ring,
+                    record_bytes=self.kv_heads * self.dim * KV_DTYPE.itemsize, candidate_offset=0).functional()
         else:
             cache_key, cache_value = cache.key, cache.value
             pages = (example("inkling.attention.ring_table", (requests, self.ring // PAGE_TOKENS), torch.int32)
@@ -336,10 +354,8 @@ class PreparedAttention(torch.nn.Module):
 
     def _verify(self, v, m):
         if self.local:
-            cache_key, lengths = stage_batch(self.cache.key_rings, v["key"], m,
-                                              window=self.window, pages=self.staged_pages)
-            cache_value, _ = stage_batch(self.cache.value_rings, v["value"], m,
-                                         window=self.window, pages=self.staged_pages)
+            cache_key, cache_value = self.staging(v["key"], v["value"], metadata=m)
+            lengths = staged_lengths(m, self.window)
             pages = self.staged_table
             kwargs = dict(k_cache=cache_key, v_cache=cache_value)
         else:
@@ -355,38 +371,26 @@ class PreparedAttention(torch.nn.Module):
         self.key_convolution.commit(values["key_previous"], values["key_raw"], metadata, counts=counts)
         self.value_convolution.commit(values["value_previous"], values["value_raw"], metadata, counts=counts)
         if self.local:
-            retain_batch(self.cache.key_rings, values["key"], counts, metadata)
-            retain_batch(self.cache.value_rings, values["value"], counts, metadata)
+            records = accepted_records(values["key"], values["value"], metadata)
+            self.ring_commit(counts, staging=records, rows=metadata.state_rows, starts=metadata.starts)
 
 
-def stage_batch(rings, values, m, *, window, pages):
-    rows, capacity = m.starts.numel(), pages * PAGE_TOKENS
-    ring = torch.empty((rows, rings.shape[1]), dtype=torch.uint8, device=rings.device)
-    gather_rows(rings, m.state_rows, ring)
-    ring = ring.view(KV_DTYPE).view(rows, -1, *values.shape[1:])
+def staged_lengths(m, window):
+    """Each request's staged key count: its preceding `window - 1` positions, bounded by its start, and its rows."""
     first = (m.starts - window + 1).clamp_min(0)
-    positions = first[:, None] + torch.arange(capacity, device=values.device)
-    previous = ring[torch.arange(rows, device=values.device)[:, None], positions.remainder(ring.shape[1])].to(values.dtype)
-    index = (m.query_start_loc[:-1, None] + positions - m.starts[:, None]).clamp(0, values.shape[0] - 1)
-    staged = torch.where((positions < m.starts[:, None])[:, :, None, None], previous, values[index])
-    lengths = torch.where(m.lengths > 0, m.starts - first + m.lengths, 0).int()
-    staged = torch.where((positions < (m.starts + m.lengths)[:, None])[:, :, None, None], staged, 0)
-    return staged.clamp(-448, 448).to(KV_DTYPE).view(rows * pages, PAGE_TOKENS, *values.shape[1:]), lengths
+    return torch.where(m.lengths > 0, m.starts - first + m.lengths, 0).int()
 
 
-def retain_batch(rings, values, counts, m):
-    rows = m.starts.numel()
-    previous = torch.empty((rows, rings.shape[1]), dtype=torch.uint8, device=rings.device)
-    gather_rows(rings, m.state_rows, previous)
-    ring = previous.view(KV_DTYPE).view(rows, -1, *values.shape[1:])
-    capacity = ring.shape[1]
-    first = m.starts + counts - capacity
-    positions = first[:, None] + (torch.arange(capacity, device=values.device) - first[:, None]).remainder(capacity)
-    indices = (m.query_start_loc[:-1, None] + positions - m.starts[:, None]).clamp(0, values.shape[0] - 1)
-    current = values[indices].clamp(-448, 448)
-    keep = ((positions < m.starts[:, None]) | (positions < 0))[:, :, None, None]
-    retained = torch.where(keep, ring.to(values.dtype), current).to(KV_DTYPE)
-    scatter_rows(retained.view(torch.uint8).view(rows, -1), m.state_rows, rings, counts > 0)
+def accepted_records(key, value, m):
+    """FP8 K and V records of each request's rows, as bytes `[2, requests, width * record bytes]`.
+
+    Record `t` of a request is its row `t`; columns past a request's rows hold other
+    requests' records, which a commit bounded by the request's accepted count never reads.
+    """
+    width = m.max_query_tokens
+    index = (m.query_start_loc[:-1, None] + torch.arange(width, device=key.device)).clamp(0, key.shape[0] - 1)
+    records = torch.stack((key[index], value[index])).clamp(-448, 448).to(KV_DTYPE)
+    return records.view(torch.uint8).view(2, index.shape[0], -1)
 
 
 def _page_slots(m):

@@ -181,3 +181,13 @@ def test_b12x_cache_writers_feed_batched_commits_before_staging_reuse():
             worker.close()
         if graph is not None:
             graph.reset()
+
+
+@pytest.mark.parametrize("candidate_offset", [-1, 1.5])
+def test_reject_candidates_before_the_staging(candidate_offset):
+    device = torch.device("cuda", 0)
+    backing = torch.zeros((3, 4096), dtype=torch.uint8, device=device)
+    rows, starts = (torch.ones(1, dtype=torch.int64, device=device) for _ in range(2))
+    with pytest.raises(ValueError, match="nonnegative record index"):
+        PreparedRingCommit(backing, (0,), rows, starts, token_capacity=4, window_tokens=8, record_bytes=16,
+                           candidate_offset=candidate_offset)

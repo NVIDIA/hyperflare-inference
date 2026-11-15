@@ -20,7 +20,10 @@ from ignition.components.paged_batch import Metadata
 from ignition.components.parallel import TensorParallelShard
 from ignition.recipes.inkling2.dspark import DraftAttention, DraftScratch, PreparedContext, PreparedDraft
 from ignition.components.weights import MLPWeights
-from ignition.recipes.inkling2.dspark_state import mix_features, rotary
+from ignition.components.markov_sampling import fp8_markov_head
+from ignition.components.vocabulary import nvfp4_draft_head
+from ignition.recipes.inkling2.dspark import inverse_frequencies
+from ignition.recipes.inkling2.dspark_state import mix_features, rotary, rotary_table
 from ignition.recipes.inkling2.dspark_weights import DraftWeights
 from ignition.components.weights import DirectWeightLoader
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
@@ -31,9 +34,10 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
     reason="requires an explicitly assigned CUDA device")
 
 
-@pytest.mark.parametrize("batch,depth", [(1, 7), (4, 7), (4, 1)])
+@pytest.mark.parametrize("batch,depth,row_scaled", [(1, 7, False), (4, 7, False), (4, 1, False),
+                                                    (1, 7, True), (4, 7, True)])
 @torch.no_grad()
-def test_sequential_recurrent_draws_record_actual_q_and_reset_state(batch, depth):
+def test_sequential_recurrent_draws_record_actual_q_and_reset_state(batch, depth, row_scaled):
     device = torch.device("cuda:0")
     generator = torch.Generator().manual_seed(422)
     hidden, rank, vocabulary, local = 128, 256, 513, 576
@@ -43,6 +47,10 @@ def test_sequential_recurrent_draws_record_actual_q_and_reset_state(batch, depth
     recurrent = SimpleNamespace(embedding=values(vocabulary, rank), state_weight=weight[:, :2 * rank].contiguous(),
         context_weight=weight[:, 2 * rank:].contiguous(), bias=values(3 * rank).float(),
         head=values(local, rank), head_bias=values(local), softcap=30.)
+    correction_head = recurrent.head
+    if row_scaled:
+        recurrent.head = fp8_markov_head(correction_head)
+        correction_head = recurrent.head.values.float() * recurrent.head.scale[:, None]
     features, context = values(batch, depth, hidden, denominator=8), values(batch, hidden, denominator=8)
     backing = values(batch, 8, local, denominator=2)
     base = backing[:, 1:depth + 1]
@@ -65,7 +73,7 @@ def test_sequential_recurrent_draws_record_actual_q_and_reset_state(batch, depth
     with RecordedPreparationSession(device=device, checkpoint="synthetic-recurrent-head",
             workload_schema="conditional-proposals", numerical_policy="bf16-checkpoint",
             autotune_effort="off", compile_workers=2) as session:
-        head = PreparedRecurrentProposalHead(recurrent, pending, session=session, name="head")
+        head = PreparedRecurrentProposalHead(recurrent, pending, positions=depth, session=session, name="head")
         sampler = PreparedVocabularySoftmax(base, q, valid, requests, slots, generations, live, tokens,
             start=0, runtime=None, coordinator=None, session=session, name="q",
             pending=pending, seeds=seeds, offsets=offsets, tokens=tokens)
@@ -75,9 +83,10 @@ def test_sequential_recurrent_draws_record_actual_q_and_reset_state(batch, depth
 
         def forward():
             state = head.begin(context)
+            fixed = head.project_context(features, context)
             previous = pending
             for index in range(depth):
-                state, logits = head.step(state, previous, features[:, index].contiguous(), context, base[:, index])
+                state, logits = head.step(state, previous, fixed[:, index], base[:, index])
                 observed_states[:, index].copy_(state)
                 scores[:, index].copy_(logits)
                 sampler.run_step(index, scores, tokens, pending=pending, seeds=seeds, offsets=offsets,
@@ -112,9 +121,20 @@ def test_sequential_recurrent_draws_record_actual_q_and_reset_state(batch, depth
                 torch.testing.assert_close(raw.double(), concatenated, rtol=2e-7, atol=2e-7)
                 state, latent = recurrent_gate(raw, state)
                 assert torch.equal(observed_states[:active, index], state[:active])
-                correction = (latent.double() @ recurrent.head.double().T + recurrent.head_bias.double()).bfloat16()
-                expected_scores = corrected_logits(base[:, index], correction, 30.)
-                assert torch.equal(scores[:active, index], expected_scores[:active])
+                if row_scaled:
+                    # The E4M3 product is FP32; the BF16 bias joins it before the BF16 rounding.
+                    correction = ((latent.double() @ correction_head.double().T).float()
+                                  + recurrent.head_bias.float()).bfloat16()
+                    expected_scores = corrected_logits(base[:, index], correction, 30.)
+                    # FP32 accumulation order can move a correction by one BF16 step.
+                    torch.testing.assert_close(scores[:active, index].float(), expected_scores[:active].float(),
+                                               rtol=2**-7, atol=2**-9)
+                    expected_scores = scores[:, index].clone()
+                else:
+                    correction = (latent.double() @ correction_head.double().T
+                                  + recurrent.head_bias.double()).bfloat16()
+                    expected_scores = corrected_logits(base[:, index], correction, 30.)
+                    assert torch.equal(scores[:active, index], expected_scores[:active])
                 expected_q = expected_scores[:, :vocabulary].float().softmax(-1)
                 torch.testing.assert_close(q[:active, index, :vocabulary], expected_q[:active], rtol=3e-6, atol=1e-9)
                 assert not q[:, index, vocabulary:].count_nonzero()
@@ -241,14 +261,20 @@ def test_draft_attention_preserves_committed_kv_with_short_target_page_tables(la
         operation = DraftAttention(layer, weights, config, scratch, m, pool, shard=TensorParallelShard(0, 1),
             runtime=None, coordinator=None, session=session, name="attention", workspace=arena)
         session.tune(show_progress=False)
-        actual = operation(source, m)
+        inverse = inverse_frequencies(d, device)
+
+        def attend():
+            plan = operation.staging[0](m, *operation.staging[1:])
+            return operation(source, m, plan, rotary_table(m.positions, inverse))
+
+        actual = attend()
         qkv = (source[:8].double() @ weights.qkv.double().T).bfloat16()
         q, k, v = qkv.split((heads * dimension, kv_heads * dimension, kv_heads * dimension), -1)
         def normalize(x, count):
             x = x.view(8, count, dimension).float()
             return (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)).bfloat16()
-        q = rotary(normalize(q, heads), m.positions[:8], operation.inverse)
-        k = rotary(normalize(k, kv_heads), m.positions[:8], operation.inverse)
+        q = rotary(normalize(q, heads), m.positions[:8], inverse)
+        k = rotary(normalize(k, kv_heads), m.positions[:8], inverse)
         v = v.reshape(8, kv_heads, dimension)
         if layer == 0:
             positions = torch.arange(max(0, start - d.window), start, device=device) % d.window
@@ -276,7 +302,7 @@ def test_draft_attention_preserves_committed_kv_with_short_target_page_tables(la
         replayed = torch.empty_like(actual)
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            replayed.copy_(operation(source, m))
+            replayed.copy_(attend())
         allocated = torch.cuda.memory_allocated()
         graph.replay()
         torch.cuda.synchronize()
@@ -300,8 +326,9 @@ def test_draft_attention_preserves_committed_kv_with_short_target_page_tables(la
         graph.reset()
 
 
+@pytest.mark.parametrize("draft_head", [None, "nvfp4"])
 @torch.no_grad()
-def test_five_layer_block_uses_learned_masks_and_replays_without_allocating():
+def test_five_layer_block_uses_learned_masks_and_replays_without_allocating(draft_head):
     device, hidden, heads, kv_heads, dimension, vocabulary, rank = torch.device("cuda:0"), 128, 12, 2, 128, 576, 256
     generator = torch.Generator().manual_seed(341)
     def values(*shape):
@@ -319,7 +346,10 @@ def test_five_layer_block_uses_learned_masks_and_replays_without_allocating():
         embedding_norm=ones(hidden), head=values(vocabulary, hidden), draft=SimpleNamespace(layers=layers,
             mask_embedding=values(hidden), norm=ones(hidden), recurrent=SimpleNamespace(embedding=values(vocabulary, rank),
                 context_weight=values(3 * rank, 2 * hidden), state_weight=values(3 * rank, 2 * rank),
-                bias=values(3 * rank).float(), head=values(vocabulary, rank), head_bias=values(vocabulary), softcap=30.)))
+                bias=values(3 * rank).float(), head=values(vocabulary, rank), head_bias=values(vocabulary), softcap=30.),
+            draft_head=None))
+    if draft_head is not None:
+        weights.draft.draft_head = nvfp4_draft_head(weights.head)
     regions = {f"draft{index}.{kind}": values(3, 1024, kv_heads, dimension)
         for index in (0, 1, 3, 4) for kind in ("key", "value")}
     regions["draft.rnn_context"] = values(3, hidden)
@@ -347,6 +377,12 @@ def test_five_layer_block_uses_learned_masks_and_replays_without_allocating():
             return features
         features = forward()
         assert features["hidden"].shape == (8, hidden)
+        if draft_head is not None:
+            # The proposal head reads its NVFP4 copy; four-bit weights keep the logits' direction.
+            reference = features["hidden"].double() @ weights.head.double().T
+            similarity = torch.nn.functional.cosine_similarity(output.double(), reference, dim=-1)
+            assert similarity.min() > .95
+            assert not torch.equal(output, reference.bfloat16())
         assert torch.equal(features["recurrent_context"], regions["draft.rnn_context"][1:2])
         torch.cuda.synchronize()
         expected = output.clone()

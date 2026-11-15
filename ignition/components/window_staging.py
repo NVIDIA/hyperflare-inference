@@ -22,6 +22,7 @@ class Query:
     window: int
     history_dtype: str
     first_position: int
+    lookback: int
 
 
 CONTRACT = native_contract(component_id="flare.window_stage", query_type=Query, tactics=lambda q: (0,))
@@ -50,10 +51,12 @@ def compile_staging(payload, ordinal):
         tuple(cute.sym_int(64) for _ in range(rank - 1)) + (1,), assumed_align=4)
         for rank, dtype in _operands(q.history_dtype))
     with torch.cuda.device(ordinal):
+        # The kernel takes a lookback only when it differs from the history length.
+        lookback = {} if q.lookback == q.window else {"lookback": q.lookback}
         return compile_kernel(WindowStageKernel(heads=q.heads, dim=q.dim, capacity=q.capacity,
-            window=q.window, first_position=q.first_position), *operands, cutlass.Int32(1), current_cuda_stream(),
-            compile_spec=KernelCompileSpec.from_key("attention.window_stage", 2,
-                (q.heads, q.dim, q.capacity, q.window, q.history_dtype, q.first_position)))
+            window=q.window, first_position=q.first_position, **lookback), *operands, cutlass.Int32(1),
+            current_cuda_stream(), compile_spec=KernelCompileSpec.from_key("attention.window_stage", 2,
+                (q.heads, q.dim, q.capacity, q.window, q.history_dtype, q.first_position, q.lookback)))
 
 
 @dataclass(frozen=True)
@@ -113,10 +116,16 @@ def _overlap(left, right):
 
 
 class PreparedWindowStaging:
-    """Gather paired history and candidates with BF16 selection and FP8 saturation."""
+    """Gather paired history and candidates with BF16 selection and FP8 saturation.
+
+    The history's second dimension is its ring: position `p` occupies slot `p`
+    modulo that length. Each request's output lists positions in order from
+    `max(start - lookback, first_position)`; `lookback` defaults to the ring
+    length and may be shorter when the ring retains more than attention reads.
+    """
 
     def __init__(self, history_key, history_value, key, value, output_key, output_value, metadata, *,
-                 counts=None, first_position=0, session, name):
+                 counts=None, first_position=0, lookback=None, session, name):
         from b12x.attention.paged_kv_write._preparation import _check_layout
 
         m = metadata
@@ -133,6 +142,9 @@ class PreparedWindowStaging:
                 or output_key.shape[0] * output_key.shape[1] % rows or output_key.numel() == 0
                 or type(first_position) is not int):
             raise ValueError("window staging requires matching positive BF16 candidates, BF16/FP8 history and FP8 output geometry")
+        lookback = history_key.shape[1] if lookback is None else lookback
+        if type(lookback) is not int or not 0 < lookback <= history_key.shape[1]:
+            raise ValueError("window staging looks back over a positive count of at most the history's positions")
         capacity = output_key.shape[0] * output_key.shape[1] // rows
         self.page_shapes = tuple(output_key.shape), tuple(output_value.shape)
         outputs = tuple(t.view(rows, capacity, *key.shape[1:]) for t in (output_key, output_value))
@@ -152,7 +164,7 @@ class PreparedWindowStaging:
         if _overlap(*outputs):
             raise ValueError("window staging outputs must not overlap")
         q = Query(key.shape[1], key.shape[2], capacity, history_key.shape[1],
-                  str(history_key.dtype).removeprefix("torch."), first_position)
+                  str(history_key.dtype).removeprefix("torch."), first_position, lookback)
         payload = CONTRACT.encode_query(q)
         arguments = self.arguments
         device_index = key.device.index

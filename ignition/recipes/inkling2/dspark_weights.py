@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Checkpoint-preserving tensor partitions for Inkling2's dense DSpark decoder."""
+"""Tensor partitions for Inkling2's dense DSpark decoder and its optional quantized proposal heads."""
 
 from dataclasses import dataclass
 from functools import cached_property
@@ -10,6 +10,8 @@ from pathlib import Path
 
 import torch
 
+from ignition.components.markov_sampling import fp8_markov_head
+from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from ignition.components.weights import DirectWeightLoader, MLPWeights
 from ignition.preparation.checkpoint import IndexedCheckpoint, _read_header
 from ignition.preparation.persistent import persistent_copy, persistent_empty
@@ -74,25 +76,36 @@ class DraftLayerWeights:
     mlp: MLPWeights
 
 
+DRAFT_HEAD_FORMATS = {"nvfp4": nvfp4_draft_head, "mxfp8": mxfp8_draft_head}
+
+
+def _transient(shape, dtype, device):
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
 @dataclass(frozen=True)
 class RecurrentWeights:
     embedding: torch.Tensor
     state_weight: torch.Tensor
     context_weight: torch.Tensor
     bias: torch.Tensor
-    head: torch.Tensor
+    # Vocabulary rows by recurrent rank: BF16, or row-scaled E4M3 when the correction head is quantized.
+    head: object
     head_bias: torch.Tensor
     context_norm: torch.Tensor
     softcap: float = 30.
 
 
-def fold_recurrent_head(head, hidden_out, hidden_bias, *, chunk=4096):
-    """Fold the BF16 output map through the vocabulary head with FP64 products."""
+def fold_recurrent_head(head, hidden_out, hidden_bias, *, chunk=4096, allocate=persistent_empty):
+    """Fold the BF16 output map through the vocabulary head with FP64 products.
+
+    `allocate` places the folded matrix; a caller that quantizes it passes a transient allocator.
+    """
     if (head.ndim != 2 or hidden_out.ndim != 2 or hidden_out.shape[0] != head.shape[1]
             or hidden_bias.shape != (head.shape[1],)
             or any(t.dtype != torch.bfloat16 or t.device != head.device for t in (head, hidden_out, hidden_bias))):
         raise ValueError("recurrent output folding requires compatible BF16 output and vocabulary matrices")
-    weight = persistent_empty((head.shape[0], hidden_out.shape[1]), torch.bfloat16, head.device)
+    weight = allocate((head.shape[0], hidden_out.shape[1]), torch.bfloat16, head.device)
     bias = persistent_empty((head.shape[0],), torch.bfloat16, head.device)
     projection, offset = hidden_out.double(), hidden_bias.double()
     for start in range(0, head.shape[0], chunk):
@@ -110,9 +123,22 @@ class DraftWeights:
     norm: torch.Tensor
     layers: tuple[DraftLayerWeights, ...]
     recurrent: RecurrentWeights
+    # Quantized copy of the target vocabulary shard that only proposals read; None projects with the target's.
+    draft_head: object | None = None
 
     @classmethod
-    def load(cls, snapshot, config, device, shard, *, target_head, progress=None):
+    def load(cls, snapshot, config, device, shard, *, target_head, progress=None,
+             draft_head_quantization=None, markov_head_quantization=None):
+        """Load one rank's drafter and derive its proposal heads from checkpoint values.
+
+        `draft_head_quantization` (`nvfp4` or `mxfp8`) adds a quantized copy of `target_head` for the block's
+        vocabulary logits. `markov_head_quantization` (`fp8`) stores the recurrent correction head, the
+        output map folded through `target_head`, as row-scaled E4M3. The target head keeps BF16.
+        """
+        if draft_head_quantization not in (None, *DRAFT_HEAD_FORMATS):
+            raise ValueError("Inkling2 draft head quantization must be omitted, nvfp4 or mxfp8")
+        if markov_head_quantization not in (None, "fp8"):
+            raise ValueError("Inkling2 recurrent correction head quantization must be omitted or fp8")
         snapshot = Path(snapshot)
         sidecar, tensors = _read_header(snapshot / "mtp.safetensors", "mtp.safetensors")
         manifest = DraftCheckpoint(snapshot, tensors, (sidecar,))
@@ -160,8 +186,16 @@ class DraftWeights:
                 raise ValueError("Inkling2 predecessor embedding must be a BF16 vocabulary by recurrent-rank matrix")
             hidden_out = loader.load_tensor("markov_head.hidden_out.weight", temporary=True)
             hidden_bias = vector("markov_head.hidden_out.bias", hidden)
-            head, head_bias = fold_recurrent_head(target_head, hidden_out, hidden_bias)
+            if markov_head_quantization is None:
+                head, head_bias = fold_recurrent_head(target_head, hidden_out, hidden_bias)
+            else:
+                folded, head_bias = fold_recurrent_head(target_head, hidden_out, hidden_bias, allocate=_transient)
+                head = fp8_markov_head(folded)
+                del folded
             recurrent = RecurrentWeights(embedding, persistent_copy(state[:, :2 * rank].contiguous()),
                 persistent_copy(state[:, 2 * rank:].contiguous()), persistent_copy(vector("markov_head.rnn_proj.bias", 3 * rank).float()),
                 head, head_bias, vector("markov_head.dflare_norm.weight", hidden))
-            return cls(alpha, vector("mask_embed", hidden), vector("norm.weight", hidden), tuple(layers), recurrent)
+            draft_head = (None if draft_head_quantization is None
+                          else DRAFT_HEAD_FORMATS[draft_head_quantization](target_head))
+            return cls(alpha, vector("mask_embed", hidden), vector("norm.weight", hidden), tuple(layers), recurrent,
+                       draft_head)
