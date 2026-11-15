@@ -162,6 +162,93 @@ def test_checkpoint_attention_fp8_and_fp32_projection(configuration, layer, mode
         assert (((partial[:n].double() - exact).abs() - gamma * accumulated).max() <= 0).item()
 
 
+def _expanded(weight):
+    """The BF16 matrix an MXFP8 weight stores, in FP64."""
+    from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch, materialize_mxfp8_scale_rows
+
+    rows = weight.weight
+    return dequantize_mxfp8_rows_torch(rows.values, materialize_mxfp8_scale_rows(rows))[:, :weight.in_features].double()
+
+
+@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
+@pytest.mark.parametrize('layer', [0, 5])
+@pytest.mark.parametrize('mode,tokens,compiled', [('decode', 1, False), ('decode', 4, True), ('verify', 8, False),
+                                                  ('prefill', 128, True)])
+def test_checkpoint_attention_projects_with_stored_mxfp8_weights(configuration, layer, mode, tokens, compiled):
+    """Online MXFP8 stores every fused input projection and the output projection; each kernel multiplies
+    BF16 activations by the stored values, and the tensors outside those projections keep checkpoint bits."""
+    from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.inkling2.attention import Columns, LayerCache, PreparedAttention
+    from ignition.recipes.inkling2.pool import ContinuationPool
+    from ignition.recipes.inkling2.weights import InklingWeightLoader
+
+    snapshot = Path(os.environ.get('FLARE_INKLING2_SNAPSHOT', '/data/models/Inkling-2-Small-NVFP4'))
+    device = torch.device('cuda', 0)
+    config = ModelConfig.from_dict(configuration)
+    loaded = []
+    for online in (False, True):
+        with InklingWeightLoader(inspect_indexed_checkpoint(snapshot), device, shard=TensorParallelShard(0, 4),
+                                 vision=False, online_mxfp8=online) as loader:
+            loaded.append(loader.load_attention(layer))
+    checkpoint, weights = loaded
+    for stored, original in zip((*weights.projections, weights.output), (*checkpoint.projections, checkpoint.output),
+                                strict=True):
+        assert isinstance(stored, MXFP8LinearWeight) and stored.weight.scale_rows is None
+        expanded = _expanded(stored)
+        assert expanded.shape == original.shape
+        assert ((expanded - original.double()).norm() / original.double().norm()).item() < .035
+    for field in ('query_clip_scale', 'relative_clip_scale', 'relative_projection', 'relative_rows',
+                  'key_convolution', 'value_convolution'):
+        torch.testing.assert_close(getattr(weights, field), getattr(checkpoint, field), rtol=0, atol=0)
+
+    text = config.text.prefix(6)
+    pool = ContinuationPool.allocate(text, RankGeometry.of(text, 4), 3, 4, device)
+    m = Metadata.allocate(tokens, 1, 4, device)
+    with RecordedPreparationSession(device=device, checkpoint='inkling2-checkpoint-attention-mxfp8',
+            workload_schema='inkling2-checkpoint-attention', numerical_policy='default', autotune_effort='off') as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        operation = PreparedAttention(layer, weights, text, LayerCache.of(pool, layer), m,
+            mode=mode, tokens=tokens, session=session, workspace=arena, name='attention', tuning_page_count=4)
+        session.tune()
+        torch.manual_seed(layer)
+        streams = tuple(torch.randn(tokens, text.hidden, device=device).bfloat16() for _ in weights.projections)
+        m.set(torch.tensor([0], device=device), torch.tensor([tokens], dtype=torch.int32, device=device),
+            torch.tensor([1], device=device), torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=device),
+            torch.zeros(1, tokens, dtype=torch.int64, device=device), torch.tensor([1], device=device))
+        def forward():
+            return operation.attend(streams, m)
+        if compiled:
+            from ignition.preparation.compilation import compile_forward
+            forward = compile_forward(forward)
+        attended, partial, values = forward()
+
+    def within_accumulation(actual, source, weight):
+        # FP32 accumulation of the products, then one rounding to BF16.
+        exact, magnitude = source.double() @ weight.T, source.double().abs() @ weight.abs().T
+        terms = source.shape[1]
+        gamma = terms * 2 ** -24 / (1 - terms * 2 ** -24)
+        return (((actual.double() - exact).abs() - gamma * magnitude - 2 ** -8 * exact.abs()).max() <= 0).item()
+
+    columns = Columns.of(text.local(layer), 12, 2, 128, text.convolution_width)
+    raw = {'gate': values['gate'].flatten(1), 'sink': values['sink'], 'key': values['key_raw'],
+           'value': values['value_raw']}
+    checked = set()
+    for stream, source, stored in zip(columns.streams, streams, weights.projections, strict=True):
+        expanded, offset = _expanded(stored), 0
+        for name, width in stream:
+            if name in raw:
+                assert within_accumulation(raw[name], source, expanded[offset:offset + width]), name
+                checked.add(name)
+            offset += width
+    assert checked == set(raw)
+    assert partial.dtype == torch.bfloat16
+    assert within_accumulation(partial, attended, _expanded(weights.output))
+
+
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
 @pytest.mark.parametrize('tokens,streams,sources,add',
     [(1, streams, sources, add) for streams in (1, 3) for sources in range(1, 10) for add in (False, True)]

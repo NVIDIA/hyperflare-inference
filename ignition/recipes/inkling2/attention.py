@@ -11,6 +11,12 @@ queries and relative-bias operands, FP8 K/V and FP32 row sinks. The gated
 BF16 result projects to partial sums of the cross-rank reduction's element type
 (FP32 on one host, BF16 over RoCEnante, where the projection rounds its FP32
 accumulation once) before the replicated BF16 output convolution.
+
+The fused input projections and the output projection keep the checkpoint's BF16
+weights, or hold them as MXFP8 (`attention_weights` with `online_mxfp8`).
+MXFP8 weights multiply BF16 activations in every mode, so prefill, decode and
+verification project with the same weight values, and the output projection
+writes BF16 partial sums: its FP32 accumulation rounded once.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ import torch
 
 from ignition.components.causal_convolution import PreparedCausalConvolution
 from ignition.components.head_gate import PreparedHeadGate
-from ignition.components.linear import UnquantizedProjection
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.ring_commit import PreparedRingCommit
 from ignition.components.rms_norm import PreparedRMSNorm
@@ -68,33 +74,40 @@ class Columns:
 class AttentionWeights:
     """One rank's attention tensors of one layer in serving layouts.
 
-    `projections` hold one fused BF16 weight per input stream with the rows of
-    `Columns`. Local layers carry static `[channels, 1, W]` K/V convolution taps;
+    `projections` hold one fused weight per input stream with the rows of
+    `Columns`, and `output` the output projection's columns of this rank's heads:
+    BF16 tensors, or b12x MXFP8 weights under online conversion. Local layers
+    carry static `[channels, 1, W]` K/V convolution taps;
     global layers carry `[W, channels]` static lag taps. `relative_projection` is
     the checkpoint's `[16, extent]` relative-logit projection and
     `relative_rows` its contiguous `[extent, 16]` transpose.
     """
 
-    projections: tuple[torch.Tensor, ...]
+    projections: tuple
     query_clip_scale: torch.Tensor
     relative_clip_scale: torch.Tensor
     relative_projection: torch.Tensor
     relative_rows: torch.Tensor
     key_convolution: torch.Tensor
     value_convolution: torch.Tensor
-    output: torch.Tensor
+    output: object
 
 
-def fuse_projections(placed, columns: Columns, *, local):
-    """Concatenate a rank's projection rows in `Columns` order; padding rows are zero."""
+def fuse_projections(placed, columns: Columns, *, local, temporary=False):
+    """Concatenate a rank's projection rows in `Columns` order; padding rows are zero.
+
+    `temporary` allocates the fused weights outside persistent storage, for a caller that converts them.
+    """
     from ignition.preparation.persistent import persistent_zeros
+
+    allocate = torch.zeros if temporary else persistent_zeros
 
     names = {"query": "query", "gate": "output_gate", "key": "key", "value": "value", "relative": "relative_query",
              "sink": "sink", "key_lags": "key_convolution_dynamic", "value_lags": "value_convolution_dynamic"}
     fused = []
     for stream, width in zip(columns.streams, columns.widths(), strict=True):
         hidden = placed["query"].shape[1]
-        weight = persistent_zeros((width, hidden), dtype=torch.bfloat16, device=placed["query"].device)
+        weight = allocate((width, hidden), dtype=torch.bfloat16, device=placed["query"].device)
         offset = 0
         for name, rows in stream:
             source = placed[names[name]]
@@ -106,8 +119,15 @@ def fuse_projections(placed, columns: Columns, *, local):
     return tuple(fused)
 
 
-def attention_weights(placed, *, local, heads, kv_heads, dim, width):
-    """Serving attention tensors from one rank's placed checkpoint roles (`weights.checkpoint_layout`)."""
+def attention_weights(placed, *, local, heads, kv_heads, dim, width, online_mxfp8=False):
+    """Serving attention tensors from one rank's placed checkpoint roles (`weights.checkpoint_layout`).
+
+    `online_mxfp8` stores every fused input projection and the output projection as MXFP8: E4M3 values
+    with one power-of-two scale per 32 input columns of each output row. A row's stored values depend on
+    that row alone, so fusing the column groups into one weight leaves each group's values as a separate
+    conversion would. `placed["output"]` and the fused weights are then temporaries.
+    """
+    from ignition.components.weights import quantize_bf16_linear_as_mxfp8
     from ignition.preparation.persistent import persistent_copy
 
     columns = Columns.of(local, heads, kv_heads, dim, width)
@@ -116,9 +136,21 @@ def attention_weights(placed, *, local, heads, kv_heads, dim, width):
         key, value = placed["key_convolution"], placed["value_convolution"]
     else:
         key, value = placed["key_convolution_static"], placed["value_convolution_static"]
-    return AttentionWeights(fuse_projections(placed, columns, local=local), placed["query_clip_scale"],
+    fused, output = fuse_projections(placed, columns, local=local, temporary=online_mxfp8), placed["output"]
+    if online_mxfp8:
+        fused = tuple(quantize_bf16_linear_as_mxfp8(weight, retain_scale_rows=False) for weight in fused)
+        output = quantize_bf16_linear_as_mxfp8(output, retain_scale_rows=False)
+    return AttentionWeights(fused, placed["query_clip_scale"],
         placed["relative_clip_scale"], projection, persistent_copy(projection.t().contiguous()), key, value,
-        placed["output"])
+        output)
+
+
+def prepare_projection(source, weight, output, *, session, name, workspace):
+    """Declare a projection of BF16 activations by a BF16 weight or by an MXFP8 weight."""
+    if isinstance(weight, torch.Tensor):
+        return UnquantizedProjection(source, weight, output, session=session, name=name)
+    return QuantizedProjection(source, weight, output, session=session, name=name, activation_mode="a16",
+                               workspace=workspace)
 
 
 @dataclass(frozen=True)
@@ -196,7 +228,7 @@ class PreparedAttention(torch.nn.Module):
             dynamic_heads=0 if self.local else self.kv_heads)
         self.value_convolution = PreparedCausalConvolution(weights.value_convolution, cache.value_history,
             dynamic_heads=0 if self.local else self.kv_heads)
-        device = weights.output.device
+        device = weights.query_clip_scale.device
         examples = {} if examples is None else examples
 
         def example(role, shape, dtype=torch.bfloat16):
@@ -204,14 +236,17 @@ class PreparedAttention(torch.nn.Module):
             return declaration_tensor(examples, role, shape, dtype, device)
 
         source = example("inkling.attention.source", (tokens, text.hidden))
-        self.projections = tuple(UnquantizedProjection(source, weight,
+        self.projections = tuple(prepare_projection(source, weight,
             example(f"inkling.attention.projection{index}", (tokens, width)), session=session,
-            name=f"{name}.projection{index}").functional(session=session)
+            name=f"{name}.projection{index}", workspace=workspace).functional(session=session)
             for index, (weight, width) in enumerate(zip(weights.projections, self.columns.widths(), strict=True)))
         attended = example("inkling.attention.attended", (tokens, self.heads * self.dim))
-        self.output_projection = UnquantizedProjection(attended, weights.output,
+        if not isinstance(weights.output, torch.Tensor):
+            # b12x's MXFP8 projection writes BF16, the FP32 accumulation rounded once.
+            partial_dtype = torch.bfloat16
+        self.output_projection = prepare_projection(attended, weights.output,
             example("inkling.attention.partial", (tokens, text.hidden), partial_dtype),
-            session=session, name=f"{name}.output").functional(session=session)
+            session=session, name=f"{name}.output", workspace=workspace).functional(session=session)
         query = example("inkling.attention.query", (tokens, self.heads, self.dim))
         output = example("inkling.attention.output", (tokens, self.heads, self.dim))
         sink = example("inkling.attention.sink", (tokens, self.heads), torch.float32)

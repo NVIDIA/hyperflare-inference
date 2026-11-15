@@ -1337,6 +1337,39 @@ checkpoint values; target verification keeps the BF16 head, so a quantized
 proposal head changes which tokens are proposed and how often they are
 accepted, never the output distribution. The default omits both flags.
 
+`--online-mxfp8` stores every decoder layer's attention projections as MXFP8
+while loading: the fused input projections (query, output gate, key, value,
+relative-bias factors, and sink logits, plus the dynamic convolution taps of
+global layers) and the output projection. Each output row keeps E4M3 values
+with one power-of-two scale per 32 input columns, so the stored values of a row
+do not depend on the rows fused with it. Activations stay BF16 in prefill,
+decoding, and verification, which therefore project with the same weight
+values, and the output projection writes BF16 partial sums. A TP4 rank then
+reads 1.22 GB of attention projection weights per decode step where BF16 reads
+2.36 GB, and holds 1.14 GB less. Routers, vocabulary shards, convolutions,
+norms, clip scales, the relative-logit projection, experts, DSpark, and the
+vision encoder keep checkpoint precision. The default omits the flag.
+
+The stored weights differ from the checkpoint's by 2.7% in relative norm. With
+the Transformers reference layers and checkpoint weights over 1,536 positions
+of prose and source code, MXFP8 projections change an attention layer's output
+by a median 4.2% across layers (2.7% to 6.8%), next to the 2.6% that E4M3
+key/value history already contributes. Next-token accuracy on those positions
+is 65.6% with MXFP8 projections and 65.8% without, and the two agree on the
+most likely token at 97.3% of positions; rounding the four ranks' partial sums
+to BF16, which cross-host reductions do, moves that agreement to 97.8% by
+itself. `tests/recipes/test_inkling2_target.py` checks on SM120 that the
+decode, verification, and prefill kernels of a window and a global layer
+multiply by the stored values.
+
+On four DGX Sparks at TP4 with 32 requests and 8,192-token chunks, a core
+exported with the flag holds 3,604,480 KV tokens per rank where the BF16 core
+holds 3,416,064. A one-token round takes 31.5 to 32.7 ms of GPU time with two
+requests and 49.8 to 50.0 ms with four, against 35.4 to 36.7 ms and 52.0 to
+53.2 ms. Time to first token at 131,990 prompt tokens is 43.5 to 43.7 s
+against 40.7 to 43.1 s: MXFP8 weights with BF16 activations project an
+8,192-row chunk more slowly than BF16 weights.
+
 Export with default tuning and Torch compilation:
 
 ```sh

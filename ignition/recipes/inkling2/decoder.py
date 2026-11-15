@@ -83,6 +83,7 @@ class PreparedLayer(torch.nn.Module):
             mode=mode, tokens=tokens, session=session, workspace=workspace, name=name + ".attention", examples=examples,
             # Prefill writes the attention partial sum in the reduction's element type. At prefill row counts the
             # BF16 projection equals the FP32 projection rounded once; decode and verification keep FP32.
+            # An MXFP8 output weight writes BF16 in every mode.
             partial_dtype=reduction_dtype if mode == "prefill" else torch.float32,
             tuning_page_count=((int(pool.memory_capacity[0].item()) - 1) * pool.ring_row_pages + pool.geometry.ring // 128
                                if text.local(layer) else int(pool.memory_capacity[1].item())))

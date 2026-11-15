@@ -40,7 +40,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache,
         drafting=speculation is not None, vision=not plan.language_model_only,
-        mtp_only=speculation is not None and speculation.mtp_only,
+        mtp_only=speculation is not None and speculation.mtp_only, online_mxfp8=plan.online_mxfp8,
         benchmark_selection=plan.benchmark_selection, **drafting)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
@@ -55,6 +55,8 @@ RECIPE = Recipe(name="inkling2", served_model_name="Inkling-2-Small-NVFP4", prep
     sampling_defaults=SAMPLING_DEFAULTS,
     # Proposal-only copies: the block's vocabulary head, and the recurrent correction head as row-scaled E4M3.
     draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("fp8",),
+    # The attention input and output projections of every decoder layer.
+    online_mxfp8=True,
     checkpoints=(Checkpoint(alias="inkling-2-small-nvfp4", repository="/data/models/Inkling-2-Small-NVFP4",
         revision="local", architecture="Inkling2ForConditionalGeneration", stored_bytes=344_366_116_864,
         device_bytes=344_366_116_864, expansion_bytes=5_673_717_760, draft_bytes=2_684_203_392),),

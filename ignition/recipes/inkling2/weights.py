@@ -73,9 +73,11 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
-             draft_head_quantization=None, markov_head_quantization=None):
+             draft_head_quantization=None, markov_head_quantization=None, online_mxfp8=False):
+        """`online_mxfp8` stores each layer's attention input and output projections as MXFP8."""
         before = torch.cuda.memory_allocated(device)
-        with InklingWeightLoader(manifest, device, shard=shard, progress=progress, vision=vision) as loader:
+        with InklingWeightLoader(manifest, device, shard=shard, progress=progress, vision=vision,
+                                 online_mxfp8=online_mxfp8) as loader:
             c = loader.config
             count = c.text.layers if layers is None else layers
             if type(count) is not int or not 1 <= count <= c.text.layers:
@@ -113,8 +115,9 @@ class ModelWeights:
 
 
 class InklingWeightLoader(DirectWeightLoader):
-    def __init__(self, manifest, device, *, shard, progress=None, vision=True):
+    def __init__(self, manifest, device, *, shard, progress=None, vision=True, online_mxfp8=False):
         super().__init__(manifest, device, progress=progress)
+        self.online_mxfp8 = online_mxfp8
         self.config = ModelConfig.load(manifest.snapshot)
         self.config.validate_shard(shard)
         self.shard, self.vision = shard, vision
@@ -129,12 +132,10 @@ class InklingWeightLoader(DirectWeightLoader):
         return {name for name in super()._selected_names()
                 if self.vision or not name.startswith("model.vision_tower.")}
 
-    def load_layer(self, index):
-        from .experts import load_experts
-
+    def load_attention(self, index):
+        """This rank's attention tensors of one layer (`attention.attention_weights`)."""
         c, s = self.config.text, self.shard
-        prefix = f"{TEXT_PREFIX}.layers.{index}"
-        a = prefix + ".self_attn"
+        a = f"{TEXT_PREFIX}.layers.{index}.self_attn"
         q0, q1 = s.partition(c.heads)
         k0, k1 = s.partition(c.kv_heads)
         query_rows = (q0 * c.head_dim, q1 * c.head_dim)
@@ -145,28 +146,35 @@ class InklingWeightLoader(DirectWeightLoader):
                                    ("relative_query", "r_proj", (q0 * c.relative_width, q1 * c.relative_width)),
                                    ("sink", "sink_proj", (q0, q1))):
             placed[role] = self.load_linear(a + "." + name, rows=extent, temporary=True)
-        placed["output"] = self.load_linear(a + ".o_proj", columns=query_rows)
+        placed["output"] = self.load_linear(a + ".o_proj", columns=query_rows, temporary=self.online_mxfp8)
         for role, name in (("query_clip_scale", "q_l2_clip.scale"),
                            ("relative_clip_scale", "rel_l2_clip.scale")):
             placed[role] = self.load_tensor(a + "." + name, extent=slice(q0, q1))
         placed["relative_projection"] = self.load_tensor(a + ".rel_logits_proj.proj")
-        if c.local(index):
-            for kind in ("key", "value"):
-                n = "k" if kind == "key" else "v"
+        for kind in ("key", "value"):
+            n = "k" if kind == "key" else "v"
+            if c.local(index):
                 placed[kind + "_convolution"] = self.load_tensor(
                     a + f".{n}_sconv.conv1d.weight", extent=slice(*key_rows))
-            norms = (self.load_tensor(prefix + ".input_layernorm.weight"),)
-        else:
-            for kind in ("key", "value"):
-                n = "k" if kind == "key" else "v"
+            else:
                 placed[kind + "_convolution_static"] = self.load_tensor(
                     a + f".{n}_sconv.static_weight", extent=(slice(None), slice(*key_rows)))
                 placed[kind + "_convolution_dynamic"] = self.load_tensor(
                     a + f".{n}_sconv.weight_proj",
                     extent=slice(k0 * c.convolution_width, k1 * c.convolution_width), temporary=True)
+        return attention_weights(placed, local=c.local(index), heads=q1 - q0, kv_heads=k1 - k0,
+                                 dim=c.head_dim, width=c.convolution_width, online_mxfp8=self.online_mxfp8)
+
+    def load_layer(self, index):
+        from .experts import load_experts
+
+        c, s = self.config.text, self.shard
+        prefix = f"{TEXT_PREFIX}.layers.{index}"
+        attention = self.load_attention(index)
+        if c.local(index):
+            norms = (self.load_tensor(prefix + ".input_layernorm.weight"),)
+        else:
             norms = tuple(self.load_tensor(prefix + f".{n}_input_layernorm.weight") for n in ("q", "k", "v"))
-        attention = attention_weights(placed, local=c.local(index), heads=q1 - q0, kv_heads=k1 - k0,
-                                      dim=c.head_dim, width=c.convolution_width)
         attention_query = None if index == 0 else scaled_query(
             self.load_tensor(prefix + ".attention_input.query"), c.hidden)
         return LayerWeights(attention, load_experts(self, index, shard=s),

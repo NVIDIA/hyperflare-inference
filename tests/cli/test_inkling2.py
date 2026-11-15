@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import pytest
 
+from ignition import planning
 from ignition.cli import _parser, preparation
 from ignition.recipes import ResolvedModel
 from ignition.recipes.inkling2.recipe import RECIPE
@@ -115,3 +116,39 @@ def test_inkling_preparation_config_validates_proposal_head_formats(arguments, m
 
     with pytest.raises(ValueError, match=message):
         PreparationConfig(**arguments)
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_inkling_online_mxfp8_flag_reaches_plan_metadata_and_preparation(monkeypatch, tmp_path, online):
+    from ignition.recipes.inkling2 import bootstrap
+
+    assert RECIPE.online_mxfp8
+    assert (RECIPE.online_mxfp8_scope, RECIPE.online_mxfp8_scopes) == ("all", ("all",))
+    model = ResolvedModel(RECIPE, RECIPE.checkpoints[0])
+    args = _parser().parse_args(["export", model.checkpoint.alias, *(["--online-mxfp8"] if online else [])])
+    devices = tuple(gpu(i, 95) for i in range(4))
+    plan = planning.plan(RECIPE, model.checkpoint, devices, selected=(0, 1, 2, 3), concurrency=8, reserve_bytes=0,
+                         speculation=RECIPE.speculation, online_mxfp8=args.online_mxfp8)
+    assert plan.online_mxfp8 is online
+    assert plan.to_dict()["online_mxfp8"] is online
+    captured = []
+    configuration = bootstrap.PreparationConfig
+
+    class ConfigurationCaptured(Exception):
+        pass
+
+    def capture_config(**kwargs):
+        captured.append(configuration(**kwargs))
+        raise ConfigurationCaptured
+
+    monkeypatch.setattr(bootstrap, "PreparationConfig", capture_config)
+    with pytest.raises(ConfigurationCaptured):
+        RECIPE.prepare(tmp_path, plan, compile_forwards=False, kernel_cache=None, progress=None)
+    assert captured.pop().online_mxfp8 is online
+
+
+def test_inkling_preparation_config_rejects_a_non_boolean_online_mxfp8():
+    from ignition.recipes.inkling2.bootstrap import PreparationConfig
+
+    with pytest.raises(ValueError, match="online MXFP8"):
+        PreparationConfig(online_mxfp8="all")
