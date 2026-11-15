@@ -8,8 +8,9 @@ Verification stages candidate window entries without changing committed rings
 or convolution histories. Accepted counts commit those histories afterward.
 Full-attention candidates write private request pages. Attention uses BF16
 queries and relative-bias operands, FP8 K/V and FP32 row sinks. The gated
-BF16 result projects to FP32 partial sums for cross-rank reduction before the
-replicated BF16 output convolution.
+BF16 result projects to partial sums of the cross-rank reduction's element type
+(FP32 on one host, BF16 over RoCEnante, where the projection rounds its FP32
+accumulation once) before the replicated BF16 output convolution.
 """
 
 from __future__ import annotations
@@ -173,7 +174,7 @@ class PreparedAttention(torch.nn.Module):
     """A rank's attention for prefill, decode or speculative verification."""
 
     def __init__(self, layer, weights: AttentionWeights, text, cache: LayerCache, metadata, *, mode, tokens,
-                 session, workspace, name, examples=None, tuning_page_count=None):
+                 session, workspace, name, examples=None, tuning_page_count=None, partial_dtype=torch.float32):
         super().__init__()
         if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported Inkling attention mode: {mode}")
@@ -201,7 +202,7 @@ class PreparedAttention(torch.nn.Module):
             for index, (weight, width) in enumerate(zip(weights.projections, self.columns.widths(), strict=True)))
         attended = example("inkling.attention.attended", (tokens, self.heads * self.dim))
         self.output_projection = UnquantizedProjection(attended, weights.output,
-            example("inkling.attention.partial", (tokens, text.hidden), torch.float32),
+            example("inkling.attention.partial", (tokens, text.hidden), partial_dtype),
             session=session, name=f"{name}.output").functional(session=session)
         query = example("inkling.attention.query", (tokens, self.heads, self.dim))
         output = example("inkling.attention.output", (tokens, self.heads, self.dim))

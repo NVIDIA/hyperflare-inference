@@ -59,6 +59,9 @@ class PreparedLayer(torch.nn.Module):
         self.reduction, self.reduction_dtype = reduction, reduction_dtype
         self.attention = PreparedAttention(layer, weights.attention, text, LayerCache.of(pool, layer), metadata,
             mode=mode, tokens=tokens, session=session, workspace=workspace, name=name + ".attention", examples=examples,
+            # Prefill writes the attention partial sum in the reduction's element type. At prefill row counts the
+            # BF16 projection equals the FP32 projection rounded once; decode and verification keep FP32.
+            partial_dtype=reduction_dtype if mode == "prefill" else torch.float32,
             tuning_page_count=((int(pool.memory_capacity[0].item()) - 1) * pool.ring_row_pages + pool.geometry.ring // 128
                                if text.local(layer) else int(pool.memory_capacity[1].item())))
         device = weights.router.device
@@ -66,8 +69,9 @@ class PreparedLayer(torch.nn.Module):
             return declaration_tensor(examples, "inkling.mlp." + role, shape, dtype, device)
         source = example("source", (tokens, text.hidden))
         logits = example("router_logits", (tokens, text.experts), torch.float32)
-        self.router_projection = UnquantizedProjection(example("router_source", source.shape, torch.float32),
-            weights.router, logits, session=session, name=name + ".router").functional(session=session)
+        # BF16 operands with the sum carried in FP32: each product of two BF16 values is exact in FP32.
+        self.router_projection = UnquantizedProjection(source, weights.router, logits, session=session,
+            name=name + ".router", accumulation="fp32").functional(session=session)
         routes = RouterScratch.allocate(tokens, device, experts=text.experts, top_k=text.experts_per_token)
         self.router = PreparedRouter(logits, routes, session=session, name=name + ".routing", score_func="sigmoid",
             renormalize=True, routed_scaling_factor=text.route_scale, correction_bias=weights.correction,
@@ -100,7 +104,7 @@ class PreparedLayer(torch.nn.Module):
             mlp_input = self.mlp_mix((*state.blocks, state.partial, attention))[0]
         else:
             mlp_input = self.mlp_mix((*state.blocks, state.partial), addend=attention)[0]
-        routes = self.router(self.router_projection(mlp_input.float()), num_valid_tokens=m.live_counts[:1])
+        routes = self.router(self.router_projection(mlp_input), num_valid_tokens=m.live_counts[:1])
         expert_partial = self.experts(mlp_input, routes.ids, routes.weights)
         mlp_raw = self.reduction(expert_partial.to(self.reduction_dtype)).to(torch.bfloat16)
         mlp, mlp_previous = self.mlp_convolution(mlp_raw, m)
