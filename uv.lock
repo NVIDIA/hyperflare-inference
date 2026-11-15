@@ -400,7 +400,7 @@ source = { directory = "heliopause" }
 [[package]]
 name = "flashinfer-python"
 version = "0.7.3"
-source = { git = "https://github.com/local-inference-lab/flashinfer.git?rev=main#aa6c4221586f7607c2bca64abbcdc0699845cf3b" }
+source = { git = "https://github.com/local-inference-lab/flashinfer.git?rev=main#4fd836dcda0998b875129aad76774ca073df10c8" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "click" },
@@ -576,7 +576,7 @@ requires-dist = [
     { name = "tokenizers", marker = "extra == 'prepare'", specifier = "==0.23.2" },
     { name = "torch", marker = "extra == 'prepare'", specifier = "==2.14.1+cu132", index = "https://download.pytorch.org/whl/cu132" },
     { name = "torchvision", marker = "extra == 'prepare'", specifier = "==0.29.1+cu132", index = "https://download.pytorch.org/whl/cu132" },
-    { name = "transformers", extras = ["torch", "vision", "chat-template"], marker = "extra == 'prepare'", git = "https://github.com/huggingface/transformers.git?rev=1d9654e78a23fb167ef539cbd699dfbd3e4830cf" },
+    { name = "transformers", extras = ["torch", "vision", "chat-template"], marker = "extra == 'prepare'", specifier = "==5.23.0" },
 ]
 provides-extras = ["test", "api-test", "prepare"]
 
@@ -1502,8 +1502,8 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.21.0.dev0"
-source = { git = "https://github.com/huggingface/transformers.git?rev=1d9654e78a23fb167ef539cbd699dfbd3e4830cf#1d9654e78a23fb167ef539cbd699dfbd3e4830cf" }
+version = "5.23.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy" },
@@ -1514,6 +1514,10 @@ dependencies = [
     { name = "tokenizers" },
     { name = "tqdm" },
     { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7e/d3/1ff04cfc1ddbc6853af16973b17cd437426b4303599bc3e84af11fe55057/transformers-5.23.0.tar.gz", hash = "sha256:19d647a4d5d903a7c644ca5cde2d86efc3dde7d8c687ae7988806ff2205efa71", size = 10614788, upload-time = "2026-11-13T14:10:39.947Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bf/62/8c06b0b932cc9a5dac7ce48bf23737107143e75f9b20fd99e97dde1463c3/transformers-5.23.0-py3-none-any.whl", hash = "sha256:018e82fd07490ad5bb58414f65e31576033dc7f36bed10c574843f69b90991bf", size = 13336114, upload-time = "2026-11-13T14:10:36.154Z" },
 ]
 
 [package.optional-dependencies]

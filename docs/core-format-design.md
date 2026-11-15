@@ -107,7 +107,9 @@ Device identity comes from the target hardware, not from an SM-version-to-name
 guess. Numeric SM architecture requirements are recorded in compatibility metadata;
 loaders validate that metadata independently of descriptive names.
 Payload exports record the captured device name in the signed core's
-`hardware_identity`. Cluster deployment IDs may be arbitrary identifiers.
+`hardware_identity`; export fails on a device whose PCI id names no platform.
+A capture request with `device_identity: "none"` records no device name
+instead, so the core is labeled `unknown-device` and claims no platform. Cluster deployment IDs may be arbitrary identifiers.
 Cores without a recorded device name are usable; when their authenticated
 metadata cannot identify the device, acquisition uses an
 `unknown-device-tp<N>-<UTC minute>` cache label. The downloader never substitutes
@@ -740,7 +742,7 @@ A published cache entry is named for its selected deployments:
 `<platform>-tp<N>-<UTC timestamp>`, for example `gb202-tp1-202610170923`.
 An entry containing several TP sizes joins their labels in ascending order,
 without duplicates: `gb202-tp1+tp2-202610170923`.
-The platform is the device identifier recorded by preparation (`gb10`,
+The platform is the device identifier recorded by preparation (`ga102`, `gb10`,
 `gb202`, or `gb300`), never an SM architecture name. Downloads use the authenticated device
 identity; cores without one use `unknown-device`, including union names such
 as `unknown-device-tp1+tp2-202610170923`. The timestamp records entry creation in

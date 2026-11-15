@@ -98,6 +98,20 @@ for _container, _fields in (
     ('ignition.recipes.kimi31.dspark_weights.DraftWeights',
      ('projection', 'hidden_norm', 'context_kv', 'norm', 'embedding', 'head',
       'markov_embedding', 'markov_head', 'layers')),
+    ('ignition.recipes.inkling2.attention.AttentionWeights',
+     ('projections', 'query_clip_scale', 'relative_clip_scale', 'relative_projection',
+      'relative_rows', 'key_convolution', 'value_convolution', 'output')),
+    ('ignition.recipes.inkling2.weights.LayerWeights',
+     ('attention', 'experts', 'router', 'correction', 'attention_convolution',
+      'mlp_convolution', 'input_norms', 'mlp_norm', 'attention_query', 'mlp_query')),
+    ('ignition.recipes.inkling2.dspark_weights.DraftLayerWeights',
+     ('qkv', 'context_kv', 'output', 'query_norm', 'key_norm', 'context_key_norm',
+      'context_norm', 'input_norm', 'post_attention_norm', 'mlp')),
+    ('ignition.recipes.inkling2.dspark_weights.RecurrentWeights',
+     ('embedding', 'state_weight', 'context_weight', 'bias', 'head', 'head_bias', 'context_norm')),
+    ('ignition.recipes.inkling2.dspark_weights.DraftWeights',
+     ('alpha', 'mask_embedding', 'norm', 'layers', 'recurrent')),
+    ('ignition.recipes.inkling2.vision.VisionWeights', ('parameters',)),
     ('ignition.recipes.kimi3.vision.VisionWeights', ('tensors',)),
     ('ignition.recipes.minimax_m3.draft.DraftLayerWeights',
      ('qkv', 'output', 'query_norm', 'key_norm', 'input_norm', 'post_attention_norm', 'mlp')),
@@ -1322,7 +1336,7 @@ class DirectWeightLoader:
                          weight_name="weight", activation="silu", w13_layout="w13", shared_columns=None,
                          global_scale_name="weight_scale_2", global_scale_kind="multiplier",
                          input_scale_name=None, activation_outer_scale="expert",
-                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None):
+                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None, a16_max_tokens=0):
         """Prepare NVFP4 or MXFP4 experts, optionally compressing their block scales.
 
         The first two projection names fill the first and second w13 halves in that
@@ -1331,6 +1345,8 @@ class DirectWeightLoader:
         those buffers; overlapping calls must not. With ``shared_columns``, each
         expert's down projection, whose intermediate columns partition across ranks,
         is read once per host (``SharedColumnReads``).
+        ``a16_max_tokens`` retains an A16 execution view of the same NVFP4
+        weights and selects it by default up to the inclusive token cutoff.
         """
         import torch
         from b12x.moe import fused_moe as moe
@@ -1341,6 +1357,10 @@ class DirectWeightLoader:
         self._require_open()
         prefixes = tuple(prefixes)
         sm103 = is_sm103(self.device)
+        if type(a16_max_tokens) is not int or a16_max_tokens < 0:
+            raise ValueError("a16_max_tokens must be a nonnegative integer")
+        if a16_max_tokens and sm103:
+            raise ValueError("dual A4/A16 experts require SM120/121")
         if a4_prefill and (sm103 or format != "nvfp4" or activation_mode != "a16"
                            or activation != "silu" or activation_outer_scale != "expert"):
             raise ValueError("calibrated A4 prefill requires SM120/121 packed NVFP4 A16 SiLU experts")
@@ -1360,7 +1380,7 @@ class DirectWeightLoader:
         first, last = _aligned_range(intermediate_range, intermediate_size, group)
         local, count = last - first, len(prefixes)
         if not sm103:
-            activation_options = {}
+            activation_options = {"a16_max_tokens": a16_max_tokens}
             if a4_prefill is not None:
                 activation_options["a4_prefill"] = a4_prefill
             if swiglu_alpha is not None:

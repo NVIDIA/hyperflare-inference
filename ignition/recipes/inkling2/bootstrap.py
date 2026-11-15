@@ -1,0 +1,372 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Prepare Inkling 2 text, vision and complete DSpark generation graphs on four local GPUs."""
+
+import contextlib
+import hashlib
+import json
+from dataclasses import dataclass, replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+
+from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, image_capacity, parallel_speculative_shapes, serving_modes
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
+from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
+from ignition.components.paged_generation import PreparedGeneration
+from ignition.components.paged_maintenance import PreparedMaintenance
+from ignition.components.paged_resume import PreparedResume
+from ignition.components.parallel import TensorParallelShard
+from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
+from ignition.components.state_transfer import StateCommands
+from ignition.preparation.capture import capture_forwards
+from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime, create_all_gather_runtime
+from ignition.preparation.execution import GraphSignature
+from ignition.preparation.fixtures.recurrent import register_benchmark_state
+from ignition.preparation.host_memory import release_unused
+from ignition.preparation.model import PreparedModel
+from ignition.preparation.rebuild_manifest import declare_weights
+from ignition.preparation.rank_group import minimum_across_ranks
+from ignition.preparation.scratch import ScratchArena
+from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
+from ignition.preparation.tuning_replicas import TuningReplica
+from ignition.progress import phase
+
+from .config import WORLD_SIZE, ModelConfig
+from .contract import prepare as prepare_contract
+from .decoder import PreparedDecoder, Scratch
+from .weights import ModelWeights
+from .pool import PAGE_TOKENS, ContinuationPool, RankGeometry, continuation_layout, page_specs
+
+
+@dataclass(frozen=True)
+class PreparationConfig:
+    collective_tuning: str = "static"
+    collective_ladder: dict | None = None
+    prompt_logprobs: bool = False
+    image_concurrency: int | None = None
+    compile_workers: int | None = None
+    native_dense_activations: bool = False
+    lock_gpu_clocks: bool = False
+    autotune_effort: str = "off"
+    tuning_replica: TuningReplica | None = None
+    devices: tuple[int, ...] = (0, 1, 2, 3)
+    context: int = 1048576
+    prefill_chunk_size: int = 4096
+    max_active: int = 8
+    snapshot_budget_bytes: int = 4 << 30
+    headroom_bytes: int = 4 << 30
+    compile_decoder: bool = False
+    retain_graphs: bool = False
+    kernel_cache: Path | None = None
+    decoder_layers: int | None = None
+    drafting: bool = True
+    vision: bool = True
+    speculative_widths: tuple[int, ...] = tuple(range(1, 9))
+    speculative_fixed_width: int | None = None
+    speculative_token_capacity: int | None = 64
+    speculative_graph_budget: int = 64
+    mtp_only: bool = False
+    benchmark_selection: object | None = None
+
+    def __post_init__(self):
+        if len(self.devices) != WORLD_SIZE or len(set(self.devices)) != WORLD_SIZE or min(self.devices) < 0:
+            raise ValueError("Inkling 2 preparation requires four distinct GPUs on one host")
+        request_capacity(self.max_active)
+        if not 1 <= self.max_active <= 8:
+            raise ValueError("Inkling 2 request capacity must be in [1, 8]")
+        if not PAGE_TOKENS <= self.context <= 1048576 or self.context % PAGE_TOKENS:
+            raise ValueError("Inkling 2 context must be 128-aligned in [128, 1048576]")
+        if not PAGE_TOKENS <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % PAGE_TOKENS:
+            raise ValueError("Inkling 2 prefill chunks must be 128-aligned and fit the context")
+        if self.prompt_logprobs:
+            raise ValueError("Inkling 2 does not capture prompt scoring graphs")
+        if self.decoder_layers is not None and (type(self.decoder_layers) is not int or not 6 <= self.decoder_layers <= 48):
+            raise ValueError("decoder layer count must be in [6, 48]")
+        if self.drafting and self.decoder_layers not in (None, 48):
+            raise ValueError("the bundled DSpark drafter requires all target layers")
+        if self.mtp_only and (not self.drafting or max(self.speculative_widths, default=1) <= 1
+                              or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
+        if self.drafting and (not self.speculative_widths or not set(self.speculative_widths) <= set(range(1, 9))):
+            raise ValueError("Inkling 2 verification widths must be in [1, 8]")
+        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
+            raise ValueError("snapshot budget must be positive and headroom nonnegative")
+        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency) if self.vision else 0)
+        _ = self.speculative_round_shapes
+
+    @property
+    def speculative_round_shapes(self):
+        if self.benchmark_selection is not None:
+            return self.benchmark_selection.speculative_round_shapes
+        return (parallel_speculative_shapes(self.max_active, self.speculative_widths,
+            self.speculative_token_capacity, self.speculative_graph_budget, fixed_width=self.speculative_fixed_width)
+            if self.drafting else ())
+
+    @property
+    def draft_tokens(self):
+        return max(self.speculative_widths) - 1 if self.drafting else 0
+
+    @property
+    def decode_tokens(self):
+        return max((p for _, _, p in self.speculative_round_shapes), default=request_capacity(self.max_active))
+
+    @property
+    def decode_samples(self):
+        return max((b * w for b, w, _ in self.speculative_round_shapes), default=request_capacity(self.max_active))
+
+
+def _logit_gather_bytes(rows, width):
+    """Per-rank bytes of an FP32 `[rows, width]` vocabulary-shard gather."""
+    return rows * width * 4
+
+
+class _Softcapped:
+    def __init__(self, projection, softcap):
+        self.projection, self.softcap = projection, softcap
+
+    def __call__(self, source):
+        return self.softcap * torch.tanh(self.projection(source) / self.softcap)
+
+
+class InklingResume(PreparedResume):
+    """Resumed sampling from the last hidden state through the softcapped FP32 vocabulary shards.
+
+    The gathered logits stop at the valid vocabulary size, so the sampler never
+    reads the masked IDs.
+    """
+
+    def __init__(self, weights, *args, **kwargs):
+        super().__init__(weights, *args, logits_dtype=torch.float32, **kwargs)
+        self.projection = _Softcapped(self.projection, weights.config.text.softcap)
+
+
+@torch.no_grad()
+@with_autotune_effort
+def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
+    from .frontend import prepare as prepare_frontend, runtime_assets
+    from .recipe import RECIPE
+
+    snapshot = Path(snapshot).resolve()
+    world = len(config.devices)
+    shard = TensorParallelShard(rank, world)
+    device = torch.device("cuda", config.devices[rank])
+    torch.cuda.set_device(device)
+    if torch.cuda.get_device_capability(device) != (12, 0):
+        raise ValueError("Inkling 2 preparation requires SM120 GPUs")
+    with phase(progress, "Inspect checkpoint"):
+        manifest = inspect_indexed_checkpoint(snapshot)
+        headers = [entry.header_sha256 for entry in manifest.shards]
+        model = ModelConfig.load(snapshot)
+        model.validate_shard(shard)
+    # Continuation rows and pages hold the prepared layers only.
+    text = model.text if config.decoder_layers is None else model.text.prefix(config.decoder_layers)
+    if not text.global_layers:
+        raise ValueError("a decoder-layer prefix must include a global-attention layer, whose K/V use pages")
+    with phase(progress, "Load weights"):
+        weights = ModelWeights.load(manifest, device, shard=shard, layers=config.decoder_layers,
+                                    progress=progress, drafting=config.drafting, vision=config.vision)
+        weights_bytes = torch.cuda.memory_allocated(device)
+    del manifest
+    release_unused()
+    transient = contextlib.ExitStack()
+    transient.enter_context(core_storage.transient())
+    geometry = RankGeometry.of(text, world)
+    draft = model.draft if config.drafting else None
+    layout = continuation_layout(text, geometry, draft)
+    page_bytes = sum(shape[0] for _, shape in page_specs(text, geometry, draft))
+    snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
+    if snapshots < 1:
+        raise ValueError("snapshot budget must hold a complete Inkling 2 continuation")
+    slots, blocks = request_capacity(config.max_active), config.context // PAGE_TOKENS
+    tokens = max(config.prefill_chunk_size, config.decode_tokens)
+    state_rows = slots + snapshots
+    pages = -(-config.prefill_chunk_size // PAGE_TOKENS) + 2 * slots
+    total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
+    vocabulary = text.valid_vocabulary
+    with phase(progress, "Allocate model state"):
+        pool = ContinuationPool.allocate(text, geometry, state_rows + 1, pages, device, storage=core_storage,
+            maximum_pages=total_memory // page_bytes, maximum_rows=total_memory // layout.row_bytes,
+            backed_slots=1 + slots, draft=draft)
+        requests = DeviceRequestState.allocate(device, vocab_size=vocabulary, capacity=slots)
+        inputs = BatchInputs.allocate(tokens, blocks, device, capacity=slots)
+        admission = AdmissionBuffers.allocate(device, vocab_size=vocabulary, capacity=slots)
+        commands = StateCommands.allocate(device, capacity=slots)
+        frame = torch.zeros(1, dtype=torch.int32, device=device)
+        sequence = torch.zeros(1, dtype=torch.int64, device=device)
+        width = max((w for _, w, _ in config.speculative_round_shapes), default=1)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + width), device=device)
+        coordinator = CollectivePreparation(group)
+        runtime = create_all_reduce_runtime(group, device, max_tokens=min(tokens, 1024),
+            hidden_size=text.hidden, element_bytes=4, ipc=core_storage.peer_storage,
+            collective_tuning=config.collective_tuning)
+        vocabulary_runtime = create_all_gather_runtime(group, device,
+            max_rows=max(config.decode_samples, slots), columns=2 * weights.head.shape[0] * world,
+            ipc=core_storage.peer_storage)
+        sampling_runtime = (create_all_gather_runtime(group, device, max_rows=config.decode_samples,
+            columns=64 * world, ipc=core_storage.peer_storage) if config.drafting else None)
+        logprob_runtime = (create_all_gather_runtime(group, device, max_rows=config.decode_samples,
+            columns=512 * world, ipc=core_storage.peer_storage) if config.drafting else None)
+        identity = hashlib.sha256(json.dumps({"text": model.text.__dict__ | {"local_layers": sorted(model.text.local_layers)},
+            "quantization": model.quantization, "headers": headers, "world_size": world,
+            "decoder_layers": len(weights.layers), "contract": "inkling2.paged-text.v1"},
+            sort_keys=True, default=str).encode()).hexdigest()
+        session = RecordedPreparationSession(compile_workers=config.compile_workers,
+            native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
+            tuning_replica=config.tuning_replica,
+            device=device, checkpoint=identity, workload_schema="inkling2", numerical_policy="default",
+            coordinator=coordinator, headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage,
+            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder,
+            autotune_effort=config.autotune_effort)
+        session.__enter__()
+        register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,
+                                 restore=pool.clear_for_preparation)
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        from ignition.components.vision_state import PrefillVisionInputs, VisionState
+        from .frontend import IMAGE_TOKEN_ID
+        vision_inputs = vision_prefill = vision_state = None
+        patches = ()
+        if config.vision:
+            from .vision_state import FEATURES, PATCH_CAPACITIES, VisionInputs
+            patches = PATCH_CAPACITIES
+            vision_inputs = VisionInputs.allocate(device)
+            vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
+            vision_state = VisionState(inputs, vision_prefill, requests, image_token=IMAGE_TOKEN_ID,
+                features=FEATURES, hidden=text.hidden, image_slots=config.image_concurrency)
+        buffers = dict(inputs.buffers(), **commands.buffers(),
+            **({} if vision_inputs is None else vision_inputs.buffers()),
+            **({} if vision_prefill is None else vision_prefill.buffers()),
+            **{name: getattr(admission, name) for name in admission.__dataclass_fields__},
+            state_pool=pool.backing, memory_capacity=pool.memory_capacity,
+            request_pending_token=requests.pending_token, sampling_grammar_mask=requests.grammar_mask,
+            frame_index=frame, submission_sequence=sequence, **completion.buffers())
+    forwards, signatures = {}, {}
+    prefills, batches = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
+    examples = {}
+    prefill_storage = Scratch.allocate(model, shard, config.prefill_chunk_size, 1, device)
+    decode_storage = Scratch.allocate(model, shard, config.decode_tokens, config.decode_samples, device)
+    collectives = dict(runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,
+                       vision_state=vision_state, examples=examples)
+    speculation = None
+    if config.drafting:
+        from .dspark import SpeculativePreparation
+        speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, decoder=PreparedDecoder,
+            completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
+            collectives=collectives, draft_tokens=config.draft_tokens, sampling_runtime=sampling_runtime,
+            logprob_runtime=logprob_runtime)
+    with phase(progress, "Construct graph catalog"):
+        def add(name, forward, kind, rows, tokens, fields, enabled=None, packed=0):
+            forwards[name] = forward
+            signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields),
+                speculation_enabled=enabled, packed_token_capacity=packed)
+
+        forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
+        for enabled in serving_modes(config.drafting, config.mtp_only):
+            mode_weights = weights if enabled else replace(weights, draft=None)
+            suffix = "-no-mtp" if config.drafting and not enabled else ""
+            for mode, sizes in (("prefill", reversed(prefills)), ("decode", () if enabled else reversed(batches))):
+                for capacity in sizes:
+                    rows = 1 if mode == "prefill" else capacity
+                    name = f"{mode}{capacity}" + (suffix if mode == "prefill" else "")
+                    m = Metadata.allocate(capacity, rows, blocks, device)
+                    storage = prefill_storage if mode == "prefill" else decode_storage
+                    decoder = PreparedDecoder(mode_weights, None, storage.rows(capacity, rows), m, pool,
+                        mode=mode, session=session, workspace=arena, name=name, **collectives)
+                    batch = PreparedBatch(inputs, requests, m, mode=mode, shard=shard, pool=pool,
+                        validate_prefill=vision_state.validate_prefill if mode == "prefill" and vision_state else None)
+                    forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=runtime,
+                        coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
+                        context_factory=speculation.forwards.context if enabled else None)
+                    fields = (*forward_inputs, *(vision_prefill.buffers() if mode == "prefill" and vision_prefill else ()))
+                    add(name, forward, mode, rows, capacity if mode == "prefill" else 1, fields, enabled)
+        if speculation is not None:
+            from ignition.components.parallel_draft import PreparedParallelDraftRound
+            for batch, width, packed in sorted(config.speculative_round_shapes, key=lambda x: (x[2], x[0]), reverse=True):
+                name = f"speculative{batch}x{width}-tokens{packed}"
+                forward = PreparedParallelDraftRound(speculation, batch, width, name, target_token_capacity=packed)
+                forward.prepare()
+                add(name, forward, "speculative", batch, width, forward_inputs, True, packed)
+        row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
+        for enabled in serving_modes(config.drafting, config.mtp_only):
+            suffix = "-no-mtp" if config.drafting and not enabled else ""
+            for capacity in reversed(batches):
+                name = f"resume{capacity}" + suffix
+                forward = InklingResume(weights, requests, pool, inputs, completion, frame, sequence, rows=capacity,
+                    runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,
+                    session=session, name=name, workspace=arena)
+                add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled)
+                for mode in ("init", "restore", "snapshot"):
+                    name = f"{mode}{capacity}" + suffix
+                    forward = PreparedMaintenance(mode, requests, pool, commands, inputs, completion, frame, sequence,
+                        runtime=runtime, coordinator=coordinator, session=session, name=name, capacity=capacity,
+                        admission_buffers=admission, draft_state=enabled)
+                    fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
+                    add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled)
+        for capacity in reversed(patches):
+            from transformers.models.inkling2.configuration_inkling2 import Inkling2VisionConfig
+            from transformers.models.inkling2.modeling_inkling2 import Inkling2VisionModel
+            from .vision import PreparedVision, VisionMetadata, VisionScratch
+            from .vision_state import PreparedVisionGeneration
+            raw = json.loads((snapshot / "config.json").read_text())
+            with torch.device("meta"):
+                module = Inkling2VisionModel(Inkling2VisionConfig.from_dict(raw["vision_config"]))
+            name = f"vision{capacity}"
+            encoder = PreparedVision(module, VisionScratch.allocate(capacity, device),
+                VisionMetadata.allocate(capacity, 1, device), weights.vision,
+                session=session, name=name, projection_workspace=arena, attention_workspace=arena)
+            encoder.functional(session=session)
+            forward = PreparedVisionGeneration(encoder, vision_inputs, vision_state, completion, frame, sequence)
+            add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
+    if speculation is not None:
+        speculation.release_examples()
+    examples.clear()
+    prefill_storage = decode_storage = None
+    with phase(progress, "Prepare and tune kernels") as stage, transient:
+        tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
+    stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
+    arena.release_preparation()
+    graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
+        pool=graph_pool, collective=runtime, coordinator=coordinator, compile_decoder=config.compile_decoder,
+        progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
+        materialize=pool.clear_for_preparation, warmup_storage=core_storage,
+        compile_kinds=("prefill", "decode", "resume", "init", "restore", "snapshot", "speculative", "vision"))
+    session.freeze()
+    pool.clear_for_preparation()
+    torch.cuda.synchronize(device)
+    release_unused()
+    server_config = dict(identity=identity, model_id=RECIPE.served_model_name, max_sequence_tokens=config.context,
+        prefill_chunk_size=config.prefill_chunk_size, pages=pages, state_rows=state_rows, snapshots=snapshots,
+        page_tokens=PAGE_TOKENS, frontend=prepare_frontend(snapshot, vision=config.vision), assets=runtime_assets(snapshot),
+        sampling_defaults=RECIPE.sampling_defaults.as_dict(),
+        model_contract=prepare_contract(signatures, buffers, pool, vocabulary=vocabulary,
+            image_slots=config.image_concurrency, vision=config.vision, drafting=config.drafting))
+    if config.drafting:
+        server_config.update(speculative_widths=tuple(sorted({w for _, w, _ in config.speculative_round_shapes})),
+            speculative_token_capacity=config.speculative_token_capacity,
+            speculative_fixed_width=config.speculative_fixed_width)
+    free, total = torch.cuda.mem_get_info(device)
+    memory = dict(rank=rank, world_size=world, device=config.devices[rank], decoder_layers=len(weights.layers),
+        weights_bytes=weights_bytes, mapped_host_bytes=0, offloaded_bytes=0, continuation_bytes=pool.backing.nbytes,
+        state_rows=state_rows, preparation_state_rows=int(pool.memory_capacity[0].item()),
+        preparation_state_bytes=int(pool.memory_capacity[0].item()) * layout.row_bytes, pages=pages,
+        page_bytes=page_bytes, page_tokens=PAGE_TOKENS, kv_bytes=pages * page_bytes, kv_dtype="float8_e4m3fn",
+        operator_scratch_bytes=arena.nbytes, graph_buffer_bytes=0, private_buffer_bytes=0, graphs=len(graphs),
+        prefill_capacities=prefills, free_device_bytes=free, total_device_bytes=total,
+        allocated_tensor_bytes=torch.cuda.memory_allocated(device),
+        reserved_tensor_bytes=torch.cuda.memory_reserved(device), headroom_bytes=config.headroom_bytes,
+        tuning=tuning, compiled_decoder=config.compile_decoder)
+    # Each decoder layer's weights form one stable payload; vocabulary shards, norms and the output query share misc.
+    rebuild_weights = declare_weights(weights, components=("embedding", "embedding_norm", "final_norm", "output_query",
+                                                           "unembedding", "draft", "vision"))
+    return PreparedModel(rebuild_weights=rebuild_weights, device=config.devices[rank], graphs=graphs, buffers=buffers,
+        signatures={name: signatures[name] for name in graphs}, max_active=config.max_active, session=session,
+        server_config=server_config, memory_report=memory,
+        forwards={name: compiled.get(name, forwards[name]) for name in graphs},
+        export_zero_ranges=completion.zero_ranges(),
+        resources=(weights, pool, requests, inputs, admission, commands, completion, forwards, arena, session,
+                   compiled, stream, graph_pool, coordinator, runtime, vocabulary_runtime, sampling_runtime, logprob_runtime, speculation, vision_state),
+        close_resources=tuple(r for r in (runtime, vocabulary_runtime, sampling_runtime, logprob_runtime) if r is not None))

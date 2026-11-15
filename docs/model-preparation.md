@@ -1341,6 +1341,62 @@ weight budget for this encoding; loading reports its actual allocation.
 flare-cli/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0,1,2,3
 ```
 
+## Inkling 2 Small NVFP4
+
+The `inkling-2-small-nvfp4` alias selects the local checkpoint
+`/data/models/Inkling-2-Small-NVFP4`. Preparation requires four SM120 GPUs and
+the bundled DSpark weights in `mtp.safetensors`. Target experts retain the
+checkpoint's static NVFP4 scales, with A4 activations for prefill and A16
+activations for decoding and speculative verification. DSpark uses MXFP8
+feed-forward projections and BF16 attention and recurrent state. Target and
+draft attention use b12x. The FlashInfer commit recorded in `uv.lock` provides
+relative bias, private paged-attention tails, and explicit expert activation
+selection.
+
+The recipe declares a 1048576-token context, eight concurrent requests,
+4096-token prefill chunks, and seven draft tokens per round. Adaptive packed
+verification has 64 target rows and a 64-graph budget, plus width-one graphs
+that preserve DSpark context. The vision encoder accepts padded 20-pixel
+patches, merges each 2-by-2 group, and supports four images per request and
+four concurrent image requests. Native TMLv0 encoding and parsing provide
+reasoning, tool calls, and structured responses. Sampling defaults are
+temperature 1.0 and top-p 1.0; the prompt encoder defaults to reasoning effort
+0.9 when the request does not specify one.
+
+Export with default tuning and Torch compilation:
+
+```sh
+ulimit -Sn 65536
+.venv/bin/ignition export /data/models/Inkling-2-Small-NVFP4 \
+  --gpus 0,1,2,3 --max-concurrency 8 --image-concurrency 4 \
+  --prefill-chunk-size 4096 --mtp-draft-tokens 7 \
+  --speculative-token-capacity 64 --speculative-graph-budget 64 \
+  --autotune-effort default
+```
+
+Pass the printed `Exported cache entry` path to `flare run`:
+
+```sh
+flare-cli/target/release/flare run CACHE_ENTRY --gpus 0,1,2,3 \
+  --mtp-draft-tokens 7 --no-history-drafts
+```
+
+On four RTX PRO 6000 Blackwell Max-Q GPUs, this configuration compiled and
+captured all 130 graphs and passed native text, eight-request concurrency,
+streaming, prefix reuse and branching, tool, structured-response, and multi-image
+tests at the default reasoning effort. The captured graph pool uses 1580 MiB
+per GPU. Native loading used 85.72 GiB per GPU and allocated 1761280 aggregate
+KV-token slots. Admission is bounded by that shared pool as well as the declared
+per-request context limit. A raw completion
+with 1048575 repeated input tokens and one generated token passed the context
+capacity check; an over-limit prompt was rejected. Run the default-effort
+serving checks with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 FLARE_INKLING2_TEST_URL=http://127.0.0.1:8000 \
+  .venv/bin/python -m pytest tests/server/test_inkling2.py -k default-effort -q
+```
+
 ## Muse Spark Open
 
 The `muse-spark-open-nvfp4` alias selects
