@@ -1366,17 +1366,17 @@ hosts round each partial sum to BF16 before the reduction, because RoCEnante
 reduces BF16. One runtime carries the hidden reductions, the vocabulary gathers
 of FP32 logits as BF16 column pairs, the sampling and log-probability gathers,
 and the sampling broadcasts. Multi-host export requires the checkpoint
-directory on rank zero only; peers read their tensor ranges from it. On rank
-zero, whose preparation address is `10.200.0.13`, with
-`[memory] reserve = "4G"`:
+directory on rank zero only; peers read their tensor ranges from it. The recipe
+accepts up to 32 concurrent requests. On rank zero, whose preparation address
+is `10.200.0.13`, with `[memory] reserve = "4G"`:
 
 ```sh
 ulimit -Sn 65536
 .venv/bin/ignition export /data/models/Inkling-2-Small-NVFP4 \
   --ranks 4 --rendezvous 10.200.0.13:29630 --gpus 0 \
-  --max-concurrency 8 --image-concurrency 4 \
-  --prefill-chunk-size 4096 --mtp-draft-tokens 7 \
-  --speculative-token-capacity 64 --speculative-graph-budget 64 \
+  --max-concurrency 32 --image-concurrency 4 \
+  --prefill-chunk-size 8192 --mtp-draft-tokens 7 \
+  --speculative-token-capacity 128 --speculative-graph-budget 64 \
   --autotune-effort default
 ```
 
@@ -1387,31 +1387,36 @@ On each peer, with its rank from 1 through 3:
 ```
 
 Serve with `flare run CACHE_ENTRY --rank 0 --rendezvous 10.200.0.13:29800
---gpus 0 --mtp-draft-tokens 7 --no-history-drafts` on rank zero and
-`flare run --rank R --rendezvous 10.200.0.13:29800 --gpus 0` with the same
-serving options on each peer. Follow the [multi-host guide](multi-host.md) for
+--gpus 0 --mtp-draft-tokens 7 --no-history-drafts --memory-limit=-0G` on rank
+zero and `flare run --rank R --rendezvous 10.200.0.13:29800 --gpus 0` with the
+same serving options on each peer. `--memory-limit=-0G` replaces the exported
+4 GiB reserve, so the cache takes everything outside the integrated-memory
+allowances, which leave about 8 GiB available on each host. Follow the [multi-host guide](multi-host.md) for
 preparation authentication, rank placement and publisher acceptance. Hosts
 that share a switch need neither `--roce-ring` nor `--roce-chain`.
 
-Disk: rank zero holds the complete core. Each peer holds the payloads it
-prepares, about a quarter of the core, and for serving the rank core it
-receives, of the same size; the prepared payloads can be removed after export.
-Drop the page cache on every host before export and before serving.
+Disk: rank zero holds the complete core, 351 GB for this configuration. Each
+peer needs about 87 GB for the payloads it prepares and another 87 GB for the
+rank core it receives when serving; the prepared payloads can be removed after
+export. Drop the page cache on every host before export and before serving.
 
-Qualification on four DGX Sparks (GB10, SM121, 121 GiB each) joined by a
-switch, with one pair also cabled directly, covers a reduced core: no drafting
-and no vision, one request, 512-token chunks, no kernel tuning and uncompiled
-forwards (`--no-mtp --language-model-only --max-concurrency 1
---prefill-chunk-size 512 --autotune-effort off --no-compile`, with no memory
-reserve). It exported 8 graphs in 18 min 43 s. Native loading used 82.9 GiB
-per rank and allocated a 24.5 GiB cache with 6414336 KV-token slots. The
-service answered a chat completion, a streamed completion, two requests
-against its one slot, and a 7150-token prompt prefilled in fourteen chunks,
-with no change in the RoCE loss counters. The eight-request configuration
-above has not completed an export on DGX Sparks. Also not run there: the
-default-effort and effort-zero cases of `tests/server/test_inkling2.py`,
-`--roce-ring`, `--roce-chain`, and a comparison of BF16 cross-host reductions
-with single-host FP32 output.
+On four DGX Sparks (GB10, SM121, 121 GiB each) joined by a switch, with one
+pair also cabled directly, this configuration compiled and captured all 152
+graphs in 1 h 26 min. The lowest available memory during export was 11.5 GiB on
+rank zero and 12.5 to 13.1 GiB on the peers; the captured graph pool uses
+2840 MiB per rank. Native loading used 90.1 to 90.2 GiB per rank and, with
+`--memory-limit=-0G`, allocated a 16.5 GiB cache: 3252224 KV-token slots and
+106 shared snapshot slots, limited by memory, leaving 7.8 to 8.3 GiB available
+per host after loading and at least 7.6 GiB during 32 concurrent requests. With
+the exported 4 GiB reserve the cache is 12.4 GiB, 2392064 KV-token slots and
+78 snapshot slots, with 12.0 to 12.5 GiB available. The service passed the
+seven default-effort tests of `tests/server/test_inkling2.py`, 32 concurrent
+requests, streaming, and an 18832-token prompt with a 2048-token output limit,
+with no change in the RoCE loss counters. A core without drafting and vision,
+prepared for one request with 512-token chunks, loaded 82.9 GiB per rank and
+passed text, streaming and a 7150-token prompt. Not run on Sparks: the
+effort-zero tests, `--roce-ring`, `--roce-chain`, and a comparison of BF16
+cross-host reductions with single-host FP32 output.
 
 ## Muse Spark Open
 

@@ -4,7 +4,9 @@
 """Inkling 2 text, TML tools, images and cached continuations through native TP4 serving.
 
 Set FLARE_RUN_CUDA_TESTS=1 and FLARE_INKLING2_TEST_URL to an exported core
-running with flare run, concurrency eight, 4096-token prefill and vision.
+running with flare run, concurrency of at least eight, 4096- or 8192-token
+prefill and vision. Prompts that cross a prefill chunk scale with the chunk
+size the service reports.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -30,8 +32,9 @@ def service(request):
     with urllib.request.urlopen(url + "/v1/models", timeout=10) as response:
         model = json.load(response)["data"][0]
     assert "inkling" in model["id"].lower(), model
-    assert model["flare"]["max_concurrency"] == 8
-    assert model["flare"]["prefill_chunk_size"] == 4096
+    assert model["flare"]["max_concurrency"] >= 8
+    chunk = model["flare"]["prefill_chunk_size"]
+    assert chunk in (4096, 8192)
     assert "image" in model["flare"]["input_modalities"]
 
     def ask(content, **options):
@@ -61,6 +64,7 @@ def service(request):
         assert result["usage"]["completion_tokens"] == len(choice["token_ids"])
         return result
 
+    ask.chunk = chunk
     return ask
 
 
@@ -87,14 +91,15 @@ def test_streamed_reasoning_and_answer(service):
 
 
 def test_chunked_prefix_reuse_and_branching(service):
-    prefix = " ".join(f"Item {i} records code {i * 17 % 997}." for i in range(700))
+    chunk = service.chunk
+    prefix = " ".join(f"Item {i} records code {i * 17 % 997}." for i in range(700 * chunk // 4096))
     history = [dict(role="user", content=prefix), dict(role="assistant", content="I have the item records.")]
     for index in (211, 677, 211):
         messages = history + [dict(role="user",
             content=f"What code does item {index} record? Reply with only the integer.")]
         first, second = service("", messages=messages), service("", messages=messages)
-        assert first["usage"]["prompt_tokens"] > 4096
-        assert second["usage"]["prompt_tokens_details"]["cached_tokens"] > 4096
+        assert first["usage"]["prompt_tokens"] > chunk
+        assert second["usage"]["prompt_tokens_details"]["cached_tokens"] > chunk
         assert answer(first) == answer(second) == str(index * 17 % 997)
 
 
@@ -122,11 +127,11 @@ def test_structured_response(service):
 
 
 def test_images_across_a_prefill_chunk(service):
-    content = [dict(type="text", text="filler " * 4100),
+    content = [dict(type="text", text="filler " * (service.chunk + 4)),
         image("red", "FIRST 128"), image("blue", "SECOND 256"),
         dict(type="text", text="Read both image labels in their original order. Only output the labels.")]
     response = service(content)
-    assert response["usage"]["prompt_tokens"] > 4096
+    assert response["usage"]["prompt_tokens"] > service.chunk
     result = answer(response)
     assert "FIRST 128" in result and "SECOND 256" in result
     assert result.index("FIRST 128") < result.index("SECOND 256")

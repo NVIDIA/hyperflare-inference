@@ -11,8 +11,9 @@
 [ ] Compare Inkling 2 output across four DGX Sparks, where cross-host hidden
     reductions round partial sums to BF16, with the single-host FP32
     reductions, and run the effort-zero cases of tests/server/test_inkling2.py
-    there. Complete an export of the declared eight-request configuration on
-    DGX Sparks and run the default-effort cases against it.
+    there. Planning at 32 requests and 8192-token chunks predicts 22.9 GiB of
+    KV pages per rank where native loading allocates 12.4 GiB; correct the
+    declared rank costs from a measured GB10 memory report.
 
 [ ] Fix native TP4 shutdown reporting "free(): double free detected in tcache 2"
     after server drain with Inkling 2 cores. Reproduces with compiled and

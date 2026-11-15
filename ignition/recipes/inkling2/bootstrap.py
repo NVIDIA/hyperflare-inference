@@ -90,8 +90,8 @@ class PreparationConfig:
         if error:
             raise ValueError(error)
         request_capacity(self.max_active)
-        if not 1 <= self.max_active <= 8:
-            raise ValueError("Inkling 2 request capacity must be in [1, 8]")
+        if not 1 <= self.max_active <= 32:
+            raise ValueError("Inkling 2 request capacity must be in [1, 32]")
         if not PAGE_TOKENS <= self.context <= 1048576 or self.context % PAGE_TOKENS:
             raise ValueError("Inkling 2 context must be 128-aligned in [128, 1048576]")
         if not PAGE_TOKENS <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % PAGE_TOKENS:

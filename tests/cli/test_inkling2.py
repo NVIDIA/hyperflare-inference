@@ -16,6 +16,7 @@ from tests.cli.test_planning import derive, gpu
 def test_inkling_defaults_cover_tp4_seven_drafts_and_vision():
     assert RECIPE.tensor_parallel == (4,)
     assert (RECIPE.context, RECIPE.concurrency, RECIPE.prefill_chunk) == (1048576, 8, 4096)
+    assert RECIPE.max_concurrency == 32
     assert (RECIPE.max_images, RECIPE.image_bytes) == (4, 32 << 20)
     model = ResolvedModel(RECIPE, RECIPE.checkpoints[0])
     args = _parser().parse_args(["export", model.checkpoint.alias])
