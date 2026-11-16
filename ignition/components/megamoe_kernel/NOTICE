@@ -16,3 +16,11 @@ Copyright contributors to the vLLM project). The Triton kernel is unchanged.
 The Python wrapper imports Triton directly and fixes the declared activation
 format to dynamic MXFP8, removing its dependency on vLLM's QuantKey classes.
 It validates the tensor geometry, formats and devices before launching.
+
+The host/csrc preparation launcher and heuristics are unchanged from
+vllm-project/DeepGEMM commit 1e1842a833699298f7afc02eefb2ed168fff6938.
+The host/include/deep_jit headers are unchanged from that revision's DeepJIT
+submodule and retain its license in LICENSE.DeepJIT. Flare's host_bindings.cpp
+passes logical expert count independently of physical HBM tensor extents.
+The binding has a separate preparation runtime and uses the carried CUDA
+headers; it does not add a native serving dependency.

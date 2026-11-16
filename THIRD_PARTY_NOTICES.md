@@ -16,6 +16,9 @@ Ignition carries unchanged DerpSeek MegaMoE headers in
 texts from DeepSeek, ds41 and DerpSeek. The optional `megamoe` preparation extra
 pins the DeepGEMM host binding used to compile them. Exported CUDA graphs retain
 the compiled kernels; the native CLI has no Python or DeepGEMM host dependency.
+The host-tier preparation launcher carries DeepGEMM host headers and its
+DeepJIT headers under their MIT licenses. It separates logical expert count
+from physical weight extents without changing the carried CUDA arithmetic.
 The input stager retains vLLM v0.32.0's Apache-2.0 Triton kernel, with a wrapper
 that selects MXFP8 and validates its buffers without importing vLLM.
 Full-model DeepSeek serving through this preparation path is not qualified.

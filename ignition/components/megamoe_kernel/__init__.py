@@ -20,6 +20,14 @@ def initialize(kernel_cache: Path):
     compiles kernels when serving them.
     """
     import deep_gemm
+    deep_gemm._C.init(str(header_root(kernel_cache)))
+    return deep_gemm
+
+
+@cache
+def header_root(kernel_cache: Path):
+    """Materialize the pinned kernel headers in an isolated preparation directory."""
+    import deep_gemm
 
     source = Path(deep_gemm.__file__).parent / "include"
     overlay = Path(__file__).parent / "include"
@@ -44,5 +52,4 @@ def initialize(kernel_cache: Path):
             except OSError as error:
                 if error.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not root.is_dir():
                     raise
-    deep_gemm._C.init(str(root))
-    return deep_gemm
+    return root

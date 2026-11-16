@@ -55,6 +55,7 @@ class MegaMoeWorkspace:
                 raise ValueError("the reference MegaMoE path requires SM103")
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("MegaMoE workspace must be prepared before capture")
+            self.kernel_cache = kernel_cache
             self.library = initialize(kernel_cache)
             alignment = self.library._C.get_token_alignment_for_mega_moe()
             self.geometry = MegaMoeGeometry(geometry.experts,
@@ -81,6 +82,8 @@ class MegaMoeQuery:
     shared_sf_stride: tuple
     shared_block_m: int
     clamp: float
+    host_rows: int = 0
+    host_lane_clusters: int = 0
 
     def __post_init__(self):
         object.__setattr__(self, "x_sf_stride", tuple(self.x_sf_stride))
@@ -99,9 +102,9 @@ def _validate_inputs(source, ids, probabilities, padding, geometry, device, rows
         raise ValueError("MegaMoE operands and workspace must share one CUDA device")
 
 
-def _validate_weights(weights, geometry, *, shared):
+def _validate_weights(weights, geometry, *, shared, count=None):
     g = geometry
-    prefix = () if shared else (g.experts,)
+    prefix = () if shared else (g.experts if count is None else count,)
     values_dtype = torch.float8_e4m3fn if shared else torch.int8
     divisor = 1 if shared else 2
     for (values, scales), rows, columns in (
@@ -145,9 +148,13 @@ CONTRACT = native_contract(component_id="flare.megamoe.tp1_mxfp8_mxfp4",
 class _State:
     def __init__(self, query, workspace):
         self.query, self.workspace = query, workspace
+        self.host_binding = None
+        if query.host_rows:
+            from ignition.components.megamoe_kernel.host import prepare
+            self.host_binding = prepare(workspace.kernel_cache)
         self.stager = load_programs(compile_inputs(CONTRACT.encode_query(query), workspace.buffer.device.index))
 
-    def run(self, source, ids, probabilities, padding, matrices, output, buffer):
+    def run(self, source, ids, probabilities, padding, matrices, output, buffer, control=None, descriptors=None):
         q = self.query
         x, sf, out_ids, out_weights, _, shared_sf, *_ = self.workspace.slice_inputs(buffer)
         self.stager[(triton.cdiv(q.rows, 8 if q.rows >= 64 else 1), q.hidden // 128, 1)](
@@ -155,23 +162,29 @@ class _State:
             ids, probabilities, padding, out_ids, out_weights, *_stage_constants(q))
         shared_gate = tuple(matrices[4:6]) if q.shared_experts else None
         shared_down = tuple(matrices[6:8]) if q.shared_experts else None
+        if self.host_binding is not None:
+            views = self.workspace.slice_inputs(buffer)
+            self.host_binding.launch(output, list(views[4:]), matrices[:4],
+                matrices[4:8] if q.shared_experts else [], control, buffer,
+                q.capacity, q.experts, q.host_rows, q.top_k, q.hidden, q.intermediate, q.clamp)
+            return
         self.workspace.library._C.fp8_fp4_mega_moe(
             output, tuple(matrices[:2]), tuple(matrices[2:4]), shared_gate, shared_down,
             None, buffer, [buffer.data_ptr()], 0, q.capacity, q.experts, q.top_k,
             (1, 1, 32), "swiglu", q.clamp, True, 1., 0.)
 
 
-@torch.library.custom_op("flare::megamoe", mutates_args=("output", "workspace"))
+@torch.library.custom_op("flare::megamoe", mutates_args=("output", "workspace", "control", "descriptors"))
 def _run(source: torch.Tensor, ids: torch.Tensor, probabilities: torch.Tensor,
          padding: torch.Tensor, matrices: list[torch.Tensor], output: torch.Tensor,
-         workspace: torch.Tensor, handle: int) -> None:
+         workspace: torch.Tensor, control: torch.Tensor | None, descriptors: torch.Tensor | None, handle: int) -> None:
     plan = plan_from_handle(handle)
     require_prepared(plan, plan.component_id, source.device).run(
-        source, ids, probabilities, padding, matrices, output, workspace)
+        source, ids, probabilities, padding, matrices, output, workspace, control, descriptors)
 
 
 @_run.register_fake
-def _run_fake(source, ids, probabilities, padding, matrices, output, workspace, handle):
+def _run_fake(source, ids, probabilities, padding, matrices, output, workspace, control, descriptors, handle):
     pass
 
 
@@ -179,7 +192,7 @@ class PreparedMegaMoe:
     """Declare fused expert execution with compiler-visible weights and protocol storage."""
 
     def __init__(self, source, ids, probabilities, padding, routed, shared, *,
-                 workspace: MegaMoeWorkspace, clamp: float, session, name):
+                 workspace: MegaMoeWorkspace, clamp: float, session, name, host_tier=None):
         g = workspace.geometry
         rows = source.shape[0]
         _validate_inputs(source, ids, probabilities, padding, g, workspace.buffer.device, rows)
@@ -187,12 +200,21 @@ class PreparedMegaMoe:
             raise ValueError("MegaMoE SwiGLU clamp must be finite and positive")
         if (shared is not None) != bool(g.shared_experts):
             raise ValueError("MegaMoE shared weights must match the workspace geometry")
-        _validate_weights(routed, g, shared=False)
+        host_rows = 0 if host_tier is None else host_tier.rows
+        if host_tier is not None and host_tier.geometry != g:
+            raise ValueError("MegaMoE host tier must match the protocol workspace geometry")
+        _validate_weights(routed, g, shared=False, count=g.experts - host_rows)
         if shared is not None:
             _validate_weights(shared, g, shared=True)
         self.matrices = list((*routed.gate_up, *routed.down))
         if shared is not None:
             self.matrices.extend((*shared.gate_up, *shared.down))
+        self.host_tier = host_tier
+        self.control = None if host_tier is None else host_tier.control
+        self.descriptors = None if host_tier is None else host_tier.descriptors
+        if host_tier is not None:
+            _validate_weights(host_tier.weights, g, shared=False, count=host_rows)
+            self.matrices.extend(host_tier.device_views)
         if any(t.device != workspace.buffer.device for t in
                (source, ids, probabilities, padding, *self.matrices)):
             raise ValueError("MegaMoE operands and workspace must share one CUDA device")
@@ -202,7 +224,7 @@ class PreparedMegaMoe:
             1, g.experts, g.capacity, rows, g.top_k, "fp8xfp4") if shared is not None else 1
         q = MegaMoeQuery(rows, g.experts, g.capacity, g.top_k, g.hidden, g.intermediate,
             g.shared_experts, tuple(workspace.views[1].stride()),
-            tuple(workspace.views[5].stride()) if shared is not None else (0, 0), block_m, clamp)
+            tuple(workspace.views[5].stride()) if shared is not None else (0, 0), block_m, clamp, host_rows, 0 if host_tier is None else host_tier.host_lane_clusters)
         self.workspace = workspace
         self.plan = native_plan(contract=CONTRACT, query=q, device=source.device,
             scratch_bytes=lambda tactic: 0,
@@ -216,7 +238,7 @@ class PreparedMegaMoe:
             source, ids, probabilities, padding = examples
             output = torch.empty_like(source)
             return PreparedCall(run=lambda: state.run(source, ids, probabilities, padding,
-                self.matrices, output, workspace.buffer), output=output,
+                self.matrices, output, workspace.buffer, self.control, self.descriptors), output=output,
                 owners=(workspace, self.matrices))
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare),))
@@ -227,5 +249,5 @@ class PreparedMegaMoe:
                          self.workspace.buffer.device, self.plan.query.rows)
         output = torch.empty_like(source)
         _run(source, ids, probabilities, padding, self.matrices, output,
-             self.workspace.buffer, self.plan.handle)
+             self.workspace.buffer, self.control, self.descriptors, self.plan.handle)
         return output

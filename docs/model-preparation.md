@@ -633,6 +633,42 @@ They compare compiled graphs against the reference at 1, 8, 64, and 256 rows,
 alternate graph capacities and routes, reject changed input geometry, and check
 declaration-storage release. This component is not selected by a model recipe.
 
+`ignition.components.megamoe_tiers.MegaMoeHostTier` allocates registered host
+rows through `CoreStorage` for the SM103 MegaMoE path. Load transformed expert
+weights into those rows with `copy_weights`, which accepts bounded batches.
+Pass the remaining physical HBM matrices and this tier to `PreparedMegaMoe`.
+Its input expert IDs address host rows first, followed by HBM rows; the recipe
+must translate canonical routing IDs to that storage order. Logical expert
+count is independent of each tier's allocation extent. Both tiers must contain
+at least one row. This component does not implement placement policy or movement.
+
+Each layer owns the host pointers, route counters and tensor-map clone table.
+Their reads and mutations are visible to compilation, and the mapped host regions
+remain owned by core storage through native drain. `host_lane_clusters` selects
+the number of two-SM clusters available to the kernel's cold-expert lane; zero
+uses its ordinary task schedule. Four clusters is the reference default, not a
+measured optimum for every workload. The lane operates only where the carried
+kernel's schedule supports it; large calls retain its ordinary schedule.
+The C++ host binding and its kernel catalog are built during preparation.
+
+Run the host-tier composition checks with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_megamoe_tiers_cuda.py -q
+```
+
+The tests compare compiled split-tier execution with all-HBM execution, including
+changing routes, padding, exact per-row counts and replay allocations. The real
+checkpoint case uses the snapshot variable above. A separate synthetic case
+changes expert count, widths and top-k and omits the shared expert; it validates
+the geometry contract, not predictive quality or serving performance.
+On GB300, these compiled checks pass with four host and four HBM checkpoint
+experts at 1, 8, 64 and 256 rows, and with five host and seven HBM synthetic
+experts at 1, 16 and 192 rows. Both zero and four host-lane clusters are checked.
+A separately exported checkpoint-component core passes 32 fresh native Helios
+replays with exact outputs and no CUDA allocations. These results do not qualify
+a model recipe, concurrent movement or end-to-end serving performance.
+
 The SM103 fused decode-attention source in
 `ignition/components/mega_attention_kernel` is also available for component
 validation. It builds against the preparation environment's Torch ABI and needs
