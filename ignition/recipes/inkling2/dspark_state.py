@@ -3,6 +3,8 @@
 
 """Inkling2 draft feature mixing, rotary positions, and committed context selection."""
 
+from dataclasses import dataclass
+
 import torch
 
 
@@ -14,46 +16,78 @@ def mix_features(features, alpha, weight, eps):
     return (mixed * scale * weight.float()).bfloat16()
 
 
-def rotary(values, positions, inverse):
+def block_inputs(anchor, mask, block):
+    """Expand one normalized first-position embedding per request into its block of learned masks."""
+    return torch.cat((anchor[:, None], mask.expand(anchor.shape[0], block - 1, -1)), 1).flatten(0, 1)
+
+
+def rotary_table(positions, inverse):
+    """Return FP32 cosines and sines of each row's position, shared by every rotation of those rows."""
     angle = positions.clamp_min(0).float()[:, None] * inverse[None]
-    cosine, sine = angle.cos()[:, None], angle.sin()[:, None]
+    return angle.cos()[:, None], angle.sin()[:, None]
+
+
+def rotate(values, table):
+    cosine, sine = table
     left, right = values.float().chunk(2, -1)
     return torch.cat((left * cosine - right * sine, right * cosine + left * sine), -1).to(values.dtype)
 
 
-def stage_window(history, values, metadata, pages):
-    """Stage the same committed suffix before every query in a noncausal block."""
+def rotary(values, positions, inverse):
+    return rotate(values, rotary_table(positions, inverse))
+
+
+@dataclass(frozen=True)
+class StagingPlan:
+    """Where each slot of a request's private attention pages comes from.
+
+    The plan depends on request metadata only, so one plan serves the key and value histories of
+    every draft layer with the same history geometry. A slot holds committed history
+    (`history[rows, slots]`), a row of the block being drafted (`values[indices]`), or zero.
+    `lengths` is each request's visible key count.
+    """
+
+    rows: torch.Tensor
+    slots: torch.Tensor
+    indices: torch.Tensor
+    committed: torch.Tensor
+    valid: torch.Tensor
+    lengths: torch.Tensor
+    page_tokens: int
+
+
+def window_plan(metadata, window, pages, *, page_tokens=128):
+    """Plan the same committed suffix of a `window`-position ring before every query of a noncausal block."""
     m = metadata
-    rows, window = m.starts.numel(), history.shape[1]
-    capacity = pages * 128
-    offsets = torch.arange(capacity, device=values.device)[None]
+    offsets = torch.arange(pages * page_tokens, device=m.starts.device)[None]
     prefix = m.starts.clamp(max=window)[:, None]
     positions = m.starts[:, None] - prefix + offsets
-    previous = history[m.state_rows[:, None], positions.remainder(window)]
-    indices = (m.query_start_loc[:-1, None] + offsets - prefix).clamp(0, values.shape[0] - 1)
-    current = values[indices]
-    valid = (m.lengths[:, None] > 0) & (offsets < prefix + m.lengths[:, None])
-    return torch.where(valid[:, :, None, None],
-        torch.where((offsets < prefix)[:, :, None, None], previous, current), 0).view(
-            rows * pages, 128, *values.shape[1:])
+    return StagingPlan(m.state_rows[:, None], positions.remainder(window),
+        (m.query_start_loc[:-1, None] + offsets - prefix).clamp(0, m.positions.numel() - 1),
+        offsets < prefix, (m.lengths[:, None] > 0) & (offsets < prefix + m.lengths[:, None]),
+        torch.where(m.lengths > 0, m.starts.clamp(max=window).int() + m.lengths, 0), page_tokens)
 
 
-def stage_paged_tail(history, values, metadata, pages):
-    """Copy the committed partial page and proposal rows into private attention pages."""
+def tail_plan(metadata, page_tokens, pages):
+    """Plan the committed partial page followed by the block's rows in private tail pages."""
     m = metadata
-    rows, page_tokens = m.starts.numel(), history.shape[1]
-    offsets = torch.arange(pages * page_tokens, device=values.device)[None]
+    rows = m.starts.numel()
+    offsets = torch.arange(pages * page_tokens, device=m.starts.device)[None]
     prefix = m.starts.remainder(page_tokens)[:, None]
     columns = (m.starts // page_tokens).clamp(max=m.page_table.shape[1] - 1)
-    requests = torch.arange(rows, device=values.device)
+    requests = torch.arange(rows, device=m.starts.device)
     source_pages = m.page_table[requests, columns].long().clamp_min(0)
-    previous = history[source_pages[:, None], offsets.remainder(page_tokens)]
-    indices = (m.query_start_loc[:-1, None] + offsets - prefix).clamp(0, values.shape[0] - 1)
-    current = values[indices]
-    valid = (m.lengths[:, None] > 0) & (offsets < prefix + m.lengths[:, None])
-    return torch.where(valid[:, :, None, None],
-        torch.where((offsets < prefix)[:, :, None, None], previous, current), 0).view(
-            rows * pages, page_tokens, *values.shape[1:])
+    return StagingPlan(source_pages[:, None], offsets.remainder(page_tokens),
+        (m.query_start_loc[:-1, None] + offsets - prefix).clamp(0, m.positions.numel() - 1),
+        offsets < prefix, (m.lengths[:, None] > 0) & (offsets < prefix + m.lengths[:, None]),
+        torch.where(m.lengths > 0, m.starts.int() + m.lengths, 0), page_tokens)
+
+
+def stage(history, values, plan):
+    """Copy the planned history and block rows into private attention pages without changing either source."""
+    staged = torch.where(plan.valid[:, :, None, None],
+        torch.where(plan.committed[:, :, None, None], history[plan.rows, plan.slots], values[plan.indices]), 0)
+    return staged.view(-1, plan.page_tokens, *values.shape[1:])
 
 
 def accepted_rows(metadata, counts, *, window=None):

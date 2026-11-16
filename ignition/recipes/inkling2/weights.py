@@ -15,6 +15,14 @@ from .attention import AttentionWeights, attention_weights
 from .config import ModelConfig, TEXT_PREFIX
 
 
+def load_exact_bfloat16(loader, name):
+    """An FP32 checkpoint tensor whose values are exact BF16 upcasts, delivered as BF16."""
+    narrowed = loader.load_tensor(name, dtype=torch.bfloat16)
+    if not torch.equal(narrowed.float(), loader.load_tensor(name, temporary=True)):
+        raise ValueError(f"{name}: FP32 values are not exact BF16 upcasts, so BF16 delivery would round them")
+    return narrowed
+
+
 def scaled_query(query, hidden):
     return persistent_copy(query.float().reshape(-1, hidden) * hidden ** -0.5)
 
@@ -42,7 +50,8 @@ class ModelWeights:
     embedding_norm: torch.Tensor
     final_norm: torch.Tensor
     output_query: torch.Tensor
-    unembedding: torch.Tensor
+    # BF16 rows, or an MXFP8 weight when the plan stores the vocabulary head as MXFP8.
+    unembedding: object
     allocated_bytes: int
     draft: object | None = None
     vision: object | None = None
@@ -64,22 +73,34 @@ class ModelWeights:
         return self.embedding_norm
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None):
+    def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
+             draft_head_quantization=None, markov_head_quantization=None, online_mxfp8=False,
+             mxfp8_vocabulary_head=False):
+        """`online_mxfp8` stores each decoder layer's attention input and output projections, and the
+        drafter's query/key/value, attention output and recurrent context projections
+        (`DraftWeights.load`), as MXFP8.
+
+        `mxfp8_vocabulary_head` stores this rank's unembedding shard as MXFP8 (E4M3 values with one
+        power-of-two scale per 32 hidden columns of each vocabulary row) and releases its BF16 rows. The
+        drafter's proposal heads are derived from the BF16 rows before that. An MXFP8 proposal head would
+        hold the same values, so proposals then read the target's shard instead of a copy."""
         before = torch.cuda.memory_allocated(device)
-        with InklingWeightLoader(manifest, device, shard=shard, progress=progress, vision=vision) as loader:
+        with InklingWeightLoader(manifest, device, shard=shard, progress=progress, vision=vision,
+                                 online_mxfp8=online_mxfp8) as loader:
             c = loader.config
             count = c.text.layers if layers is None else layers
             if type(count) is not int or not 1 <= count <= c.text.layers:
                 raise ValueError("decoder layer count must fit the checkpoint")
             first, last = shard.padded_partition(c.text.vocabulary, alignment=64)
-            def vocabulary_rows(name):
-                value = persistent_zeros((last - first, c.text.hidden), dtype=torch.bfloat16, device=device)
+            def vocabulary_rows(name, temporary=False):
+                allocate = torch.zeros if temporary else persistent_zeros
+                value = allocate((last - first, c.text.hidden), dtype=torch.bfloat16, device=device)
                 stop = min(last, c.text.vocabulary)
                 loader._copy(value[:stop - first], loader._sources[name][first:stop])
                 loader._session.flush()
                 return value
             embedding = vocabulary_rows(TEXT_PREFIX + ".embed_tokens.weight")
-            head = vocabulary_rows("lm_head.weight")
+            head = vocabulary_rows("lm_head.weight", temporary=mxfp8_vocabulary_head)
             loaded = tuple(loader.load_layer(index) for index in range(count))
             norm = loader.load_tensor(TEXT_PREFIX + ".norm.weight")
             embed_norm = loader.load_tensor(TEXT_PREFIX + ".embed_norm.weight")
@@ -97,14 +118,22 @@ class ModelWeights:
         draft = None
         if drafting:
             from .dspark_weights import DraftWeights
-            draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress)
+            shared = mxfp8_vocabulary_head and draft_head_quantization == "mxfp8"
+            draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress,
+                draft_head_quantization=None if shared else draft_head_quantization,
+                markov_head_quantization=markov_head_quantization, online_mxfp8=online_mxfp8)
+        if mxfp8_vocabulary_head:
+            from ignition.components.vocabulary import mxfp8_draft_head
+
+            head = mxfp8_draft_head(head)
         return cls(c, shard, loaded, embedding, embed_norm, norm, query, head,
                    torch.cuda.memory_allocated(device) - before, draft, tower)
 
 
 class InklingWeightLoader(DirectWeightLoader):
-    def __init__(self, manifest, device, *, shard, progress=None, vision=True):
+    def __init__(self, manifest, device, *, shard, progress=None, vision=True, online_mxfp8=False):
         super().__init__(manifest, device, progress=progress)
+        self.online_mxfp8 = online_mxfp8
         self.config = ModelConfig.load(manifest.snapshot)
         self.config.validate_shard(shard)
         self.shard, self.vision = shard, vision
@@ -119,12 +148,10 @@ class InklingWeightLoader(DirectWeightLoader):
         return {name for name in super()._selected_names()
                 if self.vision or not name.startswith("model.vision_tower.")}
 
-    def load_layer(self, index):
-        from .experts import load_experts
-
+    def load_attention(self, index):
+        """This rank's attention tensors of one layer (`attention.attention_weights`)."""
         c, s = self.config.text, self.shard
-        prefix = f"{TEXT_PREFIX}.layers.{index}"
-        a = prefix + ".self_attn"
+        a = f"{TEXT_PREFIX}.layers.{index}.self_attn"
         q0, q1 = s.partition(c.heads)
         k0, k1 = s.partition(c.kv_heads)
         query_rows = (q0 * c.head_dim, q1 * c.head_dim)
@@ -135,32 +162,39 @@ class InklingWeightLoader(DirectWeightLoader):
                                    ("relative_query", "r_proj", (q0 * c.relative_width, q1 * c.relative_width)),
                                    ("sink", "sink_proj", (q0, q1))):
             placed[role] = self.load_linear(a + "." + name, rows=extent, temporary=True)
-        placed["output"] = self.load_linear(a + ".o_proj", columns=query_rows)
+        placed["output"] = self.load_linear(a + ".o_proj", columns=query_rows, temporary=self.online_mxfp8)
         for role, name in (("query_clip_scale", "q_l2_clip.scale"),
                            ("relative_clip_scale", "rel_l2_clip.scale")):
             placed[role] = self.load_tensor(a + "." + name, extent=slice(q0, q1))
         placed["relative_projection"] = self.load_tensor(a + ".rel_logits_proj.proj")
-        if c.local(index):
-            for kind in ("key", "value"):
-                n = "k" if kind == "key" else "v"
+        for kind in ("key", "value"):
+            n = "k" if kind == "key" else "v"
+            if c.local(index):
                 placed[kind + "_convolution"] = self.load_tensor(
                     a + f".{n}_sconv.conv1d.weight", extent=slice(*key_rows))
-            norms = (self.load_tensor(prefix + ".input_layernorm.weight"),)
-        else:
-            for kind in ("key", "value"):
-                n = "k" if kind == "key" else "v"
+            else:
                 placed[kind + "_convolution_static"] = self.load_tensor(
                     a + f".{n}_sconv.static_weight", extent=(slice(None), slice(*key_rows)))
                 placed[kind + "_convolution_dynamic"] = self.load_tensor(
                     a + f".{n}_sconv.weight_proj",
                     extent=slice(k0 * c.convolution_width, k1 * c.convolution_width), temporary=True)
+        return attention_weights(placed, local=c.local(index), heads=q1 - q0, kv_heads=k1 - k0,
+                                 dim=c.head_dim, width=c.convolution_width, online_mxfp8=self.online_mxfp8)
+
+    def load_layer(self, index):
+        from .experts import load_experts
+
+        c, s = self.config.text, self.shard
+        prefix = f"{TEXT_PREFIX}.layers.{index}"
+        attention = self.load_attention(index)
+        if c.local(index):
+            norms = (self.load_tensor(prefix + ".input_layernorm.weight"),)
+        else:
             norms = tuple(self.load_tensor(prefix + f".{n}_input_layernorm.weight") for n in ("q", "k", "v"))
-        attention = attention_weights(placed, local=c.local(index), heads=q1 - q0, kv_heads=k1 - k0,
-                                      dim=c.head_dim, width=c.convolution_width)
         attention_query = None if index == 0 else scaled_query(
             self.load_tensor(prefix + ".attention_input.query"), c.hidden)
         return LayerWeights(attention, load_experts(self, index, shard=s),
-            self.load_tensor(prefix + ".mlp.gate.weight"),
+            load_exact_bfloat16(self, prefix + ".mlp.gate.weight"),
             self.load_tensor(prefix + ".mlp.gate.e_score_correction_bias"),
             self.load_tensor(prefix + ".post_attention_convolution.conv1d.weight"),
             self.load_tensor(prefix + ".post_mlp_convolution.conv1d.weight"), norms,

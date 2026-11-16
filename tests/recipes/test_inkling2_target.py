@@ -162,46 +162,91 @@ def test_checkpoint_attention_fp8_and_fp32_projection(configuration, layer, mode
         assert (((partial[:n].double() - exact).abs() - gamma * accumulated).max() <= 0).item()
 
 
-@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
-def test_accepted_window_prefix_commits_replay_without_candidate_mutation():
-    from ignition.recipes.inkling2.attention import retain_batch, stage_batch
+def _expanded(weight):
+    """The BF16 matrix an MXFP8 weight stores, in FP64."""
+    from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch, materialize_mxfp8_scale_rows
 
+    rows = weight.weight
+    return dequantize_mxfp8_rows_torch(rows.values, materialize_mxfp8_scale_rows(rows))[:, :weight.in_features].double()
+
+
+@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
+@pytest.mark.parametrize('layer', [0, 5])
+@pytest.mark.parametrize('mode,tokens,compiled', [('decode', 1, False), ('decode', 4, True), ('verify', 8, False),
+                                                  ('prefill', 128, True)])
+def test_checkpoint_attention_projects_with_stored_mxfp8_weights(configuration, layer, mode, tokens, compiled):
+    """Online MXFP8 stores every fused input projection and the output projection; each kernel multiplies
+    BF16 activations by the stored values, and the tensors outside those projections keep checkpoint bits."""
+    from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.inkling2.attention import Columns, LayerCache, PreparedAttention
+    from ignition.recipes.inkling2.pool import ContinuationPool
+    from ignition.recipes.inkling2.weights import InklingWeightLoader
+
+    snapshot = Path(os.environ.get('FLARE_INKLING2_SNAPSHOT', '/data/models/Inkling-2-Small-NVFP4'))
     device = torch.device('cuda', 0)
-    m = _metadata([8, 8, 8], [0, 1150, 3499], device)
-    m.state_rows.copy_(torch.tensor([3, 1, 2], device=device))
-    initial = torch.randn(5, 1152, 2, 128, device=device).to(torch.float8_e4m3fn)
-    rings = initial.clone().view(torch.uint8).view(5, -1)
-    values = torch.randn(24, 2, 128, dtype=torch.bfloat16, device=device)
-    staged, lengths = stage_batch(rings, values, m, window=1024, pages=9)
-    torch.testing.assert_close(rings, initial.view(torch.uint8).view(5, -1), rtol=0, atol=0)
-    assert lengths.tolist() == [8, 1031, 1031]
-    for lane, start in enumerate(m.starts.tolist()):
-        first = max(start - 1023, 0)
-        expected = torch.cat((initial[m.state_rows[lane], first % 1152:].bfloat16(), initial[m.state_rows[lane], :first % 1152].bfloat16()))
-        previous = expected[:start - first]
-        retained = torch.cat((previous, values[lane * 8:(lane + 1) * 8])).to(torch.float8_e4m3fn)
-        actual = staged.view(3, 1152, 2, 128)[lane]
-        torch.testing.assert_close(actual[:retained.shape[0]].view(torch.uint8), retained.view(torch.uint8), rtol=0, atol=0)
-        assert not actual[retained.shape[0]:].view(torch.uint8).any()
-    counts = torch.zeros(3, dtype=torch.int32, device=device)
-    retain_batch(rings, values, counts, m)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        retain_batch(rings, values, counts, m)
-    for accepted in range(9):
-        rings.copy_(initial.view(torch.uint8).view(5, -1))
-        selected = [accepted, (accepted + 1) % 9, 8 - accepted]
-        counts.copy_(torch.tensor(selected, dtype=torch.int32, device=device))
-        before = torch.cuda.memory_stats()['allocation.all.allocated']
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.cuda.memory_stats()['allocation.all.allocated'] == before
-        expected = initial.clone()
-        for lane, count in enumerate(selected):
-            for index in range(count):
-                position = (int(m.starts[lane]) + index) % 1152
-                expected[m.state_rows[lane], position] = values[lane * 8 + index].to(torch.float8_e4m3fn)
-        torch.testing.assert_close(rings, expected.view(torch.uint8).view(5, -1), rtol=0, atol=0)
+    config = ModelConfig.from_dict(configuration)
+    loaded = []
+    for online in (False, True):
+        with InklingWeightLoader(inspect_indexed_checkpoint(snapshot), device, shard=TensorParallelShard(0, 4),
+                                 vision=False, online_mxfp8=online) as loader:
+            loaded.append(loader.load_attention(layer))
+    checkpoint, weights = loaded
+    for stored, original in zip((*weights.projections, weights.output), (*checkpoint.projections, checkpoint.output),
+                                strict=True):
+        assert isinstance(stored, MXFP8LinearWeight) and stored.weight.scale_rows is None
+        expanded = _expanded(stored)
+        assert expanded.shape == original.shape
+        assert ((expanded - original.double()).norm() / original.double().norm()).item() < .035
+    for field in ('query_clip_scale', 'relative_clip_scale', 'relative_projection', 'relative_rows',
+                  'key_convolution', 'value_convolution'):
+        torch.testing.assert_close(getattr(weights, field), getattr(checkpoint, field), rtol=0, atol=0)
+
+    text = config.text.prefix(6)
+    pool = ContinuationPool.allocate(text, RankGeometry.of(text, 4), 3, 4, device)
+    m = Metadata.allocate(tokens, 1, 4, device)
+    with RecordedPreparationSession(device=device, checkpoint='inkling2-checkpoint-attention-mxfp8',
+            workload_schema='inkling2-checkpoint-attention', numerical_policy='default', autotune_effort='off') as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        operation = PreparedAttention(layer, weights, text, LayerCache.of(pool, layer), m,
+            mode=mode, tokens=tokens, session=session, workspace=arena, name='attention', tuning_page_count=4)
+        session.tune()
+        torch.manual_seed(layer)
+        streams = tuple(torch.randn(tokens, text.hidden, device=device).bfloat16() for _ in weights.projections)
+        m.set(torch.tensor([0], device=device), torch.tensor([tokens], dtype=torch.int32, device=device),
+            torch.tensor([1], device=device), torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=device),
+            torch.zeros(1, tokens, dtype=torch.int64, device=device), torch.tensor([1], device=device))
+        def forward():
+            return operation.attend(streams, m)
+        if compiled:
+            from ignition.preparation.compilation import compile_forward
+            forward = compile_forward(forward)
+        attended, partial, values = forward()
+
+    def within_accumulation(actual, source, weight):
+        # FP32 accumulation of the products, then one rounding to BF16.
+        exact, magnitude = source.double() @ weight.T, source.double().abs() @ weight.abs().T
+        terms = source.shape[1]
+        gamma = terms * 2 ** -24 / (1 - terms * 2 ** -24)
+        return (((actual.double() - exact).abs() - gamma * magnitude - 2 ** -8 * exact.abs()).max() <= 0).item()
+
+    columns = Columns.of(text.local(layer), 12, 2, 128, text.convolution_width)
+    raw = {'gate': values['gate'].flatten(1), 'sink': values['sink'], 'key': values['key_raw'],
+           'value': values['value_raw']}
+    checked = set()
+    for stream, source, stored in zip(columns.streams, streams, weights.projections, strict=True):
+        expanded, offset = _expanded(stored), 0
+        for name, width in stream:
+            if name in raw:
+                assert within_accumulation(raw[name], source, expanded[offset:offset + width]), name
+                checked.add(name)
+            offset += width
+    assert checked == set(raw)
+    assert partial.dtype == torch.bfloat16
+    assert within_accumulation(partial, attended, _expanded(weights.output))
 
 
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
@@ -224,7 +269,6 @@ def test_prepared_attention_residual_reference_and_capture(tokens, streams, sour
             workload_schema='inkling2-residual', numerical_policy='default', autotune_effort='off') as session:
         operation = PreparedResidualMix(values[0], queries, norms, sources=sources, eps=1e-6,
                                         session=session, name='residual', addend=add)
-        session.tune()
         reference = residual_mix(values, queries, addend=addend)
         mixture = operation.mix(values, addend=addend)
         for actual, expected in zip(mixture, reference, strict=True):
@@ -234,11 +278,11 @@ def test_prepared_attention_residual_reference_and_capture(tokens, streams, sour
         for got, want in zip(actual, expected, strict=True):
             torch.testing.assert_close(got, want, rtol=2 ** -7, atol=2e-5)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
-        with session.capture(), torch.cuda.graph(graph):
+        with torch.cuda.graph(graph):
             outputs = operation(values, addend=addend)
         status, _, count = driver.cuGraphGetNodes(graph.raw_cuda_graph())
         assert status == driver.CUresult.CUDA_SUCCESS
-        assert count == 1 + streams
+        assert count == 1
         for _ in range(3):
             before = torch.cuda.memory_stats()['allocation.all.allocated']
             graph.replay()
@@ -276,7 +320,6 @@ def test_prepared_attention_residual_aot_restore_and_replay(tmp_path, tokens, st
             workload_schema='inkling2-residual-aot', numerical_policy='default') as session:
         operation = PreparedResidualMix(values[0], queries, norms, sources=sources, eps=1e-6,
                                         session=session, name='residual', addend=add)
-        session.tune()
         forward = _ResidualForward(operation, values, addend)
         expected = forward()
         compiled = aot_forward(forward)
@@ -289,9 +332,8 @@ def test_prepared_attention_residual_aot_restore_and_replay(tmp_path, tokens, st
             restored = torch.compiler.load_compiled_function(file)
         restored(forward)
         graph = torch.cuda.CUDAGraph()
-        with session.capture(), torch.cuda.graph(graph):
+        with torch.cuda.graph(graph):
             outputs = restored(forward)
-        session.freeze()
         for _ in range(3):
             for value in values:
                 value.normal_()
@@ -384,3 +426,42 @@ def test_shared_attention_gate_and_value_norm_compiled_replay(tokens, projection
             assert (((gated.double() - expected_gate).abs() - bound).max() <= 0).item()
             torch.testing.assert_close(normalized, expected_norm, rtol=2 ** -7, atol=2 ** -126)
         graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned SM120 GPU')
+@pytest.mark.parametrize('effort', ['off', 'default'])
+@pytest.mark.parametrize('tokens,streams,sources,add', [(4096, 1, 5, True), (4096, 3, 9, False), (128, 1, 2, False)])
+@torch.no_grad()
+def test_fused_residual_norm_stays_within_the_norm_plans_variation(effort, tokens, streams, sources, add):
+    """The fused kernel against the FP32 mixture followed by `PreparedRMSNorm`.
+
+    The two differ only in the summation order of the mean square, as the norm's own tuned plans do
+    (85 of 37.7 million elements between two plans on a GB10): no element differs by more than one
+    BF16 unit, and at most ten elements per million differ.
+    """
+    from ignition.components.rms_norm import PreparedRMSNorm
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.inkling2.residual import PreparedResidualMix
+
+    torch.manual_seed(23)
+    device = torch.device('cuda', 0)
+    values = tuple(torch.randn(tokens, 4608, device=device).bfloat16() for _ in range(sources))
+    queries = torch.randn(streams, 4608, device=device) * 4608 ** -.5
+    norms = tuple((1 + .1 * torch.randn(4608, device=device)).bfloat16() for _ in range(streams))
+    addend = (.3 * torch.randn_like(values[-1].float())).bfloat16() if add else None
+    with RecordedPreparationSession(device=device, checkpoint='inkling2-residual-bound',
+            workload_schema='inkling2-residual-bound', numerical_policy='default', autotune_effort=effort) as session:
+        operation = PreparedResidualMix(values[0], queries, norms, sources=sources, eps=1e-6,
+                                        session=session, name='residual', addend=add)
+        mixture = torch.empty((tokens, 4608), dtype=torch.float32, device=device)
+        unfused = [PreparedRMSNorm(mixture, norm, torch.empty((tokens, 4608), dtype=torch.bfloat16, device=device),
+                                   eps=1e-6, session=session, name=f'norm{index}') for index, norm in enumerate(norms)]
+        session.tune()
+        fused = operation(values, addend=addend)
+        differing = 0
+        for got, value, norm in zip(fused, operation.mix(values, addend=addend), unfused, strict=True):
+            want = norm(value)
+            units = (got.view(torch.int16).int() - want.view(torch.int16).int()).abs()
+            assert int(units.max()) <= 1
+            differing += int((units != 0).sum())
+        assert differing <= max(1, streams * tokens * 4608 // 100_000)

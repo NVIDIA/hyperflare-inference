@@ -104,3 +104,10 @@ def test_reject_unsupported_staging_views(failure):
         values = values[0].float(), values[1]
     with pytest.raises(ValueError):
         PreparedWindowStaging(*history, *values, *outputs, m, session=None, name='invalid')
+
+
+@pytest.mark.parametrize('lookback', [0, 2049, 1023.])
+def test_reject_a_lookback_outside_the_history(lookback):
+    history, values, outputs, m, _ = _fixture(8, 128, 1)
+    with pytest.raises(ValueError, match='looks back'):
+        PreparedWindowStaging(*history, *values, *outputs, m, lookback=lookback, session=None, name='invalid')

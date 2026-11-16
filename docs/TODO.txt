@@ -15,6 +15,11 @@
     KV pages per rank where native loading allocates 12.4 GiB; correct the
     declared rank costs from a measured GB10 memory report.
 
+[ ] Measure the smallest prefill capacity at which Inkling 2 row sharding
+    shortens a chunk on four DGX Sparks. SHARDED_PREFILL_ROWS (2048) in
+    ignition/recipes/inkling2/decoder.py is an estimate; only 8192-row chunks
+    are measured in serving. A sharded chunk runs 361 collectives against 97.
+
 [ ] Fix native TP4 shutdown reporting "free(): double free detected in tcache 2"
     after server drain with Inkling 2 cores. Reproduces with compiled and
     uncompiled graphs; preserve the successful request drain and GPU release.

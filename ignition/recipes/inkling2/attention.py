@@ -8,8 +8,15 @@ Verification stages candidate window entries without changing committed rings
 or convolution histories. Accepted counts commit those histories afterward.
 Full-attention candidates write private request pages. Attention uses BF16
 queries and relative-bias operands, FP8 K/V and FP32 row sinks. The gated
-BF16 result projects to FP32 partial sums for cross-rank reduction before the
-replicated BF16 output convolution.
+BF16 result projects to partial sums of the cross-rank reduction's element type
+(FP32 on one host, BF16 over RoCEnante, where the projection rounds its FP32
+accumulation once) before the replicated BF16 output convolution.
+
+The fused input projections and the output projection keep the checkpoint's BF16
+weights, or hold them as MXFP8 (`attention_weights` with `online_mxfp8`).
+MXFP8 weights multiply BF16 activations in every mode, so prefill, decode and
+verification project with the same weight values, and the output projection
+writes BF16 partial sums: its FP32 accumulation rounded once.
 """
 
 from __future__ import annotations
@@ -20,10 +27,12 @@ import torch
 
 from ignition.components.causal_convolution import PreparedCausalConvolution
 from ignition.components.head_gate import PreparedHeadGate
-from ignition.components.linear import UnquantizedProjection
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
+from ignition.components.ring_commit import PreparedRingCommit
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, scatter_rows
+from ignition.components.window_staging import PreparedWindowStaging
 from ignition.preparation.persistent import persistent_empty
 
 from .arithmetic import l2_clip, log_scaling
@@ -65,33 +74,40 @@ class Columns:
 class AttentionWeights:
     """One rank's attention tensors of one layer in serving layouts.
 
-    `projections` hold one fused BF16 weight per input stream with the rows of
-    `Columns`. Local layers carry static `[channels, 1, W]` K/V convolution taps;
+    `projections` hold one fused weight per input stream with the rows of
+    `Columns`, and `output` the output projection's columns of this rank's heads:
+    BF16 tensors, or b12x MXFP8 weights under online conversion. Local layers
+    carry static `[channels, 1, W]` K/V convolution taps;
     global layers carry `[W, channels]` static lag taps. `relative_projection` is
     the checkpoint's `[16, extent]` relative-logit projection and
     `relative_rows` its contiguous `[extent, 16]` transpose.
     """
 
-    projections: tuple[torch.Tensor, ...]
+    projections: tuple
     query_clip_scale: torch.Tensor
     relative_clip_scale: torch.Tensor
     relative_projection: torch.Tensor
     relative_rows: torch.Tensor
     key_convolution: torch.Tensor
     value_convolution: torch.Tensor
-    output: torch.Tensor
+    output: object
 
 
-def fuse_projections(placed, columns: Columns, *, local):
-    """Concatenate a rank's projection rows in `Columns` order; padding rows are zero."""
+def fuse_projections(placed, columns: Columns, *, local, temporary=False):
+    """Concatenate a rank's projection rows in `Columns` order; padding rows are zero.
+
+    `temporary` allocates the fused weights outside persistent storage, for a caller that converts them.
+    """
     from ignition.preparation.persistent import persistent_zeros
+
+    allocate = torch.zeros if temporary else persistent_zeros
 
     names = {"query": "query", "gate": "output_gate", "key": "key", "value": "value", "relative": "relative_query",
              "sink": "sink", "key_lags": "key_convolution_dynamic", "value_lags": "value_convolution_dynamic"}
     fused = []
     for stream, width in zip(columns.streams, columns.widths(), strict=True):
         hidden = placed["query"].shape[1]
-        weight = persistent_zeros((width, hidden), dtype=torch.bfloat16, device=placed["query"].device)
+        weight = allocate((width, hidden), dtype=torch.bfloat16, device=placed["query"].device)
         offset = 0
         for name, rows in stream:
             source = placed[names[name]]
@@ -103,8 +119,15 @@ def fuse_projections(placed, columns: Columns, *, local):
     return tuple(fused)
 
 
-def attention_weights(placed, *, local, heads, kv_heads, dim, width):
-    """Serving attention tensors from one rank's placed checkpoint roles (`weights.checkpoint_layout`)."""
+def attention_weights(placed, *, local, heads, kv_heads, dim, width, online_mxfp8=False):
+    """Serving attention tensors from one rank's placed checkpoint roles (`weights.checkpoint_layout`).
+
+    `online_mxfp8` stores every fused input projection and the output projection as MXFP8: E4M3 values
+    with one power-of-two scale per 32 input columns of each output row. A row's stored values depend on
+    that row alone, so fusing the column groups into one weight leaves each group's values as a separate
+    conversion would. `placed["output"]` and the fused weights are then temporaries.
+    """
+    from ignition.components.weights import quantize_bf16_linear_as_mxfp8
     from ignition.preparation.persistent import persistent_copy
 
     columns = Columns.of(local, heads, kv_heads, dim, width)
@@ -113,9 +136,21 @@ def attention_weights(placed, *, local, heads, kv_heads, dim, width):
         key, value = placed["key_convolution"], placed["value_convolution"]
     else:
         key, value = placed["key_convolution_static"], placed["value_convolution_static"]
-    return AttentionWeights(fuse_projections(placed, columns, local=local), placed["query_clip_scale"],
+    fused, output = fuse_projections(placed, columns, local=local, temporary=online_mxfp8), placed["output"]
+    if online_mxfp8:
+        fused = tuple(quantize_bf16_linear_as_mxfp8(weight, retain_scale_rows=False) for weight in fused)
+        output = quantize_bf16_linear_as_mxfp8(output, retain_scale_rows=False)
+    return AttentionWeights(fused, placed["query_clip_scale"],
         placed["relative_clip_scale"], projection, persistent_copy(projection.t().contiguous()), key, value,
-        placed["output"])
+        output)
+
+
+def prepare_projection(source, weight, output, *, session, name, workspace):
+    """Declare a projection of BF16 activations by a BF16 weight or by an MXFP8 weight."""
+    if isinstance(weight, torch.Tensor):
+        return UnquantizedProjection(source, weight, output, session=session, name=name)
+    return QuantizedProjection(source, weight, output, session=session, name=name, activation_mode="a16",
+                               workspace=workspace)
 
 
 @dataclass(frozen=True)
@@ -124,7 +159,9 @@ class LayerCache:
 
     Local layers also expose each continuation row's K and V rings as bytes
     (`key_rings`, `value_rings`, `[rows, ring bytes]`), which prefill reads and
-    rewrites one request row at a time.
+    rewrites one request row at a time, and the continuation rows with the byte
+    offsets of the K and V rings (`rows`, `ring_offsets`), where verification
+    commits accepted positions.
     """
 
     key: torch.Tensor
@@ -134,13 +171,17 @@ class LayerCache:
     ring_row_pages: int = 0
     key_rings: torch.Tensor | None = None
     value_rings: torch.Tensor | None = None
+    rows: torch.Tensor | None = None
+    ring_offsets: tuple[int, int] | None = None
 
     @classmethod
     def of(cls, pool, layer):
         if pool.text.local(layer):
             return cls(pool.ring_pages(layer, "key"), pool.ring_pages(layer, "value"),
                        pool.history(layer, "key_convolution"), pool.history(layer, "value_convolution"),
-                       pool.ring_row_pages, pool.ring_rows(layer, "key"), pool.ring_rows(layer, "value"))
+                       pool.ring_row_pages, pool.ring_rows(layer, "key"), pool.ring_rows(layer, "value"),
+                       pool.reserved_backing,
+                       tuple(pool.layout.region(f"layer{layer}.{kind}").offset for kind in ("key", "value")))
         return cls(pool.cache(layer, "key"), pool.cache(layer, "value"), pool.history(layer, "key_convolution"),
                    pool.history(layer, "value_convolution"))
 
@@ -173,7 +214,7 @@ class PreparedAttention(torch.nn.Module):
     """A rank's attention for prefill, decode or speculative verification."""
 
     def __init__(self, layer, weights: AttentionWeights, text, cache: LayerCache, metadata, *, mode, tokens,
-                 session, workspace, name, examples=None, tuning_page_count=None):
+                 session, workspace, name, examples=None, tuning_page_count=None, partial_dtype=torch.float32):
         super().__init__()
         if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported Inkling attention mode: {mode}")
@@ -187,7 +228,7 @@ class PreparedAttention(torch.nn.Module):
             dynamic_heads=0 if self.local else self.kv_heads)
         self.value_convolution = PreparedCausalConvolution(weights.value_convolution, cache.value_history,
             dynamic_heads=0 if self.local else self.kv_heads)
-        device = weights.output.device
+        device = weights.query_clip_scale.device
         examples = {} if examples is None else examples
 
         def example(role, shape, dtype=torch.bfloat16):
@@ -195,14 +236,17 @@ class PreparedAttention(torch.nn.Module):
             return declaration_tensor(examples, role, shape, dtype, device)
 
         source = example("inkling.attention.source", (tokens, text.hidden))
-        self.projections = tuple(UnquantizedProjection(source, weight,
+        self.projections = tuple(prepare_projection(source, weight,
             example(f"inkling.attention.projection{index}", (tokens, width)), session=session,
-            name=f"{name}.projection{index}").functional(session=session)
+            name=f"{name}.projection{index}", workspace=workspace).functional(session=session)
             for index, (weight, width) in enumerate(zip(weights.projections, self.columns.widths(), strict=True)))
         attended = example("inkling.attention.attended", (tokens, self.heads * self.dim))
-        self.output_projection = UnquantizedProjection(attended, weights.output,
-            example("inkling.attention.partial", (tokens, text.hidden), torch.float32),
-            session=session, name=f"{name}.output").functional(session=session)
+        if not isinstance(weights.output, torch.Tensor):
+            # b12x's MXFP8 projection writes BF16, the FP32 accumulation rounded once.
+            partial_dtype = torch.bfloat16
+        self.output_projection = prepare_projection(attended, weights.output,
+            example("inkling.attention.partial", (tokens, text.hidden), partial_dtype),
+            session=session, name=f"{name}.output", workspace=workspace).functional(session=session)
         query = example("inkling.attention.query", (tokens, self.heads, self.dim))
         output = example("inkling.attention.output", (tokens, self.heads, self.dim))
         sink = example("inkling.attention.sink", (tokens, self.heads), torch.float32)
@@ -229,6 +273,16 @@ class PreparedAttention(torch.nn.Module):
             cache_value = example("inkling.attention.staged_value", (count, PAGE_TOKENS, self.kv_heads, self.dim), KV_DTYPE)
             pages = torch.arange(count, dtype=torch.int32, device=device).view(requests, self.staged_pages)
             self.staged_table = pages
+            if mode == "verify":
+                # One kernel stages each request's preceding window and its rows from the K and V rings;
+                # one kernel commits the accepted rows' records to both rings.
+                shape = (-1, self.ring, self.kv_heads, self.dim)
+                self.staging = PreparedWindowStaging(cache.key_rings.view(KV_DTYPE).view(shape),
+                    cache.value_rings.view(KV_DTYPE).view(shape), key, value, cache_key, cache_value, metadata,
+                    lookback=self.window - 1, session=session, name=f"{name}.staging").functional(session=session)
+                self.ring_commit = PreparedRingCommit(cache.rows, cache.ring_offsets, metadata.state_rows,
+                    metadata.starts, token_capacity=metadata.max_query_tokens, window_tokens=self.ring,
+                    record_bytes=self.kv_heads * self.dim * KV_DTYPE.itemsize, candidate_offset=0).functional()
         else:
             cache_key, cache_value = cache.key, cache.value
             pages = (example("inkling.attention.ring_table", (requests, self.ring // PAGE_TOKENS), torch.int32)
@@ -335,10 +389,8 @@ class PreparedAttention(torch.nn.Module):
 
     def _verify(self, v, m):
         if self.local:
-            cache_key, lengths = stage_batch(self.cache.key_rings, v["key"], m,
-                                              window=self.window, pages=self.staged_pages)
-            cache_value, _ = stage_batch(self.cache.value_rings, v["value"], m,
-                                         window=self.window, pages=self.staged_pages)
+            cache_key, cache_value = self.staging(v["key"], v["value"], metadata=m)
+            lengths = staged_lengths(m, self.window)
             pages = self.staged_table
             kwargs = dict(k_cache=cache_key, v_cache=cache_value)
         else:
@@ -354,38 +406,26 @@ class PreparedAttention(torch.nn.Module):
         self.key_convolution.commit(values["key_previous"], values["key_raw"], metadata, counts=counts)
         self.value_convolution.commit(values["value_previous"], values["value_raw"], metadata, counts=counts)
         if self.local:
-            retain_batch(self.cache.key_rings, values["key"], counts, metadata)
-            retain_batch(self.cache.value_rings, values["value"], counts, metadata)
+            records = accepted_records(values["key"], values["value"], metadata)
+            self.ring_commit(counts, staging=records, rows=metadata.state_rows, starts=metadata.starts)
 
 
-def stage_batch(rings, values, m, *, window, pages):
-    rows, capacity = m.starts.numel(), pages * PAGE_TOKENS
-    ring = torch.empty((rows, rings.shape[1]), dtype=torch.uint8, device=rings.device)
-    gather_rows(rings, m.state_rows, ring)
-    ring = ring.view(KV_DTYPE).view(rows, -1, *values.shape[1:])
+def staged_lengths(m, window):
+    """Each request's staged key count: its preceding `window - 1` positions, bounded by its start, and its rows."""
     first = (m.starts - window + 1).clamp_min(0)
-    positions = first[:, None] + torch.arange(capacity, device=values.device)
-    previous = ring[torch.arange(rows, device=values.device)[:, None], positions.remainder(ring.shape[1])].to(values.dtype)
-    index = (m.query_start_loc[:-1, None] + positions - m.starts[:, None]).clamp(0, values.shape[0] - 1)
-    staged = torch.where((positions < m.starts[:, None])[:, :, None, None], previous, values[index])
-    lengths = torch.where(m.lengths > 0, m.starts - first + m.lengths, 0).int()
-    staged = torch.where((positions < (m.starts + m.lengths)[:, None])[:, :, None, None], staged, 0)
-    return staged.clamp(-448, 448).to(KV_DTYPE).view(rows * pages, PAGE_TOKENS, *values.shape[1:]), lengths
+    return torch.where(m.lengths > 0, m.starts - first + m.lengths, 0).int()
 
 
-def retain_batch(rings, values, counts, m):
-    rows = m.starts.numel()
-    previous = torch.empty((rows, rings.shape[1]), dtype=torch.uint8, device=rings.device)
-    gather_rows(rings, m.state_rows, previous)
-    ring = previous.view(KV_DTYPE).view(rows, -1, *values.shape[1:])
-    capacity = ring.shape[1]
-    first = m.starts + counts - capacity
-    positions = first[:, None] + (torch.arange(capacity, device=values.device) - first[:, None]).remainder(capacity)
-    indices = (m.query_start_loc[:-1, None] + positions - m.starts[:, None]).clamp(0, values.shape[0] - 1)
-    current = values[indices].clamp(-448, 448)
-    keep = ((positions < m.starts[:, None]) | (positions < 0))[:, :, None, None]
-    retained = torch.where(keep, ring.to(values.dtype), current).to(KV_DTYPE)
-    scatter_rows(retained.view(torch.uint8).view(rows, -1), m.state_rows, rings, counts > 0)
+def accepted_records(key, value, m):
+    """FP8 K and V records of each request's rows, as bytes `[2, requests, width * record bytes]`.
+
+    Record `t` of a request is its row `t`; columns past a request's rows hold other
+    requests' records, which a commit bounded by the request's accepted count never reads.
+    """
+    width = m.max_query_tokens
+    index = (m.query_start_loc[:-1, None] + torch.arange(width, device=key.device)).clamp(0, key.shape[0] - 1)
+    records = torch.stack((key[index], value[index])).clamp(-448, 448).to(KV_DTYPE)
+    return records.view(torch.uint8).view(2, index.shape[0], -1)
 
 
 def _page_slots(m):

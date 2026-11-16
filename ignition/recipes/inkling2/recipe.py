@@ -22,12 +22,11 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     if plan.prompt_logprobs:
         raise ValueError("Inkling 2 preparation does not capture prompt scoring graphs")
     speculation = plan.speculation
-    if speculation is not None and (speculation.draft_head_quantization is not None
-                                   or speculation.markov_head_quantization is not None):
-        raise ValueError("Inkling 2 retains the bundled draft checkpoint precision")
     drafting = {} if speculation is None else dict(speculative_widths=speculation.widths,
         speculative_fixed_width=speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity,
-        speculative_graph_budget=speculation.graph_budget or 64)
+        speculative_graph_budget=speculation.graph_budget or 64,
+        draft_head_quantization=speculation.draft_head_quantization,
+        markov_head_quantization=speculation.markov_head_quantization)
     config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder,
         prompt_logprobs=plan.prompt_logprobs, compile_workers=plan.compile_workers,
         native_dense_activations=plan.native_dense_activations,
@@ -41,7 +40,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache,
         drafting=speculation is not None, vision=not plan.language_model_only,
-        mtp_only=speculation is not None and speculation.mtp_only,
+        mtp_only=speculation is not None and speculation.mtp_only, online_mxfp8=plan.online_mxfp8,
+        online_mxfp8_scope=plan.online_mxfp8_scope,
         benchmark_selection=plan.benchmark_selection, **drafting)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
@@ -54,6 +54,13 @@ def usage(prepared):
 
 RECIPE = Recipe(name="inkling2", served_model_name="Inkling-2-Small-NVFP4", prepare=prepare, usage=usage,
     sampling_defaults=SAMPLING_DEFAULTS,
+    # Proposal-only copies: the block's vocabulary head, and the recurrent correction head as row-scaled E4M3.
+    draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("fp8",),
+    # The attention input and output projections of every decoder layer, and the drafter's query/key/value,
+    # attention output and recurrent context projections. That set is the group `all`, the default, which a core
+    # exported with `--online-mxfp8` alone records; `with-vocabulary-head` adds the target's unembedding shard,
+    # which changes the logits that verification and sampling read.
+    online_mxfp8=True, online_mxfp8_scopes=("all", "with-vocabulary-head"),
     checkpoints=(Checkpoint(alias="inkling-2-small-nvfp4", repository="/data/models/Inkling-2-Small-NVFP4",
         revision="local", architecture="Inkling2ForConditionalGeneration", stored_bytes=344_366_116_864,
         device_bytes=344_366_116_864, expansion_bytes=5_673_717_760, draft_bytes=2_684_203_392),),

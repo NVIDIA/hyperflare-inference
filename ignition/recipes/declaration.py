@@ -212,7 +212,8 @@ class Recipe:
     MXFP8 while loading, trading checkpoint precision for decode bandwidth.
     `online_mxfp8_scope` selects the conversion group for preparation; `all` selects
     the complete eligible set. `online_mxfp8_scopes` also accepts groups recorded in
-    prepared metadata so an explicit precision choice retains its meaning.
+    prepared metadata so an explicit precision choice retains its meaning. A recipe whose
+    exported cores record `all` names a group that converts further weights separately.
     `language_model_only` states that a plan may prepare the recipe without its vision
     encoder, rejecting images and leaving the encoder's memory to KV pages.
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,

@@ -1325,6 +1325,121 @@ reasoning, tool calls, and structured responses. Sampling defaults are
 temperature 1.0 and top-p 1.0; the prompt encoder defaults to reasoning effort
 0.9 when the request does not specify one.
 
+Each drafting round projects eight block rows through the vocabulary head and
+then, for each of up to seven draft positions, corrects those logits with the
+recurrent head: its output map folded through the vocabulary head, one
+vocabulary row by 256 values. Both read BF16 by default, 463 MB and 25.7 MB
+per rank. `--draft-head-quantization nvfp4` or `mxfp8` prepares a quantized
+copy of the target's vocabulary shard that only proposals read, and
+`--markov-head-quantization fp8` stores the folded correction head as E4M3
+values with one FP32 scale per vocabulary row. Both are computed at load from
+checkpoint values; target verification reads the target's own vocabulary
+shard, so a quantized proposal head changes which tokens are proposed and how
+often they are accepted, never the output distribution. The default omits both
+flags.
+
+`--online-mxfp8` stores every decoder layer's attention projections as MXFP8
+while loading: the fused input projections (query, output gate, key, value,
+relative-bias factors, and sink logits, plus the dynamic convolution taps of
+global layers) and the output projection. Each output row keeps E4M3 values
+with one power-of-two scale per 32 input columns, so the stored values of a row
+do not depend on the rows fused with it. Activations stay BF16 in prefill,
+decoding, and verification, which therefore project with the same weight
+values, and the output projection writes BF16 partial sums. A TP4 rank then
+reads 1.22 GB of attention projection weights per decode step where BF16 reads
+2.36 GB, and holds 1.14 GB less. Routers, convolutions, norms, clip scales,
+the relative-logit projection, experts, and the vision encoder keep checkpoint
+precision, as do the vocabulary shards unless the plan selects the
+`with-vocabulary-head` group described below. The default omits the flag.
+
+The flag also stores three of DSpark's BF16 projections in the same MXFP8
+form, with BF16 activations: each of the five draft layers' fused
+query/key/value projection and attention output projection, and the recurrent
+head's projection of the draft hidden state and target context. Per TP4 rank
+these are 2048 by 4608, 4608 by 1536, and 768 by 9216 values. One drafting
+round reads each once: 179 MB as BF16 and 92 MB as MXFP8. The recurrent head's
+MXFP8 projection is rounded to BF16 before its FP32 bias and the previous
+draw's part are added; with BF16 weights that sum stays FP32. Each draft
+layer's key/value projection of accepted target taps, 512 by 4608 values per
+rank, keeps BF16: it also runs on every prefill row, where MXFP8 weights with
+BF16 activations are slower, and it is 24 MB of a drafting round's reads. The
+recurrent state projection, embeddings, norms, the sidecar's MXFP8
+feed-forward weights, and both proposal heads keep their precision;
+`--draft-head-quantization` and `--markov-head-quantization` select the heads'
+formats independently. Target verification decides the output, so MXFP8 draft
+projections change which tokens are proposed and how often they are accepted,
+never the output distribution.
+
+The stored weights differ from the checkpoint's by 2.7% in relative norm. With
+the Transformers reference layers and checkpoint weights over 1,536 positions
+of prose and source code, MXFP8 projections change an attention layer's output
+by a median 4.2% across layers (2.7% to 6.8%), next to the 2.6% that E4M3
+key/value history already contributes. Next-token accuracy on those positions
+is 65.6% with MXFP8 projections and 65.8% without, and the two agree on the
+most likely token at 97.3% of positions; rounding the four ranks' partial sums
+to BF16, which cross-host reductions do, moves that agreement to 97.8% by
+itself. `tests/recipes/test_inkling2_target.py` checks on SM120 that the
+decode, verification, and prefill kernels of a window and a global layer
+multiply by the stored values, and
+`tests/components/test_inkling2_dspark_cuda.py` checks the same of the three
+converted DSpark projections for a window and a global draft layer.
+
+On four DGX Sparks at TP4 with 32 requests and 8,192-token chunks, a core
+exported with the flag holds 3,604,480 KV tokens per rank where the BF16 core
+holds 3,416,064. A one-token round takes 31.5 to 32.7 ms of GPU time with two
+requests and 49.8 to 50.0 ms with four, against 35.4 to 36.7 ms and 52.0 to
+53.2 ms. Time to first token at 131,990 prompt tokens is 43.5 to 43.7 s
+against 40.7 to 43.1 s: MXFP8 weights with BF16 activations project an
+8,192-row chunk more slowly than BF16 weights.
+
+`--online-mxfp8 --online-mxfp8-scope with-vocabulary-head` selects a larger
+conversion group: the projections above and each rank's unembedding shard,
+50,256 vocabulary rows by 4,608 values at TP4, in the same MXFP8 form. The
+default group, `all`, keeps the shard in BF16, and a core exported with
+`--online-mxfp8` alone records `all`. Every decode and verification round
+reads the shard once: 239 MB as MXFP8 and 463 MB as BF16. b12x's
+packed-weight kernels multiply BF16 activations and store BF16, so each logit
+of the MXFP8 shard is an FP32 sum rounded to BF16 before the FP32 softcap,
+where the BF16 shard's logit stays FP32. The softcap, the valid-vocabulary
+mask, the cross-rank gather, sampling, log-probabilities, resumed sampling,
+and DSpark verification receive FP32 values in the same layouts under either
+group. Unlike a quantized proposal head, this group changes the distribution
+that verification and sampling use. The proposal heads are still derived from
+the BF16 rows, which the rank releases after converting them. With
+`--draft-head-quantization mxfp8` the proposal head would repeat the target's
+stored values, so proposals read the target's shard; without a quantized
+proposal head they read it too.
+
+The MXFP8 shard's stored weights differ from the checkpoint's by 2.7% in
+relative norm. On the final hidden states of 1,536 positions of prose and
+source code, computed by the Transformers reference layers with MXFP8
+attention projections and E4M3 key/value history, the recipe's logit kernels
+on a GB10 give softcapped logits that differ between the two shard formats by
+0.084 on average and by at most 0.93, at a softcap of 30. The two formats
+agree on the most likely token at 99.48% of positions; at each of the eight
+others the BF16 shard's two largest logits are within 0.07 of each other. The
+Kullback-Leibler divergence of the MXFP8 shard's distribution from the BF16
+shard's at temperature 1 has mean 3.6e-4, 99th percentile 2.1e-3, and maximum
+7.7e-3, and next-token accuracy is 60.33% against 60.39%. The stored weights
+account for most of this: with exact products of the stored weights the
+agreement is 99.61% and the mean divergence 3.1e-4, while rounding the BF16
+shard's logits to BF16 gives 99.54% and 5.3e-5 and leaves the two largest
+logits exactly equal at 0.8% of positions. The BF16 kernel repeats bit for
+bit and differs from exact products by at most 1.5e-4.
+`tests/recipes/test_inkling2_vocabulary_cuda.py` checks on SM120, with the
+checkpoint's shards of ranks 0 and 3, that loading stores the converted
+values and shares them with proposals, that the kernels at 1, 4, 8, and 128
+rows multiply by the stored values, and that the softcapped FP32 logits stay
+within the stored weights' distance of the BF16 shard's.
+
+On four DGX Sparks at TP4 with 32 requests and 8,192-token chunks, a core
+exported with the `with-vocabulary-head` group fixes 83.52 GiB of device
+memory per rank where a core exported with the `all` group fixes 83.73 GiB.
+In a rank-0 kernel trace of one-token rounds with one request, the vocabulary
+projection takes 0.94 ms against 1.89 ms. Over load at one to four requests, a
+one-token round takes a mean 22.2 ms of GPU time with one request, 30.3 ms
+with two, and 41.5 ms with four, against 22.4, 31.5, and 42.6 ms.
+
 Export with default tuning and Torch compilation:
 
 ```sh
@@ -1365,7 +1480,66 @@ ConnectX-7 ports. Ranks on one host reduce FP32 partial sums; ranks on separate
 hosts round each partial sum to BF16 before the reduction, because RoCEnante
 reduces BF16. One runtime carries the hidden reductions, the vocabulary gathers
 of FP32 logits as BF16 column pairs, the sampling and log-probability gathers,
-and the sampling broadcasts. Multi-host export requires the checkpoint
+and the sampling broadcasts.
+
+Across hosts, prefill graphs of at least 2048 rows shard their row-local stages
+by rows. Each rank owns an equal contiguous share of the chunk's rows, receives
+those rows of every attention and expert sum through a RoCEnante
+reduce-scatter, and computes the attention-residual mixtures with their norms,
+the output convolutions, the expert routing and the residual additions for
+those rows only. Shard gathers return every row to every rank where attention
+heads and experts, which are sharded by column, the drafter taps and the final
+normalized rows need them; the routes travel as one small message. After each
+reduce-scatter a column gather exchanges the three rows that precede each
+rank's rows and each request's last three rows, which the output convolutions
+and their replicated histories read. A reduce-scatter and a shard gather are
+the halves of the pipelined all-reduce they replace and reproduce its bits, and
+the gathers copy bytes, so the row-local values equal those of a forward that
+computes them on every rank. Row ownership follows the graph's capacity: a
+rank whose rows are padding computes inactive rows. Smaller prefill graphs,
+decode, verification, and ranks on one host compute these stages on every
+rank. Qualification: on one RTX PRO 6000, with the transport replaced by an
+in-process exchange between four ranks' forwards, every row-local value,
+route, gathered row and convolution history of a five-layer stack equals the
+replicated stack bit for bit, eagerly and through a compiled, captured and
+replayed forward (`tests/recipes/test_inkling2_row_shards_cuda.py`); the same
+test passes on a GB10. On four DGX Sparks at TP4 with 8192-row chunks, time to
+first token over three service launches is 2.07 to 2.34 s for a 7,668-token
+prompt, 18.4 to 20.1 s for 67,145 tokens and 40.7 to 43.1 s for 131,990 tokens.
+One launch of a core that computes these stages on every rank measured 2.59 to
+2.69 s, 22.4 to 23.0 s and 48.8 to 49.8 s.
+
+Serve a row-sharded core on four DGX Sparks with `--roce-switch-only` on every
+rank when the hosts are joined by a switch and pairs are also cabled directly.
+With the default routing a rank reaches one peer over its cable and two through
+the switch, and both ConnectX-7 ports share the host's PCIe links. In
+row-sharded chunks of 5,120 rows or more the switch then marks ECN, the
+senders' DCQCN rate control throttles the switch flows, and a mean of 2.8
+collectives per chunk take 7 to 72 ms against a 2 ms median: 110 ms of a
+2,072 ms chunk. With `--roce-switch-only`, 36 such chunks had no stalled
+collective and no host counted an ECN mark, CNP or pause frame; chunks at the
+same position of a 67,000-token prompt are 92 ms shorter, smaller chunks are
+1.3% longer, and a decode round is under 0.1 ms longer. Time to first token
+for 131,990 tokens is 40.4 to 42.0 s against 43.5 to 43.7 s with the default
+routing.
+
+Serve Inkling 2 on DGX Sparks with `--mtp-adaptive-verification-alpha 0.5`.
+With the default exponent of 1.0 the balanced scheduler leaves drafting after
+one to three rejected first drafts and returns only through an acceptance
+probe, which one request funds about every 6 s; a request whose drafts are
+accepted 80% of the time can spend 12 to 26 s of a 25 s run in one-token
+rounds at 48 to 51 tokens/s. An exponent of 0.5 keeps such requests drafting.
+On four DGX Sparks at TP4, ten sequential single-request coding completions
+generate 70.6 to 81.9 tokens/s with drafts in 99% of rounds, where fifteen
+with the default generate 46.5 to 76.7 tokens/s; task prompts ending at EOS
+reach 98.2 tokens/s at four requests against 89.2 and 88.1 against 80.4 at
+two, and 65.2 against 71.3 at one request with overlapping ranges. On an
+article continuation, where the second draft is accepted a third of the time,
+the exponent drafts in 49% to 100% of rounds for the same throughput at one
+request and 3% to 4% less at two and four. The decode benchmark's 8,192-token
+cells are unchanged at one to eight requests.
+
+Multi-host export requires the checkpoint
 directory on rank zero only; peers read their tensor ranges from it. The recipe
 accepts up to 32 concurrent requests. On rank zero, whose preparation address
 is `10.200.0.13`, with `[memory] reserve = "4G"`:

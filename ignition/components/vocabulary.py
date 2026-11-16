@@ -12,12 +12,45 @@ from .collectives import PreparedAllGather
 from .linear import QuantizedProjection, UnquantizedProjection
 
 
+class WidenedQuantizedProjection:
+    """A b12x projection of BF16 rows by a packed weight, delivered as FP32 rows.
+
+    b12x's packed-weight kernels accumulate in FP32 and store BF16. This projection
+    widens that BF16 result, so a consumer of FP32 logits binds a quantized vocabulary
+    shard with the output layout it gives an unquantized one. `rounded` is the BF16
+    declaration storage of the kernel's output, `[rows, weight.out_features]`.
+    """
+
+    def __init__(self, source, weight, output, *, session, name, activation_mode="a16", workspace=None,
+                 rounded=None):
+        if output.dtype != torch.float32 or output.shape != (source.shape[0], weight.out_features):
+            raise ValueError("widened projection requires an FP32 [rows, out_features] output")
+        if rounded is None:
+            rounded = torch.empty(output.shape, dtype=torch.bfloat16, device=output.device)
+        elif rounded.shape != output.shape or rounded.dtype != torch.bfloat16 or rounded.device != output.device:
+            raise ValueError("widened projection requires BF16 kernel output storage of the FP32 output's shape")
+        self.output = output
+        self.projection = QuantizedProjection(source, weight, rounded, session=session, name=name,
+                                              activation_mode=activation_mode, workspace=workspace)
+
+    def functional(self, *, session):
+        """Allocate the kernel's BF16 output and the FP32 result inside each forward."""
+        self.projection.functional(session=session)
+        self.output = None
+        return self
+
+    def __call__(self, source):
+        projected = self.projection(source)
+        return projected.float() if self.output is None else self.output.copy_(projected)
+
+
 class PreparedVocabularyProjection:
     """Project replicated hidden rows with a contiguous vocabulary weight shard.
 
     Local and full-vocabulary outputs are caller-owned. Every rank participates
     in the gather; the recipe chooses which rank samples from the full logits.
-    A quantized shard, such as an NVFP4 draft head, runs as a b12x A16 projection.
+    A quantized shard, such as an NVFP4 draft head, runs as a b12x A16 projection,
+    whose BF16 result is widened when the local output is FP32.
     Unquantized shards honor the output buffer's arithmetic contract; BF16
     checkpoint weights can accumulate and produce logits in FP32.
     Optional row indices expand gathered physical rows into caller-owned sample
@@ -41,7 +74,8 @@ class PreparedVocabularyProjection:
             self.projection = UnquantizedProjection(source, weight, local_output,
                 session=session, name=f"{name}.projection")
         else:
-            self.projection = QuantizedProjection(source, weight, local_output,
+            projection = WidenedQuantizedProjection if local_output.dtype == torch.float32 else QuantizedProjection
+            self.projection = projection(source, weight, local_output,
                 session=session, name=f"{name}.projection", activation_mode=activation_mode, workspace=workspace)
         self.local_only = not gather
         if self.local_only:
@@ -146,10 +180,12 @@ def nvfp4_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 8192):
 
 @torch.no_grad()
 def mxfp8_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 1024):
-    """Prepare an MXFP8 proposal head while retaining the BF16 target weights.
+    """Prepare an MXFP8 copy of a BF16 vocabulary head or shard, leaving the BF16 weights unchanged.
 
     Each 32-value input block uses E4M3 values and a power-of-two scale rounded
-    upward from its maximum magnitude. Chunking bounds conversion storage.
+    upward from its maximum magnitude. Chunking bounds conversion storage. A proposal
+    head keeps the BF16 weights for verification; a recipe that stores its target head
+    as MXFP8 releases them.
     """
     from b12x.gemm._shared.wo_mxfp8 import quantize_mxfp8_rows_torch
     from b12x.gemm.blockscaled import pack_weight

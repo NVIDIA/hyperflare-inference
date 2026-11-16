@@ -15,7 +15,7 @@ from ignition.preparation.persistent import persistent_copy
 def _commit(Staged, Backing, Offsets, Rows, Starts, Lengths, ROW_STRIDE: tl.constexpr,
             STAGED_STRIDE: tl.constexpr, REGION_STRIDE: tl.constexpr,
             ROWS_STRIDE: tl.constexpr, STARTS_STRIDE: tl.constexpr, LENGTHS_STRIDE: tl.constexpr,
-            WINDOW: tl.constexpr, RECORD: tl.constexpr, BLOCK: tl.constexpr):
+            WINDOW: tl.constexpr, CANDIDATES: tl.constexpr, RECORD: tl.constexpr, BLOCK: tl.constexpr):
     item, request, region = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     length = tl.load(Lengths + request * LENGTHS_STRIDE)
     start, row = tl.load(Starts + request * STARTS_STRIDE), tl.load(Rows + request * ROWS_STRIDE)
@@ -23,7 +23,7 @@ def _commit(Staged, Backing, Offsets, Rows, Starts, Lengths, ROW_STRIDE: tl.cons
     byte = tl.arange(0, BLOCK)
     live = (token < length) & (row > 0) & (byte < RECORD)
     value = tl.load(Staged + region * REGION_STRIDE + request * STAGED_STRIDE
-                    + (WINDOW + token) * RECORD + byte, live, other=0)
+                    + (CANDIDATES + token) * RECORD + byte, live, other=0)
     offset = tl.load(Offsets + region)
     tl.store(Backing + row * ROW_STRIDE + offset + ((start + token) % WINDOW) * RECORD + byte,
              value, live)
@@ -35,9 +35,15 @@ class PreparedRingCommit:
     Admission validates distinct positive destination rows and bounds accepted
     counts by token_capacity. Row zero and unaccepted ring records are preserved.
     The complete backing tensor exposes mutations to forward compilation.
+
+    Each request's staging holds its candidate records from record index
+    `candidate_offset`, which defaults to `window_tokens` for staging that
+    places the candidates after one window of history. Position `p` commits to
+    ring slot `p mod window_tokens`.
     """
 
-    def __init__(self, backing, offsets, rows, starts, *, token_capacity, window_tokens, record_bytes, staging=None):
+    def __init__(self, backing, offsets, rows, starts, *, token_capacity, window_tokens, record_bytes, staging=None,
+                 candidate_offset=None):
         if (backing.device.type != "cuda" or backing.dtype != torch.uint8 or backing.ndim != 2
                 or backing.stride(1) != 1 or backing.stride(0) < backing.shape[1]
                 or rows.ndim != 1 or rows.numel() == 0 or starts.shape != rows.shape
@@ -46,6 +52,9 @@ class PreparedRingCommit:
             raise ValueError("ring commits require byte rows and matching int64 row/position vectors")
         if any(type(value) is not int or value <= 0 for value in (token_capacity, window_tokens, record_bytes)):
             raise ValueError("ring and staging capacities must be positive integers")
+        candidate_offset = window_tokens if candidate_offset is None else candidate_offset
+        if type(candidate_offset) is not int or candidate_offset < 0:
+            raise ValueError("staged candidates start at a nonnegative record index")
         offsets = tuple(offsets)
         size = window_tokens * record_bytes
         if (not offsets or any(type(offset) is not int or offset < 0 or offset + size > backing.shape[1]
@@ -57,12 +66,12 @@ class PreparedRingCommit:
         record_numeric_tensor(self.offsets)
         from ignition.preparation.scratch import bind_scratch
 
-        shape = (len(offsets), rows.numel(), (window_tokens + token_capacity) * record_bytes)
+        shape = (len(offsets), rows.numel(), (candidate_offset + token_capacity) * record_bytes)
         self.staging_shape, self.rows_shape = shape, tuple(rows.shape)
         self.staging = bind_scratch({"staging": (shape, torch.uint8)}, device=backing.device,
             workspace=None if staging is None else {"staging": staging})["staging"]
         self.staging.zero_()
-        self.window_tokens, self.record_bytes = window_tokens, record_bytes
+        self.window_tokens, self.record_bytes, self.candidate_offset = window_tokens, record_bytes, candidate_offset
         self.grid = (min(token_capacity, window_tokens), rows.numel(), len(offsets))
 
     def functional(self):
@@ -76,4 +85,4 @@ class PreparedRingCommit:
             staging, self.backing, self.offsets, rows, starts, counts,
             self.backing.stride(0), staging.stride(1), staging.stride(0),
             rows.stride(0), starts.stride(0), counts.stride(0),
-            self.window_tokens, self.record_bytes, triton.next_power_of_2(self.record_bytes))
+            self.window_tokens, self.candidate_offset, self.record_bytes, triton.next_power_of_2(self.record_bytes))
