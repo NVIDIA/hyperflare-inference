@@ -614,6 +614,25 @@ The staging tests compare quantization against an independent CPU calculation
 and replay graphs with changing activations, routing and padding masks.
 These checks establish component behavior, not full-model accuracy or serving speed.
 
+`ignition.components.megamoe.PreparedMegaMoe` declares MXFP8 staging and fused
+expert execution to the preparation session. Its calls expose weight reads,
+output writes, and workspace mutations to complete-forward compilation. A
+model-owned `MegaMoeWorkspace` retains the kernel's coordination state and ring
+storage, initialized once and shared by serialized calls with the same geometry.
+Its token capacity follows DeepGEMM's alignment. Declaration examples are released
+after tuning; invocation outputs belong to the compiled graph's memory plan.
+
+With `FLARE_DEEPSEEK41_CSF_SNAPSHOT` set, run the prepared-component checks:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_megamoe_cuda.py -q
+```
+
+The SM103 checks use eight real routed experts and optional shared FP8 weights.
+They compare compiled graphs against the reference at 1, 8, 64, and 256 rows,
+alternate graph capacities and routes, reject changed input geometry, and check
+declaration-storage release. This component is not selected by a model recipe.
+
 The SM103 fused decode-attention source in
 `ignition/components/mega_attention_kernel` is also available for component
 validation. It builds against the preparation environment's Torch ABI and needs
@@ -621,6 +640,18 @@ the configured CUDA C++ toolchain and Ninja. It is not selected by the DeepSeek
 recipe. Its input contract uses BF16 queries with permuted head dimensions,
 page-separated cache payloads and scales, and packed MN-major output scales;
 the existing compressed-MLA cache buffers cannot be passed unchanged.
+
+`ignition.components.mega_attention.PreparedMegaAttention` declares this operator
+through the preparation session and exposes cache reads, output writes, and
+synchronization-state mutations to complete-forward compilation. Its
+`MegaAttentionWorkspace` retains epoch-tagged partials across serialized layers
+and graph variants. Invocation outputs and packed scales belong to the compiled
+graph's memory plan; declaration examples are released after tuning. The component
+implements the reference's window-only mode through 24 rows, parallel sparse mode
+through 16 rows, and cluster sparse mode through 76 rows. It rejects unsupported
+geometry; it does not supply prefill or cache writers. Cluster mode requires
+power-of-two pages and at most 128 window slots. All modes require at most 640
+combined key slots and 512-byte-aligned cache page strides.
 
 Build the reference library from
 [`vllm-project/FlashMLA` commit `0eee43b12f034b657133cf2afca6a72ebb6efccf`](https://github.com/vllm-project/FlashMLA/tree/0eee43b12f034b657133cf2afca6a72ebb6efccf)
@@ -637,6 +668,9 @@ packed scales exactly across mixed-cache and window-only attention, 64- and
 inputs and valid lengths. They check repeated replay and preparation rejection
 during capture. Full recipe composition and native serving are separate gates
 in the [SM103 integration process](sm103-kernel-integration.md).
+The prepared-component test also compiles two serialized attention calls sharing
+epoch state, alternates graph capacities at 1, 16, 17, 24, and 76 rows, and checks
+exact outputs, scale bytes, declaration-storage release, and geometry rejection.
 
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target

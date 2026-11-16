@@ -144,3 +144,121 @@ def test_preparation_rejects_capture_even_with_cached_module(attention):
         value.add_(1)
         with pytest.raises(RuntimeError, match="before CUDA graph capture"):
             prepare(cache)
+
+
+def test_prepared_catalog_compiles_and_preserves_epoch_across_modes(attention):
+    import weakref
+
+    from ignition.components.mega_attention import MegaAttentionWorkspace, PreparedMegaAttention, _outputs
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.tuning import RecordedPreparationSession
+
+    _, cache = attention
+    workspace = MegaAttentionWorkspace(76, device="cuda:0")
+    generator = torch.Generator(device="cuda").manual_seed(9102)
+
+    def randn(shape):
+        return torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator) * .2
+
+    window = packed_cache(randn((4 * 128, 512)), 128, "swa")
+    compressed = packed_cache(randn((8 * 64, 512)), 64, "indexed")
+    angles = torch.arange(4096, device="cuda").float()[:, None] / (
+        10000 ** (torch.arange(32, device="cuda").float() / 32))[None, :]
+    cos_sin = torch.cat((angles.cos(), angles.sin()), -1)
+    sink = randn((64,)).float()
+    operands, operators, outputs, graphs, functions = {}, {}, {}, {}, {}
+    cases = ((1, False), (16, True), (17, True), (24, False), (76, True))
+    with RecordedPreparationSession(device="cuda:0", checkpoint="synthetic-attention",
+            workload_schema="sm103-decode", numerical_policy="flashmla-bitwise",
+            compile_workers=2, autotune_effort="off") as session:
+        for rows, sparse in cases:
+            query = randn((rows, 64, 512))
+            positions = torch.arange(2048, 2048 + rows, device="cuda", dtype=torch.int32)
+            indices = torch.arange(128, 256, device="cuda", dtype=torch.int32).repeat(rows, 1)
+            lengths = torch.full((rows,), 128, device="cuda", dtype=torch.int32)
+            ci = torch.arange(512, device="cuda", dtype=torch.int32).repeat(rows, 1) if sparse else None
+            cl = torch.full((rows,), 512, device="cuda", dtype=torch.int32) if sparse else None
+            args = (query, positions, cos_sin, sink, window, indices, lengths,
+                    compressed if sparse else None, ci, cl)
+            key = rows, sparse
+            operands[key] = args
+            outputs[key] = (_outputs(rows, query.device), _outputs(rows, query.device))
+            # Independent declaration tensors must not survive tuning.
+            examples = tuple(value.clone(memory_format=torch.preserve_format) if value is not None else None
+                             for value in args)
+            # Clone may compact padded pages; cache storage is a persistent operand.
+            examples = (*examples[:4], window, *examples[5:7], args[7], *examples[8:])
+            references = [weakref.ref(value) for value in examples[:2]]
+            operators[key] = PreparedMegaAttention(*examples, workspace=workspace, scale=512 ** -.5,
+                kernel_cache=cache, session=session, name=f"attention-{rows}-{sparse}")
+        del examples
+        args = operands[(17, True)]
+        bad_page = packed_cache(randn((4 * 136, 512)), 136, "swa")
+        for invalid, message in (
+            ((*args[:4], bad_page, *args[5:]), "power-of-two pages"),
+            ((*args[:8], None, args[9]), "supplied together"),
+            ((args[0], args[1].long(), *args[2:]), "int32 positions"),
+            ((*args[:4], window[:, :, :-1], *args[5:]), "page-separated"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                PreparedMegaAttention(*invalid, workspace=workspace, scale=512 ** -.5,
+                    kernel_cache=cache, session=session, name="invalid")
+        session.tune()
+        assert all(reference() is None for reference in references)
+        for key, operation in operators.items():
+            args, destinations = operands[key], outputs[key]
+
+            def forward(args=args, operation=operation, destinations=destinations):
+                for target, value in zip(destinations[0], operation(*args)):
+                    target.copy_(value)
+                for target, value in zip(destinations[1], operation(-args[0], *args[1:])):
+                    target.copy_(value)
+
+            functions[key] = compile_forward(forward)
+            functions[key]()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                functions[key]()
+            graphs[key] = graph
+        session.freeze()
+        immutable = (cos_sin, sink, window, compressed)
+        saved = [value.clone() for value in immutable]
+        for step, key in enumerate((*reversed(cases), *cases)):
+            query, positions, cs, sk, win, wi, wl, comp, ci, cl = operands[key]
+            query.neg_()
+            positions.add_(1)
+            wi.copy_(torch.roll(wi, 19, -1))
+            wl.fill_(128)
+            wl[0] = 0 if step % 2 else 17
+            if ci is not None:
+                ci.copy_(torch.roll(ci, 23, -1))
+                cl.fill_(512)
+                cl[0] = 0 if step % 2 else 61
+            expected = []
+            for value in (query, -query):
+                out, sf = _outputs(key[0], query.device)
+                torch.ops._flashmla_C.fused_norm_rope_attn_rope_cast_decode(
+                    value, win.unsqueeze(-2), wi, 512 ** -.5, 512, sk, wl,
+                    None if comp is None else comp.unsqueeze(-2), ci, cl,
+                    False, 0., positions, False, 64, cs, 8, 32, True, True, True, out, sf)
+                expected.append((out, sf))
+            for out, sf in outputs[key]:
+                out.view(torch.uint8).fill_(255)
+                sf.fill_(-999)
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graphs[key].replay()
+            torch.cuda.synchronize()
+            assert before == torch.cuda.memory_stats()["allocation.all.allocated"]
+            for actual, reference in zip(outputs[key], expected):
+                torch.testing.assert_close(actual[0].view(torch.uint8), reference[0].view(torch.uint8), rtol=0, atol=0)
+                torch.testing.assert_close(actual[1], reference[1], rtol=0, atol=0)
+        # A prepared call must reject a different row count before entering CUDA.
+        args = operands[(16, True)]
+        with pytest.raises(ValueError, match="prepared geometry"):
+            operators[(16, True)](args[0][:1], *args[1:])
+        for actual, reference in zip(immutable, saved):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        for graph in graphs.values():
+            graph.reset()

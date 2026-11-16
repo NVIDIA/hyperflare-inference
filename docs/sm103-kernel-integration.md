@@ -139,6 +139,37 @@ Compare decode and prefill separately; an integration may improve one and hurt t
 other. Use complete graph duration to assess overlap, not a sum of isolated kernel
 speedups.
 
+Use the following procedure to establish which path actually runs:
+
+1. **Exercise dispatch boundaries.** Derive cases from the implementation's
+   selection conditions, including row counts immediately below, at, and above
+   each threshold. Cover supported decode, prefill, and speculative shapes,
+   partial pages, and relevant strides. Record the selected preparation plan for
+   each case. A batch-one result cannot establish the path used by verification.
+2. **Inspect the emitted graph.** Examine the captured graph's nodes and edges
+   after complete-forward compilation. Associate each kernel, copy, fill, and
+   dependency with the operation it implements. Check that loading-time weight
+   transforms stay outside replay and fused work appears only once. A graph dump
+   establishes structure; it does not measure latency or prove safe overlap.
+3. **Trace native execution.** Collect a GPU kernel timeline from the exported
+   core, with layer and operator attribution, using the
+   [performance measurement guidance](performance-work.md#measurement). Compare
+   actual launches with the captured structure and selected plans. Include
+   transfers and synchronization outside the graph; a host graph-launch event
+   alone cannot identify the executed kernels. Measure unprofiled serving
+   separately so profiler overhead does not become the performance result.
+4. **Explain remaining cost.** Attribute the complete graph interval to useful
+   computation, required conversions, memory traffic, and dependencies. Investigate
+   unexplained launches, idle intervals, repeated transformations, and differences
+   from the reference runtime. Recheck affected graph variants after changing a
+   producer, consumer, or layout, even when the central kernel is unchanged.
+
+Call a path clean only for the exercised configurations: dispatch is understood,
+surrounding work has a contract-based reason, fresh native replay preserves
+outputs and state without allocations, and measured execution accounts for the
+claimed benefit. Few launches do not prove correctness or optimal performance.
+Keep structural checks, numerical checks, and timing results distinct.
+
 ## Qualify in increasing scope
 
 1. **Storage and arithmetic.** Verify packed values, scales, permutations, and
