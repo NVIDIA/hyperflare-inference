@@ -555,3 +555,5 @@
     leaves the controls the template writes unchanged, and that text spelling an
     added token that is neither special nor named by the chat template (a
     lexical token) keeps that token. Close when each tokenizer passes it.
+
+Parallax: qualify functional GLM routing capture, default-off overhead, MTP replay and active residency against the rebased runtime before claiming the GB300 results in docs/parallax-research.md apply to it.

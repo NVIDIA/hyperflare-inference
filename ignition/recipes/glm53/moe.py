@@ -68,6 +68,7 @@ class PreparedGlmMoe:
             router_plan=self.routing.plan,
             a4_prefill=prefill and weights.experts_a4_prefill)
         self.concurrent_shared = None
+        self.routing_counter = None
         if source.shape[0] <= 256 and workspace.overlap:
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
                 parallel_plans=(self.routing.plan, self.experts.plan),
@@ -83,10 +84,12 @@ class PreparedGlmMoe:
         self.source = self.scratch = self.output = None
         return self
 
-    def __call__(self, source):
+    def __call__(self, source, *, valid_tokens=None):
         logits = self.router_projection(source)
         pending = None if self.concurrent_shared is None else self.concurrent_shared.start(source)
         routes = self.routing(logits)
+        if self.routing_counter is not None:
+            self.routing_counter(routes.ids, valid_tokens)
         routed = self.experts(source, routes.ids, routes.weights)
         shared = self.shared(source) if pending is None else self.concurrent_shared.finish(pending, routed)
         return torch.add(routed, shared)
