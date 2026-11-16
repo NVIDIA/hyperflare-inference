@@ -556,4 +556,11 @@
     added token that is neither special nor named by the chat template (a
     lexical token) keeps that token. Close when each tokenizer passes it.
 
-Parallax: qualify functional GLM routing capture, default-off overhead, MTP replay and active residency against the rebased runtime before claiming the GB300 results in docs/parallax-research.md apply to it.
+[ ] Parallax: qualify functional GLM routing capture, default-off overhead, MTP
+    replay and active residency against the rebased runtime before applying the
+    GB300 results in parallax-research.md to it.
+[ ] Parallax: validate CUDA host-NUMA capability admission on GB300; qualify other
+    NVIDIA hardware before claiming physical residency support. See parallax.md.
+[ ] Parallax: compare protected-core LRU and predictive policies on held-out
+    routing traces, including policy overhead and concurrent copy contention.
+    Synthetic tests establish simulator behavior only.

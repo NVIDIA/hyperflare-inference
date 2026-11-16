@@ -160,6 +160,24 @@ profiles require separate calibration data. The CLI's static control selects
 experts in catalog order; it does not derive a profile from evaluation traffic.
 There is no trained predictor or training pipeline.
 
+Native evaluation also supports a protected resident set with LRU replacement
+through `static_core_lru` in the predictor profile. This shadow control tests
+whether prediction improves on reactive placement. Every contender starts with
+the configured protected experts, then fills remaining capacity in catalog order.
+Only the LRU control protects that set against eviction; prediction policies
+retain their own replacement rules. Select protected experts from separate
+calibration traffic, never from the workload being scored.
+
+The LRU control updates recency from routing observations at their recorded
+availability time. A demand cannot trigger a transfer before its observation is
+available. Copies serialize, pending destinations reserve capacity, and each
+promotion can evict at most one eligible resident. Experts touched by the same
+observation are not victims. The configured promotion limit bounds work per
+observation. Empty protected sets provide an ordinary LRU control; heterogeneous
+experts requiring multiple evictions are skipped. This policy runs only in
+virtual residency and does not control physical movement. Its compute overhead
+and copy contention remain outside the modeled balance.
+
 The static policy preserves placement. The economic policy accepts expected-count
 forecasts and proposes at most one promotion per forecast. It subtracts predicted
 victim demand, charges transfer and synchronization costs, checks usable lead and
@@ -495,6 +513,52 @@ context before publication; this does not replace the external submission gate.
 CUDA virtual-memory access and mapping requirements are defined by the
 [NVIDIA driver API](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-driver-api/group__CUDA__VA.html).
 
+### CUDA memory admission and hardware adaptation
+
+Storage admission checks CUDA virtual memory management and host-NUMA virtual
+memory management support, then queries the host NUMA node closest to the selected
+GPU. These are requirements of the mapping mechanism, independent of the GPU's
+SM version. A nearby NUMA node alone does not establish GPU access to host backing.
+Allocation granularity, exact virtual-address reservation, mapping and access
+permission calls must also succeed. Missing capabilities or failed CUDA calls
+reject physical residency; there is no automatic substitution of pageable host
+memory or another execution path.
+
+GB300 is the only physical-residency target with hardware evidence in this
+research branch. Capability admission on another NVIDIA GPU is permission to
+attempt the mechanism, not correctness or performance qualification. Model
+kernels and prepared cores retain their own architecture requirements. The
+allocator discovers topology; measured transfer and cold-execution costs belong
+to the cost model. Neither NUMA placement nor CUDA capability flags establish
+bandwidth, coherence behavior under concurrent execution, or economic benefit.
+
+Adapting this mechanism to another NVIDIA system requires:
+
+1. Check the required CUDA memory capabilities and actual allocation, mapping and
+   access operations on the selected GPU and driver. Include rounded allocations,
+   spare slots, immutable backing and model workspace in the memory budget.
+2. Verify exact weight bytes and stable captured addresses across promotion,
+   eviction and repeated graph replay. Exercise outstanding readers, expiration,
+   cancellation, partial publication failure, rollback and shutdown.
+3. Validate the prepared model's routing, inactive rows, graph transitions and
+   speculative state with movement enabled and disabled. Passing storage tests
+   does not establish full-model equivalence.
+4. Measure transfers at expert-sized extents both in isolation and during serving.
+   Compare against fixed placement with matching workload, MTP settings and
+   capacities; report contention and publication waits separately from copy time.
+
+PCIe GPUs can use asynchronous copies from pinned host storage, but this does not
+make direct cold execution or host-NUMA remapping suitable on that system. An
+explicit staging path for systems without the required mapping capabilities is
+designed, not implemented: reserve device slots before serving, copy into an unused
+slot, wait for its ready event before consumption, and retain the slot until all
+GPU readers finish. It must satisfy the prepared graph address/layout contract
+without recapture or steady-state allocation. Predictors, policy inputs and
+evaluation can remain shared. This does not require interchangeable kernels or a
+device-portability layer.
+
+### Storage admission and qualification
+
 Regions must occupy distinct allocation-granularity pages. Admission rejects
 overlapping rounded ranges and charges physical padding to backing, HBM and
 transfer accounting. HBM slots are distributed evenly among the distinct rounded
@@ -615,7 +679,8 @@ There is no steady-state GPU allocation or graph recapture.
 and `backing_bytes` bound physical allocations; `initial_hbm` selects canonical
 experts promoted before graph execution. Slots are individual weight parts, not
 complete experts. Reserve spare slots of every required size for exchanges.
-The implementation requires local TP1 SM103, `--parallax-routing`, a predictor
+The implementation requires local TP1 with the CUDA memory capabilities above,
+`--parallax-routing`, a predictor
 profile and complete tracing coverage for the selected execution mode. Reader
 leases cover the entire speculative round, including proposal and accepted-state
 commit. Publication occurs only after those readers drain.

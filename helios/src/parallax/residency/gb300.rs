@@ -20,6 +20,28 @@ pub struct Limits {
     pub backing_bytes: usize,
     pub virtual_base: Option<u64>,
 }
+
+// CUDA device attributes; NUMA proximity alone does not establish mapping support.
+const VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED: i32 = 102;
+const HOST_NUMA_ID: i32 = 134;
+const HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED: i32 = 141;
+
+fn host_numa_node(mut attribute: impl FnMut(i32) -> Result<i32>) -> Result<i32> {
+    for (key, name) in [
+        (VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, "CUDA virtual memory management"),
+        (HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, "CUDA host-NUMA virtual memory management"),
+    ] {
+        if attribute(key).map_err(|e| Error::Backend(format!("query {name}: {e}")))? != 1 {
+            return Err(Error::Invalid(format!("expert remapping requires {name}")));
+        }
+    }
+    let node = attribute(HOST_NUMA_ID)?;
+    if node < 0 {
+        return Err(Error::Invalid("expert remapping requires a GPU-local host NUMA node".into()));
+    }
+    Ok(node)
+}
+
 struct Resources {
     driver: Arc<Driver>,
     context: usize,
@@ -378,15 +400,7 @@ impl Gb300 {
                 .map_err(|e| Error::Backend(e.to_string()))?;
             Ok(value)
         };
-        if attribute(75)? != 10 || attribute(76)? != 3 {
-            return Err(Error::Invalid("GB300 residency requires SM103".into()));
-        }
-        let node = attribute(134)?;
-        if node < 0 {
-            return Err(Error::Invalid(
-                "GB300 host NUMA placement is unavailable".into(),
-            ));
-        }
+        let node = host_numa_node(attribute)?;
         let host = properties(3, node);
         let gpu = properties(1, device);
         let mut alignment = 1;
@@ -674,6 +688,25 @@ mod gpu_tests;
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn host_mapping_admission_requires_capabilities_and_discovers_numa_node() {
+        for (vmm, host_vmm, node, accepted) in [
+            (1, 1, 7, true), (1, 1, 0, true), (0, 1, 7, false),
+            (1, 0, 7, false), (1, 1, -1, false),
+        ] {
+            let result = host_numa_node(|key| Ok(match key {
+                VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED => vmm,
+                HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED => host_vmm,
+                HOST_NUMA_ID => node,
+                _ => panic!("unexpected device attribute"),
+            }));
+            if accepted { assert_eq!(result.unwrap(), node); }
+            else { assert!(matches!(result, Err(Error::Invalid(_)))); }
+        }
+        assert!(matches!(host_numa_node(|_| Err(Error::Backend("driver failure".into()))),
+            Err(Error::Backend(_))));
+    }
 
     #[test]
     fn package_budget_preflight_counts_size_classes_and_initial_placement() {

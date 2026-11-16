@@ -80,6 +80,7 @@ pub(super) struct Ledger {
     timed_copies: u64,
     untimed_copies: u64,
     publication_ns: u64,
+    ready_wait_ns: u64,
     gate_ns: u64,
     charged_ns: u64,
     estimated_saved_ns: f64,
@@ -95,7 +96,7 @@ impl Ledger {
             generation: state.generation, events: VecDeque::new(), last_event: 0, last_record: None, error: None,
             frames:0, hot_routes:0, cold_routes:0, avoided_routes:0, eviction_routes:0, avoided_touches:0,
             eviction_touches:0, promoted_unused:BTreeSet::new(), used_promotions:0, unused_before_eviction:0,
-            commits:0, staged_bytes:0, copy_gpu_ns:0, timed_copies:0, untimed_copies:0, publication_ns:0, gate_ns:0, charged_ns:0,
+            commits:0, staged_bytes:0, copy_gpu_ns:0, timed_copies:0, untimed_copies:0, publication_ns:0, ready_wait_ns:0, gate_ns:0, charged_ns:0,
             estimated_saved_ns:0., estimated_frames:0, overlap_frames:0, shapes:BTreeMap::new(), rows:VecDeque::new() }
     }
     pub fn invalidate(&mut self, message: &str) { self.error.get_or_insert(message.into()); }
@@ -111,6 +112,7 @@ impl Ledger {
             self.last_event = event.sequence;
             self.staged_bytes += event.staged_bytes;
             self.publication_ns += event.publication_host_ns;
+            self.ready_wait_ns += event.ready_wait_ns;
             self.gate_ns += event.submission_gate_closed_ns;
             if let Some(ns) = event.copy_gpu_ns { self.copy_gpu_ns += ns; self.timed_copies += 1; }
             else if event.staged_bytes > 0 { self.untimed_copies += 1; }
@@ -201,6 +203,7 @@ impl Ledger {
             "promotions_awaiting_use":self.promoted_unused.len(),"accounted_commits":self.commits,
             "movement_events":self.last_event,"staged_bytes":self.staged_bytes,"copy_gpu_ns":self.copy_gpu_ns,
             "timed_copy_transactions":self.timed_copies,"publication_host_ns":self.publication_ns,
+            "ready_wait_ns":self.ready_wait_ns,
             "untimed_copy_transactions":self.untimed_copies,
             "submission_gate_closed_ns":self.gate_ns,"full_movement_charge_ns":self.charged_ns,
             "modeled_frames":self.estimated_frames,"movement_overlap_frames":self.overlap_frames,
@@ -225,7 +228,7 @@ mod tests {
     fn event()->MovementEvent {
         MovementEvent {sequence:1,generation:1,started_ns:100,finished_ns:200,deadline_ns:300,target_demand:None,
             promote:vec![expert(1)],evict:vec![expert(0)],outcome:"committed:2".into(),
-            staged_bytes:100,copy_gpu_ns:Some(10),publication_host_ns:5,submission_gate_closed_ns:20}
+            staged_bytes:100,copy_gpu_ns:Some(10),publication_host_ns:5,ready_wait_ns:7,submission_gate_closed_ns:20}
     }
     fn record(sequence:u64,generation:u64,start:u64)->Record {
         Record {sequence,graph:1,phase:"verify",batch_size:1,concurrency:1,
@@ -244,9 +247,11 @@ mod tests {
         assert_eq!(r["eviction_routes_vs_static"],2);
         assert_eq!(r["cold_expert_touches_avoided_vs_static"],1);
         assert_eq!(r["promotions_used"],1);
-        assert_eq!(r["full_movement_charge_ns"],15); // Reader drain is not a measured execution loss.
+        assert_eq!(r["ready_wait_ns"],7);
+        // Readiness and reader-drain waits can overlap useful inference, so neither is charged.
+        assert_eq!(r["full_movement_charge_ns"],15);
         let mut cancelled=event();cancelled.sequence=2;cancelled.generation=2;
-        cancelled.outcome="Cancelled".into();cancelled.publication_host_ns=0;cancelled.submission_gate_closed_ns=0;
+        cancelled.outcome="Cancelled".into();cancelled.publication_host_ns=0;cancelled.ready_wait_ns=0;cancelled.submission_gate_closed_ns=0;
         l.ingest(vec![cancelled]);l.observe(&record(3,2,220),None);
         assert_eq!(l.report()["full_movement_charge_ns"],25);
         assert_eq!(l.report()["accounted_commits"],1);

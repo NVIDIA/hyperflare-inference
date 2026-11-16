@@ -93,7 +93,7 @@ def test_configuration_rejects_an_unbound_package_before_gpu_work(tmp_path, monk
     values = dict(binary=sys.executable, package=str(tmp_path), catalog=str(catalog),
                   hardware=str(hardware), gpu="GPU-test", package_id="test")
     config.write_text(json.dumps(values))
-    inspection = dict(package=dict(signatures_verified=True, package_id="test", tensor_parallel=1),
+    inspection = dict(core=dict(signatures_verified=True, core_id="test", tensor_parallel=1),
                       model=dict(model_id="fixture"))
     monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: json.dumps(inspection))
     assert load_configuration(config)["model_id"] == "fixture"

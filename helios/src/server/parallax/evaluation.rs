@@ -3,6 +3,7 @@
 use super::prediction::{Expert, Forecast, Observation, Profile};
 mod placement;
 mod coverage;
+mod lru;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -141,9 +142,12 @@ impl VirtualResidency {
             .zip(p.model.expert_bytes.iter().copied())
             .collect();
         let mut reserved = 0;
-        let resident: BTreeSet<_> = sizes
-            .iter()
-            .filter_map(|(e, s)| {
+        // Every contender and the static control start with the same placement.
+        let protected: BTreeSet<_> = p.settings.static_core_lru.as_ref()
+            .map(|c| c.protected_experts.iter().copied().collect()).unwrap_or_default();
+        let resident: BTreeSet<_> = protected.iter().chain(sizes.keys().filter(|e| !protected.contains(e)))
+            .filter_map(|e| {
+                let s = &sizes[e];
                 if reserved + *s <= p.hardware.hbm_bytes {
                     reserved += *s;
                     Some(*e)
@@ -344,11 +348,15 @@ pub fn evaluate(c: &Capture) -> Value {
             contenders.insert(format!("{name}/static"), score(c, name, &Static, true));
             contenders.insert(format!("{name}/economic"), score(c, name, &Economic, true));
         }
+        if c.profile.settings.static_core_lru.is_some() {
+            contenders.insert(lru::NAME.into(), lru::evaluate(c));
+        }
     }
     let mut report = json!({"result_kind":"SHADOW: modeled route costs, NOT measured serving improvement","routing_frames":c.observations.len(),"error":c.error,
         "capture_limit_reached":c.limit_reason.is_some() || c.observations.len() >= c.profile.settings.max_frames,
         "hardware":c.profile.hardware,"workers":c.workers,"contenders":contenders,"mode":"in_process","native_capture_version":1});
     if let Some(config) = &c.profile.settings.evaluation { report["evaluation"] = json!(config); }
+    if let Some(config) = &c.profile.settings.static_core_lru { report["static_core_lru"] = json!(config); }
     if let Some(reason) = c.limit_reason {
         report["capture_limit_reason"] = json!(reason);
     }
@@ -368,6 +376,7 @@ pub(super) struct Continuous {
     baseline: VirtualResidency,
     overhead: BTreeMap<String, u64>,
     compute: BTreeMap<String, u64>,
+    reactive: Option<lru::Reactive>,
 }
 impl Continuous {
     pub fn new(capture: &Capture, limit: usize) -> Self {
@@ -380,6 +389,7 @@ impl Continuous {
             window: capture.clone(), frames: 0, cells: 0, limit,
             pending: vec![], pending_cells: 0, states,
             baseline: VirtualResidency::new(&capture.profile), overhead: BTreeMap::new(), compute: BTreeMap::new(),
+            reactive: capture.profile.settings.static_core_lru.as_ref().map(|_| lru::Reactive::new(&capture.profile)),
         }
     }
     pub fn forecast(&mut self, f: Forecast) {
@@ -412,6 +422,11 @@ impl Continuous {
         }
         for state in self.states.values_mut() { state.demand(o); }
         self.baseline.demand(o);
+        if let Some(reactive) = &mut self.reactive {
+            if let Err(error) = reactive.observe(o, &self.window.profile, self.limit) {
+                self.window.error.get_or_insert(error);
+            }
+        }
         self.frames += 1;
         self.cells += o.demands.len();
         self.window.observations.push(o.clone());
@@ -452,6 +467,9 @@ impl Continuous {
             }
             residency.insert(name.clone(), row);
         }
+        if let Some(reactive) = &self.reactive {
+            residency.insert(lru::NAME.into(), reactive.report(&self.window.profile, &self.baseline));
+        }
         (window, json!({"routing_frames":self.frames,"residency":residency}))
     }
 }
@@ -468,12 +486,16 @@ pub(super) fn evaluate_continuous(window: &Capture, totals: Value) -> Value {
     let mut report = json!({"result_kind":"SHADOW: modeled route costs, NOT measured serving improvement",
         "error":window.error,"hardware":window.profile.hardware,"workers":window.workers,
         "contenders":quality,"mode":"in_process","native_capture_version":1});
+    if window.error.is_none() && window.profile.settings.static_core_lru.is_some() {
+        report["contenders"][lru::NAME] = json!({});
+    }
     report.as_object_mut().unwrap().remove("capture_limit_reached");
     report.as_object_mut().unwrap().remove("capture_limit_reason");
     report["evaluation_window_frames"] = json!(window.observations.len());
     report["evaluation_window_start"] = json!(window.observations.first().map(|o| o.seq));
     report["routing_frames"] = totals["routing_frames"].clone();
     if let Some(config) = &window.profile.settings.evaluation { report["evaluation"] = json!(config); }
+    if let Some(config) = &window.profile.settings.static_core_lru { report["static_core_lru"] = json!(config); }
     report["continuous"] = json!(true);
     report["trace_complete"] = totals["trace_complete"].clone();
     if totals["active_policy"].is_object() { report["active_policy"] = totals["active_policy"].clone(); }

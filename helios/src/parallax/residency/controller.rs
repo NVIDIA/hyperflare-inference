@@ -13,6 +13,8 @@ pub struct Statistics {
     pub staged_bytes: u64,
     pub commits: u64,
     pub publication_host_ns: u64,
+    /// Host-observed readiness to publication start; excludes polling delay and publication work.
+    pub ready_wait_ns: u64,
     pub copy_gpu_ns: u64,
     pub timed_copies: u64,
     pub promoted_experts: u64,
@@ -65,6 +67,7 @@ struct Pending {
     slots: Vec<usize>,
     bytes: u64,
     timing_recorded: bool,
+    ready_observed_ns: Option<u64>,
 }
 
 pub struct Controller<B: Backend> {
@@ -341,6 +344,7 @@ impl<B: Backend> Controller<B> {
             slots,
             bytes,
             timing_recorded: false,
+            ready_observed_ns: None,
         });
         Ok(Progress::Staged)
     }
@@ -360,6 +364,7 @@ impl<B: Backend> Controller<B> {
             return Ok(Progress::WaitingForTransfer);
         }
         self.record_copy_timing();
+        self.pending.as_mut().unwrap().ready_observed_ns.get_or_insert(now_ns);
         let pending = self.pending.as_ref().unwrap();
         if now_ns > pending.plan.valid_until_ns {
             if let Err(e) = self.backend.as_mut().unwrap().discard() {
@@ -373,6 +378,8 @@ impl<B: Backend> Controller<B> {
             return Ok(Progress::WaitingForReaders);
         }
         let started = std::time::Instant::now();
+        self.statistics.ready_wait_ns = self.statistics.ready_wait_ns.saturating_add(
+            now_ns.saturating_sub(pending.ready_observed_ns.unwrap()));
         let result = unsafe { self.backend.as_mut().unwrap().publish(&pending.bindings) };
         self.statistics.publication_host_ns = self
             .statistics
