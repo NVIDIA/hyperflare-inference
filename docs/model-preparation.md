@@ -1523,6 +1523,22 @@ same position of a 67,000-token prompt are 92 ms shorter, smaller chunks are
 for 131,990 tokens is 40.4 to 42.0 s against 43.5 to 43.7 s with the default
 routing.
 
+Serve Inkling 2 on DGX Sparks with `--mtp-adaptive-verification-alpha 0.5`.
+With the default exponent of 1.0 the balanced scheduler leaves drafting after
+one to three rejected first drafts and returns only through an acceptance
+probe, which one request funds about every 6 s; a request whose drafts are
+accepted 80% of the time can spend 12 to 26 s of a 25 s run in one-token
+rounds at 48 to 51 tokens/s. An exponent of 0.5 keeps such requests drafting.
+On four DGX Sparks at TP4, ten sequential single-request coding completions
+generate 70.6 to 81.9 tokens/s with drafts in 99% of rounds, where fifteen
+with the default generate 46.5 to 76.7 tokens/s; task prompts ending at EOS
+reach 98.2 tokens/s at four requests against 89.2 and 88.1 against 80.4 at
+two, and 65.2 against 71.3 at one request with overlapping ranges. On an
+article continuation, where the second draft is accepted a third of the time,
+the exponent drafts in 49% to 100% of rounds for the same throughput at one
+request and 3% to 4% less at two and four. The decode benchmark's 8,192-token
+cells are unchanged at one to eight requests.
+
 Multi-host export requires the checkpoint
 directory on rank zero only; peers read their tensor ranges from it. The recipe
 accepts up to 32 concurrent requests. On rank zero, whose preparation address
