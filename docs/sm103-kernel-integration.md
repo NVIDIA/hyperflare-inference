@@ -170,6 +170,25 @@ outputs and state without allocations, and measured execution accounts for the
 claimed benefit. Few launches do not prove correctness or optimal performance.
 Keep structural checks, numerical checks, and timing results distinct.
 
+For example, a fused attention operator may return FP8 activations with packed
+scales for a grouped output projection. Check the producer's output coordinates
+against the projection's weight columns and scale groups. If they differ only
+by a fixed permutation, permute the weights and their scales during loading and
+verify exact inverse reconstruction. Then test the composed attention and
+projection against the reference, including masked rows and dispatch boundaries.
+Inspect the compiled graph to confirm that no activation unpack/repack was
+introduced between them. Preserve any BF16 intermediate rounding required by
+the reference before the following dense projection. Direct FP8 consumption
+alone does not establish numerical equivalence or lower complete-forward time.
+
+Document the resulting execution path in the model's preparation guidance so
+another developer can distinguish an integrated path from an available component.
+Identify the recipe entry point, shape-dependent selection, resident weight and
+cache layouts, and tests that exercise the composed forward. State which paths
+are qualified for prefill, decode, verification, and draft execution. A remaining
+reference-runtime fusion or precision difference belongs in the comparison's
+limitations; unresolved integration work belongs in [TODO.txt](TODO.txt).
+
 ## Qualify in increasing scope
 
 1. **Storage and arithmetic.** Verify packed values, scales, permutations, and

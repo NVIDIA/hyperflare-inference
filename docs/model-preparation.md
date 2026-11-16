@@ -727,6 +727,35 @@ capacities with changing inputs and masks, and check declaration lifetimes and
 replay allocations. These are synthetic component checks, not qualification of
 a DeepSeek serving recipe or speculative acceptance behavior.
 
+The preparation helpers in `ignition.components.mega_attention_weights` apply
+the reference projection layouts once: query output rows are interleaved in
+16-element head chunks, while grouped output input columns are interleaved in
+32-element chunks. Their native scale bytes move with the corresponding values.
+Inputs use expanded per-row UE8M0 scales, not checkpoint block-scale grids or
+CSF containers. These coordinate layouts follow vLLM's fused-attention loading
+contract and FlashMLA's projection permutations.
+
+`PreparedGroupedFP8Projection` in `ignition.components.mega_attention_output`
+consumes the fused attention FP8 values and packed MN-major scales directly
+through DeepGEMM's grouped projection. It produces the reference BF16
+intermediate before the final dense projection. Weight reads and output writes
+are visible to compilation; declaration examples are released after tuning.
+It does not implement DerpSeek's small-row W8 fusion or the final dense projection.
+
+With both `FLARE_DEEPSEEK41_CSF_SNAPSHOT` and `FLARE_FLASHMLA_LIBRARY` set, run:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mega_attention_weights_cuda.py tests/components/test_mega_attention_output_cuda.py -q
+```
+
+Weight checks reconstruct canonical bytes and compare FlashMLA's transforms
+using target layers 0, 20 and 39, including all native scale-byte encodings in
+synthetic planes. The composed attention/projection check uses real layer-zero
+output weights with synthetic activations at 1, 17, 192, 257 and 8192 rows.
+It compares compiled outputs exactly against FlashMLA followed by DeepGEMM,
+changes inputs and masks, and checks replay allocations. Recipe selection,
+complete attention composition and full-model serving remain separate gates.
+
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses

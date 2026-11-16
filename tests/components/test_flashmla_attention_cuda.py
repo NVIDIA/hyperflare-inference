@@ -54,7 +54,7 @@ def operands(rows, paged, compressed):
     q = random((rows, 64, 512))
     q = q.reshape(rows, 64, 32, 16).transpose(1, 2).contiguous().reshape_as(q)
     pos = torch.arange(2048, 2048 + rows, dtype=torch.int32, device="cuda")
-    angles = torch.arange(8192, device="cuda").float()[:, None] / (
+    angles = torch.arange(max(8192, rows + 4096), device="cuda").float()[:, None] / (
         10000 ** (torch.arange(32, device="cuda").float() / 32))[None, :]
     cs = torch.cat((angles.cos(), angles.sin()), -1)
     sink = random((64,)).float()

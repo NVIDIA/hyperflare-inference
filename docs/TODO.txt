@@ -8,7 +8,9 @@
     page-separated payload/scales, compressor and hierarchical indexer. The
     installed b12x compressed-MLA auto mode emits unsupported block-scaled MMA
     on SM103; the recipe's default BF16 mode has not been checked separately.
-    Qualify full graph transitions and MTP before serving comparisons.
+    Qualify full graph transitions and MTP before serving comparisons. Account
+    for DerpSeek exact's enabled W8 output projection, low-latency GEMMs and
+    fused preparation seams when attributing remaining full-step differences.
 
 [ ] Add a DerpSeek-style static-plus-LRU placement contender to Parallax. Check
     decisions against the reference on identical routing traces before claiming
