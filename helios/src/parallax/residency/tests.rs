@@ -164,6 +164,7 @@ fn publication_waits_for_both_transfer_and_readers() {
         reader.complete();
     }
     assert_eq!(unsafe { c.progress(3) }.unwrap(), Progress::Committed(1));
+    assert_eq!(c.statistics().ready_wait_ns, 1);
     assert!(c.snapshot().experts[&expert(0)]);
     assert!(!c.snapshot().experts[&expert(1)]);
     assert_eq!(c.snapshot().statistics.staged_bytes, 128); // physical padding is charged
@@ -387,6 +388,7 @@ fn movement_timing_is_once_per_copy_and_excludes_initial_placement() {
     let report=binding.report().unwrap();
     assert_eq!(report.events.len(),1);
     assert_eq!(report.events[0].copy_gpu_ns,Some(123));
+    assert_eq!(report.events[0].ready_wait_ns,20);
     assert_eq!(report.events[0].staged_bytes,128); // Two 64-byte weight parts.
     assert!(report.events[0].submission_gate_closed_ns>=20);
     assert_eq!(report.snapshot.statistics.timed_copies,2);

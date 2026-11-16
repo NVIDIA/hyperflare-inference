@@ -43,6 +43,29 @@ pub struct EvaluationConfig {
     pub max_promotions_per_forecast: usize,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticCoreLruConfig {
+    pub version: u32,
+    pub protected_experts: Vec<Expert>,
+    pub max_promotions_per_observation: usize,
+}
+impl StaticCoreLruConfig {
+    fn validate(&self, model: &Catalog, hbm_bytes: u64) -> Result<()> {
+        if self.version != 1 || !(1..=512).contains(&self.max_promotions_per_observation) {
+            return Err("static-core LRU requires version 1 and 1..512 promotions per observation".into());
+        }
+        let mut seen = BTreeSet::new();
+        let mut bytes = 0u64;
+        for expert in &self.protected_experts {
+            let index = model.experts.binary_search(expert).map_err(|_| "unknown protected expert")?;
+            if !seen.insert(expert) { return Err("duplicate protected expert".into()); }
+            bytes = bytes.checked_add(model.expert_bytes[index]).ok_or("protected expert bytes overflow")?;
+        }
+        if bytes > hbm_bytes { return Err("protected experts exceed the shadow HBM budget".into()); }
+        Ok(())
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
     pub catalog: PathBuf,
@@ -57,6 +80,8 @@ pub struct Settings {
     pub evaluation: Option<EvaluationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<super::active::Config>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_core_lru: Option<StaticCoreLruConfig>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -143,6 +168,7 @@ impl Profile {
         {
             return Err("invalid hardware costs or backing capacity".into());
         }
+        if let Some(config) = &s.static_core_lru { config.validate(m, h.hbm_bytes)?; }
         let worst = (m.expert_bytes.iter().copied().max().unwrap_or(0) as f64
             / h.bandwidth_bytes_per_ns
             + h.transfer_latency_ns as f64

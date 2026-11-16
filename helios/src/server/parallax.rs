@@ -191,6 +191,7 @@ fn physical_report(binding: &crate::parallax::residency::execution::ExecutionBin
                 "promoted_experts_including_startup":state.statistics.promoted_experts,
                 "evicted_experts_including_startup":state.statistics.evicted_experts,
                 "publication_host_ns_including_startup":state.statistics.publication_host_ns,
+                "ready_wait_ns_including_startup":state.statistics.ready_wait_ns,
                 "copy_gpu_ns_including_startup":state.statistics.copy_gpu_ns,
                 "timed_copy_transactions_including_startup":state.statistics.timed_copies,
                 "rollbacks":state.statistics.rollbacks,"rejected_plans":state.statistics.rejected,

@@ -158,6 +158,7 @@ fn render_actual(frame: &mut Frame, area: Rect, report: Value) {
     let rows=vec![
         Row::new(vec!["Copy GPU time".into(),ms("copy_gpu_ns"),format!("{} timed transactions; startup excluded",ledger["timed_copy_transactions"])]),
         Row::new(vec!["Publication CPU time".into(),ms("publication_host_ns"),"Actual mapping calls".into()]),
+        Row::new(vec!["Ready → publication wait".into(),ms("ready_wait_ns"),"Lower bound from first ready poll; not GPU idle time".into()]),
         Row::new(vec!["Submission gate closed".into(),ms("submission_gate_closed_ns"),"Includes reader drain; not GPU idle time".into()]),
         Row::new(vec!["Cold touches avoided/added".into(),format!("{}/{}",ledger["cold_expert_touches_avoided_vs_static"],ledger["eviction_expert_touches_vs_static"]),"Against initial placement; one per expert/graph".into()]),
         Row::new(vec!["Promotions used/unused".into(),format!("{}/{}",ledger["promotions_used"],ledger["promotions_unused_before_eviction"]),format!("{} still awaiting use",ledger["promotions_awaiting_use"])]),

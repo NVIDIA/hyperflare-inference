@@ -35,6 +35,8 @@ Prepare a single-rank telemetry-capable package as described in
 The expert catalog contains `identity`, `architecture`, canonical `experts`, and
 corresponding `expert_bytes`. Its identity must end with `;package=<package_id>`,
 where the package ID comes from authenticated `flare inspect --json` output.
+The inspector exposes it as `core.core_id`; the Parallax catalog suffix and
+experiment field retain the names `package` and `package_id`.
 Hardware fields are `identity`, `hbm_bytes`, `backing_bytes`,
 `bandwidth_bytes_per_ns`, `transfer_latency_ns`, `synchronization_ns`, and
 `cold_cost_ns`. Label uncalibrated inputs explicitly. The demo's input profile
@@ -58,6 +60,35 @@ All contenders share the same retained observation window. Each contender's
 virtual hot/cold residency, pending transfers, movement counts and hit/miss totals
 persist for the server lifetime. Reaching a retention limit does not stop a
 predictor or reset its residency. The dashboard shows both measurement scopes.
+
+To compare predictors against reactive replacement, add this optional member to
+the profile. This example protects no experts and therefore uses ordinary LRU:
+
+```json
+"static_core_lru": {
+  "version": 1,
+  "protected_experts": [],
+  "max_promotions_per_observation": 8
+}
+```
+
+Populate `protected_experts` with canonical `{"layer": 3, "expert": 0}` objects
+from a separate calibration workload to preserve a fixed resident set. IDs must
+exist in the catalog and their total bytes must fit the shadow HBM budget. All
+contenders start from that same placement, with remaining capacity filled in
+catalog order. The `reactive/static_core_lru` row reports simulated hits, movement
+and balance; it has no forecasts or prediction accuracy. Routing availability,
+copy completion and capacity reservations constrain its decisions. Its state
+persists beyond the retained trace window. It cannot select an active controller.
+
+For publication attempts, the actual residency ledger reports
+**Ready → publication wait** from the first
+host poll observing a completed transfer to the start of mapping publication.
+This is a lower bound on the time copied weights waited to become usable: it
+excludes delay before that poll and excludes publication work itself. It can
+overlap useful inference and is not added to the movement charge. Copy GPU time,
+publication CPU time and the closed submission gate remain separate measurements.
+These measurements diagnose delay; they do not establish serving speedup.
 
 A separate trace retains the initial complete prefix within the same bounds.
 Admission reserves space for pending predictor replies. On graceful shutdown,

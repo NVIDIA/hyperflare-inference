@@ -35,6 +35,7 @@ pub(super) fn profile(name: &str) -> Profile {
             max_frames: 64,
             evaluation: None,
             active: None,
+            static_core_lru: None,
         },
         model: Catalog {
             identity: "synthetic;package=test".into(),

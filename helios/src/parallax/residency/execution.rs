@@ -69,6 +69,7 @@ pub struct MovementEvent {
     pub staged_bytes: u64,
     pub copy_gpu_ns: Option<u64>,
     pub publication_host_ns: u64,
+    pub ready_wait_ns: u64,
     /// Includes reader drain and publication; not necessarily GPU idle time.
     pub submission_gate_closed_ns: u64,
 }
@@ -124,6 +125,7 @@ impl State {
             copy_gpu_ns: (after.timed_copies > before.timed_copies)
                 .then(|| after.copy_gpu_ns.saturating_sub(before.copy_gpu_ns)),
             publication_host_ns: after.publication_host_ns.saturating_sub(before.publication_host_ns),
+            ready_wait_ns: after.ready_wait_ns.saturating_sub(before.ready_wait_ns),
             submission_gate_closed_ns: gate_closed_at.map_or(0, |at| finished_ns.saturating_sub(at)),
         });
     }
