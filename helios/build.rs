@@ -16,6 +16,7 @@ fn main() {
         runtime
             .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
             .file_descriptor_set_path(out.join("runtime_core_descriptor.bin"))
+            .field_attribute(".flare.runtime.ExecutionGraph.routing_trace", "#[serde(default)]")
             .field_attribute(".flare.runtime.RebuildSpeculation.vocabulary_parallel_sampling", "#[serde(default)]")
             .field_attribute(".flare.runtime.RebuildSpeculation.mtp_only", "#[serde(default)]")
             .field_attribute(".flare.runtime.RebuildManifest.online_mxfp8_scope", "#[serde(default)]")

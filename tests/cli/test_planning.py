@@ -832,7 +832,7 @@ def test_collective_tuning_plan_recipe_default_and_override(mode):
 def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_path, recipe, mode):
     from importlib import import_module
 
-    bootstrap_name = "kimi3" if recipe.name == "kimi31" else recipe.name
+    bootstrap_name = "kimi3" if recipe.name == "kimi31" else recipe.prepare.__module__.rsplit(".", 1)[0].rsplit(".", 1)[-1]
     bootstrap = import_module(f"ignition.recipes.{bootstrap_name}.bootstrap")
     assert recipe.collective_tuning == "static"
     assert bootstrap.PreparationConfig.__dataclass_fields__["collective_tuning"].default == "static"
@@ -918,3 +918,21 @@ def test_moe_decode_a16_geometry_and_rebuild_metadata(monkeypatch):
         replace(ordinary, gpus=tuple(gpu(i, 95) for i in range(4)), force_moe_decode_a16=True)
     with pytest.raises(UsageError, match="mixed-prefill"):
         replace(ordinary, mixed_prefill=True, force_moe_decode_a16=True)
+
+
+@pytest.mark.parametrize("world", (1, 2, 4))
+def test_lil_glm_defaults_to_native_scales(world):
+    from ignition.recipes import resolve
+
+    model = resolve("lil-glm-5.3-flash")
+    def make(mode=None):
+        return planning.fit(model.recipe, model.checkpoint, tuple(gpu(i, 256) for i in range(world)),
+                            concurrency=1, reserve_bytes=0, speculation=None, expert_scale_compression=mode)
+    automatic, native = make(), make("native")
+    assert automatic.expert_scale_compression is None
+    assert native.expert_scale_compression is None
+    assert automatic.weights_bytes == native.weights_bytes
+    assert automatic.recipe.name == "lil_glm53"
+    assert automatic.recipe.prepare is resolve("glm-5.3-flash").recipe.prepare
+    with pytest.raises(UsageError, match="does not prepare this scale encoding"):
+        make("csf")

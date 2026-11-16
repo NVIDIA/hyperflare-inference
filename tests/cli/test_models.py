@@ -21,7 +21,7 @@ HUB = Path.home() / ".cache/huggingface/hub"
 def test_declarations_import_without_model_dependencies():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; from ignition.recipes import aliases; from ignition import planning;"
-         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'qwen3.8-27b-qad', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'mimo-v2.6-flash-rl', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'kimi-k3.1-pro', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4', 'inkling-2-small-nvfp4');"
+         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'qwen3.8-27b-qad', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'mimo-v2.6-flash-rl', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'kimi-k3.1-pro', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4', 'inkling-2-small-nvfp4', 'lil-glm-5.3-flash');"
          " assert not {'torch', 'transformers', 'flare_heliopause'} & set(sys.modules)"],
         cwd=ROOT, check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -237,8 +237,10 @@ def test_declared_ranges_are_consistent():
         for checkpoint in recipe.checkpoints:
             assert checkpoint.revision == "local" if Path(checkpoint.repository).is_absolute() else len(checkpoint.revision) == 40
             assert 0 <= checkpoint.draft_bytes <= checkpoint.device_bytes
-            # A draft model may have its own checkpoint index.
-            assert checkpoint.device_bytes - checkpoint.draft_bytes + checkpoint.mapped_host_bytes <= checkpoint.stored_bytes
+            # The pinned LIL checkpoint stores 9,825,076,532 CSF bytes; SM103
+            # consumes 19,025,362,944 expanded scale bytes. A draft may have its own index.
+            expansion = 19_025_362_944 - 9_825_076_532 if checkpoint.alias == "lil-glm-5.3-flash" else 0
+            assert checkpoint.device_bytes - expansion - checkpoint.draft_bytes + checkpoint.mapped_host_bytes <= checkpoint.stored_bytes
 
 
 def test_local_checkpoint_alias_uses_actual_directory(tmp_path, monkeypatch):
@@ -266,3 +268,21 @@ def test_alias_preserves_selected_checkpoint_when_directory_is_shared(tmp_path, 
         assert model.recipe is recipe and model.checkpoint is checkpoint
         assert model.directory == tmp_path
     assert resolve(str(tmp_path)).checkpoint is checkpoints[0]
+
+
+def test_lil_glm_pinned_alias_and_repository_keep_their_recipe(tmp_path):
+    original = resolve("glm-5.3-flash")
+    model = resolve("lil-glm-5.3-flash")
+    checkpoint = model.checkpoint
+    assert model.recipe.name == "lil_glm53"
+    assert checkpoint.repository == "local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"
+    assert checkpoint.revision == "dec48abd33efa73c3bb7c95b74eee10cad34f9be"
+    assert model.recipe is not original.recipe
+    for source in (checkpoint.repository, f"{checkpoint.repository}@{checkpoint.revision}"):
+        resolved = resolve(source)
+        assert resolved.recipe is model.recipe and resolved.checkpoint is checkpoint
+    snapshot = model.snapshot(tmp_path)
+    assert snapshot == tmp_path / "models--local-inference-lab--GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD" / "snapshots" / checkpoint.revision
+    cache_checkpoint(snapshot, checkpoint)
+    assert model.cached(tmp_path)
+    assert resolve("glm-5.3-flash").checkpoint is original.checkpoint

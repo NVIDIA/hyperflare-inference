@@ -225,6 +225,14 @@ pub struct AuthorizedCore {
 }
 
 impl AuthorizedCore {
+    /// Signed payload identity for binding observation and expert storage catalogs.
+    pub fn payload_id(&self) -> Option<[u8; 32]> {
+        match &self.kind {
+            AuthorizedKind::Payload(core) => Some(core.source.authorized.verified().core_id()),
+            AuthorizedKind::Legacy { .. } => None,
+        }
+    }
+
     /// Canonical model ID followed by serving aliases from the signed serving contract.
     pub fn model_names(&self) -> Result<Vec<&str>> {
         let contract = match &self.kind {
@@ -2605,6 +2613,10 @@ impl PayloadVerifiedCore {
 }
 
 impl PayloadAuthorizedCore {
+    pub(super) fn verified_metadata(&self) -> &payload_auth::VerifiedCore {
+        self.source.authorized.verified()
+    }
+
     pub(super) fn cluster(&self) -> Option<wire::Cluster> {
         self.source
             .authorized
