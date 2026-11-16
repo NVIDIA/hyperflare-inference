@@ -12,6 +12,9 @@
     continuation rows and padded staging when connecting the attention recipe.
     The installed b12x compressed-MLA auto mode emits unsupported block-scaled MMA
     on SM103; the recipe's default BF16 mode has not been checked separately.
+    Its MXFP4 indexer also emits an unsupported SM103 MMA. Connect the reference
+    paged-logit component with matching planar key writes and query quantization;
+    integrate DerpSeek's candidate-restricted scoring and top-K selection.
     Qualify full graph transitions and MTP before serving comparisons. Account
     for DerpSeek exact's enabled W8 output projection, low-latency GEMMs and
     fused preparation seams when attributing remaining full-step differences.

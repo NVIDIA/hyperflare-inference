@@ -24,3 +24,8 @@ submodule and retain its license in LICENSE.DeepJIT. Flare's host_bindings.cpp
 passes logical expert count independently of physical HBM tensor extents.
 The binding has a separate preparation runtime and uses the carried CUDA
 headers; it does not add a native serving dependency.
+
+host/csrc/jit_kernels/impls/sm100_mqa_logits.hpp is also unchanged from that
+DeepGEMM revision. mqa_bindings.cpp supplies caller-owned logits and scheduler
+storage to its paged MXFP4 indexer launcher. It preserves the reference kernel
+and separated cache planes while exposing allocation lifetimes to preparation.

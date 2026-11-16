@@ -836,6 +836,30 @@ capacities with changing inputs and masks, and check declaration lifetimes and
 replay allocations. These are synthetic component checks, not qualification of
 a DeepSeek serving recipe or speculative acceptance behavior.
 
+`ignition.components.mxfp4_logits.PreparedPagedMXFP4Logits` prepares the pinned
+DeepGEMM SM103 index-scoring kernel with explicit logits and scheduler scratch.
+It takes 32-head, 128-element MXFP4 queries, four packed UE8M0 scale bytes per
+head, FP32 head weights, and separate value/scale cache planes. Cache pages hold
+64 or 128 keys with a 512-byte-aligned page stride. Each query row supplies its
+own page table and visible length, allowing different speculative prefixes of
+one request. Columns outside that length are undefined and must be masked by
+the selection stage. This component computes scores; it does not select keys
+or implement candidate-restricted scoring.
+
+With the `megamoe` preparation dependency installed and an assigned SM103 GPU:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mxfp4_logits_cuda.py -q
+```
+
+On GB300, generated packed inputs match the pinned DeepGEMM public API exactly
+at 1, 17 and 257 query rows, both page sizes, and a 2,049-key capacity. Tests
+change queries, lengths and page mappings between replays, include empty rows,
+and check cache preservation and allocation-free compiled graph replay.
+Compute Sanitizer memcheck reports zero errors for these cases. These
+checks qualify the storage binding; they do not qualify query quantization,
+top-K selection, full attention or exported native serving.
+
 The preparation helpers in `ignition.components.mega_attention_weights` apply
 the reference projection layouts once: query output rows are interleaved in
 16-element head chunks, while grouped output input columns are interleaved in
