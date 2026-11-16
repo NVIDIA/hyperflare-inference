@@ -31,6 +31,23 @@ class MegaMoeWeights:
     down: tuple[torch.Tensor, torch.Tensor]
 
 
+@dataclass(frozen=True)
+class SharedFp8Planes:
+    """FP8 shared-expert matrices with equivalent native scales for each row."""
+
+    w13: torch.Tensor
+    s13: torch.Tensor
+    w2: torch.Tensor
+    s2: torch.Tensor
+
+
+def _pack_scales(value, rows, columns, count):
+    import deep_gemm
+
+    fp32 = (value.to(torch.int32) << 23).view(torch.float32)
+    return deep_gemm.transform_sf_into_required_layout(fp32, rows, columns, (1, 32), count)
+
+
 def pack_mxfp4_planes(planes):
     """Apply DeepGEMM's reference MXFP4 transform without requantizing weights.
 
@@ -52,13 +69,9 @@ def pack_mxfp4_planes(planes):
                    for t in (planes.w13, planes.s13, planes.w2, planes.s2))):
         raise ValueError("MegaMoE packing requires matched contiguous MXFP4 planes and 128-aligned widths")
 
-    def scales(value, rows, columns):
-        fp32 = (value.to(torch.int32) << 23).view(torch.float32)
-        return deep_gemm.transform_sf_into_required_layout(fp32, rows, columns, (1, 32), count)
-
     gate_up, down = deep_gemm.transform_weights_for_mega_moe(
-        (planes.w13.view(torch.int8), scales(planes.s13, 2 * intermediate, hidden)),
-        (planes.w2.view(torch.int8), scales(planes.s2, hidden, intermediate)),
+        (planes.w13.view(torch.int8), _pack_scales(planes.s13, 2 * intermediate, hidden, count)),
+        (planes.w2.view(torch.int8), _pack_scales(planes.s2, hidden, intermediate, count)),
     )
     return MegaMoeWeights(tuple(persistent_copy(t) for t in gate_up),
                           tuple(persistent_copy(t) for t in down))
@@ -147,3 +160,55 @@ def load_mxfp4_planes(loader, prefixes, *, hidden_size, intermediate_size,
     for source, target in zip(sources, (planes.s13, planes.s2)):
         expand_source_scales(source, target, swizzled=False)
     return planes
+
+
+def load_shared_fp8_planes(loader, prefix, *, hidden_size, intermediate_size,
+                           block_size, projection_names=("w1", "w3", "w2"), scale_name="scale"):
+    """Retain shared FP8 weights and broadcast block scales to native 1x32 groups.
+
+    Broadcasting the checkpoint's scale bytes preserves their numerical values;
+    no shared weight is converted to FP4 to enable the fused kernel.
+    """
+    loader._require_open()
+    block_m, block_k = block_size
+    if (block_m <= 0 or block_k <= 0 or block_k % 32 or hidden_size <= 0
+            or intermediate_size <= 0 or hidden_size % 128 or intermediate_size % 128
+            or len(projection_names) != 3 or len(set(projection_names)) != 3):
+        raise ValueError("shared MegaMoE weights require 128-aligned widths and native block-FP8 scales")
+    weights, scales = [], []
+    for index, projection in enumerate(projection_names):
+        rows, columns = (hidden_size, intermediate_size) if index == 2 else (intermediate_size, hidden_size)
+        name = prefix + "." + projection
+        weight = loader.load_tensor(name + ".weight", temporary=True)
+        scale = loader.load_tensor(name + "." + scale_name, temporary=True)
+        if (weight.dtype != torch.float8_e4m3fn or weight.shape != (rows, columns)
+                or scale.dtype not in (torch.uint8, torch.float8_e8m0fnu)
+                or scale.shape != ((rows + block_m - 1) // block_m, (columns + block_k - 1) // block_k)):
+            raise ValueError(f"shared FP8 checkpoint geometry or scale format mismatch: {name}")
+        weights.append(weight)
+        scales.append(scale.view(torch.uint8).repeat_interleave(block_m, dim=0)[:rows]
+                      .repeat_interleave(block_k // 32, dim=1)[:, :columns // 32].contiguous())
+    return SharedFp8Planes(torch.cat(weights[:2]), torch.cat(scales[:2]), weights[2], scales[2])
+
+
+def pack_shared_fp8_planes(planes):
+    """Pack shared FP8 matrices for the same MegaMoE launch as routed MXFP4 experts."""
+    import deep_gemm
+    from ignition.preparation.persistent import persistent_copy
+
+    rows, hidden = planes.w13.shape
+    intermediate = rows // 2
+    if (rows % 2 or intermediate % 128 or hidden % 128
+            or planes.w2.shape != (hidden, intermediate)
+            or planes.s13.shape != (rows, hidden // 32) or planes.s2.shape != (hidden, intermediate // 32)
+            or any(t.dtype != torch.float8_e4m3fn for t in (planes.w13, planes.w2))
+            or any(t.dtype != torch.uint8 for t in (planes.s13, planes.s2))
+            or any(t.device != planes.w13.device or not t.is_contiguous()
+                   for t in (planes.w13, planes.s13, planes.w2, planes.s2))):
+        raise ValueError("shared MegaMoE packing requires matched FP8 matrices and native 1x32 scale bytes")
+    gate_up, down = deep_gemm.transform_weights_for_mega_moe(
+        (planes.w13, _pack_scales(planes.s13[None], rows, hidden, 1).squeeze(0)),
+        (planes.w2, _pack_scales(planes.s2[None], hidden, intermediate, 1).squeeze(0)),
+    )
+    return MegaMoeWeights(tuple(persistent_copy(t) for t in gate_up),
+                          tuple(persistent_copy(t) for t in down))

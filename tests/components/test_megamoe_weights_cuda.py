@@ -13,7 +13,9 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from ignition.components.megamoe_weights import load_mxfp4_planes, pack_mxfp4_planes
+from ignition.components.megamoe_weights import (
+    load_mxfp4_planes, pack_mxfp4_planes, load_shared_fp8_planes, pack_shared_fp8_planes,
+)
 from ignition.components.weights import DirectWeightLoader
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 
@@ -80,6 +82,19 @@ def assert_planes(planes, prefixes, expected, first, last):
             torch.testing.assert_close(actual.cpu(), wanted, rtol=0, atol=0)
 
 
+def undo_gate_up(value):
+    groups, rows, columns = value.shape
+    tiled = value.reshape(groups, rows // 16, 2, 8, columns)
+    return torch.cat((tiled[:, :, 0].reshape(groups, rows // 2, columns),
+                      tiled[:, :, 1].reshape(groups, rows // 2, columns)), dim=1)
+
+
+def undo_scale_rows(value):
+    groups, rows, columns = value.shape
+    return value.reshape(groups, rows // 128, 32, 4, columns).transpose(2, 3).reshape(
+        groups, rows, columns).contiguous().view(torch.uint8)
+
+
 @pytest.mark.parametrize("interval", [(0, 256), (64, 192)])
 def test_csf_and_native_scales_preserve_weight_bytes_and_partitions(source, interval):
     root, expected = source
@@ -136,17 +151,6 @@ def test_kernel_weight_layout_roundtrips_native_checkpoint_bytes(source, tmp_pat
                                   hidden_size=128, intermediate_size=256)
     packed = pack_mxfp4_planes(planes)
 
-    def undo_gate_up(value):
-        groups, rows, columns = value.shape
-        tiled = value.reshape(groups, rows // 16, 2, 8, columns)
-        return torch.cat((tiled[:, :, 0].reshape(groups, rows // 2, columns),
-                          tiled[:, :, 1].reshape(groups, rows // 2, columns)), dim=1)
-
-    def undo_scale_rows(value):
-        groups, rows, columns = value.shape
-        return value.reshape(groups, rows // 128, 32, 4, columns).transpose(2, 3).reshape(
-            groups, rows, columns).contiguous().view(torch.uint8)
-
     for actual, expected in (
         (undo_gate_up(packed.gate_up[0].cpu().view(torch.uint8)), planes.w13),
         (undo_gate_up(undo_scale_rows(packed.gate_up[1].cpu())), planes.s13),
@@ -175,3 +179,37 @@ def test_checkpoint_planes_match_independent_cpu_decode(layer):
     with DirectWeightLoader(manifest, "cuda:0", prefixes=tuple(p + "." for p in prefixes)) as loader:
         planes = load_mxfp4_planes(loader, prefixes, hidden_size=5120, intermediate_size=2304)
     assert_planes(planes, prefixes, expected, 0, 2304)
+
+
+@pytest.mark.parametrize("layer", [0, 39])
+def test_shared_checkpoint_keeps_fp8_weights_and_exact_scale_values(layer, tmp_path):
+    pytest.importorskip("deep_gemm", reason="requires the megamoe preparation extra")
+    snapshot = os.environ.get("FLARE_DEEPSEEK41_CSF_SNAPSHOT")
+    if not snapshot:
+        pytest.skip("requires the DeepSeek V4.1 Flash lossless-CSF checkpoint")
+    from ignition.components.megamoe_kernel import initialize
+
+    initialize(tmp_path / "kernels")
+    root = Path(snapshot)
+    manifest = inspect_indexed_checkpoint(root)
+    prefix = f"layers.{layer}.ffn.shared_experts"
+    with DirectWeightLoader(manifest, "cuda:0", prefixes=(prefix + ".",)) as loader:
+        planes = load_shared_fp8_planes(loader, prefix, hidden_size=5120,
+                                        intermediate_size=2304, block_size=(32, 32))
+    packed = pack_shared_fp8_planes(planes)
+    actual = (
+        undo_gate_up(packed.gate_up[0].cpu().view(torch.uint8)[None])[0],
+        undo_gate_up(undo_scale_rows(packed.gate_up[1].cpu()[None]))[0],
+        packed.down[0].cpu().view(torch.uint8),
+        undo_scale_rows(packed.down[1].cpu()[None])[0],
+    )
+    expected = []
+    for projection in ("w1", "w3", "w2"):
+        name = prefix + "." + projection
+        with safe_open(root / manifest.tensors[name + ".weight"].shard, framework="pt") as reader:
+            expected.append((reader.get_tensor(name + ".weight").view(torch.uint8),
+                             reader.get_tensor(name + ".scale").view(torch.uint8).repeat_interleave(32, dim=0)))
+    wanted = (torch.cat((expected[0][0], expected[1][0])), torch.cat((expected[0][1], expected[1][1])),
+              expected[2][0], expected[2][1])
+    for value, reference in zip(actual, wanted, strict=True):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
