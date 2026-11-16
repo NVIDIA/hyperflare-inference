@@ -50,7 +50,8 @@ class ModelWeights:
     embedding_norm: torch.Tensor
     final_norm: torch.Tensor
     output_query: torch.Tensor
-    unembedding: torch.Tensor
+    # BF16 rows, or an MXFP8 weight when the plan stores the vocabulary head as MXFP8.
+    unembedding: object
     allocated_bytes: int
     draft: object | None = None
     vision: object | None = None
@@ -73,10 +74,16 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
-             draft_head_quantization=None, markov_head_quantization=None, online_mxfp8=False):
+             draft_head_quantization=None, markov_head_quantization=None, online_mxfp8=False,
+             mxfp8_vocabulary_head=False):
         """`online_mxfp8` stores each decoder layer's attention input and output projections, and the
         drafter's query/key/value, attention output and recurrent context projections
-        (`DraftWeights.load`), as MXFP8."""
+        (`DraftWeights.load`), as MXFP8.
+
+        `mxfp8_vocabulary_head` stores this rank's unembedding shard as MXFP8 (E4M3 values with one
+        power-of-two scale per 32 hidden columns of each vocabulary row) and releases its BF16 rows. The
+        drafter's proposal heads are derived from the BF16 rows before that. An MXFP8 proposal head would
+        hold the same values, so proposals then read the target's shard instead of a copy."""
         before = torch.cuda.memory_allocated(device)
         with InklingWeightLoader(manifest, device, shard=shard, progress=progress, vision=vision,
                                  online_mxfp8=online_mxfp8) as loader:
@@ -85,14 +92,15 @@ class ModelWeights:
             if type(count) is not int or not 1 <= count <= c.text.layers:
                 raise ValueError("decoder layer count must fit the checkpoint")
             first, last = shard.padded_partition(c.text.vocabulary, alignment=64)
-            def vocabulary_rows(name):
-                value = persistent_zeros((last - first, c.text.hidden), dtype=torch.bfloat16, device=device)
+            def vocabulary_rows(name, temporary=False):
+                allocate = torch.zeros if temporary else persistent_zeros
+                value = allocate((last - first, c.text.hidden), dtype=torch.bfloat16, device=device)
                 stop = min(last, c.text.vocabulary)
                 loader._copy(value[:stop - first], loader._sources[name][first:stop])
                 loader._session.flush()
                 return value
             embedding = vocabulary_rows(TEXT_PREFIX + ".embed_tokens.weight")
-            head = vocabulary_rows("lm_head.weight")
+            head = vocabulary_rows("lm_head.weight", temporary=mxfp8_vocabulary_head)
             loaded = tuple(loader.load_layer(index) for index in range(count))
             norm = loader.load_tensor(TEXT_PREFIX + ".norm.weight")
             embed_norm = loader.load_tensor(TEXT_PREFIX + ".embed_norm.weight")
@@ -110,9 +118,14 @@ class ModelWeights:
         draft = None
         if drafting:
             from .dspark_weights import DraftWeights
+            shared = mxfp8_vocabulary_head and draft_head_quantization == "mxfp8"
             draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress,
-                draft_head_quantization=draft_head_quantization, markov_head_quantization=markov_head_quantization,
-                online_mxfp8=online_mxfp8)
+                draft_head_quantization=None if shared else draft_head_quantization,
+                markov_head_quantization=markov_head_quantization, online_mxfp8=online_mxfp8)
+        if mxfp8_vocabulary_head:
+            from ignition.components.vocabulary import mxfp8_draft_head
+
+            head = mxfp8_draft_head(head)
         return cls(c, shard, loaded, embedding, embed_norm, norm, query, head,
                    torch.cuda.memory_allocated(device) - before, draft, tower)
 

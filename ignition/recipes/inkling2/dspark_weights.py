@@ -136,7 +136,8 @@ class DraftWeights:
     norm: torch.Tensor
     layers: tuple[DraftLayerWeights, ...]
     recurrent: RecurrentWeights
-    # Quantized copy of the target vocabulary shard that only proposals read; None projects with the target's.
+    # Quantized copy of the target vocabulary shard that only proposals read; None projects with the target's
+    # stored shard.
     draft_head: object | None = None
 
     @classmethod
@@ -146,7 +147,8 @@ class DraftWeights:
 
         `draft_head_quantization` (`nvfp4` or `mxfp8`) adds a quantized copy of `target_head` for the block's
         vocabulary logits. `markov_head_quantization` (`fp8`) stores the recurrent correction head, the
-        output map folded through `target_head`, as row-scaled E4M3. The target head keeps BF16.
+        output map folded through `target_head`, as row-scaled E4M3. `target_head` is the BF16 shard, which
+        this function reads and does not retain; `ModelWeights.load` decides how the target stores it.
         `online_mxfp8` stores each layer's fused query/key/value projection and attention output
         projection, and the recurrent head's context projection, as MXFP8: E4M3 values with one
         power-of-two scale per 32 input columns of each output row. Each layer's key/value projection of

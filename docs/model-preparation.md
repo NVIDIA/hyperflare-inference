@@ -1333,9 +1333,10 @@ per rank. `--draft-head-quantization nvfp4` or `mxfp8` prepares a quantized
 copy of the target's vocabulary shard that only proposals read, and
 `--markov-head-quantization fp8` stores the folded correction head as E4M3
 values with one FP32 scale per vocabulary row. Both are computed at load from
-checkpoint values; target verification keeps the BF16 head, so a quantized
-proposal head changes which tokens are proposed and how often they are
-accepted, never the output distribution. The default omits both flags.
+checkpoint values; target verification reads the target's own vocabulary
+shard, so a quantized proposal head changes which tokens are proposed and how
+often they are accepted, never the output distribution. The default omits both
+flags.
 
 `--online-mxfp8` stores every decoder layer's attention projections as MXFP8
 while loading: the fused input projections (query, output gate, key, value,
@@ -1346,9 +1347,10 @@ do not depend on the rows fused with it. Activations stay BF16 in prefill,
 decoding, and verification, which therefore project with the same weight
 values, and the output projection writes BF16 partial sums. A TP4 rank then
 reads 1.22 GB of attention projection weights per decode step where BF16 reads
-2.36 GB, and holds 1.14 GB less. Routers, vocabulary shards, convolutions,
-norms, clip scales, the relative-logit projection, experts, and the vision
-encoder keep checkpoint precision. The default omits the flag.
+2.36 GB, and holds 1.14 GB less. Routers, convolutions, norms, clip scales,
+the relative-logit projection, experts, and the vision encoder keep checkpoint
+precision, as do the vocabulary shards unless the plan selects the
+`with-vocabulary-head` group described below. The default omits the flag.
 
 The flag also stores three of DSpark's BF16 projections in the same MXFP8
 form, with BF16 activations: each of the five draft layers' fused
@@ -1389,6 +1391,54 @@ requests and 49.8 to 50.0 ms with four, against 35.4 to 36.7 ms and 52.0 to
 53.2 ms. Time to first token at 131,990 prompt tokens is 43.5 to 43.7 s
 against 40.7 to 43.1 s: MXFP8 weights with BF16 activations project an
 8,192-row chunk more slowly than BF16 weights.
+
+`--online-mxfp8 --online-mxfp8-scope with-vocabulary-head` selects a larger
+conversion group: the projections above and each rank's unembedding shard,
+50,256 vocabulary rows by 4,608 values at TP4, in the same MXFP8 form. The
+default group, `all`, keeps the shard in BF16, and a core exported with
+`--online-mxfp8` alone records `all`. Every decode and verification round
+reads the shard once: 239 MB as MXFP8 and 463 MB as BF16. b12x's
+packed-weight kernels multiply BF16 activations and store BF16, so each logit
+of the MXFP8 shard is an FP32 sum rounded to BF16 before the FP32 softcap,
+where the BF16 shard's logit stays FP32. The softcap, the valid-vocabulary
+mask, the cross-rank gather, sampling, log-probabilities, resumed sampling,
+and DSpark verification receive FP32 values in the same layouts under either
+group. Unlike a quantized proposal head, this group changes the distribution
+that verification and sampling use. The proposal heads are still derived from
+the BF16 rows, which the rank releases after converting them. With
+`--draft-head-quantization mxfp8` the proposal head would repeat the target's
+stored values, so proposals read the target's shard; without a quantized
+proposal head they read it too.
+
+The MXFP8 shard's stored weights differ from the checkpoint's by 2.7% in
+relative norm. On the final hidden states of 1,536 positions of prose and
+source code, computed by the Transformers reference layers with MXFP8
+attention projections and E4M3 key/value history, the recipe's logit kernels
+on a GB10 give softcapped logits that differ between the two shard formats by
+0.084 on average and by at most 0.93, at a softcap of 30. The two formats
+agree on the most likely token at 99.48% of positions; at each of the eight
+others the BF16 shard's two largest logits are within 0.07 of each other. The
+Kullback-Leibler divergence of the MXFP8 shard's distribution from the BF16
+shard's at temperature 1 has mean 3.6e-4, 99th percentile 2.1e-3, and maximum
+7.7e-3, and next-token accuracy is 60.33% against 60.39%. The stored weights
+account for most of this: with exact products of the stored weights the
+agreement is 99.61% and the mean divergence 3.1e-4, while rounding the BF16
+shard's logits to BF16 gives 99.54% and 5.3e-5 and leaves the two largest
+logits exactly equal at 0.8% of positions. The BF16 kernel repeats bit for
+bit and differs from exact products by at most 1.5e-4.
+`tests/recipes/test_inkling2_vocabulary_cuda.py` checks on SM120, with the
+checkpoint's shards of ranks 0 and 3, that loading stores the converted
+values and shares them with proposals, that the kernels at 1, 4, 8, and 128
+rows multiply by the stored values, and that the softcapped FP32 logits stay
+within the stored weights' distance of the BF16 shard's.
+
+On four DGX Sparks at TP4 with 32 requests and 8,192-token chunks, a core
+exported with the `with-vocabulary-head` group fixes 83.52 GiB of device
+memory per rank where a core exported with the `all` group fixes 83.73 GiB.
+In a rank-0 kernel trace of one-token rounds with one request, the vocabulary
+projection takes 0.94 ms against 1.89 ms. Over load at one to four requests, a
+one-token round takes a mean 22.2 ms of GPU time with one request, 30.3 ms
+with two, and 41.5 ms with four, against 22.4, 31.5, and 42.6 ms.
 
 Export with default tuning and Torch compilation:
 

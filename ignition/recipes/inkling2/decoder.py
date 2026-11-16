@@ -259,9 +259,11 @@ class PreparedDecoder:
             session=session, workspace=workspace, name=name, examples=examples, rows=rows, route_gather=route_gather)
         self.layers = self.stack.layers
         self.logits = PreparedLogits(weights.head, text, weights.rank, tokens=samples,
-                                     session=session, name=name + ".logits", examples=examples)
-        local = example("local_logits", (samples, weights.head.shape[0]), torch.float32)
-        gathered = example("gathered_logits", (samples, weights.head.shape[0] * weights.world), torch.float32)
+                                     session=session, name=name + ".logits", examples=examples, workspace=workspace)
+        # The embedding and unembedding shards hold the same vocabulary rows; the unembedding may be packed.
+        columns = weights.embedding.shape[0]
+        local = example("local_logits", (samples, columns), torch.float32)
+        gathered = example("gathered_logits", (samples, columns * weights.world), torch.float32)
         self.gather = PreparedAllGather(local.view(torch.bfloat16), gathered.view(torch.bfloat16),
             runtime=vocabulary_runtime, coordinator=coordinator, session=session,
             name=name + ".logit_gather").functional(session=session)

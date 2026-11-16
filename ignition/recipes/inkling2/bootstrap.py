@@ -81,6 +81,9 @@ class PreparationConfig:
     # Stores the target's attention input and output projections, and the drafter's query/key/value, attention
     # output and recurrent context projections, as MXFP8 at load; False keeps the checkpoint's BF16.
     online_mxfp8: bool = False
+    # The conversion group `online_mxfp8` selects: `all` is the set above, and `with-vocabulary-head` adds the
+    # target's unembedding shard, whose logits then come from b12x's BF16-output packed-weight kernels.
+    online_mxfp8_scope: str = "all"
     benchmark_selection: object | None = None
 
     def __post_init__(self):
@@ -122,6 +125,10 @@ class PreparationConfig:
             raise ValueError("proposal head quantization requires learned speculation with positive draft depth")
         if type(self.online_mxfp8) is not bool:
             raise ValueError("Inkling 2 online MXFP8 conversion must be a boolean")
+        if self.online_mxfp8_scope not in ("all", "with-vocabulary-head"):
+            raise ValueError("Inkling 2 online MXFP8 scope must be all or with-vocabulary-head")
+        if self.online_mxfp8_scope != "all" and not self.online_mxfp8:
+            raise ValueError("Inkling 2 online MXFP8 scope requires online MXFP8 conversion")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency) if self.vision else 0)
@@ -134,6 +141,10 @@ class PreparationConfig:
         return (parallel_speculative_shapes(self.max_active, self.speculative_widths,
             self.speculative_token_capacity, self.speculative_graph_budget, fixed_width=self.speculative_fixed_width)
             if self.drafting else ())
+
+    @property
+    def mxfp8_vocabulary_head(self):
+        return self.online_mxfp8 and self.online_mxfp8_scope == "with-vocabulary-head"
 
     @property
     def draft_tokens(self):
@@ -235,7 +246,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                                     progress=progress, drafting=config.drafting, vision=config.vision,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    online_mxfp8=config.online_mxfp8)
+                                    online_mxfp8=config.online_mxfp8,
+                                    mxfp8_vocabulary_head=config.mxfp8_vocabulary_head)
         weights_bytes = torch.cuda.memory_allocated(device)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
@@ -274,12 +286,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         coordinator = CollectivePreparation(group)
         runtime, vocabulary_runtime, sampling_runtime, logprob_runtime = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
-            hidden=text.hidden, local_vocabulary=weights.head.shape[0],
+            hidden=text.hidden, local_vocabulary=weights.embedding.shape[0],
             draft_block=model.draft.block)
         identity = hashlib.sha256(json.dumps({"text": model.text.__dict__ | {"local_layers": sorted(model.text.local_layers)},
             "quantization": model.quantization, "headers": headers, "world_size": world,
             "decoder_layers": len(weights.layers), "contract": "inkling2.paged-text.v1"}
-            | ({"online_mxfp8": True} if config.online_mxfp8 else {}),
+            | ({"online_mxfp8": True} if config.online_mxfp8 else {})
+            | ({"online_mxfp8_scope": config.online_mxfp8_scope} if config.online_mxfp8_scope != "all" else {}),
             sort_keys=True, default=str).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
@@ -427,7 +440,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         reserved_tensor_bytes=torch.cuda.memory_reserved(device), headroom_bytes=config.headroom_bytes,
         tuning=tuning, compiled_decoder=config.compile_decoder,
         draft_head_quantization=config.draft_head_quantization,
-        markov_head_quantization=config.markov_head_quantization, online_mxfp8=config.online_mxfp8)
+        markov_head_quantization=config.markov_head_quantization, online_mxfp8=config.online_mxfp8,
+        online_mxfp8_scope=config.online_mxfp8_scope)
     # Each decoder layer's weights form one stable payload; vocabulary shards, norms and the output query share misc.
     rebuild_weights = declare_weights(weights, components=("embedding", "embedding_norm", "final_norm", "output_query",
                                                            "unembedding", "draft", "vision"))

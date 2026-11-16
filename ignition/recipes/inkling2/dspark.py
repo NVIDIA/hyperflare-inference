@@ -254,12 +254,14 @@ class PreparedDraft:
         self.layer_plans = tuple(self.staging.index(layer.attention.staging) for layer in self.layers)
         self.norm = norm(scratch.accumulator, weights.draft.norm, scratch.hidden,
             eps=d.text["rms_norm_eps"], session=session, name=name + ".norm")
-        if weights.draft.draft_head is None:
-            self.head = UnquantizedProjection(scratch.hidden, weights.head, scratch.local_logits,
+        # Proposals read the drafter's quantized copy of the target's vocabulary shard when it has one, and
+        # otherwise the target's shard in the form the target stores: BF16 or MXFP8.
+        head = weights.head if weights.draft.draft_head is None else weights.draft.draft_head
+        if isinstance(head, torch.Tensor):
+            self.head = UnquantizedProjection(scratch.hidden, head, scratch.local_logits,
                 session=session, name=name + ".head").functional(session=session)
         else:
-            # A quantized copy of the target's vocabulary shard serves proposals; verification keeps the target's.
-            self.head = QuantizedProjection(scratch.hidden, weights.draft.draft_head, scratch.local_logits,
+            self.head = QuantizedProjection(scratch.hidden, head, scratch.local_logits,
                 session=session, name=name + ".head", activation_mode="a16",
                 workspace=workspace).functional(session=session)
         self.recurrent = PreparedRecurrentProposalHead(weights.draft.recurrent,

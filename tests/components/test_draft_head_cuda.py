@@ -120,6 +120,34 @@ def test_mxfp8_vocabulary_shard_replays_changed_inputs_without_target_mutation(r
             graph.reset()
 
 
+@pytest.mark.parametrize("rows,functional", [(1, False), (8, True), (160, True)])
+@torch.no_grad()
+def test_mxfp8_vocabulary_shard_fills_fp32_logits_with_its_bf16_products(rows, functional):
+    """A consumer of FP32 logits binds a packed shard: the kernel's BF16 products arrive widened, unchanged."""
+    torch.manual_seed(41019)
+    target = torch.randn((192, 512), device="cuda", dtype=torch.bfloat16) * .02
+    weight = mxfp8_draft_head(target)
+    scales = weight.weight.scale_rows.view(torch.float8_e8m0fnu).reshape(192, 16)
+    restored = (weight.weight.values.float().reshape(192, 16, 32) * scales.float()[..., None]).reshape(192, 512)
+    source = torch.randn((rows, 512), device="cuda", dtype=torch.bfloat16)
+    local, logits = (torch.full((rows, 192), float("nan"), device="cuda") for _ in range(2))
+    with RecordedPreparationSession(device="cuda:0", checkpoint="mxfp8-fp32-logits",
+            workload_schema="a16-vocabulary", numerical_policy="mxfp8-weight-bf16-source",
+            autotune_effort="off") as session:
+        operation = PreparedVocabularyProjection(source, weight, local, logits,
+            runtime=None, coordinator=None, session=session, name="head")
+        if functional:
+            operation.functional(session=session)
+        session.tune(show_progress=False)
+        result = compile_forward(lambda: operation(source))() if functional else operation(source)
+    assert result.dtype == torch.float32 and result.shape == (rows, 192)
+    assert functional or result.data_ptr() == logits.data_ptr()
+    assert torch.equal(result, result.bfloat16().float())
+    expected = source.double() @ restored.double().T
+    bound = expected.abs() * 2**-7 + expected.abs().max() * 1e-6
+    assert bool(((result.double() - expected).abs() <= bound).all())
+
+
 @torch.no_grad()
 def test_mxfp8_head_retains_the_actual_bounded_proposal_distribution():
     from ignition.components.draft_sampling import PreparedDraftProposal

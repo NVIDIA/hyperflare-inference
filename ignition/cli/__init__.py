@@ -261,7 +261,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " default: checkpoint precision)")
     advanced.add_argument("--online-mxfp8-scope", metavar="SCOPE",
                           help="select the recipe's online MXFP8 conversion group; Kimi K3.1 supports all"
-                               " (every eligible target and DFlash2 projection) or kda-input (default: recipe scope)")
+                               " (every eligible target and DFlash2 projection) or kda-input; Inkling 2 supports all"
+                               " (attention and DSpark projections) or with-vocabulary-head, which also stores the"
+                               " target vocabulary head as MXFP8 (default: recipe scope)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")
