@@ -576,7 +576,7 @@ def _record_fp4_expert_owner_provenance(prepared, *, prefixes, sources, projecti
     scale_native = (scale_compression is None and swizzled
                     and first % 128 == 0 and local % 128 == 0
                     and (first // group) % 4 == 0 and local_scale_columns % 4 == 0)
-    if s13 is not None and w13_stable:
+    if s13 is not None and w13_stable and f'{prefixes[0]}.{first_name}.{scale_name}' in sources:
         for index, prefix in enumerate(prefixes):
             for projection, _rows in ((first_name, 0), (second_name, local)):
                 source = sources[f'{prefix}.{projection}.{scale_name}']
@@ -599,7 +599,7 @@ def _record_fp4_expert_owner_provenance(prepared, *, prefixes, sources, projecti
                         extents=extents, source_strides=source_strides,
                         destination_strides=destination_strides),)
                 s13_sources.append(entry)
-    if s2 is not None:
+    if s2 is not None and f'{prefixes[0]}.{down_name}.{scale_name}' in sources:
         for index, prefix in enumerate(prefixes):
             source = sources[f'{prefix}.{down_name}.{scale_name}']
             entry = dict(tensor=f'{prefix}.{down_name}.{scale_name}',
@@ -1377,6 +1377,8 @@ class DirectWeightLoader:
             raise ValueError("ordinary FP4 experts require NVFP4 or MXFP4")
         group = 16 if format == "nvfp4" else 32
         scale_dtype = torch.float8_e4m3fn if format == "nvfp4" else torch.uint8
+        csf_scales = (format == "nvfp4" and not sm103 and
+                      f"{prefixes[0]}.{up_name}.{scale_name}.csf32_bases" in self._sources)
         first, last = _aligned_range(intermediate_range, intermediate_size, group)
         local, count = last - first, len(prefixes)
         if not sm103:
@@ -1428,7 +1430,7 @@ class DirectWeightLoader:
                 (down_name, w2[index], s2[index]),
             ):
                 source = self._sources[f"{prefix}.{projection}.{weight_name}"]
-                scale = self._sources[f"{prefix}.{projection}.{scale_name}"]
+                scale = (None if csf_scales else self._sources[f"{prefix}.{projection}.{scale_name}"])
                 if format == "mxfp4":
                     if source.dtype == torch.int8:
                         source = source.view(torch.uint8)
@@ -1438,20 +1440,23 @@ class DirectWeightLoader:
                                  else (intermediate_size, hidden_size))
                 if source.dtype != torch.uint8 or source.shape != (rows, columns // 2):
                     raise ValueError(f"{prefix}.{projection}: packed FP4 weight geometry mismatch")
-                if scale.shape != (rows, columns // group) or scale.dtype != scale_dtype:
+                if scale is not None and (scale.shape != (rows, columns // group)
+                                            or scale.dtype != scale_dtype):
                     raise ValueError(f"{prefix}.{projection}: {format.upper()} block scale geometry or dtype mismatch")
                 if projection == down_name and shared is not None:
                     # The reader stages the whole projection; its rows are contiguous in the checkpoint.
                     if shared.reader(index) == shared.rank:
                         offset = index // shared.world * slot_bytes
                         self._copy(shared.view(shared.rank, offset, source.shape, torch.uint8), source, numeric=False)
-                        self._copy(shared.view(shared.rank, offset + down_bytes, scale.shape, scale_dtype), scale,
-                                   numeric=False)
+                        if scale is not None:
+                            self._copy(shared.view(shared.rank, offset + down_bytes, scale.shape, scale_dtype),
+                                       scale, numeric=False)
                 else:
                     self._copy(values, source[:, first // 2:last // 2] if projection == down_name
                                else source[first:last])
-                    self._copy(blocks, scale[:, first // group:last // group] if projection == down_name
-                               else scale[first:last])
+                    if scale is not None:
+                        self._copy(blocks, scale[:, first // group:last // group] if projection == down_name
+                                   else scale[first:last])
                 if format == "mxfp4":
                     continue
                 value = self._sources[f"{prefix}.{projection}.{global_scale_name}"]
@@ -1476,12 +1481,14 @@ class DirectWeightLoader:
             for index in range(count):
                 reader, offset = shared.reader(index), index // shared.world * slot_bytes
                 down = shared.view(reader, offset, (hidden_size, intermediate_size // 2), torch.uint8)
-                blocks = shared.view(reader, offset + down_bytes, (hidden_size, intermediate_size // group),
-                                     scale_dtype)
                 w2[index].copy_(down[:, first // 2:last // 2])
-                s2[index].copy_(blocks[:, first // group:last // group])
+                if not csf_scales:
+                    blocks = shared.view(reader, offset + down_bytes, (hidden_size, intermediate_size // group),
+                                         scale_dtype)
+                    s2[index].copy_(blocks[:, first // group:last // group])
             record_numeric_tensor(w2)
-            record_numeric_tensor(s2)
+            if not csf_scales:
+                record_numeric_tensor(s2)
             shared.exchange()
         if (activation_mode == "a4" or a4_prefill) and activation_outer_scale == "expert":
             if scale_vectors is None or len(scale_vectors) != 4:
@@ -1505,6 +1512,18 @@ class DirectWeightLoader:
             target = (persistent_empty if retained else torch.empty)(values.shape, dtype=torch.float32, device=self.device)
             self._copy(target, values)
             device_scales.append(target)
+        if csf_scales:
+            # Stage the CSF planes once (join=2 interleaves up/gate per expert for w13);
+            # they expand into swizzled owners below, mirroring load_nvfp4_experts.
+            s13src = self._queue_csf_sources(
+                [f"{prefix}.{projection}.{scale_name}" for prefix in prefixes
+                 for projection in (up_name, gate_name)],
+                rows=intermediate_size, columns=hidden_size // group, quantization="nvfp4",
+                temporary=True, join=2, row_range=(first, last))
+            s2src = self._queue_csf_sources(
+                [f"{prefix}.{down_name}.{scale_name}" for prefix in prefixes],
+                rows=hidden_size, columns=intermediate_size // group, quantization="nvfp4",
+                temporary=True, column_range=(first // group, last // group))
         self._session.flush()
         if sm103:
             if swiglu_clamp_after_silu:
@@ -1517,16 +1536,28 @@ class DirectWeightLoader:
         scale_allocate = (persistent_empty if scale_compression is None
                           and (activation_mode != "a16" or plan.prepared_format.packing.value == "source_native")
                           else None)
+        if csf_scales:
+            from b12x._lib.quant._csf_prepare import expand_source_scales, validate_source
+
+            csf13 = (scale_allocate or torch.empty)(
+                (count, 2 * local, hidden_size // group), dtype=scale_dtype, device=self.device)
+            csf2 = (scale_allocate or torch.empty)(
+                (count, hidden_size, local // group), dtype=scale_dtype, device=self.device)
+            for source, destination in ((s13src, csf13), (s2src, csf2)):
+                validate_source(source)
+                expand_source_scales(source, destination, swizzled=not sm103)
         packed = moe.PackedWeights(
             w13=w13, w2=w2,
-            w13_block_scales=swizzle_block_scale(s13, allocate=scale_allocate) if format == "nvfp4" else s13,
-            w2_block_scales=swizzle_block_scale(s2, allocate=scale_allocate) if format == "nvfp4" else s2, **gains)
+            w13_block_scales=(csf13 if csf_scales else swizzle_block_scale(s13, allocate=scale_allocate))
+            if format == "nvfp4" else s13,
+            w2_block_scales=(csf2 if csf_scales else swizzle_block_scale(s2, allocate=scale_allocate))
+            if format == "nvfp4" else s2, **gains)
         del s13, s2, blocks
         prepared = moe.prepare_weights(plan=plan, weights=packed, scale_scratch=scale_scratch, allocate=persistent_empty)
         source_metadata = _snapshot_fp4_sources(self._sources, tuple(
             f'{prefix}.{projection}.{name}'
             for prefix in prefixes for projection in projection_names
-            for name in (weight_name, scale_name)))
+            for name in ((weight_name,) if csf_scales else (weight_name, scale_name))))
         recorder = lambda value: _record_fp4_expert_owner_provenance(
             value, prefixes=prefixes, sources=source_metadata,
             projection_names=projection_names, weight_name=weight_name,
