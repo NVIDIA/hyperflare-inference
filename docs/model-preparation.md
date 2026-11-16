@@ -634,8 +634,15 @@ alternate graph capacities and routes, reject changed input geometry, and check
 declaration-storage release. This component is not selected by a model recipe.
 
 `ignition.components.megamoe_tiers.MegaMoeHostTier` allocates registered host
-rows through `CoreStorage` for the SM103 MegaMoE path. Load transformed expert
-weights into those rows with `copy_weights`, which accepts bounded batches.
+rows through `CoreStorage` for the SM103 MegaMoE path. Allocate final HBM rows
+with `allocate_mxfp4_weights`; `load_mxfp4_weights_into` fills either those
+matrices or the tier's `cpu_weights` in bounded batches. It releases each
+batch's source and transformed tensors before loading the next batch, so
+host-bound weights do not accumulate in persistent GPU storage. The loader
+accepts explicit checkpoint prefixes, gate/up/down projection names, scale names
+and intermediate partitions. Recipes supply checkpoint mapping; the loader
+does not select placements. `copy_weights` also accepts already transformed
+batches, whose temporary ownership remains the caller's responsibility.
 Pass the remaining physical HBM matrices and this tier to `PreparedMegaMoe`.
 Its input expert IDs address host rows first, followed by HBM rows; the recipe
 must translate canonical routing IDs to that storage order. Logical expert
@@ -656,6 +663,20 @@ Run the host-tier composition checks with:
 ```sh
 FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_megamoe_tiers_cuda.py -q
 ```
+
+`tests/components/test_megamoe_loading_cuda.py` checks exact tier contents and
+persistent allocation stability while loading synthetic CSF weights in partial
+batches. Run it with the same GPU opt-in. For a complete checkpoint-layer check,
+set `FLARE_MEGAMOE_REFERENCE_ROWMAP` to DerpSeek's
+`engine/rowmaps/exact-splitA-varied-mm.json` and set the snapshot variable above,
+then run `tests/components/test_megamoe_layer_cuda.py`. That fixture uses layer
+0's 224 static HBM experts, 96 cached HBM copies and 160 host experts, with
+checkpoint weights and generated activations and routes. It checks every
+physical copy and compares compiled execution with all-HBM execution,
+including quiescent mapping changes between existing host and cache copies.
+On GB300, outputs and route counts match exactly at 1, 8, 64 and 256 rows with
+zero and four cold-lane clusters, without allocations during captured replay.
+This check does not exercise concurrent replacement or physical movement.
 
 The tests compare compiled split-tier execution with all-HBM execution, including
 changing routes, padding, exact per-row counts and replay allocations. The real

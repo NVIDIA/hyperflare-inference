@@ -12,7 +12,6 @@ from ignition.components.megamoe import MegaMoeGeometry, MegaMoeWorkspace, Prepa
 from ignition.components.megamoe_tiers import MegaMoeHostTier
 from ignition.components.megamoe_weights import MegaMoeWeights, Mxfp4Planes, pack_mxfp4_planes
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.core_storage import CoreStorage
 from ignition.preparation.tuning import RecordedPreparationSession
 from tests.components.test_megamoe_cuda import experts
 
@@ -25,16 +24,8 @@ def select(weights, rows):
                           tuple(t[rows].clone() for t in weights.down))
 
 
-@pytest.fixture(scope="module")
-def core_storage():
-    storage = CoreStorage()
-    with storage:
-        yield storage
-    storage.close()
-
-
 @pytest.mark.parametrize("checkpoint", [True, False], ids=["checkpoint", "synthetic-geometry"])
-def test_compiled_tiers_match_hbm_with_changing_routes(request, tmp_path, checkpoint, core_storage):
+def test_compiled_tiers_match_hbm_with_changing_routes(request, tmp_path, checkpoint, megamoe_core_storage):
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("requires SM103")
     if checkpoint:
@@ -51,7 +42,7 @@ def test_compiled_tiers_match_hbm_with_changing_routes(request, tmp_path, checkp
             return torch.randint(118, 124, shape, device="cuda", dtype=torch.uint8, generator=g)
         routed = pack_mxfp4_planes(Mxfp4Planes(values((12, 1024, 512)), scales((12, 1024, 32)),
             values((12, 1024, 256)), scales((12, 1024, 16))))
-    storage = core_storage
+    storage = megamoe_core_storage
     graphs = []
     workspace = MegaMoeWorkspace(geometry,
         device="cuda:0", kernel_cache=tmp_path)

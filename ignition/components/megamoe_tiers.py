@@ -3,9 +3,11 @@
 
 """Mapped host weight storage and per-layer control for the MegaMoE Grace tier."""
 
+import math
+
 import torch
 
-from ignition.components.megamoe_weights import MegaMoeWeights
+from ignition.components.megamoe_weights import MegaMoeWeights, mxfp4_weight_layouts
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 
@@ -32,21 +34,15 @@ class MegaMoeHostTier:
         self.geometry, self.rows = geometry, rows
         self.host_lane_clusters = host_lane_clusters
         self.regions, self.host_views, self.device_views = [], [], []
-        for label, width, columns, scale in (
-            ("gate_up", 2 * geometry.intermediate, geometry.hidden, False),
-            ("gate_up_scales", 2 * geometry.intermediate, geometry.hidden, True),
-            ("down", geometry.hidden, geometry.intermediate, False),
-            ("down_scales", geometry.hidden, geometry.intermediate, True),
-        ):
-            cols = columns // (128 if scale else 2)
-            stride = (width * cols, 1, width) if scale else (width * cols, cols, 1)
-            region = storage.host_allocate(f"{name}.{label}", (rows * width * cols,),
-                                           torch.int32 if scale else torch.int8)
+        labels = ("gate_up", "gate_up_scales", "down", "down_scales")
+        layouts = mxfp4_weight_layouts(rows, geometry.hidden, geometry.intermediate)
+        for label, (shape, dtype, stride) in zip(labels, layouts):
+            region = storage.host_allocate(f"{name}.{label}", (math.prod(shape),), dtype)
             self.regions.append(region)
-            shape = (rows, width, cols)
             self.host_views.append(region.host_view.as_strided(shape, stride))
             self.device_views.append(region.device_view.as_strided(shape, stride))
         self.weights = MegaMoeWeights(tuple(self.device_views[:2]), tuple(self.device_views[2:]))
+        self.cpu_weights = MegaMoeWeights(tuple(self.host_views[:2]), tuple(self.host_views[2:]))
         for value in self.device_views:
             record_numeric_tensor(value)
         # The pinned kernel's table contains four 128-byte maps per CTA, at most 160 CTAs.

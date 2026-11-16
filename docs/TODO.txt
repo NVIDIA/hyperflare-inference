@@ -1,6 +1,6 @@
 [ ] Integrate the qualified MegaMoE preparation components into DeepSeek TP1
     capture, including shared experts, HBM/Grace storage, routing telemetry and
-    MTP. Bound loading-time weight transforms when filling physical tier rows.
+    MTP. Validate the bounded tier loader within full-model preparation.
     Compare exported Flare/Parallax serving with DerpSeek exact using matched
     workloads, memory budgets, arithmetic and speculative settings.
 

@@ -48,13 +48,14 @@ def _pack_scales(value, rows, columns, count):
     return deep_gemm.transform_sf_into_required_layout(fp32, rows, columns, (1, 32), count)
 
 
-def pack_mxfp4_planes(planes):
+def pack_mxfp4_planes(planes, *, temporary=False):
     """Apply DeepGEMM's reference MXFP4 transform without requantizing weights.
 
     Matches vLLM's SM100 MegaMoE preparation: reinterpret native exponent bytes
     as FP32 powers of two, pack the native scale layout, then interleave gate
-    and up rows. Call only during preparation; the returned planes own their
-    final storage through graph capture and export.
+    and up rows. Call only during preparation. By default, returned planes use
+    persistent storage for capture and export. ``temporary=True`` leaves them
+    in disposable storage for copying into final tier rows.
     """
     import deep_gemm
     from ignition.preparation.persistent import persistent_copy
@@ -73,6 +74,8 @@ def pack_mxfp4_planes(planes):
         (planes.w13.view(torch.int8), _pack_scales(planes.s13, 2 * intermediate, hidden, count)),
         (planes.w2.view(torch.int8), _pack_scales(planes.s2, hidden, intermediate, count)),
     )
+    if temporary:
+        return MegaMoeWeights(gate_up, down)
     return MegaMoeWeights(tuple(persistent_copy(t) for t in gate_up),
                           tuple(persistent_copy(t) for t in down))
 
@@ -212,3 +215,68 @@ def pack_shared_fp8_planes(planes):
     )
     return MegaMoeWeights(tuple(persistent_copy(t) for t in gate_up),
                           tuple(persistent_copy(t) for t in down))
+
+
+def mxfp4_weight_layouts(count, hidden, intermediate):
+    """Physical value/scale layouts for transformed routed weights in either tier."""
+    if (any(type(v) is not int or v <= 0 for v in (count, hidden, intermediate))
+            or hidden % 128 or intermediate % 128):
+        raise ValueError("MegaMoE weight storage requires positive rows and 128-aligned widths")
+    result = []
+    for rows, columns in ((2 * intermediate, hidden), (hidden, intermediate)):
+        result.append(((count, rows, columns // 2), torch.int8,
+                       (rows * (columns // 2), columns // 2, 1)))
+        result.append(((count, rows, columns // 128), torch.int32,
+                       (rows * (columns // 128), 1, rows)))
+    return tuple(result)
+
+
+def allocate_mxfp4_weights(count, hidden, intermediate, *, device):
+    """Allocate only the physical HBM expert rows, ready for bounded loading."""
+    from ignition.preparation.persistent import persistent_empty
+    from ignition.preparation.tensor_metadata import record_numeric_tensor
+
+    values = tuple(persistent_empty(shape, dtype, device, stride=stride)
+                   for shape, dtype, stride in mxfp4_weight_layouts(count, hidden, intermediate))
+    for value in values:
+        record_numeric_tensor(value)
+    return MegaMoeWeights(values[:2], values[2:])
+
+
+def load_mxfp4_weights_into(loader, prefixes, destination, *, hidden_size, intermediate_size,
+                            batch_experts=8, intermediate_range=None,
+                            projection_names=("w1", "w3", "w2"), scale_name="scale"):
+    """Load and transform bounded batches directly into final physical tier rows.
+
+    Destination tensors may be HBM tensors or registered CPU host views. Scale
+    layout and native bytes are preserved. The caller owns placement order;
+    this function neither chooses experts nor changes routing mappings.
+    """
+    from ignition.components.weights import _aligned_range
+
+    loader._require_open()
+    prefixes = tuple(prefixes)
+    if (not prefixes or len(set(prefixes)) != len(prefixes)
+            or type(batch_experts) is not int or batch_experts <= 0):
+        raise ValueError("MegaMoE bounded loading requires unique expert prefixes and a positive batch size")
+    first, last = _aligned_range(intermediate_range, intermediate_size, 32)
+    targets = (*destination.gate_up, *destination.down)
+    layouts = mxfp4_weight_layouts(len(prefixes), hidden_size, last - first)
+    for target, (shape, dtype, stride) in zip(targets, layouts, strict=True):
+        if target.shape != shape or target.dtype != dtype or target.stride() != stride:
+            raise ValueError("MegaMoE bounded loading requires destination geometry and packed scale layout to match")
+        if target.device.type != "cpu" and target.device != loader.device:
+            raise ValueError("MegaMoE destinations must be host views or use the loader's CUDA device")
+    if len({t.device for t in targets}) != 1:
+        raise ValueError("MegaMoE physical weight planes must occupy one tier")
+    for start in range(0, len(prefixes), batch_experts):
+        stop = min(start + batch_experts, len(prefixes))
+        planes = load_mxfp4_planes(loader, prefixes[start:stop], hidden_size=hidden_size,
+            intermediate_size=intermediate_size, intermediate_range=(first, last),
+            projection_names=projection_names, scale_name=scale_name)
+        packed = pack_mxfp4_planes(planes, temporary=True)
+        for target, source in zip(targets, (*packed.gate_up, *packed.down), strict=True):
+            target[start:stop].copy_(source)
+        # Release this batch before allocating the next source/transform planes.
+        del source, packed, planes
+    return destination
