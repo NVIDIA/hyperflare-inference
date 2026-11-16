@@ -1,3 +1,12 @@
+[ ] Integrate the qualified MegaMoE preparation components into DeepSeek TP1
+    capture, including shared experts, HBM/Grace storage, routing telemetry and
+    MTP. Compare exported Flare/Parallax serving with DerpSeek exact using matched
+    workloads, memory budgets, arithmetic and speculative settings.
+
+[ ] Add a DerpSeek-style static-plus-LRU placement contender to Parallax. Check
+    decisions against the reference on identical routing traces before claiming
+    policy equivalence; use the common movement ledger for comparisons.
+
 [ ] Compare Inkling 2 effort-zero generation with the canonical target using
     the static NVFP4 checkpoint. Native TP4 emits analysis in content_text and
     violates exact-output prompts; a long-prefix lookup also intermittently

@@ -9,6 +9,15 @@ release. The public source repository includes the preparation tools and their
 dependency declarations. Model weights, datasets, prepared model cores, and
 container images are not included in the binary release.
 
+## MegaMoE preparation kernels
+
+Ignition carries unchanged DerpSeek MegaMoE headers in
+[megamoe_kernel](ignition/components/megamoe_kernel/NOTICE), with MIT license
+texts from DeepSeek, ds41 and DerpSeek. The optional `megamoe` preparation extra
+pins the DeepGEMM host binding used to compile them. Exported CUDA graphs retain
+the compiled kernels; the native CLI has no Python or DeepGEMM host dependency.
+Full-model DeepSeek serving through this preparation path is not qualified.
+
 ## Native CLI release dependencies
 
 [third_party/rust/README.md](third_party/rust/README.md) groups the native Cargo

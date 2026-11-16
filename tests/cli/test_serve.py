@@ -484,7 +484,7 @@ def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_pat
         installed.append(True)
     monkeypatch.setattr(environment.runtime_patches, "apply", install)
     monkeypatch.setenv("HOME", str(tmp_path))
-    for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
+    for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "DG_JIT_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", "TORCH_CUSTOM_PYTHONPATH"):
         monkeypatch.setenv(name, "previous")
     path = tmp_path / "config.toml"
@@ -494,6 +494,7 @@ def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_pat
     assert installed == [True]
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-b,GPU-a"
     assert os.environ["B12X_COMPILE_CACHE_DIR"] == f"{tmp_path}/kernels/b12x"
+    assert os.environ["DG_JIT_CACHE_DIR"] == f"{tmp_path}/kernels/deepgemm"
     assert Path(os.environ["FLASHINFER_WORKSPACE_BASE"]).is_relative_to(tmp_path / "kernels" / "flashinfer")
     assert os.environ["TRITON_CACHE_DIR"] == f"{tmp_path}/kernels/triton"
     assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == f"{tmp_path}/kernels/inductor"
@@ -517,7 +518,7 @@ def test_environment_leaves_pip_cuda_toolchain_selection_to_cutile(monkeypatch, 
     monkeypatch.syspath_prepend(str(package.parent))
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH", "TRITON_PTXAS.EXE_PATH",
-                 "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
+                 "B12X_COMPILE_CACHE_DIR", "DG_JIT_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", "TORCH_CUSTOM_PYTHONPATH"):
         monkeypatch.setenv(name, "previous")
     if inherited_cuda is None:
@@ -540,7 +541,7 @@ def test_environment_sets_the_recipe_b12x_settings_over_inherited_values(monkeyp
 
     monkeypatch.setattr(environment.runtime_patches, "apply", lambda: ())
     monkeypatch.setenv("HOME", str(tmp_path))
-    for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
+    for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "DG_JIT_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", *RECIPE.b12x_environment):
         monkeypatch.setenv(name, "inherited")
     monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "hierarchical")

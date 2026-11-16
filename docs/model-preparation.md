@@ -577,6 +577,37 @@ expansion buffers reused by serial expert layers. Planning conservatively estima
 `--expert-scale-compression native` preserves native scales. MLA arithmetic defaults
 to BF16; `--mla-compute-mode auto` lets b12x select arithmetic while preserving
 packed KV storage.
+
+The GB300 MegaMoE preparation components are available for component validation;
+the DeepSeek recipe does not yet export a TP1 MegaMoE serving core. Install the
+optional preparation dependency with:
+
+```sh
+uv sync --locked --extra prepare --extra test --extra megamoe
+```
+
+`ignition.components.megamoe_weights.load_mxfp4_planes` loads packed MXFP4 weights
+and expands CSF scales once into native UE8M0 bytes. `pack_mxfp4_planes` applies
+the DeepGEMM gate/up interleave and scale layout without requantizing weights.
+The reference kernel headers and their licenses are retained in
+`ignition/components/megamoe_kernel`; its initializer builds a private header
+tree under the supplied kernel cache and leaves the installed dependency intact.
+These components do not enable live expert movement or change the existing TP
+recipe's compressed-scale execution path.
+
+On an assigned GPU, validate synthetic source planes and checkpoint partitions
+with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_megamoe_weights_cuda.py -q
+```
+
+Set `FLARE_DEEPSEEK41_CSF_SNAPSHOT` to an indexed lossless-CSF checkpoint to
+include real expert comparisons from target layers 0, 20 and 39. Without it,
+those cases skip. The index must declare `metadata.total_size` equal to its
+stored tensor payload bytes; logical uncompressed sizes are not substitutes.
+These checks compare preparation bytes, not full-model accuracy or serving speed.
+
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses

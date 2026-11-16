@@ -1,0 +1,11 @@
+This directory carries unchanged MegaMoE headers from chronarion/derpseek,
+commit fd3f9981468ac5bf0cdf30392f5baf7d9c1c6db8:
+https://github.com/chronarion/derpseek/tree/fd3f9981468ac5bf0cdf30392f5baf7d9c1c6db8/engine/overlay/megamoe_fork
+
+DerpSeek adds direct host-memory expert reads and a separate scheduling lane.
+The headers derive from DeepSeek's DeepGEMM through Garner McCloud's ds41
+recipe and chronarion's dsv41 integration. The original header comments and
+license texts are retained in LICENSE.DeepGEMM, LICENSE.ds41 and LICENSE.DerpSeek.
+
+Flare's Python binding prepares a private include tree for kernel compilation
+before graph capture. It does not change the carried CUDA implementations.

@@ -357,6 +357,11 @@ tileiras = [
 ]
 
 [[package]]
+name = "deep-gemm"
+version = "2.8.0+local"
+source = { git = "https://github.com/vllm-project/DeepGEMM.git?rev=1e1842a833699298f7afc02eefb2ed168fff6938#1e1842a833699298f7afc02eefb2ed168fff6938" }
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -533,6 +538,9 @@ api-test = [
     { name = "openai" },
     { name = "pytest" },
 ]
+megamoe = [
+    { name = "deep-gemm" },
+]
 prepare = [
     { name = "accelerate" },
     { name = "cryptography" },
@@ -562,6 +570,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'prepare'", specifier = ">=46,<52" },
     { name = "cuda-python", marker = "extra == 'prepare'", specifier = "==13.3.1" },
     { name = "cuda-tile", extras = ["tileiras"], marker = "extra == 'prepare'", specifier = "==1.6.0" },
+    { name = "deep-gemm", marker = "extra == 'megamoe'", git = "https://github.com/vllm-project/DeepGEMM.git?rev=1e1842a833699298f7afc02eefb2ed168fff6938" },
     { name = "flare-heliopause", marker = "extra == 'prepare'", directory = "heliopause" },
     { name = "flashinfer-python", extras = ["b12x"], marker = "extra == 'prepare'", git = "https://github.com/local-inference-lab/flashinfer.git?rev=598c8547be335bcd833254177ac18ccb2bf4dabc" },
     { name = "huggingface-hub", marker = "extra == 'prepare'", specifier = "==1.33.0" },
@@ -578,7 +587,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'prepare'", specifier = "==0.29.1+cu132", index = "https://download.pytorch.org/whl/cu132" },
     { name = "transformers", extras = ["torch", "vision", "chat-template"], marker = "extra == 'prepare'", specifier = "==5.23.0" },
 ]
-provides-extras = ["test", "api-test", "prepare"]
+provides-extras = ["test", "api-test", "megamoe", "prepare"]
 
 [[package]]
 name = "iniconfig"
