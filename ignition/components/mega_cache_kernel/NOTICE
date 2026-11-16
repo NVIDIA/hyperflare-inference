@@ -1,0 +1,13 @@
+The csrc/ directory contains unchanged CUDA and header files from vLLM
+v0.32.0, commit 5df63a7203cdb9328d824a27b682e77c7b9928be:
+https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be/csrc
+
+kernels.py retains unchanged Triton function definitions from that revision:
+- vllm/models/deepseek_v4/common/ops/fused_indexer_q.py: _fp32x2_to_fp4x2
+- vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py:
+  _rope_quant_insert_nvfp4_kernel
+
+LICENSE.vllm retains the Apache-2.0 license. The original source credits the
+vLLM contributors; the CUDA source also identifies its TensorRT-LLM and vLLM
+rotary-kernel inspirations. Flare supplies the isolated operator registration
+and preparation build. It does not import the vLLM serving runtime.

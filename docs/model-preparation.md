@@ -672,6 +672,29 @@ The prepared-component test also compiles two serialized attention calls sharing
 epoch state, alternates graph capacities at 1, 16, 17, 24, and 76 rows, and checks
 exact outputs, scale bytes, declaration-storage release, and geometry rejection.
 
+`ignition.components.mega_attention_cache` supplies matching cache layout and
+insertion components. `MegaCacheLayout` separates page payloads from scale rows
+and aligns page strides to 512 bytes. `PreparedMegaCacheWriter` prepares the
+unchanged vLLM rotary-and-insert CUDA kernel for MXFP8 windows and its Triton
+kernel for NVFP4 compressed rows. The latter publishes ratio-two rows only when
+a pair closes. Values, positions, slots, and rotary tables are explicit inputs;
+inactive slots and alignment padding remain unchanged. The continuation helpers
+copy both planes into a staging prefix and commit only accepted suffix tokens
+back to the 128-token ring. They do not copy a contiguous record prefix between
+pages of different sizes, because the scale region moves with the page size.
+
+With the same FlashMLA reference library, run the cache-component checks:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mega_attention_cache_cuda.py -q
+```
+
+These checks cover encoded bytes against an independent encoder with identity
+rotation, inactive slots, pair boundaries, padded pages, partial ring commits,
+and compiled writer-to-attention composition against FlashMLA. The cache
+components are not selected by the DeepSeek recipe; full-model continuation,
+speculative state, and serving performance still require recipe integration.
+
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses

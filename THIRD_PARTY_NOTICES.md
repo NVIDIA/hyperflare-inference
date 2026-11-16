@@ -29,6 +29,14 @@ The MIT license and upstream notices credit Garner McCloud's
 sources against the installed Torch ABI before capture. The kernels have
 component-level graph replay tests; they are not wired into a serving recipe.
 
+Ignition also carries vLLM v0.32.0's unchanged CUDA window-cache writer and
+Triton compressed-cache writer in
+[mega_cache_kernel](ignition/components/mega_cache_kernel/NOTICE), under
+Apache-2.0. Flare supplies an isolated operator registration and preparation
+build. These writers fuse rotary transformation, quantization, and insertion
+into the page layout consumed by the reference attention kernel. They do not
+require the vLLM serving runtime.
+
 ## Native CLI release dependencies
 
 [third_party/rust/README.md](third_party/rust/README.md) groups the native Cargo
