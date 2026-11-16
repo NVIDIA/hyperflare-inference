@@ -4,12 +4,77 @@
 """Mapped host weight storage and per-layer control for the MegaMoE Grace tier."""
 
 import math
+from dataclasses import dataclass
 
 import torch
 
-from ignition.components.megamoe_weights import MegaMoeWeights, mxfp4_weight_layouts
+from ignition.components.megamoe_weights import (
+    MegaMoeWeights, allocate_mxfp4_weights, load_mxfp4_weights_into,
+    load_shared_fp8_planes, mxfp4_weight_layouts, pack_shared_fp8_planes,
+)
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.preparation.tensor_metadata import record_numeric_tensor
+
+
+@dataclass(frozen=True)
+class MegaMoeLayerWeights:
+    """Fused expert operands, canonical row mapping and retained protocol owners."""
+
+    routed: MegaMoeWeights
+    shared: MegaMoeWeights | None
+    workspace: object
+    host_tier: object | None
+    expert_map: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MegaMoeLayerLayout:
+    """Explicit physical rows for one layer; repeated cross-tier IDs are copies.
+
+    HBM rows override host rows in the initial canonical mapping. The caller
+    owns placement selection and any later publication after readers drain.
+    Workspaces may be shared only across serialized calls of equal geometry.
+    """
+
+    workspace: object
+    host_experts: tuple[int, ...]
+    hbm_experts: tuple[int, ...]
+    storage: object
+    host_lane_clusters: int = 4
+
+    def load(self, loader, prefixes, *, shared_prefix, block_size,
+             projection_names=("w1", "w3", "w2"), scale_name="scale", name):
+        prefixes = tuple(prefixes)
+        g = self.workspace.geometry
+        physical = self.host_experts + self.hbm_experts
+        if (not prefixes or len(prefixes) != len(set(prefixes))
+                or not self.hbm_experts or len(physical) != g.experts
+                or any(type(i) is not int or not 0 <= i < len(prefixes) for i in physical)
+                or any(len(set(rows)) != len(rows) for rows in (self.host_experts, self.hbm_experts))
+                or set(physical) != set(range(len(prefixes)))
+                or (shared_prefix is not None) != bool(g.shared_experts)
+                or loader.device != self.workspace.buffer.device):
+            raise ValueError("MegaMoE placement must cover canonical experts with unique rows per tier and matching workspace")
+        routed = allocate_mxfp4_weights(len(self.hbm_experts), g.hidden, g.intermediate, device=loader.device)
+        tier = (MegaMoeHostTier(g, rows=len(self.host_experts), storage=self.storage,
+                               name=name, host_lane_clusters=self.host_lane_clusters)
+                if self.host_experts else None)
+        destinations = [(self.hbm_experts, routed)]
+        if tier is not None:
+            destinations.append((self.host_experts, tier.cpu_weights))
+        for ids, target in destinations:
+            load_mxfp4_weights_into(loader, [prefixes[i] for i in ids], target,
+                hidden_size=g.hidden, intermediate_size=g.intermediate,
+                projection_names=projection_names, scale_name=scale_name)
+        shared = (pack_shared_fp8_planes(load_shared_fp8_planes(loader, shared_prefix,
+            hidden_size=g.hidden, intermediate_size=g.intermediate, block_size=block_size,
+            projection_names=projection_names, scale_name=scale_name)) if shared_prefix is not None else None)
+        mapping = [0] * len(prefixes)
+        for row, canonical in enumerate(physical):
+            mapping[canonical] = row
+        expert_map = persistent_copy(torch.tensor(mapping, dtype=torch.int32, device=loader.device))
+        record_numeric_tensor(expert_map)
+        return MegaMoeLayerWeights(routed, shared, self.workspace, tier, expert_map)
 
 
 class MegaMoeHostTier:

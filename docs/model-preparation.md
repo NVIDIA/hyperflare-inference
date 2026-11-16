@@ -610,6 +610,10 @@ include real routed-expert comparisons from target layers 0, 20 and 39 and
 shared-expert comparisons from layers 0 and 39. Without it,
 those cases skip. The index must declare `metadata.total_size` equal to its
 stored tensor payload bytes; logical uncompressed sizes are not substitutes.
+The recipe accepts a `mxfp4_csf` quantization declaration with format version 1
+and `weight_scale_encoding: csf`, while requiring block-32 FP8 dense weights,
+UE8M0 scales, dynamic activations and FP4 experts. Scale payload readers retain
+their independent encoding and geometry checks.
 The staging tests compare quantization against an independent CPU calculation
 and replay graphs with changing activations, routing and padding masks.
 These checks establish component behavior, not full-model accuracy or serving speed.
@@ -631,7 +635,9 @@ FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_megamoe_
 The SM103 checks use eight real routed experts and optional shared FP8 weights.
 They compare compiled graphs against the reference at 1, 8, 64, and 256 rows,
 alternate graph capacities and routes, reject changed input geometry, and check
-declaration-storage release. This component is not selected by a model recipe.
+declaration-storage release. The DeepSeek expert-block preparation accepts this
+component through explicit layer layouts; the CLI's full-model preparation does
+not select it.
 
 `ignition.components.megamoe_tiers.MegaMoeHostTier` allocates registered host
 rows through `CoreStorage` for the SM103 MegaMoE path. Allocate final HBM rows
@@ -689,6 +695,29 @@ experts at 1, 16 and 192 rows. Both zero and four host-lane clusters are checked
 A separately exported checkpoint-component core passes 32 fresh native Helios
 replays with exact outputs and no CUDA allocations. These results do not qualify
 a model recipe, concurrent movement or end-to-end serving performance.
+
+`MegaMoeLayerLayout` pairs a protocol workspace with ordered canonical host and
+HBM expert IDs. It rejects missing experts, duplicate IDs within a tier and
+workspace mismatches before allocating weights. An ID present in both tiers
+has two physical copies; the initial map selects its HBM copy. Loading and
+mapping do not choose a placement policy.
+
+DeepSeek's `ModelWeights.load(..., megamoe_layouts=...)` accepts these layouts
+keyed by checkpoint FFN prefix, such as `layers.0.ffn` or `mtp.0.ffn`. A supplied
+inventory must cover every enabled target and draft layer. Its decoder composes
+the ordinary router with the canonical map and fused routed/shared execution;
+it does not also launch the standalone shared expert. The existing tensor-parallel
+expert path remains selected when layouts are absent.
+
+With the checkpoint and rowmap variables above, run
+`tests/components/test_megamoe_recipe_cuda.py` using the GPU opt-in to check the
+recipe's expert block. On GB300, target layer 0 matches canonical all-HBM
+execution at 1, 8, 64 and 256 rows, and draft layer 0 matches at 1, 8, 64 and
+192 rows. These checks use real router and expert weights with generated
+activations, changing padding and image-correction selection where declared.
+They check exact output/count agreement and allocation-free captured replay.
+They qualify the expert block, not full decoder state, learned speculation,
+vision processing or serving throughput.
 
 The SM103 fused decode-attention source in
 `ignition/components/mega_attention_kernel` is also available for component

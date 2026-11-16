@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from ignition.components.weights import MLPWeights
+from ignition.components.megamoe_tiers import MegaMoeLayerLayout
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
 from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from ignition.components.markov_sampling import fp8_markov_head
@@ -22,7 +23,7 @@ class ExpertWeights:
     router: torch.Tensor
     correction: torch.Tensor
     experts: object
-    shared: MLPWeights
+    shared: MLPWeights | None
     vision_correction: torch.Tensor | None = None
 
 
@@ -78,11 +79,20 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False):
+             vocabulary_parallel_sampling=False, megamoe_layouts=None):
         config = ModelConfig.load(manifest.metadata_path)
+        if megamoe_layouts is not None:
+            required = {f"layers.{i}.ffn" for i in range(config.layers)}
+            if dspark:
+                required.update(f"mtp.{i}.ffn" for i in range(config.draft.layers))
+            if set(megamoe_layouts) != required:
+                raise ValueError("MegaMoE preparation requires explicit layouts for every enabled target and draft layer")
+            if any(not isinstance(layout, MegaMoeLayerLayout) for layout in megamoe_layouts.values()):
+                raise TypeError("every MegaMoE layer requires a concrete MegaMoeLayerLayout")
         before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
-                                 expert_scale_compression=expert_scale_compression) as loader:
+                                 expert_scale_compression=expert_scale_compression,
+                                 megamoe_layouts=megamoe_layouts) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
@@ -107,11 +117,16 @@ class ModelWeights:
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
-                 expert_scale_compression=None):
+                 expert_scale_compression=None, megamoe_layouts=None):
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         self.dspark = dspark
         self.expert_scale_compression = expert_scale_compression
+        self.megamoe_layouts = {} if megamoe_layouts is None else dict(megamoe_layouts)
+        if any(not isinstance(layout, MegaMoeLayerLayout) for layout in self.megamoe_layouts.values()):
+            raise TypeError("every MegaMoE layer requires a concrete MegaMoeLayerLayout")
+        if self.megamoe_layouts and shard.world_size != 1:
+            raise ValueError("MegaMoE expert layouts require unsharded TP1 weights")
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
         self.config = ModelConfig.load(manifest.metadata_path)
         self.shard = shard
@@ -160,16 +175,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
             # Replicated index heads avoid a context-sized TP score reduction.
             result["index_q"] = self.load_linear(attn + ".indexer.wq_b")
             result["index_weights"] = self.load_tensor(attn + ".indexer.weights_proj.weight")
-        ffn = prefix + ".ffn"
-        interval = shard.partition(text["moe_intermediate_size"], alignment=32)
-        experts = self.load_experts(
-            [f"{ffn}.experts.{i}" for i in range(self.config.draft.experts if draft else text["n_routed_experts"])],
-            interval)
-        shared = MLPWeights(self.load_linear_group((ffn + ".shared_experts.w1", ffn + ".shared_experts.w3"),
-            row_ranges=(interval, interval)), self.load_linear(ffn + ".shared_experts.w2", columns=interval))
-        routed = ExpertWeights(self.load_tensor(ffn + ".gate.weight"),
-            self.load_tensor(ffn + ".gate.bias"), experts, shared,
-            self.load_tensor(ffn + ".gate.bias_vl") if self.config.vision is not None else None)
+        routed = self.load_ffn(layer, draft=draft)
         residual = {name: self.load_tensor(prefix + "." + name) for name in (
             "hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale",
             "attn_norm.weight", "ffn_norm.weight")}
@@ -180,3 +186,31 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
                 "weight": persistent_copy(self.load_tensor(prefix + ".engram.q_weight", dtype=torch.float32, temporary=True)
                           * self.load_tensor(prefix + ".engram.k_weight", dtype=torch.float32, temporary=True))}
         return LayerWeights(result, routed, residual, engram)
+
+    def load_ffn(self, layer, *, draft=False):
+        prefix = f"mtp.{layer}" if draft else f"layers.{layer}"
+        ffn = prefix + ".ffn"
+        text, shard = self.config.text, self.shard
+        interval = shard.partition(text["moe_intermediate_size"], alignment=32)
+        prefixes = [f"{ffn}.experts.{i}" for i in range(
+            self.config.draft.experts if draft else text["n_routed_experts"])]
+        if self.megamoe_layouts and ffn not in self.megamoe_layouts:
+            raise ValueError(f"MegaMoE preparation has no explicit layout for {ffn}")
+        layout = self.megamoe_layouts.get(ffn)
+        if layout is None:
+            experts = self.load_experts(prefixes, interval)
+            shared = MLPWeights(self.load_linear_group((ffn + ".shared_experts.w1", ffn + ".shared_experts.w3"),
+                row_ranges=(interval, interval)), self.load_linear(ffn + ".shared_experts.w2", columns=interval))
+        else:
+            g = layout.workspace.geometry
+            if ((g.hidden, g.intermediate, g.top_k, g.shared_experts) !=
+                    (text["hidden_size"], text["moe_intermediate_size"],
+                     self.config.draft.top_k if draft else text["num_experts_per_tok"], text["n_shared_experts"])):
+                raise ValueError("MegaMoE layout does not match the checkpoint's expert geometry")
+            experts = layout.load(self, prefixes, shared_prefix=ffn + ".shared_experts",
+                block_size=tuple(self.config.quantization["weight_block_size"]),
+                projection_names=("w1", "w3", "w2"), scale_name="scale", name=ffn)
+            shared = None
+        return ExpertWeights(self.load_tensor(ffn + ".gate.weight"),
+            self.load_tensor(ffn + ".gate.bias"), experts, shared,
+            self.load_tensor(ffn + ".gate.bias_vl") if self.config.vision is not None else None)

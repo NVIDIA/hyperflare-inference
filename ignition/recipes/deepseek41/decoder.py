@@ -16,6 +16,8 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.mhc import MHCWeights, MHCScratch, PreparedMHC, PreparedMHCPost
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.moe import RouterScratch, PreparedRouter, PreparedRoutedExperts
+from ignition.components.megamoe import PreparedMegaMoe
+from ignition.components.megamoe_tiers import MegaMoeLayerWeights
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.tuning import register_finalizer
@@ -159,25 +161,8 @@ class PreparedLayer:
         self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
             _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
             pre_mix=s.attn_mix, pre_out=s.pre_mix, **options)
-        self.router_projection = UnquantizedProjection(s.ffn_hc.normalized, weights.experts.router, s.router_logits,
-            session=session, name=name + ".router")
-        self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
-            score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
-            routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
-            image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
-            image_mask=self.image_mask)
-        self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
-            s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
-            router_plan=self.router.plan)
-        self.shared = PreparedMLP(s.ffn_hc.normalized, weights.experts.shared, s.shared.gate_up,
-            s.shared.intermediate, s.shared.output, session=session, name=name + ".shared", workspace=workspace,
-            swiglu_limit=text["swiglu_limit"], round_silu=False, activation_mode="auto")
-        self.concurrent_shared = None
-        if mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap:
-            self.concurrent_shared = ConcurrentSharedExpert(self.shared,
-                parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
-                session=session, workspace=workspace,
-                defer_launch=s.ffn_hc.normalized.shape[0] > 4)
+        self._prepare_experts(weights.experts, s, text, mode=mode, session=session,
+                              name=name, workspace=workspace)
         self.mlp_reduce = PreparedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".mlp_reduce")
         self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
@@ -187,18 +172,55 @@ class PreparedLayer:
             self.attention_hc.functional()
         self.attention_reduce.functional(session=session)
         self.ffn_hc.functional()
-        self.router_projection.functional(session=session)
-        self.router.functional(session=session)
-        self.experts.functional(session=session)
-        if self.concurrent_shared is None:
-            self.shared.functional(session=session)
-        else:
-            self.concurrent_shared.functional(session=session)
         self.mlp_reduce.functional(session=session)
         if self.post is not None:
             self.post.functional()
         self.has_image_mask = self.image_mask is not None
         register_finalizer(session, self.release_examples)
+
+    def _prepare_experts(self, weights, s, text, *, mode, session, name, workspace):
+        self.router_projection = UnquantizedProjection(s.ffn_hc.normalized, weights.router, s.router_logits,
+            session=session, name=name + ".router")
+        self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
+            score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
+            routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.correction,
+            image_correction_bias=weights.vision_correction if self.image_mask is not None else None,
+            image_mask=self.image_mask)
+        self.megamoe = self.expert_map = None
+        if isinstance(weights.experts, MegaMoeLayerWeights):
+            if weights.shared is not None:
+                raise ValueError("fused MegaMoE weights must own the shared expert exactly once")
+            expert = weights.experts
+            self.expert_map = expert.expert_map
+            if self.expert_map.shape != (weights.router.shape[0],):
+                raise ValueError("MegaMoE canonical mapping must match the router's expert columns")
+            padding = torch.zeros(s.ffn_hc.normalized.shape[0], device=s.ffn_hc.normalized.device, dtype=torch.bool)
+            self.megamoe = PreparedMegaMoe(s.ffn_hc.normalized, s.router.ids, s.router.weights,
+                padding, expert.routed, expert.shared, workspace=expert.workspace,
+                host_tier=expert.host_tier, clamp=text["swiglu_limit"], session=session, name=name + ".experts")
+            self.experts = self.shared = self.concurrent_shared = None
+        else:
+            self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts, s.router.ids,
+                s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
+                router_plan=self.router.plan)
+            self.shared = PreparedMLP(s.ffn_hc.normalized, weights.shared, s.shared.gate_up,
+                s.shared.intermediate, s.shared.output, session=session, name=name + ".shared", workspace=workspace,
+                swiglu_limit=text["swiglu_limit"], round_silu=False, activation_mode="auto")
+            self.concurrent_shared = None
+            if mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap:
+                self.concurrent_shared = ConcurrentSharedExpert(self.shared,
+                    parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
+                    session=session, workspace=workspace,
+                    defer_launch=s.ffn_hc.normalized.shape[0] > 4)
+        self.router_projection.functional(session=session)
+        self.router.functional(session=session)
+        if self.megamoe is not None:
+            return
+        self.experts.functional(session=session)
+        if self.concurrent_shared is None:
+            self.shared.functional(session=session)
+        else:
+            self.concurrent_shared.functional(session=session)
 
     def release_examples(self):
         self.scratch = self.metadata = self.image_mask = None
@@ -209,6 +231,20 @@ class PreparedLayer:
         incoming, next_mix, records, selection, _ = self._run(incoming, pre_mix, metadata, indices,
             selection, boundary=boundary, window_cache=window_cache)
         return incoming, next_mix, records, selection
+
+    def _run_experts(self, normalized, metadata):
+        pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
+        image_mask = metadata.token_ids >= 129280 if self.has_image_mask else None
+        router_logits = self.router_projection(normalized)
+        route = self.router(router_logits, image_mask=image_mask)
+        if self.megamoe is not None:
+            mapped = self.expert_map[route.ids.long()]
+            return self.megamoe(normalized, mapped, route.weights, metadata.positions < 0), route
+        routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
+                              selected_logits=route.selected_logits, image_mask=image_mask)
+        shared = (self.shared(normalized) if self.concurrent_shared is None
+                  else self.concurrent_shared.finish(pending, routed))
+        return routed + shared, route
 
     def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
         if self.engram is not None:
@@ -225,15 +261,8 @@ class PreparedLayer:
         next_mix = torch.zeros_like(attn_mix)
         residual, post, comb, normalized = self.ffn_hc(attention_output, residual, post, comb,
             pre_mix=attn_mix, pre_out=next_mix)
-        pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
-        image_mask = metadata.token_ids >= 129280 if self.has_image_mask else None
-        router_logits = self.router_projection(normalized)
-        route = self.router(router_logits, image_mask=image_mask)
-        routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
-                              selected_logits=route.selected_logits, image_mask=image_mask)
-        shared = (self.shared(normalized) if self.concurrent_shared is None
-                  else self.concurrent_shared.finish(pending, routed))
-        output = self.mlp_reduce(routed + shared)
+        partial, route = self._run_experts(normalized, metadata)
+        output = self.mlp_reduce(partial)
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
         observations = {"attention." + key: value for key, value in observations.items()}
