@@ -18,6 +18,7 @@ from b12x.preparation.types import plan_from_handle, require_prepared
 from ignition.components.mega_cache_kernel import prepare
 from ignition.components.mega_cache_kernel.kernels import _rope_quant_insert_nvfp4_kernel
 from ignition.components.native_operator import native_contract, native_plan
+from ignition.components.ring_commit import _commit
 from ignition.preparation.tuning import declare, register_finalizer
 
 
@@ -192,22 +193,6 @@ def _snapshot_window(History, Staged, Rows, HISTORY_STRIDE: tl.constexpr,
     tl.store(Staged + request * STAGED_STRIDE + target, value, live)
 
 
-@triton.jit
-def _commit_window(Staged, History, Rows, Starts, Counts, HISTORY_STRIDE: tl.constexpr,
-                   STAGED_STRIDE: tl.constexpr, STAGED_TOKENS: tl.constexpr):
-    request, item = tl.program_id(0), tl.program_id(1)
-    row, start, length = tl.load(Rows + request), tl.load(Starts + request), tl.load(Counts + request)
-    token = tl.maximum(0, length - 128) + item
-    ring_slot = (start + token) % 128
-    byte = tl.arange(0, 1024)
-    source = tl.where(byte < 512, (128 + token) * 512 + byte,
-                      STAGED_TOKENS * 512 + (128 + token) * 16 + byte - 512)
-    target = tl.where(byte < 512, ring_slot * 512 + byte, 128 * 512 + ring_slot * 16 + byte - 512)
-    live = (row > 0) & (token < length) & (byte < 528)
-    value = tl.load(Staged + request * STAGED_STRIDE + source, live, other=0)
-    tl.store(History + row * HISTORY_STRIDE + target, value, live)
-
-
 def _validate_window_transfer(history, staged, rows):
     MegaCacheLayout(128, 528).validate(history)
     if staged.ndim != 3 or staged.shape[1] <= 128:
@@ -240,5 +225,6 @@ def commit_window(staged, history, rows, starts, counts):
     if any(t.shape != rows.shape or t.dtype != torch.int64 or not t.is_contiguous()
            or t.device != rows.device for t in (starts, counts)):
         raise ValueError("window commit requires contiguous int64 start positions and accepted counts")
-    torch.library.wrap_triton(_commit_window)[(rows.numel(), 128)](
-        staged, history, rows, starts, counts, history.stride(0), staged.stride(0), staged.shape[1])
+    torch.library.wrap_triton(_commit)[(min(staged.shape[1] - 128, 128), rows.numel(), 1)](
+        staged, history, None, rows, starts, counts, history.stride(0), staged.stride(0), 0,
+        rows.stride(0), starts.stride(0), counts.stride(0), 128, staged.shape[1], (512, 16), 528, 1024)

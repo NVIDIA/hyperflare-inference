@@ -7,8 +7,10 @@
 
 [ ] Wire prepared SM103 decode/prefill attention and cache writers into DeepSeek
     TP1 with DerpSeek-exact Q/output weight permutations, BF16 prefill gathering,
-    page-separated payload/scales, compressor and hierarchical indexer. The
-    installed b12x compressed-MLA auto mode emits unsupported block-scaled MMA
+    page-separated payload/scales, compressor and hierarchical indexer.
+    The batched ring commit supports separated planes; select it with aligned
+    continuation rows and padded staging when connecting the attention recipe.
+    The installed b12x compressed-MLA auto mode emits unsupported block-scaled MMA
     on SM103; the recipe's default BF16 mode has not been checked separately.
     Qualify full graph transitions and MTP before serving comparisons. Account
     for DerpSeek exact's enabled W8 output projection, low-latency GEMMs and

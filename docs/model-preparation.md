@@ -769,6 +769,15 @@ copy both planes into a staging prefix and commit only accepted suffix tokens
 back to the 128-token ring. They do not copy a contiguous record prefix between
 pages of different sizes, because the scale region moves with the page size.
 
+`PreparedRingCommit` also accepts `record_planes=(512, 16)` and
+`staging_alignment=512` to commit multiple window layers in one launch. These
+describe the byte layout: payload rows precede scale rows, and staging pages
+include trailing alignment padding. Omitting them retains interleaved records.
+The single-window continuation helper uses the same commit kernel. Both preserve
+inactive rows, rejected suffixes, surrounding state fields and page padding.
+The cache's continuation backing must separately satisfy the reader's page-stride
+alignment; padding staging alone does not establish that contract.
+
 With the same FlashMLA reference library, run the cache-component checks:
 
 ```sh
@@ -780,6 +789,20 @@ rotation, inactive slots, pair boundaries, padded pages, partial ring commits,
 and compiled writer-to-attention composition against FlashMLA. The cache
 components are not selected by the DeepSeek recipe; full-model continuation,
 speculative state, and serving performance still require recipe integration.
+
+For batched commit checks, build the isolated Heliopause extension with native
+replay qualification and run:
+
+```sh
+uv pip install --python .venv/bin/python --no-deps --config-settings 'build-args=--features qualification' ./heliopause
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_ring_commit_cuda.py -q
+```
+
+On GB300 these checks cover both layouts across 40 window regions, batch sizes
+1, 4 and 64, partial acceptance, wraparound, strided request vectors and staging
+through 4,096 tokens. Compiled writer-to-commit checks compare committed bytes
+with an independent encoder and overwrite staging after its last consumer.
+Native replay checks exact state and stable CUDA allocation counters.
 
 `ignition.components.flashmla_attention.PreparedFlashMLA` supplies the reference
 fused attention for gathered BF16 prefill and paged MXFP8/NVFP4 decode. Unlike
