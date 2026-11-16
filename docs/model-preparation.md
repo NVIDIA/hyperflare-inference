@@ -614,6 +614,30 @@ The staging tests compare quantization against an independent CPU calculation
 and replay graphs with changing activations, routing and padding masks.
 These checks establish component behavior, not full-model accuracy or serving speed.
 
+The SM103 fused decode-attention source in
+`ignition/components/mega_attention_kernel` is also available for component
+validation. It builds against the preparation environment's Torch ABI and needs
+the configured CUDA C++ toolchain and Ninja. It is not selected by the DeepSeek
+recipe. Its input contract uses BF16 queries with permuted head dimensions,
+page-separated cache payloads and scales, and packed MN-major output scales;
+the existing compressed-MLA cache buffers cannot be passed unchanged.
+
+Build the reference library from
+[`vllm-project/FlashMLA` commit `0eee43b12f034b657133cf2afca6a72ebb6efccf`](https://github.com/vllm-project/FlashMLA/tree/0eee43b12f034b657133cf2afca6a72ebb6efccf)
+with its submodules and SM103 support. Set `FLARE_FLASHMLA_LIBRARY` to the
+resulting `_flashmla_C.abi3.so` file, then run on an assigned SM103 GPU:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mega_attention_cuda.py -q
+```
+
+Without the reference library these tests skip. They compare FP8 outputs and
+packed scales exactly across mixed-cache and window-only attention, 64- and
+128-token compressed pages, 128- and 136-token windows, and changing captured
+inputs and valid lengths. They check repeated replay and preparation rejection
+during capture. Full recipe composition and native serving are separate gates
+in the [SM103 integration process](sm103-kernel-integration.md).
+
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses

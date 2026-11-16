@@ -3,6 +3,12 @@
     MTP. Compare exported Flare/Parallax serving with DerpSeek exact using matched
     workloads, memory budgets, arithmetic and speculative settings.
 
+[ ] Align DeepSeek TP1 attention with DerpSeek exact: SM103 fused decode and
+    prefill, Q/output weight permutations, page-separated payload/scales with
+    512-byte-aligned page strides, compressor and hierarchical indexer. The
+    installed b12x compressed-MLA default emits unsupported block-scaled MMA
+    on SM103. Qualify full graph transitions and MTP before serving comparisons.
+
 [ ] Add a DerpSeek-style static-plus-LRU placement contender to Parallax. Check
     decisions against the reference on identical routing traces before claiming
     policy equivalence; use the common movement ledger for comparisons.

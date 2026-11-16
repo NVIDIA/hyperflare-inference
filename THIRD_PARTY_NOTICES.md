@@ -20,6 +20,15 @@ The input stager retains vLLM v0.32.0's Apache-2.0 Triton kernel, with a wrapper
 that selects MXFP8 and validates its buffers without importing vLLM.
 Full-model DeepSeek serving through this preparation path is not qualified.
 
+## SM103 fused attention preparation kernels
+
+Ignition carries unchanged ds41 fused decode-attention CUDA sources in
+[mega_attention_kernel](ignition/components/mega_attention_kernel/NOTICE).
+The MIT license and upstream notices credit Garner McCloud's
+`dgx-station-recipes` implementation. The preparation binding compiles these
+sources against the installed Torch ABI before capture. The kernels have
+component-level graph replay tests; they are not wired into a serving recipe.
+
 ## Native CLI release dependencies
 
 [third_party/rust/README.md](third_party/rust/README.md) groups the native Cargo

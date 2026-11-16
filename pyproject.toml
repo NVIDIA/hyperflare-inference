@@ -55,6 +55,7 @@ deep-gemm = ["torch==2.14.1+cu132", "packaging", "wheel"]
 include = ["ignition*"]
 
 [tool.setuptools.package-data]
+"ignition.components.mega_attention_kernel" = ["csrc/*.cu", "include/w1/*.cuh", "include/w7/*.cuh", "include/w8/*.cuh", "LICENSE.*", "NOTICE*"]
 "ignition.components.megamoe_kernel" = ["include/deep_gemm/impls/*.cuh", "include/deep_gemm/scheduler/*.cuh", "LICENSE.*", "NOTICE"]
 "ignition.preparation" = ["ladders/*.json"]
 "ignition.recipes.deepseek41" = ["assets/*"]
