@@ -15,6 +15,30 @@ import pytest
 from ignition.preparation.runtime_core import FileSource
 
 
+@pytest.mark.parametrize("options,roots,granularity", [({}, ["device-0"], 256),
+    ({"roots": (), "granularity": 65536}, [], 65536)])
+def test_request_preserves_explicit_roots_and_allocation_granularity(monkeypatch, tmp_path,
+                                                                   options, roots, granularity):
+    from types import SimpleNamespace
+    from ignition.preparation import runtime_core
+
+    monkeypatch.setitem(sys.modules, "flare_heliopause", SimpleNamespace(current_context=lambda: (123, 0)))
+    monkeypatch.setitem(sys.modules, "ignition.components.weights",
+                        SimpleNamespace(record_final_fp4_expert_provenance_all=lambda: None))
+    monkeypatch.setitem(sys.modules, "ignition.preparation.rebuild_manifest",
+                        SimpleNamespace(rebuild_weights_metadata=lambda value: None,
+                                        weight_payload_request=lambda value: None))
+    monkeypatch.setattr(runtime_core, "_cupti_path", lambda: "libcupti.so")
+    captured = []
+    core = runtime_core.RuntimeCore(allocations=[runtime_core.Allocation("device-0", 65536, 65536)],
+                                    modules={}, kernels=())
+    monkeypatch.setattr(core, "_capture", lambda request, owners, recorder: captured.append(request))
+    core.write(tmp_path / "rank.sources.json", {}, sources=True, **options)
+    assert captured[0]["roots"] == roots
+    assert captured[0]["granularity"] == granularity
+    assert captured[0]["allocations"][0]["name"] == "device-0"
+
+
 @pytest.mark.parametrize("flags", [0, 1, 8, 9])
 def test_template_export_declares_flags_without_an_executable(flags):
     from types import SimpleNamespace

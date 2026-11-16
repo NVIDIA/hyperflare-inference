@@ -289,6 +289,7 @@ impl VerifiedCore {
         let decoded =
             wire::DeploymentBody::decode(body).map_err(|_| invalid("invalid deployment body"))?;
         let mut catalog = self.catalog.clone();
+        schema::validate_deployment_contract(&self.core, &decoded)?;
         schema::validate_deployment(&decoded, &mut catalog)?;
         if decoded.deployment_id != commitment.deployment_id {
             return Err(invalid("deployment body disagrees with its commitment"));
@@ -437,6 +438,7 @@ pub fn verify(
         )?;
         let decoded =
             wire::DeploymentBody::decode(body).map_err(|_| invalid("invalid deployment body"))?;
+        schema::validate_deployment_contract(&core, &decoded)?;
         let count = schema::validate_deployment(&decoded, &mut catalog)?;
         if decoded.deployment_id != commitment.deployment_id {
             return Err(invalid("deployment body disagrees with its commitment"));
@@ -490,6 +492,7 @@ pub fn verify(
         }
         for decoded_rank in &ranks {
             let mut local = frozen.clone();
+            schema::validate_rank_contract(&decoded, decoded_rank)?;
             schema::validate_rank(decoded_rank, count, &mut local, &mut resource_ids)?;
             if decoded_rank.compressed_prepared_weights.is_some()
                 && let Some(weights) = super::prepared_weights::catalog(decoded_rank)?
@@ -1324,6 +1327,155 @@ mod tests {
             envelope: builder.sign(&signing_key).unwrap(),
             signing_key,
             core_id,
+        }
+    }
+
+    fn resign_fixture(
+        mut fixture: Fixture,
+        edit: impl FnOnce(&mut wire::CoreBody, &mut wire::DeploymentBody, &mut [wire::RankBody]),
+    ) -> Fixture {
+        let envelope = envelope(&fixture.envelope).unwrap();
+        let mut core = wire::CoreBody::decode(envelope.core_body.as_slice()).unwrap();
+        let mut deployment =
+            wire::DeploymentBody::decode(envelope.deployments[0].body.as_slice()).unwrap();
+        let mut ranks: Vec<_> = envelope
+            .ranks
+            .iter()
+            .map(|rank| wire::RankBody::decode(rank.body.as_slice()).unwrap())
+            .collect();
+        edit(&mut core, &mut deployment, &mut ranks);
+        let ranks: Vec<_> = ranks
+            .into_iter()
+            .map(|rank| (rank.rank, rank.encode_to_vec()))
+            .collect();
+        deployment.ranks = ranks
+            .iter()
+            .map(|(rank, bytes)| wire::RankCommitment {
+                rank: *rank,
+                body_digest: sha256(bytes).to_vec(),
+            })
+            .collect();
+        let deployment = deployment.encode_to_vec();
+        core.deployments[0].body_digest = sha256(&deployment).to_vec();
+        let mut builder = EnvelopeBuilder::new(
+            core.encode_to_vec(),
+            fixture.publishers[0].public_key,
+            fixture.core_id,
+        )
+        .unwrap();
+        builder.deployment(0, deployment).unwrap();
+        for (rank, bytes) in ranks {
+            builder.rank(0, rank, bytes).unwrap();
+        }
+        fixture.envelope = builder.sign(&fixture.signing_key).unwrap();
+        fixture
+    }
+
+    fn physical_metadata(
+        core: &mut wire::CoreBody,
+        deployment: &mut wire::DeploymentBody,
+        ranks: &mut [wire::RankBody],
+    ) {
+        core.frontend = None;
+        core.sampling_defaults = None;
+        core.assets.clear();
+        deployment.contract = None;
+        deployment.engram = None;
+        for rank in ranks {
+            rank.execution = None;
+        }
+    }
+
+    #[test]
+    fn signed_physical_graph_core_authenticates_and_authorizes() {
+        let fixture = resign_fixture(fixture(), physical_metadata);
+        let catalog = verify(&fixture.envelope, &fixture.publishers, Selection::Catalog).unwrap();
+        assert!(catalog.deployment_body(0).unwrap().contract.is_none());
+        let verified = verify(
+            &fixture.envelope,
+            &fixture.publishers,
+            Selection::Deployment {
+                deployment: 0,
+                rank: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(verified.ranks().len(), 2);
+        assert!(verified.is_executable());
+        assert!(verified.authorize("example").is_ok());
+    }
+
+    #[test]
+    fn signed_serving_core_preserves_optional_rank_execution() {
+        let fixture = resign_fixture(fixture(), |_, _, ranks| {
+            for rank in ranks {
+                rank.execution = None;
+            }
+        });
+        let verified = verify(
+            &fixture.envelope,
+            &fixture.publishers,
+            Selection::Deployment {
+                deployment: 0,
+                rank: None,
+            },
+        )
+        .unwrap();
+        assert!(verified.deployment().unwrap().contract.is_some());
+        assert!(verified.ranks().iter().all(|rank| rank.execution.is_none()));
+    }
+
+    #[test]
+    fn signed_physical_graph_core_rejects_partial_and_mixed_serving_metadata() {
+        let expected = [
+            "frontend and sampling defaults must be present together",
+            "frontend and sampling defaults must be present together",
+            "cannot contain frontend assets",
+            "serving contract disagrees with core frontend metadata",
+            "serving contract disagrees with core frontend metadata",
+            "cannot contain Engram serving state",
+            "cannot contain token-serving execution",
+            "must contain at least one graph",
+        ];
+        for (case, message) in expected.iter().enumerate() {
+            let fixture = resign_fixture(fixture(), |core, deployment, ranks| {
+                physical_metadata(core, deployment, ranks);
+                match case {
+                    0 => core.frontend = Some(runtime::FrontendSettings::default()),
+                    1 => {
+                        core.sampling_defaults = Some(runtime::DefaultSamplingParameters::default())
+                    }
+                    2 => core.assets.push(wire::FrontendAsset::default()),
+                    3 => deployment.contract = Some(runtime::ServingContract::default()),
+                    4 => {
+                        core.frontend = Some(runtime::FrontendSettings::default());
+                        core.sampling_defaults =
+                            Some(runtime::DefaultSamplingParameters::default());
+                    }
+                    5 => deployment.engram = Some(wire::Engram::default()),
+                    6 => ranks[0].execution = Some(runtime::Execution::default()),
+                    7 => ranks[0].graphs.clear(),
+                    _ => unreachable!(),
+                }
+            });
+            let error = verify(
+                &fixture.envelope,
+                &fixture.publishers,
+                Selection::Deployment {
+                    deployment: 0,
+                    rank: None,
+                },
+            )
+            .err()
+            .expect("inconsistent signed metadata must be rejected");
+            assert!(error.to_string().contains(*message), "case {case}: {error}");
+            if case < 6 {
+                let error = verify(&fixture.envelope, &fixture.publishers, Selection::Catalog)
+                    .and_then(|catalog| catalog.deployment_body(0))
+                    .err()
+                    .expect("inspection must reject inconsistent serving metadata");
+                assert!(error.to_string().contains(*message), "case {case}: {error}");
+            }
         }
     }
 

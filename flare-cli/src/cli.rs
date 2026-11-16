@@ -463,6 +463,10 @@ impl OrbitPush {
     pub fn run_args(&self) -> Run {
         Run {
             core: Some(PathBuf::from(&self.core)),
+            tensor_request: None,
+            tensor_output: None,
+            tensor_warmup: 1,
+            tensor_repetitions: 3,
             host: "127.0.0.1".parse().unwrap(),
             port: 8000,
             served_model_name: None,
@@ -644,6 +648,10 @@ impl OrbitRun {
     pub fn run_args(&self) -> Run {
         Run {
             core: Some(PathBuf::from(self.core.as_deref().unwrap_or_default())),
+            tensor_request: None,
+            tensor_output: None,
+            tensor_warmup: 1,
+            tensor_repetitions: 3,
             host: self.host.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
             port: self.port.unwrap_or(8000),
             served_model_name: self.served_model_name.clone(),
@@ -688,6 +696,27 @@ pub struct Run {
     /// Local core, MODEL[@VERSION], or Hugging Face repository; local models resolve first.
     #[arg(value_name = "CORE", required_unless_present = "rank")]
     pub core: Option<PathBuf>,
+
+    /// Execute one fixed tensor graph request from JSON, then exit.
+    #[arg(long, value_name = "PATH", requires = "tensor_output", conflicts_with_all = ["rank", "hosts", "rendezvous", "stage_only", "roce_ring", "roce_chain"], help_heading = "Tensor execution")]
+    pub tensor_request: Option<PathBuf>,
+
+    /// Directory for raw tensor outputs and native execution measurements.
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        requires = "tensor_request",
+        help_heading = "Tensor execution"
+    )]
+    pub tensor_output: Option<PathBuf>,
+
+    /// Untimed repetitions after the correctness replay.
+    #[arg(long, default_value_t = 1, help_heading = "Tensor execution")]
+    pub tensor_warmup: u32,
+
+    /// Timed repetitions with request inputs restored before each replay.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..), help_heading = "Tensor execution")]
+    pub tensor_repetitions: u32,
 
     /// IP address for the HTTP server [default: server.host, else 127.0.0.1].
     #[arg(
@@ -1214,6 +1243,52 @@ impl ServingOptions {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn tensor_execution_requires_output_and_one_local_request() {
+        let parsed = Cli::try_parse_from([
+            "flare",
+            "run",
+            "core",
+            "--tensor-request",
+            "request.json",
+            "--tensor-output",
+            "outputs",
+            "--tensor-warmup",
+            "0",
+            "--tensor-repetitions",
+            "2",
+        ])
+        .unwrap();
+        let Command::Run(args) = parsed.command else {
+            panic!("expected run")
+        };
+        assert_eq!(
+            args.tensor_request.as_deref(),
+            Some(Path::new("request.json"))
+        );
+        assert_eq!(args.tensor_output.as_deref(), Some(Path::new("outputs")));
+        assert_eq!(args.tensor_warmup, 0);
+        assert_eq!(args.tensor_repetitions, 2);
+        for extra in [
+            vec![],
+            vec!["--tensor-output", "outputs", "--rank", "0"],
+            vec!["--tensor-output", "outputs", "--stage-only"],
+            vec!["--tensor-output", "outputs", "--tensor-repetitions", "0"],
+        ] {
+            let mut argv = vec!["flare", "run", "core", "--tensor-request", "request.json"];
+            argv.extend(extra);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        let Command::Run(args) = Cli::try_parse_from(["flare", "run", "core"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected run")
+        };
+        assert!(args.tensor_request.is_none());
+        assert!(args.tensor_output.is_none());
+    }
 
     #[test]
     fn canonical_core_cache_flag_accepts_hidden_legacy_aliases() {

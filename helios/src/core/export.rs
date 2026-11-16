@@ -613,6 +613,7 @@ fn publish_inner(
             data_phase.finish(data_result(payload_bytes, reused_bytes));
             let ranks_count =
                 u32::try_from(deployment.ranks.len()).map_err(|_| invalid("too many ranks"))?;
+            schema::validate_rank_contract(&body, &rank_body)?;
             schema::validate_rank(&rank_body, ranks_count, &mut catalog, &mut resource_ids)?;
             if rank_body.compressed_prepared_weights.is_some()
                 && let Some(weights) = super::prepared_weights::catalog(&rank_body)?
@@ -657,6 +658,7 @@ fn publish_inner(
         }
         data_phase.finish(data_result(payload_bytes, reused_bytes));
         let encoded = wire::DeploymentBody::encode_to_vec(&body);
+        schema::validate_deployment_contract(&core, &body)?;
         schema::validate_deployment(&body, &mut catalog)?;
         core.deployments.push(wire::DeploymentCommitment {
             deployment_id: body.deployment_id.clone(),
@@ -916,6 +918,13 @@ fn preflight(request: &PublishRequest, destination: &Destination<'_>) -> Result<
     if matches!(destination, Destination::Directory(root) if root.join("model.safetensors").exists())
     {
         return Err(invalid("primary already exists in the export directory"));
+    }
+    schema::validate_core_serving(&request.core)?;
+    for deployment in &request.deployments {
+        schema::validate_deployment_contract(&request.core, &deployment.body)?;
+        for rank in &deployment.ranks {
+            schema::validate_rank_contract(&deployment.body, &rank.body)?;
+        }
     }
     Ok(())
 }
@@ -2712,6 +2721,15 @@ mod tests {
 
     #[test]
     fn publish_writes_signed_directory_and_seals_executables() {
+        check_signed_publication(false);
+    }
+
+    #[test]
+    fn publish_physical_graph_core_authenticates_and_converts() {
+        check_signed_publication(true);
+    }
+
+    fn check_signed_publication(physical: bool) {
         use crate::core::protection::{self, Selection};
         use crate::runtime_core::Publisher;
         use ring::signature::KeyPair;
@@ -2836,7 +2854,7 @@ mod tests {
             prepared_weights: None,
             compressed_prepared_weights: None,
         };
-        let request = PublishRequest {
+        let mut request = PublishRequest {
             core,
             payloads: vec![PublishPayload {
                 role: wire::PayloadRole::Frontend,
@@ -2886,8 +2904,31 @@ mod tests {
             accepted: "example".into(),
             no_weights: false,
         };
+        if physical {
+            request.core.frontend = None;
+            request.core.sampling_defaults = None;
+            request.core.assets.clear();
+            request.payloads.clear();
+            request.deployments[0].body.contract = None;
+            request.core.frontend = Some(crate::runtime_core::wire::FrontendSettings::default());
+            let error = publish(&request, &key, Destination::Directory(&root))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("must be present together"));
+            request.core.frontend = None;
+            request.deployments[0].body.contract =
+                Some(crate::runtime_core::wire::ServingContract::default());
+            let error = publish(&request, &key, Destination::Directory(&root))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("serving contract disagrees"));
+            request.deployments[0].body.contract = None;
+            assert!(!root.join("model.safetensors").exists());
+            assert!(!root.join("weights").exists());
+            assert!(!root.join("deployments").exists());
+        }
         let published = publish(&request, &key, Destination::Directory(&root)).unwrap();
-        assert_eq!(published.payloads.len(), 4);
+        assert_eq!(published.payloads.len(), if physical { 3 } else { 4 });
         let publisher = Publisher {
             name: "Example".into(),
             namespace: "example".into(),
@@ -2898,13 +2939,14 @@ mod tests {
         assert_eq!(metadata.envelope, published.manifest);
         let verified = protection::verify(
             &metadata.envelope,
-            &[publisher],
+            std::slice::from_ref(&publisher),
             Selection::Deployment {
                 deployment: 0,
                 rank: Some(0),
             },
         )
         .unwrap();
+        assert_eq!(verified.deployment().unwrap().contract.is_none(), physical);
         let catalog = verified.catalog().clone();
         let files = metadata
             .payloads(&catalog, [id.as_bytes().as_slice()])
@@ -2956,14 +2998,33 @@ mod tests {
             root.join("deployments/sm120-tp1/rank-0/graphs.safetensors")
                 .exists()
         );
-        let primary = container::Container::open(&root.join("model.safetensors")).unwrap();
-        let mut embedded = Vec::new();
-        primary
-            .tensor("frontend.tokenizer")
-            .unwrap()
-            .copy_to(&mut embedded)
+        if physical {
+            let packed = root.join("packed.safetensors");
+            crate::core::conversion::pack(&root, &packed).unwrap();
+            let unpacked = root.join("unpacked");
+            crate::core::conversion::unpack(&packed, &unpacked).unwrap();
+            let converted = crate::core::reader::Metadata::open(&unpacked).unwrap();
+            assert_eq!(converted.envelope, published.manifest);
+            let verified = protection::verify(
+                &converted.envelope,
+                &[publisher],
+                Selection::Deployment {
+                    deployment: 0,
+                    rank: None,
+                },
+            )
             .unwrap();
-        assert_eq!(embedded, tokenizer);
+            assert!(verified.authorize("example").is_ok());
+        } else {
+            let primary = container::Container::open(&root.join("model.safetensors")).unwrap();
+            let mut embedded = Vec::new();
+            primary
+                .tensor("frontend.tokenizer")
+                .unwrap()
+                .copy_to(&mut embedded)
+                .unwrap();
+            assert_eq!(embedded, tokenizer);
+        }
     }
 
     #[test]
