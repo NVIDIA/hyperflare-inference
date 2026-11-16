@@ -695,6 +695,38 @@ and compiled writer-to-attention composition against FlashMLA. The cache
 components are not selected by the DeepSeek recipe; full-model continuation,
 speculative state, and serving performance still require recipe integration.
 
+`ignition.components.flashmla_attention.PreparedFlashMLA` supplies the reference
+fused attention for gathered BF16 prefill and paged MXFP8/NVFP4 decode. Unlike
+the small-row decode component, it accepts the larger row counts and staging
+page geometries needed by speculative verification. Pass the pinned FlashMLA
+library above as its `library` argument and a preparation kernel-cache path.
+The host binding links unchanged kernel instantiations; it does not compile a
+second copy of their GPU code. Its parameter and numeric-type headers are
+packaged with their licenses. Outputs, packed scales, and attention statistics
+are explicit tensors in the compiled forward, so the upstream host API's
+internal statistics allocations do not become opaque captured storage.
+
+Queries retain the reference head permutation. Prefill consumes already gathered
+BF16 keys; decode consumes page-separated quantized caches and physical indices.
+The caller owns cache writes, gathering and index translation. Mixed MXFP8/NVFP4
+decode requires a window index capacity divisible by eight. The component does
+not add normalization before attention; its caller supplies the required query
+arithmetic. Rotary transformation and output quantization remain in the fused
+kernel.
+
+With the same assigned GPU and `FLARE_FLASHMLA_LIBRARY`, run:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_flashmla_attention_cuda.py -q
+```
+
+The checks cover compiled prefill at 1, 257 and 1024 rows; window-only decode at
+25 rows; and mixed-cache decode at 77 and 192 rows with 136-token window pages.
+They compare outputs, scales and statistics with the upstream API, alternate
+capacities with changing inputs and masks, and check declaration lifetimes and
+replay allocations. These are synthetic component checks, not qualification of
+a DeepSeek serving recipe or speculative acceptance behavior.
+
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses

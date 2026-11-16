@@ -37,6 +37,13 @@ build. These writers fuse rotary transformation, quantization, and insertion
 into the page layout consumed by the reference attention kernel. They do not
 require the vLLM serving runtime.
 
+The [FlashMLA host binding](ignition/components/flashmla_kernel/NOTICE) links
+unchanged compiled FlashMLA kernel instantiations during preparation. It carries
+the upstream parameter headers and the CUTLASS numeric-type headers needed by
+that interface, with MIT and BSD-3-Clause licenses. Flare supplies explicit
+output/statistics buffers and preparation integration. Exported cores retain
+CUDA kernels and do not load the FlashMLA host library when serving.
+
 ## Native CLI release dependencies
 
 [third_party/rust/README.md](third_party/rust/README.md) groups the native Cargo
