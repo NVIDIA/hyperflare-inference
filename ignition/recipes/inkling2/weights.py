@@ -74,7 +74,9 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
              draft_head_quantization=None, markov_head_quantization=None, online_mxfp8=False):
-        """`online_mxfp8` stores each layer's attention input and output projections as MXFP8."""
+        """`online_mxfp8` stores each decoder layer's attention input and output projections, and the
+        drafter's query/key/value, attention output and recurrent context projections
+        (`DraftWeights.load`), as MXFP8."""
         before = torch.cuda.memory_allocated(device)
         with InklingWeightLoader(manifest, device, shard=shard, progress=progress, vision=vision,
                                  online_mxfp8=online_mxfp8) as loader:
@@ -109,7 +111,8 @@ class ModelWeights:
         if drafting:
             from .dspark_weights import DraftWeights
             draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress,
-                draft_head_quantization=draft_head_quantization, markov_head_quantization=markov_head_quantization)
+                draft_head_quantization=draft_head_quantization, markov_head_quantization=markov_head_quantization,
+                online_mxfp8=online_mxfp8)
         return cls(c, shard, loaded, embedding, embed_norm, norm, query, head,
                    torch.cuda.memory_allocated(device) - before, draft, tower)
 

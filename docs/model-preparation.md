@@ -1347,8 +1347,26 @@ decoding, and verification, which therefore project with the same weight
 values, and the output projection writes BF16 partial sums. A TP4 rank then
 reads 1.22 GB of attention projection weights per decode step where BF16 reads
 2.36 GB, and holds 1.14 GB less. Routers, vocabulary shards, convolutions,
-norms, clip scales, the relative-logit projection, experts, DSpark, and the
-vision encoder keep checkpoint precision. The default omits the flag.
+norms, clip scales, the relative-logit projection, experts, and the vision
+encoder keep checkpoint precision. The default omits the flag.
+
+The flag also stores three of DSpark's BF16 projections in the same MXFP8
+form, with BF16 activations: each of the five draft layers' fused
+query/key/value projection and attention output projection, and the recurrent
+head's projection of the draft hidden state and target context. Per TP4 rank
+these are 2048 by 4608, 4608 by 1536, and 768 by 9216 values. One drafting
+round reads each once: 179 MB as BF16 and 92 MB as MXFP8. The recurrent head's
+MXFP8 projection is rounded to BF16 before its FP32 bias and the previous
+draw's part are added; with BF16 weights that sum stays FP32. Each draft
+layer's key/value projection of accepted target taps, 512 by 4608 values per
+rank, keeps BF16: it also runs on every prefill row, where MXFP8 weights with
+BF16 activations are slower, and it is 24 MB of a drafting round's reads. The
+recurrent state projection, embeddings, norms, the sidecar's MXFP8
+feed-forward weights, and both proposal heads keep their precision;
+`--draft-head-quantization` and `--markov-head-quantization` select the heads'
+formats independently. Target verification decides the output, so MXFP8 draft
+projections change which tokens are proposed and how often they are accepted,
+never the output distribution.
 
 The stored weights differ from the checkpoint's by 2.7% in relative norm. With
 the Transformers reference layers and checkpoint weights over 1,536 positions
@@ -1360,7 +1378,9 @@ most likely token at 97.3% of positions; rounding the four ranks' partial sums
 to BF16, which cross-host reductions do, moves that agreement to 97.8% by
 itself. `tests/recipes/test_inkling2_target.py` checks on SM120 that the
 decode, verification, and prefill kernels of a window and a global layer
-multiply by the stored values.
+multiply by the stored values, and
+`tests/components/test_inkling2_dspark_cuda.py` checks the same of the three
+converted DSpark projections for a window and a global draft layer.
 
 On four DGX Sparks at TP4 with 32 requests and 8,192-token chunks, a core
 exported with the flag holds 3,604,480 KV tokens per rank where the BF16 core

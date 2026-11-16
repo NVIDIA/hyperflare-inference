@@ -247,6 +247,26 @@ def test_block_context_projection_matches_one_projection_per_position():
         operation.project_context(states[:, :3], context)
 
 
+def test_block_context_projection_adds_the_fp32_bias_to_a_bf16_projection():
+    """An MXFP8 context weight projects to BF16; the recurrence input is that rounding plus the FP32 bias."""
+    generator = torch.Generator().manual_seed(19)
+    rows, positions, hidden, rank, vocabulary = 3, 7, 16, 8, 24
+    weight = (torch.randn(3 * rank, 2 * rank + 2 * hidden, generator=generator) / 8).bfloat16()
+    bias = torch.randn(3 * rank, generator=generator) / 8
+    head = (torch.randn(vocabulary, rank, generator=generator) / 4).bfloat16()
+    head_bias = (torch.randn(vocabulary, generator=generator) / 4).bfloat16()
+    states = torch.randn(rows, positions, hidden, generator=generator).bfloat16()
+    context = torch.randn(rows, hidden, generator=generator).bfloat16()
+    operation = _recurrent_head(weight, bias, head, head_bias, positions, row_scaled=False)
+    exact = operation.context
+    operation.context = lambda source: exact(source).bfloat16()
+    fixed = operation.project_context(states, context)
+    assert fixed.shape == (rows, positions, 3 * rank) and fixed.dtype == torch.float32
+    for index in range(positions):
+        source = torch.cat((states[:, index], context), -1)
+        assert torch.equal(fixed[:, index], exact(source).bfloat16().float() + bias)
+
+
 def test_row_scaled_correction_adds_the_bf16_bias_in_fp32_before_bf16_rounding():
     generator = torch.Generator().manual_seed(21)
     rows, hidden, rank, vocabulary = 2, 16, 8, 24

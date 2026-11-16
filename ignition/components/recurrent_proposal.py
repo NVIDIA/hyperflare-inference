@@ -6,7 +6,7 @@
 import torch
 
 from .embedding import PreparedEmbedding
-from .linear import UnquantizedProjection
+from .linear import UnquantizedProjection, prepare_projection
 from .markov_sampling import PreparedRowScaledFP8MarkovProjection, RowScaledFP8MarkovWeight
 
 
@@ -35,12 +35,17 @@ class PreparedRecurrentProposalHead:
     computes the second part for every position of the block in one projection; `step` adds the
     first. `weights.head` maps the recurrent output to vocabulary corrections as BF16 rows, or as
     row-scaled E4M3 rows whose FP32 product takes the BF16 bias before rounding to BF16.
+
+    `weights.context_weight` is a BF16 matrix, whose projection stays FP32 until the gate, or a b12x
+    MXFP8 weight, whose projection of the BF16 activations is rounded to BF16 before the FP32 bias
+    and the previous draw's part are added. `workspace` supplies the MXFP8 projection's scratch.
     """
 
-    def __init__(self, weights, tokens, *, positions, session, name):
+    def __init__(self, weights, tokens, *, positions, session, name, workspace=None):
         rows, device = tokens.numel(), tokens.device
         rank = weights.embedding.shape[1]
-        hidden = weights.context_weight.shape[1] // 2
+        bf16 = isinstance(weights.context_weight, torch.Tensor)
+        hidden = (weights.context_weight.shape[1] if bf16 else weights.context_weight.in_features) // 2
         if type(positions) is not int or positions < 1:
             raise ValueError("a recurrent proposal head corrects at least one position per row")
         self.rank, self.softcap, self.positions = rank, weights.softcap, positions
@@ -48,12 +53,13 @@ class PreparedRecurrentProposalHead:
         embedding = torch.empty((rows, rank), dtype=torch.bfloat16, device=device)
         dynamic = torch.empty((rows, 2 * rank), dtype=torch.bfloat16, device=device)
         context = torch.empty((rows * positions, 2 * hidden), dtype=torch.bfloat16, device=device)
-        fixed = torch.empty((rows * positions, 3 * rank), dtype=torch.float32, device=device)
+        fixed = torch.empty((rows * positions, 3 * rank), dtype=torch.float32 if bf16 else torch.bfloat16,
+                            device=device)
         raw = torch.empty((rows, 3 * rank), dtype=torch.float32, device=device)
         self.embed = PreparedEmbedding(weights.embedding, tokens, embedding,
             session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
-        self.context = UnquantizedProjection(context, weights.context_weight, fixed,
-            session=session, name=name + ".context").functional(session=session)
+        self.context = prepare_projection(context, weights.context_weight, fixed, session=session,
+            name=name + ".context", workspace=workspace, activation_mode="a16").functional(session=session)
         self.dynamic = UnquantizedProjection(dynamic, weights.state_weight, raw,
             session=session, name=name + ".dynamic").functional(session=session)
         self.output_bias = None

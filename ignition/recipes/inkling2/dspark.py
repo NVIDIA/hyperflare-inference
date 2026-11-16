@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inkling2 noncausal DSpark blocks and accepted target-feature context storage."""
+"""Inkling2 noncausal DSpark blocks and accepted target-feature context storage.
+
+The query/key/value and attention output projections and the recurrent head's context projection
+multiply BF16 activations by the sidecar's BF16 weights or by MXFP8 weights (`DraftWeights.load` with
+`online_mxfp8`). The key/value projection of accepted target taps, which also runs on every prefill
+row, always multiplies by BF16 weights.
+"""
 
 from dataclasses import dataclass
 
@@ -18,6 +24,7 @@ from ignition.components.speculation import SpeculativeRngState
 from ignition.components.state import gather_rows, save_hidden
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 
+from .attention import prepare_projection
 from .dspark_state import (block_inputs, context_slots, mix_features, rotary_table, rotate, stage, tail_plan,
                            window_plan)
 
@@ -128,8 +135,8 @@ class DraftAttention:
         d = config.draft
         self.query_shape, self.key_shape = tuple(scratch.query.shape), tuple(scratch.key.shape)
         self.window, self.local = d.window, index in d.local_layers
-        self.qkv = UnquantizedProjection(scratch.hidden, weights.qkv, scratch.qkv,
-            session=session, name=name + ".qkv").functional(session=session)
+        self.qkv = prepare_projection(scratch.hidden, weights.qkv, scratch.qkv,
+            session=session, name=name + ".qkv", workspace=workspace).functional(session=session)
         self.query_norm = norm(scratch.query.flatten(0, 1), weights.query_norm, scratch.query.flatten(0, 1),
             eps=d.text["rms_norm_eps"], session=session, name=name + ".q_norm")
         self.key_norm = norm(scratch.key.flatten(0, 1), weights.key_norm, scratch.key.flatten(0, 1),
@@ -161,8 +168,8 @@ class DraftAttention:
                 session=session, k_cache=None, v_cache=None, cache_seqlens=None, cu_seqlens_q=None,
                 **({} if self.local else {"page_table": None, "tail_key": None, "tail_value": None}))
         heads = scratch.attended.flatten(1)
-        self.output = UnquantizedProjection(heads, weights.output, scratch.partial,
-            session=session, name=name + ".output").functional(session=session)
+        self.output = prepare_projection(heads, weights.output, scratch.partial,
+            session=session, name=name + ".output", workspace=workspace).functional(session=session)
         self.reduce = PreparedAllReduce(scratch.partial, scratch.hidden, runtime=runtime, coordinator=coordinator,
             session=session, name=name + ".reduce").functional(session=session)
 
@@ -257,7 +264,7 @@ class PreparedDraft:
                 workspace=workspace).functional(session=session)
         self.recurrent = PreparedRecurrentProposalHead(weights.draft.recurrent,
             torch.zeros(metadata.lengths.numel(), dtype=torch.int64, device=device),
-            positions=self.block - 1, session=session, name=name + ".recurrent")
+            positions=self.block - 1, session=session, name=name + ".recurrent", workspace=workspace)
 
     def release_outputs(self):
         return self

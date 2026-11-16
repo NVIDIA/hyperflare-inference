@@ -55,7 +55,8 @@ RECIPE = Recipe(name="inkling2", served_model_name="Inkling-2-Small-NVFP4", prep
     sampling_defaults=SAMPLING_DEFAULTS,
     # Proposal-only copies: the block's vocabulary head, and the recurrent correction head as row-scaled E4M3.
     draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("fp8",),
-    # The attention input and output projections of every decoder layer.
+    # The attention input and output projections of every decoder layer, and the drafter's query/key/value,
+    # attention output and recurrent context projections.
     online_mxfp8=True,
     checkpoints=(Checkpoint(alias="inkling-2-small-nvfp4", repository="/data/models/Inkling-2-Small-NVFP4",
         revision="local", architecture="Inkling2ForConditionalGeneration", stored_bytes=344_366_116_864,

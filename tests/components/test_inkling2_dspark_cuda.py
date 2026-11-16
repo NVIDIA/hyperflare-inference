@@ -501,6 +501,120 @@ def test_checkpoint_draft_aot_reads_only_selected_mapped_context_rows(tmp_path):
         graph.reset()
 
 
+def _stored_matrix(weight):
+    """The matrix an MXFP8 weight stores, in FP64."""
+    from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch, materialize_mxfp8_scale_rows
+
+    rows = weight.weight
+    return dequantize_mxfp8_rows_torch(rows.values, materialize_mxfp8_scale_rows(rows))[:, :weight.in_features].double()
+
+
+@pytest.mark.parametrize("layer", [0, 2])
+@pytest.mark.parametrize("requests,compiled", [(1, False), (4, True)])
+@torch.no_grad()
+def test_checkpoint_draft_projects_with_stored_mxfp8_weights(layer, requests, compiled):
+    """Online MXFP8 stores each draft layer's query/key/value and output projections and the recurrent head's
+    context projection; each kernel multiplies BF16 activations by the stored values, and the drafter's other
+    tensors, including the key/value projection of accepted target taps, keep checkpoint bits."""
+    from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+    from ignition.recipes.inkling2.config import ModelConfig
+
+    snapshot = os.environ.get("FLARE_INKLING2_SNAPSHOT")
+    if snapshot is None:
+        pytest.skip("requires FLARE_INKLING2_SNAPSHOT")
+    device, block = torch.device("cuda:0"), 8
+    torch.cuda.set_device(device)
+    config, shard = ModelConfig.load(snapshot), TensorParallelShard(0, 4)
+    d, hidden = config.draft, config.text["hidden_size"]
+    with DirectWeightLoader(inspect_indexed_checkpoint(snapshot), device) as loader:
+        head = loader.load_tensor("lm_head.weight", extent=(slice(0, 50304), slice(None)))
+    checkpoint, draft = (DraftWeights.load(snapshot, config, device, shard, target_head=head, online_mxfp8=online)
+                         for online in (False, True))
+
+    def same_bits(stored, original):
+        if isinstance(original, MXFP8LinearWeight):
+            assert torch.equal(stored.weight.values.view(torch.uint8), original.weight.values.view(torch.uint8))
+            assert torch.equal(stored.weight.scale_mma.view(torch.uint8), original.weight.scale_mma.view(torch.uint8))
+        else:
+            assert stored.dtype == original.dtype and torch.equal(stored, original)
+
+    converted = [(stored_layer, original_layer, field)
+                 for stored_layer, original_layer in zip(draft.layers, checkpoint.layers, strict=True)
+                 for field in ("qkv", "output")]
+    converted.append((draft.recurrent, checkpoint.recurrent, "context_weight"))
+    for stored_owner, original_owner, field in converted:
+        stored, original = getattr(stored_owner, field), getattr(original_owner, field)
+        assert isinstance(stored, MXFP8LinearWeight) and stored.weight.scale_rows is None
+        assert original.dtype == torch.bfloat16
+        expanded = _stored_matrix(stored)
+        assert expanded.shape == original.shape
+        assert ((expanded - original.double()).norm() / original.double().norm()).item() < .035, field
+    for stored_layer, original_layer in zip(draft.layers, checkpoint.layers, strict=True):
+        for field in ("context_kv", "query_norm", "key_norm", "context_key_norm", "context_norm", "input_norm",
+                      "post_attention_norm"):
+            same_bits(getattr(stored_layer, field), getattr(original_layer, field))
+        same_bits(stored_layer.mlp.gate_up, original_layer.mlp.gate_up)
+        same_bits(stored_layer.mlp.down, original_layer.mlp.down)
+    for field in ("alpha", "mask_embedding", "norm"):
+        same_bits(getattr(draft, field), getattr(checkpoint, field))
+    for field in ("embedding", "state_weight", "bias", "head", "head_bias", "context_norm"):
+        same_bits(getattr(draft.recurrent, field), getattr(checkpoint.recurrent, field))
+    assert draft.draft_head is None and checkpoint.draft_head is None
+    del checkpoint
+
+    tokens = requests * block
+    kv_heads = d.kv_heads // shard.world_size
+    def zeros(*shape):
+        return torch.zeros(shape, dtype=torch.bfloat16, device=device)
+    regions = {f"draft{index}.{kind}": zeros(requests + 1, d.window, kv_heads, d.head_dim)
+               for index in sorted(d.local_layers) for kind in ("key", "value")}
+    regions["draft.rnn_context"] = zeros(requests + 1, hidden)
+    key, value = zeros(2 * requests, 128, kv_heads, d.head_dim), zeros(2 * requests, 128, kv_heads, d.head_dim)
+    pool = SimpleNamespace(reserved_region=regions.__getitem__, key=lambda *args, **kwargs: key,
+        value=lambda *args, **kwargs: value)
+    m = Metadata.pack(torch.full((requests,), 127, device=device), torch.full((requests,), block, device=device),
+        torch.arange(1, requests + 1, device=device),
+        torch.arange(2 * requests, dtype=torch.int32, device=device).view(requests, 2),
+        torch.zeros(requests, block, dtype=torch.int64, device=device),
+        torch.tensor([requests], dtype=torch.int32, device=device), token_capacity=tokens, sample_count=tokens)
+    scratch = DraftScratch.allocate(config, shard, tokens, block, device)
+    pending = torch.zeros(requests, dtype=torch.int64, device=device)
+    with RecordedPreparationSession(device=device, checkpoint="inkling2-checkpoint-draft-mxfp8",
+            workload_schema="inkling2-checkpoint-draft", numerical_policy="default", autotune_effort="off") as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        attention = DraftAttention(layer, draft.layers[layer], config, scratch, m, pool, shard=shard,
+            runtime=None, coordinator=None, session=session, name="attention", workspace=arena)
+        recurrent = PreparedRecurrentProposalHead(draft.recurrent, pending, positions=block - 1,
+            session=session, name="recurrent", workspace=arena)
+        session.tune()
+        torch.manual_seed(layer)
+        def activations(rows, width):
+            return torch.randn(rows, width, device=device).bfloat16()
+        sources = (activations(tokens, hidden), activations(tokens, attention.query_shape[1] * d.head_dim),
+                   activations(requests * (block - 1), 2 * hidden))
+        def forward():
+            return attention.qkv(sources[0]), attention.output(sources[1]), recurrent.context(sources[2])
+        if compiled:
+            from ignition.preparation.compilation import compile_forward
+            forward = compile_forward(forward)
+        outputs = forward()
+        torch.cuda.synchronize()
+
+    def within_accumulation(actual, source, weight):
+        # FP32 accumulation of the products, then one rounding to BF16.
+        exact, magnitude = source.double() @ weight.T, source.double().abs() @ weight.abs().T
+        terms = source.shape[1]
+        gamma = terms * 2 ** -24 / (1 - terms * 2 ** -24)
+        return (((actual.double() - exact).abs() - gamma * magnitude - 2 ** -8 * exact.abs()).max() <= 0).item()
+
+    stored = (draft.layers[layer].qkv, draft.layers[layer].output, draft.recurrent.context_weight)
+    for name, actual, source, weight in zip(("qkv", "output", "recurrent_context"), outputs, sources, stored,
+                                            strict=True):
+        assert actual.dtype == torch.bfloat16 and actual.shape == (source.shape[0], weight.out_features), name
+        assert within_accumulation(actual, source, _stored_matrix(weight)), name
+
+
 @torch.no_grad()
 def test_checkpoint_sidecar_preserves_fp8_values_scales_and_feature_coefficients():
     from b12x.gemm._shared.wo_mxfp8 import materialize_mxfp8_scale_rows

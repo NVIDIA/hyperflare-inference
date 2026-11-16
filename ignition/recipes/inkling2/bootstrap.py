@@ -78,7 +78,8 @@ class PreparationConfig:
     # Proposal-only quantized copies derived from checkpoint values at load; None keeps BF16.
     draft_head_quantization: str | None = None
     markov_head_quantization: str | None = None
-    # Stores the attention input and output projections as MXFP8 at load; False keeps the checkpoint's BF16.
+    # Stores the target's attention input and output projections, and the drafter's query/key/value, attention
+    # output and recurrent context projections, as MXFP8 at load; False keeps the checkpoint's BF16.
     online_mxfp8: bool = False
     benchmark_selection: object | None = None
 
