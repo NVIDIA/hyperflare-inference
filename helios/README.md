@@ -388,7 +388,9 @@ resume sampling from saved hidden state without replaying prompt tokens. See
 Before CUDA enqueue, callers check `GraphExecutor::can_submit`, obtain its
 `next_fence`, and call `RequestScheduler::commit` with the plan to reserve pages
 and record use of cache ancestors. Commit validates the plan's epochs and
-resources without rerunning scheduling policy. Completion validation checks
+resources without rerunning scheduling policy. Residency progress runs during
+executor polling, before admission; submission cannot advance residency and
+close the gate after the scheduler reserves a fence. Completion validation checks
 generations, physical slots, monotonic counters and per-step logical bounds before
 mutating request state.
 Two ordinary decode or complete speculative steps can reference a request
