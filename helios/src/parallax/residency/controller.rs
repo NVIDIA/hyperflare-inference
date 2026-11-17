@@ -341,19 +341,25 @@ impl<B: Backend> Controller<B> {
                 }
             })
             .collect();
-        let mut reserved = used;
+        // Search only free slots within the expert's physical pool. Rewalking
+        // every occupied slot for each plane can consume the prediction window.
+        let mut available = BTreeMap::<usize, Vec<usize>>::new();
+        for slot in 0..backend.slots() {
+            if !used.contains(&slot) {
+                available.entry(backend.slot_group(slot)).or_default().push(slot);
+            }
+        }
         let mut copies = vec![];
         let mut bindings = vec![];
         let mut slots = vec![];
         let mut bytes = 0u64;
         for expert in &plan.promote {
             for &region in &self.experts[expert] {
-                let slot = (0..backend.slots())
-                    .find(|slot| !reserved.contains(slot)
-                        && backend.region_group(region) == backend.slot_group(*slot)
-                        && backend.slot_accepts(region, *slot))
+                let free = available.get_mut(&backend.region_group(region))
                     .ok_or(Error::Capacity)?;
-                reserved.insert(slot);
+                let index = free.iter().position(|slot| backend.slot_accepts(region, *slot))
+                    .ok_or(Error::Capacity)?;
+                let slot = free.remove(index);
                 bytes = bytes
                     .checked_add(backend.transfer_bytes(region) as u64)
                     .ok_or_else(|| Error::Invalid("movement byte count overflow".into()))?;

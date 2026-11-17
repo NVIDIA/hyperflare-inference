@@ -19,6 +19,8 @@ struct Memory {
     slots: usize,
     initial: Vec<Location>,
     backing: Vec<bool>,
+    region_groups: Vec<usize>,
+    slot_groups: Vec<usize>,
     state: Arc<Mutex<State>>,
     dropped: Arc<AtomicUsize>,
 }
@@ -35,6 +37,8 @@ unsafe impl Backend for Memory {
     }
     fn initial_location(&self, region: usize) -> Location { self.initial[region] }
     fn has_backing(&self, region: usize) -> bool { self.backing[region] }
+    fn region_group(&self, region: usize) -> usize { self.region_groups[region] }
+    fn slot_group(&self, slot: usize) -> usize { self.slot_groups[slot] }
     fn slots(&self) -> usize {
         self.slots
     }
@@ -123,6 +127,8 @@ fn memory(slots: usize, initial: Vec<Location>, backing: Vec<bool>) -> (Memory, 
             slots,
             initial,
             backing,
+            region_groups: vec![0; 4],
+            slot_groups: vec![0; slots],
             state: state.clone(),
             dropped: dropped.clone(),
         };
@@ -145,6 +151,63 @@ fn initial_hbm_occupancy_preserves_spare_slots_and_reader_fences() {
     assert_eq!(state.lock().unwrap().published,
         vec![Some(Location::Backing), Some(Location::Backing), Some(Location::Hbm(2)), Some(Location::Hbm(3))]);
     assert_eq!(c.snapshot().free_slots, 2);
+}
+
+#[test]
+fn large_catalog_exchange_preserves_pool_and_reader_constraints() {
+    let layers = 40;
+    let experts = 384;
+    let rows = 288;
+    let parts = 4;
+    let mut regions = Vec::new();
+    let mut initial = Vec::new();
+    let mut region_groups = Vec::new();
+    for layer in 0..layers {
+        for expert in 0..experts {
+            for part in 0..parts {
+                regions.push(Region { expert: ExpertId { layer, expert }, part,
+                    offset: regions.len() * 64, bytes: 64 });
+                initial.push(if expert < rows - 1 {
+                    Location::Hbm((layer * rows + expert) * parts + part)
+                } else { Location::Backing });
+                region_groups.push(layer);
+            }
+        }
+    }
+    let state = Arc::new(Mutex::new(State { ready: true,
+        published: initial.iter().copied().map(Some).collect(), ..State::default() }));
+    let memory = Memory { backing: vec![true; regions.len()], regions, initial, region_groups,
+        slots: layers * rows * parts,
+        slot_groups: (0..layers * rows * parts).map(|slot| slot / (rows * parts)).collect(),
+        state: state.clone(), dropped: Arc::new(AtomicUsize::new(0)) };
+    let mut controller = Controller::new("large-catalog".into(), memory).unwrap();
+    let plan = Plan { version: 1, catalog_id: "large-catalog".into(), generation: 0,
+        valid_until_ns: u64::MAX,
+        promote: (0..layers).map(|layer| ExpertId { layer, expert: rows - 1 }).collect(),
+        evict: (0..layers).map(|layer| ExpertId { layer, expert: 0 }).collect() };
+    let mut samples = Vec::new();
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        assert_eq!(controller.begin(plan.clone(), 0).unwrap(), Progress::Staged);
+        samples.push(started.elapsed().as_nanos());
+        assert_eq!(controller.cancel().unwrap(), Progress::Cancelled);
+    }
+    println!("CPU reservation samples (ns), fake storage without CUDA: {samples:?}");
+    let reader = controller.acquire_reader().unwrap();
+    controller.begin(plan, 0).unwrap();
+    assert_eq!(controller.snapshot().free_slots, 0);
+    assert_eq!(unsafe { controller.progress(1) }.unwrap(), Progress::WaitingForReaders);
+    unsafe { reader.complete(); }
+    assert_eq!(unsafe { controller.progress(2) }.unwrap(), Progress::Committed(1));
+    let published = &state.lock().unwrap().published;
+    for layer in 0..layers {
+        for part in 0..parts {
+            assert_eq!(published[(layer * experts + rows - 1) * parts + part],
+                Some(Location::Hbm((layer * rows + rows - 1) * parts + part)));
+            assert_eq!(published[layer * experts * parts + part], Some(Location::Backing));
+        }
+    }
+    assert_eq!(controller.snapshot().free_slots, layers * parts);
 }
 
 #[test]
