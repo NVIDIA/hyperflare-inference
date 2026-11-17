@@ -399,7 +399,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
         commands = StateCommands.allocate(device, capacity=slots)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
-        coordinator = CollectivePreparation(group)
+        coordinator = CollectivePreparation(group) if group is not None else None
         verification_samples = (slots * max(config.speculative_widths)
                                 if config.packed_verification else config.decode_tokens)
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(

@@ -15,6 +15,7 @@ from ignition.components.mega_cache_kernel.gather import (
     _dequantize_and_gather_k_mxfp8_kernel,
     _dequantize_and_gather_k_nvfp4_kernel,
 )
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 
@@ -103,7 +104,7 @@ class PreparedFusedMLA:
 
     def __init__(self, query, positions, sink, window, indices, lengths, metadata, *,
                  preparation, rotary, mode, compressed=None, selected=None, selected_lengths=None,
-                 session, name):
+                 session, name, examples=None):
         self.preparation, self.cs = preparation, preparation.cos_sin[rotary]
         self.compressed, self.mode = compressed, mode
         self.requests, self.window_tokens = metadata.starts.numel(), window.shape[1]
@@ -112,9 +113,11 @@ class PreparedFusedMLA:
         self.prefill = mode == "prefill"
         if self.prefill:
             self.key_capacity = self.compressed_capacity + self.window_tokens
-            kv = torch.empty((self.requests * self.key_capacity, 1, 512), device=query.device, dtype=torch.bfloat16)
+            kv = declaration_tensor(examples, "fused_mla.kv", (self.requests * self.key_capacity, 1, 512),
+                                    torch.bfloat16, query.device)
             width = indices.shape[1] + (0 if selected is None else selected.shape[1])
-            ids = torch.full((query.shape[0], 1, width), -1, device=query.device, dtype=torch.int32)
+            ids = declaration_tensor(examples, "fused_mla.indices", (query.shape[0], 1, width),
+                                     torch.int32, query.device).fill_(-1)
             self.operator = PreparedFlashMLA(query, positions, self.cs, sink, kv, ids, lengths,
                 scale=512 ** -.5, kernel_cache=preparation.kernel_cache, library=preparation.library,
                 session=session, name=name)

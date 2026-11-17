@@ -468,7 +468,7 @@ class PreparedAttention:
                 preparation=self.fused_layout, rotary=int(bool(self.ratio)), mode=mode,
                 compressed=compressed, selected=scratch.selected if self.ratio else None,
                 selected_lengths=self.index_lengths if self.ratio else None,
-                session=session, name=f"{name}.attention")
+                session=session, name=f"{name}.attention", examples=examples)
         self.concurrent_query = None
         if (mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
                 and isinstance(workspace, ScratchArena) and workspace.overlap):

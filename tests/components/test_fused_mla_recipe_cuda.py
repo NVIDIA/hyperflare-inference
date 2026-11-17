@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from ignition.components.fused_mla import FusedMLAPreparation
+from ignition.components.fused_mla import FusedMLAPreparation, PreparedFusedMLA
 from ignition.components.paged_batch import Metadata
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
@@ -41,6 +41,38 @@ def preparation(tmp_path_factory):
     return manifest, config, rotary, layout
 
 
+def test_prefill_declarations_share_full_context_operands(preparation):
+    _, _, _, layout = preparation
+    metadata = Metadata.allocate(4, 1, 512, "cuda:0")
+    query = torch.zeros((4, 64, 512), device="cuda", dtype=torch.bfloat16)
+    positions = torch.zeros(4, device="cuda", dtype=torch.int32)
+    sink = torch.zeros(64, device="cuda", dtype=torch.float32)
+    window = torch.zeros((1, 128, 528), device="cuda", dtype=torch.uint8)
+    compressed = torch.zeros((1, 128, 288), device="cuda", dtype=torch.uint8)
+    indices = torch.full((4, 128), -1, device="cuda", dtype=torch.int32)
+    selected = torch.full((4, 512), -1, device="cuda", dtype=torch.int32)
+    lengths = torch.zeros(4, device="cuda", dtype=torch.int32)
+    kv_bytes = (512 * 128 + 128) * 512 * 2
+    measured = []
+    for shared in (False, True):
+        examples = {} if shared else None
+        with RecordedPreparationSession(device="cuda:0", checkpoint="declaration-storage",
+                workload_schema="four-prefill-layers", numerical_policy="storage-only",
+                compile_workers=1, autotune_effort="off") as session:
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            operators = [PreparedFusedMLA(query, positions, sink, window, indices, lengths, metadata,
+                preparation=layout, rotary=1, mode="prefill", compressed=compressed,
+                selected=selected, selected_lengths=lengths, session=session,
+                name=f"attention.{index}", examples=examples) for index in range(4)]
+            torch.cuda.synchronize()
+            measured.append(torch.cuda.memory_allocated() - before)
+            assert len(operators) == 4
+    assert measured[0] >= 4 * kv_bytes
+    assert kv_bytes <= measured[1] < kv_bytes + 1024 * 1024
+    print(f"prefill declaration bytes: independent={measured[0]}, shared={measured[1]}")
+
+
 @pytest.mark.parametrize("layer,draft,consumer", [(0, False, None), (2, False, None),
                          (20, False, None), (20, False, 24), (0, True, None)],
                          ids=["window", "ratio-two", "ratio-one", "hierarchical", "draft"])
@@ -61,7 +93,7 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
     pool = ContinuationPool.allocate(config, 12, 8 * 67 + 1, "cuda:0", dspark=draft,
                                      window_record_planes=(512, 16))
     arena = ScratchArena("cuda:0", overlap=overlap)
-    catalog, graphs, functions = [], [], []
+    catalog, graphs, functions, examples = [], [], [], {}
     generator = torch.Generator(device="cuda").manual_seed(1029 + layer)
     try:
         with RecordedPreparationSession(device="cuda:0", checkpoint="deepseek41-fused-attention",
@@ -76,7 +108,8 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
                 candidates = torch.full_like(scratch.candidates, -1)
                 candidate_counts = torch.zeros_like(scratch.candidate_counts)
                 attentions = tuple(PreparedAttention(index, weights[index], source, scratch, metadata, pool, rotary,
-                    mode=mode, world=1, session=session, name=f"attention.{index}.{mode}.{tokens}", workspace=arena)
+                    mode=mode, world=1, session=session, name=f"attention.{index}.{mode}.{tokens}",
+                    workspace=arena, examples=examples)
                     for index in layers)
                 output = torch.empty_like(source)
                 accepted = torch.zeros(batch, device="cuda", dtype=torch.int64)
@@ -92,6 +125,8 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
 
                 catalog.append((metadata, source, output, accepted, forward))
             session.tune()
+            torch.cuda.synchronize()
+            examples.clear()
             arena.release_preparation()
             for (tokens, batch, width, mode), (metadata, source, output, accepted, forward) in zip(cases, catalog):
                 starts = torch.full((batch,), 126, device="cuda", dtype=torch.int64)
