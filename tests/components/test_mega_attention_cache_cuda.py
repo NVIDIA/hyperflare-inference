@@ -12,6 +12,7 @@ import torch
 from ignition.components.mega_attention_cache import MegaCacheLayout, PreparedMegaCacheWriter
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.tuning import RecordedPreparationSession
+from ignition.preparation.virtual_storage import VirtualStorage
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -100,6 +101,41 @@ def test_compiled_writers_preserve_layout_and_unwritten_state(tmp_path):
             operations[(17, 136, 528, 1)](args[0][:1], *args[1:])
         for graph in graphs.values():
             graph.reset()
+
+
+@pytest.mark.parametrize("record_bytes,ratio", [(528, 1), (288, 1), (288, 2)])
+def test_writer_preparation_does_not_materialize_virtual_cache(tmp_path, record_bytes, ratio):
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("requires SM103")
+    layout = MegaCacheLayout(64, record_bytes)
+    storage = VirtualStorage("cuda:0")
+    try:
+        backing = storage.device_allocate("cache", (1_000_000, layout.page_bytes), torch.uint8,
+                                          group="KV_PAGES", maximum=1_000_000, units=4)
+        backing[:4].fill_(43)
+        cache = layout.view(backing)
+        values = torch.full((17, 512), .25, dtype=torch.bfloat16, device="cuda")
+        positions = torch.arange(17, dtype=torch.int64, device="cuda")
+        slots = positions + 128
+        cs = torch.cat((torch.ones((64, 32), device="cuda"), torch.zeros((64, 32), device="cuda")), -1)
+        with RecordedPreparationSession(device="cuda:0", checkpoint="virtual-cache-writer",
+                workload_schema="bounded-preparation", numerical_policy="exact-encoded-bytes",
+                compile_workers=1, autotune_effort="off") as session:
+            operation = PreparedMegaCacheWriter(values, positions, cs, cache, slots, ratio=ratio,
+                kernel_cache=tmp_path, session=session, name="writer")
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            session.tune()
+            torch.cuda.synchronize()
+            assert torch.cuda.max_memory_allocated() - before < 64 << 20
+            assert bool((backing[:4] == 43).all())
+            expected = expected_cache(backing[:4], values, positions, slots, layout, ratio)
+            operation(values, positions, cs, cache, slots)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(backing[:4].cpu(), expected, rtol=0, atol=0)
+    finally:
+        storage.close()
 
 
 @pytest.mark.parametrize("pages", [1, 2])

@@ -166,8 +166,13 @@ class PreparedMegaCacheWriter:
         examples = [values, positions, cos_sin, cache, slots]
 
         def prepare_call(state):
-            values, positions, cos_sin, cache, slots = examples
-            target = torch.empty_strided(cache.shape, cache.stride(), dtype=cache.dtype, device=device)
+            values, _, cos_sin, cache, _ = examples
+            # Tuning writes a bounded fixture; the serving cache can be mostly virtual.
+            pages = triton.cdiv(q.rows, q.page_tokens)
+            target = torch.empty_strided((pages, q.page_tokens, q.record_bytes), cache.stride(),
+                                         dtype=cache.dtype, device=device)
+            slots = torch.arange(q.rows, dtype=torch.int64, device=device)
+            positions = slots % q.rotary_rows
             return PreparedCall(run=lambda: state.run(values, positions, cos_sin, target, slots), output=target)
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare_call),))
