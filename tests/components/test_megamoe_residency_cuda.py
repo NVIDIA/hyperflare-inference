@@ -16,6 +16,7 @@ import torch
 from ignition.components.megamoe import MegaMoeGeometry, MegaMoeWorkspace, PreparedMegaMoe
 from ignition.components.megamoe_tiers import MegaMoeHostTier
 from ignition.preparation.compilation import compile_forward
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 from tests.components.test_megamoe_cuda import experts
 from tests.components.test_megamoe_tiers_cuda import select
@@ -59,8 +60,10 @@ def test_native_row_exchanges_preserve_checkpoint_moe(experts, tmp_path, megamoe
         with RecordedPreparationSession(device="cuda:0", checkpoint="deepseek41-eight-experts",
                 workload_schema="native-row-exchanges", numerical_policy="reference-bitwise",
                 compile_workers=2, autotune_effort="off") as session:
+            arena = ScratchArena("cuda:0")
+            session.register_scratch(arena)
             stager = (PreparedExpertStage(tier, torch.cuda.Stream(), mapping, host_ids,
-                session=session, name="row-stage", min_cold=2) if staged else None)
+                session=session, workspace=arena, name="row-stage", min_cold=2) if staged else None)
             for rows in (1, 16, 64, 256):
                 x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16, generator=generator) * .1
                 ids = (torch.arange(rows * 6, device="cuda") % 8).reshape(rows, 6).int()
@@ -74,6 +77,8 @@ def test_native_row_exchanges_preserve_checkpoint_moe(experts, tmp_path, megamoe
                                      clamp=10., session=session, name=f"reference-{rows}")
                 catalog.append((args, op, ref, actual, expected))
             session.tune()
+            torch.cuda.synchronize()
+            arena.release_preparation()
             for args, op, ref, actual, expected in catalog:
                 def forward(args=args, op=op, ref=ref, actual=actual, expected=expected):
                     x, ids, probabilities, padding = args

@@ -12,6 +12,7 @@ from ignition.components.megamoe import MegaMoeGeometry, MegaMoeWorkspace, Prepa
 from ignition.components.megamoe_staging import PreparedExpertStage
 from ignition.components.megamoe_tiers import MegaMoeHostTier
 from ignition.preparation.compilation import compile_forward
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 from tests.components.test_megamoe_cuda import experts
 from tests.components.test_megamoe_tiers_cuda import select
@@ -42,9 +43,11 @@ def test_compiled_staging_preserves_checkpoint_outputs(experts, tmp_path, megamo
         with RecordedPreparationSession(device="cuda:0", checkpoint="deepseek41-eight-experts",
                 workload_schema="captured-expert-staging", numerical_policy="reference-bitwise",
                 compile_workers=2, autotune_effort=effort) as session:
+            arena = ScratchArena("cuda:0")
+            session.register_scratch(arena)
             mapping = torch.arange(8, device="cuda", dtype=torch.int32)
             stagers = [PreparedExpertStage(tier, streams[layer % 2], mapping, range(4),
-                session=session, name=f"stage-{layer}", min_cold=2) for layer, tier in enumerate(tiers)]
+                session=session, workspace=arena, name=f"stage-{layer}", min_cold=2) for layer, tier in enumerate(tiers)]
             for rows in (256, 1024, 8192):
                 x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16, generator=generator) * .1
                 ids = (torch.arange(rows * 6, device="cuda") % 8).reshape(rows, 6).int()
@@ -64,6 +67,7 @@ def test_compiled_staging_preserves_checkpoint_outputs(experts, tmp_path, megamo
             before_tuning = torch.cuda.memory_allocated()
             session.tune()
             torch.cuda.synchronize()
+            arena.release_preparation()
             # A selected plan must not retain a full copy destination allocated
             # for tuning; model preparation has one such plan per host geometry.
             assert torch.cuda.memory_allocated() - before_tuning < sum(t.numel() for t in stagers[0].sources)

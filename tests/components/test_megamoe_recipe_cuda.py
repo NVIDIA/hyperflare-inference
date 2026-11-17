@@ -70,7 +70,7 @@ def test_recipe_fused_experts_match_canonical_hbm(tmp_path, megamoe_core_storage
             from ignition.components.megamoe_staging import PreparedExpertStage
 
             stager = (PreparedExpertStage(weights.experts.host_tier, torch.cuda.Stream(),
-                weights.experts.expert_map, host, session=session, name="recipe-stage") if staged else None)
+                weights.experts.expert_map, host, session=session, workspace=arena, name="recipe-stage") if staged else None)
             for rows, mode in cases:
                 scratch = Scratch.allocate(rows, rows, 1, "cuda:0", experts=canonical, top_k=top_k)
                 x = scratch.ffn_hc.normalized

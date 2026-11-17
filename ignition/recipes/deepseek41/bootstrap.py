@@ -471,7 +471,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 expert = layer.experts.experts
                 if expert.host_tier is not None and expert.host_tier.rows >= staging.min_cold_experts:
                     expert_stagers[index] = PreparedExpertStage(expert.host_tier, streams[len(expert_stagers) % 2],
-                        expert.expert_map, expert.host_experts, session=session, name=f"prefill-stage-{index}",
+                        expert.expert_map, expert.host_experts, session=session, workspace=arena, name=f"prefill-stage-{index}",
                         min_cold=staging.min_cold_experts)
             if not expert_stagers:
                 raise ValueError("prefill staging requires eligible target host experts")

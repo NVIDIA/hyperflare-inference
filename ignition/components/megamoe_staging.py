@@ -158,7 +158,7 @@ class PreparedExpertStage:
     capture stream for serial diagnosis. Stage scratch is forward-local.
     """
 
-    def __init__(self, tier, stream, mapping, host_experts, *, session, name, min_cold=8):
+    def __init__(self, tier, stream, mapping, host_experts, *, session, workspace, name, min_cold=8):
         host_experts = tuple(host_experts)
         if (mapping.dtype != torch.int32 or mapping.ndim != 1 or not mapping.is_contiguous()
                 or mapping.device != tier.control.device
@@ -176,14 +176,16 @@ class PreparedExpertStage:
         self.decision = persistent_zeros((1,), device=mapping.device, dtype=torch.int32)
         self.query = q = StageQuery(tier.rows, tuple(t.numel() // (4 * tier.rows) for t in self.sources), min_cold)
         self.plan = native_plan(contract=CONTRACT, query=q, device=mapping.device,
-            scratch_bytes=lambda tactic: sum(source.numel() for source in self.sources),
+            scratch_bytes=lambda tactic: sum((source.numel() + 255) // 256 * 256 for source in self.sources),
             compile_jobs=lambda tactic, device: (CompileJob.create(
                 "ignition.components.megamoe_staging:compile_copies",
                 dict(query=CONTRACT.encode_query(q), ctas=tactic), device.ordinal),),
             materialize=lambda tactic: _State(q, tactic, mapping.device))
 
         def prepare(state):
-            destinations = [torch.zeros_like(source) for source in self.sources]
+            # Candidate trials execute serially. Borrow the shared preparation
+            # arena rather than allocating four weight planes per candidate.
+            destinations = workspace.views(*((tuple(source.shape), source.dtype) for source in self.sources))
             current_map = mapping.clone()
             decision = torch.full_like(self.decision, min_cold)
             def produce():

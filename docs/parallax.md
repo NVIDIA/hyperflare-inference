@@ -760,6 +760,8 @@ storage, residency maps and control counters remain unchanged. Native residency
 publication must exclude readers for the entire graph, including its copies.
 Two auxiliary streams permit lookahead; stream reuse follows the preceding
 consumer, with all source and destination lifetimes visible to compilation.
+Serialized tuning trials borrow the shared preparation scratch arena; they do
+not allocate a separate expert-copy destination for each candidate.
 Native promotion counters describe permanent residency transactions. Temporary
 staging costs require separate graph measurements; per-copy staging telemetry
 is not exported.
