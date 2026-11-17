@@ -786,7 +786,9 @@ impl GraphExecutor {
             ))
             .into());
         }
-        self.progress_residency()?;
+        // Only polling may advance residency and close its submission gate.
+        // The scheduler can already own this fence after checking can_submit;
+        // a newly ready transfer must not revoke that reservation here.
         if self.residency.as_ref().is_some_and(|gate| gate.paused()) { return Ok(None); }
         let resources = self
             .resources

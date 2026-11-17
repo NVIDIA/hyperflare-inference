@@ -740,7 +740,10 @@ limit before allocating Grace backing or the HBM pool.
 The execution manifest carries an optional residency binding. Exactly one native
 executor may claim it. Each submitted frame retains a reader lease until its
 completion event. Copies can overlap readers; when copies finish, the executor
-stops new submissions until existing readers complete and mappings publish.
+advances residency during polling and stops new submissions until existing
+readers complete and mappings publish. Submission itself does not advance
+residency: a queued movement cannot revoke a scheduler reservation made after
+the executor reported available capacity.
 Recoverable copy or publication failures disable movement and preserve static
 storage. Unconfirmed mappings or readers stop execution and retain owners.
 There is no steady-state GPU allocation or graph recapture.
