@@ -353,6 +353,11 @@
 [ ] Qualify Qwen3.8 Flash at TP4 end to end: export and native serving through
     flare run. See model-preparation.md.
 
+[ ] Regenerate tests/frontend/qwen38.json and tests/frontend/qwen38_images.json
+    on the pinned Transformers release. Both record a source commit instead of
+    a release, so qualification rejects them; close when both record
+    transformers_version.
+
 [ ] Qualify DeepSeek V4.1 --vocabulary-parallel-sampling above one concurrent
     request at TP4. Close when complete-model serving passes at the recipe's
     default concurrency.

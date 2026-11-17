@@ -36,6 +36,21 @@ def write_json(path: Path, value) -> None:
     temporary.replace(path)
 
 
+def distribution_origin(distribution) -> dict:
+    """Read a distribution's direct URL record, or an empty record for registry installs."""
+    return json.loads(distribution.read_text("direct_url.json") or "{}")
+
+
+def require_fixture_transformers(fixture: dict) -> None:
+    """Reject a fixture recorded with a different Transformers release."""
+    recorded = fixture.get("transformers_version")
+    if recorded is None:
+        raise ValueError("frontend fixture records no Transformers version; regenerate it")
+    installed = importlib.metadata.version("transformers")
+    if installed != recorded:
+        raise ValueError(f"frontend fixture requires Transformers {recorded}; found {installed}")
+
+
 def common_prefix(left: list[int], right: list[int]) -> int:
     return next((i for i, pair in enumerate(zip(left, right)) if pair[0] != pair[1]), min(len(left), len(right)))
 
@@ -490,9 +505,9 @@ def main() -> int:
     import transformers
     import tokenizers
 
-    origin = json.loads(importlib.metadata.distribution("transformers").read_text("direct_url.json"))
-    if origin.get("vcs_info", {}).get("commit_id") != text_fixture["transformers_commit"] or tokenizers.__version__ != text_fixture["tokenizers_version"]:
-        raise ValueError("qualification requires the pinned Transformers/tokenizers preparation environment")
+    require_fixture_transformers(text_fixture)
+    if tokenizers.__version__ != text_fixture["tokenizers_version"]:
+        raise ValueError("qualification requires the pinned tokenizers version")
     tokenizer = transformers.AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
     run = Run(args)
 

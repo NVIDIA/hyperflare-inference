@@ -3,10 +3,12 @@
 
 """Stored tensor contract for the pinned Qwen3.8 Flash Next checkpoint."""
 
+import importlib.metadata
+
 MODEL_ID = "nvidia/Qwen3.8-Flash-Next-FP4-Local"
 REVISION = "b9ce18a6887e18c089fdea8509a33e63429a3300"
 ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
-TRANSFORMERS_REVISION = "1d9654e78a23fb167ef539cbd699dfbd3e4830cf"
+TRANSFORMERS_VERSION = "5.23.0"
 CONFIG_SHA256 = "b50dbc52a0c83b0cd2a44a372c1fb6b5e0e6827d22f2611c97d4d030f92f6b28"
 INDEX_SHA256 = "5fa166bbb1cf25adda455117563efa72a2072272001f459eedece131ffc913e1"
 HEADERS_SHA256 = "b4884a790482d83fc86cf97eb01054780817d39e866c29013ca63cae881441aa"
@@ -66,6 +68,16 @@ VISION_GEOMETRY = {
     "spatial_merge_size": 2,
     "num_position_embeddings": 2304,
 }
+
+
+def require_transformers(component: str) -> None:
+    """Reject preparation that does not run on the pinned Transformers release."""
+    try:
+        installed = importlib.metadata.version("transformers")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise RuntimeError(f"{component} requires Transformers {TRANSFORMERS_VERSION}") from error
+    if installed != TRANSFORMERS_VERSION:
+        raise RuntimeError(f"{component} requires Transformers {TRANSFORMERS_VERSION}; found {installed}")
 
 
 def expected_quantization():
