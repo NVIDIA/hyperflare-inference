@@ -65,6 +65,18 @@ fn rows_cannot_mix_layers_parts_or_live_slots() {
 }
 
 #[test]
+fn invalid_slot_indices_in_any_plane_fail_without_indexing_occupancy() {
+    let layout = Layout::new(vec![layer()]).unwrap();
+    for part in 0..4 {
+        for slot in [layout.slots.len(), usize::MAX] {
+            let mut locations = layout.initial.clone();
+            locations[4 + part] = Location::Hbm(slot);
+            assert!(layout.maps(&locations).is_err());
+        }
+    }
+}
+
+#[test]
 fn invalid_geometry_is_rejected_without_cuda() {
     let mut cases = vec![];
     let mut p = layer();
@@ -133,4 +145,51 @@ fn failed_drain_or_rollback_poison_mapping_publication() {
         assert!(matches!(result, Err(Error::Poisoned(_))));
         assert_eq!(calls, if failed_drain { 1 } else { 2 });
     }
+}
+
+/// CPU-only measurement of the two full-map validations performed by publication.
+#[test]
+#[ignore = "manual release-mode CPU timing; does not use CUDA"]
+fn publication_map_validation_cost() {
+    let layers = (0..40).map(|layer| {
+        let resident = if layer < 20 { 320 } else { 256 };
+        Layer {
+            layer, experts: 384,
+            host_experts: (resident - 96..384).collect(),
+            hbm_experts: (0..resident).collect(),
+            mapping_address: 0x1000 + layer as u64 * 0x1000,
+            planes: [8192, 512, 4096, 256].into_iter().enumerate().map(|(part, row_bytes)| {
+                let base = 0x1_0000_0000 + layer as u64 * 0x1000_0000 + part as u64 * 0x100_0000;
+                Plane { host_address: base, hbm_address: base + 0x80_0000, row_bytes }
+            }).collect(),
+        }
+    }).collect();
+    let layout = Layout::new(layers).unwrap();
+    let mut changed = layout.initial.clone();
+    for (index, layer) in layout.layers.iter().enumerate() {
+        let victim = layer.host_experts[0];
+        let promoted = layer.hbm_experts.len();
+        let start = layout.starts[index];
+        for part in 0..layer.planes.len() {
+            changed[start + promoted * layer.planes.len() + part] =
+                changed[start + victim * layer.planes.len() + part];
+            changed[start + victim * layer.planes.len() + part] = Location::Backing;
+        }
+    }
+    let expected_before = layout.maps(&layout.initial).unwrap();
+    let expected_after = layout.maps(&changed).unwrap();
+    assert_ne!(expected_before, expected_after);
+    let mut times = vec![];
+    for index in 0..110 {
+        let started = std::time::Instant::now();
+        let before = layout.maps(std::hint::black_box(&layout.initial)).unwrap();
+        let after = layout.maps(std::hint::black_box(&changed)).unwrap();
+        let elapsed = started.elapsed().as_nanos();
+        assert_eq!(before, expected_before);
+        assert_eq!(after, expected_after);
+        if index >= 10 { times.push(elapsed); }
+    }
+    times.sort_unstable();
+    println!("SYNTHETIC CPU map validation: {} regions, {} slots, 100 samples; pair p50={} ns p95={} ns p99={} ns. Excludes CUDA upload and reader drain.",
+        layout.regions.len(), layout.slots.len(), times[49], times[94], times[98]);
 }
