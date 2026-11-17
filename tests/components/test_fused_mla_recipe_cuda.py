@@ -3,6 +3,7 @@
 
 """Checkpoint attention preserves selected sets and output/state at matched ordering."""
 
+import gc
 import os
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 import torch
 
 from ignition.components.fused_mla import FusedMLAPreparation, PreparedFusedMLA
+from ignition.components.mega_attention_output import PreparedFusedMLAOutput
 from ignition.components.paged_batch import Metadata
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
@@ -88,6 +90,36 @@ def test_prefill_declarations_share_full_context_operands(preparation):
     assert measured[0] >= 4 * kv_bytes
     assert kv_bytes <= measured[1] < kv_bytes + 1024 * 1024
     print(f"prefill declaration bytes: independent={measured[0]}, shared={measured[1]}")
+
+
+def test_prefill_output_declarations_share_operands(preparation):
+    manifest, _, _, layout = preparation
+    with DeepSeekWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(0, 1),
+            prefixes=("layers.2.attn.",), fused_attention=layout) as loader:
+        weights = loader.load_attention(2)["output"]
+    output = torch.empty((8192, 5120), dtype=torch.bfloat16, device="cuda")
+    measured = []
+    for shared in (False, True):
+        examples = {} if shared else None
+        arena = ScratchArena("cuda:0")
+        with RecordedPreparationSession(device="cuda:0", checkpoint="checkpoint-output-declarations",
+                workload_schema="four-prefill-output-projections", numerical_policy="storage-only",
+                compile_workers=1, autotune_effort="off") as session:
+            session.register_scratch(arena)
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            operators = [PreparedFusedMLAOutput(weights, output, kernel_cache=layout.kernel_cache,
+                session=session, name=f"output.{index}", workspace=arena, examples=examples)
+                for index in range(4)]
+            torch.cuda.synchronize()
+            measured.append(torch.cuda.memory_allocated() - before)
+            assert len(operators) == 4
+        del operators, session, arena, examples
+        gc.collect()
+        torch.cuda.synchronize()
+    print(f"prefill output declaration bytes: independent={measured[0]}, shared={measured[1]}")
+    # Four 256 MiB FP8 inputs and 128 MiB grouped results should share one pair.
+    assert measured[0] - measured[1] >= 3 * (256 + 128) * 1024 * 1024
 
 
 @pytest.mark.parametrize("layer,draft,consumer", [(0, False, None), (2, False, None),

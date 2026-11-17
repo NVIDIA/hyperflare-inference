@@ -15,6 +15,7 @@ from ignition.components.mega_attention import _spec
 from ignition.components.native_operator import native_contract, native_plan
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.examples import declaration_tensor
 
 
 @dataclass(frozen=True)
@@ -103,16 +104,22 @@ class PreparedGroupedFP8Projection:
 class PreparedFusedMLAOutput:
     """Preserve the BF16 grouped intermediate before the final dense projection."""
 
-    def __init__(self, values, scales, weights, output, *, kernel_cache, session, name, workspace):
+    def __init__(self, weights, output, *, kernel_cache, session, name, workspace, examples=None):
         from ignition.components.linear import QuantizedProjection
 
+        rows = output.shape[0]
+        groups, width, inputs = weights.grouped[0].shape
+        values = declaration_tensor(examples, "fused_mla_output.values", (rows, groups, inputs),
+                                    torch.float8_e4m3fn, output.device)
+        scales = declaration_tensor(examples, "fused_mla_output.scales",
+            (groups, inputs // 128, (rows + 3) // 4 * 4), torch.int32, output.device).permute(2, 0, 1)[:rows]
         self.grouped = PreparedGroupedFP8Projection(values, scales, *weights.grouped,
             kernel_cache=kernel_cache, session=session, name=name + ".grouped")
-        rows, groups = values.shape[:2]
-        width = weights.grouped[0].shape[1]
-        example = torch.empty((rows, groups * width), device=values.device, dtype=torch.bfloat16)
+        example = declaration_tensor(examples, "fused_mla_output.grouped_result", (rows, groups * width),
+                                     torch.bfloat16, output.device)
         self.dense = QuantizedProjection(example, weights.dense, output, session=session,
-            name=name + ".dense", workspace=workspace, activation_mode="auto").functional(session=session)
+            name=name + ".dense", workspace=workspace, activation_mode="auto",
+            examples=examples, example_role="fused_mla_output.dense").functional(session=session)
 
     def __call__(self, values, scales):
         return self.dense(self.grouped(values, scales).flatten(1))

@@ -17,7 +17,6 @@ from ignition.components import sm103_projection
 from ignition.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from ignition.components.attention_output import PreparedGroupedOutputProjection
 from ignition.components.fused_mla import PreparedFusedMLA
-from ignition.components.mega_attention import _outputs
 from ignition.components.mega_attention_cache import MegaCacheLayout, PreparedMegaCacheWriter, snapshot_window, commit_window
 from ignition.components.mega_attention_output import PreparedFusedMLAOutput
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
@@ -401,9 +400,9 @@ class PreparedAttention:
                 snapshot_tokens=128 if mode in ("verify", "draft") else 0)
         else:
             self.cos_sin = self.fused_layout.cos_sin[int(bool(self.ratio))]
-            self.output_projection = PreparedFusedMLAOutput(*_outputs(tokens, device), weights["output"],
+            self.output_projection = PreparedFusedMLAOutput(weights["output"],
                 scratch.output, kernel_cache=self.fused_layout.kernel_cache, session=session,
-                name=name + ".output", workspace=workspace)
+                name=name + ".output", workspace=workspace, examples=examples)
             self.window_writer = PreparedMegaCacheWriter(scratch.window_values, window_metadata.position,
                 self.cos_sin, self.window_layout.view(self.window_cache), self.window_slots, ratio=1,
                 kernel_cache=self.fused_layout.kernel_cache, session=session, name=f"{name}.window_write")
