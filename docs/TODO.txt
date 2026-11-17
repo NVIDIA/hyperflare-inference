@@ -2,8 +2,7 @@
     and seven adaptive drafts. Prepare C16, 8192-token prefill and three drafts for
     the DerpSeek standard workload; validate long-context and vision replay.
     Connect canonical routing telemetry, including MTP, and expert movement.
-    Use the authenticated prepared-weight catalog decoder for compressed catalogs
-    and validate the MegaMoE expert planes' strides and physical row mappings.
+    Validate the MegaMoE expert planes' strides and physical row mappings.
     Compare exported Flare/Parallax serving with DerpSeek exact using matched
     workloads, memory budgets, arithmetic and speculative settings.
 

@@ -627,7 +627,10 @@ pauses, and compare measured serving results against a matched static placement.
 
 The [`storage binding resolver`](../helios/src/parallax/residency/package.rs)
 matches a versioned configuration to an authenticated package's prepared-weight
-catalog. Configuration names weight views and maps their first tensor axis to
+catalog, decoded through the shared reader for inline and zstd-compressed
+representations. The reader bounds decompression and rejects conflicting
+representations, damaged frames and decoded-length mismatches.
+Configuration names weight views and maps their first tensor axis to
 canonical expert IDs; it cannot supply addresses or replacement weight data.
 Resolution checks package identity, single-rank geometry, contiguous extents,
 complete page ownership, immutable-weight initializers and disjoint regions.
