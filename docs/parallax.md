@@ -271,15 +271,27 @@ execution mode. Packages exported with only ordinary traced variants still requi
 `--mtp-draft-tokens 0`; enabling MTP tracing requires a package with traced MTP
 graphs. Mixed tracing fails admission.
 
-DeepSeek V4.1 TP1 capture wiring is implemented and component-qualified on GB300;
-exported native tracing is not yet qualified. Its ordinary, scored-prefill and
-packed MTP variants count canonical target IDs before physical expert mapping.
+DeepSeek V4.1 TP1 capture wiring has checkpoint component coverage and bounded
+exported native text coverage on GB300. Its ordinary, scored-prefill and packed
+MTP variants count canonical target IDs before physical expert mapping.
 Verification counts include rejected target candidates; draft experts are not
 part of this feed. Each layer records its executed row count, including the
 shorter decoder suffix during bounded prefill. Histogram token totals therefore
 need not be equal across layers. The checkpoint expert-block check covers
 1, 17, 64, 128 and 8192 rows, exact plain/traced outputs and IDs, inactive rows,
 alternating frames, untouched plain telemetry buffers and allocation-free replay.
+
+The exported native check uses concurrency sixteen, 8192-token prefill and three
+adaptive drafts. It compares the same core and release runtime with tracing off
+and on. All 22 requests have identical output token IDs,
+messages, finish reasons and token counts, including chunked prefill, prefix reuse,
+branching and concurrent speculative execution. Tracing off publishes no frames.
+A separate C1 collection preserves 1,285 consecutive frames without sequence gaps,
+including multi-chunk prefill and MTP verification, with valid per-layer totals.
+These checks cover routing integration and bounded output agreement, not full-model
+tensor/state equivalence or scored-prefill tracing. Free-form seeded C1 responses
+vary within both off and on runs, so their request latency does not isolate
+instrumentation overhead. Physical movement remains disabled for these checks.
 
 Telemetry is disabled by default. Native startup selects counter-free graphs and
 omits routing readback storage from the execution manifest; no routing records

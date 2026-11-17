@@ -648,8 +648,11 @@ movement.
 
 `--parallax-routing` adds optional target-routing variants for ordinary and packed
 MTP execution. Runtime selection remains off by default. DeepSeek's capture wiring
-has checkpoint expert-block coverage through 8192 rows; exported native tracing
-is not yet qualified. See [the routing contract](parallax.md#native-capture-and-live-comparison)
+has checkpoint expert-block coverage through 8192 rows and bounded exported
+C16/8192/MTP3 text checks with identical tracing-off/on output token IDs. Native
+collection covers per-layer histograms through multi-chunk prefill and MTP;
+full-model tensor/state equivalence and isolated overhead remain unqualified.
+See [the routing contract](parallax.md#native-capture-and-live-comparison)
 for canonical IDs, per-layer valid counts and draft exclusion.
 
 Run the persistent native text regression against an idle release server with
