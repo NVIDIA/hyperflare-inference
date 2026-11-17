@@ -640,7 +640,8 @@ and static HBM/Grace placement. Its 111 compiled forwards and 141 captured graph
 load through release Flare. Checks cover a 12,842-token prompt crossing prefill
 chunks, exact cold/warm output token agreement, prefix reuse and branching,
 sixteen simultaneous requests, token accounting, and request drain. Native
-counters confirm speculative execution at batch sixteen. These checks do not
+counters confirm speculative execution at batch sixteen. The checks also cover
+direct-destination prefill cache assembly in an exported core. They do not
 establish full-model numerical equivalence, vision replay, long-context
 correctness, ordinary/MTP equivalence at concurrency sixteen, or adaptive expert
 movement.
