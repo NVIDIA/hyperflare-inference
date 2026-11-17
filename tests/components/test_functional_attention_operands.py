@@ -136,6 +136,7 @@ def test_compressor_join_carries_runtime_metadata_and_angles(monkeypatch, with_a
     op.output_layouts = (((2, 4), (4, 1), torch.float32),)
     op.weights = op.history = op.caches = op.plans = []
     op.frequencies, op.ratio, op.eps, op.stream_handle = torch.ones(4), 4, 1e-6, 9
+    op.hadamard, op.key_power_of_two = True, False
     m = SimpleNamespace(**{key: torch.ones(2, dtype=torch.int64)
         for key in ("requests", "positions", "starts", "query_start_loc", "state_rows")})
     positions, slots = torch.ones(2), torch.ones(2)
@@ -146,6 +147,7 @@ def test_compressor_join_carries_runtime_metadata_and_angles(monkeypatch, with_a
     pending = op.start(torch.ones(2, 4), m, positions, slots, angles=angles)
     output = op.finish(pending, [torch.ones(2, 4)])
     borrowed = calls[0][8]
+    assert calls[0][14:16] == (True, False)
     assert calls[1][0] is borrowed
     assert calls[1][3] is output
     originals = (calls[0][0], m.requests, m.positions, m.starts,
