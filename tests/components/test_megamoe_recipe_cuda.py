@@ -25,8 +25,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned SM103 GPU")
 
 
-@pytest.mark.parametrize("draft", [False, True], ids=["target", "draft"])
-def test_recipe_fused_experts_match_canonical_hbm(tmp_path, megamoe_core_storage, draft):
+@pytest.mark.parametrize("draft,staged", [(False, False), (True, False), (False, True)],
+                         ids=["target", "draft", "staged-target"])
+def test_recipe_fused_experts_match_canonical_hbm(tmp_path, megamoe_core_storage, draft, staged):
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("requires SM103")
     snapshot = os.environ.get("FLARE_DEEPSEEK41_CSF_SNAPSHOT")
@@ -41,10 +42,13 @@ def test_recipe_fused_experts_match_canonical_hbm(tmp_path, megamoe_core_storage
         canonical, top_k = 384, 6
         host, hbm = tuple(rows["host"]), tuple(rows["hot"] + rows["cache"])
         prefix, cases = "layers.0.ffn", ((1, "decode"), (8, "verify"), (64, "prefill"), (256, "prefill"))
+        if staged:
+            cases = ((1, "decode"), (8, "verify"), (1024, "prefill"), (8192, "prefill"))
+    capacity = max(rows for rows, _ in cases)
     storage = megamoe_core_storage
-    workspace = MegaMoeWorkspace(MegaMoeGeometry(len(host) + len(hbm), 256, top_k, 5120, 2304, 1),
+    workspace = MegaMoeWorkspace(MegaMoeGeometry(len(host) + len(hbm), capacity, top_k, 5120, 2304, 1),
                                  device="cuda:0", kernel_cache=tmp_path)
-    reference_workspace = MegaMoeWorkspace(MegaMoeGeometry(canonical, 256, top_k, 5120, 2304, 1),
+    reference_workspace = MegaMoeWorkspace(MegaMoeGeometry(canonical, capacity, top_k, 5120, 2304, 1),
                                            device="cuda:0", kernel_cache=tmp_path)
     layout = MegaMoeLayerLayout(workspace, host, hbm, storage)
     reference_layout = MegaMoeLayerLayout(reference_workspace, (), tuple(range(canonical)), storage)
@@ -63,6 +67,10 @@ def test_recipe_fused_experts_match_canonical_hbm(tmp_path, megamoe_core_storage
                 workload_schema="target-draft-routing", numerical_policy="reference-bitwise",
                 compile_workers=2, autotune_effort="off") as session:
             session.register_scratch(arena)
+            from ignition.components.megamoe_staging import PreparedExpertStage
+
+            stager = (PreparedExpertStage(weights.experts.host_tier, torch.cuda.Stream(),
+                weights.experts.expert_map, host, session=session, name="recipe-stage") if staged else None)
             for rows, mode in cases:
                 scratch = Scratch.allocate(rows, rows, 1, "cuda:0", experts=canonical, top_k=top_k)
                 x = scratch.ffn_hc.normalized
@@ -86,7 +94,8 @@ def test_recipe_fused_experts_match_canonical_hbm(tmp_path, megamoe_core_storage
             arena.release_preparation()
             for x, metadata, layer, actual, expected, ids, ref in catalog:
                 def forward(x=x, metadata=metadata, layer=layer, actual=actual, expected=expected, ids=ids, ref=ref):
-                    value, route = layer._run_experts(x, metadata)
+                    pending = (stager, stager.start(x)) if stager is not None and x.shape[0] >= 1024 else None
+                    value, route = layer._run_experts(x, metadata, pending)
                     actual.copy_(value)
                     ids.copy_(route.ids)
                     expected.copy_(ref(x, route.ids, route.weights, metadata.positions < 0))
@@ -118,7 +127,11 @@ def test_recipe_fused_experts_match_canonical_hbm(tmp_path, megamoe_core_storage
                     if tier is not None:
                         counts = torch.bincount(weights.experts.expert_map[ids[live].long()].long().flatten(),
                                                 minlength=workspace.geometry.experts)
-                        torch.testing.assert_close((tier.control[16:] - before).long(), counts, rtol=0, atol=0)
+                        if staged and x.shape[0] >= 1024:
+                            torch.testing.assert_close(tier.control[16:], before, rtol=0, atol=0)
+                            assert stager.decision.item() == (counts[:tier.rows] > 0).sum().item()
+                        else:
+                            torch.testing.assert_close((tier.control[16:] - before).long(), counts, rtol=0, atol=0)
     finally:
         torch.cuda.synchronize()
         for graph in graphs:

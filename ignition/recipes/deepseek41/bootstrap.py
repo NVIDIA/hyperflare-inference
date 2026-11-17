@@ -68,9 +68,10 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 
 def _forward_factories(mla_compute_mode, *, vision,
-                       draft_vocabulary_runtime=None, examples=None):
+                       draft_vocabulary_runtime=None, examples=None, expert_stagers=None, stage_min_rows=1024):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
-    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples),
+    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples,
+                    expert_stagers=expert_stagers, stage_min_rows=stage_min_rows),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode, examples=examples))
 
@@ -201,6 +202,9 @@ class PreparationConfig:
             raise ValueError("DeepSeek context must be 128-aligned in [128,1048576]")
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
             raise ValueError("prefill chunk size must be 64-aligned in [64,context]")
+        if (self.sm103 is not None and self.sm103.prefill_staging is not None
+                and self.sm103.prefill_staging.min_rows > self.prefill_chunk_size):
+            raise ValueError("prefill staging row threshold exceeds the prepared prefill capacity")
         request_capacity(self.max_active)
         self.speculative_shapes
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
@@ -456,9 +460,25 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 token_base=129280, sentinel_names=("image_start", "image_start", "image_newline", "image_end"),
                 feature_type=1, image_slots=config.image_concurrency, arena=feature_arena)
             vision_storage = {}
+        expert_stagers = {}
+        staging = None if config.sm103 is None else config.sm103.prefill_staging
+        if staging is not None:
+            from ignition.components.megamoe_staging import PreparedExpertStage
+
+            streams = ([torch.cuda.Stream(device=device) for _ in range(2)] if config.stream_overlap
+                       else [None, None])
+            for index, layer in enumerate(weights.layers):
+                expert = layer.experts.experts
+                if expert.host_tier is not None and expert.host_tier.rows >= staging.min_cold_experts:
+                    expert_stagers[index] = PreparedExpertStage(expert.host_tier, streams[len(expert_stagers) % 2],
+                        expert.expert_map, expert.host_experts, session=session, name=f"prefill-stage-{index}",
+                        min_cold=staging.min_cold_experts)
+            if not expert_stagers:
+                raise ValueError("prefill staging requires eligible target host experts")
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples)
+            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples,
+            expert_stagers=expert_stagers, stage_min_rows=1024 if staging is None else staging.min_rows)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -651,6 +671,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     session.freeze()
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
+    for stager in expert_stagers.values():
+        stager.decision.zero_()
+    torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
     release_unused()
     if group is not None:
@@ -681,6 +704,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "catalog_operand_bytes": catalog_bytes,
         "weights_bytes": weights.allocated_bytes, "mapped_host_bytes": expert_host_bytes,
         "expert_tier_bytes": None if config.sm103 is None else tier_bytes,
+        "expert_staging_scratch_estimate": 0 if config.sm103 is None else config.sm103.staging_bytes(weights.config),
         "megamoe_workspace_bytes": workspace_bytes,
         "expert_scale_compression": config.expert_scale_compression,
         "sm103": None if config.sm103 is None else config.sm103.to_dict(),

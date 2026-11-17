@@ -7,6 +7,21 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class PrefillExpertStaging:
+    """Prepared row threshold and preceding-call cold demand for temporary copies."""
+
+    min_rows: int = 1024
+    min_cold_experts: int = 8
+
+    def __post_init__(self):
+        if any(type(value) is not int or value <= 0 for value in (self.min_rows, self.min_cold_experts)):
+            raise ValueError("prefill expert staging thresholds must be positive integers")
+
+    def to_dict(self):
+        return dict(min_rows=self.min_rows, min_cold_experts=self.min_cold_experts)
+
+
+@dataclass(frozen=True)
 class ExpertPlacement:
     """Physical row order; an HBM copy overrides the same expert's host copy."""
 

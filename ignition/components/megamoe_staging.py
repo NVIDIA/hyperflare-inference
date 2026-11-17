@@ -112,8 +112,10 @@ class _State:
 def _start(anchor: torch.Tensor, sources: list[torch.Tensor],
            destinations: list[torch.Tensor], mapping: torch.Tensor, canonical: torch.Tensor,
            decision: torch.Tensor, stream: int, handle: int) -> None:
-    auxiliary = torch.cuda.ExternalStream(stream, device=anchor.device)
-    auxiliary.wait_stream(torch.cuda.current_stream(anchor.device))
+    main = torch.cuda.current_stream(anchor.device)
+    auxiliary = torch.cuda.ExternalStream(stream, device=anchor.device) if stream else main
+    if stream:
+        auxiliary.wait_stream(main)
     plan = plan_from_handle(handle)
     with torch.cuda.stream(auxiliary):
         require_prepared(plan, plan.component_id, anchor.device).run(
@@ -129,8 +131,9 @@ def _start_fake(anchor, sources, destinations, mapping, canonical, decision, str
 def _join(consumer: torch.Tensor, sources: list[torch.Tensor],
           destinations: list[torch.Tensor], mapping: torch.Tensor, canonical: torch.Tensor,
           decision: torch.Tensor, stream: int) -> None:
-    torch.cuda.current_stream(consumer.device).wait_stream(
-        torch.cuda.ExternalStream(stream, device=consumer.device))
+    if stream:
+        torch.cuda.current_stream(consumer.device).wait_stream(
+            torch.cuda.ExternalStream(stream, device=consumer.device))
 
 
 @_join.register_fake
@@ -151,19 +154,21 @@ class PreparedExpertStage:
     must clear preparation observations after warmup and capture have drained.
     Residency publication must exclude readers for the entire graph, including the
     copy. Reuse a stream only after its preceding consumer is enqueued, passing that
-    consumer's output as the next start anchor. Stage scratch is forward-local.
+    consumer's output as the next start anchor. A None stream uses the calling
+    capture stream for serial diagnosis. Stage scratch is forward-local.
     """
 
     def __init__(self, tier, stream, mapping, host_experts, *, session, name, min_cold=8):
         host_experts = tuple(host_experts)
         if (mapping.dtype != torch.int32 or mapping.ndim != 1 or not mapping.is_contiguous()
-                or mapping.device != tier.control.device or stream.device != mapping.device
+                or mapping.device != tier.control.device
+                or stream is not None and stream.device != mapping.device
                 or len(host_experts) != tier.rows
                 or len(set(host_experts)) != tier.rows
                 or any(type(i) is not int or not 0 <= i < mapping.numel() for i in host_experts)):
             raise ValueError("expert staging requires canonical host IDs and a contiguous int32 residency map")
         self.tier, self.stream, self.mapping = tier, stream, mapping
-        self.stream_handle = stream.cuda_stream
+        self.stream_handle = 0 if stream is None else stream.cuda_stream
         self.layouts = tuple((tuple(t.shape), t.stride(), t.dtype) for t in tier.device_views)
         self.sources = [t.as_strided((t.numel(),), (1,)).view(torch.uint8) for t in tier.device_views]
         self.canonical = persistent_copy(torch.tensor(host_experts, device=mapping.device, dtype=torch.int32))
@@ -171,7 +176,7 @@ class PreparedExpertStage:
         self.decision = persistent_zeros((1,), device=mapping.device, dtype=torch.int32)
         self.query = q = StageQuery(tier.rows, tuple(t.numel() // (4 * tier.rows) for t in self.sources), min_cold)
         self.plan = native_plan(contract=CONTRACT, query=q, device=mapping.device,
-            scratch_bytes=lambda tactic: 0,
+            scratch_bytes=lambda tactic: sum(source.numel() for source in self.sources),
             compile_jobs=lambda tactic, device: (CompileJob.create(
                 "ignition.components.megamoe_staging:compile_copies",
                 dict(query=CONTRACT.encode_query(q), ctas=tactic), device.ordinal),),
@@ -179,11 +184,16 @@ class PreparedExpertStage:
 
         def prepare(state):
             destinations = [torch.zeros_like(source) for source in self.sources]
+            current_map = mapping.clone()
             decision = torch.full_like(self.decision, min_cold)
-            return PreparedCall(run=lambda: state.run(self.sources, destinations, mapping, self.canonical, decision),
-                                output=destinations, owners=(self, destinations, decision))
+            def produce():
+                current_map.copy_(mapping)
+                decision.fill_(min_cold)
+            return PreparedCall(run=lambda: state.run(self.sources, destinations, current_map, self.canonical, decision),
+                                produce=produce, output=destinations,
+                                owners=(tier, mapping, self.canonical))
 
-        declare(session, (self.plan.request(name=name, prepare_call=prepare),))
+        declare(session, (self.plan.request(name=name, prepare_call=prepare, benchmark_call=prepare),))
         example = torch.empty(1, dtype=torch.uint8, device=mapping.device)
         control = torch.empty_like(tier.control)
         self.cells, self.block = control.numel(), triton.next_power_of_2(control.numel())

@@ -735,7 +735,11 @@ CUDA_VISIBLE_DEVICES=GPU_UUID FLARE_RUN_CUDA_TESTS=1 cargo test --release \
 host-to-HBM copies ahead of a MegaMoE consumer. It follows DerpSeek's use of
 temporary prompt staging and previous cold demand, with the decisions and copies
 inside captured graphs. It is a preparation component, not a native residency
-policy, and is not connected to a serving recipe.
+policy. Experimental DeepSeek SM103 preparation can insert it into target
+prefill through the `prefill_staging` setting described in
+[model preparation](model-preparation.md#deepseek-v41-flash). Eligibility follows
+prepared row counts, excluding compact suffix layers below the threshold and
+all decode and MTP graphs. Full-model serving with this wiring is not qualified.
 
 The component reads the authoritative canonical map on every replay and copies
 only host rows without a selected HBM copy. Prepared copy kernels use SMs;
@@ -756,13 +760,18 @@ storage, residency maps and control counters remain unchanged. Native residency
 publication must exclude readers for the entire graph, including its copies.
 Two auxiliary streams permit lookahead; stream reuse follows the preceding
 consumer, with all source and destination lifetimes visible to compilation.
+Native promotion counters describe permanent residency transactions. Temporary
+staging costs require separate graph measurements; per-copy staging telemetry
+is not exported.
 
 GB300 component checks cover exact checkpoint-expert output agreement at
 256/1024/8192 rows across staging and direct-host transitions, changing routes
 and padding, two-stream reuse and allocation-free replay. Native row-storage
 checks cover sixteen physical exchanges at 1/16/64/256 rows with exact output
-agreement. These checks do not establish exported-core support or a serving
-performance improvement.
+agreement. An exported component fixture passes 32 native Helios replays across
+1/16/256/1024 rows, with exact all-HBM reference agreement, poisoned outputs and
+no replay-time CUDA allocation. These checks do not establish full-model serving
+support or a serving performance improvement.
 
 ### Connecting storage to serving
 

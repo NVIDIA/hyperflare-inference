@@ -11,7 +11,7 @@ import sys
 
 import pytest
 
-from ignition.components.expert_placement import ExpertPlacement
+from ignition.components.expert_placement import ExpertPlacement, PrefillExpertStaging
 from ignition.recipes.deepseek41.bootstrap import PreparationConfig, _collective_runtimes
 from ignition.recipes.deepseek41.sm103 import SM103Config
 from .test_deepseek41_pool import config
@@ -109,12 +109,34 @@ def snapshot(tmp_path, configuration):
     return path
 
 
-def test_configuration_roundtrip_resolves_libraries_and_preserves_row_order(options, tmp_path):
+@pytest.mark.parametrize("staging", [None, PrefillExpertStaging(1024, 8)])
+def test_configuration_roundtrip_resolves_libraries_and_preserves_row_order(options, tmp_path, staging):
+    options = replace(options, prefill_staging=staging)
     value = options.to_dict()
     value["flashmla_library"] = value["deepselect_library"] = "library.so"
     path = tmp_path / "sm103.json"
     path.write_text(json.dumps(value))
     assert SM103Config.load(path) == options
+
+
+def test_staging_capacity_and_host_demand_are_admitted_explicitly(options, model, tmp_path):
+    options = replace(options, prefill_staging=PrefillExpertStaging(1024, 8))
+    with pytest.raises(ValueError, match="threshold exceeds"):
+        PreparationConfig(devices=(0,), sm103=options, kernel_cache=tmp_path, prefill_chunk_size=256)
+    assert PreparationConfig(devices=(0,), sm103=options, kernel_cache=tmp_path,
+                             prefill_chunk_size=8192).sm103.prefill_staging == options.prefill_staging
+    with pytest.raises(ValueError, match="cold-demand threshold"):
+        replace(options, prefill_staging=PrefillExpertStaging(1024, 385)).staging_bytes(model)
+
+
+@pytest.mark.parametrize("staging", [True, {}, {"min_rows": 1024},
+    {"min_rows": 1024, "min_cold_experts": 8, "unknown": 1},
+    {"min_rows": True, "min_cold_experts": 8}, {"min_rows": 1024, "min_cold_experts": 0}])
+def test_staging_json_rejects_incomplete_or_invalid_settings(options, tmp_path, staging):
+    path = tmp_path / "sm103.json"
+    path.write_text(json.dumps({**options.to_dict(), "prefill_staging": staging}))
+    with pytest.raises(ValueError):
+        SM103Config.load(path)
 
 
 @pytest.mark.parametrize("tracing", [False, True])
@@ -182,13 +204,16 @@ def test_invalid_json_configuration_is_rejected(options, tmp_path, change):
 
 
 @pytest.mark.parametrize("drafting", [False, True])
-def test_planning_counts_native_experts_and_physical_cache_layout(options, snapshot, drafting):
+@pytest.mark.parametrize("staging", [False, True])
+def test_planning_counts_native_experts_and_physical_cache_layout(options, snapshot, drafting, staging):
     from ignition.recipes.deepseek41.config import ModelConfig
     from ignition.recipes.deepseek41.pool import continuation_layout, page_bytes
     from ignition.recipes.deepseek41.recipe import RECIPE
 
     if not drafting:
         options = replace(options, placements=options.placements[:40])
+    if staging:
+        options = replace(options, prefill_staging=PrefillExpertStaging())
     recipe, checkpoint = options.planning_inputs(RECIPE, RECIPE.checkpoints[0], snapshot, dspark=drafting)
     model = ModelConfig.load(snapshot)
     tier = options.expert_bytes(model, dspark=drafting)
@@ -200,10 +225,14 @@ def test_planning_counts_native_experts_and_physical_cache_layout(options, snaps
     costs = recipe.ranks[1] if drafting else recipe.plain_ranks[1]
     assert costs.state_row_bytes == continuation_layout(model, dspark=drafting, alignment=512).row_bytes
     assert costs.page_bytes == page_bytes(model, alignment=512)
+    assert costs.graph_bytes == (8 << 30) + (3 * 224 * 18_800_640 if staging else 0)
     assert 1 not in RECIPE.ranks  # Explicit placement must not change ordinary TP admission.
 
 
-def test_cli_uses_gb300_and_records_placement_without_importing_torch(options, snapshot, tmp_path):
+@pytest.mark.parametrize("staging", [False, True])
+def test_cli_uses_gb300_and_records_placement_without_importing_torch(options, snapshot, tmp_path, staging):
+    if staging:
+        options = replace(options, prefill_staging=PrefillExpertStaging(min_rows=256))
     path = tmp_path / "sm103.json"
     path.write_text(json.dumps(options.to_dict()))
     # A separate process checks the actual planning boundary before CUDA setup.

@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 
-from ignition.components.expert_placement import ExpertPlacement
+from ignition.components.expert_placement import ExpertPlacement, PrefillExpertStaging
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,7 @@ class SM103Config:
     flashmla_library: Path
     deepselect_library: Path
     host_lane_clusters: int = 4
+    prefill_staging: PrefillExpertStaging | None = None
 
     @classmethod
     def load(cls, path):
@@ -29,7 +30,8 @@ class SM103Config:
             return result
         value = json.loads(path.read_text(), object_pairs_hook=unique)
         required = {"version", "placements", "flashmla_library", "deepselect_library", "host_lane_clusters"}
-        if (not isinstance(value, dict) or set(value) != required
+        if (not isinstance(value, dict) or not required <= set(value)
+                or set(value) - required - {"prefill_staging"}
                 or type(value["version"]) is not int or value["version"] != 1
                 or not isinstance(value["placements"], dict)):
             raise ValueError("SM103 preparation requires version 1, placements, both library paths and host_lane_clusters")
@@ -44,7 +46,12 @@ class SM103Config:
             if not isinstance(value[name], str) or not value[name]:
                 raise ValueError(f"{name} must name a prepared shared library")
             libraries.append(path.parent / value[name])
-        return cls(tuple(placements), *libraries, value["host_lane_clusters"])
+        staging = value.get("prefill_staging")
+        if staging is not None:
+            if not isinstance(staging, dict) or set(staging) != {"min_rows", "min_cold_experts"}:
+                raise ValueError("prefill_staging requires min_rows and min_cold_experts")
+            staging = PrefillExpertStaging(**staging)
+        return cls(tuple(placements), *libraries, value["host_lane_clusters"], staging)
 
     def __post_init__(self):
         if (not isinstance(self.placements, tuple) or not self.placements
@@ -55,6 +62,8 @@ class SM103Config:
             raise ValueError("SM103 preparation requires distinct named expert placements")
         if type(self.host_lane_clusters) is not int or not 0 <= self.host_lane_clusters < 76:
             raise ValueError("SM103 host lane clusters must be in [0, 75]")
+        if self.prefill_staging is not None and not isinstance(self.prefill_staging, PrefillExpertStaging):
+            raise ValueError("SM103 prefill staging requires explicit row and cold-demand thresholds")
         for name in ("flashmla_library", "deepselect_library"):
             path = Path(getattr(self, name)).resolve(strict=True)
             if not path.is_file():
@@ -69,9 +78,23 @@ class SM103Config:
             raise ValueError("SM103 placements must match every enabled target and draft layer's canonical experts")
 
     def to_dict(self):
-        return dict(version=1, placements={name: placement.to_dict() for name, placement in self.placements},
+        result = dict(version=1, placements={name: placement.to_dict() for name, placement in self.placements},
                     flashmla_library=str(self.flashmla_library), deepselect_library=str(self.deepselect_library),
                     host_lane_clusters=self.host_lane_clusters)
+        if self.prefill_staging is not None:
+            result["prefill_staging"] = self.prefill_staging.to_dict()
+        return result
+
+    def staging_bytes(self, model):
+        """Conservative three-plane-set allowance for two-consumer lookahead."""
+        if self.prefill_staging is None:
+            return 0
+        per_expert = 3 * model.text["hidden_size"] * model.text["moe_intermediate_size"] * 17 // 32
+        rows = [len(p.host) for name, p in self.placements if name.startswith("layers.")
+                and len(p.host) >= self.prefill_staging.min_cold_experts]
+        if not rows:
+            raise ValueError("prefill staging requires a target host tier that can meet its cold-demand threshold")
+        return 3 * max(rows) * per_expert
 
     def expert_bytes(self, model, *, dspark):
         """Native packed MXFP4 payload and expanded UE8M0 scales, including copies."""
@@ -117,8 +140,9 @@ class SM103Config:
             draft += sum(len(p.hbm) for name, p in self.placements if name.startswith("mtp.")) * per_expert
         # Physical row/page costs are checked against ContinuationPool in tests.
         # Graph storage is an estimate; measured capture accounting supersedes it.
-        ranks = {1: RankCosts(3_045_888, 114_688, 8 << 30)}
-        plain = {1: RankCosts(2_843_136, 114_688, 8 << 30)}
+        graph_bytes = (8 << 30) + self.staging_bytes(model)
+        ranks = {1: RankCosts(3_045_888, 114_688, graph_bytes)}
+        plain = {1: RankCosts(2_843_136, 114_688, graph_bytes)}
         return (replace(recipe, ranks=ranks, plain_ranks=plain, expert_scale_compression=None),
                 replace(checkpoint, device_bytes=tier["hbm"] + other, draft_bytes=draft,
                     mapped_host_bytes=tier["host"], expansion_bytes=0,

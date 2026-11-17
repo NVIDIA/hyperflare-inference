@@ -613,6 +613,30 @@ Supply all 40 target layers and, when MTP is enabled, all three draft layers.
 Unknown fields, duplicate keys, missing experts, and repeated IDs within a tier
 are rejected. Both tiers may contain the same expert.
 
+An optional `prefill_staging` object prepares temporary expert prefetch:
+
+```json
+"prefill_staging": {"min_rows": 1024, "min_cold_experts": 8}
+```
+
+Omission disables staging. Target prefill layers qualify by their prepared row
+count; a compact decoder suffix below `min_rows` keeps direct-host execution.
+Two auxiliary streams start copies ahead of the consuming layers. Captured copy
+kernels inspect the live canonical map and skip HBM-resident duplicates. The
+preceding invocation's distinct host demand selects staging only when it reaches
+`min_cold_experts`; otherwise the consumer reads original host weights. Decode
+and MTP graphs do not use this prefill mechanism. The copies use SMs, not DMA
+engines, and still reserve full host-plane scratch extents. Planning includes a
+three-plane-set scratch allowance; capture measures the actual graph pool.
+Preparation clears the demand history after capture, before export.
+`--no-stream-overlap` keeps these copies on the calling capture stream.
+
+This is experimental preparation wiring. Component checks establish exact
+checkpoint-expert replay and selective copying; full-model export, fixed memory,
+serving noninterference and performance are not qualified. Changing this setting
+changes the preparation manifest, so use ordinary export rather than
+`--reuse-weights` across different staging configurations.
+
 The explicit configuration admits one local SM103 GPU and expanded native
 expert scales. It does not change the recipe's ordinary TP selection. Planning
 counts physical expert copies at their expanded native size and estimates other

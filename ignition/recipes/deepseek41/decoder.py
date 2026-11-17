@@ -239,12 +239,13 @@ class PreparedLayer:
         if self.concurrent_shared is not None:
             self.shared = None
 
-    def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
+    def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
+                 expert_stage=None):
         incoming, next_mix, records, selection, _ = self._run(incoming, pre_mix, metadata, indices,
-            selection, boundary=boundary, window_cache=window_cache)
+            selection, boundary=boundary, window_cache=window_cache, expert_stage=expert_stage)
         return incoming, next_mix, records, selection
 
-    def _run_experts(self, normalized, metadata):
+    def _run_experts(self, normalized, metadata, expert_stage=None):
         pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
         image_mask = metadata.token_ids >= 129280 if self.has_image_mask else None
         router_logits = self.router_projection(normalized)
@@ -253,14 +254,15 @@ class PreparedLayer:
             self.routing_counter(route.ids, metadata.live_counts[:1])
         if self.megamoe is not None:
             mapped = self.expert_map[route.ids.long()]
-            return self.megamoe(normalized, mapped, route.weights, metadata.positions < 0), route
+            return self.megamoe(normalized, mapped, route.weights, metadata.positions < 0, staged=expert_stage), route
         routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
         shared = (self.shared(normalized) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(pending, routed))
         return routed + shared, route
 
-    def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
+    def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
+             expert_stage=None):
         if self.engram is not None:
             incoming = (self.engram(incoming[0], metadata),)
         if boundary is None:
@@ -275,7 +277,7 @@ class PreparedLayer:
         next_mix = torch.zeros_like(attn_mix)
         residual, post, comb, normalized = self.ffn_hc(attention_output, residual, post, comb,
             pre_mix=attn_mix, pre_out=next_mix)
-        partial, route = self._run_experts(normalized, metadata)
+        partial, route = self._run_experts(normalized, metadata, expert_stage)
         output = self.mlp_reduce(partial)
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
@@ -288,7 +290,8 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None):
+                 vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
+                 expert_stagers=None, stage_min_rows=1024):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
@@ -360,6 +363,10 @@ class PreparedDecoder:
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
                 examples=examples))
             carry = defer
+        self.expert_stagers = {index: stager for index, stager in (expert_stagers or {}).items()
+            if mode == "prefill" and self.layers[index].megamoe is not None
+            and self.layers[index].megamoe.plan.query.rows >= stage_min_rows}
+        self.stage_layers = tuple(self.expert_stagers)
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
             logits_dtype=torch.float32)
@@ -424,6 +431,8 @@ class PreparedDecoder:
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
         auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
         suffix, records = None, []
+        pending_experts = {index: self.expert_stagers[index].start(embedding)
+                           for index in self.stage_layers[:2]}
         for index, layer in enumerate(self.layers):
             boundary = None
             if layer.boundary is not None:
@@ -440,9 +449,16 @@ class PreparedDecoder:
                     feedback = torch.where(suffix.live[:, None], feedback, 0)
                 column = self.aux_layers.index(index)
                 auxiliary[:, column * 5120:(column + 1) * 5120].copy_(feedback)
+            expert_stage = ((self.expert_stagers[index], pending_experts.pop(index))
+                            if index in self.expert_stagers else None)
             incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
-                boundary=boundary, window_cache=None if staging is None else staging[index])
+                boundary=boundary, window_cache=None if staging is None else staging[index], expert_stage=expert_stage)
             records.append(record)
+            if expert_stage is not None:
+                following = self.stage_layers.index(index) + 2
+                if following < len(self.stage_layers):
+                    next_index = self.stage_layers[following]
+                    pending_experts[next_index] = self.expert_stagers[next_index].start(incoming[0])
         residual, = incoming
         samples = metadata.sample_indices
         head_residual = residual if self.compact_head else residual[samples]

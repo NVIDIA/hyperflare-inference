@@ -20,11 +20,13 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned SM103 GPU")
 
 
-def test_compiled_staging_preserves_checkpoint_outputs(experts, tmp_path, megamoe_core_storage):
+@pytest.mark.parametrize("effort,overlap", [("off", True), ("default", True), ("off", False)],
+                         ids=["heuristic", "tuned", "serial"])
+def test_compiled_staging_preserves_checkpoint_outputs(experts, tmp_path, megamoe_core_storage, effort, overlap):
     routed, shared = experts
     workspace = MegaMoeWorkspace(MegaMoeGeometry(8, 8192, 6, 5120, 2304, 1),
                                 device="cuda:0", kernel_cache=tmp_path)
-    streams = [torch.cuda.Stream() for _ in range(2)]
+    streams = [torch.cuda.Stream() for _ in range(2)] if overlap else [None, None]
     tiers, references, residents, stagers, graphs, functions = [], [], [], [], [], []
     for layer in range(3):
         weights = select(routed, [(i + layer) % 8 for i in range(8)])
@@ -39,7 +41,7 @@ def test_compiled_staging_preserves_checkpoint_outputs(experts, tmp_path, megamo
     try:
         with RecordedPreparationSession(device="cuda:0", checkpoint="deepseek41-eight-experts",
                 workload_schema="captured-expert-staging", numerical_policy="reference-bitwise",
-                compile_workers=2, autotune_effort="off") as session:
+                compile_workers=2, autotune_effort=effort) as session:
             mapping = torch.arange(8, device="cuda", dtype=torch.int32)
             stagers = [PreparedExpertStage(tier, streams[layer % 2], mapping, range(4),
                 session=session, name=f"stage-{layer}", min_cold=2) for layer, tier in enumerate(tiers)]
@@ -59,7 +61,12 @@ def test_compiled_staging_preserves_checkpoint_outputs(experts, tmp_path, megamo
                     controls.append(PreparedMegaMoe(*args, references[layer], shared,
                         workspace=workspace, clamp=10., session=session, name=f"reference-{layer}-{rows}"))
                 catalog.append((args, operations, controls, actual, expected))
+            before_tuning = torch.cuda.memory_allocated()
             session.tune()
+            torch.cuda.synchronize()
+            # A selected plan must not retain a full copy destination allocated
+            # for tuning; model preparation has one such plan per host geometry.
+            assert torch.cuda.memory_allocated() - before_tuning < sum(t.numel() for t in stagers[0].sources)
             for args, operations, controls, actual, expected in catalog:
                 def forward(args=args, operations=operations, controls=controls,
                             actual=actual, expected=expected):
