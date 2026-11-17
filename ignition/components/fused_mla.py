@@ -49,24 +49,32 @@ class FusedMLAPreparation:
                    None if deepselect_library is None else Path(deepselect_library).resolve(strict=True))
 
 
-def gather_cache(cache, lengths, pages, *, capacity):
+def gather_cache(cache, lengths, pages, *, output):
     """Gather logical request prefixes with the reference cache dequantization kernels.
 
-    Lengths are in [0, capacity]; page entries address cache pages. The caller
-    supplies those admission bounds. Only gathered prefixes are initialized.
+    Lengths are in [0, output.shape[1]]; page entries address cache pages. The caller
+    supplies those admission bounds. Output rows are contiguous BF16 vectors;
+    request strides may include other key regions. Only live prefixes are written.
     """
     if cache.ndim != 3:
         raise ValueError("cache gathering requires a separated paged cache")
     layout = MegaCacheLayout(cache.shape[1], cache.shape[2])
     layout.validate(cache)
-    if (type(capacity) is not int or capacity <= 0 or pages.ndim != 2
+    if output.ndim != 3:
+        raise ValueError("cache gather output must have request, token, and channel dimensions")
+    capacity = output.shape[1]
+    if (capacity <= 0 or pages.ndim != 2
             or pages.dtype != torch.int32 or not pages.is_contiguous()
             or lengths.shape != (pages.shape[0],) or lengths.dtype != torch.int32
             or not lengths.is_contiguous() or lengths.device != cache.device or pages.device != cache.device
             or capacity > pages.shape[1] * layout.page_tokens
             or pages.shape[0] * capacity * 512 >= 2**31):
         raise ValueError("cache gather capacity and contiguous int32 request metadata must fit the page table and reference offsets")
-    output = torch.empty((pages.shape[0], capacity, 512), device=cache.device, dtype=torch.bfloat16)
+    if (output.shape != (pages.shape[0], capacity, 512) or output.dtype != torch.bfloat16
+            or output.device != cache.device or output.stride(2) != 1 or output.stride(1) != 512
+            or output.stride(0) < capacity * 512
+            or (pages.shape[0] - 1) * output.stride(0) + capacity * 512 >= 2**31):
+        raise ValueError("cache gather output requires disjoint BF16 request regions and int32-safe row offsets")
     kernel = (_dequantize_and_gather_k_mxfp8_kernel if layout.record_bytes == 528
               else _dequantize_and_gather_k_nvfp4_kernel)
     workers = max(128, min(8192, (capacity + 7) // 8))
@@ -144,14 +152,14 @@ class PreparedFusedMLA:
                                  self.compressed, ci, selected_lengths)
         window_pages = torch.arange(self.requests, device=query.device, dtype=torch.int32).view(-1, 1)
         window_lengths = torch.full((self.requests,), self.window_tokens, device=query.device, dtype=torch.int32)
-        kv = gather_cache(window, window_lengths, window_pages, capacity=self.window_tokens)
+        kv = torch.empty((self.requests, self.key_capacity, 512), device=query.device, dtype=torch.bfloat16)
+        gather_cache(window, window_lengths, window_pages, output=kv[:, self.compressed_capacity:])
         ids = torch.where(indices >= 0,
             metadata.requests[:, None] * self.key_capacity + self.compressed_capacity + indices % self.window_tokens, -1)
         if self.compressed is not None:
             ratio = 128 // self.compressed_tokens
             counts = ((metadata.starts + metadata.lengths) // ratio).to(torch.int32)
-            compressed = gather_cache(self.compressed, counts, metadata.page_table, capacity=self.compressed_capacity)
-            kv = torch.cat((compressed, kv), dim=1)
+            gather_cache(self.compressed, counts, metadata.page_table, output=kv[:, :self.compressed_capacity])
             ci = torch.where(selected >= 0, selected + metadata.requests[:, None] * self.key_capacity, -1)
             ids, lengths = combined_indices(ids, lengths, ci, selected_lengths)
         return self.operator(query, positions, self.cs, self.sink, kv.view(-1, 1, 512), ids.to(torch.int32).unsqueeze(1), lengths)

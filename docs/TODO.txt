@@ -5,6 +5,8 @@
     Validate the MegaMoE expert planes' strides and physical row mappings.
     Compare exported Flare/Parallax serving with DerpSeek exact using matched
     workloads, memory budgets, arithmetic and speculative settings.
+    Re-export direct-destination prefill cache gathers and measure native TTFT
+    against the otherwise identical concatenation core before claiming a serving gain.
 
 [ ] Extend numerical qualification of DeepSeek TP1 SM103 attention, cache writers,
     compressor and hierarchical indexer across long contexts and graph capacities.

@@ -1008,6 +1008,15 @@ scoring, masks scores with the published candidates where required, and
 returns request-local selected token IDs. This also keeps candidate-restricted
 prefill in FP32; BF16 sparse scoring is used for decode and verification.
 
+Prefill attention gathers compressed and window keys directly into disjoint
+regions of one BF16 buffer. The reference dequantization kernels retain their
+arithmetic and use explicit request strides; no concatenation copies the unused
+context capacity. Only live prefixes are initialized, and attention indices must
+exclude the remaining storage. Gather checks compare live keys with an independent
+cache decoder, preserve neighboring regions and inactive requests, and exercise
+compiled graph replay with changing page maps. Existing cores keep their captured
+cache assembly until re-exported.
+
 Synthetic GB300 checks compare contiguous scoring bitwise with the pinned
 DeepGEMM API at 1, 17, 257 and 8192 query rows, including a 131072-key case at
 128 rows. Gather tests compare encoded key and scale bytes under changing

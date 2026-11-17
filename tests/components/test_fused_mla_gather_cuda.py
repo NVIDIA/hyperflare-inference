@@ -16,8 +16,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned CUDA GPU")
 
 
+@pytest.mark.parametrize("prefix,suffix", [(0, 0), (3, 11)], ids=["contiguous", "shared-buffer"])
 @pytest.mark.parametrize("page,record", [(136, 528), (64, 288), (128, 288)])
-def test_gathered_prefixes_match_independent_cache_decoder(page, record):
+def test_gathered_prefixes_match_independent_cache_decoder(page, record, prefix, suffix):
     from b12x.attention._shared.mla.compressed_reference import (
         pack_deepseek_v41_cache_reference, unpack_deepseek_v41_cache_reference,
     )
@@ -34,10 +35,12 @@ def test_gathered_prefixes_match_independent_cache_decoder(page, record):
     cache = layout.view(backing)
     pages = torch.tensor([[4, 1], [3, 5], [2, 0]], device="cuda", dtype=torch.int32)
     lengths = torch.tensor([page + 17, 1, 0], device="cuda", dtype=torch.int32)
-    output = torch.empty((3, 2 * page, 512), device="cuda", dtype=torch.bfloat16)
+    destination = torch.full((3, prefix + 2 * page + suffix, 512), -123,
+                             device="cuda", dtype=torch.bfloat16)
+    output = destination[:, prefix:prefix + 2 * page]
 
     def forward():
-        output.copy_(gather_cache(cache, lengths, pages, capacity=2 * page))
+        gather_cache(cache, lengths, pages, output=output)
 
     function = compile_forward(forward)
     function()
@@ -51,6 +54,7 @@ def test_gathered_prefixes_match_independent_cache_decoder(page, record):
             lengths.copy_(torch.tensor(sizes, device="cuda", dtype=torch.int32))
             pages.copy_(pages.flip(0))
             expected = decoded[pages.long()].flatten(1, 2).to(torch.bfloat16)
+            destination.fill_(-123)
             torch.cuda.synchronize()
             before = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph.replay()
@@ -58,6 +62,26 @@ def test_gathered_prefixes_match_independent_cache_decoder(page, record):
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
             for request, count in enumerate(sizes):
                 torch.testing.assert_close(output[request, :count], expected[request, :count], rtol=0, atol=0)
+                assert torch.all(output[request, count:] == -123)
+            assert torch.all(destination[:, :prefix] == -123)
+            assert torch.all(destination[:, prefix + 2 * page:] == -123)
             assert torch.equal(backing, original)
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("shape,strides,dtype", [
+    ((2, 128, 512), (128 * 512, 512, 1), torch.float32),
+    ((2, 128, 256), (128 * 256, 256, 1), torch.bfloat16),
+    ((2, 128, 512), (128 * 1024, 1024, 2), torch.bfloat16),
+    ((2, 128, 512), (0, 512, 1), torch.bfloat16),
+    ((2, 128, 512), (2**31, 512, 1), torch.bfloat16),
+], ids=["dtype", "channels", "strided-channels", "overlapping-requests", "offset-overflow"])
+def test_gather_rejects_unsafe_destination_geometry(shape, strides, dtype):
+    layout = MegaCacheLayout(128, 288)
+    cache = layout.view(torch.empty((2, layout.page_bytes), device="meta", dtype=torch.uint8))
+    pages = torch.empty((2, 1), device="meta", dtype=torch.int32)
+    lengths = torch.empty(2, device="meta", dtype=torch.int32)
+    output = torch.empty_strided(shape, strides, device="meta", dtype=dtype)
+    with pytest.raises(ValueError, match="cache gather output requires"):
+        gather_cache(cache, lengths, pages, output=output)
