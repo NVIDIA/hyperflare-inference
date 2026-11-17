@@ -578,9 +578,9 @@ expansion buffers reused by serial expert layers. Planning conservatively estima
 to BF16; `--mla-compute-mode auto` lets b12x select arithmetic while preserving
 packed KV storage.
 
-The GB300 MegaMoE preparation components are available for component validation;
-the DeepSeek recipe does not yet export a TP1 MegaMoE serving core. Install the
-optional preparation dependency with:
+The experimental GB300 TP1 path exports MegaMoE expert execution with explicit
+HBM/Grace placement and prepared FlashMLA attention. Install the optional
+preparation dependency with:
 
 ```sh
 uv sync --locked --extra prepare --extra test --extra megamoe
@@ -602,8 +602,7 @@ allocator padding and execution storage. Workspace construction is checked on
 GB300 for all 40 target and three draft layers, including separate capacities
 for target and draft calls. CPU checks cover admission, placement completeness,
 storage accounting and exclusion of mutable residency state from the weight
-catalog. These checks do not qualify a complete model load, graph catalog,
-core export or serving.
+catalog.
 
 For experimental TP1 export, `--sm103-preparation PATH` reads a version-1 JSON
 object with `placements`, `flashmla_library`, `deepselect_library`, and
@@ -624,8 +623,32 @@ plan reports HBM weight estimates and Grace expert bytes. Graph storage remains
 an estimate until capture measures it. This path requires a local checkpoint or
 an already downloaded checkpoint because placement sizing reads tensor headers.
 Use `ignition export` followed by release `flare run`; `debug-serve` and
-multi-host preparation reject this option. Complete TP1 export and serving
-remain unqualified.
+multi-host preparation reject this option.
+
+Full-model preparation and exported release serving have passed initial text
+integration checks on GB300 TP1 with concurrency one, 256-token prefill, native
+expert scales, static HBM/Grace placement, and seven adaptive drafts. Twenty
+model forwards compiled and 26 graphs captured, including ordinary, speculative,
+maintenance, and vision graphs. Native text checks cover ordinary and MTP
+execution, repeated seeded token output, 786-token chunked prefill, prefix reuse,
+independent requests, token accounting, and clean shutdown. The six tested token
+sequences agree between ordinary and MTP execution. These checks do not establish
+full-model numerical equivalence, vision replay, larger serving capacities,
+long-context correctness, or adaptive expert movement.
+
+Run the persistent native text regression against an idle release server with
+those capacities and `--mtp-draft-tokens 7 --mtp-adaptive-verification`:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 FLARE_DEEPSEEK41_SM103_TEST_URL=http://127.0.0.1:8000 \
+  .venv/bin/python -m pytest -q tests/server/test_deepseek41_sm103.py
+```
+
+The test uses the core's declared sampling defaults and an explicit seed. A
+requested sampling parameter without a declared range is clamped to its core
+default; requesting top-k one does not make this core greedy. The seven-draft
+catalog cannot be treated as a three-draft comparison by changing the runtime
+limit: prepare the intended draft depth and serving capacities explicitly.
 
 `ignition.components.megamoe_weights.load_mxfp4_planes` loads packed MXFP4 weights
 and expands CSF scales once into native UE8M0 bytes. `pack_mxfp4_planes` applies
