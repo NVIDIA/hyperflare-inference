@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepared reference SM103 paged MXFP4 query/key scoring."""
+"""Prepared reference SM103 contiguous and paged MXFP4 query/key scoring."""
 
 from dataclasses import dataclass
 
@@ -13,6 +13,12 @@ from ignition.components.mega_attention import _spec
 from ignition.components.megamoe_kernel.mqa import prepare
 from ignition.components.native_operator import native_contract, native_plan
 from ignition.preparation.tuning import declare, register_finalizer
+
+
+@dataclass(frozen=True)
+class ContiguousLogitsQuery:
+    rows: int
+    columns: int
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,81 @@ CONTRACT = native_contract(component_id="flare.mxfp4.paged_logits",
                            query_type=LogitsQuery, tactics=lambda query: (None,))
 SPARSE_CONTRACT = native_contract(component_id="flare.mxfp4.sparse_paged_logits",
                                  query_type=SparseLogitsQuery, tactics=lambda query: (None,))
+CONTIGUOUS_CONTRACT = native_contract(component_id="flare.mxfp4.contiguous_logits",
+    query_type=ContiguousLogitsQuery, tactics=lambda query: (None,))
+
+
+class _ContiguousState:
+    def __init__(self, kernel_cache):
+        self.library = prepare(kernel_cache)
+
+    def run(self, operands, output):
+        self.library.contiguous(*operands, output)
+
+
+@torch.library.custom_op("flare::mxfp4_contiguous_logits", mutates_args=("output",))
+def _run_contiguous(query: torch.Tensor, scales: torch.Tensor, keys: torch.Tensor,
+                    key_scales: torch.Tensor, weights: torch.Tensor, starts: torch.Tensor,
+                    ends: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+    plan = plan_from_handle(handle)
+    require_prepared(plan, plan.component_id, query.device).run(
+        (query, scales, keys, key_scales, weights, starts, ends), output)
+
+
+@_run_contiguous.register_fake
+def _run_contiguous_fake(query, scales, keys, key_scales, weights, starts, ends, output, handle):
+    pass
+
+
+def _contiguous_output(query, device):
+    return torch.empty(((query.rows + 3) // 4 * 4, (query.columns + 511) // 256 * 256),
+                       dtype=torch.float32, device=device)
+
+
+class PreparedContiguousMXFP4Logits:
+    """Score contiguous keys with FP32 head weights and reference prefill arithmetic.
+
+    Each query selects a half-open interval in the shared key array. Admission
+    must enforce 0 <= starts <= ends <= key capacity; empty intervals do no
+    work. Output outside those intervals is undefined and must be masked by
+    the consumer. Keys and their four UE8M0 scale bytes are copied losslessly
+    from the cache before this operation; the scorer performs no gathering.
+    """
+
+    def __init__(self, query, scales, keys, key_scales, weights, starts, ends, *,
+                 kernel_cache, session, name):
+        rows = query.shape[0] if query.ndim else 0
+        columns = keys.shape[0] if keys.ndim else 0
+        operands = query, scales, keys, key_scales, weights, starts, ends
+        expected = (((rows, 32, 64), torch.int8), ((rows, 32), torch.int32),
+                    ((columns, 64), torch.int8), ((columns,), torch.int32),
+                    ((rows, 32), torch.float32), ((rows,), torch.int32), ((rows,), torch.int32))
+        if (not 0 < rows <= 131072 or not 0 < columns <= 1 << 24
+                or any(t.shape != shape or t.dtype != dtype or not t.is_contiguous()
+                       or t.device != query.device for t, (shape, dtype) in zip(operands, expected))):
+            raise ValueError("contiguous MXFP4 logits require packed 32-head queries, 128-element keys and int32 intervals")
+        if query.device.type != "cuda" or torch.cuda.get_device_capability(query.device) != (10, 3):
+            raise ValueError("the reference MXFP4 logits require SM103")
+        self.specs = tuple(map(_spec, operands))
+        q = ContiguousLogitsQuery(rows, columns)
+        self.plan = native_plan(contract=CONTIGUOUS_CONTRACT, query=q, device=query.device,
+            scratch_bytes=lambda tactic: 0, materialize=lambda tactic: _ContiguousState(kernel_cache))
+        examples, device = list(operands), query.device
+
+        def prepare_call(state):
+            output = _contiguous_output(q, device)
+            return PreparedCall(run=lambda: state.run(examples, output), output=output)
+
+        declare(session, (self.plan.request(name=name, prepare_call=prepare_call),))
+        register_finalizer(session, examples.clear)
+
+    def __call__(self, query, scales, keys, key_scales, weights, starts, ends):
+        operands = query, scales, keys, key_scales, weights, starts, ends
+        if tuple(map(_spec, operands)) != self.specs:
+            raise ValueError("contiguous MXFP4 operands must match their prepared geometry, dtype, strides and device")
+        output = _contiguous_output(self.plan.query, query.device)
+        _run_contiguous(*operands, output, self.plan.handle)
+        return output[:self.plan.query.rows, :self.plan.query.columns]
 
 
 class _State:

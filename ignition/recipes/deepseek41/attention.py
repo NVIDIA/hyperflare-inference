@@ -24,6 +24,7 @@ from ignition.components.linear import QuantizedProjection, UnquantizedProjectio
 from ignition.components.mla_norm_quant import PreparedMLANormQuant
 from ignition.components.mxfp4_indexer import PreparedMXFP4Indexer
 from ignition.components.mxfp4_index_inputs import index_cache_view, write_index_keys
+from ignition.components.mxfp4_index_gather import PreparedMXFP4IndexGather
 from ignition.components.reference_indexer import PreparedReferenceIndexer
 from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.rms_norm import PreparedRMSNorm
@@ -31,6 +32,7 @@ from ignition.components.state import gather_rows, gather_rows_three, save_hidde
 from ignition.components.window_indices import PreparedWindowIndices, WindowIndices
 from ignition.preparation.tuning import declare, register_finalizer
 from ignition.preparation.scratch import ScratchArena
+from ignition.preparation.examples import declaration_tensor
 
 from ignition.components.rotary import CompressedRotary as Rotary
 from ignition.components.parallel import TensorParallelShard
@@ -407,6 +409,7 @@ class PreparedAttention:
                 kernel_cache=self.fused_layout.kernel_cache, session=session, name=f"{name}.window_write")
         self.global_kv = None
         self.selectors = []
+        self.index_gather = None
         if "compressor" in weights:
             self.global_kv = PreparedGlobalKV(layer, weights, source, scratch, metadata, pool, rotary,
                 session=session, name=name, indices=window_metadata, deferred=mode == "verify")
@@ -421,6 +424,19 @@ class PreparedAttention:
             if layer >= candidate_source and scratch.candidates.shape[0] < tokens:
                 raise ValueError("hierarchical selection exceeds candidate row capacity")
             index_examples = {} if examples is None else examples
+            prefill_keys = None
+            if self.fused_layout is not None and mode == "prefill":
+                self.index_cache = index_cache_view(pool.pages[f"layer{self.source.layer}.index_page"],
+                                                   128 // self.ratio)
+                capacity = metadata.page_table.numel() * (128 // self.ratio)
+                offsets = declaration_tensor(index_examples, "reference_index.offsets", (rows + 1,),
+                                             torch.int32, device)
+                self.index_gather = PreparedMXFP4IndexGather(self.index_cache, metadata.page_table, offsets,
+                    capacity=capacity, kernel_cache=self.fused_layout.kernel_cache,
+                    session=session, name=name + ".index_gather")
+                prefill_keys = (
+                    declaration_tensor(index_examples, "reference_index.keys", (capacity, 64), torch.int8, device),
+                    declaration_tensor(index_examples, "reference_index.key_scales", (capacity,), torch.int32, device))
             for first in range(0, tokens, INDEXER_QUERY_ROWS):
                 last = min(tokens, first + INDEXER_QUERY_ROWS)
                 if self.fused_layout is not None:
@@ -433,7 +449,8 @@ class PreparedAttention:
                         candidate_count=config.text["candidate_topk_blocks"],
                         block_tokens=config.text["candidate_block_size"], prefill=mode == "prefill",
                         kernel_cache=self.fused_layout.kernel_cache, library=self.fused_layout.deepselect_library,
-                        session=session, name=f"{name}.index{first}", examples=index_examples)
+                        session=session, name=f"{name}.index{first}", examples=index_examples,
+                        prefill_keys=prefill_keys)
                     self.selectors.append(selector)
                     continue
                 candidates = {}
@@ -579,6 +596,13 @@ class PreparedAttention:
                     self.rotary.apply(index_query, position, compressed=True)
                     index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 outputs, candidate_outputs, count_outputs = [], [], []
+                prefill_keys, packed_starts = None, None
+                if self.index_gather is not None:
+                    counts = torch.where(m.lengths > 0, (m.starts + m.lengths) // self.ratio, 0).to(torch.int32)
+                    offsets = torch.cat((torch.zeros(1, dtype=torch.int32, device=source.device),
+                                         counts.cumsum(0, dtype=torch.int32)))
+                    prefill_keys = self.index_gather(self.index_cache, m.page_table, offsets)
+                    packed_starts = offsets[m.requests]
                 for ordinal, selector in enumerate(self.selectors):
                     first = ordinal * INDEXER_QUERY_ROWS
                     last = min(source.shape[0], first + INDEXER_QUERY_ROWS)
@@ -588,10 +612,15 @@ class PreparedAttention:
                             candidates=None if self.layer <= self.candidate_source else candidates[first:last],
                             counts=None if self.layer <= self.candidate_source else candidate_counts[first:last])
                     else:
+                        starts = None if packed_starts is None else packed_starts[first:last]
+                        lengths = geometry.lengths[first:last]
+                        if starts is not None:
+                            lengths = lengths + starts
                         result = selector(index_query[first:last], index_weights[first:last],
-                            m.token_page_table[first:last], geometry.lengths[first:last],
+                            m.token_page_table[first:last], lengths,
                             position[first:last], m.requests[first:last],
-                            candidates=None if self.layer <= self.candidate_source else candidates[first:last])
+                            candidates=None if self.layer <= self.candidate_source else candidates[first:last],
+                            prefill_keys=prefill_keys, starts=starts)
                     if self.layer == self.candidate_source:
                         result, next_candidates, next_counts = result
                         candidate_outputs.append(next_candidates)

@@ -33,10 +33,18 @@ def prepare(kernel_cache: Path):
                            + str(torch._C._GLIBCXX_USE_CXX11_ABI)).encode())
             build = Path(kernel_cache) / "mega-cache" / digest.hexdigest()
             build.mkdir(parents=True, exist_ok=True)
-            _library = load(name="flare_reference_cache", sources=[str(root / "bindings.cpp"), str(source)],
+            _library = load(name="flare_reference_cache", sources=[str(root / "bindings.cpp"), str(source),
+                str(root / "csrc/indexer_cache_gather.cu")],
                 extra_include_paths=[str(root / "csrc")],
                 extra_cuda_cflags=["-DUSE_CUDA", "-O3", "-std=c++20",
                                   "-gencode=arch=compute_103a,code=sm_103a"],
                 extra_cflags=["-DUSE_CUDA", "-O3", "-std=c++20"],
                 build_directory=str(build), is_python_module=False, verbose=False)
     return torch.ops.flare_reference_cache.rope_insert
+
+
+def prepare_gather(kernel_cache: Path):
+    """Prepare the lossless paged index-key gather alongside cache insertion."""
+    prepare(kernel_cache)
+    import torch
+    return torch.ops.flare_reference_cache.indexer_gather

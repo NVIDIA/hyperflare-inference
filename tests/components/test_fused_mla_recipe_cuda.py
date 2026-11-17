@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Checkpoint attention composition preserves compiled output and continuation state."""
+"""Checkpoint attention preserves selected sets and output/state at matched ordering."""
 
 import os
 from pathlib import Path
@@ -23,6 +23,23 @@ from ignition.recipes.deepseek41.weights import DeepSeekWeightLoader
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned SM103 GPU")
+
+
+class ReferenceSelectionOrder:
+    """Check the real reference selection, then match its unordered result to replay."""
+
+    def __init__(self, selector, recorded):
+        self.selector, self.recorded = selector, recorded
+
+    def __call__(self, *args, **kwargs):
+        result = self.selector(*args, **kwargs)
+        ids = result[0] if isinstance(result, tuple) else result
+        torch.testing.assert_close(ids.sort(-1).values, self.recorded.sort(-1).values, rtol=0, atol=0)
+        # Atomic top-K scatter has no order contract. Couple only that ordering;
+        # the reference must still compute exactly the same token set itself.
+        permutation = ids.argsort(-1).gather(1, self.recorded.argsort(-1).argsort(-1))
+        ordered = ids.gather(1, permutation)
+        return (ordered, *result[1:]) if isinstance(result, tuple) else ordered
 
 
 @pytest.fixture(scope="module")
@@ -88,7 +105,7 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
         weights = {index: loader.load_attention(index, draft=draft) for index in layers}
     cases = ((8, 1, 8, "draft"), (64, 8, 8, "draft"), (192, 1, 192, "draft")) if draft else (
         (1, 1, 1, "decode"), (17, 1, 17, "verify"), (64, 8, 8, "verify"), (257, 1, 257, "prefill"))
-    if not draft and layer == 0:
+    if not draft:
         cases += ((8192, 1, 8192, "prefill"),)
     pool = ContinuationPool.allocate(config, 12, 8 * 67 + 1, "cuda:0", dspark=draft,
                                      window_record_planes=(512, 16))
@@ -113,22 +130,26 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
                     for index in layers)
                 output = torch.empty_like(source)
                 accepted = torch.zeros(batch, device="cuda", dtype=torch.int64)
+                selections = tuple(torch.empty_like(selected) for _ in attentions)
 
                 def forward(attentions=attentions, source=source, metadata=metadata, selected=selected,
-                            candidates=candidates, candidate_counts=candidate_counts, output=output, accepted=accepted, mode=mode):
+                            candidates=candidates, candidate_counts=candidate_counts, output=output,
+                            accepted=accepted, mode=mode, selections=selections):
                     result, selection = source, (selected, candidates, candidate_counts)
-                    for attention in attentions:
+                    for attention, recorded in zip(attentions, selections):
                         result, records, selection = attention(result, metadata, selection)
+                        recorded.copy_(selection[0])
                         if mode == "verify":
                             attention.commit(accepted, records, metadata)
                     output.copy_(result)
 
-                catalog.append((metadata, source, output, accepted, forward))
+                catalog.append((metadata, source, output, accepted, forward, attentions, selections))
             session.tune()
             torch.cuda.synchronize()
             examples.clear()
             arena.release_preparation()
-            for (tokens, batch, width, mode), (metadata, source, output, accepted, forward) in zip(cases, catalog):
+            for (tokens, batch, width, mode), operands in zip(cases, catalog):
+                metadata, source, output, accepted, forward, _, _ = operands
                 starts = torch.full((batch,), 126, device="cuda", dtype=torch.int64)
                 lengths = torch.full((batch,), width, device="cuda", dtype=torch.int32)
                 rows = torch.arange(1, batch + 1, device="cuda", dtype=torch.int64)
@@ -148,7 +169,7 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
             for step in range(2):
                 for case, operands, graph in zip(cases, catalog, graphs):
                     tokens, batch, width, mode = case
-                    metadata, source, output, accepted, forward = operands
+                    metadata, source, output, accepted, forward, attentions, selections = operands
                     source.neg_()
                     starts = torch.full((batch,), 126 + 2 * step, device="cuda", dtype=torch.int64)
                     lengths = torch.tensor([width if step == 0 or i == 0 else width // 2 for i in range(batch)],
@@ -159,11 +180,6 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
                                  torch.tensor([batch], device="cuda", dtype=torch.int32))
                     accepted.copy_(lengths if step == 0 else lengths // 2)
                     pool.clear_for_preparation()
-                    forward()
-                    expected = output.clone()
-                    expected_state = pool.backing.clone()
-                    expected_pages = {name: tensor.clone() for name, tensor in pool.pages.items()}
-                    pool.clear_for_preparation()
                     output.fill_(float("nan"))
                     torch.cuda.synchronize()
                     before = torch.cuda.memory_stats()["allocation.all.allocated"]
@@ -171,10 +187,28 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
                     torch.cuda.synchronize()
                     assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
                     assert torch.isfinite(output).all()
-                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
-                    torch.testing.assert_close(pool.backing, expected_state, rtol=0, atol=0)
+                    actual = output.clone()
+                    actual_state = pool.backing.clone()
+                    actual_pages = {name: tensor.clone() for name, tensor in pool.pages.items()}
+                    recorded_selections = tuple(ids.clone() for ids in selections)
+                    original_selectors = tuple(attention.selectors for attention in attentions)
+                    try:
+                        for attention, recorded in zip(attentions, recorded_selections):
+                            selectors, first = [], 0
+                            for selector in attention.selectors:
+                                count = selector.scoring.plan.query.rows
+                                selectors.append(ReferenceSelectionOrder(selector, recorded[first:first + count]))
+                                first += count
+                            attention.selectors = selectors
+                        pool.clear_for_preparation()
+                        forward()
+                    finally:
+                        for attention, selectors in zip(attentions, original_selectors):
+                            attention.selectors = selectors
+                    torch.testing.assert_close(actual, output, rtol=0, atol=0)
+                    torch.testing.assert_close(actual_state, pool.backing, rtol=0, atol=0)
                     for name, tensor in pool.pages.items():
-                        torch.testing.assert_close(tensor, expected_pages[name], rtol=0, atol=0)
+                        torch.testing.assert_close(actual_pages[name], tensor, rtol=0, atol=0)
     finally:
         torch.cuda.synchronize()
         for graph in graphs:

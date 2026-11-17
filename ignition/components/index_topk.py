@@ -84,7 +84,8 @@ class PreparedIndexTopK:
     """Select 512 keys with the reference's dtype/phase-specific algorithms.
 
     Lengths bound each row's live prefix and must not exceed the prepared
-    column count. BF16 scores use DeepSelect; FP32 prefill uses per-row
+    column count. Prefill accepts packed interval starts and returns indices
+    relative to those starts. BF16 scores use DeepSelect; FP32 prefill uses per-row
     selection, and FP32 decode uses cooperative selection through 64 rows,
     then persistent selection. Decode launchers receive the prepared capacity
     as their maximum length bound. Outputs shorter than 512 are -1 padded.
@@ -119,9 +120,13 @@ class PreparedIndexTopK:
         declare(session, (self.plan.request(name=name, prepare_call=prepare_call),))
         register_finalizer(session, examples.clear)
 
-    def __call__(self, logits, lengths):
+    def __call__(self, logits, lengths, *, starts=None):
         if (_spec(logits), _spec(lengths)) != self.specs:
             raise ValueError("index top-K inputs must match their prepared geometry, dtype, strides and device")
-        starts, output, workspace = _outputs(self.plan.query, logits.device)
+        default_starts, output, workspace = _outputs(self.plan.query, logits.device)
+        if starts is None:
+            starts = default_starts
+        elif self.plan.query.implementation != "prefill" or _spec(starts) != self.specs[1]:
+            raise ValueError("packed starts require FP32 prefill selection and matching int32 bounds")
         _run(logits, lengths, starts, output, workspace, self.plan.handle)
         return output

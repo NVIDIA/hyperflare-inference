@@ -1,5 +1,5 @@
 [ ] Extend DeepSeek SM103 native qualification beyond TP1 C1, 256-token prefill
-    and seven adaptive drafts. Prepare C16, larger prefill and three drafts for
+    and seven adaptive drafts. Prepare C16, 8192-token prefill and three drafts for
     the DerpSeek standard workload; validate long-context and vision replay.
     Connect canonical routing telemetry, including MTP, and expert movement.
     Use the authenticated prepared-weight catalog decoder for compressed catalogs
@@ -13,9 +13,10 @@
     on SM103; the recipe's default BF16 mode has not been checked separately.
     Its MXFP4 indexer also emits an unsupported SM103 MMA. Qualify the composed
     reference query/key encoding, full/candidate paged scoring and selection
-    across all shared-source layers and long contexts. Match
-    the reference's contiguous-workspace prefill scoring before claiming that
-    prefill uses an equivalent kernel path; the composition uses paged scoring.
+    across all shared-source layers and long contexts. Validate the composed
+    contiguous prefill indexer in an exported core at 8192-token chunks.
+    Integrate and measure prefill expert staging before claiming equivalence
+    to DerpSeek's overlapped host-to-HBM execution.
     Qualify full graph transitions and MTP before serving comparisons. Account
     for DerpSeek exact's enabled W8 output projection, low-latency GEMMs and
     fused preparation seams when attributing remaining full-step differences.

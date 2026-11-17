@@ -9,6 +9,7 @@ import triton
 from ignition.components.mega_cache_kernel.candidates import (
     _block_scores_kernel, _store_candidates_kernel,
     _expand_candidates_kernel, _sparse_topk_remap_kernel,
+    _candidate_flags_kernel, _mask_candidates_kernel,
 )
 
 
@@ -18,10 +19,11 @@ def _lengths(lengths, rows, device):
         raise ValueError("candidate bounds require one contiguous int32 length per row")
 
 
-def select_blocks(logits, lengths, *, count, block_tokens):
+def select_blocks(logits, lengths, *, count, block_tokens, starts=None):
     """Select blocks by maximum score, always retaining the newest live block.
 
-    Lengths bound request-local prefixes in logits. Empty blocks are excluded;
+    Starts and lengths bound packed intervals; omitted starts are zero.
+    Empty blocks are excluded;
     the result contains unique block IDs with -1 padding. Selection retains
     the reference's torch.topk tie behavior.
     """
@@ -32,16 +34,48 @@ def select_blocks(logits, lengths, *, count, block_tokens):
         raise ValueError("candidate selection requires FP32 score rows, power-of-two capacity and 8/16-token blocks")
     rows, width = logits.shape
     _lengths(lengths, rows, logits.device)
+    if starts is not None:
+        _lengths(starts, rows, logits.device)
     blocks = triton.cdiv(width, block_tokens)
     scores = torch.empty((rows, blocks), dtype=logits.dtype, device=logits.device)
     output = torch.empty((rows, count), dtype=torch.int32, device=logits.device)
     torch.library.wrap_triton(_block_scores_kernel)[(rows, triton.cdiv(blocks, 128))](
-        logits, None, lengths, scores, *logits.stride(), 0, lengths.stride(0),
-        width, blocks, block_tokens, False, 1, 128)
+        logits, starts, lengths, scores, *logits.stride(),
+        0 if starts is None else starts.stride(0), lengths.stride(0),
+        width, blocks, block_tokens, starts is not None, 1, 128)
     top = scores.topk(min(count, blocks), dim=-1)
     torch.library.wrap_triton(_store_candidates_kernel)[(rows, triton.cdiv(count, 256))](
         top.values, top.indices, output, *output.stride(), top.values.shape[1], count, 256)
     return output
+
+
+def mask_blocks(logits, lengths, candidates, *, block_tokens, starts=None):
+    """Mask contiguous FP32 scores in place using request-local candidate IDs.
+
+    Starts and lengths bound half-open scoring intervals in the packed key
+    array; omitted starts are zero. Candidate -1 entries are padding. The
+    reference's out-of-width candidate clamp is retained exactly.
+    """
+    if (logits.ndim != 2 or logits.device.type != "cuda" or min(logits.shape) <= 0
+            or logits.dtype != torch.float32 or logits.stride(1) != 1
+            or candidates.ndim != 2 or candidates.shape[0] != logits.shape[0]
+            or not 0 < candidates.shape[1] <= 4096 or candidates.dtype != torch.int32
+            or candidates.stride(1) != 1 or candidates.device != logits.device
+            or type(block_tokens) is not int or block_tokens not in (8, 16)):
+        raise ValueError("candidate masking requires FP32 score rows, matched int32 candidates and 8/16-token blocks")
+    rows, width = logits.shape
+    _lengths(lengths, rows, logits.device)
+    if starts is not None:
+        _lengths(starts, rows, logits.device)
+    blocks = triton.cdiv(width, block_tokens)
+    flags = torch.empty((rows, blocks + 1), device=logits.device, dtype=torch.uint8)
+    start_stride = 0 if starts is None else starts.stride(0)
+    torch.library.wrap_triton(_candidate_flags_kernel)[(rows,)](
+        candidates, starts, flags, *candidates.stride(), start_stride,
+        width, blocks, block_tokens, candidates.shape[1], starts is not None, 1)
+    torch.library.wrap_triton(_mask_candidates_kernel)[(rows, triton.cdiv(width, 1024))](
+        logits, starts, lengths, flags, *logits.stride(), start_stride,
+        lengths.stride(0), width, blocks, block_tokens, starts is not None, 1, 1024)
 
 
 def expand_blocks(candidates, lengths, *, block_tokens, sparse_tokens):

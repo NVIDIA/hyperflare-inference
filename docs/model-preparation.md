@@ -913,6 +913,15 @@ workspace are explicit forward-local tensors. Candidate block IDs must be
 sorted, unique in their live prefix, and padded by repeating the last live
 block. The selection stage receives a separate valid-column count.
 
+`PreparedContiguousMXFP4Logits` uses the reference FP32 prefill scorer over
+packed keys and their original scale bytes. Each query supplies a half-open
+interval in the packed key array. `PreparedMXFP4IndexGather` copies the paged
+cache into that array without dequantization; request prefix sums define the
+gathered segments. Empty requests read no pages. Storage beyond the gathered
+segments and scores outside query intervals are undefined and must remain
+excluded from selection. Both operations expose forward-local outputs to
+compilation and retain their prepared native resources through graph drain.
+
 With the `megamoe` preparation dependency installed and an assigned SM103 GPU:
 
 ```sh
@@ -937,8 +946,9 @@ skips inactive slots and compression positions that do not close a record.
 cooperative FP32 decode selector through 64 rows, and persistent FP32 decode
 selector above that. BF16 sparse scores use an explicitly supplied DeepSelect
 library. The library is needed during preparation; serving replays the captured
-kernels. Cooperative selection uses atomic scatter, so token order can differ
-between identical invocations. Validate selected sets and scores separately
+kernels. Cooperative decode and per-row prefill selection use atomic scatter,
+so token order can differ between identical invocations. Validate selected sets
+and scores separately
 from downstream floating-point reduction repeatability.
 
 `ignition.components.index_candidates` selects blocks by maximum score, retains
@@ -972,15 +982,45 @@ with `window_record_planes=(512, 16)`. The loader applies the lossless query
 and output weight permutations; `PreparedAttention` composes projections,
 cache writes, index selection, attention and output projection. This API is
 restricted to TP1. `PreparationConfig.sm103` selects it in the Python bootstrap;
-the CLI planner does not yet expose that configuration.
+the CLI accepts the explicit `--sm103-preparation` configuration described above.
 
 Window and compressed cache readers, prefill gathers, draft-context writers,
 snapshots and accepted-prefix commits use matching separated planes. Index
 pages and continuation rows retain 512-byte alignment, including padding in
 64-key index pages. Candidate-producing layers publish block IDs for later
 candidate-restricted layers. Scoring uses paged kernels in both decode and
-prefill; the reference runtime's contiguous-workspace prefill scoring is a
-distinct path whose performance is not established by these checks.
+verification. Prefill gathers packed index keys once per attention layer and
+shares them across its 128-query scoring slices. It uses contiguous FP32
+scoring, masks scores with the published candidates where required, and
+returns request-local selected token IDs. This also keeps candidate-restricted
+prefill in FP32; BF16 sparse scoring is used for decode and verification.
+
+Synthetic GB300 checks compare contiguous scoring bitwise with the pinned
+DeepGEMM API at 1, 17, 257 and 8192 query rows, including a 131072-key case at
+128 rows. Gather tests compare encoded key and scale bytes under changing
+page mappings and empty requests. Composed prefill tests check selected score
+values and candidate blocks against independent tensor selection, with packed
+multi-request intervals and an 8192-row case. Worker-compiled graph replays
+preserve cache bytes and make no new Torch allocations. These checks establish
+component behavior; they do not establish full-model numerical agreement or
+native serving throughput. Existing exported cores retain their captured
+indexer path until re-exported.
+
+With the preparation dependencies installed and an assigned SM103 GPU:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python - <<'PY'
+from ignition import runtime_patches
+runtime_patches.apply()
+import pytest
+raise SystemExit(pytest.main([
+    "-q", "tests/components/test_mxfp4_contiguous_logits_cuda.py",
+    "tests/components/test_mxfp4_index_gather_cuda.py",
+    "tests/components/test_index_candidates_cuda.py",
+    "tests/components/test_reference_prefill_indexer_cuda.py",
+]))
+PY
+```
 
 Set `FLARE_DEEPSEEK41_CSF_SNAPSHOT` to the indexed checkpoint and supply the
 FlashMLA and DeepSelect libraries described above, then run:
@@ -992,9 +1032,15 @@ FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_fused_ml
 On GB300, checkpoint-backed tests with stream overlap enabled preserve exact
 compiled/uncompiled outputs and continuation state for target layers 0, 2 and
 20, the layer-20/layer-24 candidate producer/consumer pair, and draft layer 0.
-Target shapes include 1-row decode, 17/64-row verification and 257-row prefill;
-window-only prefill also covers 8,192 rows. Draft shapes cover 8, 64 and 192
-rows. Replays change inputs, request/page mappings, active lengths and accepted
+Target shapes include 1-row decode, 17/64-row verification and 257-row prefill.
+Window-only attention, ratio-two layer 2, and the layer-20/layer-24 pair also
+cover 8192-row prefill. Draft shapes cover 8, 64 and 192 rows. The test checks
+selected token sets exactly, then orders the independently computed reference
+selection to match replay before comparing outputs and state bitwise. The
+reference selector's atomic scatter varies token order even without compilation;
+the resulting low-precision attention outputs need not be bitwise repeatable
+across independent executions. Production selection ordering is unchanged.
+Replays change inputs, request/page mappings, active lengths and accepted
 prefixes and allocate no device tensors. These layer tests do not qualify
 full-model speculation, long-context attention, native core export or serving.
 The snapshot/restore regression checks both cache layouts at consumed-token

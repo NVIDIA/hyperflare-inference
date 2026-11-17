@@ -11,6 +11,35 @@
 
 void initialize(const std::string& root) { flare_mqa::init_jit(root); }
 
+void contiguous(torch::Tensor q, torch::Tensor qs, torch::Tensor keys,
+                torch::Tensor key_scales, torch::Tensor weights,
+                torch::Tensor starts, torch::Tensor ends, torch::Tensor output) {
+    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kInt8 && q.is_contiguous());
+    TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 && q.size(1) == 32 && q.size(2) == 64);
+    const int rows = q.size(0);
+    for (const auto& t : {qs, keys, key_scales, weights, starts, ends, output}) {
+        TORCH_CHECK(t.device() == q.device() && t.is_contiguous());
+    }
+    TORCH_CHECK(qs.scalar_type() == torch::kInt && qs.sizes() == torch::IntArrayRef({rows, 32}));
+    TORCH_CHECK(keys.dim() == 2 && keys.size(0) > 0 && keys.size(1) == 64);
+    TORCH_CHECK(keys.scalar_type() == torch::kInt8);
+    const int columns = keys.size(0);
+    TORCH_CHECK(key_scales.scalar_type() == torch::kInt);
+    TORCH_CHECK(key_scales.sizes() == torch::IntArrayRef({columns}));
+    TORCH_CHECK(weights.scalar_type() == torch::kFloat);
+    TORCH_CHECK(weights.sizes() == torch::IntArrayRef({rows, 32}));
+    for (const auto& t : {starts, ends}) {
+        TORCH_CHECK(t.scalar_type() == torch::kInt && t.sizes() == torch::IntArrayRef({rows}));
+    }
+    // Preserve the reference API's four-query and extra 256-key tile padding.
+    const int stride = (columns + 511) / 256 * 256;
+    TORCH_CHECK(output.scalar_type() == torch::kFloat);
+    TORCH_CHECK(output.sizes() == torch::IntArrayRef({(rows + 3) / 4 * 4, stride}));
+    flare_mqa::sm100_mqa_logits(q, qs, keys, key_scales, weights, starts, ends,
+        output, torch::kFloat, rows, columns, 0, stride, 32, 128, 4, 256,
+        false, true, torch::kInt8, std::nullopt);
+}
+
 std::vector<int64_t> sparse_sizes(int rows, int blocks, int block_tokens) {
     TORCH_CHECK(rows > 0 && rows <= (1 << 20));
     const auto metadata = flare_mqa::get_num_metadata_bytes(
@@ -103,6 +132,7 @@ void paged(torch::Tensor q, torch::Tensor qs, torch::Tensor cache,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("initialize", &initialize);
+    m.def("contiguous", &contiguous);
     m.def("paged", &paged);
     m.def("sparse_sizes", &sparse_sizes);
     m.def("sparse", &sparse);

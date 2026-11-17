@@ -165,3 +165,67 @@ def _sparse_topk_remap_kernel(
     blocks = tl.load(si_ptr + row * si_stride + cc // SBK)
     pos = (blocks - ks_base) * SBK + cc % SBK
     tl.store(out_ptr + row * out_stride + cols, tl.where(valid, pos, -1), mask=cols < k)
+
+
+@triton.jit(do_not_specialize=["width", "nblocks"])
+def _candidate_flags_kernel(
+    candidates,
+    starts,
+    flags,
+    stride_row,
+    stride_col,
+    stride_start,
+    width,
+    nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    K: tl.constexpr,
+    HAS_STARTS: tl.constexpr,
+    ROW_REPEAT: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, 1024)
+    for tile in range(tl.cdiv(nblocks + 1, 1024)):
+        slots = tile * 1024 + offsets
+        tl.store(flags + row * (nblocks + 1) + slots, 0, slots <= nblocks)
+    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+    cols = tl.arange(0, triton.next_power_of_2(K))
+    block = tl.load(
+        candidates + row * stride_row + cols * stride_col, cols < K, other=-1
+    ).to(tl.int64)
+    # Preserve the packed-column clamp for candidates beyond the logits width.
+    block = tl.where(start + block * BLOCK_SIZE >= width, nblocks, block)
+    tl.debug_barrier()
+    tl.store(flags + row * (nblocks + 1) + block, 1, (cols < K) & (block >= 0))
+
+
+@triton.jit(do_not_specialize=["width", "nblocks"])
+def _mask_candidates_kernel(
+    logits,
+    starts,
+    ends,
+    flags,
+    stride_row,
+    stride_col,
+    stride_start,
+    stride_end,
+    width,
+    nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_STARTS: tl.constexpr,
+    ROW_REPEAT: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+    end = tl.load(ends + row // ROW_REPEAT * stride_end)
+    valid = (cols >= start) & (cols < end) & (cols < width)
+    block = (cols - start) // BLOCK_SIZE
+    keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
+    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
+    keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
+    tl.store(
+        logits + row * stride_row + cols * stride_col,
+        -float("inf"),
+        (cols < width) & ~(valid & keep),
+    )
