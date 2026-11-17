@@ -6,9 +6,60 @@
 #include "csrc/utils/exception.hpp"
 #include <deep_gemm/scheduler/mega_moe.cuh>
 #include "csrc/jit_kernels/impls/sm100_mqa_logits.hpp"
+#include "csrc/jit_kernels/impls/sm100_sparse_mqa_logits.hpp"
 #undef deep_gemm
 
 void initialize(const std::string& root) { flare_mqa::init_jit(root); }
+
+std::vector<int64_t> sparse_sizes(int rows, int blocks, int block_tokens) {
+    TORCH_CHECK(rows > 0 && rows <= (1 << 20));
+    const auto metadata = flare_mqa::get_num_metadata_bytes(
+        rows, blocks, block_tokens, 640, true, flare_mqa::runtime->get_num_sms());
+    using namespace flare_mqa::layout::sparse_mqa_logits;
+    return {metadata, sizeof(WorkspaceState) + rows * static_cast<int64_t>(sizeof(QBlockInfo))};
+}
+
+void sparse(torch::Tensor q, torch::Tensor qs, torch::Tensor cache,
+            torch::Tensor weights, torch::Tensor lengths, torch::Tensor pages,
+            torch::Tensor requests, torch::Tensor blocks, torch::Tensor metadata,
+            torch::Tensor workspace, torch::Tensor output, int block_tokens) {
+    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kInt8 && q.is_contiguous());
+    TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 && q.size(1) == 32 && q.size(2) == 64);
+    const int rows = q.size(0);
+    for (const auto& t : {qs, cache, weights, lengths, pages, requests, blocks, metadata, workspace, output})
+        TORCH_CHECK(t.device() == q.device());
+    TORCH_CHECK(qs.scalar_type() == torch::kInt && qs.is_contiguous());
+    TORCH_CHECK(qs.sizes() == torch::IntArrayRef({rows, 32}));
+    TORCH_CHECK(cache.dim() == 3 && cache.scalar_type() == torch::kByte && cache.size(2) == 68);
+    const int page_size = cache.size(1);
+    TORCH_CHECK(page_size == 64 || page_size == 128);
+    TORCH_CHECK(cache.size(0) > 0 && cache.stride(2) == 1 && cache.stride(1) == 68);
+    TORCH_CHECK(cache.stride(0) >= page_size * 68 && cache.stride(0) % 512 == 0);
+    TORCH_CHECK(weights.scalar_type() == torch::kBFloat16 && weights.is_contiguous());
+    TORCH_CHECK(weights.sizes() == torch::IntArrayRef({rows, 32}));
+    for (const auto& t : {lengths, requests}) {
+        TORCH_CHECK(t.scalar_type() == torch::kInt && t.is_contiguous());
+        TORCH_CHECK(t.sizes() == torch::IntArrayRef({rows}));
+    }
+    TORCH_CHECK(pages.scalar_type() == torch::kInt && pages.is_contiguous());
+    TORCH_CHECK(pages.dim() == 2 && pages.size(0) == rows && pages.size(1) > 0);
+    TORCH_CHECK(pages.stride(0) >= pages.size(1));
+    TORCH_CHECK(blocks.scalar_type() == torch::kInt && blocks.is_contiguous());
+    TORCH_CHECK(blocks.dim() == 2 && blocks.size(0) == rows);
+    const auto sizes = sparse_sizes(rows, blocks.size(1), block_tokens);
+    for (const auto& t : {metadata, workspace})
+        TORCH_CHECK(t.scalar_type() == torch::kByte && t.is_contiguous() && t.dim() == 1);
+    TORCH_CHECK(metadata.numel() >= sizes[0] && workspace.numel() >= sizes[1]);
+    TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.is_contiguous());
+    TORCH_CHECK(output.dim() == 2 && output.size(0) == (rows + 1) / 2 * 2);
+    TORCH_CHECK(output.size(1) == (blocks.size(1) * block_tokens + 511) / 512 * 512);
+    flare_mqa::launch_sm100_sparse_mqa_logits_metadata(true, false, page_size, 0,
+        pages.stride(0), blocks, metadata, workspace, 640, block_tokens, nullptr, nullptr,
+        lengths.data_ptr<int>(), pages.data_ptr<int>(), requests.data_ptr<int>());
+    flare_mqa::launch_sm100_sparse_mqa_logits(true, false, block_tokens, q.unsqueeze(1),
+        qs.unsqueeze(1), cache.unsqueeze(2), torch::Tensor(), weights, metadata,
+        output.slice(0, 0, rows));
+}
 
 void paged(torch::Tensor q, torch::Tensor qs, torch::Tensor cache,
            torch::Tensor weights, torch::Tensor lengths, torch::Tensor pages,
@@ -31,6 +82,7 @@ void paged(torch::Tensor q, torch::Tensor qs, torch::Tensor cache,
     TORCH_CHECK(lengths.sizes() == torch::IntArrayRef({rows}));
     TORCH_CHECK(pages.scalar_type() == torch::kInt && pages.is_contiguous());
     TORCH_CHECK(pages.dim() == 2 && pages.size(0) == rows && pages.size(1) > 0);
+    TORCH_CHECK(pages.stride(0) >= pages.size(1));
     const int sms = flare_mqa::runtime->get_num_sms();
     TORCH_CHECK(schedule.scalar_type() == torch::kInt && schedule.is_contiguous());
     TORCH_CHECK(schedule.sizes() == torch::IntArrayRef({sms + 1, 2}));
@@ -52,4 +104,6 @@ void paged(torch::Tensor q, torch::Tensor qs, torch::Tensor cache,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("initialize", &initialize);
     m.def("paged", &paged);
+    m.def("sparse_sizes", &sparse_sizes);
+    m.def("sparse", &sparse);
 }

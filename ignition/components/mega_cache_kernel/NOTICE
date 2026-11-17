@@ -7,6 +7,19 @@ kernels.py retains unchanged Triton function definitions from that revision:
 - vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py:
   _rope_quant_insert_nvfp4_kernel
 
+indexer.py carries _quantize_mxfp4_pair and the MXFP4 query kernel from
+FusedIndexerQRopeMxFp4TritonKernel in fused_indexer_q.py, and
+_indexer_k_norm_rope_quant_store_kernel from
+vllm/models/deepseek_v41/common/ops/indexer_k_store.py at the same revision.
+The query kernel is named _query_rope_quant_kernel outside its vLLM warmup
+class; the function body is unchanged. Flare's wrapper supplies explicit
+outputs and exposes the launches to complete-forward compilation.
+
+candidates.py retains unchanged Triton definitions from
+vllm/model_executor/kernels/attention/dsa/candidate_blocks.py and
+sparse_mqa_logits.py at the same revision. They select blocks by maximum
+score, expand/sort sparse block IDs, and remap selected columns to tokens.
+
 LICENSE.vllm retains the Apache-2.0 license. The original source credits the
 vLLM contributors; the CUDA source also identifies its TensorRT-LLM and vLLM
 rotary-kernel inspirations. Flare supplies the isolated operator registration

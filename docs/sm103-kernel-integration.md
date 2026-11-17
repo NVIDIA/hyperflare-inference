@@ -73,6 +73,9 @@ The usual adaptation points are:
   scales, logical-to-physical indices, and padding. Equal tensor shapes or byte
   counts do not establish layout compatibility. Check both full pages and partial
   windows, including speculative capacity beyond the ordinary decode window.
+  Check singleton slices of broadcast tables: PyTorch can classify them as
+  contiguous while retaining a zero row stride. Kernels that use that stride
+  as a physical width or address bound need an explicitly materialized row.
 - **Composition and fusion.** Identify exactly which normalization, rotation,
   gating, shared-expert, reduction, or output-quantization work the kernel includes.
   Remove duplicate work only when the replacement preserves the complete

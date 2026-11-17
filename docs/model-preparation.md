@@ -843,8 +843,11 @@ head, FP32 head weights, and separate value/scale cache planes. Cache pages hold
 64 or 128 keys with a 512-byte-aligned page stride. Each query row supplies its
 own page table and visible length, allowing different speculative prefixes of
 one request. Columns outside that length are undefined and must be masked by
-the selection stage. This component computes scores; it does not select keys
-or implement candidate-restricted scoring.
+the selection stage. `PreparedSparsePagedMXFP4Logits` scores candidate blocks
+using the reference's BF16 head weights and BF16 output. Its metadata and
+workspace are explicit forward-local tensors. Candidate block IDs must be
+sorted, unique in their live prefix, and padded by repeating the last live
+block. The selection stage receives a separate valid-column count.
 
 With the `megamoe` preparation dependency installed and an assigned SM103 GPU:
 
@@ -859,6 +862,44 @@ and check cache preservation and allocation-free compiled graph replay.
 Compute Sanitizer memcheck reports zero errors for these cases. These
 checks qualify the storage binding; they do not qualify query quantization,
 top-K selection, full attention or exported native serving.
+
+The index-input helpers in `ignition.components.mxfp4_index_inputs` fuse query
+rotation and MXFP4 encoding, and key normalization, rotation and planar cache
+writes. They retain BF16 rounding at the reference boundaries. Head weights
+receive the two reference scaling multiplications in order. The key writer
+skips inactive slots and compression positions that do not close a record.
+
+`PreparedIndexTopK` uses the reference per-row FP32 prefill selector,
+cooperative FP32 decode selector through 64 rows, and persistent FP32 decode
+selector above that. BF16 sparse scores use an explicitly supplied DeepSelect
+library. The library is needed during preparation; serving replays the captured
+kernels. Cooperative selection uses atomic scatter, so token order can differ
+between identical invocations. Validate selected sets and scores separately
+from downstream floating-point reduction repeatability.
+
+`ignition.components.index_candidates` selects blocks by maximum score, retains
+the newest visible block, sorts and expands candidates for sparse scoring, and
+maps selected columns back to logical token IDs. Its candidate state contains
+block IDs, not flattened token IDs. These helpers preserve the reference's
+selection and padding rules.
+
+With an assigned SM103 GPU and `FLARE_DEEPSELECT_LIBRARY` pointing to a shared
+library providing the pinned reference `torch.ops.deep_select.topk` operator:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mxfp4_sparse_logits_cuda.py tests/components/test_mxfp4_index_inputs_cuda.py tests/components/test_index_topk_cuda.py tests/components/test_index_candidates_cuda.py -q
+```
+
+On GB300, sparse scoring matches the reference API at 1, 17 and 257 rows with
+64/128-key pages and 8/16-key sparse blocks. Input encoding matches an independent
+tensor reference exactly. Selection checks exact token sets, independently
+computed top-K score values, empty prefixes and changed replay inputs; candidate
+checks include partial blocks, newest-block retention and logical remapping.
+All check allocation-free compiled replay. These generated-input tests establish
+component behavior, not full-model attention or serving qualification. The BF16
+selection cases skip when the DeepSelect library is not supplied. Compute
+Sanitizer memcheck reports zero errors across these component cases and the
+full-cache scoring regressions.
 
 The preparation helpers in `ignition.components.mega_attention_weights` apply
 the reference projection layouts once: query output rows are interleaved in
