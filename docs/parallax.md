@@ -791,8 +791,8 @@ leases cover the entire speculative round, including proposal and accepted-state
 commit. Publication occurs only after those readers drain.
 
 Without an `active` entry in the predictor profile, serving retains the configured
-initial placement while all contenders run in shadow. An optional `active` object
-contains `predictor`, `max_promotions`, `interval_ns`, `hold_ns` and
+initial placement while all contenders run in shadow. A forecast-driven `active`
+object contains `predictor`, `max_promotions`, `interval_ns`, `hold_ns` and
 `publication_ns`. The economic policy swaps equal-sized expert representations,
 uses only spare staging slots, charges predicted eviction losses and copying,
 and requires a positive aggregate benefit after the assumed transaction-wide
@@ -802,11 +802,24 @@ exploration without a cold-execution price. It requires a strictly higher-ranked
 promotion and retains capacity, deadline and replacement limits. The default
 `economic_exchange` behavior is unchanged. Both modes expose an independent
 [actual residency ledger and empirical cost model](parallax-demo.md#experimental-gb300-residency).
-The executor also cancels staged work once the target routing event has occurred, even if the
-forecast's estimated time deadline has not expired.
+For forecast-driven plans, the executor also cancels staged work once the target
+routing event has occurred, even if its estimated time deadline has not expired.
 `interval_ns` limits decisions to one per 0.1–60 seconds; `hold_ns` prevents rapid
 replacement. Missing copy calibration, invalid observations or predictor failure
 suppress proposals. The residency controller independently validates every plan.
+
+An experimental `policy: "decayed_miss_lru"` active configuration selects reactive
+placement using the same decayed-miss ranking and LRU core as the independent
+shadow contender. It requires explicit initial residents, protected pinned
+experts, per-layer physical size compatibility, `interval_ns`, `valid_for_ns` and
+`publication_ns`; it has no `predictor` field. The ledger supplies exact
+execution-generation hit/miss classification. Slot replacement age changes only
+when a physical publication commits, not when a plan is proposed. Copy admission
+requires calibrated transfer costs, spare capacity and completion within the
+observation's validity window. These checks bound movement without estimating a
+cold-execution benefit. CPU tests cover decision and publication accounting;
+physical serving remains unqualified. See the
+[active policy configuration](parallax-demo.md#experimental-gb300-residency).
 
 The prediction endpoint and dashboard distinguish actual HBM/Grace counts and
 mapping generations from shadow contender ledgers. Physical copy and publication

@@ -280,7 +280,8 @@ impl Observer {
                     }
                     if let Some(policy) = &mut active {
                         let config = capture.profile.settings.active.as_ref().unwrap();
-                        if lost.load(Ordering::Relaxed) != 0 || live.window.error.is_some() || capture.workers[&config.predictor].disabled {
+                        if lost.load(Ordering::Relaxed) != 0 || live.window.error.is_some()
+                            || config.predictor().is_some_and(|name| capture.workers[name].disabled) {
                             policy.disable("routing observations were lost or the active predictor failed");
                         }
                     }
@@ -349,6 +350,9 @@ impl Observer {
                             if let (Some(ledger), Some(binding)) = (&mut ledger, &binding) {
                                 let active_since = ledger.sync(binding);
                                 ledger.observe(&record, active_since);
+                                if let Some(policy) = &mut active {
+                                    policy.observe(&record, ledger, &capture.profile, now_ns());
+                                }
                             }
                             if last_sequence.is_some_and(|last| record.sequence != last + 1) {
                                 live.window.error = Some("native routing sequence gap; incomplete stream".into());

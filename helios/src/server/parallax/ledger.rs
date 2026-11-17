@@ -100,6 +100,13 @@ impl Ledger {
             estimated_saved_ns:0., estimated_frames:0, overlap_frames:0, shapes:BTreeMap::new(), rows:VecDeque::new() }
     }
     pub fn invalidate(&mut self, message: &str) { self.error.get_or_insert(message.into()); }
+    pub(super) fn executed_resident(&self, generation: Option<u64>) -> Result<&BTreeSet<ExpertId>, &str> {
+        if let Some(error) = &self.error { return Err(error); }
+        if generation != Some(self.generation) {
+            return Err("active policy requires the ledger's exact execution generation");
+        }
+        Ok(&self.resident)
+    }
     pub fn sync(&mut self, binding: &ExecutionBinding) -> Option<u64> {
         match binding.events_after(self.last_event) {
             Ok((events, active)) => { self.ingest(events); active }

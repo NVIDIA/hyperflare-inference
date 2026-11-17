@@ -5,6 +5,88 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Config {
+    Forecast(ForecastConfig),
+    Reactive(super::active_decayed::Config),
+}
+impl Config {
+    pub fn validate(&self, profile: &Profile) -> Result<(), String> {
+        match self {
+            Self::Forecast(config) => config.validate(profile),
+            Self::Reactive(config) => config.validate(profile),
+        }
+    }
+    pub fn predictor(&self) -> Option<&str> {
+        match self {
+            Self::Forecast(config) => Some(&config.predictor),
+            Self::Reactive(_) => None,
+        }
+    }
+}
+
+pub(super) enum Active {
+    Forecast(ForecastActive),
+    Reactive(super::active_decayed::Active),
+}
+impl Active {
+    pub fn new(
+        profile: &Profile,
+        binding: Option<ExecutionBinding>,
+    ) -> Result<Option<Self>, String> {
+        match &profile.settings.active {
+            None => Ok(None),
+            Some(Config::Forecast(_)) => {
+                ForecastActive::new(profile, binding).map(|p| p.map(Self::Forecast))
+            }
+            Some(Config::Reactive(config)) => super::active_decayed::Active::new(
+                config,
+                profile,
+                binding.ok_or("active placement requires physical expert storage")?,
+            )
+            .map(|p| Some(Self::Reactive(p))),
+        }
+    }
+    pub fn disable(&mut self, reason: &str) {
+        match self {
+            Self::Forecast(policy) => policy.disable(reason),
+            Self::Reactive(policy) => policy.disable(reason),
+        }
+    }
+    pub fn forecast(
+        &mut self,
+        forecast: &Forecast,
+        profile: &Profile,
+        now: u64,
+        target_demand: u64,
+    ) {
+        if let Self::Forecast(policy) = self {
+            policy.forecast(forecast, profile, now, target_demand);
+        }
+    }
+    pub fn observe(
+        &mut self,
+        record: &super::Record,
+        ledger: &super::ledger::Ledger,
+        profile: &Profile,
+        now: u64,
+    ) {
+        if let Self::Reactive(policy) = self {
+            match ledger.executed_resident(record.sample.residency_generation) {
+                Ok(executed) => policy.observe(record, executed, profile, now),
+                Err(error) => policy.disable(error),
+            }
+        }
+    }
+    pub fn report(&self) -> Value {
+        match self {
+            Self::Forecast(policy) => policy.report(),
+            Self::Reactive(policy) => policy.report(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Policy {
@@ -15,7 +97,7 @@ pub enum Policy {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
+pub struct ForecastConfig {
     #[serde(default)]
     pub policy: Policy,
     pub predictor: String,
@@ -25,7 +107,7 @@ pub struct Config {
     /// Assumed quiescent drain/publication cost for a complete transaction.
     pub publication_ns: u64,
 }
-impl Config {
+impl ForecastConfig {
     pub fn validate(&self, profile: &Profile) -> Result<(), String> {
         if !(1..=64).contains(&self.max_promotions)
             || !(100_000_000..=60_000_000_000).contains(&self.interval_ns)
@@ -44,8 +126,8 @@ impl Config {
     }
 }
 
-pub struct Active {
-    config: Config,
+pub(super) struct ForecastActive {
+    config: ForecastConfig,
     binding: ExecutionBinding,
     storage: BTreeMap<Expert, (u64, usize)>,
     constraints: BTreeMap<Expert, PlacementConstraint>,
@@ -57,12 +139,12 @@ pub struct Active {
     last_gain_ns: f64,
     failure: Option<String>,
 }
-impl Active {
+impl ForecastActive {
     pub fn new(
         profile: &Profile,
         binding: Option<ExecutionBinding>,
     ) -> Result<Option<Self>, String> {
-        let Some(config) = &profile.settings.active else {
+        let Some(Config::Forecast(config)) = &profile.settings.active else {
             return Ok(None);
         };
         config.validate(profile)?;
@@ -165,7 +247,7 @@ impl Active {
 }
 
 fn propose(
-    config: &Config,
+    config: &ForecastConfig,
     state: &Snapshot,
     storage: &BTreeMap<Expert, (u64, usize)>,
     constraints: &BTreeMap<Expert, PlacementConstraint>,
@@ -263,17 +345,35 @@ mod tests {
         calibration::{Calibration, CopyCost},
         prediction_tests::{fixture, profile},
     };
+    #[test]
+    fn policy_configuration_preserves_forecast_defaults_and_rejects_mixed_fields() {
+        let legacy = json!({"predictor":"recent", "max_promotions":2,
+            "interval_ns":100_000_000, "hold_ns":100_000_000, "publication_ns":100});
+        let config: Config = serde_json::from_value(legacy).unwrap();
+        let Config::Forecast(forecast) = config else { panic!("legacy forecast changed policy") };
+        assert!(forecast.policy == Policy::EconomicExchange);
+        let mut reactive = json!({"policy":"decayed_miss_lru", "interval_ns":100_000_000,
+            "valid_for_ns":200_000_000, "publication_ns":1_000_000});
+        let config: Config = serde_json::from_value(reactive.clone()).unwrap();
+        assert!(config.predictor().is_none());
+        let mut profile = profile("reactive-admission");
+        assert!(config.validate(&profile).is_err());
+        profile.settings.active = Some(config);
+        assert!(Active::new(&profile, None).is_err());
+        reactive["predictor"] = json!("recent");
+        assert!(serde_json::from_value::<Config>(reactive).is_err());
+    }
     fn constraints(storage: &BTreeMap<Expert, (u64, usize)>) -> BTreeMap<Expert, PlacementConstraint> {
         storage.keys().map(|e| (*e, PlacementConstraint { group: 0, evictable: true })).collect()
     }
     fn inputs() -> (
-        Config,
+        ForecastConfig,
         Profile,
         Snapshot,
         BTreeMap<Expert, (u64, usize)>,
         Forecast,
     ) {
-        let config = Config {
+        let config = ForecastConfig {
             policy: Policy::EconomicExchange,
             predictor: "recent".into(),
             max_promotions: 2,
@@ -404,9 +504,10 @@ mod tests {
     #[test]
     fn active_configuration_cannot_silently_run_without_physical_storage() {
         let (config, mut profile, _, _, _) = inputs();
-        profile.settings.active = Some(config);
+        profile.settings.active = Some(Config::Forecast(config));
         assert!(Active::new(&profile, None).is_err());
-        profile.settings.active.as_mut().unwrap().interval_ns = 0;
+        let Some(Config::Forecast(config)) = profile.settings.active.as_mut() else { unreachable!() };
+        config.interval_ns = 0;
         assert!(profile.validate().is_err());
     }
     #[test]
