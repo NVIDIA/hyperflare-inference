@@ -22,20 +22,21 @@
     across all shared-source layers and long contexts. Validate the composed
     contiguous prefill indexer's numerical behavior at long contexts; exported
     C16/8192/MTP3 native text integration passes.
-    Validate the captured selective prefill staging wiring through full-model
-    export and native replay; measure fixed memory, TTFT and decode interference.
+    Validate the exported selective prefill staging core through native replay;
+    measure fixed memory, TTFT and decode interference against a matched catalog.
     Compare adaptive staging with DerpSeek's DMA staging on matched workloads;
     component timings do not establish a serving improvement.
     Extend full graph transition and MTP numerical qualification. For the
-    multiple-depth packed catalog, export C16/8192 with seven drafts
-    and 128 target rows, validate native selection at depths 3/5/7 and compare
-    serving cost and acceptance before choosing a runtime limit. Account
+    multiple-depth packed catalog, validate the C16/8192 seven-draft export
+    with 128 target rows at runtime MTP3 for expert-placement comparisons.
+    Defer depth sweeps until measurements identify MTP as a limiting cost. Account
     for DerpSeek exact's enabled W8 output projection, low-latency GEMMs and
     fused preparation seams when attributing remaining full-step differences.
 
-[ ] Measure native row-map publication and serving impact after bitmap occupancy
-    validation. CPU map construction is measured separately; repeat GPU row
-    exchange checks and the same-core MTP3 active/static serving comparison.
+[ ] Reduce full-heap collection cost during compiled-forward capture without
+    retaining retired guard cycles. Young-generation-only collection fails the
+    grouped-owner retirement check. Preserve immediate guard release and native
+    replay lifetime tests; measure full-catalog capture time and peak host memory.
 
 [ ] Qualify decayed-miss LRU on held-out live routing alongside predictive
     contenders; measure CPU overhead and compare policy decisions against DerpSeek
