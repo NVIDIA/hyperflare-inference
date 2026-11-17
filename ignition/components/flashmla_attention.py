@@ -118,6 +118,16 @@ def _buffers(query, device):
     return output, scales, statistics
 
 
+def _aligned_indices(indices):
+    # The kernel vector-loads index rows at 32-byte boundaries. Retain the
+    # logical key capacity and lengths while padding only the row storage.
+    width = indices.shape[-1]
+    padding = -width % 8
+    if padding:
+        return torch.nn.functional.pad(indices, (0, padding), value=-1)[..., :width]
+    return indices
+
+
 class PreparedFlashMLA:
     """Use the pinned fused kernel with compiler-visible outputs and statistics.
 
@@ -125,6 +135,8 @@ class PreparedFlashMLA:
     have the reference's 16-element permutation. Valid rotary positions and cache
     indices must be in range, and lengths must fit their index capacity. Negative
     indices mask keys. The caller owns cache insertion, gathering and index mapping.
+    Index rows acquire 32-byte-aligned storage inside the compiled forward;
+    padding does not add keys or change their live lengths.
     """
 
     def __init__(self, query, positions, cos_sin, sink, kv, indices, lengths,
@@ -143,6 +155,7 @@ class PreparedFlashMLA:
             scratch_bytes=lambda tactic: 0,
             materialize=lambda tactic: _State(q, kernel_cache, library))
         examples = list(operands)
+        examples[5] = _aligned_indices(indices)
 
         def prepare_call(state):
             output, scales, statistics = _buffers(q, device)
@@ -158,5 +171,7 @@ class PreparedFlashMLA:
         if tuple(_spec(value) for value in operands) != self.specs:
             raise ValueError("FlashMLA operands must match their prepared geometry, dtype, strides and device")
         output, scales, statistics = _buffers(self.plan.query, query.device)
-        _run(*operands, output, scales, statistics, self.plan.handle)
+        _run(query, positions, cos_sin, sink, kv, _aligned_indices(indices), lengths,
+             compressed, compressed_indices, compressed_lengths,
+             output, scales, statistics, self.plan.handle)
         return output, scales

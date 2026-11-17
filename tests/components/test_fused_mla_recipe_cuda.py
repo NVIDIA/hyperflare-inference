@@ -135,11 +135,13 @@ def test_checkpoint_attention_compiled_state_matches_uncompiled(preparation, lay
     with DeepSeekWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(0, 1),
             prefixes=prefixes, dspark=draft, fused_attention=layout) as loader:
         weights = {index: loader.load_attention(index, draft=draft) for index in layers}
-    cases = ((8, 1, 8, "draft"), (64, 8, 8, "draft"), (192, 1, 192, "draft")) if draft else (
+    cases = ((8, 1, 8, "draft"), (64, 8, 8, "draft"), (192, 1, 192, "draft"),
+             (32, 16, 2, "draft"), (48, 16, 3, "draft"), (112, 16, 7, "draft")) if draft else (
         (1, 1, 1, "decode"), (17, 1, 17, "verify"), (64, 8, 8, "verify"), (257, 1, 257, "prefill"))
     if not draft:
         cases += ((8192, 1, 8192, "prefill"),)
-    pool = ContinuationPool.allocate(config, 12, 8 * 67 + 1, "cuda:0", dspark=draft,
+    max_batch = max(case[1] for case in cases)
+    pool = ContinuationPool.allocate(config, max_batch + 4, max_batch * 67 + 1, "cuda:0", dspark=draft,
                                      window_record_planes=(512, 16))
     arena = ScratchArena("cuda:0", overlap=overlap)
     catalog, graphs, functions, examples = [], [], [], {}

@@ -32,7 +32,7 @@ def binding(tmp_path_factory):
     return prepare(cache, Path(library)), cache, Path(library)
 
 
-def operands(rows, paged, compressed):
+def operands(rows, paged, compressed, width=None):
     from b12x.attention._shared.mla.compressed_reference import pack_deepseek_v41_cache_reference
 
     generator = torch.Generator(device="cuda").manual_seed(313)
@@ -59,7 +59,7 @@ def operands(rows, paged, compressed):
     cs = torch.cat((angles.cos(), angles.sin()), -1)
     sink = random((64,)).float()
     kv = cache(136, "swa") if paged else random((2048, 1, 512))
-    width = 128 if paged else 640
+    width = (128 if paged else 640) if width is None else width
     indices = torch.randint(0, 1024, (rows, width), dtype=torch.int32, device="cuda", generator=generator)
     if not paged:
         indices = indices.unsqueeze(1)
@@ -72,6 +72,12 @@ def operands(rows, paged, compressed):
 
 def reference(args, output, scales):
     q, pos, cs, sink, kv, indices, lengths, extra, ci, cl = args
+    if indices.shape[-1] % 8:
+        width = indices.shape[-1]
+        backing = torch.full((*indices.shape[:-1], (width + 7) // 8 * 8), -1,
+                             dtype=indices.dtype, device=indices.device)
+        backing[..., :width].copy_(indices)
+        indices = backing[..., :width]
     if kv.dtype == torch.bfloat16:
         return torch.ops._flashmla_C.fused_norm_rope_attn_rope_cast_fwd(q, kv, indices, 512 ** -.5, 512,
             sink, lengths, False, 0., pos, False, 64, cs, 8, 32, True, True, True, output, scales)
@@ -83,7 +89,10 @@ def reference(args, output, scales):
 def test_compiled_catalog_exposes_storage_and_preserves_results(binding):
     _, cache, library = binding
     cases = ((1, False, False), (257, False, False), (1024, False, False),
-             (25, True, False), (77, True, True), (192, True, True))
+             (25, True, False), (77, True, True), (192, True, True),
+             (25, True, False, 129), (32, True, False, 130),
+             (48, True, False, 131), (64, True, False, 132),
+             (112, True, False, 135), (257, False, False, 131))
     operations, data, outputs, references, functions, graphs = {}, {}, {}, {}, {}, {}
     declaration_refs = []
     with RecordedPreparationSession(device="cuda:0", checkpoint="synthetic-flashmla",
