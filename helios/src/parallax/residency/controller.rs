@@ -122,7 +122,27 @@ impl<B: Backend> Controller<B> {
                 "empty catalog or invalid staging capacity".into(),
             ));
         }
-        let locations = vec![Location::Backing; backend.regions().len()];
+        let locations: Vec<_> = (0..backend.regions().len())
+            .map(|i| backend.initial_location(i)).collect();
+        let mut occupied = BTreeSet::new();
+        for (region, location) in locations.iter().enumerate() {
+            match *location {
+                Location::Backing if !backend.has_backing(region) => {
+                    return Err(Error::Invalid("initial expert location has no backing copy".into()));
+                }
+                Location::Hbm(slot) if slot >= backend.slots()
+                    || !backend.slot_accepts(region, slot) || !occupied.insert(slot) => {
+                    return Err(Error::Invalid("invalid or overlapping initial HBM slots".into()));
+                }
+                _ => {}
+            }
+        }
+        for parts in experts.values() {
+            let in_hbm = matches!(locations[parts[0]], Location::Hbm(_));
+            if parts.iter().any(|i| matches!(locations[*i], Location::Hbm(_)) != in_hbm) {
+                return Err(Error::Invalid("initial expert parts must occupy the same tier".into()));
+            }
+        }
         Ok(Self {
             catalog_id,
             backend: Some(backend),
@@ -283,6 +303,9 @@ impl<B: Backend> Controller<B> {
                     return Err(Error::Invalid(
                         "movement disagrees with authoritative residency".into(),
                     ));
+                }
+                if !promotion && parts.iter().any(|i| !self.backend.as_ref().unwrap().has_backing(*i)) {
+                    return Err(Error::Invalid("cannot evict an expert without immutable backing".into()));
                 }
             }
         }

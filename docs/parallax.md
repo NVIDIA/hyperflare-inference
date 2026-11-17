@@ -490,6 +490,9 @@ reader leases. A versioned plan names the package/representation catalog, expect
 generation, expiration time, promotions and evictions. Admission rejects foreign
 catalogs, stale generations, expired or conflicting plans, unknown experts and
 insufficient spare capacity before submitting copies. An empty plan does nothing.
+Storage declares its initial tier and physical slot for each region. Admission
+rejects overlapping initial slots and mixed-tier expert parts. Experts without
+an immutable backing copy cannot be evicted.
 
 Each expert consists of one or more immutable storage regions. The controller
 stages all promoted regions into unused HBM slots; an eviction in the same plan
@@ -559,7 +562,7 @@ device-portability layer.
 
 ### Storage admission and qualification
 
-Regions must occupy distinct allocation-granularity pages. Admission rejects
+The virtual-memory backend requires distinct allocation-granularity pages. Admission rejects
 overlapping rounded ranges and charges physical padding to backing, HBM and
 transfer accounting. HBM slots are distributed evenly among the distinct rounded
 region sizes; each mapping requires a slot of exactly that size. This avoids
@@ -622,6 +625,46 @@ That includes staging, polling and mapping publication; it is not a serving
 stall measurement. Modeling only transfer bandwidth omits this cost. Serving
 integration must measure staging and publication separately, charge scheduler
 pauses, and compare measured serving results against a matched static placement.
+
+### Expert row storage
+
+The [`row backend`](../helios/src/parallax/residency/rows.rs) implements storage
+transactions for kernels that read canonical expert IDs through an int32 row map.
+Each layer declares immutable host rows, HBM rows, the canonical expert order in
+each tier, weight-plane row sizes and a mapping buffer. Mapping values address
+host rows first, followed by HBM rows. Construction validates disjoint storage,
+complete canonical coverage and agreement with the device's initial map.
+
+The backend copies every plane of a promoted expert into an unused HBM row on a
+low-priority CUDA stream. An expert's planes must use the same physical row;
+slots from another layer or plane cannot substitute. A ready event gates
+publication. Uploading affected maps requires zero controller reader leases and
+an external gate that excludes graph submission. Recoverable publication failure restores every
+changed map. Unconfirmed upload drain or rollback poisons storage and requires
+the owner to retain its buffers and CUDA context. GPU allocations, graph
+parameters and physical plane addresses remain fixed; a canonical expert's
+resolved address changes with its row map.
+
+The backend borrows storage through an unsafe Rust construction API. It is not
+connected to authenticated core loading or the serving residency option.
+GB300 storage qualification covers twenty exchanges at each of two four-plane
+geometries: 37/17/65/9-byte rows and 11,796,480/737,280/5,898,240/368,640-byte
+rows. One instantiated memcpy graph per geometry reads from fixed mapping-buffer
+and weight-plane addresses throughout the exchanges. Checks compare all promoted
+bytes, pinned and immutable backing bytes, reader-gated publication and device
+allocation stability. CPU tests cover geometry, initial placement, pinned
+eviction rejection and partial-publication rollback. This is synthetic storage
+qualification, not captured MoE arithmetic, full-model correctness or serving
+performance. Driver-failure recovery has CPU protocol coverage only.
+
+Run the GPU storage check only on an assigned idle GPU:
+
+```sh
+CUDA_VISIBLE_DEVICES=GPU_UUID FLARE_RUN_CUDA_TESTS=1 cargo test --release \
+  --manifest-path helios/Cargo.toml --features server,runtime-core --lib \
+  row_dma_preserves_captured_addresses_and_reader_gated_mapping \
+  -- --ignored --nocapture
+```
 
 ### Connecting storage to serving
 
