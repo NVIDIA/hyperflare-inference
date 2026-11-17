@@ -64,3 +64,14 @@ libjpeg-turbo
 This software is based in part on the work of the Independent JPEG
 Group.
 The libjpeg-turbo license texts are linked from third_party/rust/README.md.
+
+DerpSeek residency policy
+------------------------
+Copyright (c) 2026 chronarion
+helios/src/server/parallax/evaluation/decayed_lru.rs adapts the decayed-miss
+ranking, per-layer quotas and LRU victim selection described in:
+https://github.com/chronarion/derpseek/blob/fd3f9981468ac5bf0cdf30392f5baf7d9c1c6db8/engine/derpseek_engine/residency.py
+The Rust implementation uses independent virtual residency and demand-time
+classification; it does not include DerpSeek's physical copy execution.
+The MIT license is reproduced in helios/licenses/DerpSeek.txt in source and
+licenses/DerpSeek.txt in binary archives.

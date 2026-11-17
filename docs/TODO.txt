@@ -1,6 +1,8 @@
-[ ] Add a DerpSeek-style static-plus-LRU placement contender to Parallax. Check
-    decisions against the reference on identical routing traces before claiming
-    policy equivalence; use the common movement ledger for comparisons.
+[ ] Qualify decayed-miss LRU on held-out live routing alongside predictive
+    contenders; measure CPU overhead and compare policy decisions against DerpSeek
+    under matched readback grouping and slot order. Connect an active policy to
+    the safe physical transaction engine before claiming serving equivalence.
+    See parallax-demo.md#decayed-miss-lru-comparison.
 
 [ ] Compare Inkling 2 effort-zero generation with the canonical target using
     the static NVFP4 checkpoint. Native TP4 emits analysis in content_text and

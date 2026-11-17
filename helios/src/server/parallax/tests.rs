@@ -37,6 +37,7 @@ pub(super) fn profile(name: &str) -> Profile {
             evaluation: None,
             active: None,
             static_core_lru: None,
+            decayed_miss_lru: None,
         },
         model: Catalog {
             identity: "synthetic;package=test".into(),

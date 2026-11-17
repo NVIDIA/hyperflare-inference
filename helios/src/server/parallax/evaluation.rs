@@ -4,6 +4,7 @@ use super::prediction::{Expert, Forecast, Observation, Profile};
 mod placement;
 mod coverage;
 mod lru;
+mod decayed_lru;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -356,12 +357,16 @@ pub fn evaluate(c: &Capture) -> Value {
         if c.profile.settings.static_core_lru.is_some() {
             contenders.insert(lru::NAME.into(), lru::evaluate(c));
         }
+        if c.profile.settings.decayed_miss_lru.is_some() {
+            contenders.insert(decayed_lru::NAME.into(), decayed_lru::evaluate(c));
+        }
     }
     let mut report = json!({"result_kind":"SHADOW: modeled route costs, NOT measured serving improvement","routing_frames":c.observations.len(),"error":c.error,
         "capture_limit_reached":c.limit_reason.is_some() || c.observations.len() >= c.profile.settings.max_frames,
         "hardware":c.profile.hardware,"workers":c.workers,"contenders":contenders,"mode":"in_process","native_capture_version":1});
     if let Some(config) = &c.profile.settings.evaluation { report["evaluation"] = json!(config); }
     if let Some(config) = &c.profile.settings.static_core_lru { report["static_core_lru"] = json!(config); }
+    if let Some(config) = &c.profile.settings.decayed_miss_lru { report["decayed_miss_lru"] = json!(config); }
     if let Some(reason) = c.limit_reason {
         report["capture_limit_reason"] = json!(reason);
     }
@@ -382,6 +387,7 @@ pub(super) struct Continuous {
     overhead: BTreeMap<String, u64>,
     compute: BTreeMap<String, u64>,
     reactive: Option<lru::Reactive>,
+    decayed: Option<decayed_lru::Reactive>,
 }
 impl Continuous {
     pub fn new(capture: &Capture, limit: usize) -> Self {
@@ -395,6 +401,7 @@ impl Continuous {
             pending: vec![], pending_cells: 0, states,
             baseline: VirtualResidency::new(&capture.profile), overhead: BTreeMap::new(), compute: BTreeMap::new(),
             reactive: capture.profile.settings.static_core_lru.as_ref().map(|_| lru::Reactive::new(&capture.profile)),
+            decayed: capture.profile.settings.decayed_miss_lru.as_ref().map(|_| decayed_lru::Reactive::new(&capture.profile)),
         }
     }
     pub fn forecast(&mut self, f: Forecast) {
@@ -428,6 +435,11 @@ impl Continuous {
         for state in self.states.values_mut() { state.demand(o); }
         self.baseline.demand(o);
         if let Some(reactive) = &mut self.reactive {
+            if let Err(error) = reactive.observe(o, &self.window.profile, self.limit) {
+                self.window.error.get_or_insert(error);
+            }
+        }
+        if let Some(reactive) = &mut self.decayed {
             if let Err(error) = reactive.observe(o, &self.window.profile, self.limit) {
                 self.window.error.get_or_insert(error);
             }
@@ -475,6 +487,9 @@ impl Continuous {
         if let Some(reactive) = &self.reactive {
             residency.insert(lru::NAME.into(), reactive.report(&self.window.profile, &self.baseline));
         }
+        if let Some(reactive) = &self.decayed {
+            residency.insert(decayed_lru::NAME.into(), reactive.report(&self.window.profile, &self.baseline));
+        }
         (window, json!({"routing_frames":self.frames,"residency":residency}))
     }
 }
@@ -494,6 +509,9 @@ pub(super) fn evaluate_continuous(window: &Capture, totals: Value) -> Value {
     if window.error.is_none() && window.profile.settings.static_core_lru.is_some() {
         report["contenders"][lru::NAME] = json!({});
     }
+    if window.error.is_none() && window.profile.settings.decayed_miss_lru.is_some() {
+        report["contenders"][decayed_lru::NAME] = json!({});
+    }
     report.as_object_mut().unwrap().remove("capture_limit_reached");
     report.as_object_mut().unwrap().remove("capture_limit_reason");
     report["evaluation_window_frames"] = json!(window.observations.len());
@@ -501,6 +519,7 @@ pub(super) fn evaluate_continuous(window: &Capture, totals: Value) -> Value {
     report["routing_frames"] = totals["routing_frames"].clone();
     if let Some(config) = &window.profile.settings.evaluation { report["evaluation"] = json!(config); }
     if let Some(config) = &window.profile.settings.static_core_lru { report["static_core_lru"] = json!(config); }
+    if let Some(config) = &window.profile.settings.decayed_miss_lru { report["decayed_miss_lru"] = json!(config); }
     report["continuous"] = json!(true);
     report["trace_complete"] = totals["trace_complete"].clone();
     if totals["active_policy"].is_object() { report["active_policy"] = totals["active_policy"].clone(); }
