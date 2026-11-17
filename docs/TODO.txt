@@ -567,4 +567,7 @@
     NVIDIA hardware before claiming physical residency support. See parallax.md.
 [ ] Parallax: compare protected-core LRU and predictive policies on held-out
     routing traces, including policy overhead and concurrent copy contention.
-    Synthetic tests establish simulator behavior only.
+    Measure forecast lead across native readback and observer delays; a two-frame
+    offset can target work that has already started. Reduce observatory scoring
+    CPU cost, including repeated evaluation while routing is idle. Live shadow
+    collection does not establish movement benefit.
