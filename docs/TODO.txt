@@ -22,8 +22,10 @@
     across all shared-source layers and long contexts. Validate the composed
     contiguous prefill indexer's numerical behavior at long contexts; exported
     C16/8192/MTP3 native text integration passes.
-    Integrate and measure prefill expert staging before claiming equivalence
-    to DerpSeek's overlapped host-to-HBM execution.
+    Connect the captured selective staging component to prefill, validate export
+    and native replay, and measure fixed memory, TTFT and decode interference.
+    Compare adaptive staging with DerpSeek's DMA staging on matched workloads;
+    component timings do not establish a serving improvement.
     Extend full graph transition and MTP numerical qualification. Account
     for DerpSeek exact's enabled W8 output projection, low-latency GEMMs and
     fused preparation seams when attributing remaining full-step differences.

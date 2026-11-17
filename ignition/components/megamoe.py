@@ -244,10 +244,21 @@ class PreparedMegaMoe:
         declare(session, (self.plan.request(name=name, prepare_call=prepare),))
         register_finalizer(session, examples.clear)
 
-    def __call__(self, source, ids, probabilities, padding):
+    def __call__(self, source, ids, probabilities, padding, *, staged=None):
         _validate_inputs(source, ids, probabilities, padding, self.workspace.geometry,
                          self.workspace.buffer.device, self.plan.query.rows)
         output = torch.empty_like(source)
-        _run(source, ids, probabilities, padding, self.matrices, output,
-             self.workspace.buffer, self.control, self.descriptors, self.plan.handle)
+        matrices, control = self.matrices, self.control
+        if staged is not None:
+            if self.host_tier is None:
+                raise ValueError("expert staging requires a prepared host tier")
+            stager, pending = staged
+            if stager.tier is not self.host_tier:
+                raise ValueError("expert staging must use the consumer's immutable host rows")
+            planes, control = stager.finish(pending, source)
+            matrices = [*self.matrices[:-4], *planes]
+        _run(source, ids, probabilities, padding, matrices, output,
+             self.workspace.buffer, control, self.descriptors, self.plan.handle)
+        if staged is not None:
+            stager.observe(control)
         return output

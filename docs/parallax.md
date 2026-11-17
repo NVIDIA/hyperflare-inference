@@ -729,6 +729,41 @@ CUDA_VISIBLE_DEVICES=GPU_UUID FLARE_RUN_CUDA_TESTS=1 cargo test --release \
   -- --ignored --nocapture
 ```
 
+### Captured temporary expert staging
+
+`ignition.components.megamoe_staging.PreparedExpertStage` prepares selective
+host-to-HBM copies ahead of a MegaMoE consumer. It follows DerpSeek's use of
+temporary prompt staging and previous cold demand, with the decisions and copies
+inside captured graphs. It is a preparation component, not a native residency
+policy, and is not connected to a serving recipe.
+
+The component reads the authoritative canonical map on every replay and copies
+only host rows without a selected HBM copy. Prepared copy kernels use SMs;
+these selective transfers do not use DMA copy engines. Preparation can tune
+64, 128 or 256 copy CTAs. Each instance retains the preceding invocation's
+distinct host-expert count. Below its prepared threshold, the copy kernels skip
+their payload work and the consumer binds the original host weights. Zero
+history selects direct-host execution. Export must clear preparation observations
+after warmup and capture drain. A prediction miss changes cost, not which experts
+execute.
+
+Each forward owns its staging planes and private control block. The copy stream
+waits for its input dependency; the consumer joins that stream before reading
+staged weights. The private control block retains the original physical row
+indices and selects either staged HBM pointers or the permanent host pointers.
+The consumer's counters update the next invocation's decision. Permanent weight
+storage, residency maps and control counters remain unchanged. Native residency
+publication must exclude readers for the entire graph, including its copies.
+Two auxiliary streams permit lookahead; stream reuse follows the preceding
+consumer, with all source and destination lifetimes visible to compilation.
+
+GB300 component checks cover exact checkpoint-expert output agreement at
+256/1024/8192 rows across staging and direct-host transitions, changing routes
+and padding, two-stream reuse and allocation-free replay. Native row-storage
+checks cover sixteen physical exchanges at 1/16/64/256 rows with exact output
+agreement. These checks do not establish exported-core support or a serving
+performance improvement.
+
 ### Connecting storage to serving
 
 The [`storage binding resolver`](../helios/src/parallax/residency/package.rs)

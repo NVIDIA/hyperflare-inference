@@ -26,8 +26,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_native_row_exchanges_preserve_checkpoint_moe(experts, tmp_path, megamoe_core_storage):
+@pytest.mark.parametrize("staged", [False, True], ids=["direct-host", "staged-host"])
+def test_native_row_exchanges_preserve_checkpoint_moe(experts, tmp_path, megamoe_core_storage, staged):
     from flare_heliopause import ExpertResidencyTestStorage
+    from ignition.components.megamoe_staging import PreparedExpertStage
 
     routed, shared = experts
     host_ids, hbm_ids = list(range(2, 8)), list(range(6))
@@ -57,6 +59,8 @@ def test_native_row_exchanges_preserve_checkpoint_moe(experts, tmp_path, megamoe
         with RecordedPreparationSession(device="cuda:0", checkpoint="deepseek41-eight-experts",
                 workload_schema="native-row-exchanges", numerical_policy="reference-bitwise",
                 compile_workers=2, autotune_effort="off") as session:
+            stager = (PreparedExpertStage(tier, torch.cuda.Stream(), mapping, host_ids,
+                session=session, name="row-stage", min_cold=2) if staged else None)
             for rows in (1, 16, 64, 256):
                 x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16, generator=generator) * .1
                 ids = (torch.arange(rows * 6, device="cuda") % 8).reshape(rows, 6).int()
@@ -73,7 +77,8 @@ def test_native_row_exchanges_preserve_checkpoint_moe(experts, tmp_path, megamoe
             for args, op, ref, actual, expected in catalog:
                 def forward(args=args, op=op, ref=ref, actual=actual, expected=expected):
                     x, ids, probabilities, padding = args
-                    actual.copy_(op(x, mapping[ids.long()], probabilities, padding))
+                    pending = None if stager is None else (stager, stager.start(x))
+                    actual.copy_(op(x, mapping[ids.long()], probabilities, padding, staged=pending))
                     expected.copy_(ref(*args))
                 fn = compile_forward(forward)
                 fn()
@@ -113,7 +118,11 @@ def test_native_row_exchanges_preserve_checkpoint_moe(experts, tmp_path, megamoe
                     assert torch.isfinite(actual).all()
                     physical = mapping[ids[~padding].long()].long().flatten()
                     counts = torch.bincount(physical, minlength=geometry.experts)
-                    torch.testing.assert_close((tier.control[16:] - before).long(), counts, rtol=0, atol=0)
+                    if staged:
+                        torch.testing.assert_close(tier.control[16:], before, rtol=0, atol=0)
+                        assert stager.decision.item() == (counts[:tier.rows] > 0).sum().item()
+                    else:
+                        torch.testing.assert_close((tier.control[16:] - before).long(), counts, rtol=0, atol=0)
             print(json.dumps({"checkpoint_experts": 8, "shapes": [1, 16, 64, 256],
                 "exchanges": len(transactions), "exact_output_parity": True,
                 "transaction_wall_ns": transactions}))
