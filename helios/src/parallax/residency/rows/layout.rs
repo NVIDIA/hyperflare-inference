@@ -190,7 +190,8 @@ impl Layout {
         if locations.len() != self.regions.len() {
             return Err(invalid("expert location count differs from layout"));
         }
-        let mut occupied = BTreeSet::new();
+        // Slots are dense layout indices. Validate their geometry before indexing.
+        let mut occupied = vec![false; self.slots.len()];
         let mut maps = vec![];
         for (index, layer) in self.layers.iter().enumerate() {
             let mut map = vec![];
@@ -213,7 +214,7 @@ impl Layout {
                         Location::Backing if locations[start] == Location::Backing => {}
                         Location::Hbm(slot)
                             if self.accepts(region, slot)
-                                && occupied.insert(slot)
+                                && !std::mem::replace(&mut occupied[slot], true)
                                 && self.slots[slot].row + layer.host_experts.len() == value
                                 && matches!(locations[start], Location::Hbm(_)) => {}
                         _ => {

@@ -670,6 +670,22 @@ performance. Driver-failure recovery has CPU protocol coverage only. CPU export
 and resolution tests cover typed metadata, compressed catalogs and malformed
 bindings; a full DeepSeek export with this declaration is not qualified.
 
+Map validation checks slot occupancy with a bitmap sized from the declared HBM
+slots, after validating layer, plane and size compatibility. This preserves
+complete map validation without constructing an ordered set for each map.
+To measure its CPU cost independently of CUDA upload and reader drain, run:
+
+```sh
+cargo test --release --manifest-path helios/Cargo.toml --features runtime-core,server \
+  --lib parallax::residency::rows::tests::publication_map_validation_cost \
+  -- --ignored --exact --nocapture
+```
+
+This manual test builds synthetic addresses for 40 layers, 384 experts per layer
+and four weight planes, then times the two map constructions used by publication.
+It does not access a GPU or measure serving throughput. Physical publication time
+is reported separately as `publication_host_ns` in movement events.
+
 The qualification-only Heliopause interface also drives the native residency
 controller against captured MegaMoE graphs on GB300. The
 [`checkpoint component test`](../tests/components/test_megamoe_residency_cuda.py)

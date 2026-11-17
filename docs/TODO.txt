@@ -1,3 +1,7 @@
+[ ] Measure native row-map publication and serving impact after bitmap occupancy
+    validation. CPU map construction is measured separately; repeat GPU row
+    exchange checks and the same-core MTP3 active/static serving comparison.
+
 [ ] Qualify decayed-miss LRU on held-out live routing alongside predictive
     contenders; measure CPU overhead and compare policy decisions against DerpSeek
     under matched readback grouping and slot order. Connect an active policy to
