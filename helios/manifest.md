@@ -109,6 +109,18 @@ lists. Graph executable handles are nonzero and unique. Registered device
 spans do not overlap; captured weights and scratch need not appear in this I/O
 manifest but must remain in the resource owner.
 
+`Execution.expert_rows` optionally declares version-1 expert row storage for
+Parallax. Each layer records canonical expert count, host/HBM physical row order,
+a registered int32 mapping buffer and paired prepared-weight view names. Mapping
+indices enumerate host rows before HBM rows; an initial HBM copy takes precedence
+when an expert occurs in both tiers. The mapping has no host input or startup
+tuning writer. Every expert has all its planes in one physical row, with matching
+dtype, inner shape and strides across tiers. Rows are dense spans even when inner
+axes are transposed. These declarations change neither graph operations nor
+default residency. Cores without them retain static loading behavior. See
+[row storage](../docs/parallax.md#expert-row-storage) for implementation and
+qualification scope.
+
 Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `scored_prefill`,
 `decode`, `speculative`, `mixed`, `resume`, and `vision`. Decode and speculative
 batch capacities are powers of two through 64. Decode has one token per lane.

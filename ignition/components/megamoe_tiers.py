@@ -25,6 +25,8 @@ class MegaMoeLayerWeights:
     workspace: object
     host_tier: object | None
     expert_map: torch.Tensor
+    host_experts: tuple[int, ...] = ()
+    hbm_experts: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,7 +76,8 @@ class MegaMoeLayerLayout:
             mapping[canonical] = row
         expert_map = persistent_copy(torch.tensor(mapping, dtype=torch.int32, device=loader.device))
         record_numeric_tensor(expert_map)
-        return MegaMoeLayerWeights(routed, shared, self.workspace, tier, expert_map)
+        return MegaMoeLayerWeights(routed, shared, self.workspace, tier, expert_map,
+                                   self.host_experts, self.hbm_experts)
 
 
 class MegaMoeHostTier:

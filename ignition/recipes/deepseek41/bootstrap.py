@@ -465,6 +465,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
         routing_trace = None
+        from ignition.components.expert_row_storage import megamoe_row_storage
+        from ignition.components.megamoe_tiers import MegaMoeLayerWeights
+
+        expert_rows, row_buffers = megamoe_row_storage(
+            (index, layer.experts.experts, f"weights.layers[{index}].experts.experts")
+            for index, layer in enumerate(weights.layers)
+            if isinstance(layer.experts.experts, MegaMoeLayerWeights)
+            and layer.experts.experts.host_tier is not None)
+        buffers.update(row_buffers)
         if config.parallax_routing:
             from ignition.components.routing_trace import BUFFER, RoutingTrace
 
@@ -713,7 +722,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward = forward.forward
         if hasattr(forward, "completion") and hasattr(forward.completion, "scratch_tensors"):
             disposable.append(forward.completion.scratch_tensors)
-    model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), expert_rows=expert_rows, device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges(disposable), *completion.zero_ranges()),
