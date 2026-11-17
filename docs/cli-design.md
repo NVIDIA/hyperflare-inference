@@ -497,14 +497,15 @@ its proposal and prefix-allocation mode.
 DeepSeek V4.1 defaults to seven draft tokens, concurrency 32, a 4096-token
 prefill chunk, 128 physical target rows, and at most 64 packed round graphs,
 with packed GPU prefix selection.
-Its catalog contains combined proposal/allocation/verification rounds and
-width-one graphs; ordinary graphs serve `--mtp-draft-tokens 0`.
+Its catalog contains combined proposal/allocation/verification rounds at each
+depth from one through the configured maximum, plus width-one graphs;
+ordinary graphs serve `--mtp-draft-tokens 0`.
 The [model preparation guide](model-preparation.md#deepseek-v41-flash) defines
 the packed capacity selection. The row cap bounds target work and storage;
 raising it permits longer aggregate prefixes at larger batches. The independent
-graph budget controls catalog density between each batch's smallest wider round
-and its maximum physical extent. Width-one and ordinary graphs do not consume
-that budget. Budgets below the required endpoint count fail during planning;
+graph budget covers the complete rounds across all depths, refining physical
+capacities after mandatory depth and batch coverage. Width-one and ordinary
+graphs do not consume that budget. Insufficient budgets fail during planning;
 budgets above the number of distinct valid capacities capture every capacity.
 In export/conversion examples, `CACHE_ENTRY` is the directory path printed by
 `ignition export`. For eight requests with five drafts each, this example limits
@@ -517,8 +518,11 @@ physical target capacity to 24 rows while retaining six-token per-request prefix
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors
 ```
 
-Packed cores require adaptive execution at their captured draft depth, or
-`--mtp-draft-tokens 0` for ordinary execution. Native serving uses all captured
+Packed cores require a captured draft depth within the requested runtime limit,
+or `--mtp-draft-tokens 0` for ordinary execution. A single-depth core cannot
+select a smaller positive depth. DeepSeek V4.1 preparation includes lower-depth
+rounds for runtime comparison; their full-model execution is not qualified.
+Native serving uses all captured
 packed capacities by default. Prefer `--mtp-max-verification-token-budget N` to
 retain every captured capacity at or below a ceiling. This example limits the
 24-row core above to at most 16 target rows per round:

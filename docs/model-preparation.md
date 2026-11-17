@@ -693,9 +693,9 @@ The test checks the advertised capacity pair before running. At concurrency
 sixteen it also submits sixteen simultaneous requests and requires a batch-sixteen
 speculative counter increase. The test uses the core's declared sampling defaults
 and an explicit seed. A requested sampling parameter without a declared range is clamped to its core
-default; requesting top-k one does not make this core greedy. The seven-draft
-catalog cannot be treated as a three-draft comparison by changing the runtime
-limit: prepare the intended draft depth and serving capacities explicitly.
+default; requesting top-k one does not make this core greedy. Runtime draft
+limits select actual captured depths. A core containing only seven-draft rounds
+cannot serve a three-draft comparison; export the depth catalog described below.
 
 `ignition.components.megamoe_weights.load_mxfp4_planes` loads packed MXFP4 weights
 and expands CSF scales once into native UE8M0 bytes. `pack_mxfp4_planes` applies
@@ -1158,41 +1158,37 @@ or `audit`. It adds preparation time without changing the serving graph catalog.
 
 `--speculative-token-capacity` bounds physical target rows;
 `--speculative-graph-budget` independently controls the number of packed rounds.
-For each power-of-two request bucket `B`, the catalog retains capacities
-`B + 1` and `min(token_capacity, B * (draft_tokens + 1))` when that interval is
-nonempty. These endpoints preserve the smallest positive aggregate draft budget
-and full-width verification wherever it fits. Width-one continuations cover
-every request bucket independently and do not consume the packed graph budget.
+For each power-of-two request bucket `B` and every draft depth from one through
+the configured maximum, the catalog retains target capacity
+`min(token_capacity, B * (depth + 1))` when it exceeds `B`. The maximum depth
+also retains capacity `B + 1`. Width-one continuations cover every request bucket
+independently and do not consume the packed graph budget. Each combined round
+records its actual proposal depth, allowing `flare run --mtp-draft-tokens N`
+to select captured depths up to `N` without recapture or relabeling.
 
 Additional graphs refine the largest ratio between adjacent capacities across
-all buckets. Each refinement inserts the integer nearest the geometric midpoint
-that minimizes the larger resulting ratio. Equal ratios prefer smaller batches,
-then smaller capacities. Comparing ratios gives each batch the same relative
-resolution rather than assigning all graphs to the largest absolute row range.
+batch and depth pairs, with the width-one continuation as the lower boundary.
+Each refinement inserts the integer nearest the geometric midpoint that minimizes
+the larger resulting ratio. Equal ratios prefer smaller batches, then smaller
+depths and capacities. The budget covers all depths together, so retaining more
+depths leaves fewer graphs to refine physical row capacities.
 At a fixed row cap, increasing the graph budget adds one distinct graph at a
 time and preserves every graph already selected. Integer row capacities limit
 the available resolution: larger budgets saturate at every valid capacity.
-Budgets below the endpoint count fail before preparation; the default request
-and token capacities require at least 12 packed graphs.
-
-With seven drafts, 128 target rows, and a 64-graph budget, the catalog contains:
-
-| Captured request capacity | Packed graphs | Minimum / maximum target rows |
-|---|---:|---:|
-| 1 | 7 | 2 / 8 |
-| 2 | 10 | 3 / 16 |
-| 4 | 12 | 5 / 32 |
-| 8 | 12 | 9 / 64 |
-| 16 | 14 | 17 / 128 |
-| 32 | 9 | 33 / 128 |
+Budgets below the mandatory coverage count fail before preparation. With
+concurrency 32, seven drafts and 128 target rows, at least 48 packed graphs
+are required. The default budget is 64.
 
 These 64 combined packed rounds and six width-one continuations are separate
 from ordinary decode, prefill, maintenance, and vision graphs. The persistent
 preparation catalog prints every selected capacity. At batch 32, the 128-row
-cap permits four target rows per request on average, while proposal generation
-still produces seven drafts per request. Raising the row cap permits longer
+cap permits four target rows per request on average; a seven-draft round still
+produces seven proposals per request. Raising the row cap permits longer
 aggregate verification prefixes; raising the graph budget improves resolution
 within that cap and increases capture and retained graph resources.
+The multiple-depth catalog is implemented; full-model export and native serving
+across runtime depths are not qualified. Previously exported
+single-depth cores retain their original runtime choices.
 
 The host owns admission, cohort membership, and cache reservations. The captured
 round assigns prefixes from native proposal confidence and reports one terminal

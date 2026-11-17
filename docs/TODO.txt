@@ -26,7 +26,10 @@
     export and native replay; measure fixed memory, TTFT and decode interference.
     Compare adaptive staging with DerpSeek's DMA staging on matched workloads;
     component timings do not establish a serving improvement.
-    Extend full graph transition and MTP numerical qualification. Account
+    Extend full graph transition and MTP numerical qualification. For the
+    multiple-depth packed catalog, export C16/8192 with seven drafts
+    and 128 target rows, validate native selection at depths 3/5/7 and compare
+    serving cost and acceptance before choosing a runtime limit. Account
     for DerpSeek exact's enabled W8 output projection, low-latency GEMMs and
     fused preparation seams when attributing remaining full-step differences.
 
