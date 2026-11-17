@@ -586,6 +586,25 @@ optional preparation dependency with:
 uv sync --locked --extra prepare --extra test --extra megamoe
 ```
 
+The Python preparation bootstrap accepts `PreparationConfig.sm103`, an
+`SM103Config` from `ignition.recipes.deepseek41.sm103`. It names prepared
+FlashMLA and DeepSelect libraries and an `ExpertPlacement` for every enabled
+target and draft FFN. Each placement lists canonical expert IDs in physical
+host and HBM row order. Every expert must be present; an expert may have one
+copy in each tier, with the HBM copy selected initially. No placement changes
+occur during preparation or replay through this API.
+
+The bootstrap connects the tier loader, shared MegaMoE workspaces, fused
+attention and 512-byte-aligned cache storage. It records the placement and
+separate host/HBM expert extents in its memory report. Expert extents include
+expanded scales and duplicate copies; they exclude shared experts, projections,
+allocator padding and execution storage. Workspace construction is checked on
+GB300 for all 40 target and three draft layers, including separate capacities
+for target and draft calls. CPU checks cover admission, placement completeness,
+storage accounting and exclusion of mutable residency state from the weight
+catalog. These checks do not qualify a complete model load, graph catalog,
+core export or serving. The CLI planner does not yet expose this configuration.
+
 `ignition.components.megamoe_weights.load_mxfp4_planes` loads packed MXFP4 weights
 and expands CSF scales once into native UE8M0 bytes. `pack_mxfp4_planes` applies
 the DeepGEMM gate/up interleave and scale layout without requantizing weights.
@@ -907,8 +926,8 @@ MegaAttention synchronization storage and prepared-library paths. Pass it as
 with `window_record_planes=(512, 16)`. The loader applies the lossless query
 and output weight permutations; `PreparedAttention` composes projections,
 cache writes, index selection, attention and output projection. This API is
-restricted to TP1 layer preparation. The CLI's full-model preparation bootstrap
-does not select it.
+restricted to TP1. `PreparationConfig.sm103` selects it in the Python bootstrap;
+the CLI planner does not yet expose that configuration.
 
 Window and compressed cache readers, prefill gathers, draft-context writers,
 snapshots and accepted-prefix commits use matching separated planes. Index
