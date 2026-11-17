@@ -23,7 +23,7 @@ from transformers.vision_utils import (
     get_vision_position_ids,
 )
 
-from ignition.preparation.qwen38 import FRONTEND_SHA256, MODEL_ID, REVISION, TRANSFORMERS_REVISION
+from ignition.preparation.qwen38 import FRONTEND_SHA256, MODEL_ID, REVISION, TRANSFORMERS_VERSION
 
 
 TORCH_COMMIT = "cf30153c4c131c8164ee7798e5022d810682e2cb"
@@ -42,11 +42,10 @@ def pattern(width: int, height: int, seed: int) -> np.ndarray:
 
 
 def generate(snapshot: Path, output: Path, binary_dir: Path | None):
-    distribution = importlib.metadata.distribution("transformers")
-    provenance = json.loads(distribution.read_text("direct_url.json") or "{}")
-    if provenance.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_REVISION:
-        raise RuntimeError("Transformers commit does not match checkpoint qualification pin")
     versions = {name: importlib.metadata.version(name) for name in ("torch", "torchvision", "Pillow", "transformers", "numpy")}
+    if versions["transformers"] != TRANSFORMERS_VERSION:
+        raise RuntimeError(f"fixture generation requires Transformers {TRANSFORMERS_VERSION}; "
+                           f"found {versions['transformers']}")
     for name, expected in {"torch": "2.13.0+cu130", "torchvision": "0.28.0+cu130", "Pillow": "12.3.0"}.items():
         if versions[name] != expected:
             raise RuntimeError(f"{name} must be {expected}, got {versions[name]}")
@@ -145,7 +144,7 @@ def generate(snapshot: Path, output: Path, binary_dir: Path | None):
         except ValueError as error:
             case["error"] = str(error)
         geometry_cases.append(case)
-    result = {"model_id": MODEL_ID, "revision": REVISION, "transformers_commit": TRANSFORMERS_REVISION,
+    result = {"model_id": MODEL_ID, "revision": REVISION, "transformers_version": versions["transformers"],
         "torch_commit": TORCH_COMMIT, "versions": versions, "assets": assets,
         "image_processor_class": f"{type(processor.image_processor).__module__}.{type(processor.image_processor).__name__}",
         "backend": processor.image_processor.backend, "cases": cases, "geometry_cases": geometry_cases}

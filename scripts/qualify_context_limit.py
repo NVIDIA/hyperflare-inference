@@ -22,7 +22,10 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from qualify.server import Run, digest, metric_delta, resource_totals, write_json
+from qualify.server import (
+    Run, digest, distribution_origin, metric_delta, require_fixture_transformers, resource_totals,
+    write_json,
+)
 
 
 MODEL = "local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD"
@@ -85,13 +88,13 @@ def load_tokenizer(snapshot):
     assets = {name: digest(snapshot / name) for name in fixture["assets"]}
     if assets != fixture["assets"]:
         raise ValueError("snapshot tokenizer/template assets differ from the pinned fixture")
-    origin = json.loads(importlib.metadata.distribution("transformers").read_text("direct_url.json"))
-    if (origin.get("vcs_info", {}).get("commit_id") != fixture["transformers_commit"]
-            or tokenizers.__version__ != fixture["tokenizers_version"]):
-        raise ValueError("qualification requires pinned Transformers and tokenizers")
+    require_fixture_transformers(fixture)
+    if tokenizers.__version__ != fixture["tokenizers_version"]:
+        raise ValueError("qualification requires the pinned tokenizers version")
+    distribution = importlib.metadata.distribution("transformers")
     tokenizer = transformers.AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
     return tokenizer, {"assets_sha256": assets, "transformers_version": transformers.__version__,
-        "transformers_origin": origin, "tokenizers_version": tokenizers.__version__}
+        "transformers_origin": distribution_origin(distribution), "tokenizers_version": tokenizers.__version__}
 
 
 def render(tokenizer, body, *, tokenize):
