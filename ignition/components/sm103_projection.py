@@ -604,12 +604,17 @@ def bf16_out(source, weight, out, plan_handle):
     """Run a prepared BF16 projection by its plan handle: FlashInfer's GEMM on SM103, b12x's GEMV elsewhere."""
     plan = plan_from_handle(plan_handle)
     if plan.component_id == DENSE_COMPONENT:
-        from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
-
-        workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=source.device)
-        _dense_out_workspace(source, weight, out, workspace, plan_handle)
+        dense_out(source, weight, out, plan_handle)
         return
     torch.ops.b12x.bf16_gemv_small_n_out(source, weight, out, plan_handle, None)
+
+
+def dense_out(source, weight, out, plan_handle):
+    """Run a selected SM103 dense plan with compiler-visible workspace."""
+    from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+
+    workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=source.device)
+    _dense_out_workspace(source, weight, out, workspace, plan_handle)
 
 
 @torch.library.custom_op("flare::sm103_dense_out", mutates_args=("out",))
