@@ -1,7 +1,7 @@
-//! Restore authenticated expert weights directly into reserved Grace mappings.
+//! Bind authenticated expert storage before native graph submission.
 use super::{
     NativeResources, Storage,
-    format::{Memory, Core, invalid},
+    format::{Core, Memory, invalid},
 };
 use crate::{
     Result,
@@ -18,9 +18,93 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod rows;
+pub use rows::RowResidencyOptions;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ResidencyOptions {
+    Rows(RowResidencyOptions),
+    VirtualMemory(VirtualMemoryOptions),
+}
+impl ResidencyOptions {
+    pub fn catalog_id(&self) -> &str {
+        match self {
+            Self::Rows(o) => &o.catalog_id,
+            Self::VirtualMemory(o) => &o.catalog_id,
+        }
+    }
+    pub fn canonical(&self) -> &[ExpertId] {
+        match self {
+            Self::Rows(o) => &o.canonical,
+            Self::VirtualMemory(o) => &o.canonical,
+        }
+    }
+    pub(super) fn resolve(
+        &self,
+        core: &crate::core::protection::VerifiedCore,
+    ) -> Result<ResolvedResidency> {
+        match self {
+            Self::Rows(options) => options.resolve(core),
+            Self::VirtualMemory(options) => {
+                options.validate()?;
+                let regions = options
+                    .storage
+                    .resolve(core, &options.canonical, 1)
+                    .map_err(|e| invalid(e.to_string()))?;
+                Ok(ResolvedResidency::VirtualMemory {
+                    options: options.clone(),
+                    regions,
+                })
+            }
+        }
+    }
+}
+
+pub(super) enum ResolvedResidency {
+    VirtualMemory {
+        options: VirtualMemoryOptions,
+        regions: Vec<BoundRegion>,
+    },
+    Rows {
+        catalog_id: String,
+        layers: Vec<crate::parallax::residency::rows::Layer>,
+        evict: Vec<ExpertId>,
+    },
+}
+impl ResolvedResidency {
+    pub(super) unsafe fn plan(&self, owner: &mut NativeResources, core: &Core) -> Result<()> {
+        if let Self::VirtualMemory { options, regions } = self {
+            unsafe {
+                owner.plan_residency(core, options, regions)?;
+            }
+        }
+        // Row storage reuses the package's fixed allocations and normal budget.
+        Ok(())
+    }
+    pub(super) unsafe fn prepare(&self, owner: &mut NativeResources, core: &Core) -> Result<()> {
+        if let Self::VirtualMemory { options, regions } = self {
+            unsafe {
+                owner.prepare_residency(core, options, regions)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) unsafe fn finish(self, owner: &mut NativeResources) -> Result<()> {
+        match self {
+            Self::VirtualMemory { options, .. } => unsafe { owner.finish_residency(&options) },
+            Self::Rows {
+                catalog_id,
+                layers,
+                evict,
+            } => unsafe { owner.finish_row_residency(catalog_id, layers, evict) },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ResidencyOptions {
+pub struct VirtualMemoryOptions {
     pub version: u32,
     pub storage: StorageConfig,
     pub catalog_id: String,
@@ -30,7 +114,7 @@ pub struct ResidencyOptions {
     pub backing_bytes: usize,
     pub initial_hbm: Vec<ExpertId>,
 }
-impl ResidencyOptions {
+impl VirtualMemoryOptions {
     pub(super) fn validate(&self) -> Result<()> {
         if self.version != 1
             || self.catalog_id.trim().is_empty()
@@ -99,7 +183,10 @@ fn allocations(package: &Core, regions: &[BoundRegion]) -> Result<Vec<usize>> {
     Ok(groups.into_keys().collect())
 }
 
-fn geometry(regions: &[BoundRegion], options: &ResidencyOptions) -> Result<(Vec<Region>, Limits)> {
+fn geometry(
+    regions: &[BoundRegion],
+    options: &VirtualMemoryOptions,
+) -> Result<(Vec<Region>, Limits)> {
     let base = regions
         .iter()
         .map(|r| r.address)
@@ -132,7 +219,7 @@ impl NativeResources {
     pub(super) unsafe fn plan_residency(
         &mut self,
         package: &Core,
-        options: &ResidencyOptions,
+        options: &VirtualMemoryOptions,
         regions: &[BoundRegion],
     ) -> Result<()> {
         options.validate()?;
@@ -159,11 +246,11 @@ impl NativeResources {
     pub(super) unsafe fn prepare_residency(
         &mut self,
         package: &Core,
-        options: &ResidencyOptions,
-        regions: Vec<BoundRegion>,
+        options: &VirtualMemoryOptions,
+        regions: &[BoundRegion],
     ) -> Result<()> {
         options.validate()?;
-        let selected = allocations(package, &regions)?;
+        let selected = allocations(package, regions)?;
         if selected
             .iter()
             .any(|i| self.allocations.contains_key(&package.allocations[*i].name))
@@ -202,7 +289,7 @@ impl NativeResources {
         Ok(())
     }
 
-    pub(super) unsafe fn finish_residency(&mut self, options: &ResidencyOptions) -> Result<()> {
+    pub(super) unsafe fn finish_residency(&mut self, options: &VirtualMemoryOptions) -> Result<()> {
         let loading = self
             .parallax_loading
             .take()

@@ -674,8 +674,13 @@ signed `Execution.expert_rows` declaration and resolves plane names through the
 prepared-weight catalog. It accepts dense rows with transposed inner axes,
 requires identical host/HBM row layouts, and validates fixed tier allocations,
 payload coverage and a dedicated mapping buffer. Missing declarations reject
-row movement; ordinary static loading does not require them. The resolver and
-backend are not connected to the serving residency option.
+row movement; ordinary static loading does not require them. Version-2 residency
+configuration connects this resolver to native core loading. After authenticated
+weights load, the runtime checks that every range belongs to its retained
+allocations, constructs the controller and retires the configured number of
+duplicate HBM rows per layer. This reserves staging capacity before graph
+instantiation. Experts without a backing copy remain pinned. The active policy
+uses each layer's spare capacity and chooses victims from that same layer.
 GB300 storage qualification covers twenty exchanges at each of two four-plane
 geometries: 37/17/65/9-byte rows and 11,796,480/737,280/5,898,240/368,640-byte
 rows. One instantiated memcpy graph per geometry reads from fixed mapping-buffer
@@ -687,6 +692,19 @@ qualification, not captured MoE arithmetic, full-model correctness or serving
 performance. Driver-failure recovery has CPU protocol coverage only. CPU export
 and resolution tests cover typed metadata, compressed catalogs and malformed
 bindings; a full DeepSeek export with this declaration is not qualified.
+
+The qualification-only Heliopause interface also drives the native residency
+controller against captured MegaMoE graphs on GB300. The
+[`checkpoint component test`](../tests/components/test_megamoe_residency_cuda.py)
+uses eight DeepSeek V4.1 MXFP4 experts, shared FP8 weights and generated inputs.
+Sixteen physical exchanges preserve exact all-HBM reference outputs and routing
+counts at 1, 16, 64 and 256 rows, with changing padding. Every promoted weight
+and scale plane, pinned expert and immutable host row is checked. Movement and
+captured replay allocate no additional GPU storage. This test covers component
+arithmetic under quiescent exchanges, not full-model prefill or serving benefit.
+Run it with a release Heliopause build containing the `qualification` feature,
+`FLARE_RUN_CUDA_TESTS=1`, an assigned SM103 GPU in `CUDA_VISIBLE_DEVICES`, and
+`FLARE_DEEPSEEK41_CSF_SNAPSHOT` pointing to the lossless-CSF checkpoint.
 
 Run the GPU storage check only on an assigned idle GPU:
 
@@ -750,13 +768,27 @@ Recoverable copy or publication failures disable movement and preserve static
 storage. Unconfirmed mappings or readers stop execution and retain owners.
 There is no steady-state GPU allocation or graph recapture.
 
-`flare run --parallax-residency PATH` selects a version-1 JSON configuration:
+`flare run --parallax-residency PATH` accepts two JSON storage configurations.
+Version 1 selects virtual-memory storage:
 `storage` contains the resolved storage binding configuration; `catalog_id` and
 `canonical` must exactly match the predictor catalog; `hbm_slots`, `hbm_bytes`
 and `backing_bytes` bound physical allocations; `initial_hbm` selects canonical
 experts promoted before graph execution. Slots are individual weight parts, not
 complete experts. Reserve spare slots of every required size for exchanges.
-The implementation requires local TP1 with the CUDA memory capabilities above,
+
+Version 2 selects the fixed row storage declared by `Execution.expert_rows`:
+`package_id` identifies the loaded core, `catalog_id` and `canonical` must match
+the complete predictor catalog, and `spare_rows_per_layer` reserves complete
+expert rows from each layer's duplicate HBM copies. For example, a value of one
+retires the last backed HBM expert in each declared layer. At least one
+replaceable resident expert must remain per layer. Storage sizes and addresses
+come from authenticated metadata, not this configuration. The core's ordinary
+allocation budget includes these spare rows; they do not increase the HBM pool.
+Use the same configuration for static and active measurements so staging
+capacity does not change between runs. Native row serving remains experimental;
+the storage and metadata checks above do not establish full-model qualification.
+
+Both configurations require local TP1 with the relevant CUDA storage capabilities,
 `--parallax-routing`, a predictor
 profile and complete tracing coverage for the selected execution mode. Reader
 leases cover the entire speculative round, including proposal and accepted-state

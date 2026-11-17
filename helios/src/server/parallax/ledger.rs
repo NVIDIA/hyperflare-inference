@@ -221,7 +221,7 @@ mod tests {
     fn expert(expert:usize)->ExpertId { ExpertId {layer:3,expert} }
     fn ledger()->Ledger {
         Ledger::new(Snapshot { catalog_id:"fixture".into(), generation:1,
-            experts:(0..4).map(|i|(expert(i),i==0)).collect(),free_slots:1,hbm_allocated_bytes:100,
+            experts:(0..4).map(|i|(expert(i),i==0)).collect(),free_slots:1,free_slots_by_group:[(0,1)].into(),hbm_allocated_bytes:100,
             backing_allocated_bytes:400,readers:0,pending:false,poisoned:false,statistics:Default::default() },
             (0..4).map(|i|(expert(i),100,1)).collect())
     }

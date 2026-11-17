@@ -220,6 +220,10 @@ fn row_dma_preserves_captured_addresses_and_reader_gated_mapping() {
         assert!(!backend.capabilities().cold_moe_execution_qualified);
         let mut controller = Controller::new("synthetic-rows".into(), backend).unwrap();
         assert_eq!(controller.snapshot().free_slots, 0);
+        let constraints = controller.placement_constraints();
+        assert!(!constraints[&expert(0)].evictable);
+        assert!(constraints[&expert(1)].evictable);
+        assert!(constraints.values().all(|c| c.group == 3));
         assert!(matches!(
             controller.begin(plan(0, vec![3], vec![0]), 0),
             Err(Error::Invalid(_))
@@ -228,6 +232,7 @@ fn row_dma_preserves_captured_addresses_and_reader_gated_mapping() {
         controller.begin(plan(0, vec![], vec![2]), 0).unwrap();
         assert_eq!(settle(&mut controller), Progress::Committed(1));
         assert_eq!(controller.snapshot().free_slots, 4);
+        assert_eq!(controller.snapshot().free_slots_by_group, [(3, 4)].into());
         let mut ranges = vec![(mapping, 16)];
         ranges.extend(planes.iter().map(|p| (p.hbm_address, p.row_bytes * 3)));
         let output_bytes = ranges.iter().map(|(_, n)| n).sum();

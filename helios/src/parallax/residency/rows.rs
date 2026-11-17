@@ -171,6 +171,12 @@ unsafe impl Backend for Rows {
     fn has_backing(&self, region: usize) -> bool {
         self.layout.backing[region].is_some()
     }
+    fn region_group(&self, region: usize) -> usize {
+        self.layout.regions[region].expert.layer
+    }
+    fn slot_group(&self, slot: usize) -> usize {
+        self.layout.layers[self.layout.slots[slot].layer].layer
+    }
     fn slots(&self) -> usize {
         self.layout.slots.len()
     }

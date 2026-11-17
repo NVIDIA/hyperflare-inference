@@ -5,9 +5,8 @@
     canonical histogram collection: validate full state, scored-prefill tracing
     and isolated overhead. Free-form seeded C1 outputs vary with tracing off
     and on; request timing alone cannot establish instrumentation cost.
-    Export and qualify the signed expert-row declaration, then connect its
-    resolver to native serving ownership. Reserve complete spare rows;
-    preserve pinned experts and enforce per-layer placement capacity. Validate
+    Export and qualify the signed expert-row declaration through native serving
+    ownership, including startup spare rows and per-layer placement capacity. Validate
     checkpoint MoE arithmetic under exchanges and compare static/moving serving.
     Synthetic row-DMA tests do not qualify model execution.
     Compare exported Flare/Parallax serving with DerpSeek exact using matched
