@@ -6,11 +6,6 @@ use std::collections::VecDeque;
 
 pub(super) const NAME: &str = "reactive/decayed_miss_lru";
 
-struct Slot {
-    expert: Expert,
-    born: u64,
-    used: u64,
-}
 struct Available {
     at: u64,
     misses: Vec<(Expert, u64)>,
@@ -20,51 +15,27 @@ struct Available {
 
 pub(super) struct Reactive {
     state: VirtualResidency,
-    slots: Vec<Slot>,
-    slot_of: BTreeMap<Expert, usize>,
-    managed_layers: BTreeSet<usize>,
-    recent: BTreeMap<Expert, f32>,
+    policy: crate::server::parallax::decayed_miss::State,
     waiting: VecDeque<Available>,
     cells: usize,
-    tick: u64,
 }
 impl Reactive {
     pub(super) fn new(profile: &Profile) -> Self {
         let state = VirtualResidency::new(profile);
-        let protected: BTreeSet<_> = profile
-            .settings
-            .decayed_miss_lru
-            .as_ref()
-            .unwrap()
-            .protected_experts
-            .iter()
-            .copied()
-            .collect();
-        let slots: Vec<_> = state
-            .resident
-            .iter()
-            .filter(|e| !protected.contains(e))
-            .map(|e| Slot {
-                expert: *e,
-                born: 0,
-                used: 0,
-            })
-            .collect();
-        let managed_layers = slots.iter().map(|s| s.expert.layer).collect();
-        let slot_of = slots
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.expert, i))
-            .collect();
+        let policy = crate::server::parallax::decayed_miss::State::new(
+            &state.resident,
+            &profile
+                .settings
+                .decayed_miss_lru
+                .as_ref()
+                .unwrap()
+                .protected_experts,
+        );
         Self {
             state,
-            slots,
-            slot_of,
-            managed_layers,
-            recent: BTreeMap::new(),
+            policy,
             waiting: VecDeque::new(),
             cells: 0,
-            tick: 0,
         }
     }
 
@@ -95,12 +66,12 @@ impl Reactive {
             cells,
         };
         for (e, n) in &o.demands {
-            if *n == 0 || !self.managed_layers.contains(&e.layer) {
+            if *n == 0 || !self.policy.managed_layers.contains(&e.layer) {
                 continue;
             }
             if self.state.resident.contains(e) {
-                if let Some(i) = self.slot_of.get(e) {
-                    frame.hits.push((*i, self.slots[*i].born));
+                if let Some(i) = self.policy.slot_of.get(e) {
+                    frame.hits.push((*i, self.policy.slots[*i].born));
                 }
             } else {
                 frame.misses.push((*e, *n));
@@ -112,21 +83,9 @@ impl Reactive {
     }
 
     fn place(&mut self, frame: Available, p: &Profile) {
-        self.tick += 1;
-        self.state.advance(frame.at);
         let config = p.settings.decayed_miss_lru.as_ref().unwrap();
-        for (i, born) in frame.hits {
-            if self.slots[i].born == born {
-                self.slots[i].used = self.tick;
-            }
-        }
-        let decay = (1. - 1. / config.window as f64) as f32;
-        for score in self.recent.values_mut() {
-            *score *= decay;
-        }
-        for (e, n) in &frame.misses {
-            *self.recent.entry(*e).or_default() += *n as f32;
-        }
+        self.policy.observe(&frame.hits, &frame.misses, config);
+        self.state.advance(frame.at);
         if p.hardware
             .transfer_calibration
             .as_ref()
@@ -134,75 +93,28 @@ impl Reactive {
         {
             return;
         }
-        let mut candidates: Vec<_> = frame
-            .misses
+        let pending = self
+            .state
+            .pending
             .iter()
-            .map(|(e, _)| *e)
-            .filter(|e| {
-                self.managed_layers.contains(&e.layer)
-                    && !self.state.resident.contains(e)
-                    && !self.state.pending.iter().any(|(_, pending)| pending == e)
-                    && self.recent[e] >= config.min_misses
-            })
+            .map(|(_, expert)| *expert)
             .collect();
-        candidates.sort_by(|a, b| self.recent[b].total_cmp(&self.recent[a]).then(a.cmp(b)));
-        candidates.dedup();
-        // Quotas precede victim admission, matching the reference's policy order.
-        // A busy layer does not donate its selected quota to a lower-ranked layer.
-        let mut layers: Vec<(usize, Vec<Expert>)> = vec![];
-        let mut selected = 0;
-        for e in candidates {
-            let index = layers
-                .iter()
-                .position(|(layer, _)| *layer == e.layer)
-                .unwrap_or_else(|| {
-                    layers.push((e.layer, vec![]));
-                    layers.len() - 1
-                });
-            let picks = &mut layers[index].1;
-            if picks.len() == config.max_promotions_per_layer {
-                continue;
-            }
-            picks.push(e);
-            selected += 1;
-            if selected == config.max_promotions_per_observation {
-                break;
-            }
-        }
-        for (layer, picks) in layers {
-            let mut victims: Vec<_> = self
-                .slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| {
-                    s.expert.layer == layer
-                        && self.state.resident.contains(&s.expert)
-                        && self.tick - s.born >= config.min_age_observations
-                })
-                .map(|(i, s)| (s.used, i))
-                .collect();
-            victims.sort_unstable();
-            for (e, (_, i)) in picks.into_iter().zip(victims) {
-                let victim = self.slots[i].expert;
-                let before = self.state.promotions;
-                self.state.apply(
-                    Movement {
-                        promote: e,
-                        evict: Some(victim),
-                    },
-                    frame.at,
-                    p,
-                );
-                if self.state.promotions == before {
-                    continue;
-                }
-                self.slot_of.remove(&victim);
-                self.slot_of.insert(e, i);
-                self.slots[i] = Slot {
-                    expert: e,
-                    born: self.tick,
-                    used: self.tick,
-                };
+        for (expert, index) in
+            self.policy
+                .propose(&frame.misses, &self.state.resident, &pending, config)
+        {
+            let victim = self.policy.slots[index].expert;
+            let before = self.state.promotions;
+            self.state.apply(
+                Movement {
+                    promote: expert,
+                    evict: Some(victim),
+                },
+                frame.at,
+                p,
+            );
+            if self.state.promotions != before {
+                self.policy.replace(index, expert);
             }
         }
     }
@@ -217,7 +129,7 @@ impl Reactive {
             "resident_experts":s.resident.len(), "cold_experts":p.model.experts.len()-s.resident.len(),
             "pending_transfers":s.pending.len(), "reserved_hbm_bytes":s.reserved,
             "protected_experts":p.settings.decayed_miss_lru.as_ref().unwrap().protected_experts.len(),
-            "policy_ticks":self.tick, "cache_slots":self.slots.len(),
+            "policy_ticks":self.policy.tick, "cache_slots":self.policy.slots.len(),
             "policy_scope":"Shadow only. Fixed per-layer pools, decayed misses and LRU; one tick per available frame. Transfers serialize and evict before copy. No physical execution, policy overhead or serving contention calibration; not a DerpSeek throughput reproduction."
         });
         apply_ledger(&mut row, s, baseline, 0, p);
@@ -313,9 +225,9 @@ mod tests {
             available(200, &[(e(0, 3), 1), (e(0, 4), 5), (e(1, 3), 3)]),
             &p,
         );
-        assert_eq!(r.recent[&e(0, 3)], 6.);
+        assert_eq!(r.policy.recent[&e(0, 3)], 6.);
         assert_eq!(
-            r.slots.iter().map(|s| s.expert).collect::<Vec<_>>(),
+            r.policy.slots.iter().map(|s| s.expert).collect::<Vec<_>>(),
             vec![e(0, 3), e(0, 2), e(1, 3), e(1, 2)]
         );
         assert!(r.state.resident.contains(&e(0, 0)));
@@ -325,7 +237,7 @@ mod tests {
         assert_eq!(r.state.pending, vec![(315, e(0, 3)), (430, e(1, 3))]);
         // A high historical score without a current miss cannot cause promotion.
         r.place(available(500, &[(e(0, 5), 1)]), &p);
-        assert_eq!(r.slots[1].expert, e(0, 5));
+        assert_eq!(r.policy.slots[1].expert, e(0, 5));
     }
 
     #[test]
@@ -348,11 +260,11 @@ mod tests {
         r.place(available(20, &[(e(0, 4), 20), (e(1, 3), 10)]), &p);
         // The top candidate consumes the quota even though its layer is busy.
         assert_eq!(r.state.promotions, 1);
-        assert_eq!(r.slots[1].expert, e(1, 1));
+        assert_eq!(r.policy.slots[1].expert, e(1, 1));
         r.place(available(30, &[(e(0, 3), 100), (e(1, 3), 10)]), &p);
         // Already-held candidates do not consume the quota.
         assert_eq!(r.state.promotions, 2);
-        assert_eq!(r.slots[1].expert, e(1, 3));
+        assert_eq!(r.policy.slots[1].expert, e(1, 3));
     }
 
     #[test]
@@ -372,14 +284,14 @@ mod tests {
             .unwrap();
         assert_eq!(r.state.hits, 2); // Initial expert 1, then completed promotion 3.
         assert_eq!(r.state.misses, 6);
-        let birth = r.slots[0].born;
+        let birth = r.policy.slots[0].born;
         r.observe(&observation(3, 550, 700, &[]), &p, 20).unwrap();
-        assert_eq!(r.recent[&e(0, 3)], 5.); // Includes the earlier cold demand of four.
-        assert_eq!(r.slots[0].used, birth); // Old hit on evicted expert 1 cannot refresh 3.
+        assert_eq!(r.policy.recent[&e(0, 3)], 5.); // Includes the earlier cold demand of four.
+        assert_eq!(r.policy.slots[0].used, birth); // Old hit on evicted expert 1 cannot refresh 3.
         assert_eq!(r.state.promotions, 1); // Expert 3 is now held, not copied twice.
         r.observe(&observation(4, 650, 800, &[]), &p, 20).unwrap();
-        assert_eq!(r.slots[0].used, 3); // The hit on expert 3 becomes available.
-        assert_eq!(r.recent[&e(0, 3)], 2.5);
+        assert_eq!(r.policy.slots[0].used, 3); // The hit on expert 3 becomes available.
+        assert_eq!(r.policy.recent[&e(0, 3)], 2.5);
     }
 
     #[test]
@@ -408,7 +320,7 @@ mod tests {
         assert_eq!(r.state.pending, vec![(135, e(1, 3))]);
         assert_eq!(r.state.reserved, 300); // Unassigned global capacity remains unused.
         assert_eq!(r.state.misses, 101); // All cold demand remains in the ledger.
-        assert!(!r.recent.contains_key(&e(0, 3)));
+        assert!(!r.policy.recent.contains_key(&e(0, 3)));
     }
 
     #[test]
@@ -424,8 +336,8 @@ mod tests {
         )
         .unwrap();
         r.observe(&observation(2, 50, 60, &[]), &p, 20).unwrap();
-        assert_eq!(r.slots[0].expert, e(0, 1));
-        assert_eq!(r.slots[1].expert, e(0, 3));
+        assert_eq!(r.policy.slots[0].expert, e(0, 1));
+        assert_eq!(r.policy.slots[1].expert, e(0, 3));
     }
 
     #[test]
@@ -443,12 +355,13 @@ mod tests {
             config.max_promotions_per_layer = f["per_layer"].as_u64().unwrap() as usize;
             config.max_promotions_per_observation = f["total"].as_u64().unwrap() as usize;
             let mut r = Reactive::new(&p);
-            r.tick = 4;
+            r.policy.tick = 4;
             let mut misses = vec![];
             for layer in 0..2 {
                 for j in 0..5 {
                     let expert = e(layer, j + 1);
-                    r.recent
+                    r.policy
+                        .recent
                         .insert(expert, f["previous"][layer][j].as_f64().unwrap() as f32);
                     let count = f["misses"][layer][j].as_u64().unwrap();
                     if count > 0 {
@@ -456,7 +369,7 @@ mod tests {
                     }
                 }
                 for slot in 0..2 {
-                    let s = &mut r.slots[2 * layer + slot];
+                    let s = &mut r.policy.slots[2 * layer + slot];
                     s.born = f["born"][layer][slot].as_u64().unwrap();
                     s.used = f["used"][layer][slot].as_u64().unwrap();
                     if f["busy"][layer][slot].as_bool().unwrap() {
@@ -471,7 +384,7 @@ mod tests {
             let actual: Vec<_> = r.state.pending[pending..]
                 .iter()
                 .map(|(_, expert)| {
-                    let slot = r.slot_of[expert] % 2;
+                    let slot = r.policy.slot_of[expert] % 2;
                     json!([expert.layer, expert.expert, slot])
                 })
                 .collect();

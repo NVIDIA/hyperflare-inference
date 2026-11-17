@@ -39,8 +39,9 @@
 
 [ ] Qualify decayed-miss LRU on held-out live routing alongside predictive
     contenders; measure CPU overhead and compare policy decisions against DerpSeek
-    under matched readback grouping and slot order. Connect an active policy to
-    the safe physical transaction engine before claiming serving equivalence.
+    under matched readback grouping and slot order. Validate the active policy
+    through physical row transactions and matched native serving before claiming
+    serving equivalence; retain execution-generation and commit-age checks.
     See parallax-demo.md#decayed-miss-lru-comparison.
 
 [ ] Compare Inkling 2 effort-zero generation with the canonical target using

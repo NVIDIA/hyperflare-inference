@@ -127,7 +127,8 @@ LRU victims. A layer with only busy or young slots does not pass its selected
 quota to another layer. The minimum age protects a slot from its last promotion;
 hits update recency but do not restart that age.
 
-This is a shadow comparison, not an active controller or a reproduction of
+This contender uses independent shadow state. The optional physical policy
+described below shares its ranking algorithm, but neither mode reproduces
 DerpSeek serving. One available frame is one policy tick; DerpSeek can consume
 multiple readbacks in one serving tick. Delayed hits retain their slot generation,
 so they cannot refresh a replacement occupant. The common simulator serializes
@@ -436,6 +437,42 @@ still apply. This mode can make serving slower. The example publication allowanc
 is an assumption used for deadline admission; measured costs appear separately.
 Omitting `policy` retains `economic_exchange`, which requires positive expected
 savings under the profile's cold-execution penalty.
+
+The experimental `decayed_miss_lru` active policy instead consumes observed
+misses, without a prediction provider. It requires the version-2 profile's
+`decayed_miss_lru` settings and explicit `initial_resident` placement to match
+physical storage. Select it with:
+
+```json
+"active": {
+  "policy": "decayed_miss_lru",
+  "interval_ns": 100000000,
+  "valid_for_ns": 200000000,
+  "publication_ns": 1000000
+}
+```
+
+Protect every resident expert without backing storage in
+`decayed_miss_lru.protected_experts`. Within a layer, experts must have equal
+physical sizes, plane counts and allocation groups. The active policy admits at
+most 64 promotions per observation and respects the available spare slots in each
+group; a per-layer promotion quota cannot create staging capacity.
+
+Routing records identify the residency generation used by their graph. The
+policy classifies misses against that generation, even when later publications
+have changed placement. Hits cannot refresh a replacement installed after that
+graph. Successful publication advances slot ownership and replacement age;
+expired, cancelled and rejected proposals do not. A missing routing or movement
+event disables the policy instead of guessing its state.
+
+The validity window starts when routing becomes available. Startup transfer
+calibration and the assumed publication cost bound copy admission within that
+window; it is not a forecast of future demand or a claim of positive savings.
+The controller independently validates generations, capacity and reader safety.
+The `active_policy` report exposes proposals, accounted commits, stale
+observations and failures. CPU checks cover delayed generations, cancellation,
+copy deadlines, spare capacity and protected victims. Physical serving of this
+policy is not qualified.
 
 With physical storage enabled, the dashboard displays the actual residency
 ledger. GPU-timed copies and host mapping publication exclude startup placement.
