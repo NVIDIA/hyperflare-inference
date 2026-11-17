@@ -70,9 +70,8 @@ impl StorageConfig {
                 "invalid expert storage configuration or mapping granularity",
             ));
         }
-        let catalog = body
-            .prepared_weights
-            .as_ref()
+        let catalog = crate::core::prepared_weights::catalog(body)
+            .map_err(|error| invalid(&error.to_string()))?
             .filter(|c| c.version == 1)
             .ok_or_else(|| {
                 invalid("expert movement requires a supported prepared-weight catalog")
@@ -228,6 +227,17 @@ impl StorageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+
+    fn compressed(mut body: wire::RankBody) -> wire::RankBody {
+        let bytes = body.prepared_weights.take().unwrap().encode_to_vec();
+        body.compressed_prepared_weights = Some(wire::CompressedPreparedWeightCatalog {
+            zstd: zstd::stream::encode_all(bytes.as_slice(), 3).unwrap(),
+            decoded_nbytes: bytes.len() as u64,
+        });
+        body
+    }
+
     fn fixture() -> (StorageConfig, wire::RankBody, Vec<ExpertId>) {
         let config = StorageConfig {
             version: 1,
@@ -291,23 +301,25 @@ mod tests {
     #[test]
     fn canonical_ids_resolve_to_authenticated_view_offsets() {
         let (config, body, experts) = fixture();
-        let regions = config.resolve_body(&body, &experts, 64).unwrap();
-        assert_eq!(
-            (
-                regions[0].expert.expert,
-                regions[0].address,
-                regions[0].bytes
-            ),
-            (7, 4096, 128)
-        );
-        assert_eq!(
-            (
-                regions[1].expert.expert,
-                regions[1].address,
-                regions[1].offset
-            ),
-            (2, 4224, 128)
-        );
+        for body in [body.clone(), compressed(body)] {
+            let regions = config.resolve_body(&body, &experts, 64).unwrap();
+            assert_eq!(
+                (
+                    regions[0].expert.expert,
+                    regions[0].address,
+                    regions[0].bytes
+                ),
+                (7, 4096, 128)
+            );
+            assert_eq!(
+                (
+                    regions[1].expert.expert,
+                    regions[1].address,
+                    regions[1].offset
+                ),
+                (2, 4224, 128)
+            );
+        }
     }
     #[test]
     fn unsafe_storage_bindings_are_rejected() {
@@ -343,10 +355,38 @@ mod tests {
                 9 => body.allocations[0].memory = 2,
                 _ => unreachable!(),
             }
+            for body in [body.clone(), compressed(body)] {
+                assert!(
+                    config.resolve_body(&body, &experts, 64).is_err(),
+                    "fault {fault}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_catalog_encodings_are_rejected() {
+        let (config, body, experts) = fixture();
+        for fault in 0..5 {
+            let mut invalid = compressed(body.clone());
+            let catalog = invalid.compressed_prepared_weights.as_mut().unwrap();
+            match fault {
+                0 => catalog.zstd[0] ^= 0xff,
+                1 => catalog.decoded_nbytes += 1,
+                2 => catalog.zstd.push(0),
+                3 => invalid.prepared_weights = body.prepared_weights.clone(),
+                4 => invalid.compressed_prepared_weights = None,
+                _ => unreachable!(),
+            }
             assert!(
-                config.resolve_body(&body, &experts, 64).is_err(),
+                config.resolve_body(&invalid, &experts, 64).is_err(),
                 "fault {fault}"
             );
+        }
+        let mut body = body;
+        body.prepared_weights.as_mut().unwrap().version = 2;
+        for body in [body.clone(), compressed(body)] {
+            assert!(config.resolve_body(&body, &experts, 64).is_err());
         }
     }
 
@@ -369,7 +409,9 @@ mod tests {
         )
         .unwrap();
         let body = verified.rank(0).unwrap();
-        let catalog = body.prepared_weights.as_ref().unwrap();
+        let catalog = crate::core::prepared_weights::catalog(body)
+            .unwrap()
+            .unwrap();
         let mut planes = Vec::new();
         for view in &catalog.views {
             let part = if view.name.ends_with(".experts.w13") {
