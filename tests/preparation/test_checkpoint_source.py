@@ -145,7 +145,7 @@ def test_failed_parallel_read_closes_and_joins_all_workers(tmp_path):
     from contextlib import closing
     from ignition.preparation.remote_weights import RemoteWeightSession
 
-    with pytest.raises(ConnectionError):
+    with pytest.raises(RuntimeError, match="checkpoint source rejected access: interrupted source range"):
         with connected(tmp_path, 4) as (client, server, start):
             adapter = RemoteWeightSession.__new__(RemoteWeightSession)
             adapter.source = client
