@@ -145,17 +145,22 @@ impl VirtualResidency {
         // Every contender and the static control start with the same placement.
         let protected: BTreeSet<_> = p.settings.static_core_lru.as_ref()
             .map(|c| c.protected_experts.iter().copied().collect()).unwrap_or_default();
-        let resident: BTreeSet<_> = protected.iter().chain(sizes.keys().filter(|e| !protected.contains(e)))
-            .filter_map(|e| {
-                let s = &sizes[e];
-                if reserved + *s <= p.hardware.hbm_bytes {
-                    reserved += *s;
-                    Some(*e)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let resident: BTreeSet<_> = if let Some(initial) = &p.settings.initial_resident {
+            reserved = initial.iter().map(|e| sizes[e]).sum();
+            initial.iter().copied().collect()
+        } else {
+            protected.iter().chain(sizes.keys().filter(|e| !protected.contains(e)))
+                .filter_map(|e| {
+                    let s = &sizes[e];
+                    if reserved + *s <= p.hardware.hbm_bytes {
+                        reserved += *s;
+                        Some(*e)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
         Self {
             initial: resident.clone(), cold_avoided: 0, eviction_misses: 0,
             resident,

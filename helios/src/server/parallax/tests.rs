@@ -33,6 +33,7 @@ pub(super) fn profile(name: &str) -> Profile {
             horizon_ns: 10000,
             budget_ns: 100_000_000,
             max_frames: 64,
+            initial_resident: None,
             evaluation: None,
             active: None,
             static_core_lru: None,
@@ -189,6 +190,59 @@ fn native_capture_replays_exactly_and_rejects_invalid_forecasts() {
     std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
     assert!(super::replay(&path).is_err());
     std::fs::remove_dir_all(&c.profile.settings.output).unwrap();
+}
+
+#[test]
+fn explicit_initial_residency_changes_the_baseline_and_survives_replay() {
+    let mut c = fixture();
+    assert_eq!(evaluate(&c)["contenders"]["recent/static"]["hits"], 0);
+    c.profile.settings.version = 2;
+    c.profile.settings.initial_resident = Some(vec![c.profile.model.experts[1]]);
+    c.profile.validate().unwrap();
+    let result = evaluate(&c);
+    for policy in ["recent/static", "recent/economic"] {
+        assert_eq!(result["contenders"][policy]["hits"], 10);
+        assert_eq!(result["contenders"][policy]["misses"], 0);
+    }
+    std::fs::create_dir(&c.profile.settings.output).unwrap();
+    let path = c.profile.settings.output.join("capture.json");
+    std::fs::write(&path, serde_json::to_vec(&c).unwrap()).unwrap();
+    assert_eq!(super::replay(&path).unwrap(), result);
+    std::fs::remove_dir_all(&c.profile.settings.output).unwrap();
+}
+
+#[test]
+fn initial_residency_validates_version_identity_capacity_and_protection() {
+    let mut p = profile("initial-residency");
+    let encoded = serde_json::to_value(&p.settings).unwrap();
+    assert!(encoded.get("initial_resident").is_none());
+    p.settings = serde_json::from_value(encoded).unwrap();
+    p.validate().unwrap();
+    p.settings.initial_resident = Some(vec![]);
+    assert!(p.validate().is_err());
+    p.settings.version = 2;
+    p.validate().unwrap();
+    let [a, b] = p.model.experts[..] else { panic!("fixture geometry") };
+    for invalid in [vec![a, a], vec![Expert { layer: 99, expert: 0 }], vec![a, b]] {
+        p.settings.initial_resident = Some(invalid);
+        assert!(p.validate().is_err());
+    }
+    p.model.expert_bytes = vec![50, 150];
+    p.settings.initial_resident = Some(vec![b]);
+    assert!(p.validate().is_err());
+    p.settings.initial_resident = Some(vec![a]);
+    p.validate().unwrap();
+    p.settings.static_core_lru = Some(StaticCoreLruConfig {
+        version: 1, protected_experts: vec![b], max_promotions_per_observation: 1,
+    });
+    p.hardware.hbm_bytes = 200;
+    assert!(p.validate().is_err());
+    p.settings.initial_resident = Some(vec![b]);
+    p.validate().unwrap();
+    p.settings.initial_resident = None;
+    assert!(p.validate().is_err());
+    p.settings.version = 3;
+    assert!(p.validate().is_err());
 }
 struct Slow;
 impl Predictor for Slow {

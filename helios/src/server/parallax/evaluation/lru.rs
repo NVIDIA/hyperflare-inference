@@ -263,6 +263,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_initial_set_preserves_free_capacity_and_independent_states() {
+        let mut p = configured();
+        p.settings.version = 2;
+        p.settings.initial_resident = Some(vec![expert(4), expert(0)]);
+        p.validate().unwrap();
+        let baseline = VirtualResidency::new(&p);
+        let mut reactive = Reactive::new(&p);
+        assert_eq!(baseline.resident, BTreeSet::from([expert(0), expert(4)]));
+        assert_eq!(baseline.reserved, 200);
+        assert_eq!(reactive.state.resident, baseline.resident);
+        reactive.place(&observation(1, 10, 20, &[3]), &p);
+        reactive.state.advance(1000);
+        assert!(reactive.state.resident.contains(&expert(3)));
+        assert_eq!(reactive.state.reserved, 300);
+        assert_eq!(baseline.reserved, 200);
+        assert!(!baseline.resident.contains(&expert(3)));
+        assert_eq!(baseline.initial, reactive.state.initial);
+        p.settings.static_core_lru = None;
+        p.settings.initial_resident = Some(vec![]);
+        p.validate().unwrap();
+        let empty = VirtualResidency::new(&p);
+        assert!(empty.resident.is_empty());
+        assert_eq!(empty.reserved, 0);
+    }
+
+    #[test]
     fn calibration_core_seeds_every_contender_without_sharing_mutations() {
         let mut p = configured();
         p.settings
