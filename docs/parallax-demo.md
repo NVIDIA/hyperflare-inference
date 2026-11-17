@@ -215,6 +215,13 @@ Its early forecasts include the fitting period; assess the frozen contender afte
 that period has left the statistics window. Static residency remains a placement
 control, separate from this frequency predictor.
 
+`budget_ns` limits each provider's queueing and computation from submission to
+completion. A reply completed within that budget remains eligible when the
+observatory reads it later. Its forecast becomes available only when read;
+publication delay still reduces usable lead time and can make the forecast
+expire. A provider still unfinished when its budget expires, or one that completes
+over budget, is disabled without waiting for its thread or delaying other providers.
+
 Profiles without `evaluation` retain version 1 scoring (eight global ranks), its
 single-promotion policy and legacy cost arithmetic for exact historical replay.
 They do not silently adopt version 2 semantics. New experiments should explicitly

@@ -39,6 +39,116 @@ struct Worker {
     pending: Option<u64>,
     version: String,
 }
+enum WorkerPoll {
+    Waiting,
+    Ready(Reply),
+    TimedOut,
+    Unavailable,
+}
+impl Worker {
+    fn poll(&mut self, now: u64, budget: u64) -> WorkerPoll {
+        match self.reply.try_recv() {
+            Ok(reply) => {
+                let Some(submitted) = self.pending.take() else {
+                    return WorkerPoll::Unavailable;
+                };
+                let Some(finished) = reply.started.checked_add(reply.compute) else {
+                    return WorkerPoll::Unavailable;
+                };
+                // Publication may be delayed by observation processing. Charge the
+                // provider's queue and execution time, not delayed receipt of its reply.
+                if finished.saturating_sub(submitted) > budget {
+                    WorkerPoll::TimedOut
+                } else {
+                    WorkerPoll::Ready(reply)
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                if self
+                    .pending
+                    .is_some_and(|start| now.saturating_sub(start) > budget)
+                {
+                    self.pending = None;
+                    WorkerPoll::TimedOut
+                } else {
+                    WorkerPoll::Waiting
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.pending = None;
+                WorkerPoll::Unavailable
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    fn worker() -> (Worker, mpsc::SyncSender<Reply>) {
+        let (input, _) = mpsc::sync_channel(1);
+        let (sender, reply) = mpsc::sync_channel(1);
+        (
+            Worker {
+                input,
+                reply,
+                pending: Some(100),
+                version: "test".into(),
+            },
+            sender,
+        )
+    }
+
+    fn reply(started: u64, compute: u64) -> Reply {
+        let profile = super::super::prediction_tests::profile("worker-budget");
+        Reply {
+            context: Context {
+                model: Arc::new(profile.model),
+                history: vec![],
+                available_ns: 100,
+                target_offset: 1,
+                horizon_ns: 100,
+            },
+            started,
+            compute,
+            result: Ok(vec![]),
+        }
+    }
+
+    #[test]
+    fn queued_completion_survives_delayed_observer_poll() {
+        let (mut worker, sender) = worker();
+        sender.send(reply(110, 20)).unwrap();
+        let WorkerPoll::Ready(reply) = worker.poll(1_000, 100) else {
+            panic!("a completed provider must not time out while awaiting publication");
+        };
+        assert_eq!((reply.started, reply.compute), (110, 20));
+        assert!(worker.pending.is_none());
+    }
+
+    #[test]
+    fn completed_reply_budget_includes_queueing_and_execution() {
+        for (started, compute, expired) in [(110, 90, false), (110, 91, true), (201, 0, true)] {
+            let (mut worker, sender) = worker();
+            sender.send(reply(started, compute)).unwrap();
+            match worker.poll(1_000, 100) {
+                WorkerPoll::Ready(_) => assert!(!expired),
+                WorkerPoll::TimedOut => assert!(expired),
+                _ => panic!("expected a queued completion or its execution timeout"),
+            }
+            assert!(worker.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn missing_reply_times_out_without_waiting_for_the_provider() {
+        let (mut worker, _sender) = worker();
+        assert!(matches!(worker.poll(200, 100), WorkerPoll::Waiting));
+        assert!(matches!(worker.poll(201, 100), WorkerPoll::TimedOut));
+        assert!(worker.pending.is_none());
+    }
+}
 fn save(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec(value).map_err(|e| e.to_string())?)
@@ -179,17 +289,8 @@ impl Observer {
                         if counts.disabled {
                             continue;
                         }
-                        if worker.pending.is_some_and(|start| {
-                            now_ns() - start > capture.profile.settings.budget_ns
-                        }) {
-                            counts.timeouts += 1;
-                            counts.disabled = true;
-                            worker.pending = None;
-                            continue;
-                        }
-                        match worker.reply.try_recv() {
-                            Ok(reply) => {
-                                worker.pending = None;
+                        match worker.poll(now_ns(), capture.profile.settings.budget_ns) {
+                            WorkerPoll::Ready(reply) => {
                                 let cutoff = reply.context.history.last().unwrap().seq;
                                 match reply.result {
                                     Ok(scores) => {
@@ -232,12 +333,15 @@ impl Observer {
                                     }
                                 }
                             }
-                            Err(TryRecvError::Disconnected) => {
-                                worker.pending = None;
+                            WorkerPoll::TimedOut => {
+                                counts.timeouts += 1;
+                                counts.disabled = true;
+                            }
+                            WorkerPoll::Unavailable => {
                                 counts.failures += 1;
                                 counts.disabled = true;
                             }
-                            Err(TryRecvError::Empty) => {}
+                            WorkerPoll::Waiting => {}
                         }
                     }
                     match rx.recv_timeout(Duration::from_millis(1)) {
@@ -319,8 +423,9 @@ impl Observer {
                                         history: history.clone(),
                                         available_ns: history.last().unwrap().available_ns,
                                     };
+                                    let submitted = now_ns();
                                     if worker.input.try_send(context).is_ok() {
-                                        worker.pending = Some(now_ns());
+                                        worker.pending = Some(submitted);
                                         counts.submitted += 1;
                                     } else {
                                         counts.dropped_busy += 1;

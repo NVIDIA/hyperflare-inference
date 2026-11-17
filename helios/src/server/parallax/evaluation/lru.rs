@@ -79,6 +79,16 @@ impl Reactive {
         }
         let mut candidates = observation.demands.clone();
         candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        // Demand and protection are fixed for this observation. Reuse the same
+        // victim order instead of scanning every resident for each cold expert.
+        let mut victims: Vec<_> = self
+            .state
+            .resident
+            .iter()
+            .filter(|e| !self.protected.contains(e) && !touched.contains(e))
+            .copied()
+            .collect();
+        victims.sort_by_key(|e| (self.last_used.get(e).copied(), *e));
         let mut promoted = 0;
         for (expert, count) in candidates {
             if promoted == config.max_promotions_per_observation {
@@ -98,21 +108,12 @@ impl Reactive {
             let evict = if self.state.reserved + size <= profile.hardware.hbm_bytes {
                 None
             } else {
-                let victim = self
-                    .state
-                    .resident
-                    .iter()
-                    .filter(|e| {
-                        !self.protected.contains(e)
-                            && !touched.contains(e)
-                            && self.state.reserved - self.state.sizes[e] + size
-                                <= profile.hardware.hbm_bytes
-                    })
-                    .min_by_key(|e| (self.last_used.get(e).copied(), **e));
-                let Some(victim) = victim else {
+                let Some(index) = victims.iter().position(|e| {
+                    self.state.reserved - self.state.sizes[e] + size <= profile.hardware.hbm_bytes
+                }) else {
                     continue;
                 };
-                Some(*victim)
+                Some(victims.remove(index))
             };
             self.state.apply(
                 Movement {
@@ -260,6 +261,46 @@ mod tests {
                 .protected_experts = ids;
             assert!(p.validate().is_err());
         }
+    }
+
+    #[test]
+    fn batch_keeps_skipped_small_victims_and_uses_released_capacity() {
+        let mut p = configured();
+        p.model.experts = (0..7).map(expert).collect();
+        p.model.expert_bytes = vec![100, 100, 200, 100, 150, 100, 50];
+        p.hardware.hbm_bytes = 500;
+        p.hardware.backing_bytes = 800;
+        p.settings.version = 2;
+        p.settings.initial_resident = Some((0..4).map(expert).collect());
+        p.settings
+            .static_core_lru
+            .as_mut()
+            .unwrap()
+            .max_promotions_per_observation = 3;
+        p.validate().unwrap();
+        let mut r = Reactive::new(&p);
+        r.place(&observation(0, 10, 20, &[4, 5, 6]), &p);
+        // Expert 1 is too small for 4, but remains the oldest victim for 5.
+        // Replacing 2 with 4 leaves enough space for 6 without another eviction.
+        assert_eq!(r.state.resident, [expert(0), expert(3)].into());
+        assert_eq!(
+            r.state.pending.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+            vec![expert(4), expert(5), expert(6)]
+        );
+        assert_eq!(r.state.reserved, 500);
+        assert_eq!(r.state.promotions, 3);
+        assert_eq!(r.state.evictions, 2);
+    }
+
+    #[test]
+    fn touching_every_resident_leaves_no_eviction_candidate() {
+        let p = configured();
+        let mut r = Reactive::new(&p);
+        r.place(&observation(0, 10, 20, &[0, 1, 2, 3, 4]), &p);
+        assert_eq!(r.state.resident, [expert(0), expert(1), expert(2)].into());
+        assert!(r.state.pending.is_empty());
+        assert_eq!(r.state.promotions, 0);
+        assert_eq!(r.state.evictions, 0);
     }
 
     #[test]
