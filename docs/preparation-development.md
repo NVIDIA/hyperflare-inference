@@ -242,6 +242,12 @@ without Python calls or steady-state allocations.
 
 ## Physical cache backing and preparation memory
 
+On Linux, `CoreStorage` reserves a 2 TiB virtual device window per rank. Half
+serves the caching allocator; the other half covers persistent tensors,
+continuation rows and KV pages, which can each reserve a full-device extent.
+This accommodates GB300 memory geometry without backing those virtual extents
+in full. Windows retains a 1 TiB window within its WDDM address constraints.
+
 - **Bound preparation cache backing by tuning and capture needs.** Keep virtual
   serving capacity separate from physical preparation backing. Back only the
   KV pages touched by tuning and capture, plus the null row, simultaneously live

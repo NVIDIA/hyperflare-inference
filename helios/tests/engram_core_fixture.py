@@ -25,6 +25,7 @@ def prepare(root, shard_size=64 << 30, table_world=1):
         from b12x.sequence import engram
         from ignition.components.engram import EngramInputs, PreparedEngramLookup
         from ignition.components.parallel import TensorParallelShard
+        from ignition.components.embedding_partition import EmbeddingHeadPartition
         from ignition.components.ngram_delivery import publish_requests
         from ignition.components.readiness import ReadinessTimings
         from ignition.preparation.execution import PreparedExecution, GraphSignature
@@ -84,8 +85,11 @@ def prepare(root, shard_size=64 << 30, table_world=1):
             graph.instantiate()
             # Session cleanup unloads compiled kernels; retain it until export has read the graph.
             try:
+                partition = EmbeddingHeadPartition.for_rank(geometry.offsets[0], rows, 0, table_world)
                 tables = Tables(geometry, tuple(range(32)), {1: tuple(sources)}, {1: inputs}, {1: mailbox}, sequence,
-                    TensorParallelShard(0, table_world), torch.arange(6144, device=device))
+                    TensorParallelShard(0, table_world),
+                    {1: torch.tensor(partition.row_mapping, dtype=torch.int64, device=device)},
+                    torch.arange(6144, device=device))
                 reference_rows = list(range(rows))
                 (root / 'reference_rows.json').write_text(json.dumps(reference_rows))
                 buffers = dict(tables.buffers(), output=output, transfer_source=transfer_source, frame_index=frame,

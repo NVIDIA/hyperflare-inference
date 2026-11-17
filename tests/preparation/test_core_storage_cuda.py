@@ -17,7 +17,7 @@ import pytest
 def test_export_keeps_host_mailbox_and_omits_unused_library_storage(tmp_path):
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation import runtime_core_pb2 as proto
-    from ignition.preparation.core_file import read_index
+    from tests.preparation.payload_fixture import manifest, schema
 
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
     root = Path(__file__).resolve().parents[2]
@@ -25,12 +25,13 @@ def test_export_keeps_host_mailbox_and_omits_unused_library_storage(tmp_path):
     result = subprocess.run([sys.executable, str(root / "helios/tests/engram_core_fixture.py"), str(output)],
                             cwd=root, timeout=180, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "VRAM inventory at export" in result.stderr
+    assert "GPU memory inventory at export" in result.stderr
     assert "Rank 0 / CUDA 0" in result.stderr
     assert "Graph I/O / persistent state" in result.stderr
     assert "not resident VRAM" in result.stderr
-    index, _ = read_index(output / "core")
-    allocations = index.ranks[0].allocations
+    envelope = manifest(output / "core")
+    rank = schema()("RankBody").FromString(envelope.ranks[0].body)
+    allocations = rank.allocations
     host, = (allocation for allocation in allocations if allocation.memory == proto.MAPPED_HOST)
     assert host.address == CoreStorage.HOST_BASE
     assert all(allocation.address >= CoreStorage.EXTERNAL_FLOOR
