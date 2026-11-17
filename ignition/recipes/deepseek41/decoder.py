@@ -4,6 +4,7 @@
 
 """Tensor-parallel DeepSeek text stack with lagged hyperconnections."""
 
+from copy import copy
 from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
@@ -179,6 +180,8 @@ class PreparedLayer:
         register_finalizer(session, self.release_examples)
 
     def _prepare_experts(self, weights, s, text, *, mode, session, name, workspace):
+        self.routing_counter = None
+        self.routing_shape = tuple(s.router.ids.shape)
         self.router_projection = UnquantizedProjection(s.ffn_hc.normalized, weights.router, s.router_logits,
             session=session, name=name + ".router")
         self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
@@ -222,6 +225,15 @@ class PreparedLayer:
         else:
             self.concurrent_shared.functional(session=session)
 
+    def with_routing_trace(self, trace, layer):
+        if trace is None or self.routing_counter is not None:
+            raise ValueError("routing instrumentation requires an untraced layer")
+        traced = copy(self)
+        traced.routing_counter = trace.functional_counter(layer, *self.routing_shape)
+        # The original owns preparation examples; copied wrappers must not retain them.
+        traced.release_examples()
+        return traced
+
     def release_examples(self):
         self.scratch = self.metadata = self.image_mask = None
         if self.concurrent_shared is not None:
@@ -237,6 +249,8 @@ class PreparedLayer:
         image_mask = metadata.token_ids >= 129280 if self.has_image_mask else None
         router_logits = self.router_projection(normalized)
         route = self.router(router_logits, image_mask=image_mask)
+        if self.routing_counter is not None:
+            self.routing_counter(route.ids, metadata.live_counts[:1])
         if self.megamoe is not None:
             mapped = self.expert_map[route.ids.long()]
             return self.megamoe(normalized, mapped, route.weights, metadata.positions < 0), route
@@ -278,6 +292,7 @@ class PreparedDecoder:
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
+        self.routing_trace = None
         self.mode = mode
         self.vision = vision if mode == "prefill" else None
         self.table_requests = PreparedTableRequests(tables, metadata, pool, session=session, name=name + ".table_requests")
@@ -380,7 +395,18 @@ class PreparedDecoder:
         self.scratch = self.metadata = self.output_scratch = self.output_metadata = None
         self.auxiliary = self.safe_tokens = self.head_hidden = self.local_logits = None
 
+    def with_routing_trace(self, trace):
+        if trace is None or self.routing_trace is not None:
+            raise ValueError("routing instrumentation requires an untraced decoder")
+        traced = copy(self)
+        traced.routing_trace = trace
+        traced.layers = [layer.with_routing_trace(trace, index) for index, layer in enumerate(self.layers)]
+        traced.release_outputs()
+        return traced
+
     def __call__(self, metadata):
+        if self.routing_trace is not None:
+            self.routing_trace.begin()
         source_metadata = metadata
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)

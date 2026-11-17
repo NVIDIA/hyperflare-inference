@@ -257,7 +257,8 @@ traces; a serving-throughput opportunity requires a different calibrated model.
 ## Native capture and live comparison
 
 Preparation captures a read-only histogram operation after expert routing in
-[`ignition/recipes/glm53/moe.py`](../ignition/recipes/glm53/moe.py). The reusable
+[GLM](../ignition/recipes/glm53/moe.py) and
+[DeepSeek V4.1](../ignition/recipes/deepseek41/decoder.py). The reusable
 [`routing counter`](../ignition/components/routing_trace.py) reads canonical expert
 IDs and masks inactive packed rows. It writes a separate output without changing
 IDs, routing weights, hidden states or cache state.
@@ -269,6 +270,16 @@ option `--parallax-routing` requires complete tracing coverage for the selected
 execution mode. Packages exported with only ordinary traced variants still require
 `--mtp-draft-tokens 0`; enabling MTP tracing requires a package with traced MTP
 graphs. Mixed tracing fails admission.
+
+DeepSeek V4.1 TP1 capture wiring is implemented and component-qualified on GB300;
+exported native tracing is not yet qualified. Its ordinary, scored-prefill and
+packed MTP variants count canonical target IDs before physical expert mapping.
+Verification counts include rejected target candidates; draft experts are not
+part of this feed. Each layer records its executed row count, including the
+shorter decoder suffix during bounded prefill. Histogram token totals therefore
+need not be equal across layers. The checkpoint expert-block check covers
+1, 17, 64, 128 and 8192 rows, exact plain/traced outputs and IDs, inactive rows,
+alternating frames, untouched plain telemetry buffers and allocation-free replay.
 
 Telemetry is disabled by default. Native startup selects counter-free graphs and
 omits routing readback storage from the execution manifest; no routing records

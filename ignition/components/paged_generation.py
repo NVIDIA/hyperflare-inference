@@ -4,6 +4,8 @@
 
 """Collective text execution and request completion."""
 
+from copy import copy
+
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
@@ -68,6 +70,11 @@ class PreparedGeneration:
         if self.context is not None:
             self.context.functional()
         self.batch.functional()
+
+    def with_routing_trace(self, trace):
+        traced = copy(self)
+        traced.decoder = self.decoder.with_routing_trace(trace)
+        return traced
 
     def __call__(self):
         self._run()

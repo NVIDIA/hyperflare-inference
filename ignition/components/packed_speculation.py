@@ -9,6 +9,7 @@ cohort, physical target capacity, page tables, and request epochs cannot change
 inside the round.
 """
 
+from copy import copy
 from dataclasses import replace
 
 import torch
@@ -62,6 +63,11 @@ class PreparedPackedSpeculativeRound:
             runtime = o.collectives["vocabulary_runtime"]
         self.broadcast = PreparedBroadcast((confidence,), runtime=runtime, session=o.session,
             coordinator=o.collectives["coordinator"], name=name + ".confidence").functional(session=o.session)
+
+    def with_routing_trace(self, trace):
+        traced = copy(self)
+        traced.target = self.target.with_routing_trace(trace)
+        return traced
 
     def __call__(self):
         s, t = self.source, self.target

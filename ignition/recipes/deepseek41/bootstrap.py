@@ -95,6 +95,7 @@ class PreparationConfig:
     collective_tuning: str = "static"
     collective_ladder: dict | None = None
     prompt_logprobs: bool = False
+    parallax_routing: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
     native_dense_activations: bool = False
@@ -137,6 +138,10 @@ class PreparationConfig:
     sm103: SM103Config | None = None
 
     def __post_init__(self):
+        if type(self.parallax_routing) is not bool:
+            raise TypeError("parallax_routing must be a boolean")
+        if self.parallax_routing and len(self.devices) != 1:
+            raise ValueError("routing trace collection requires one GPU")
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -459,6 +464,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
+        routing_trace = None
+        if config.parallax_routing:
+            from ignition.components.routing_trace import BUFFER, RoutingTrace
+
+            expert_counts = {layer.experts.router.shape[0] for layer in weights.layers}
+            if len(expert_counts) != 1:
+                raise ValueError("routing trace v1 requires one routed expert count across target layers")
+            experts, = expert_counts
+            route_output = torch.zeros((2, len(weights.layers), 4 + experts), dtype=torch.int64, device=device)
+            buffers[BUFFER] = route_output
+            routing_trace = RoutingTrace(route_output, frame, sequence)
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
         forwards, signatures, metadata, scratch = {}, {}, {}, {}
@@ -486,22 +502,31 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
              + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
              + (len(config.batch_capacities) if False in modes else 0))
     count += len(PATCH_CAPACITIES) if vision_state is not None else 0
+    if routing_trace is not None:
+        count += (len(modes) * prefill_graph_count(config.prefill_capacities, scoring)
+                  + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
+                  + (len(config.batch_capacities) if False in modes else 0))
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)
     with phase(progress, "Construct graph catalog", total=count) as stage:
         def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0, draft_tokens=None):
             nonlocal catalog_previous
+            variants = [(name, forward, False)]
+            if routing_trace is not None and kind in ("decode", "prefill", "scored_prefill", "speculative"):
+                variants.append((name + "-parallax", forward.with_routing_trace(routing_trace), True))
             if kind == "scored_prefill":
-                forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
-            forwards[name] = forward
-            signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
-                                              packed_token_capacity=packed_tokens, draft_tokens=draft_tokens,
-                confidence_width=draft_tokens if "speculative_prefix_limits" in fields else 0)
-            allocated = torch.cuda.memory_allocated(device)
-            catalog_bytes[kind] = catalog_bytes.get(kind, 0) + allocated - catalog_previous
-            catalog_previous = allocated
-            stage.update(advance=1)
+            for graph_name, operation, traced in variants:
+                if kind == "scored_prefill":
+                    operation = PreparedScoredPrefill(operation, requests, inputs)
+                forwards[graph_name] = operation
+                signatures[graph_name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
+                    packed_token_capacity=packed_tokens, draft_tokens=draft_tokens, routing_trace=traced,
+                    confidence_width=draft_tokens if "speculative_prefix_limits" in fields else 0)
+                allocated = torch.cuda.memory_allocated(device)
+                catalog_bytes[kind] = catalog_bytes.get(kind, 0) + allocated - catalog_previous
+                catalog_previous = allocated
+                stage.update(advance=1)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
         for enabled in modes:
@@ -664,6 +689,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "pages": pages, "page_bytes": bytes_per_page, "page_tokens": PAGE_TOKENS,
         "kv_bytes": pages * bytes_per_page, "completion_output_bytes": completion.nbytes, "operator_scratch_bytes": arena.nbytes,
         "graphs": len(graphs), "prefill_capacities": config.prefill_capacities,
+        "parallax_routing_bytes": 0 if routing_trace is None else routing_trace.output.nbytes,
         "indexer_query_rows": INDEXER_QUERY_ROWS,
         "free_device_bytes": free, "total_device_bytes": total, "headroom_bytes": config.headroom_bytes,
         "allocated_bytes": torch.cuda.memory_allocated(device), "reserved_bytes": torch.cuda.memory_reserved(device),

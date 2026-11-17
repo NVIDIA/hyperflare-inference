@@ -117,7 +117,8 @@ def test_configuration_roundtrip_resolves_libraries_and_preserves_row_order(opti
     assert SM103Config.load(path) == options
 
 
-def test_single_rank_recipe_passes_placement_without_starting_peers(options, snapshot, tmp_path, monkeypatch):
+@pytest.mark.parametrize("tracing", [False, True])
+def test_single_rank_recipe_passes_placement_without_starting_peers(options, snapshot, tmp_path, monkeypatch, tracing):
     from types import SimpleNamespace
     from ignition import planning
     from ignition.recipes.deepseek41 import bootstrap
@@ -128,7 +129,7 @@ def test_single_rank_recipe_passes_placement_without_starting_peers(options, sna
     recipe, checkpoint = options.planning_inputs(RECIPE, RECIPE.checkpoints[0], snapshot, dspark=True)
     gpu = planning.Gpu(0, "GB300", "GPU-test", 256 << 30, 250 << 30, (10, 3))
     plan = replace(planning.plan(recipe, checkpoint, (gpu,), selected=(0,), concurrency=1,
-        reserve_bytes=0, speculation=recipe.speculation, prefill_chunk=256), sm103=options)
+        reserve_bytes=0, speculation=recipe.speculation, prefill_chunk=256, parallax_routing=tracing), sm103=options)
     prepared = SimpleNamespace(memory_report=dict(pages=64, free_device_bytes=1 << 30))
     storage = object()
     calls = []
@@ -145,9 +146,19 @@ def test_single_rank_recipe_passes_placement_without_starting_peers(options, sna
     path, config, rank, group, owner = calls[0]
     assert path == snapshot and rank == 0 and group is None and owner is storage
     assert config.sm103 == options and config.devices == (0,) and config.dspark
+    assert config.parallax_routing is tracing
     assert usage(prepared) == (RankUsage(64, 1 << 30),)
     peers = SimpleNamespace(memory_report={"ranks": [prepared.memory_report] * 3})
     assert usage(peers) == (RankUsage(64, 1 << 30),) * 3
+
+
+def test_routing_capture_rejects_multiple_ranks_and_non_boolean_selection(options, tmp_path):
+    with pytest.raises(ValueError, match="one GPU"):
+        PreparationConfig(parallax_routing=True)
+    with pytest.raises(TypeError, match="boolean"):
+        PreparationConfig(parallax_routing=1)
+    config = PreparationConfig(devices=(0,), sm103=options, kernel_cache=tmp_path, parallax_routing=True)
+    assert config.dspark and config.packed_speculative_shapes and config.parallax_routing
 
 
 @pytest.mark.parametrize("change", ["version", "unknown", "bool_cluster", "duplicate", "incomplete"])

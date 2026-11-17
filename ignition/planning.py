@@ -215,8 +215,8 @@ class Plan:
     def __post_init__(self):
         if type(self.parallax_routing) is not bool:
             raise UsageError("parallax routing capture must be a boolean")
-        if self.parallax_routing and (self.recipe.name not in ("glm53", "lil_glm53") or self.world_size != 1 or self.mixed_prefill):
-            raise UsageError("--parallax-routing requires GLM-Flash on one GPU without mixed prefill")
+        if self.parallax_routing and (self.recipe.name not in ("glm53", "lil_glm53", "deepseek41") or self.world_size != 1 or self.mixed_prefill):
+            raise UsageError("--parallax-routing requires GLM-Flash or DeepSeek V4.1 on one GPU without mixed prefill")
         if self.context_parallel_size is not None:
             if (type(self.context_parallel_size) is not int or not 1 <= self.context_parallel_size <= self.world_size
                     or self.world_size % self.context_parallel_size):

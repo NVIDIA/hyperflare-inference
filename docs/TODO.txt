@@ -1,7 +1,8 @@
 [ ] Extend DeepSeek SM103 native qualification beyond the TP1 C1/256/MTP7 and
     C16/8192/MTP3 text integration checks; validate long-context correctness,
     vision replay and ordinary/MTP agreement at C16.
-    Connect canonical routing telemetry, including MTP, and expert movement.
+    Qualify exported canonical routing telemetry, including packed MTP, with
+    default-off and traced native output/state/overhead checks. Connect expert movement.
     Validate the MegaMoE expert planes' strides and physical row mappings.
     Compare exported Flare/Parallax serving with DerpSeek exact using matched
     workloads, memory budgets, arithmetic and speculative settings.

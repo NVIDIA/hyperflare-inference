@@ -4,6 +4,7 @@
 
 """Parallel draft proposals, stochastic target verification and accepted-state commits."""
 
+from copy import copy
 from dataclasses import dataclass
 
 import torch
@@ -376,6 +377,13 @@ class PreparedParallelDraftRound:
         proposal = self.propose(probabilities=probabilities)
         result = self.verify(probabilities=probabilities, proposal=proposal)
         return proposal, result
+
+    def with_routing_trace(self, trace):
+        if self.proposal_only:
+            raise ValueError("target routing telemetry cannot instrument a proposal-only round")
+        traced = copy(self)
+        traced.decoder = self.decoder.with_routing_trace(trace)
+        return traced
 
     def __call__(self):
         self._round()

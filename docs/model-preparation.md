@@ -646,6 +646,12 @@ establish full-model numerical equivalence, vision replay, long-context
 correctness, ordinary/MTP equivalence at concurrency sixteen, or adaptive expert
 movement.
 
+`--parallax-routing` adds optional target-routing variants for ordinary and packed
+MTP execution. Runtime selection remains off by default. DeepSeek's capture wiring
+has checkpoint expert-block coverage through 8192 rows; exported native tracing
+is not yet qualified. See [the routing contract](parallax.md#native-capture-and-live-comparison)
+for canonical IDs, per-layer valid counts and draft exclusion.
+
 Run the persistent native text regression against an idle release server with
 either qualified capacity pair and `--mtp-adaptive-verification`. Use runtime
 `--mtp-draft-tokens 7` for concurrency one or `--mtp-draft-tokens 3` for
