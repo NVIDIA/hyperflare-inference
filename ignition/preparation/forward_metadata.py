@@ -8,8 +8,10 @@ import ctypes
 import io
 import pickle
 import socket
+import sys
 import types
 from contextvars import ContextVar
+from importlib.machinery import ExtensionFileLoader, PathFinder
 from threading import Lock, RLock, local
 
 import torch
@@ -118,6 +120,8 @@ class _ForwardPickler(pickle.Pickler):
             return _deserialize_triton_kernel, (_serialize_triton_kernel(value),)
         if isinstance(value, types.MappingProxyType):
             return _mapping_proxy, (dict(value),)
+        if isinstance(value, (torch._ops.OpOverloadPacket, torch._ops.OpOverload, torch._ops._OpNamespace)):
+            return _Unavailable, (f'Torch operator binding {value}',)
         from tvm_ffi.core import CObject
 
         if isinstance(value, CObject) or (not isinstance(value, type) and '<locals>' in type(value).__qualname__):
@@ -143,6 +147,12 @@ class _ForwardPickler(pickle.Pickler):
             return _Unavailable, (value.__qualname__,)
         if isinstance(value, types.ModuleType):
             import importlib
+            spec = value.__spec__
+            if spec is not None and isinstance(spec.loader, ExtensionFileLoader):
+                parent = sys.modules.get(spec.parent)
+                if PathFinder.find_spec(value.__name__, getattr(parent, '__path__', None)) is None:
+                    # Preparation-built extensions are owned by the rank, not compiler workers.
+                    return _Unavailable, (f'native extension {value.__name__}',)
             return importlib.import_module, (value.__name__,)
         if (type(value).__module__.startswith(('b12x.', 'ignition.'))
                 and hasattr(type(value), '__getattr__') and hasattr(value, '__dict__')):

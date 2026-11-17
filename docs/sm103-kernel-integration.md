@@ -107,6 +107,12 @@ Retain libraries, compiled programs, tensors, and graph resources until native
 work drains. Exported serving must need no Python callback, runtime compilation,
 graph recapture, or steady-state allocation.
 
+Exercise the compiler-worker handoff used by export. Worker payloads carry tensor
+layouts and selected-plan metadata; preparation-built native bindings remain in
+the owning rank. In-process component compilation does not test this serialization
+boundary. Check worker compilation and captured replay of a composed producer and
+consumer before attempting full-model export.
+
 Introducing an external implementation also requires its license and attribution,
 a reproducible preparation build, and tests against its reference behavior.
 Qualify the implementation before rewriting it. This does not authorize new

@@ -11,12 +11,28 @@ import torch
 
 from ignition.components.mega_attention_cache import MegaCacheLayout, PreparedMegaCacheWriter
 from ignition.preparation.compilation import compile_forward
+from ignition.preparation.capture import capture_forwards
+from ignition.preparation.execution import GraphSignature
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.preparation.virtual_storage import VirtualStorage
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned SM103 GPU")
+
+
+class CacheAttentionForward:
+    def __init__(self, writers, attention, arguments, output, scales):
+        self.writers, self.attention, self.arguments = writers, attention, arguments
+        self.output, self.scales = output, scales
+
+    def __call__(self):
+        for writer, arguments in self.writers:
+            writer(*arguments)
+        query, positions, *arguments = self.arguments
+        output, scales = self.attention(query, positions.int(), *arguments)
+        self.output.copy_(output)
+        self.scales.copy_(scales)
 
 
 def expected_cache(backing, values, positions, slots, layout, ratio):
@@ -259,20 +275,16 @@ def test_cache_writers_feed_compiled_fused_attention(tmp_path, rows):
             kernel_cache=tmp_path, session=session, name="attention")
         session.tune()
 
-        def forward():
-            window_writer(values, positions, cs, window, slots)
-            compressed_writer(latent, positions, cs, compressed, compressed_slots)
-            result, scales = attention(query, positions.int(), cs, sink, window, wi, window_lengths,
-                                       compressed, ci, compressed_lengths)
-            out.copy_(result)
-            sf.copy_(scales)
-
-        function = compile_forward(forward)
-        function()
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with session.capture(), torch.cuda.graph(graph):
-            function()
+        forward = CacheAttentionForward(
+            ((window_writer, (values, positions, cs, window, slots)),
+             (compressed_writer, (latent, positions, cs, compressed, compressed_slots))),
+            attention, (query, positions, cs, sink, window, wi, window_lengths,
+                        compressed, ci, compressed_lengths), out, sf)
+        graphs, compiled = capture_forwards({"decode": forward}, {"decode": GraphSignature("decode", rows, 1)},
+            session=session, device=torch.device("cuda:0"), stream=torch.cuda.Stream(),
+            pool=torch.cuda.graph_pool_handle(), cache_root=tmp_path / "forwards")
+        assert not compiled["decode"].cache_hit
+        graph = graphs["decode"]
         session.freeze()
         for _ in range(3):
             positions.add_(1)
