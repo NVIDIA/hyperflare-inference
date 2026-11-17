@@ -4,6 +4,7 @@
 """Heterogeneous physical records behind a shared logical page identity."""
 
 import torch
+import pytest
 
 from ignition.recipes.deepseek41.config import ModelConfig
 from ignition.recipes.deepseek41.pool import ContinuationPool, PAGE_TOKENS, page_bytes
@@ -30,10 +31,11 @@ def test_shared_sources_preserve_compression_geometry():
     assert PAGE_TOKENS == 128
 
 
-def test_contract_registers_compressed_planes_from_their_storage_owner():
+@pytest.mark.parametrize("planes", [(528,), (512, 16)])
+def test_contract_registers_compressed_planes_from_their_storage_owner(planes):
     from ignition.recipes.deepseek41.contract import prepare
 
-    pool = ContinuationPool.allocate(config(), 2, 3, "cpu")
+    pool = ContinuationPool.allocate(config(), 2, 3, "cpu", window_record_planes=planes)
     buffers = {}
     contract = prepare({}, buffers, pool, page_tokens=PAGE_TOKENS, draft_lag=None)
     regions = {r["storage"]["buffer"]: r for r in contract["cache"]["regions"]}
@@ -45,8 +47,24 @@ def test_contract_registers_compressed_planes_from_their_storage_owner():
         assert region["tokens_per_record"] == (1 if name.startswith("layer20.") else 2)
 
 
-def test_continuation_copies_window_compressor_and_hidden_state():
-    pool = ContinuationPool.allocate(config(), 3, 2, "cpu")
+@pytest.mark.parametrize("planes", [(528,), (512, 16)])
+def test_continuation_copies_window_compressor_and_hidden_state(planes):
+    pool = ContinuationPool.allocate(config(), 3, 2, "cpu", window_record_planes=planes)
+    assert sum(t.shape[1] for t in pool.pages.values()) == page_bytes(
+        pool.config, alignment=512 if planes == (512, 16) else 256)
+    if planes == (512, 16):
+        from ignition.components.mega_attention_cache import MegaCacheLayout
+        from ignition.components.mxfp4_index_inputs import index_cache_view
+        MegaCacheLayout(128, 528).view(pool.window(0))
+        for source in pool.config.sources:
+            pages = pool.pages[f"layer{source.layer}.index_page"]
+            view = index_cache_view(pages, source.records(PAGE_TOKENS))
+            assert view.stride(0) % 512 == 0
+            assert index_cache_view(pages[:1], source.records(PAGE_TOKENS)).stride(0) == pages.stride(0)
+            assert view.data_ptr() == pages.data_ptr()
+            assert view.shape == (2, source.records(PAGE_TOKENS), 68)
+        assert pool.layout.row_bytes % 512 == 0
+        assert all(region.offset % 512 == 0 for region in pool.layout.regions)
     for name in ("layer39.window", "layer2.pending_values", "layer14.pending_gates",
                  "layer8.pending_position", "last_hidden", "consumed_tokens"):
         region = pool.region(name)

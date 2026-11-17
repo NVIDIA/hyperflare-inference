@@ -16,9 +16,15 @@ from b12x.preparation import PreparedCall
 from ignition.components import sm103_projection
 from ignition.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from ignition.components.attention_output import PreparedGroupedOutputProjection
+from ignition.components.fused_mla import PreparedFusedMLA
+from ignition.components.mega_attention import _outputs
+from ignition.components.mega_attention_cache import MegaCacheLayout, PreparedMegaCacheWriter, snapshot_window, commit_window
+from ignition.components.mega_attention_output import PreparedFusedMLAOutput
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.mla_norm_quant import PreparedMLANormQuant
 from ignition.components.mxfp4_indexer import PreparedMXFP4Indexer
+from ignition.components.mxfp4_index_inputs import index_cache_view, write_index_keys
+from ignition.components.reference_indexer import PreparedReferenceIndexer
 from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, gather_rows_three, save_hidden
@@ -241,6 +247,7 @@ class PreparedGlobalKV:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *,
                  session, name, indices, deferred=False):
         self.rotary = rotary
+        self.fused_layout = weights.get("fused_layout")
         self.ratio = pool.config.text["compress_ratios"][layer]
         if indices.metadata is not metadata or indices.position.shape != (source.shape[0],):
             raise ValueError("global KV indices must describe every source row")
@@ -249,21 +256,41 @@ class PreparedGlobalKV:
             pool, slots, session=session, name=f"{name}.compress", deferred=deferred)
         self.index_key = UnquantizedProjection(self.compressor.output, weights["index_k"], scratch.index_keys,
             session=session, name=f"{name}.index_key").functional(session=session)
-        self.index_norm = PreparedRMSNorm(scratch.index_keys, weights["index_norm"], scratch.normalized_keys,
-            eps=pool.config.text["rms_norm_eps"], session=session, name=name + ".index_norm").functional()
-        self.writer = PreparedCompressedCacheWriter(self.compressor.output,
-            pool.pages[f"layer{layer}.latent_page"], self.compressor.slots,
-            page_size=PAGE_TOKENS // self.ratio, kind="indexed", session=session,
-            name=f"{name}.compressed_write").functional(session=session)
+        self.index_norm_weight = weights["index_norm"]
+        self.eps = pool.config.text["rms_norm_eps"]
+        self.index_norm = (PreparedRMSNorm(scratch.index_keys, weights["index_norm"], scratch.normalized_keys,
+            eps=self.eps, session=session, name=name + ".index_norm").functional()
+            if self.fused_layout is None else None)
+        self.cache = pool.pages[f"layer{layer}.latent_page"]
+        if self.fused_layout is None:
+            self.writer = PreparedCompressedCacheWriter(self.compressor.output,
+                self.cache, self.compressor.slots,
+                page_size=PAGE_TOKENS // self.ratio, kind="indexed", session=session,
+                name=f"{name}.compressed_write").functional(session=session)
+        else:
+            self.index_cache = index_cache_view(pool.pages[f"layer{layer}.index_page"], PAGE_TOKENS // self.ratio)
+            self.cache = MegaCacheLayout(PAGE_TOKENS // self.ratio, 288).view(self.cache)
+            self.writer = PreparedMegaCacheWriter(self.compressor.output, slots,
+                self.fused_layout.cos_sin[1], self.cache, self.compressor.slots,
+                ratio=self.ratio, kernel_cache=self.fused_layout.kernel_cache,
+                session=session, name=f"{name}.compressed_write")
         self.compressor.functional(session=session)
 
     def __call__(self, source, indexer, metadata, geometry):
         latent, slots, records = self.compressor(source, metadata, geometry.slots)
-        keys = self.index_norm(self.index_key(latent))
-        self.rotary.apply(keys, geometry.position, compressed=True)
-        indexer.write_keys(keys, slots)
-        self.rotary.apply(latent, geometry.position, compressed=True)
-        self.writer(latent, slots)
+        keys = self.index_key(latent)
+        if self.fused_layout is None:
+            keys = self.index_norm(keys)
+            self.rotary.apply(keys, geometry.position, compressed=True)
+            indexer.write_keys(keys, slots)
+            self.rotary.apply(latent, geometry.position, compressed=True)
+            self.writer(latent, slots)
+        else:
+            closing_position = (geometry.position + self.ratio - 1).clamp_min(0)
+            write_index_keys(keys, closing_position, self.fused_layout.cos_sin[1],
+                self.index_norm_weight, self.index_cache, slots, eps=self.eps, ratio=self.ratio)
+            self.writer(latent, closing_position,
+                self.fused_layout.cos_sin[1], self.cache, slots)
         return records
 
 
@@ -286,6 +313,10 @@ class PreparedAttention:
                  mla_compute_mode="auto", window_metadata=None, examples=None):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
+        self.fused_layout = weights.get("fused_layout")
+        expected_planes = (528,) if self.fused_layout is None else (512, 16)
+        if pool.window_record_planes != expected_planes or (self.fused_layout is not None and world != 1):
+            raise ValueError("attention weights and continuation cache planes must match; fused MLA requires TP1")
         self.replay_start = replay_start
         config = pool.config
         draft = mode == "draft"
@@ -297,16 +328,18 @@ class PreparedAttention:
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=device)
         self.window_page_size = 128 if mode == "decode" else 128 + metadata.max_query_tokens
+        self.window_layout = MegaCacheLayout(self.window_page_size, 528) if self.fused_layout is not None else None
+        self.window_bytes = self.window_page_size * 528 if self.window_layout is None else self.window_layout.page_bytes
         self.window = pool.window(layer, draft=draft)
         if window_staging is not None:
-            if (mode != "verify" or window_staging.shape != (rows, self.window_page_size * 528)
+            if (mode != "verify" or window_staging.shape != (rows, self.window_bytes)
                     or window_staging.dtype != torch.uint8 or window_staging.device != device
                     or not window_staging.is_contiguous()):
                 raise ValueError("verification window staging must match the contiguous cache geometry")
             self.window_cache = window_staging
         else:
             self.window_cache = self.window if mode == "decode" else zeros(
-                (rows, self.window_page_size * 528), torch.uint8)
+                (rows, self.window_bytes), torch.uint8)
         window_width = self.window_page_size if draft else 128
         self.owns_window_metadata = window_metadata is None
         if window_metadata is None:
@@ -355,14 +388,23 @@ class PreparedAttention:
             eps=self.eps, session=session, name=name + ".q_norm") if self.norm_quant is None else None)
         self.window_norm = (PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
             eps=self.eps, session=session, name=name + ".kv_norm") if self.norm_quant is None else None)
-        self.output_projection = PreparedGroupedOutputProjection(scratch.attended.view(tokens, -1, 4096),
-            weights["output"], scratch.output, session=session, name=name + ".output", workspace=workspace)
-        self.window_writer = PreparedCompressedCacheWriter(scratch.window_values, self.window_cache,
-            self.window_slots, page_size=self.window_page_size, kind="swa", session=session,
-            name=f"{name}.window_write",
-            history=self.window if mode in ("verify", "draft") else None,
-            history_rows=metadata.state_rows if mode in ("verify", "draft") else None,
-            snapshot_tokens=128 if mode in ("verify", "draft") else 0)
+        if self.fused_layout is None:
+            self.output_projection = PreparedGroupedOutputProjection(scratch.attended.view(tokens, -1, 4096),
+                weights["output"], scratch.output, session=session, name=name + ".output", workspace=workspace)
+            self.window_writer = PreparedCompressedCacheWriter(scratch.window_values, self.window_cache,
+                self.window_slots, page_size=self.window_page_size, kind="swa", session=session,
+                name=f"{name}.window_write",
+                history=self.window if mode in ("verify", "draft") else None,
+                history_rows=metadata.state_rows if mode in ("verify", "draft") else None,
+                snapshot_tokens=128 if mode in ("verify", "draft") else 0)
+        else:
+            self.cos_sin = self.fused_layout.cos_sin[int(bool(self.ratio))]
+            self.output_projection = PreparedFusedMLAOutput(*_outputs(tokens, device), weights["output"],
+                scratch.output, kernel_cache=self.fused_layout.kernel_cache, session=session,
+                name=name + ".output", workspace=workspace)
+            self.window_writer = PreparedMegaCacheWriter(scratch.window_values, window_metadata.position,
+                self.cos_sin, self.window_layout.view(self.window_cache), self.window_slots, ratio=1,
+                kernel_cache=self.fused_layout.kernel_cache, session=session, name=f"{name}.window_write")
         self.global_kv = None
         self.selectors = []
         if "compressor" in weights:
@@ -378,8 +420,22 @@ class PreparedAttention:
             candidate_source = config.text["candidate_source_layer_id"]
             if layer >= candidate_source and scratch.candidates.shape[0] < tokens:
                 raise ValueError("hierarchical selection exceeds candidate row capacity")
+            index_examples = {} if examples is None else examples
             for first in range(0, tokens, INDEXER_QUERY_ROWS):
                 last = min(tokens, first + INDEXER_QUERY_ROWS)
+                if self.fused_layout is not None:
+                    selector = PreparedReferenceIndexer(scratch.index_query[first:last],
+                        pool.pages[f"layer{self.source.layer}.index_page"], self.page_table[first:last],
+                        self.lengths[first:last], page_tokens=128 // self.ratio,
+                        cos_sin=self.fused_layout.cos_sin[1],
+                        candidate_mode=("publish" if layer == candidate_source else
+                                        "restrict" if layer > candidate_source else "none"),
+                        candidate_count=config.text["candidate_topk_blocks"],
+                        block_tokens=config.text["candidate_block_size"], prefill=mode == "prefill",
+                        kernel_cache=self.fused_layout.kernel_cache, library=self.fused_layout.deepselect_library,
+                        session=session, name=f"{name}.index{first}", examples=index_examples)
+                    self.selectors.append(selector)
+                    continue
                 candidates = {}
                 if layer == candidate_source:
                     candidates = dict(candidates_out=scratch.candidates[first:last], counts_out=scratch.candidate_counts[first:last])
@@ -396,16 +452,23 @@ class PreparedAttention:
             indexed_indices=scratch.selected, indexed_lengths=self.index_lengths,
             page_table=self.page_table,
             indexed_page_size=128 // self.ratio)
-        self.attention = PreparedCompressedMLA(scratch.query, self.window_cache, self.window_indices,
-            self.window_lengths, weights["sink"], scratch.attended,
-            window_page_size=self.window_page_size,
-            # Speculative rows use explicit indices into staged caches. Their
-            # prepared row bound belongs to the decode contract, including
-            # multi-request verification and noncausal draft blocks.
-            mode="decode" if mode in ("decode", "verify", "draft") else "extend",
-            decode_row_capacity=tokens if mode in ("decode", "verify", "draft") else None,
-            session=session, name=f"{name}.attention",
-            workspace=workspace, compute_mode=mla_compute_mode, **indexed)
+        if self.fused_layout is None:
+            self.attention = PreparedCompressedMLA(scratch.query, self.window_cache, self.window_indices,
+                self.window_lengths, weights["sink"], scratch.attended,
+                window_page_size=self.window_page_size,
+                # Verification uses packed rows and explicit staged-cache indices.
+                mode="decode" if mode in ("decode", "verify", "draft") else "extend",
+                decode_row_capacity=tokens if mode in ("decode", "verify", "draft") else None,
+                session=session, name=f"{name}.attention",
+                workspace=workspace, compute_mode=mla_compute_mode, **indexed)
+        else:
+            compressed = None if not self.ratio else MegaCacheLayout(128 // self.ratio, 288).view(indexed["indexed"])
+            self.attention = PreparedFusedMLA(scratch.query, window_metadata.position.int(), weights["sink"],
+                self.window_layout.view(self.window_cache), self.window_indices, self.window_lengths, metadata,
+                preparation=self.fused_layout, rotary=int(bool(self.ratio)), mode=mode,
+                compressed=compressed, selected=scratch.selected if self.ratio else None,
+                selected_lengths=self.index_lengths if self.ratio else None,
+                session=session, name=f"{name}.attention")
         self.concurrent_query = None
         if (mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
                 and isinstance(workspace, ScratchArena) and workspace.overlap):
@@ -416,12 +479,15 @@ class PreparedAttention:
                 global_kv = self.global_kv
                 compressor = global_kv.compressor
                 parallel_plans.extend((compressor.project_values.plan, compressor.plan,
-                    global_kv.index_key.plan, global_kv.index_norm.plan, global_kv.writer.plan))
+                    global_kv.index_key.plan, global_kv.writer.plan))
+                if global_kv.index_norm is not None:
+                    parallel_plans.append(global_kv.index_norm.plan)
                 if hasattr(compressor, "project_gates"):
                     parallel_plans.append(compressor.project_gates.plan)
             if self.selectors:
                 parallel_plans.extend((self.index_query.plan, self.index_weight.plan))
-                parallel_plans.extend(selector.plan for selector in self.selectors)
+                for selector in self.selectors:
+                    parallel_plans.extend(selector.plans if self.fused_layout is not None else (selector.plan,))
             self.concurrent_query = ConcurrentProjectionChain((self.projections["q_b"],),
                 parallel_plans=parallel_plans, session=session, workspace=workspace)
 
@@ -437,14 +503,16 @@ class PreparedAttention:
         else:
             self.query_norm.functional()
             self.window_norm.functional()
-        self.output_projection.functional(session=session)
-        self.window_writer.functional(session=session, cache=None)
-        self.attention.functional(session=session, window=None)
+        if self.fused_layout is None:
+            self.output_projection.functional(session=session)
+            self.window_writer.functional(session=session, cache=None)
+            self.attention.functional(session=session, window=None)
         if self.selectors:
             self.index_query.functional(session=session)
             self.index_weight.functional(session=session)
-            for selector in self.selectors:
-                selector.functional(session=session)
+            if self.fused_layout is None:
+                for selector in self.selectors:
+                    selector.functional(session=session)
         if self.owns_window_metadata:
             self.window_metadata.functional()
         register_finalizer(session, self.release_examples)
@@ -466,8 +534,11 @@ class PreparedAttention:
         position = indices.position
         if window_cache is None:
             window_cache = self.window if self.mode == "decode" else torch.zeros(
-                (m.starts.numel(), self.window_page_size * 528), dtype=torch.uint8, device=source.device)
-        if self.mode == "prefill":
+                (m.starts.numel(), self.window_bytes), dtype=torch.uint8, device=source.device)
+        if self.fused_layout is not None and self.mode != "decode":
+            snapshot_window(MegaCacheLayout(128, 528).view(self.window),
+                            self.window_layout.view(window_cache), m.state_rows)
+        elif self.mode == "prefill":
             gather_rows(self.window, m.state_rows, window_cache[:, :128 * 528])
         qkv = self.projections["qkv_a"]
         qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
@@ -485,10 +556,15 @@ class PreparedAttention:
             window_values = self.window_norm(projected[:, 1280:])
         if self.concurrent_query is None:
             query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
-            self.rotary.apply(query, position, compressed=bool(self.ratio))
-        self.rotary.apply(window_values, position, compressed=bool(self.ratio))
-        self.window_writer(window_values, indices.window_slots,
-                           history_rows=m.state_rows if self.mode in ("verify", "draft") else None, cache=window_cache)
+            if self.fused_layout is None:
+                self.rotary.apply(query, position, compressed=bool(self.ratio))
+        if self.fused_layout is None:
+            self.rotary.apply(window_values, position, compressed=bool(self.ratio))
+            self.window_writer(window_values, indices.window_slots,
+                               history_rows=m.state_rows if self.mode in ("verify", "draft") else None, cache=window_cache)
+        else:
+            self.window_writer(window_values, position, self.cos_sin,
+                               self.window_layout.view(window_cache), indices.window_slots)
         dependency = window_cache
         selected, candidates, candidate_counts = selection
         records = None
@@ -498,17 +574,24 @@ class PreparedAttention:
                 records = self.global_kv(source, self.selectors[0], m, geometry)
             if self.selectors:
                 index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
-                self.rotary.apply(index_query, position, compressed=True)
                 index_weights = self.index_weight(source)
-                index_weights.mul_(128 ** -.5 * 32 ** -.5)
+                if self.fused_layout is None:
+                    self.rotary.apply(index_query, position, compressed=True)
+                    index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 outputs, candidate_outputs, count_outputs = [], [], []
                 for ordinal, selector in enumerate(self.selectors):
                     first = ordinal * INDEXER_QUERY_ROWS
                     last = min(source.shape[0], first + INDEXER_QUERY_ROWS)
-                    result = selector(index_query[first:last], index_weights[first:last],
-                        m.token_page_table[first:last], geometry.lengths[first:last], geometry.active_width,
-                        candidates=None if self.layer <= self.candidate_source else candidates[first:last],
-                        counts=None if self.layer <= self.candidate_source else candidate_counts[first:last])
+                    if self.fused_layout is None:
+                        result = selector(index_query[first:last], index_weights[first:last],
+                            m.token_page_table[first:last], geometry.lengths[first:last], geometry.active_width,
+                            candidates=None if self.layer <= self.candidate_source else candidates[first:last],
+                            counts=None if self.layer <= self.candidate_source else candidate_counts[first:last])
+                    else:
+                        result = selector(index_query[first:last], index_weights[first:last],
+                            m.token_page_table[first:last], geometry.lengths[first:last],
+                            position[first:last], m.requests[first:last],
+                            candidates=None if self.layer <= self.candidate_source else candidates[first:last])
                     if self.layer == self.candidate_source:
                         result, next_candidates, next_counts = result
                         candidate_outputs.append(next_candidates)
@@ -521,13 +604,20 @@ class PreparedAttention:
                 dependency = selected
         if self.concurrent_query is not None:
             query = self.concurrent_query.finish(pending, dependency).view(self.query_shape)
-            self.rotary.apply(query, position, compressed=bool(self.ratio))
-        attended = self.attention(query, indices.window_indices, indices.window_lengths,
-            indexed_indices=selected if self.ratio else None,
-            indexed_lengths=geometry.index_lengths if self.ratio else None,
-            page_table=m.token_page_table if self.ratio else None, window=window_cache)
-        self.rotary.apply(attended, position, compressed=bool(self.ratio), inverse=True)
-        output = self.output_projection(attended.view(source.shape[0], -1, 4096))
+            if self.fused_layout is None:
+                self.rotary.apply(query, position, compressed=bool(self.ratio))
+        if self.fused_layout is None:
+            attended = self.attention(query, indices.window_indices, indices.window_lengths,
+                indexed_indices=selected if self.ratio else None,
+                indexed_lengths=geometry.index_lengths if self.ratio else None,
+                page_table=m.token_page_table if self.ratio else None, window=window_cache)
+            self.rotary.apply(attended, position, compressed=bool(self.ratio), inverse=True)
+            output = self.output_projection(attended.view(source.shape[0], -1, 4096))
+        else:
+            attended, scales = self.attention(query, position.int(), self.window_layout.view(window_cache),
+                indices.window_indices, indices.window_lengths, m, selected=selected if self.ratio else None,
+                selected_lengths=geometry.index_lengths if self.ratio else None)
+            output = self.output_projection(attended, scales)
         record = window_cache, records
         if self.mode == "prefill":
             self.commit(m.lengths, record, m)
@@ -538,8 +628,12 @@ class PreparedAttention:
 
     def commit(self, counts, records, metadata):
         window_cache, _ = records
-        torch.library.wrap_triton(_commit_window)[(128, metadata.starts.numel())](window_cache, self.window,
-            metadata.state_rows, metadata.starts, counts, self.window.stride(0), window_cache.stride(0), 1024)
+        if self.fused_layout is None:
+            torch.library.wrap_triton(_commit_window)[(128, metadata.starts.numel())](window_cache, self.window,
+                metadata.state_rows, metadata.starts, counts, self.window.stride(0), window_cache.stride(0), 1024)
+        else:
+            commit_window(self.window_layout.view(window_cache), MegaCacheLayout(128, 528).view(self.window),
+                          metadata.state_rows, metadata.starts, counts.long())
         self.commit_pending(counts, records, metadata)
 
     def commit_pending(self, counts, records, metadata):

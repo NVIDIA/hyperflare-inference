@@ -306,7 +306,8 @@ class PreparedDecoder:
                 [pool.layout.region(f"layer{index}.window").offset for index in range(len(weights.layers))],
                 metadata.state_rows, metadata.starts,
                 token_capacity=metadata.max_query_tokens,
-                window_tokens=128, record_bytes=528)
+                window_tokens=128, record_bytes=528, record_planes=pool.window_record_planes,
+                staging_alignment=512 if pool.window_record_planes == (512, 16) else 1)
         ratios = weights.config.text["compress_ratios"][:len(weights.layers)]
         prefix_ratios = ratios if self.packing is None else ratios[:decoder_start + 1]
         self.window_metadata = AttentionIndices(metadata, mode=mode,

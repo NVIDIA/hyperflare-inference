@@ -98,3 +98,21 @@ class PreparedGroupedFP8Projection:
         output = torch.empty((q.rows, q.groups, q.outputs), dtype=torch.bfloat16, device=values.device)
         _run(values, scales, *self.weights, output, self.plan.handle)
         return output
+
+
+class PreparedFusedMLAOutput:
+    """Preserve the BF16 grouped intermediate before the final dense projection."""
+
+    def __init__(self, values, scales, weights, output, *, kernel_cache, session, name, workspace):
+        from ignition.components.linear import QuantizedProjection
+
+        self.grouped = PreparedGroupedFP8Projection(values, scales, *weights.grouped,
+            kernel_cache=kernel_cache, session=session, name=name + ".grouped")
+        rows, groups = values.shape[:2]
+        width = weights.grouped[0].shape[1]
+        example = torch.empty((rows, groups * width), device=values.device, dtype=torch.bfloat16)
+        self.dense = QuantizedProjection(example, weights.dense, output, session=session,
+            name=name + ".dense", workspace=workspace, activation_mode="auto").functional(session=session)
+
+    def __call__(self, values, scales):
+        return self.dense(self.grouped(values, scales).flatten(1))

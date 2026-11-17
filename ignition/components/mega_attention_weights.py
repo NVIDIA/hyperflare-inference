@@ -3,9 +3,17 @@
 
 """Lossless weight layouts at the fused attention projection boundaries."""
 
+from dataclasses import dataclass
+
 import torch
 
 from ignition.preparation.persistent import persistent_copy
+
+
+@dataclass(frozen=True)
+class FusedMLAOutputWeights:
+    grouped: tuple[torch.Tensor, torch.Tensor]
+    dense: object
 
 
 def _validate(values, scales, shape):

@@ -901,6 +901,44 @@ selection cases skip when the DeepSelect library is not supplied. Compute
 Sanitizer memcheck reports zero errors across these component cases and the
 full-cache scoring regressions.
 
+The layer-composition API uses `FusedMLAPreparation` to share rotary tables,
+MegaAttention synchronization storage and prepared-library paths. Pass it as
+`fused_attention` to `DeepSeekWeightLoader`, and allocate `ContinuationPool`
+with `window_record_planes=(512, 16)`. The loader applies the lossless query
+and output weight permutations; `PreparedAttention` composes projections,
+cache writes, index selection, attention and output projection. This API is
+restricted to TP1 layer preparation. The CLI's full-model preparation bootstrap
+does not select it.
+
+Window and compressed cache readers, prefill gathers, draft-context writers,
+snapshots and accepted-prefix commits use matching separated planes. Index
+pages and continuation rows retain 512-byte alignment, including padding in
+64-key index pages. Candidate-producing layers publish block IDs for later
+candidate-restricted layers. Scoring uses paged kernels in both decode and
+prefill; the reference runtime's contiguous-workspace prefill scoring is a
+distinct path whose performance is not established by these checks.
+
+Set `FLARE_DEEPSEEK41_CSF_SNAPSHOT` to the indexed checkpoint and supply the
+FlashMLA and DeepSelect libraries described above, then run:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_fused_mla_recipe_cuda.py tests/components/test_fused_mla_gather_cuda.py -q
+```
+
+On GB300, checkpoint-backed tests with stream overlap enabled preserve exact
+compiled/uncompiled outputs and continuation state for target layers 0, 2 and
+20, the layer-20/layer-24 candidate producer/consumer pair, and draft layer 0.
+Target shapes include 1-row decode, 17/64-row verification and 257-row prefill;
+window-only prefill also covers 8,192 rows. Draft shapes cover 8, 64 and 192
+rows. Replays change inputs, request/page mappings, active lengths and accepted
+prefixes and allocate no device tensors. These layer tests do not qualify
+full-model speculation, long-context attention, native core export or serving.
+The snapshot/restore regression checks both cache layouts at consumed-token
+endpoints 1, 127, 128, 129, 255 and 256. It verifies complete continuation rows
+and partial physical pages, including padding, when two requests restore the
+same snapshot. Run `tests/recipes/test_deepseek41_state_transfer_cuda.py` with
+`FLARE_RUN_CUDA_TESTS=1` on an assigned GPU.
+
 The preparation helpers in `ignition.components.mega_attention_weights` apply
 the reference projection layouts once: query output rows are interleaved in
 16-element head chunks, while grouped output input columns are interleaved in

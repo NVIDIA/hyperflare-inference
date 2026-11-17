@@ -10,6 +10,8 @@ import torch
 
 from ignition.components.weights import MLPWeights
 from ignition.components.megamoe_tiers import MegaMoeLayerLayout
+from ignition.components.fused_mla import FusedMLAPreparation
+from ignition.components.mega_attention_weights import FusedMLAOutputWeights, query_planes, output_planes, pack_output_planes
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
 from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from ignition.components.markov_sampling import fp8_markov_head
@@ -79,7 +81,7 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False, megamoe_layouts=None):
+             vocabulary_parallel_sampling=False, megamoe_layouts=None, fused_attention=None):
         config = ModelConfig.load(manifest.metadata_path)
         if megamoe_layouts is not None:
             required = {f"layers.{i}.ffn" for i in range(config.layers)}
@@ -92,7 +94,7 @@ class ModelWeights:
         before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
                                  expert_scale_compression=expert_scale_compression,
-                                 megamoe_layouts=megamoe_layouts) as loader:
+                                 megamoe_layouts=megamoe_layouts, fused_attention=fused_attention) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
@@ -117,11 +119,15 @@ class ModelWeights:
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
-                 expert_scale_compression=None, megamoe_layouts=None):
+                 expert_scale_compression=None, megamoe_layouts=None, fused_attention=None):
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         self.dspark = dspark
         self.expert_scale_compression = expert_scale_compression
+        if fused_attention is not None and (not isinstance(fused_attention, FusedMLAPreparation)
+                or shard.world_size != 1 or len(fused_attention.cos_sin) != 2):
+            raise ValueError("fused MLA preparation requires TP1 and both ordinary and compressed rotary tables")
+        self.fused_attention = fused_attention
         self.megamoe_layouts = {} if megamoe_layouts is None else dict(megamoe_layouts)
         if any(not isinstance(layout, MegaMoeLayerLayout) for layout in self.megamoe_layouts.values()):
             raise TypeError("every MegaMoE layer requires a concrete MegaMoeLayerLayout")
@@ -148,6 +154,22 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
 
     def load_layer(self, layer, *, draft=False):
         prefix = f"mtp.{layer}" if draft else f"layers.{layer}"
+        result = self.load_attention(layer, draft=draft)
+        shard = self.shard
+        routed = self.load_ffn(layer, draft=draft)
+        residual = {name: self.load_tensor(prefix + "." + name) for name in (
+            "hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale",
+            "attn_norm.weight", "ffn_norm.weight")}
+        engram = None
+        if not draft and layer in self.config.text["engram_layer_ids"]:
+            engram = {"projection": self.load_linear_columns(prefix + ".engram.wkv",
+                ((head * 256, (head + 1) * 256) for head in range(shard.rank, 24, shard.world_size))),
+                "weight": persistent_copy(self.load_tensor(prefix + ".engram.q_weight", dtype=torch.float32, temporary=True)
+                          * self.load_tensor(prefix + ".engram.k_weight", dtype=torch.float32, temporary=True))}
+        return LayerWeights(result, routed, residual, engram)
+
+    def load_attention(self, layer, *, draft=False):
+        prefix = f"mtp.{layer}" if draft else f"layers.{layer}"
         text, shard = self.config.text, self.shard
         attn = prefix + ".attn"
         first, last = shard.padded_partition(8)
@@ -155,12 +177,27 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         groups = first * 1024, last * 1024
         result = {
             "qkv_a": self.load_linear_group((attn + ".wq_a", attn + ".wkv")),
-            "q_b": self.load_linear_group((attn + ".wq_b",), row_ranges=(heads,), pad=True),
-            "output": self.load_attention_output(attn, groups, pad=True),
             "q_norm": self.load_tensor(attn + ".q_norm.weight"),
             "kv_norm": self.load_tensor(attn + ".kv_norm.weight"),
             "sink": self.load_padded_tensor(attn + ".attn_sink", rows=(first * 8, last * 8)),
         }
+        if self.fused_attention is None:
+            result["q_b"] = self.load_linear_group((attn + ".wq_b",), row_ranges=(heads,), pad=True)
+            result["output"] = self.load_attention_output(attn, groups, pad=True)
+        else:
+            from b12x.gemm.blockscaled import pack_weight
+            from ignition.preparation.persistent import persistent_empty
+
+            q, qs = self._dense_blocks(attn + ".wq_b")
+            a, sa = self._dense_blocks(attn + ".wo_a")
+            self._session.flush()
+            qs = qs.repeat_interleave(self.block_size, 0).repeat_interleave(self.block_size // 32, 1)
+            q, qs = query_planes(q, qs)
+            result["q_b"] = pack_weight(q, qs, recipe="mxfp8", allocate=persistent_empty)
+            sa = sa.repeat_interleave(self.block_size, 0).repeat_interleave(self.block_size // 32, 1)
+            grouped = pack_output_planes(*output_planes(a.view(8, 1024, 4096), sa.view(8, 1024, 128)))
+            result["output"] = FusedMLAOutputWeights(grouped, self.load_linear(attn + ".wo_b"))
+            result["fused_layout"] = self.fused_attention
         if not draft and layer in text["kv_source_layer_ids"]:
             ratio = text["compress_ratios"][layer]
             result["compressor"] = {
@@ -175,17 +212,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
             # Replicated index heads avoid a context-sized TP score reduction.
             result["index_q"] = self.load_linear(attn + ".indexer.wq_b")
             result["index_weights"] = self.load_tensor(attn + ".indexer.weights_proj.weight")
-        routed = self.load_ffn(layer, draft=draft)
-        residual = {name: self.load_tensor(prefix + "." + name) for name in (
-            "hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale",
-            "attn_norm.weight", "ffn_norm.weight")}
-        engram = None
-        if not draft and layer in text["engram_layer_ids"]:
-            engram = {"projection": self.load_linear_columns(prefix + ".engram.wkv",
-                ((head * 256, (head + 1) * 256) for head in range(shard.rank, 24, shard.world_size))),
-                "weight": persistent_copy(self.load_tensor(prefix + ".engram.q_weight", dtype=torch.float32, temporary=True)
-                          * self.load_tensor(prefix + ".engram.k_weight", dtype=torch.float32, temporary=True))}
-        return LayerWeights(result, routed, residual, engram)
+        return result
 
     def load_ffn(self, layer, *, draft=False):
         prefix = f"mtp.{layer}" if draft else f"layers.{layer}"

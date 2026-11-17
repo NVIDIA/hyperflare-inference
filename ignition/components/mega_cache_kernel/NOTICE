@@ -7,6 +7,10 @@ kernels.py retains unchanged Triton function definitions from that revision:
 - vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py:
   _rope_quant_insert_nvfp4_kernel
 
+gather.py retains the unchanged _dequantize_and_gather_k_mxfp8_kernel and
+_dequantize_and_gather_k_nvfp4_kernel definitions from
+vllm/models/deepseek_v41/common/ops/cache_utils.py at the same revision.
+
 indexer.py carries _quantize_mxfp4_pair and the MXFP4 query kernel from
 FusedIndexerQRopeMxFp4TritonKernel in fused_indexer_q.py, and
 _indexer_k_norm_rope_quant_store_kernel from

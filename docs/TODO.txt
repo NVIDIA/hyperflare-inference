@@ -8,13 +8,15 @@
 [ ] Wire prepared SM103 decode/prefill attention and cache writers into DeepSeek
     TP1 with DerpSeek-exact Q/output weight permutations, BF16 prefill gathering,
     page-separated payload/scales, compressor and hierarchical indexer.
-    The batched ring commit supports separated planes; select it with aligned
-    continuation rows and padded staging when connecting the attention recipe.
+    Select the composed layer API with aligned continuation rows and padded
+    staging in full-model preparation.
     The installed b12x compressed-MLA auto mode emits unsupported block-scaled MMA
     on SM103; the recipe's default BF16 mode has not been checked separately.
-    Its MXFP4 indexer also emits an unsupported SM103 MMA. Connect the reference
-    paged-logit component with matching planar key writes and query quantization;
-    integrate DerpSeek's candidate-restricted scoring and top-K selection.
+    Its MXFP4 indexer also emits an unsupported SM103 MMA. Qualify the composed
+    reference query/key encoding, full/candidate paged scoring and selection
+    across all shared-source layers and long contexts. Match
+    the reference's contiguous-workspace prefill scoring before claiming that
+    prefill uses an equivalent kernel path; the composition uses paged scoring.
     Qualify full graph transitions and MTP before serving comparisons. Account
     for DerpSeek exact's enabled W8 output projection, low-latency GEMMs and
     fused preparation seams when attributing remaining full-step differences.

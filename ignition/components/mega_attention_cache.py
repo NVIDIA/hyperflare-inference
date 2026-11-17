@@ -51,7 +51,8 @@ class MegaCacheLayout:
                 or storage.shape[1] != self.page_bytes or storage.stride(0) < self.page_bytes
                 or storage.stride(0) % 512):
             raise ValueError("cache backing must have one aligned byte row per page")
-        return storage[:, :self.page_tokens * self.record_bytes].view(-1, self.page_tokens, self.record_bytes)
+        return storage.as_strided((storage.shape[0], self.page_tokens, self.record_bytes),
+                                  (storage.stride(0), self.record_bytes, 1))
 
     def validate(self, cache):
         if (cache.ndim != 3 or cache.shape[0] <= 0

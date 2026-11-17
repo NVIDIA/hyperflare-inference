@@ -102,12 +102,13 @@ def test_compiled_writers_preserve_layout_and_unwritten_state(tmp_path):
             graph.reset()
 
 
-def test_cache_layout_requires_page_padding():
+@pytest.mark.parametrize("pages", [1, 2])
+def test_cache_layout_requires_page_padding(pages):
     layout = MegaCacheLayout(136, 528)
     assert layout.page_bytes == 72192
-    backing = torch.empty((2, layout.page_bytes), dtype=torch.uint8)
+    backing = torch.empty((pages, layout.page_bytes), dtype=torch.uint8)
     cache = layout.view(backing)
-    assert cache.shape == (2, 136, 528)
+    assert cache.shape == (pages, 136, 528)
     assert cache.stride() == (72192, 528, 1)
     layout.validate(cache)
     with pytest.raises(ValueError, match="aligned byte row"):
