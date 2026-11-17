@@ -93,6 +93,68 @@ Version 1 preserves the protected-core-plus-catalog-order default and rejects an
 explicit initial set. Runtimes that only support version 1 reject version 2
 profiles, so they cannot silently evaluate a different starting placement.
 
+### Decayed-miss LRU comparison
+
+A version-2 profile can also enable a separate `reactive/decayed_miss_lru`
+contender alongside the predictors and `static_core_lru`:
+
+```json
+"decayed_miss_lru": {
+  "version": 1,
+  "protected_experts": [],
+  "window": 64,
+  "min_misses": 1,
+  "min_age_observations": 8,
+  "max_promotions_per_layer": 4,
+  "max_promotions_per_observation": 24
+}
+```
+
+This policy follows the decayed-miss ranking and LRU replacement approach in
+[chronarion/DerpSeek](https://github.com/chronarion/derpseek/blob/main/engine/derpseek_engine/residency.py).
+Each layer's unprotected initial residents define its fixed cache slots. Protected
+experts remain resident; spare budget does not add slots or move capacity between
+layers. Layers with no cache slots do not consume promotion quotas. Expert sizes
+must be equal within each layer, but can differ across layers.
+Canonical expert order defines initial slot order and breaks equal-score ties.
+
+The simulator records hits and misses against its own placement at demand time.
+Only when that observation becomes available does it decay historical misses by
+`1 - 1/window`, add the observed misses, and consider experts that missed in that
+frame. Resident and pending experts cannot be promoted again. Candidates are
+ranked globally, subject to per-layer and total quotas, before selecting eligible
+LRU victims. A layer with only busy or young slots does not pass its selected
+quota to another layer. The minimum age protects a slot from its last promotion;
+hits update recency but do not restart that age.
+
+This is a shadow comparison, not an active controller or a reproduction of
+DerpSeek serving. One available frame is one policy tick; DerpSeek can consume
+multiple readbacks in one serving tick. Delayed hits retain their slot generation,
+so they cannot refresh a replacement occupant. The common simulator serializes
+copies, removes victims when copying begins, and charges the full modeled copy
+cost. It does not simulate Flare's physical spare-row publication transaction.
+Policy CPU overhead and interference are uncalibrated; balances are estimates.
+The contender shares the initial placement and hardware profile with the other
+rows but owns independent residency, pending copies, and history. Its state
+persists across trace-window trimming and replays through `flare parallax --replay`.
+
+The synthetic decision fixture compares the Rust policy with DerpSeek's `_pairs`
+method under canonical host/slot order and one observation per tick. To regenerate
+it from the reference revision named in [NOTICE](../NOTICE), use the preparation
+Python environment (NumPy required) and a trusted local checkout:
+
+```sh
+.venv/bin/python -m scripts.parallax.lru_reference \
+  /path/to/derpseek/engine/derpseek_engine/residency.py \
+  --output /tmp/parallax_decayed_lru.json
+```
+
+Compare that output with `helios/tests/fixtures/parallax_decayed_lru.json`, then run
+`cargo test --release --manifest-path helios/Cargo.toml --features runtime-core,server --lib server::parallax`.
+The generator executes the reference method on synthetic state without importing
+the GPU engine. The Rust tests also exercise delayed observations, independent
+states, bounded retention, and the public offline replay path.
+
 For publication attempts, the actual residency ledger reports
 **Ready → publication wait** from the first
 host poll observing a completed transfer to the start of mapping publication.

@@ -78,6 +78,11 @@ availability notice accompanies binary distributions containing that dependency.
 
 ### Code adapted into this repository
 
+The native Parallax decayed-miss LRU shadow policy adapts chronarion's DerpSeek
+residency decision rules. [NOTICE](NOTICE) identifies the source and scope;
+`helios/licenses/DerpSeek.txt` retains the MIT license and copyright for source
+and binary distribution.
+
 [NOTICE](NOTICE) identifies the adapted code and upstream copyright notices.
 PyTorch-derived image resizing code is compiled into the native runtime; its
 full license and copyrights are included in `licenses/PyTorch.txt` in binary

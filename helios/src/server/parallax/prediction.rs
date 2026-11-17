@@ -65,6 +65,44 @@ impl StaticCoreLruConfig {
         Ok(())
     }
 }
+/// Per-layer fixed cache pools with decayed miss ranking and LRU replacement.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecayedMissLruConfig {
+    pub version: u32,
+    pub protected_experts: Vec<Expert>,
+    pub window: u32,
+    pub min_misses: f32,
+    pub min_age_observations: u64,
+    pub max_promotions_per_layer: usize,
+    pub max_promotions_per_observation: usize,
+}
+impl DecayedMissLruConfig {
+    fn validate(&self, profile: &Profile) -> Result<()> {
+        if self.version != 1 || !(1..=65536).contains(&self.window)
+            || !self.min_misses.is_finite() || self.min_misses < 0.
+            || self.min_age_observations > 65536
+            || !(1..=512).contains(&self.max_promotions_per_layer)
+            || !(1..=512).contains(&self.max_promotions_per_observation) {
+            return Err("invalid decayed-miss LRU version, decay, age or promotion limits".into());
+        }
+        let initial = profile.settings.initial_resident.as_ref()
+            .ok_or("decayed-miss LRU requires explicit initial_resident in profile version 2")?;
+        let mut seen = BTreeSet::new();
+        for e in &self.protected_experts {
+            if !seen.insert(*e) || !initial.contains(e) {
+                return Err("decayed-miss LRU protected experts must be unique initial residents".into());
+            }
+        }
+        let mut layer_sizes = BTreeMap::new();
+        for (e, bytes) in profile.model.experts.iter().zip(&profile.model.expert_bytes) {
+            if layer_sizes.insert(e.layer, *bytes).is_some_and(|old| old != *bytes) {
+                return Err("decayed-miss LRU requires equal expert sizes within each layer".into());
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
@@ -84,6 +122,8 @@ pub struct Settings {
     pub active: Option<super::active::Config>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_core_lru: Option<StaticCoreLruConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decayed_miss_lru: Option<DecayedMissLruConfig>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -186,6 +226,7 @@ impl Profile {
                 return Err("protected experts must be initially resident".into());
             }
         }
+        if let Some(config) = &s.decayed_miss_lru { config.validate(self)?; }
         let worst = (m.expert_bytes.iter().copied().max().unwrap_or(0) as f64
             / h.bandwidth_bytes_per_ns
             + h.transfer_latency_ns as f64
