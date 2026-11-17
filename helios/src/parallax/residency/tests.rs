@@ -17,6 +17,8 @@ struct State {
 struct Memory {
     regions: Vec<Region>,
     slots: usize,
+    initial: Vec<Location>,
+    backing: Vec<bool>,
     state: Arc<Mutex<State>>,
     dropped: Arc<AtomicUsize>,
 }
@@ -31,6 +33,8 @@ unsafe impl Backend for Memory {
     fn regions(&self) -> &[Region] {
         &self.regions
     }
+    fn initial_location(&self, region: usize) -> Location { self.initial[region] }
+    fn has_backing(&self, region: usize) -> bool { self.backing[region] }
     fn slots(&self) -> usize {
         self.slots
     }
@@ -96,9 +100,13 @@ fn expert(expert: usize) -> ExpertId {
     ExpertId { layer: 3, expert }
 }
 fn setup(slots: usize) -> (Controller<Memory>, Arc<Mutex<State>>, Arc<AtomicUsize>) {
+    let (memory, state, dropped) = memory(slots, vec![Location::Backing; 4], vec![true; 4]);
+    (Controller::new("synthetic-native".into(), memory).unwrap(), state, dropped)
+}
+fn memory(slots: usize, initial: Vec<Location>, backing: Vec<bool>) -> (Memory, Arc<Mutex<State>>, Arc<AtomicUsize>) {
     let state = Arc::new(Mutex::new(State {
         ready: true,
-        published: vec![Some(Location::Backing); 4],
+        published: initial.iter().copied().map(Some).collect(),
         ..State::default()
     }));
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -110,17 +118,63 @@ fn setup(slots: usize) -> (Controller<Memory>, Arc<Mutex<State>>, Arc<AtomicUsiz
             bytes: 37,
         })
         .collect();
-    let controller = Controller::new(
-        "synthetic-native".into(),
-        Memory {
+    let memory = Memory {
             regions,
             slots,
+            initial,
+            backing,
             state: state.clone(),
             dropped: dropped.clone(),
-        },
-    )
-    .unwrap();
-    (controller, state, dropped)
+        };
+    (memory, state, dropped)
+}
+
+#[test]
+fn initial_hbm_occupancy_preserves_spare_slots_and_reader_fences() {
+    let (memory, state, _) = memory(4,
+        vec![Location::Hbm(0), Location::Hbm(1), Location::Backing, Location::Backing], vec![true; 4]);
+    let mut c = Controller::new("synthetic-native".into(), memory).unwrap();
+    assert_eq!(c.snapshot().free_slots, 2);
+    assert!(c.snapshot().experts[&expert(0)]);
+    let reader = c.acquire_reader().unwrap();
+    c.begin(plan(0, &[1], &[0]), 0).unwrap();
+    assert_eq!(c.snapshot().free_slots, 0);
+    assert_eq!(unsafe { c.progress(1) }.unwrap(), Progress::WaitingForReaders);
+    unsafe { reader.complete(); }
+    assert_eq!(unsafe { c.progress(2) }.unwrap(), Progress::Committed(1));
+    assert_eq!(state.lock().unwrap().published,
+        vec![Some(Location::Backing), Some(Location::Backing), Some(Location::Hbm(2)), Some(Location::Hbm(3))]);
+    assert_eq!(c.snapshot().free_slots, 2);
+}
+
+#[test]
+fn pinned_initial_expert_cannot_be_evicted_without_backing() {
+    let (memory, state, _) = memory(4,
+        vec![Location::Hbm(0), Location::Hbm(1), Location::Backing, Location::Backing],
+        vec![true, false, true, true]);
+    let mut c = Controller::new("synthetic-native".into(), memory).unwrap();
+    assert_eq!(c.begin(plan(0, &[1], &[0]), 0),
+        Err(Error::Invalid("cannot evict an expert without immutable backing".into())));
+    assert_eq!(state.lock().unwrap().copies, 0);
+    assert_eq!(c.snapshot().generation, 0);
+    assert_eq!(c.snapshot().free_slots, 2);
+    c.begin(plan(0, &[1], &[]), 0).unwrap();
+    assert_eq!(unsafe { c.progress(1) }.unwrap(), Progress::Committed(1));
+    assert!(c.snapshot().experts.values().all(|resident| *resident));
+}
+
+#[test]
+fn invalid_initial_placements_fail_before_copying() {
+    for (initial, backing) in [
+        (vec![Location::Hbm(0), Location::Hbm(0), Location::Backing, Location::Backing], vec![true; 4]),
+        (vec![Location::Hbm(0), Location::Hbm(4), Location::Backing, Location::Backing], vec![true; 4]),
+        (vec![Location::Hbm(0), Location::Backing, Location::Backing, Location::Backing], vec![true; 4]),
+        (vec![Location::Backing; 4], vec![true, false, true, true]),
+    ] {
+        let (memory, state, _) = memory(4, initial, backing);
+        assert!(matches!(Controller::new("synthetic-native".into(), memory), Err(Error::Invalid(_))));
+        assert_eq!(state.lock().unwrap().copies, 0);
+    }
 }
 fn plan(generation: u64, promote: &[usize], evict: &[usize]) -> Plan {
     Plan {

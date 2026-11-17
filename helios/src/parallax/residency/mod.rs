@@ -7,6 +7,8 @@ pub mod execution;
 pub mod gb300;
 #[cfg(feature = "runtime-core")]
 pub mod package;
+#[cfg(feature = "runtime-core")]
+pub mod rows;
 mod transaction;
 use super::ExpertId;
 pub use controller::{Controller, Progress, ReaderLease, Snapshot, Statistics};
@@ -29,8 +31,8 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-/// A page-isolated part of one expert's immutable representation. Offsets preserve
-/// prepared tensor layout; the backend must reject overlapping rounded mappings.
+/// A part of one expert's representation. Offsets preserve prepared layout.
+/// Remapping backends additionally require isolated allocation-granularity pages.
 #[derive(Clone, Debug)]
 pub struct Region {
     pub expert: ExpertId,
@@ -62,6 +64,7 @@ pub struct Plan {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities {
+    /// A canonical expert part resolves to the same byte address after placement changes.
     pub stable_addresses: bool,
     pub asynchronous_staging: bool,
     pub publication_requires_quiescence: bool,
@@ -75,10 +78,13 @@ pub struct Capabilities {
 /// every old binding is restored; uncertain rollback/drain must return Poisoned.
 /// A recoverable staging error has drained all submitted copies. `discard` may
 /// succeed only after all copies finish, and is idempotent after publication.
-/// New backends begin with every region in immutable backing storage.
+/// Initial locations describe the published storage before the first transaction.
+/// Backing copies, when present, remain immutable throughout the backend lifetime.
 /// No device allocation is allowed after construction.
 pub unsafe trait Backend {
     fn regions(&self) -> &[Region];
+    fn initial_location(&self, _region: usize) -> Location { Location::Backing }
+    fn has_backing(&self, _region: usize) -> bool { true }
     fn slots(&self) -> usize;
     fn slot_bytes(&self) -> usize;
     fn slot_capacity(&self, _slot: usize) -> usize {

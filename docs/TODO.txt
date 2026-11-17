@@ -5,8 +5,11 @@
     canonical histogram collection: validate full state, scored-prefill tracing
     and isolated overhead. Free-form seeded C1 outputs vary with tracing off
     and on; request timing alone cannot establish instrumentation cost.
-    Connect expert movement.
-    Validate the MegaMoE expert planes' strides and physical row mappings.
+    Connect row-based expert movement through authenticated core metadata for
+    canonical IDs, planes and mapping buffers. Reserve complete spare rows;
+    preserve pinned experts and enforce per-layer placement capacity. Validate
+    checkpoint MoE arithmetic under exchanges and compare static/moving serving.
+    Synthetic row-DMA tests do not qualify model execution.
     Compare exported Flare/Parallax serving with DerpSeek exact using matched
     workloads, memory budgets, arithmetic and speculative settings.
 
