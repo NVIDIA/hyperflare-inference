@@ -117,6 +117,39 @@ def test_configuration_roundtrip_resolves_libraries_and_preserves_row_order(opti
     assert SM103Config.load(path) == options
 
 
+def test_single_rank_recipe_passes_placement_without_starting_peers(options, snapshot, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ignition import planning
+    from ignition.recipes.deepseek41 import bootstrap
+    from ignition.recipes.deepseek41.recipe import RECIPE, usage
+    from ignition.recipes.declaration import RankUsage
+    from ignition.preparation import rank_group
+
+    recipe, checkpoint = options.planning_inputs(RECIPE, RECIPE.checkpoints[0], snapshot, dspark=True)
+    gpu = planning.Gpu(0, "GB300", "GPU-test", 256 << 30, 250 << 30, (10, 3))
+    plan = replace(planning.plan(recipe, checkpoint, (gpu,), selected=(0,), concurrency=1,
+        reserve_bytes=0, speculation=recipe.speculation, prefill_chunk=256), sm103=options)
+    prepared = SimpleNamespace(memory_report=dict(pages=64, free_device_bytes=1 << 30))
+    storage = object()
+    calls = []
+
+    def prepare_rank(path, config, *, rank, group, progress, core_storage):
+        calls.append((path, config, rank, group, core_storage))
+        return prepared
+
+    monkeypatch.setattr(bootstrap, "prepare_rank", prepare_rank)
+    monkeypatch.setattr(rank_group, "prepare_group", lambda *a, **kw: pytest.fail("TP1 started peer orchestration"))
+    assert recipe.prepare(snapshot, plan, compile_forwards=True, kernel_cache=tmp_path,
+                          progress=None, core_storage=storage) is prepared
+    assert len(calls) == 1
+    path, config, rank, group, owner = calls[0]
+    assert path == snapshot and rank == 0 and group is None and owner is storage
+    assert config.sm103 == options and config.devices == (0,) and config.dspark
+    assert usage(prepared) == (RankUsage(64, 1 << 30),)
+    peers = SimpleNamespace(memory_report={"ranks": [prepared.memory_report] * 3})
+    assert usage(peers) == (RankUsage(64, 1 << 30),) * 3
+
+
 @pytest.mark.parametrize("change", ["version", "unknown", "bool_cluster", "duplicate", "incomplete"])
 def test_invalid_json_configuration_is_rejected(options, tmp_path, change):
     value = options.to_dict()
