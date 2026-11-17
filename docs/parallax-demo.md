@@ -74,12 +74,24 @@ the profile. This example protects no experts and therefore uses ordinary LRU:
 
 Populate `protected_experts` with canonical `{"layer": 3, "expert": 0}` objects
 from a separate calibration workload to preserve a fixed resident set. IDs must
-exist in the catalog and their total bytes must fit the shadow HBM budget. All
-contenders start from that same placement, with remaining capacity filled in
-catalog order. The `reactive/static_core_lru` row reports simulated hits, movement
-and balance; it has no forecasts or prediction accuracy. Routing availability,
+exist in the catalog and their total bytes must fit the shadow HBM budget. With
+profile version 1, all contenders start from that same placement, with remaining
+capacity filled in catalog order. The `reactive/static_core_lru` row reports
+simulated hits, movement and balance; it has no forecasts or prediction accuracy. Routing availability,
 copy completion and capacity reservations constrain its decisions. Its state
 persists beyond the retained trace window. It cannot select an active controller.
+
+To match a known physical starting placement, use profile `version: 2` and add
+`initial_resident`, an array of canonical `{"layer": 3, "expert": 0}` objects.
+Every predictor-policy pair, the static baseline and the reactive control start
+with independent copies of exactly that set. Spare capacity stays empty; an empty
+array starts with no resident experts. IDs must be unique, exist in the catalog
+and fit the shadow HBM byte budget. Any `static_core_lru.protected_experts` must
+be included. The list is retained in captures for offline replay and changes only
+virtual residency; it does not move weights or set the physical backend's state.
+Version 1 preserves the protected-core-plus-catalog-order default and rejects an
+explicit initial set. Runtimes that only support version 1 reject version 2
+profiles, so they cannot silently evaluate a different starting placement.
 
 For publication attempts, the actual residency ledger reports
 **Ready → publication wait** from the first

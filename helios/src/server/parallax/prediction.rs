@@ -77,6 +77,8 @@ pub struct Settings {
     pub budget_ns: u64,
     pub max_frames: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_resident: Option<Vec<Expert>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<EvaluationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<super::active::Config>,
@@ -121,6 +123,9 @@ impl Profile {
     pub fn validate(&self) -> Result<()> {
         if let Some(active) = &self.settings.active { active.validate(self)?; }
         let s = &self.settings;
+        if !matches!((s.version, &s.initial_resident), (1, None) | (2, Some(_))) {
+            return Err("Parallax profile version 1 uses default residency; version 2 requires initial_resident".into());
+        }
         if s.evaluation.as_ref().is_some_and(|e| e.version != 2
             || !(1..=4096).contains(&e.top_k_per_layer)
             || !(1..=512).contains(&e.max_promotions_per_forecast)) {
@@ -128,8 +133,7 @@ impl Profile {
         }
         let m = &self.model;
         let h = &self.hardware;
-        if s.version != 1
-            || !(1..=4).contains(&s.predictors.len())
+        if !(1..=4).contains(&s.predictors.len())
             || s.target_offset == 0
             || s.target_offset > 1024
             || s.horizon_ns == 0
@@ -169,6 +173,19 @@ impl Profile {
             return Err("invalid hardware costs or backing capacity".into());
         }
         if let Some(config) = &s.static_core_lru { config.validate(m, h.hbm_bytes)?; }
+        if let Some(initial) = &s.initial_resident {
+            let mut seen = BTreeSet::new();
+            let mut bytes = 0u64;
+            for expert in initial {
+                let index = m.experts.binary_search(expert).map_err(|_| "unknown initially resident expert")?;
+                if !seen.insert(*expert) { return Err("duplicate initially resident expert".into()); }
+                bytes = bytes.checked_add(m.expert_bytes[index]).ok_or("initial residency bytes overflow")?;
+            }
+            if bytes > h.hbm_bytes { return Err("initial residency exceeds the shadow HBM budget".into()); }
+            if s.static_core_lru.as_ref().is_some_and(|c| c.protected_experts.iter().any(|e| !seen.contains(e))) {
+                return Err("protected experts must be initially resident".into());
+            }
+        }
         let worst = (m.expert_bytes.iter().copied().max().unwrap_or(0) as f64
             / h.bandwidth_bytes_per_ns
             + h.transfer_latency_ns as f64
