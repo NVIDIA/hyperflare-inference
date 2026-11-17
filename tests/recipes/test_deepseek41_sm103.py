@@ -4,6 +4,10 @@
 """SM103 preparation admits complete explicit placements and counts physical copies."""
 
 from dataclasses import replace
+import json
+import struct
+import subprocess
+import sys
 
 import pytest
 
@@ -11,6 +15,7 @@ from ignition.components.expert_placement import ExpertPlacement
 from ignition.recipes.deepseek41.bootstrap import PreparationConfig, _collective_runtimes
 from ignition.recipes.deepseek41.sm103 import SM103Config
 from .test_deepseek41_pool import config
+from .test_deepseek41_csf_config import configuration
 
 
 @pytest.fixture
@@ -79,3 +84,131 @@ def test_tp1_requires_explicit_local_sm103_configuration(options, tmp_path):
 def test_invalid_physical_expert_rows_are_rejected(experts, host, hbm):
     with pytest.raises(ValueError, match="complete canonical coverage"):
         ExpertPlacement(experts, host, hbm)
+
+
+@pytest.fixture
+def snapshot(tmp_path, configuration):
+    """Small synthetic payloads exercise header accounting, not model execution."""
+    path = tmp_path / "checkpoint"
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(configuration))
+    tensors = {
+        "layers.0.attn.wq.weight": ("F8_E4M3", 1024),
+        "layers.0.attn.wq.scale": ("U8", 32),
+        "layers.0.ffn.experts.0.w1.weight": ("U8", 16),
+        "layers.0.engram.embed.weight": ("U8", 32),
+        "mtp.0.attn.wkv.weight": ("F8_E4M3", 1024),
+    }
+    offset, header = 0, {}
+    for name, (dtype, size) in tensors.items():
+        header[name] = dict(dtype=dtype, shape=[size], data_offsets=[offset, offset + size])
+        offset += size
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    (path / "model.safetensors").write_bytes(struct.pack("<Q", len(encoded)) + encoded + bytes(offset))
+    return path
+
+
+def test_configuration_roundtrip_resolves_libraries_and_preserves_row_order(options, tmp_path):
+    value = options.to_dict()
+    value["flashmla_library"] = value["deepselect_library"] = "library.so"
+    path = tmp_path / "sm103.json"
+    path.write_text(json.dumps(value))
+    assert SM103Config.load(path) == options
+
+
+@pytest.mark.parametrize("change", ["version", "unknown", "bool_cluster", "duplicate", "incomplete"])
+def test_invalid_json_configuration_is_rejected(options, tmp_path, change):
+    value = options.to_dict()
+    if change == "version":
+        value["version"] = True
+    elif change == "unknown":
+        value["ignored"] = 1
+    elif change == "bool_cluster":
+        value["host_lane_clusters"] = True
+    elif change == "incomplete":
+        value["placements"]["layers.0.ffn"]["host"] = []
+    text = json.dumps(value)
+    if change == "duplicate":
+        text = '{"version": 1, ' + text[1:]
+    path = tmp_path / "sm103.json"
+    path.write_text(text)
+    with pytest.raises(ValueError):
+        SM103Config.load(path)
+
+
+@pytest.mark.parametrize("drafting", [False, True])
+def test_planning_counts_native_experts_and_physical_cache_layout(options, snapshot, drafting):
+    from ignition.recipes.deepseek41.config import ModelConfig
+    from ignition.recipes.deepseek41.pool import continuation_layout, page_bytes
+    from ignition.recipes.deepseek41.recipe import RECIPE
+
+    if not drafting:
+        options = replace(options, placements=options.placements[:40])
+    recipe, checkpoint = options.planning_inputs(RECIPE, RECIPE.checkpoints[0], snapshot, dspark=drafting)
+    model = ModelConfig.load(snapshot)
+    tier = options.expert_bytes(model, dspark=drafting)
+    # FP8 projections reserve expanded scales and round up to allocation alignment.
+    assert checkpoint.device_bytes == tier["hbm"] + 1536 + 512 + (1536 + 1056 if drafting else 0)
+    assert checkpoint.mapped_host_bytes == tier["host"]
+    assert checkpoint.expansion_bytes == 0
+    assert not checkpoint.scale_compressed_device_bytes
+    costs = recipe.ranks[1] if drafting else recipe.plain_ranks[1]
+    assert costs.state_row_bytes == continuation_layout(model, dspark=drafting, alignment=512).row_bytes
+    assert costs.page_bytes == page_bytes(model, alignment=512)
+    assert 1 not in RECIPE.ranks  # Explicit placement must not change ordinary TP admission.
+
+
+def test_cli_uses_gb300_and_records_placement_without_importing_torch(options, snapshot, tmp_path):
+    path = tmp_path / "sm103.json"
+    path.write_text(json.dumps(options.to_dict()))
+    # A separate process checks the actual planning boundary before CUDA setup.
+    script = '''
+import json, sys
+from pathlib import Path
+from google.protobuf.json_format import ParseDict
+from ignition import planning
+from ignition.cli.config import Configuration, Setting
+from ignition.cli.preparation import Host, derive
+from ignition.errors import UsageError
+from ignition.recipes import ResolvedModel
+from ignition.recipes.deepseek41.recipe import RECIPE
+from ignition.preparation.rebuild_manifest import from_plan
+from ignition.preparation.runtime_core_pb2 import RebuildManifest
+from ignition.preparation import host_memory
+host_memory.available_bytes = lambda: 512 << 30
+root, snapshot, placement = map(Path, sys.argv[1:])
+configuration = Configuration(root / "config.toml", {}, exists=True)
+gpus = (planning.Gpu(0, "RTX", "GPU-rtx", 96 << 30, 95 << 30, (12, 0)),
+        planning.Gpu(1, "GB300", "GPU-gb300", 256 << 30, 250 << 30, (10, 3)))
+model = ResolvedModel(RECIPE, RECIPE.checkpoints[0], snapshot)
+arguments = dict(concurrency=Setting(1, "test"), speculation=RECIPE.speculation,
+                 prefill_chunk=256, sm103_preparation=placement)
+for selected in (None, "1"):
+    plan = derive(configuration, model, Host(gpus, None), gpus=selected, **arguments)
+    assert tuple(g.index for g in plan.gpus) == (1,)
+    assert plan.speculation == RECIPE.speculation
+    assert plan.expert_scale_compression is None
+    assert plan.to_dict()["sm103_preparation"] == plan.sm103.to_dict()
+    manifest = ParseDict(from_plan(model, plan, compiled_forwards=True), RebuildManifest())
+    restored = RebuildManifest.FromString(manifest.SerializeToString())
+    assert json.loads(restored.sm103_preparation_json) == plan.sm103.to_dict()
+for selected in ("0", "0,1", "2"):
+    try:
+        derive(configuration, model, Host(gpus, None), gpus=selected, **arguments)
+    except UsageError as error:
+        assert "one SM103 GPU" in str(error), str(error)
+    else:
+        raise AssertionError("invalid GPU accepted")
+host_memory.available_bytes = lambda: 1 << 30
+try:
+    derive(configuration, model, Host(gpus, None), gpus="1", **arguments)
+except UsageError as error:
+    assert "insufficient host memory" in str(error), str(error)
+else:
+    raise AssertionError("host budget ignored")
+assert "torch" not in sys.modules
+'''
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path), str(snapshot), str(path)],
+                            text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr

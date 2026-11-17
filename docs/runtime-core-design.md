@@ -351,6 +351,13 @@ collective preparation records the complete offline ladder as
 `RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
 original ladder file path. Helios does not interpret that preparation input.
 
+Experimental SM103 expert-tier exports record their resolved preparation
+configuration in `RebuildManifest.sm103_preparation_json`: canonical expert IDs
+in physical host/HBM row order, prepared library paths, and host-lane cluster
+count. Missing metadata means no explicit SM103 configuration. Weight reuse and
+core combination require identical recorded configurations; loading and replay
+use the captured programs and do not interpret these preparation settings.
+
 Online MXFP8 conversion records its resolved projection group in
 `RebuildManifest.online_mxfp8_scope`. An absent or empty field means `all`,
 independently of the recipe's preparation default. Explicit `all` and `kda-input`

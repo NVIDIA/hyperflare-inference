@@ -603,7 +603,29 @@ GB300 for all 40 target and three draft layers, including separate capacities
 for target and draft calls. CPU checks cover admission, placement completeness,
 storage accounting and exclusion of mutable residency state from the weight
 catalog. These checks do not qualify a complete model load, graph catalog,
-core export or serving. The CLI planner does not yet expose this configuration.
+core export or serving.
+
+For experimental TP1 export, `--sm103-preparation PATH` reads a version-1 JSON
+object with `placements`, `flashmla_library`, `deepselect_library`, and
+`host_lane_clusters`. Library paths resolve relative to the JSON file. Each
+placement is keyed by `layers.N.ffn` or `mtp.N.ffn` and contains `experts`,
+`host`, and `hbm`; the two arrays give canonical IDs in physical row order.
+Supply all 40 target layers and, when MTP is enabled, all three draft layers.
+Unknown fields, duplicate keys, missing experts, and repeated IDs within a tier
+are rejected. Both tiers may contain the same expert.
+
+The explicit configuration admits one local SM103 GPU and expanded native
+expert scales. It does not change the recipe's ordinary TP selection. Planning
+counts physical expert copies at their expanded native size and estimates other
+device weights from checkpoint headers. It checks host memory for mapped expert
+weights plus 8 GiB of preparation headroom; file-backed Engram tables and later
+compiler/cache demand still require separate host-memory budgeting. The printed
+plan reports HBM weight estimates and Grace expert bytes. Graph storage remains
+an estimate until capture measures it. This path requires a local checkpoint or
+an already downloaded checkpoint because placement sizing reads tensor headers.
+Use `ignition export` followed by release `flare run`; `debug-serve` and
+multi-host preparation reject this option. Complete TP1 export and serving
+remain unqualified.
 
 `ignition.components.megamoe_weights.load_mxfp4_planes` loads packed MXFP4 weights
 and expands CSF scales once into native UE8M0 bytes. `pack_mxfp4_planes` applies

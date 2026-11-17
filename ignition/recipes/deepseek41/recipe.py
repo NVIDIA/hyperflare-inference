@@ -40,7 +40,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=HEADROOM_BYTES + plan.reserve_bytes, kernel_cache=kernel_cache,
         dspark=speculation is not None,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression,
-        mla_compute_mode=plan.mla_compute_mode, **drafting)
+        mla_compute_mode=plan.mla_compute_mode, sm103=plan.sm103, **drafting)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 

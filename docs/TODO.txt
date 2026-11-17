@@ -1,5 +1,6 @@
-[ ] Expose DeepSeek's SM103 preparation configuration through CLI planning with
-    physical HBM/Grace budgets, then qualify full-model loading and capture.
+[ ] Qualify DeepSeek's explicit SM103 CLI preparation through full-model loading,
+    capture, export and native serving. Check measured HBM/Grace use against
+    header-derived weight estimates and preparation headroom.
     Connect routing telemetry and MTP. Validate the recipe's fused expert block
     and bounded tier loader within full-model preparation.
     Compare exported Flare/Parallax serving with DerpSeek exact using matched
