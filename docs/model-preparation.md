@@ -632,20 +632,33 @@ model forwards compiled and 26 graphs captured, including ordinary, speculative,
 maintenance, and vision graphs. Native text checks cover ordinary and MTP
 execution, repeated seeded token output, 786-token chunked prefill, prefix reuse,
 independent requests, token accounting, and clean shutdown. The six tested token
-sequences agree between ordinary and MTP execution. These checks do not establish
-full-model numerical equivalence, vision replay, larger serving capacities,
-long-context correctness, or adaptive expert movement.
+sequences agree between ordinary and MTP execution.
+
+The TP1 concurrency-sixteen, 8192-token prefill, three-draft configuration has
+also completed native text integration checks with expanded native expert scales
+and static HBM/Grace placement. Its 111 compiled forwards and 141 captured graphs
+load through release Flare. Checks cover a 12,842-token prompt crossing prefill
+chunks, exact cold/warm output token agreement, prefix reuse and branching,
+sixteen simultaneous requests, token accounting, and request drain. Native
+counters confirm speculative execution at batch sixteen. These checks do not
+establish full-model numerical equivalence, vision replay, long-context
+correctness, ordinary/MTP equivalence at concurrency sixteen, or adaptive expert
+movement.
 
 Run the persistent native text regression against an idle release server with
-those capacities and `--mtp-draft-tokens 7 --mtp-adaptive-verification`:
+either qualified capacity pair and `--mtp-adaptive-verification`. Use runtime
+`--mtp-draft-tokens 7` for concurrency one or `--mtp-draft-tokens 3` for
+concurrency sixteen:
 
 ```sh
 FLARE_RUN_CUDA_TESTS=1 FLARE_DEEPSEEK41_SM103_TEST_URL=http://127.0.0.1:8000 \
   .venv/bin/python -m pytest -q tests/server/test_deepseek41_sm103.py
 ```
 
-The test uses the core's declared sampling defaults and an explicit seed. A
-requested sampling parameter without a declared range is clamped to its core
+The test checks the advertised capacity pair before running. At concurrency
+sixteen it also submits sixteen simultaneous requests and requires a batch-sixteen
+speculative counter increase. The test uses the core's declared sampling defaults
+and an explicit seed. A requested sampling parameter without a declared range is clamped to its core
 default; requesting top-k one does not make this core greedy. The seven-draft
 catalog cannot be treated as a three-draft comparison by changing the runtime
 limit: prepare the intended draft depth and serving capacities explicitly.

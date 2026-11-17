@@ -4,14 +4,17 @@
 """Native DeepSeek TP1 text replay with mapped Grace experts and MTP.
 
 Set FLARE_RUN_CUDA_TESTS=1 and FLARE_DEEPSEEK41_SM103_TEST_URL to an idle
-release Flare service prepared with explicit SM103 placement, concurrency one,
-256-token prefill, and seven adaptive drafts. This checks serving integration,
-not numerical agreement with a reference model or other graph capacities.
+release Flare service prepared with explicit SM103 placement: concurrency one,
+256-token prefill and seven adaptive drafts, or concurrency sixteen, 8192-token
+prefill and three adaptive drafts. This checks serving integration, not numerical
+agreement with a reference model or other graph capacities.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
+import threading
 import time
 import urllib.request
 
@@ -21,7 +24,7 @@ import pytest
 pytestmark = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_CUDA_TESTS") != "1"
     or not os.environ.get("FLARE_DEEPSEEK41_SM103_TEST_URL"),
-    reason="requires an idle native DeepSeek SM103 TP1 C1 MTP service",
+    reason="requires an idle native DeepSeek SM103 TP1 MTP service",
 )
 
 
@@ -38,15 +41,19 @@ def test_native_text_replay_and_prefix_reuse():
 
     model = json.loads(get("/v1/models"))["data"][0]
     assert "deepseek" in model["id"].lower() and "4.1" in model["id"]
-    assert model["flare"]["max_concurrency"] == 1
-    assert model["flare"]["prefill_chunk_size"] == 256
+    concurrency = model["flare"]["max_concurrency"]
+    chunk = model["flare"]["prefill_chunk_size"]
+    assert (concurrency, chunk) in ((1, 256), (16, 8192)), model
 
-    def ask(prompt):
+    def ask(prompt, barrier=None):
         # Sampling follows the core's declared defaults; only seed is overridden.
         body = dict(model=model["id"], messages=[dict(role="user", content=prompt)],
-                    seed=1234, max_tokens=256, enable_thinking=False, return_token_ids=True)
+                    seed=1234, max_tokens=512 if concurrency == 16 else 256,
+                    enable_thinking=False, return_token_ids=True)
         request = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
                                          {"Content-Type": "application/json"})
+        if barrier is not None:
+            barrier.wait(timeout=30)
         with urllib.request.urlopen(request, timeout=600) as response:
             result = json.load(response)
         choice = result["choices"][0]
@@ -64,18 +71,33 @@ def test_native_text_replay_and_prefix_reuse():
     assert first == repeated == "391"
     assert ids == repeated_ids
 
-    context = " ".join(f"Item {i} records code {i * 17 % 997}." for i in range(96))
+    items = 1536 if concurrency == 16 else 96
+    context = " ".join(f"Item {i} records code {i * 17 % 997}." for i in range(items))
     prompt = context + "\nWhat code does item 37 record? Reply with only the integer."
     result, first, ids = ask(prompt)
-    assert result["usage"]["prompt_tokens"] > 256
+    assert result["usage"]["prompt_tokens"] > chunk
     result, repeated, repeated_ids = ask(prompt)
     assert first == repeated == "629"
     assert ids == repeated_ids
-    assert result["usage"]["prompt_tokens_details"]["cached_tokens"] > 256
+    assert result["usage"]["prompt_tokens_details"]["cached_tokens"] > chunk
     _, answer, _ = ask(context + "\nWhat code does item 71 record? Reply with only the integer.")
     assert answer == "210"
     _, answer, _ = ask("Write the integers from 1 through 40 inclusive, separated by commas, with no other text.")
     assert [int(value) for value in re.findall(r"\d+", answer)] == list(range(1, 41)), answer
+
+    if concurrency == 16:
+        barrier = threading.Barrier(concurrency)
+
+        def concurrent_request(index):
+            start = index * 100 + 1
+            _, answer, _ = ask(
+                f"Write every integer from {start} through {start + 79} inclusive, "
+                "separated by commas, with no other text.", barrier,
+            )
+            assert [int(value) for value in re.findall(r"\d+", answer)] == list(range(start, start + 80)), answer
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            list(executor.map(concurrent_request, range(concurrency)))
 
     deadline = time.monotonic() + 30
     while True:
@@ -84,8 +106,12 @@ def test_native_text_replay_and_prefix_reuse():
             break
         assert time.monotonic() < deadline, {key: after[key] for key in gauges}
         time.sleep(.01)
-    assert after["flare_requests_completed_total"] - before["flare_requests_completed_total"] == 6
+    expected_requests = 22 if concurrency == 16 else 6
+    assert after["flare_requests_completed_total"] - before["flare_requests_completed_total"] == expected_requests
     assert after["flare_requests_failed_total"] == before["flare_requests_failed_total"]
     assert after["flare_cache_reused_tokens_total"] > before["flare_cache_reused_tokens_total"]
     assert sum(value - before.get(key, 0) for key, value in after.items()
                if key.startswith('flare_speculative_offered_drafts_total{batch="1",')) > 0
+    if concurrency == 16:
+        assert sum(value - before.get(key, 0) for key, value in after.items()
+                   if key.startswith('flare_speculative_offered_drafts_total{batch="16",')) > 0
