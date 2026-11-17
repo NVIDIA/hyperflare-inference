@@ -687,11 +687,10 @@ rows. One instantiated memcpy graph per geometry reads from fixed mapping-buffer
 and weight-plane addresses throughout the exchanges. Checks compare all promoted
 bytes, pinned and immutable backing bytes, reader-gated publication and device
 allocation stability. CPU tests cover geometry, initial placement, pinned
-eviction rejection and partial-publication rollback. This is synthetic storage
-qualification, not captured MoE arithmetic, full-model correctness or serving
-performance. Driver-failure recovery has CPU protocol coverage only. CPU export
-and resolution tests cover typed metadata, compressed catalogs and malformed
-bindings; a full DeepSeek export with this declaration is not qualified.
+eviction rejection and partial-publication rollback. These storage checks do not
+establish captured MoE arithmetic, full-model correctness or serving performance.
+Driver-failure recovery has CPU protocol coverage only. CPU export and
+resolution tests cover typed metadata, compressed catalogs and malformed bindings.
 
 The qualification-only Heliopause interface also drives the native residency
 controller against captured MegaMoE graphs on GB300. The
@@ -705,6 +704,21 @@ arithmetic under quiescent exchanges, not full-model prefill or serving benefit.
 Run it with a release Heliopause build containing the `qualification` feature,
 `FLARE_RUN_CUDA_TESTS=1`, an assigned SM103 GPU in `CUDA_VISIBLE_DEVICES`, and
 `FLARE_DEEPSEEK41_CSF_SNAPSHOT` pointing to the lossless-CSF checkpoint.
+
+Native serving qualification uses a signed DeepSeek V4.1 MXFP4 CSF core on GB300,
+TP1, concurrency sixteen, 8192-token prefill chunks and adaptive MTP3. The row
+resolver binds 40 target layers with 384 experts each and reserves one spare HBM
+row per layer. Static and active placement use the same 11,480 resident experts,
+prepared graphs, release runtime and EWMA predictor. Both complete sixteen
+2048-token responses at each of C1, C8 and C16 with exact client/native token
+accounting and zero request errors. Twenty seeded integration requests match
+the tracing-disabled control's token IDs, messages and finish reasons. Active
+serving commits physical promotions while keeping routing and movement error
+counters clear, and both processes drain and exit normally. This qualifies
+bounded serving noninterference; it does not establish full-model numerical
+or cache-state equivalence, long-context answer correctness, vision or TP
+movement. Repeated-prefill client TTFT measurements do not isolate GPU prefill
+arithmetic. See [follow-up work](TODO.txt) for unrun checks and cost calibration.
 
 Run the GPU storage check only on an assigned idle GPU:
 
