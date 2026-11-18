@@ -24,6 +24,7 @@ from ignition import runtime_patches
 
 _INVOCATIONS = ContextVar('flare_storage_invocations')
 _OPTIONS = {'max_autotune': True, 'emulate_precision_casts': True,
+            'eager_numerics.division_rounding': True,
             'memory_planning': True, 'memory_pool': 'combined',
             'triton.cudagraphs': False, 'triton.autotune_at_compile_time': False,
             'triton.cooperative_reductions': True,
@@ -139,6 +140,33 @@ def _native_layer_norm(source: torch.Tensor, shape: list[int], weight: torch.Ten
 @_native_layer_norm.register_fake
 def _fake_native_layer_norm(source, shape, weight, bias, eps):
     return torch.ops.aten.native_layer_norm.default(source, shape, weight, bias, eps)
+
+
+@torch.library.custom_op('flare::native_group_norm', mutates_args=())
+def _native_group_norm(source: torch.Tensor, weight: torch.Tensor | None, bias: torch.Tensor | None,
+                       n: int, c: int, hxw: int, groups: int,
+                       eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.ops.aten.native_group_norm.default(source, weight, bias, n, c, hxw, groups, eps)
+
+
+@_native_group_norm.register_fake
+def _fake_native_group_norm(source, weight, bias, n, c, hxw, groups, eps):
+    return torch.ops.aten.native_group_norm.default(source, weight, bias, n, c, hxw, groups, eps)
+
+
+@torch.library.custom_op('flare::native_convolution', mutates_args=())
+def _native_convolution(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
+                        stride: list[int], padding: list[int], dilation: list[int],
+                        transposed: bool, output_padding: list[int], groups: int) -> torch.Tensor:
+    return torch.ops.aten.convolution.default(input, weight, bias, stride, padding, dilation,
+                                             transposed, output_padding, groups)
+
+
+@_native_convolution.register_fake
+def _fake_native_convolution(input, weight, bias, stride, padding, dilation,
+                             transposed, output_padding, groups):
+    return torch.ops.aten.convolution.default(input, weight, bias, stride, padding, dilation,
+                                             transposed, output_padding, groups)
 
 
 @torch.library.custom_op('flare::native_rms_norm', mutates_args=())
@@ -346,7 +374,10 @@ def compile_forward(fn, *, tracer=None):
     Their typed views are reconstructed inside each opaque invocation so
     Inductor can preserve mutations without cloning strided state regions.
     Pointwise tensor operations remain visible to ordinary Inductor compilation.
-    Mean reductions, FP32 sigmoid, exact GELU, LayerNorm and RMSNorm retain ATen's rounding.
+    Mean reductions, FP32 sigmoid, exact GELU, low-precision CUDA cubes,
+    FP16/BF16/FP32 CUDA mm, addmm and convolution, LayerNorm, GroupNorm and RMSNorm
+    retain native ATen operations. End-to-end numerical equality also depends
+    on traced layouts and surrounding arithmetic.
     Both compilation and cache restoration execute one warmup on caller-owned state.
     Compiled artifacts take persistent tensors as inputs and are cached without
     weight payloads or process-local kernel handles. Each callable retains its
@@ -384,8 +415,40 @@ def _lower_storage(module):
                 destination.meta = node.meta.copy()
             node.target = torch.ops.aten.gelu.out
             node.kwargs = {**node.kwargs, 'out': destination}
+        elif (node.op == 'call_function' and node.target is torch.ops.aten.pow.Tensor_Scalar
+                and node.meta['val'].device.type == 'cuda'
+                and node.meta['val'].dtype in (torch.float16, torch.bfloat16)):
+            exponent = node.args[1] if len(node.args) > 1 else node.kwargs.get('exponent')
+            if isinstance(exponent, (int, float)) and exponent == 3:
+                # ATen rounds the intermediate square before multiplying by the source again.
+                source = node.args[0] if node.args else node.kwargs['self']
+                with graph.inserting_before(node):
+                    destination = graph.call_function(torch.ops.aten.empty_like.default, (source,))
+                    destination.meta = node.meta.copy()
+                node.target = torch.ops.aten.pow.Tensor_Scalar_out
+                node.kwargs = {**node.kwargs, 'out': destination}
+        elif (node.op == 'call_function'
+                and node.target in (torch.ops.aten.mm.default, torch.ops.aten.addmm.default)
+                and node.meta['val'].device.type == 'cuda'
+                and node.meta['val'].dtype in (torch.float16, torch.bfloat16, torch.float32)):
+            # Bias broadcasting makes the result layout independent of the input layout.
+            value = node.meta['val']
+            with graph.inserting_before(node):
+                destination = graph.call_function(torch.ops.aten.empty_strided.default,
+                        (tuple(map(int, value.shape)), tuple(map(int, value.stride()))),
+                        {'dtype': value.dtype, 'device': value.device})
+                destination.meta = node.meta.copy()
+            node.target = (torch.ops.aten.mm.out if node.target is torch.ops.aten.mm.default
+                           else torch.ops.aten.addmm.out)
+            node.kwargs = {**node.kwargs, 'out': destination}
+        elif (node.op == 'call_function' and node.target is torch.ops.aten.convolution.default
+                and node.meta['val'].device.type == 'cuda'
+                and node.meta['val'].dtype in (torch.float16, torch.bfloat16, torch.float32)):
+            node.target = torch.ops.flare.native_convolution.default
         elif node.op == 'call_function' and node.target is torch.ops.aten.native_layer_norm.default:
             node.target = torch.ops.flare.native_layer_norm.default
+        elif node.op == 'call_function' and node.target is torch.ops.aten.native_group_norm.default:
+            node.target = torch.ops.flare.native_group_norm.default
         elif node.op == 'call_function' and node.target is torch.ops.aten._fused_rms_norm.default:
             node.target = torch.ops.flare.native_rms_norm.default
     for node in reversed(list(graph.nodes)):

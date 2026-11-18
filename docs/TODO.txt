@@ -462,25 +462,30 @@
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
 
-[ ] Resolve compiled PixArt-Alpha differences from canonical Diffusers in
-    ignition/recipes/pixart/prepare.py. On SM120, the fixed 512-square 20-step
-    profile's two eager compositions are exact across all 43 outputs, and
-    native outputs and repeats match captured bytes. Canonical exact
-    comparisons fail. Close when the complete profile passes a numerical
+[ ] Resolve remaining compiled PixArt-Alpha differences from canonical Diffusers
+    in ignition/recipes/pixart/prepare.py. On RTX 6000D, complete T5 conditioning
+    matches same-device eager bytes for the tested positive and negative inputs
+    with arithmetic-preserving compilation. VAE decoding of canonical latents
+    still differs. FakeTensor scalar division can normalize singleton batch
+    strides and change nearest-upsample layout; qualify its contribution to
+    full decoder error. Denoising, solver history, export, and native replay
+    require qualification with this compilation policy. Close when the complete
+    512-square 20-step profile passes all 43 outputs under a numerical
     criterion justified by operator precision and measured repeatability on
     independent inputs, retaining exact native/captured equality. Withhold
     performance claims until numerical correctness passes.
 
-[ ] Resolve compiled SDXL text-conditioning, denoising, and VAE differences
-    from canonical Diffusers in ignition/recipes/sdxl/prepare.py. On SM120,
-    both fixed prompts' eager compositions are exact at four and 30 steps, and
-    native outputs match captured compiled bytes, but canonical exact
-    comparisons fail. The first update and decoder also differ with canonical
-    intermediate inputs in both profiles. Locate the arithmetic differences
-    before changing precision policy; close when
-    the complete profile passes a justified numerical criterion on independent
-    inputs while retaining exact native/captured equality. Withhold performance
-    claims until numerical correctness passes.
+[ ] Resolve remaining compiled SDXL differences from canonical Diffusers in
+    ignition/recipes/sdxl/prepare.py. On RTX 6000D, complete CLIP1 conditioning
+    matches same-device eager bytes for the tested positive and negative inputs
+    with arithmetic-preserving compilation. VAE decoding of canonical latents
+    still differs. FakeTensor scalar division can normalize singleton batch
+    strides and change nearest-upsample layout; qualify its contribution to
+    full decoder error. CLIP2, denoising, export, and native replay require
+    qualification with this compilation policy. Close when the complete
+    1024-square four-step and 30-step profiles pass a justified numerical
+    criterion on independent inputs while retaining exact native/captured
+    equality. Withhold performance claims until numerical correctness passes.
 
 [ ] Review proposals/iterative_contract.proto and the concurrent operation
     boundary in diffusion-design.md with the project owner before implementing

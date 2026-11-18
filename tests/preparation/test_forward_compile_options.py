@@ -30,7 +30,8 @@ def _loaded_backend():
     from torch._dynamo.guards import GuardManagerWrapper
 
     backend = aot.StorageBackend.__new__(aot.StorageBackend)
-    backend.artifact = SimpleNamespace(_flare_graph=object())
+    backend.artifact = SimpleNamespace(_flare_graph=object(),
+                                      inner_fn=SimpleNamespace(compiled_fn=object()))
     backend._serialized_artifact = b"portable backend"
     return SimpleNamespace(compiled_fn=backend, signature=signature(lambda forward: None),
         runtime_env=SimpleNamespace(closure=()), guards_state=b"portable guards",
