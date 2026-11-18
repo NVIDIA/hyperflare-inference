@@ -477,7 +477,6 @@
     graph-only core operation contracts in diffusion-design.md. Numerical
     qualification does not replace the required design decision.
 
-[ ] Review proposals/iterative_contract.proto and the concurrent operation
-    boundary in diffusion-design.md with the project owner before implementing
-    production serving metadata or concurrent native scheduling. The fixed
-    tensor command does not implement that proposed serving contract.
+[ ] Define and obtain project-owner approval for concurrent tensor-serving
+    admission, state ownership and completion semantics before extending fixed
+    tensor execution to concurrent scheduling or HTTP delivery.

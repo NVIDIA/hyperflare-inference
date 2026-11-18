@@ -466,8 +466,7 @@ def test_zero_scalar_invalid_and_unbacked_views_preserve_behavior():
             symbol = environment.create_unbacked_symint()
             symbols = {symbol.node.expr: sympy.Symbol("unbacked")}
             with mode:
-                # These declared constraints apply identically to both controls. They
-                # allow tensor construction without inventing a concrete symbol hint.
+                # Apply equal size constraints without assigning a concrete symbol hint.
                 torch._check_is_size(symbol)
                 torch._check(symbol >= 2)
                 if name == "contiguous_dimension":
@@ -491,8 +490,6 @@ def test_zero_scalar_invalid_and_unbacked_views_preserve_behavior():
                     outcome = dict(metadata=symbolic_metadata(result, symbols),
                                    aliases_input=result.untyped_storage()._cdata == source.untyped_storage()._cdata)
                 except (ValueError, RuntimeError) as error:
-                    # Error text can contain stack locations from either control. The
-                    # stable contract is the exact exception type and symbolic state.
                     outcome = dict(error_type=type(error).__module__ + "." + type(error).__qualname__,
                                    message=str(error))
                 after = symbolic_state(environment, symbols)
