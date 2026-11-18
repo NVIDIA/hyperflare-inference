@@ -1,0 +1,144 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+// Proposed tensor-generation contract: designed, not implemented.
+// This schema is not imported by the production core schemas or build scripts.
+// Its field numbers belong only to this proposal. Integrating operation semantics
+// requires the project-owner approval specified in AGENTS.md.
+syntax = "proto3";
+package flare.proposal.iterative;
+
+import "runtime_core.proto";
+
+// One tensor-generation workload. Physical buffers, graph nodes, compiled kernels,
+// and immutable constants remain rank execution metadata in the runtime core.
+message IterativeContract {
+  uint32 version = 1; // This proposal defines version 1.
+  // Persistent request slots, not CFG lanes. Positive, int32-representable.
+  uint64 request_capacity = 2;
+  // Per-slot int64 values. Every program declares its accesses to these views.
+  flare.runtime.StateView generation = 3;
+  flare.runtime.StateView iteration = 4;
+  // Registered int64[2, request_capacity, 7], indexed by frame and submission row.
+  // Columns follow IterativeCompletion field order. Status zero is not complete.
+  // Reuse requires terminal rank agreement and completed host transfer/consumption.
+  // Only submitted live rows are observed; each record must match its submission.
+  string completion_buffer = 5;
+  repeated TensorProfile profiles = 6;
+  repeated IterativeProgram programs = 7;
+}
+
+// One exact per-request geometry and fixed resolved schedule. Names are labels,
+// never native model or algorithm selectors. Admission requires an exact match.
+message TensorProfile {
+  string name = 1;
+  repeated TensorInput inputs = 2;
+  // Positive complete-iteration count, not forward calls; fits nonnegative int64.
+  uint64 iterations = 3;
+  repeated BatchVariant variants = 4;
+  repeated TensorResult results = 5;
+}
+
+// Contiguous host tensor supplied at admission. Shape excludes the request axis;
+// a scalar uses [1]. Dtype uses the existing execution-buffer dtype vocabulary.
+// Inputs are immutable for the request and replicated across participating ranks.
+message TensorInput {
+  string name = 1;
+  string dtype = 2;
+  repeated uint64 shape = 3;
+}
+
+// Programs for one external batch capacity within a profile. Every reference must
+// resolve to a program of that capacity and matching operation. Batch capacity
+// is positive and no greater than contract.request_capacity. The iteration
+// list has exactly profile.iterations entries; graph references may repeat.
+// This is a fixed sequence with no predicates, jumps, callbacks, or nested loops.
+message BatchVariant {
+  uint64 batch_capacity = 1;
+  string initialize = 2;
+  repeated string iterations = 3;
+  string finalize = 4;
+}
+
+enum IterativeOperation {
+  ITERATIVE_OPERATION_UNSPECIFIED = 0;
+  INITIALIZE = 1;
+  ADVANCE = 2;
+  FINALIZE = 3;
+}
+
+// References an already captured physical graph, never an import or callback.
+// ADVANCE includes all denoiser evaluations, guidance, numerical integration,
+// random draws, and committed state updates for one complete iteration.
+// Live lanes are [0, LIVE_ROWS), with unique request slots inside the contract
+// capacity. Inactive tail slots contain -1 and make no persistent state writes.
+message IterativeProgram {
+  string graph = 1;
+  IterativeOperation operation = 2;
+  uint64 batch_capacity = 3;
+  repeated TensorBinding inputs = 4;
+  repeated flare.runtime.StateAccess state = 5;
+  repeated flare.runtime.TunedBinding tuned_bindings = 6;
+}
+
+// A semantic source for a registered physical input buffer. Scalar, submission
+// row, and request row are the permitted existing indexing modes. Tensor sources
+// use SUBMISSION_ROW with [batch_capacity, *input.shape] or REQUEST_ROW with
+// [request_capacity, *input.shape]; inner layout is contiguous. Controls use
+// SUBMISSION_ROW for slot/generation/expected-iteration, SCALAR for the others.
+// Tensor names refer to the selected profile; sources cannot be unspecified.
+message TensorBinding {
+  string buffer = 1;
+  oneof source {
+    string tensor = 2;
+    ControlValue control = 3;
+  }
+  flare.runtime.InputIndexing indexing = 4;
+}
+
+enum ControlValue {
+  CONTROL_VALUE_UNSPECIFIED = 0;
+  REQUEST_SLOT = 1; // int32 submission rows; inactive rows use -1.
+  REQUEST_GENERATION = 2; // int64 submission rows.
+  LIVE_ROWS = 3; // int32 scalar, no greater than the program batch capacity.
+  EXPECTED_ITERATION = 4; // int64 submission rows; absent during initialization.
+  FRAME_INDEX = 5; // int32 scalar selecting one of the two completion frames.
+  SUBMISSION_SEQUENCE = 6; // int64 scalar identifying this submission.
+}
+
+// Fixed contiguous result for one request slot. All results are delivered from
+// rank zero in this proposal. Shape excludes the request axis. Storage is an
+// existing row-byte view: nbytes equals product(shape) * sizeof(dtype), and its
+// row stride must remain compatible across profiles sharing the same buffer.
+// Finalization writes the result before success; ownership lasts through copy-out.
+message TensorResult {
+  string name = 1;
+  string dtype = 2;
+  repeated uint64 shape = 3;
+  flare.runtime.StateView storage = 4;
+}
+
+// Semantic fields of the fixed device completion record, not a requirement to
+// serialize Protobuf on the GPU. Identity/cursor integers fit nonnegative int64.
+// INITIALIZE reports submitted and committed cursors 0 and requires exclusive
+// native ownership of a drained slot before it writes generation or request state.
+// ADVANCE commits submitted_iteration + 1, without overflow;
+// FINALIZE requires the terminal cursor and leaves it unchanged.
+message IterativeCompletion {
+  uint64 request_slot = 1;
+  uint64 request_generation = 2;
+  uint64 submission_sequence = 3;
+  uint64 submitted_iteration = 4;
+  uint64 committed_iteration = 5;
+  CompletionStatus status = 6;
+  uint32 error_code = 7;
+}
+
+enum CompletionStatus {
+  COMPLETION_STATUS_UNSPECIFIED = 0;
+  SUCCEEDED = 1;
+  REJECTED = 2; // Invalid identity/cursor; no persistent mutation or result.
+  FAILED = 3; // State is unusable until execution drains and it is reinitialized.
+}

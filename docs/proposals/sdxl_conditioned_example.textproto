@@ -1,0 +1,395 @@
+# Illustrative SDXL-shaped tensor declaration; no executable graphs or weights.
+# Fixed four-iteration teaching example, not a recommended sampling preset.
+# initial_noise is unit Gaussian noise; initialization applies the scheduler's
+# prepared init_noise_sigma, which need not equal its first schedule sigma.
+# Updates are deterministic and history-free, with no draws after admission.
+# Positive and negative conditioning use identical size/crop geometry.
+# decoded_image is raw channel-first VAE output before image postprocessing.
+version: 1
+request_capacity: 2
+generation {
+  buffer: "request.generation"
+  stride: 8
+  nbytes: 8
+}
+iteration {
+  buffer: "request.iteration"
+  stride: 8
+  nbytes: 8
+}
+completion_buffer: "iteration_completions"
+profiles {
+  name: "conditioned-image-1024"
+  inputs {
+    name: "initial_noise"
+    dtype: "float16"
+    shape: 4
+    shape: 128
+    shape: 128
+  }
+  inputs {
+    name: "positive_sequence"
+    dtype: "float16"
+    shape: 77
+    shape: 2048
+  }
+  inputs {
+    name: "negative_sequence"
+    dtype: "float16"
+    shape: 77
+    shape: 2048
+  }
+  inputs {
+    name: "positive_pooled"
+    dtype: "float16"
+    shape: 1280
+  }
+  inputs {
+    name: "negative_pooled"
+    dtype: "float16"
+    shape: 1280
+  }
+  inputs {
+    name: "size_crop"
+    dtype: "float16"
+    shape: 6
+  }
+  inputs {
+    name: "guidance"
+    dtype: "float32"
+    shape: 1
+  }
+  iterations: 4
+  variants {
+    batch_capacity: 1
+    initialize: "image.initialize.batch1"
+    iterations: "image.advance.batch1"
+    iterations: "image.advance.batch1"
+    iterations: "image.advance.batch1"
+    iterations: "image.advance.batch1"
+    finalize: "image.finalize.batch1"
+  }
+  results {
+    name: "decoded_image"
+    dtype: "float32"
+    shape: 3
+    shape: 1024
+    shape: 1024
+    storage {
+      buffer: "result.decoded_image"
+      stride: 12582912
+      nbytes: 12582912
+    }
+  }
+}
+programs {
+  graph: "image.initialize.batch1"
+  operation: INITIALIZE
+  batch_capacity: 1
+  inputs {
+    buffer: "slots"
+    control: REQUEST_SLOT
+    indexing: SUBMISSION_ROW
+  }
+  inputs {
+    buffer: "generations"
+    control: REQUEST_GENERATION
+    indexing: SUBMISSION_ROW
+  }
+  inputs {
+    buffer: "live_rows"
+    control: LIVE_ROWS
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "frame_index"
+    control: FRAME_INDEX
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "submission_sequence"
+    control: SUBMISSION_SEQUENCE
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "input.initial_noise"
+    tensor: "initial_noise"
+    indexing: REQUEST_ROW
+  }
+  inputs {
+    buffer: "input.positive_sequence"
+    tensor: "positive_sequence"
+    indexing: REQUEST_ROW
+  }
+  inputs {
+    buffer: "input.negative_sequence"
+    tensor: "negative_sequence"
+    indexing: REQUEST_ROW
+  }
+  inputs {
+    buffer: "input.positive_pooled"
+    tensor: "positive_pooled"
+    indexing: REQUEST_ROW
+  }
+  inputs {
+    buffer: "input.negative_pooled"
+    tensor: "negative_pooled"
+    indexing: REQUEST_ROW
+  }
+  inputs {
+    buffer: "input.size_crop"
+    tensor: "size_crop"
+    indexing: REQUEST_ROW
+  }
+  inputs {
+    buffer: "input.guidance"
+    tensor: "guidance"
+    indexing: REQUEST_ROW
+  }
+  state {
+    view {
+      buffer: "request.generation"
+      stride: 8
+      nbytes: 8
+    }
+    access: WRITE
+  }
+  state {
+    view {
+      buffer: "request.iteration"
+      stride: 8
+      nbytes: 8
+    }
+    access: WRITE
+  }
+  state {
+    view {
+      buffer: "state.latent"
+      stride: 131072
+      nbytes: 131072
+    }
+    access: WRITE
+  }
+  state {
+    view {
+      buffer: "state.positive_sequence"
+      stride: 315392
+      nbytes: 315392
+    }
+    access: WRITE
+  }
+  state {
+    view {
+      buffer: "state.negative_sequence"
+      stride: 315392
+      nbytes: 315392
+    }
+    access: WRITE
+  }
+  state {
+    view {
+      buffer: "state.positive_pooled"
+      stride: 2560
+      nbytes: 2560
+    }
+    access: WRITE
+  }
+  state {
+    view {
+      buffer: "state.negative_pooled"
+      stride: 2560
+      nbytes: 2560
+    }
+    access: WRITE
+  }
+  state {
+    view {
+      buffer: "state.size_crop"
+      stride: 12
+      nbytes: 12
+    }
+    access: WRITE
+  }
+  state {
+    view {
+      buffer: "state.guidance"
+      stride: 4
+      nbytes: 4
+    }
+    access: WRITE
+  }
+}
+programs {
+  graph: "image.advance.batch1"
+  operation: ADVANCE
+  batch_capacity: 1
+  inputs {
+    buffer: "slots"
+    control: REQUEST_SLOT
+    indexing: SUBMISSION_ROW
+  }
+  inputs {
+    buffer: "generations"
+    control: REQUEST_GENERATION
+    indexing: SUBMISSION_ROW
+  }
+  inputs {
+    buffer: "live_rows"
+    control: LIVE_ROWS
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "frame_index"
+    control: FRAME_INDEX
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "submission_sequence"
+    control: SUBMISSION_SEQUENCE
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "expected_iterations"
+    control: EXPECTED_ITERATION
+    indexing: SUBMISSION_ROW
+  }
+  state {
+    view {
+      buffer: "request.generation"
+      stride: 8
+      nbytes: 8
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "request.iteration"
+      stride: 8
+      nbytes: 8
+    }
+    access: READ_WRITE
+  }
+  state {
+    view {
+      buffer: "state.latent"
+      stride: 131072
+      nbytes: 131072
+    }
+    access: READ_WRITE
+  }
+  state {
+    view {
+      buffer: "state.positive_sequence"
+      stride: 315392
+      nbytes: 315392
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "state.negative_sequence"
+      stride: 315392
+      nbytes: 315392
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "state.positive_pooled"
+      stride: 2560
+      nbytes: 2560
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "state.negative_pooled"
+      stride: 2560
+      nbytes: 2560
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "state.size_crop"
+      stride: 12
+      nbytes: 12
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "state.guidance"
+      stride: 4
+      nbytes: 4
+    }
+    access: READ
+  }
+}
+programs {
+  graph: "image.finalize.batch1"
+  operation: FINALIZE
+  batch_capacity: 1
+  inputs {
+    buffer: "slots"
+    control: REQUEST_SLOT
+    indexing: SUBMISSION_ROW
+  }
+  inputs {
+    buffer: "generations"
+    control: REQUEST_GENERATION
+    indexing: SUBMISSION_ROW
+  }
+  inputs {
+    buffer: "live_rows"
+    control: LIVE_ROWS
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "frame_index"
+    control: FRAME_INDEX
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "submission_sequence"
+    control: SUBMISSION_SEQUENCE
+    indexing: SCALAR
+  }
+  inputs {
+    buffer: "expected_iterations"
+    control: EXPECTED_ITERATION
+    indexing: SUBMISSION_ROW
+  }
+  state {
+    view {
+      buffer: "request.generation"
+      stride: 8
+      nbytes: 8
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "request.iteration"
+      stride: 8
+      nbytes: 8
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "state.latent"
+      stride: 131072
+      nbytes: 131072
+    }
+    access: READ
+  }
+  state {
+    view {
+      buffer: "result.decoded_image"
+      stride: 12582912
+      nbytes: 12582912
+    }
+    access: WRITE
+  }
+}

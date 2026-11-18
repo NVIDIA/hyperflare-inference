@@ -217,8 +217,19 @@ not substitutes for identifiers.
 | `Initializer` | Allocation name, destination offset, source `PayloadUse`. |
 | `ExecutableResource` | Preassigned resource ID, kind, stored compressed `PayloadSlice`, signed decoded length, 4 MiB chunk metadata, and compressed chunk commitments. |
 | `Module` / `Function` | Cubin resource reference; module reference, symbol, parameter layout and launch attributes. |
-| `Graph` | Graph name, instantiation flags, compressed graph resource reference, node and edge counts, and function dependencies. Graph bytes encode nodes, edges, parameters, and dependencies. The rank's `flare.runtime.Execution` record carries each graph's operation kind, capacities, and input bindings. |
+| `Graph` | Graph name, instantiation flags, compressed graph resource reference, node and edge counts, and function dependencies. Graph bytes encode nodes, edges, parameters, and dependencies. For token serving, the rank's optional `flare.runtime.Execution` record carries operation kinds, capacities, and input bindings. |
 | `PreparedWeightView` | Semantic tensor name, stable group, dtype, shape, strides, allocation/view binding, source tensor identities and logical ranges, concatenation order, padding/fills, typed packing parameters and locality tile, and quantization statistic domain. |
+
+A physical graph core contains authenticated storage and executable graphs for
+[fixed tensor requests](runtime-core-design.md#fixed-tensor-requests). Its core
+frontend and sampling defaults are both absent, it has no frontend assets, and
+every deployment omits the serving contract and Engram state. Each rank omits
+token-serving execution metadata and contains at least one graph. Token-serving
+cores retain paired frontend and sampling metadata and a serving contract in
+every deployment; rank execution remains optional in the container schema.
+Publication, authenticated reads, and conversion reject partial or mixed forms.
+Physical graph cores use the same signatures, resource checks, and wire format;
+the token-serving entry points reject them because they lack a serving contract.
 
 Payload descriptors are authenticated wherever consumed, with equality enforced
 across shared and rank bodies. Each body is signed over its exact serialized

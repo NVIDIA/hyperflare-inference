@@ -30,6 +30,7 @@ mod inspect;
 mod launch;
 #[cfg(unix)]
 mod orbit;
+mod tensors;
 mod trust;
 #[cfg(windows)]
 use flare::windows;
@@ -134,6 +135,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return trust::revoke(&fingerprint, trust_store.as_deref());
         }
     };
+    if args.tensor_request.is_some() {
+        if args.gpus.len() > 1 {
+            return Err("tensor execution requires one GPU".into());
+        }
+        if !args.gpus.is_empty() {
+            environment::configure(&args.gpus)?;
+        }
+        let mut progress = StartupProgress::stderr();
+        let (_, authorized, _, _lease) = load_core(&args, &mut progress)?;
+        if flare_helios::runtime_core::rank_needs(&authorized).len() != 1
+            || flare_helios::runtime_core::core_cluster(&authorized).is_some()
+        {
+            return Err("tensor execution requires one independent core rank".into());
+        }
+        configure_core_devices(&mut args, &authorized, &mut progress)?;
+        progress.finish_animation();
+        return tensors::run(&args, authorized);
+    }
     #[cfg(windows)]
     if args.rank.is_some()
         || args.rendezvous.is_some()
