@@ -463,26 +463,22 @@
     APT index. See debian.md and release.md.
 
 [ ] Resolve remaining compiled PixArt-Alpha differences from canonical Diffusers
-    in ignition/recipes/pixart/prepare.py. On RTX 6000D, complete T5 conditioning
-    matches same-device eager bytes for the tested positive and negative inputs
-    with arithmetic-preserving compilation. VAE decoding of canonical latents
-    still differs. FakeTensor scalar division can normalize singleton batch
-    strides and change nearest-upsample layout; qualify its contribution to
-    full decoder error. Denoising, solver history, export, and native replay
-    require qualification with this compilation policy. Close when the complete
+    in ignition/recipes/pixart/prepare.py. On RTX 6000D, arithmetic-preserving
+    compilation and native replay match every saved pre-decoder checkpoint for
+    two prompts in the 512-square 20-step profile. Decoded images still differ.
+    Qualify view/reshape and scalar-operation metadata and native boundary
+    strides against eager decoder layouts. Close when the complete
     512-square 20-step profile passes all 43 outputs under a numerical
     criterion justified by operator precision and measured repeatability on
     independent inputs, retaining exact native/captured equality. Withhold
     performance claims until numerical correctness passes.
 
 [ ] Resolve remaining compiled SDXL differences from canonical Diffusers in
-    ignition/recipes/sdxl/prepare.py. On RTX 6000D, complete CLIP1 conditioning
-    matches same-device eager bytes for the tested positive and negative inputs
-    with arithmetic-preserving compilation. VAE decoding of canonical latents
-    still differs. FakeTensor scalar division can normalize singleton batch
-    strides and change nearest-upsample layout; qualify its contribution to
-    full decoder error. CLIP2, denoising, export, and native replay require
-    qualification with this compilation policy. Close when the complete
+    ignition/recipes/sdxl/prepare.py. On RTX 6000D, arithmetic-preserving
+    compilation and native replay match every saved pre-decoder checkpoint for
+    two prompts in each 1024-square four-step and 30-step profile. Decoded images
+    still differ. Qualify view/reshape and scalar-operation metadata and native
+    boundary strides against eager decoder layouts. Close when the complete
     1024-square four-step and 30-step profiles pass a justified numerical
     criterion on independent inputs while retaining exact native/captured
     equality. Withhold performance claims until numerical correctness passes.
