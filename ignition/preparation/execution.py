@@ -31,7 +31,7 @@ class GraphSignature:
     confidence_width: int = 0
 
     def __post_init__(self):
-        if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
+        if self.kind not in ("init", "restore", "snapshot", "prefill", "terminal_prefill", "scored_prefill", "decode", "resume",
                              "vision", "speculative", "mixed"):
             raise ValueError("unknown prepared graph operation")
         if self.kind == "scored_prefill" and (self.batch_capacity != 1

@@ -660,3 +660,30 @@ def test_core_token_capacity_bounds_packed_upload_and_publication(width):
     assert requests[1].generated == [42] + tokens[:9] and requests[1].done
     assert requests[0].acceptance.expected(width) == width
     assert len(requests[0].acceptance.expectations(width)) == width + 1
+
+
+@pytest.mark.parametrize("count", [1, 128, 129, 512, 513, 640, 641, 1025])
+def test_terminal_prefill_reserves_rows_before_snapshot_and_generation(count):
+    graphs = dict(layout().graphs)
+    graphs.update({("terminal_prefill", 1, capacity): f"terminal{capacity}"
+                   for capacity in (128, 256, 512)})
+    scheduler = Scheduler(layout(graphs=graphs, terminal_prefill_min_tokens=129))
+    live = request(1, [42] * count)
+    scheduler.submit(live)
+    init = scheduler.plan()
+    scheduler.complete(init, records(scheduler, init, {live: (1, 0, [], 0)}))
+    partial = False
+    while live.consumed < count:
+        step = scheduler.plan()
+        lane = step.lanes[0]
+        terminal = lane.start + lane.tokens == count
+        assert step.kind == ("terminal_prefill" if terminal else "prefill")
+        assert uploads(scheduler, step)["sample_enabled"][0][0] == int(terminal)
+        if terminal and partial:
+            assert lane.tokens >= 129
+        scheduler.complete(step, records(scheduler, step,
+            {live: (1, lane.start + lane.tokens, [43] if terminal else [], 0)}))
+        if not terminal:
+            partial = True
+            assert not live.generated and not scheduler.cache and live.phase == "prefill"
+    assert live.generated == [43] and scheduler.plan().kind == "snapshot"

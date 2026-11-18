@@ -504,3 +504,8 @@
     test_every_recipe_passes_collective_policy_to_preparation rewrites a TP4
     ladder to DeepSeek V4.1 TP3 or Muse Spark TP8; b12x rejects those gather
     and word-exchange candidates before the preparation handoff is tested.
+[ ] Qualify exported intermediate/terminal DeepSeek V4.1 prefill after upstream integration
+    through exported serving: complete cache and speculative state, scored
+    prefill, prefix reuse, cancellation and request interleaving. Compare chunk
+    boundaries with at least 129 terminal tokens and short prompts or extensions
+    from complete prefixes. Measure prefill and decode regressions separately.

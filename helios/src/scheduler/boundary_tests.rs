@@ -99,7 +99,7 @@ fn run_step(s: &mut RequestScheduler) -> ScheduledPlan {
         let r = s.request(lane.request).unwrap();
         let end = lane.start_position + lane.tokens as u64;
         let emitted = match step.kind {
-            GraphKind::Prefill => usize::from(end == r.prompt_tokens as u64),
+            GraphKind::Prefill | GraphKind::TerminalPrefill => usize::from(end == r.prompt_tokens as u64),
             GraphKind::Decode | GraphKind::Resume => 1,
             GraphKind::Speculative => step
                 .token_capacity
@@ -885,6 +885,34 @@ fn completed_message_anchor_is_offered_immediately_near_prompt() {
 }
 
 #[test]
+fn an_interior_message_checkpoint_can_feed_a_short_divergent_prefill() {
+    let mut s = scheduler_with_concurrency(16, false, 64, 1);
+    linear_checkpoint_costs(&mut s, 0.05);
+    s.enable_publications();
+    let boundary = 512;
+    let original = s.admit(spec(Some(boundary), 2048, 3)).unwrap();
+    stop_at_capture(&mut s, original, boundary as u64);
+    run_step(&mut s);
+    let publications = s.take_publications();
+    assert_eq!(publications.len(), 1);
+    let checkpoint = publications[0].id;
+    assert_eq!(publications[0].key.consumed_tokens, boundary as u64);
+    assert_eq!(s.request(original).unwrap().generated_tokens, 0);
+    finish(&mut s, original);
+
+    let mut branch = spec(None, boundary + 1, 1);
+    branch.prompt[boundary] += 1;
+    let child = s.admit(branch).unwrap();
+    assert_eq!(s.request(child).unwrap().prefix, Some(checkpoint));
+    assert_eq!(s.request(child).unwrap().reused_prompt_tokens(), boundary as u64);
+    let plan = (0..4).map(|_| run_step(&mut s)).find(|plan| plan.kind == GraphKind::Prefill)
+        .expect("short branch should enter prefill after restoring the checkpoint");
+    assert_eq!(plan.lanes[0].start_position, boundary as u64);
+    assert_eq!(plan.lanes[0].tokens, 1);
+    assert_eq!(s.request(child).unwrap().generated_tokens, 1);
+}
+
+#[test]
 fn completed_message_is_offered_once_and_reuse_preserves_exact_endpoint() {
     let mut s = scheduler_with_concurrency(16, false, 64, 1);
     s.enable_publications();
@@ -988,4 +1016,242 @@ fn exhausted_storage_keeps_the_nearest_message_supplementaries() {
         assert_eq!(s.stats().snapshot_evictions, 0);
         assert_eq!(s.stats().message_checkpoints, snapshots as u64);
     }
+}
+
+fn terminal_scheduler() -> RequestScheduler {
+    let mut scheduler = scheduler(16, false);
+    let capacities = scheduler.prefill_catalog.clone();
+    scheduler.terminal_prefill_graphs(129, &capacities).unwrap();
+    let mut graphs = super::tests::duration_graphs(4);
+    let terminal: Vec<_> = graphs.iter().filter(|g| g.kind == GraphKind::Prefill).cloned()
+        .map(|mut graph| { graph.kind = GraphKind::TerminalPrefill; graph }).collect();
+    graphs.extend(terminal);
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler
+}
+
+#[test]
+fn terminal_prefill_reserves_valid_rows_and_completes_before_publication() {
+    for prompt in [1, 127, 128, 129, 511, 512, 513, 640, 641, 642, 1024, 1025, 2048] {
+        let mut scheduler = terminal_scheduler();
+        let handle = scheduler.admit(spec(None, prompt, 1)).unwrap();
+        let mut incomplete = false;
+        let mut terminal_count = 0;
+        for _ in 0..100 {
+            let request = scheduler.request(handle).unwrap();
+            if request.phase == RequestPhase::Finishing { break; }
+            let step = run_step(&mut scheduler);
+            match step.kind {
+                GraphKind::Prefill => {
+                    assert_eq!(scheduler.request(handle).unwrap().generated_tokens, 0);
+                    incomplete = true;
+                    let request = scheduler.request(handle).unwrap();
+                    assert!(request.deferred_prefill_end.is_some());
+                    assert!(prompt - request.consumed_tokens as usize >= 129);
+                }
+                GraphKind::TerminalPrefill => {
+                    assert!(!incomplete || step.lanes[0].tokens >= 129);
+                    assert!(scheduler.request(handle).unwrap().deferred_prefill_end.is_none());
+                    incomplete = false;
+                    terminal_count += 1;
+                }
+                GraphKind::Snapshot | GraphKind::Resume | GraphKind::Decode => assert!(!incomplete),
+                _ => {}
+            }
+        }
+        assert_eq!(terminal_count, 1, "prompt {prompt}");
+        assert_eq!(scheduler.request(handle).unwrap().phase, RequestPhase::Finishing);
+    }
+}
+
+#[test]
+fn terminal_prefill_preserves_intermediate_message_checkpoint() {
+    let mut scheduler = terminal_scheduler();
+    let handle = scheduler.admit(spec(Some(700), 1400, 1)).unwrap();
+    let mut terminals = Vec::new();
+    for _ in 0..100 {
+        if scheduler.request(handle).unwrap().phase == RequestPhase::Finishing { break; }
+        let step = run_step(&mut scheduler);
+        if step.kind == GraphKind::TerminalPrefill {
+            terminals.push(step.lanes[0].start_position as usize + step.lanes[0].tokens);
+        }
+        if step.kind == GraphKind::Snapshot {
+            assert!(scheduler.request(handle).unwrap().deferred_prefill_end.is_none());
+        }
+    }
+    assert!(terminals.contains(&700), "{terminals:?}");
+    assert!(terminals.contains(&1400), "{terminals:?}");
+}
+
+#[test]
+fn terminal_prefill_rejects_invalid_geometry() {
+    let mut scheduler = scheduler(4, false);
+    assert!(scheduler.terminal_prefill_graphs(0, &[64, 512]).is_err());
+    assert!(scheduler.terminal_prefill_graphs(129, &[]).is_err());
+    assert!(scheduler.terminal_prefill_graphs(513, &[64, 512]).is_err());
+    assert!(scheduler.terminal_prefill_graphs(129, &[64, 256]).is_err());
+}
+
+
+#[test]
+fn terminal_prefill_cancellation_discards_incomplete_state_after_drain() {
+    let mut scheduler = terminal_scheduler();
+    let handle = scheduler.admit(spec(None, 2048, 1)).unwrap();
+    while scheduler.request(handle).unwrap().deferred_prefill_end.is_none() {
+        run_step(&mut scheduler);
+    }
+    let published = scheduler.stats().snapshot_publications;
+    scheduler.cancel(handle).unwrap();
+    assert_eq!(scheduler.stats().snapshot_publications, published);
+    assert!(scheduler.request(handle).is_err());
+    let next = scheduler.admit(spec(None, 2048, 1)).unwrap();
+    assert_eq!(scheduler.request(next).unwrap().consumed_tokens, 0);
+    assert!(scheduler.request(next).unwrap().deferred_prefill_end.is_none());
+}
+
+#[test]
+fn terminal_prefill_rejects_output_from_incomplete_state() {
+    let mut scheduler = terminal_scheduler();
+    let handle = scheduler.admit(spec(None, 1400, 3)).unwrap();
+    run_step(&mut scheduler);
+    let plan = scheduler.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Prefill);
+    let fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&plan, fence).unwrap();
+    let lane = &plan.lanes[0];
+    let mut records = vec![CompletionRecord::default(); scheduler.limits.request_capacity()];
+    records[handle.slot as usize] = CompletionRecord {
+        generation: handle.generation as i64, submission_sequence: fence.0 as i64,
+        consumed_tokens: (lane.start_position + lane.tokens as u64) as i64,
+        generated_tokens: 1, token_id: 42, status: 1, ..Default::default()
+    };
+    assert!(scheduler.complete(fence, &records, Default::default()).unwrap_err().to_string().contains("incomplete continuation"));
+    assert_eq!(scheduler.request(handle).unwrap().consumed_tokens, 0);
+    assert_eq!(scheduler.request(handle).unwrap().generated_tokens, 0);
+    assert_eq!(scheduler.request(handle).unwrap().pending, 1);
+    scheduler.cancel(handle).unwrap();
+    assert_eq!(scheduler.stats().snapshot_publications, 0);
+}
+
+#[test]
+fn terminal_prefill_completes_atomic_input_when_a_tail_cannot_be_reserved() {
+    let mut scheduler = terminal_scheduler();
+    let handle = scheduler.admit(spec(None, 513, 1)).unwrap();
+    scheduler.set_prefill_spans(handle, &[0..512]).unwrap();
+    run_step(&mut scheduler);
+    let first = run_step(&mut scheduler);
+    assert_eq!((first.kind, first.lanes[0].tokens), (GraphKind::TerminalPrefill, 512));
+    assert!(scheduler.request(handle).unwrap().deferred_prefill_end.is_none());
+    assert_eq!(scheduler.request(handle).unwrap().generated_tokens, 0);
+    let last = run_step(&mut scheduler);
+    assert_eq!((last.kind, last.lanes[0].tokens), (GraphKind::TerminalPrefill, 1));
+    assert_eq!(scheduler.request(handle).unwrap().generated_tokens, 1);
+}
+
+#[test]
+fn terminal_prefill_restores_complete_prefix_and_accepts_a_short_extension() {
+    let mut scheduler = terminal_scheduler();
+    let first = scheduler.admit(spec(None, 1400, 1)).unwrap();
+    finish(&mut scheduler, first);
+    let next = scheduler.admit(spec(None, 1409, 2)).unwrap();
+    assert_eq!(scheduler.request(next).unwrap().prefix_tokens, 1400);
+    assert_eq!(run_step(&mut scheduler).kind, GraphKind::Restore);
+    let tail = run_step(&mut scheduler);
+    assert_eq!((tail.kind, tail.lanes[0].tokens), (GraphKind::TerminalPrefill, 9));
+    assert!(scheduler.request(next).unwrap().deferred_prefill_end.is_none());
+}
+
+#[test]
+fn terminal_prefill_finishes_before_speculative_generation() {
+    let mut scheduler = terminal_scheduler();
+    scheduler.enable_speculation(&[1, 2, 4, 8]).unwrap();
+    let handle = scheduler.admit(spec(None, 1400, 20)).unwrap();
+    let mut terminal = false;
+    for _ in 0..100 {
+        let step = run_step(&mut scheduler);
+        if step.kind == GraphKind::TerminalPrefill { terminal = true; }
+        if step.kind == GraphKind::Speculative {
+            assert!(terminal);
+            assert!(scheduler.request(handle).unwrap().deferred_prefill_end.is_none());
+            return;
+        }
+    }
+    panic!("speculative generation did not follow terminal prefill");
+}
+
+#[test]
+fn terminal_prefill_cancellation_retains_pages_until_the_partial_graph_drains() {
+    let mut scheduler = terminal_scheduler();
+    let handle = scheduler.admit(spec(None, 1400, 3)).unwrap();
+    run_step(&mut scheduler);
+    let plan = scheduler.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Prefill);
+    let fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&plan, fence).unwrap();
+    let free = scheduler.free_page_count();
+    let pending = scheduler.request(handle).unwrap().private_pages.len()
+        + scheduler.request(handle).unwrap().reserved_pages.len();
+    scheduler.cancel(handle).unwrap();
+    assert_eq!(scheduler.free_page_count(), free);
+    let mut records = vec![CompletionRecord::default(); scheduler.limits.request_capacity()];
+    records[handle.slot as usize] = CompletionRecord {
+        generation: handle.generation as i64, submission_sequence: fence.0 as i64,
+        consumed_tokens: plan.lanes[0].tokens as i64, status: 1, token_id: -1,
+        ..Default::default()
+    };
+    scheduler.complete(fence, &records, Default::default()).unwrap();
+    assert_eq!(scheduler.free_page_count(), free + pending);
+    assert_eq!(scheduler.stats().snapshot_publications, 0);
+}
+
+#[test]
+fn prefill_service_rates_use_the_executed_operation() {
+    for scored in [false, true] {
+        for prompt in [64, 1000] {
+            let mut scheduler = terminal_scheduler();
+            let capacities = scheduler.prefill_catalog.clone();
+            scheduler.scored_prefill_graphs(&capacities).unwrap();
+            let mut graphs = super::tests::duration_graphs(4);
+            for graph in &mut graphs {
+                if graph.kind == GraphKind::Prefill { graph.estimated_duration_ns = 1_000_000; }
+            }
+            for (kind, duration) in [(GraphKind::TerminalPrefill, 10_000_000),
+                                     (GraphKind::ScoredPrefill, 20_000_000)] {
+                let complete: Vec<_> = graphs.iter().filter(|g| g.kind == GraphKind::Prefill).cloned()
+                    .map(|mut g| { g.kind = kind; g.estimated_duration_ns = duration; g }).collect();
+                graphs.extend(complete);
+            }
+            scheduler.measured_graph_durations(&graphs).unwrap();
+            let mut request = spec(None, prompt, 1);
+            request.prompt_logprobs = scored;
+            let handle = scheduler.admit(request).unwrap();
+            assert_eq!(run_step(&mut scheduler).kind, GraphKind::Init);
+            let plan = scheduler.plan().unwrap();
+            let (kind, milliseconds) = if scored { (GraphKind::ScoredPrefill, 20.) }
+                else if prompt < 129 { (GraphKind::TerminalPrefill, 10.) }
+                else { (GraphKind::Prefill, 1.) };
+            assert_eq!(plan.kind, kind);
+            let lane = &plan.lanes[0];
+            let first_output = usize::from(lane.start_position + lane.tokens as u64 == prompt as u64);
+            let expected = (lane.tokens + first_output) as f64 / milliseconds;
+            assert_eq!(scheduler.service_rates(scheduler.request(handle).unwrap()), (Some(expected), None));
+        }
+    }
+}
+
+#[test]
+fn terminal_prefill_requires_its_own_timing_evidence() {
+    let mut scheduler = terminal_scheduler();
+    let mut graphs = super::tests::duration_graphs(4);
+    let terminal: Vec<_> = graphs.iter().filter(|g| g.kind == GraphKind::Prefill).cloned()
+        .map(|mut graph| {
+            graph.kind = GraphKind::TerminalPrefill;
+            graph.estimated_duration_ns = 0;
+            graph
+        }).collect();
+    graphs.extend(terminal);
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    let handle = scheduler.admit(spec(None, 64, 1)).unwrap();
+    assert_eq!(run_step(&mut scheduler).kind, GraphKind::Init);
+    assert_eq!(scheduler.service_rates(scheduler.request(handle).unwrap()), (None, None));
 }

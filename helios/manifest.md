@@ -109,7 +109,7 @@ lists. Graph executable handles are nonzero and unique. Registered device
 spans do not overlap; captured weights and scratch need not appear in this I/O
 manifest but must remain in the resource owner.
 
-Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `scored_prefill`,
+Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `terminal_prefill`, `scored_prefill`,
 `decode`, `speculative`, `mixed`, `resume`, and `vision`. Decode and speculative
 batch capacities are powers of two through 64. Decode has one token per lane.
 A speculative graph performs complete proposal, optional confidence/allocation,
@@ -126,7 +126,7 @@ A mixed graph has a power-of-two batch capacity from 2 through the request
 storage capacity, W from 1 through T, and a `prefill_capacity` that is a positive
 multiple of 64. It binds the `int32[1]` `prefill_row` input. Every other kind
 sets `prefill_capacity` to zero.
-Prefill and scored prefill have batch capacity 1. Their token capacities are 1,
+Prefill, terminal prefill, and scored prefill have batch capacity 1. Their token capacities are 1,
 16, or a positive multiple of 64. The model configuration separately requires the captured
 catalog for its `prefill_chunk_size`; transport validation does not infer a
 scheduling policy or substitute a missing graph.

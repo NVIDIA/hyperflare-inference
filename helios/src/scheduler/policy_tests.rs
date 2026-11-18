@@ -10,6 +10,42 @@ use crate::execution::{ExecutionTiming, SamplingMode, TokenVector};
 
 const MS: u64 = 1_000_000;
 
+#[test]
+fn intermediate_prefill_prices_the_measured_terminal_tail_before_selecting_a_chunk() {
+    for (intermediate_ms, tail_ms, expected_kind, expected_tokens) in [
+        (25, 50, GraphKind::TerminalPrefill, 512),
+        (10, 20, GraphKind::Prefill, 256),
+    ] {
+        let mut s = engine(1, false);
+        let capacities = [256, 512];
+        s.prefill_graphs(&capacities).unwrap();
+        s.terminal_prefill_graphs(129, &capacities).unwrap();
+        let mut graphs = super::tests::duration_graphs(1);
+        let terminal: Vec<_> = graphs.iter().filter(|g| g.kind == GraphKind::Prefill
+            && capacities.contains(&g.token_capacity)).cloned().map(|mut g| {
+                g.kind = GraphKind::TerminalPrefill;
+                g.name = format!("terminal-{}", g.token_capacity);
+                g
+            }).collect();
+        graphs.extend(terminal);
+        s.measured_graph_durations(&graphs).unwrap();
+        set_cost(&mut s, GraphKind::Prefill, 1, 256, intermediate_ms * MS);
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, 256, tail_ms * MS);
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, 512, 60 * MS);
+        let handle = add(&mut s, 1, 512, 1);
+        assert_eq!(step(&mut s, 0).kind, GraphKind::Init);
+        let plan = s.plan().unwrap();
+        assert_eq!((plan.kind, plan.lanes[0].tokens), (expected_kind, expected_tokens));
+        assert_eq!(plan.lanes[0].request, handle);
+        assert_eq!(s.request(handle).unwrap().consumed_tokens, 0);
+        // Planning future completion neither commits the tail nor extends the
+        // duration of the one graph actually submitted.
+        assert_eq!(plan.estimated_duration_ns(), if expected_kind == GraphKind::Prefill {
+            intermediate_ms * MS
+        } else { 60 * MS });
+    }
+}
+
 #[path = "planning_tests.rs"]
 mod planning_tests;
 
