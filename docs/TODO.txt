@@ -462,26 +462,20 @@
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
 
-[ ] Resolve remaining compiled PixArt-Alpha differences from canonical Diffusers
-    in ignition/recipes/pixart/prepare.py. On RTX 6000D, arithmetic-preserving
-    compilation and native replay match every saved pre-decoder checkpoint for
-    two prompts in the 512-square 20-step profile. Decoded images still differ.
-    Qualify view/reshape and scalar-operation metadata and native boundary
-    strides against eager decoder layouts. Close when the complete
-    512-square 20-step profile passes all 43 outputs under a numerical
-    criterion justified by operator precision and measured repeatability on
-    independent inputs, retaining exact native/captured equality. Withhold
-    performance claims until numerical correctness passes.
+[ ] Correct the memory-dependent assertion in tests/preparation/test_aot.py's
+    test_explicit_worker_budget_compiles_and_replays_a_catalog. It requires
+    nine workers even when host-memory admission permits seven. Preserve the
+    catalog compilation, replay and allocation checks while validating the
+    admitted worker count rather than assuming the requested count is granted.
 
-[ ] Resolve remaining compiled SDXL differences from canonical Diffusers in
-    ignition/recipes/sdxl/prepare.py. On RTX 6000D, arithmetic-preserving
-    compilation and native replay match every saved pre-decoder checkpoint for
-    two prompts in each 1024-square four-step and 30-step profile. Decoded images
-    still differ. Qualify view/reshape and scalar-operation metadata and native
-    boundary strides against eager decoder layouts. Close when the complete
-    1024-square four-step and 30-step profiles pass a justified numerical
-    criterion on independent inputs while retaining exact native/captured
-    equality. Withhold performance claims until numerical correctness passes.
+[ ] Qualify generated-kernel and compiled-forward device rebinding in
+    tests/preparation/test_aot.py on two assigned GPUs with the runtime metadata
+    patches installed. Close when both rebinding tests pass their no-tracing,
+    no-compilation, changed-input replay and allocation checks.
+
+[ ] Obtain project-owner approval for the fixed offline tensor-request and
+    graph-only core operation contracts in diffusion-design.md. Numerical
+    qualification does not replace the required design decision.
 
 [ ] Review proposals/iterative_contract.proto and the concurrent operation
     boundary in diffusion-design.md with the project owner before implementing

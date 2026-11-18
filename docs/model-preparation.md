@@ -89,7 +89,13 @@ Inductor retains zeroed graph workspaces through the final graph operation, so
 its memory planner cannot reuse their storage while the graph still needs it.
 Triton's helper cache key uses machine, operating system, and interpreter pointer
 width without invoking `file`, avoiding subprocess probing under profiler injection.
-Compiled-forward and Torch graph cache identities include the runtime patches.
+Binary addition, subtraction, multiplication, and division metadata retain scalar
+operands when deriving output strides. The reshape core uses native stride
+calculation for backed shapes that permit a view. These rules preserve
+singleton-dimension strides that affect native memory-format selection. The
+reshape path retains its existing handling of unbacked shapes, zero-sized and
+scalar tensors, and cases that require a copy or an error. Compiled-forward,
+Torch graph, and FakeTensor metadata cache identities include the runtime patches.
 
 Standalone Python tools that use Torch or Triton directly must install the fixes
 in the same process before compilation or CUDA driver initialization:

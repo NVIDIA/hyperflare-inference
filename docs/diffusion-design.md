@@ -116,19 +116,17 @@ from export or native replay differences.
 Default numerical acceptance is exact equality; any nonzero tolerance must be
 explicit. Reports retain per-tensor errors and raw timing samples.
 
-On NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120), the four-step and
-30-step profiles have been checked with the recipe's two prompts and noise
-seeds 42 and 43. Independently loaded native executions replay all seven or
-33 graphs respectively. Their eight or 34 saved outputs and final repetitions
-match the captured compiled outputs byte for byte. The native processes load
-neither Python nor PyTorch. The composed eager forwards match the canonical
-Diffusers observations exactly.
-The compiled text conditioning, denoising updates, and decoded images differ
-from the canonical reference; initialization remains exact. Replaying the
-first update and decoder with canonical intermediate inputs also produces
-differences in both profiles. Export and native replay are verified for these
-cases, while numerical equivalence to canonical Diffusers remains unqualified.
-Exact reference comparisons fail and performance ratios are withheld.
+On NVIDIA RTX 6000D (SM120), the four-step and 30-step profiles are qualified
+with the recipe's two prompts and noise seeds 42 and 43. Independently loaded
+native executions replay all seven or 33 graphs respectively. All eight or 34
+saved outputs match canonical Diffusers and captured compiled execution byte
+for byte, with mean absolute error zero. Saved repeat outputs are also exact.
+The native processes load neither Python nor PyTorch. This qualification covers
+these fixed profiles and inputs; it does not establish other shapes, schedules,
+checkpoints or concurrent serving.
+
+Qualification uses PyTorch 2.14.1+cu132 and Diffusers 0.43.0. Performance remains
+unqualified.
 
 Timing begins with token IDs and noise already on the GPU and ends with the raw
 decoded tensor. It excludes loading, tokenization, transfers and image-file
@@ -142,8 +140,7 @@ the proposed signed semantic serving contract and does not provide concurrent
 admission, cancellation, continuation, native prompt tokenization or an HTTP
 image endpoint. Other shapes, solvers and diffusion architectures are outside
 this preparation path; each step count requires separate numerical
-qualification. Outstanding qualification is tracked in
-[`TODO.txt`](TODO.txt).
+qualification.
 
 ## Fixed PixArt tensor execution
 
@@ -177,14 +174,15 @@ dispatch. The preparation entry point is separate from the token-model recipe
 registry, and the concurrent serving limitations of the SDXL tensor command
 also apply here.
 
-On NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120), both fixed prompts and
-seeds 42 and 43 pass all 43 exact comparisons between the composed eager recipe
-and canonical Diffusers. Independently loaded native executions and their
-repetitions match all captured compiled outputs byte for byte. The native
-executor implementation is unchanged from the SDXL path. Compiled results
-differ from canonical eager results, so exact reference comparisons fail and
-performance ratios are withheld. This qualifies export and native replay for
-the stated profile; canonical numerical equivalence remains unqualified.
+On NVIDIA RTX 6000D (SM120), both fixed prompts and seeds 42 and 43 pass all
+43 comparisons between canonical Diffusers, captured compiled execution and
+independently loaded native execution byte for byte, with mean absolute error
+zero. Saved repeat outputs are also exact. The native executor is shared with
+SDXL. This qualifies the stated fixed profile and inputs; it does not establish
+other shapes, schedules, checkpoints or concurrent serving.
+
+Qualification uses PyTorch 2.14.1+cu132 and Diffusers 0.43.0. Performance remains
+unqualified.
 
 The solver helper's FP16 arithmetic is qualified on CUDA at four and 20 steps
 against the canonical scheduler. CPU FP32 trajectories also match, but CPU
@@ -193,8 +191,7 @@ differently. These scheduler checks do not establish complete-model
 qualification for other step counts, shapes, precision modes, or checkpoints.
 Timing starts with token IDs, masks, and noise on the GPU and ends with the raw
 decoded tensor; it excludes caption processing, loading, transfers, and image
-encoding. Outstanding numerical qualification is tracked in
-[`TODO.txt`](TODO.txt).
+encoding.
 
 ## Prepare and compare fixed profiles
 
