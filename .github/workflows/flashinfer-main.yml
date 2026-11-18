@@ -3,7 +3,11 @@ name: FlashInfer main
 # Flare prepares models against the head of local-inference-lab/flashinfer main.
 # This workflow proves that the dependency declared in pyproject.toml and
 # uv.lock resolves to that exact commit and that the commit builds, installs,
-# and imports on a GPU-less runner. It does not install Flare's full preparation
+# and imports on a GPU-less runner. It also checks that the installed FlashInfer
+# proxy ABI equals the ABI in Flare's native RoCE runtime, which native RoCE
+# transport and prepared cores depend on. That check reads files only and does
+# not prepare a model on a GPU, so it does not show GPU preparation correctness.
+# It does not install Flare's full preparation
 # environment: that pins torch 2.14.1+cu132 and builds Heliopause, which needs
 # CUDA and Rust. The standalone install below uses FlashInfer's own resolved
 # dependencies, so it proves the FlashInfer commit, not the complete preparation
@@ -128,3 +132,8 @@ jobs:
           print(f"installed flashinfer {flashinfer.__version__} at {installed}")
           PY
           df -h /
+      - name: Check the proxy ABI against the native runtime
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/flashinfer-venv"
+          "$venv/bin/python" -I scripts/check_flashinfer_compatibility.py
