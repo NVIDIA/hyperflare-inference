@@ -54,7 +54,7 @@ def test_export_uses_the_configured_model(host, tmp_path, capsys):
 
 
 @pytest.mark.parametrize("arguments, code, message", [
-    (["export", "nope"], 2, "supported models: qwen3.8-flash, qwen3.8-27b, glm-5.3-flash"),
+    (["export", "nope"], 2, "supported models: qwen3.8-flash, qwen3.8-27b, qwen3.8-27b-qad, glm-5.3-flash"),
     (["export", "qwen3.8-flash", "--gpus", "x"], 2, "--gpus expects indices"),
     (["export", "qwen3.8-flash", "--gpus", "9"], 2, "does not have"),
     (["export", "qwen3.8-flash", "--max-concurrency", "65"], 2, "1 through 64"),
@@ -121,8 +121,9 @@ def test_stream_overlap_flag_is_a_preparation_flag_that_overlapping_recipes_acce
         assert not preparation.stream_overlap(serial, resolve(model))
         assert preparation.stream_overlap(_parser().parse_args(["export", model]), resolve(model))
     # MiMo composes no concurrent branches, so serializing them is rejected rather than ignored.
-    assert export("mimo-v2.6-pro-mopd", "--no-stream-overlap") == 2
-    assert "--no-stream-overlap: mimo-v2.6-pro-mopd runs no branches concurrently" in failure(capsys)[0]
+    for alias in ("mimo-v2.6-pro-mopd", "mimo-v2.6-flash-rl"):
+        assert export(alias, "--no-stream-overlap") == 2
+        assert f"--no-stream-overlap: {alias} runs no branches concurrently" in failure(capsys)[0]
 
 
 def test_direct_execution_is_an_explicit_serve_diagnostic(host, capsys):

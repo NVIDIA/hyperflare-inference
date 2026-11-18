@@ -12,6 +12,7 @@ mod cache_memory;
 mod cooperative_tests;
 mod describe;
 pub use describe::InspectionOptions;
+pub mod address_space;
 mod device_memory;
 pub mod driver;
 mod engram;
@@ -28,6 +29,7 @@ pub use metadata::{unverified_metadata, unverified_metadata_selected};
 mod memory;
 mod model;
 mod payload;
+mod peer_access;
 mod protection;
 mod protobuf;
 pub use protobuf::wire;
@@ -66,7 +68,7 @@ use crate::{
     startup::{Phase, StartupProgress},
 };
 use driver::{
-    Access, AllocationProperties, CopyEndpoint, CopyParams, Driver, Handle, KernelParams, Location,
+    AllocationProperties, CopyEndpoint, CopyParams, Driver, Handle, KernelParams, Location,
     MemsetParams, TensorMap,
 };
 use format::{Blob, Memory, Node, Core, Reference, Relocation, RelocationKind, invalid};
@@ -86,6 +88,9 @@ pub struct NativeResources {
     driver: Arc<Driver>,
     context: Handle,
     device: i32,
+    rank: usize,
+    // Allocation base -> (local rank, CUDA device) readers, including the owner.
+    peer_readers: HashMap<u64, Vec<(usize, i32)>>,
     allocations: HashMap<String, Storage>,
     modules: Vec<Handle>,
     functions: HashMap<usize, Handle>,
@@ -343,6 +348,8 @@ impl NativeResources {
                 driver,
                 context,
                 device,
+                rank: 0,
+                peer_readers: HashMap::new(),
                 allocations: HashMap::new(),
                 modules: vec![],
                 functions: HashMap::new(),
@@ -420,7 +427,15 @@ impl NativeResources {
         let driver = &self.driver;
         unsafe {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
+            let bits = address_space::virtual_address_bits(self.device);
             for reservation in &core.reservations {
+                address_space::check_fits(
+                    "core reservation",
+                    reservation.address,
+                    reservation.nbytes as u64,
+                    bits,
+                )
+                .map_err(|error| invalid(format!("{error}; re-export the core for this GPU")))?;
                 let mut address = 0;
                 driver.check(
                     "cuMemAddressReserve",
@@ -583,17 +598,7 @@ impl NativeResources {
                 if allocation.address.is_some() {
                     match allocation.memory {
                         Memory::Device => {
-                            let access = Access {
-                                location: Location {
-                                    kind: 1,
-                                    device: self.device,
-                                },
-                                flags: 3,
-                            };
-                            driver.check(
-                                "cuMemSetAccess",
-                                (driver.access)(address, allocation.nbytes, &access, 1),
-                            )?;
+                            self.grant_storage_access(&allocation.name)?;
                         }
                         Memory::MappedHost => {
                             #[cfg(unix)]

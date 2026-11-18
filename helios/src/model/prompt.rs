@@ -55,6 +55,11 @@ pub fn prepare_image_inputs(
         Some(ImageLayoutKind::Glm) => crate::frontend::images::layouts::glm::prepare_input(
             frontend, processor, rendered, &images,
         )?,
+        Some(ImageLayoutKind::ClassToken) => crate::frontend::images::layouts::class_token::prepare_input(
+            config.contract.frontend.image_tokens.as_ref()
+                .ok_or("class-token image layout requires a prepared feature token")?.feature_token,
+            processor, rendered, &images,
+        )?,
         Some(ImageLayoutKind::Qwen) => crate::frontend::images::layouts::qwen::prepare_input(
             frontend, processor, rendered, &images,
         )?,
@@ -276,26 +281,22 @@ pub fn prepare_output(
     if !tools.is_empty() && syntax.tools.is_none() {
         return Err("tool parsing is not prepared".into());
     }
-    let mut control_tokens = if syntax
-        .tools
-        .as_ref()
-        .is_some_and(|tool| matches!(tool.kind, super::contract::ToolParserKind::Xtml | super::contract::ToolParserKind::Atem))
-    {
-        let markers = if syntax.tools.as_ref().unwrap().kind == super::contract::ToolParserKind::Atem {
-            vec!["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
-        } else { vec!["<|open|>", "<|close|>", "<|sep|>"] };
-        markers.into_iter()
-            .map(|marker| {
-                let ids = frontend.encode(marker, false)?;
-                if ids.len() != 1 {
-                    return Err("output envelope delimiters must each occupy one tokenizer token".into());
-                }
-                Ok((ids[0], marker.to_owned()))
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        vec![]
+    let markers: &[&str] = match syntax.tools.as_ref().map(|tool| tool.kind) {
+        Some(super::contract::ToolParserKind::Xtml) => &["<|open|>", "<|close|>", "<|sep|>"],
+        Some(super::contract::ToolParserKind::Atem) => &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"],
+        Some(super::contract::ToolParserKind::TmlJson) => &crate::output::tml::CONTROL_MARKERS,
+        _ => &[],
     };
+    let mut control_tokens = markers
+        .iter()
+        .map(|&marker| {
+            let ids = frontend.encode(marker, false)?;
+            if ids.len() != 1 {
+                return Err("output envelope delimiters must each occupy one tokenizer token".into());
+            }
+            Ok((ids[0], marker.to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     if syntax.tools.as_ref().is_some_and(|tool| tool.kind == super::contract::ToolParserKind::Dsml) {
         let tokenizer = frontend.tokenizer();
         for token in [deepseek_recipe_core::special_tokens::SpecialToken::ThinkingEnd,
@@ -313,7 +314,12 @@ pub fn prepare_output(
     if recipient {
         reasoning = prefix.is_some_and(|p| p.starts_with(" to=self<|message|>"));
     }
-    let start = if recipient && !open_assistant {
+    let content_headers = syntax.tools.as_ref().is_some_and(|t| t.kind == super::contract::ToolParserKind::TmlJson);
+    let start = if content_headers {
+        // The last framing token generated as a control token decides whether the
+        // prompt ends between frames, inside a header, or inside a frame body.
+        crate::output::tml::prompt_start(&rendered.token_ids, &control_tokens)
+    } else if recipient && !open_assistant {
         crate::output::tagged::OutputStart::RecipientFrame
     } else if recipient && prefix.is_some_and(|p| !p.contains("<|message|>")) {
         crate::output::tagged::OutputStart::RecipientHeader
@@ -406,6 +412,7 @@ mod tests {
             (ImageLayoutKind::Moonvit, ImageSettings::Moonvit {}, "<|media_pad|>", 4),
             (ImageLayoutKind::Step, ImageSettings::Step {}, "<im_patch>", 16),
             (ImageLayoutKind::Radio, ImageSettings::Radio {}, "<image>", 4),
+            (ImageLayoutKind::ClassToken, ImageSettings::PaddedGrid {}, "<image>", 4),
         ];
         for (layout, settings, placeholder, merge) in profiles {
             let initial = ImageProcessor::load(settings.clone(), Default::default()).unwrap();

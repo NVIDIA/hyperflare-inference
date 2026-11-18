@@ -144,7 +144,8 @@ class PreparedParallelDraftRound:
                 name=name + ".markov",
             )
         )
-        if self.draft is not None and self.vocabulary_parallel:
+        self.recurrent = getattr(self.draft, "recurrent", None)
+        if self.draft is not None and self.vocabulary_parallel and self.recurrent is None:
             from .dspark import PreparedMarkovEmbedding
 
             self.markov = PreparedMarkovEmbedding(o.weights, self.markov_token,
@@ -324,16 +325,18 @@ class PreparedParallelDraftRound:
 
         o, b, w = self.owner, self.batch, self.width
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
-        start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
+        start = o.weights.shard.rank * self.probability_shape[-1]
         options = dict(start=start, runtime=o.sampling_runtime, session=o.session,
                        coordinator=o.collectives["coordinator"])
         if self.draft is not None:
             local = torch.empty(self.draft.local_logit_shape, dtype=self.draft.local_logit_dtype,
                                 device=o.requests.histogram.device).view(b, o.block_size, -1)
             base = local[:, o.logit_offset:o.logit_offset + w - 1]
+            transition = ({} if self.recurrent is not None else dict(
+                embedding=o.weights.draft.markov_embedding, head=o.weights.draft.markov_head))
             self.full_proposal = PreparedVocabularySoftmax(base, self.probabilities, self.valid, *args,
                 self.drafts, **options, name=self.name + ".proposal", workspace=None,
-                embedding=o.weights.draft.markov_embedding, head=o.weights.draft.markov_head,
+                **transition,
                 pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts)
             self.full_proposal.prepare()
         if self.proposal_only:
@@ -435,7 +438,21 @@ class PreparedParallelDraftRound:
             block_state = None
             if self.full_proposal is not None:
                 base = draft_logits[:, o.logit_offset:o.logit_offset + w - 1]
-                if self.vocabulary_parallel:
+                if self.vocabulary_parallel and self.recurrent is not None:
+                    hidden = features["hidden"].view(b, block, -1)
+                    context = features["recurrent_context"]
+                    state = self.recurrent.begin(context)
+                    scores = torch.empty_like(draft_logits)[:, o.logit_offset:o.logit_offset + w - 1]
+                    for index in range(w - 1):
+                        state, logits = self.recurrent.step(state, markov_token,
+                            hidden[:, index + o.logit_offset].contiguous(), context,
+                            base[:, index])
+                        scores[:, index].copy_(logits)
+                        self.full_proposal.run_step(index, scores, drafts, pending=markov_token,
+                            seeds=seed, offsets=base_offset, probabilities=probabilities, valid=valid,
+                            tokens=drafts)
+                        markov_token = drafts[:, index].clone()
+                elif self.vocabulary_parallel:
                     self.full_proposal.run(base, drafts, pending=markov_token, seeds=seed, offsets=base_offset,
                         probabilities=probabilities, valid=valid, tokens=drafts)
                 else:

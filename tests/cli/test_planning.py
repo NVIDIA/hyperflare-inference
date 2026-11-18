@@ -308,7 +308,7 @@ def test_prefill_chunk_defaults_to_the_recipe_and_accepts_an_override():
 
 @pytest.mark.parametrize("model,world_size,packed", [
     pytest.param(ResolvedModel(recipe, checkpoint),
-                 8 if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
+                 recipe.checkpoint_tensor_parallel(checkpoint)[-1] if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
                  recipe.speculation.packed_verification, id=checkpoint.alias)
     for recipe in recipes() if recipe.speculation is not None for checkpoint in recipe.checkpoints
 ])
@@ -328,7 +328,8 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     configuration = Configuration.load(path)
     if expected is None:
         expected = ((4, 4096, 6) if model.recipe.name == "gemma4" else
-                    (4, 4096, 32) if model.recipe.name == "muse_spark" else (32, 4096, 128))
+                    (4, 4096, 32) if model.recipe.name == "muse_spark" else
+                    (8, 4096, 64) if model.recipe.name == "inkling2" else (32, 4096, 128))
     args = _parser().parse_args(["export", model.checkpoint.alias, *flags])
     selected = preparation.speculation(args, model, configuration)
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
@@ -353,6 +354,42 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     assert record["speculative_token_capacity"] == expected[2]
     assert record["speculation"]["packed_verification"] is packed
     assert record["speculation"]["draft_prefix_selection"] == model.recipe.speculation.draft_prefix_selection
+
+
+@pytest.mark.parametrize("model", [
+    pytest.param(ResolvedModel(recipe, checkpoint), id=checkpoint.alias)
+    for recipe in recipes() if recipe.name in ("kimi3", "kimi31") for checkpoint in recipe.checkpoints
+])
+@pytest.mark.parametrize("compression", [("--expert-scale-compression",), ("--expert-scale-compression", "csf")],
+                         ids=["bare-csf", "explicit-csf"])
+@pytest.mark.parametrize("drafting", [False, True])
+def test_kimi_expert_scale_compression_preserves_cli_plan_capacity(tmp_path, model, compression, drafting):
+    from ignition.cli import _parser, preparation
+    from ignition.cli.config import Configuration
+
+    path = tmp_path / "flare.toml"
+    path.write_text("")
+    configuration = Configuration.load(path)
+    alias = model.checkpoint.alias
+    flags = ["--speculative-token-capacity", "64"] if drafting else ["--no-mtp"]
+    args = _parser().parse_args(["export", alias, "--gpus", "0-15", "--max-concurrency", "8",
+        "--prefill-chunk-size", "4096", *flags, *compression])
+    devices = tuple(replace(gpu(i, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for i in range(16))
+    settings = dict(gpus=args.gpus,
+        concurrency=configuration.max_concurrency(alias, model.recipe.concurrency, args.max_concurrency),
+        speculation=preparation.speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size)
+    host = preparation.Host(devices, None)
+    default = preparation.derive(configuration, model, host, **settings)
+    plan = preparation.derive(configuration, model, host,
+        expert_scale_compression=args.expert_scale_compression, **settings)
+
+    assert plan.expert_scale_compression == plan.to_dict()["expert_scale_compression"] == "csf"
+    assert (plan.world_size, plan.concurrency, plan.prefill_chunk) == (16, 8, 4096)
+    assert (plan.speculation is not None) is drafting
+    if drafting:
+        assert plan.speculative_token_capacity == 64
+    assert (plan.weights_bytes, plan.pages, plan.cache_states) == (
+        default.weights_bytes, default.pages, default.cache_states)
 
 
 @pytest.mark.parametrize("alias,scope", [("kimi-k3", "all"), ("kimi-k3.1-pro", "kda-input")])
@@ -425,14 +462,37 @@ def test_online_mxfp8_scope_must_be_declared_by_recipe():
 
 
 @pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
-def test_online_mxfp8_has_no_user_scope_option(command, capsys):
+def test_online_mxfp8_scope_option(command):
     from ignition.cli import _parser
 
-    with pytest.raises(SystemExit) as error:
-        _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8",
-                              "--online-mxfp8-scope", "all"])
-    assert error.value.code == 2
-    assert "unrecognized arguments: --online-mxfp8-scope all" in capsys.readouterr().err
+    default = _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8"])
+    args = _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8",
+                                 "--online-mxfp8-scope", "all"])
+    assert default.online_mxfp8_scope is None
+    assert args.online_mxfp8_scope == "all"
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
+def test_draft_body_quantization_option(command):
+    from ignition.cli import _parser
+
+    default = _parser().parse_args([command, "kimi-k3.1-pro", "--speculative-method", "dflash2"])
+    args = _parser().parse_args([command, "kimi-k3.1-pro", "--speculative-method", "dflash2",
+                                 "--draft-body-quantization", "mxfp8"])
+    assert default.draft_body_quantization is None
+    assert args.draft_body_quantization == "mxfp8"
+
+
+def test_draft_body_quantization_requires_dflash2_and_positive_depth():
+    from ignition.recipes.kimi31.recipe import RECIPE
+
+    with pytest.raises(UsageError, match="requires --speculative-method dflash2"):
+        devices = tuple(replace(gpu(i, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for i in range(16))
+        planning.fit(RECIPE, RECIPE.checkpoints[0], devices, concurrency=1,
+                     reserve_bytes=0, speculation=replace(RECIPE.speculation,
+                                                          draft_body_quantization="mxfp8"))
+    with pytest.raises(ValueError, match="positive learned draft depth"):
+        Speculation(0, draft_body_quantization="mxfp8")
 
 
 @pytest.mark.parametrize("alias,default", [("kimi-k3", "all"), ("kimi-k3.1-pro", "kda-input")])

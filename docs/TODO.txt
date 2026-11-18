@@ -1,3 +1,21 @@
+[ ] Compare Inkling 2 effort-zero generation with the canonical target using
+    the static NVFP4 checkpoint. Native TP4 emits analysis in content_text and
+    violates exact-output prompts; a long-prefix lookup also intermittently
+    reaches its 1024-token output limit. The TML prompt matches tml-renderers 0.4.1.
+    Preserve the failing zero-effort cases in tests/server/test_inkling2.py.
+
+[ ] Qualify Inkling 2 numerical agreement at long contexts and on fully
+    populated large vision graphs. Canonical vision comparisons cover at most
+    256 live patches.
+
+[ ] Fix native TP4 shutdown reporting "free(): double free detected in tcache 2"
+    after server drain with Inkling 2 cores. Reproduces with compiled and
+    uncompiled graphs; preserve the successful request drain and GPU release.
+
+[ ] Make test_explicit_worker_budget_compiles_and_replays_a_catalog account for
+    host memory admission. Its nine-worker assertion requires 296 GiB available
+    under the 32 GiB worker allowance and 8 GiB headroom; smaller hosts admit fewer.
+
 [ ] Ensure Rust bridge updates relink the WinUI executable during incremental
     builds. MSBuild can retain flare-winui.exe after the bridge library changes;
     verify loose and single-file outputs without requiring /t:Rebuild.
@@ -72,6 +90,14 @@
     catalogs, host copy-out pressure, and tensor-parallel execution. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.
 
+[ ] Qualify capacity-blocked host restores and demand recency for individual checkpoints
+    through exported Kimi K3.1 cores under concurrent long prompts, immediate
+    continuations, and aliased snapshot pressure. Compare reused tokens, request
+    latency, throughput, snapshot backing pages, and storage skips with equivalent
+    clocks and cache budgets; include prompt-end and message-boundary follow-ups.
+    Remove after native serving confirms restoration progress and retention behavior;
+    CPU scheduler and worker tests do not establish serving performance.
+
 [ ] Correct the 10-byte core payload fixtures in Orbit agent tests
     running_groups_are_stopped_and_outlive_their_controller_session and
     groups_run_together_on_disjoint_gpus_and_status_lists_them; their transfer
@@ -143,6 +169,18 @@
     ownership, publication ordering, scratch/epoch reuse, and preparation-time
     autotuning against existing collectives. Cover graph replay, concurrent
     channels, rollover, and complete-collective latency on the target topology.
+
+[ ] Test Kimi K3.1 latent-column reduce-scatter plus one FP32 RMS-statistic
+    all-reduce per token before other MoE collective changes. Compare against
+    the latent all-reduce at TP16, prefill 4096, context 0. Preserve BF16
+    normalization rounding and validate numerical agreement and complete graph
+    latency. The candidate reduces latent replication but adds a serial
+    collective stage.
+
+[ ] Honor --expert-scale-compression native in Kimi K3 and K3.1 preparation
+    and report the default encoding accurately. The shared loader always uses
+    CSF, and the declared resident weight estimate already includes compression.
+    Wire the option through loading and add native-scale memory costs and tests.
 
 [ ] Review fusion of pooled DeepSeek V4.1 indexer lengths: captured graphs split
     clamp from amax and retain explicit copy kernels. Measure complete GPU steps
@@ -461,3 +499,8 @@
 [ ] Publish Debian packages with releases and update the APT repository from
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
+
+[ ] Repair runtime collective-policy fixtures in tests/cli/test_planning.py.
+    test_every_recipe_passes_collective_policy_to_preparation rewrites a TP4
+    ladder to DeepSeek V4.1 TP3 or Muse Spark TP8; b12x rejects those gather
+    and word-exchange candidates before the preparation handoff is tested.

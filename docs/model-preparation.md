@@ -813,6 +813,34 @@ Use two or four available GPUs for preparation and serving:
   --gpus 0,1,2,3
 ```
 
+The 160 GB checkpoint exceeds one DGX Spark's memory, so Spark serving runs
+tensor-parallel across two or four hosts, one rank per host, reducing through
+RoCEnante over their ConnectX-7 ports. One runtime carries the hidden and
+prefill reductions, the vocabulary gathers, the DSpark Markov gather, and the
+sampling broadcasts. Multi-host export requires the checkpoint in rank zero's
+hub cache at the declared revision; it does not download. On rank zero, whose
+preparation address is `10.200.0.12`:
+
+```sh
+.venv/bin/ignition export deepseek-v4-flash --ranks 2 \
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 16
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek4-spark-tp2.safetensors
+```
+
+On the peer:
+
+```sh
+.venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 2
+```
+
+Four Sparks use `--ranks 4` and join peer ranks 1 through 3. Serve through
+`flare orbit run spark1:/data/flare-runtime/deepseek4-spark-tp2.safetensors --cluster sparks`,
+following the [multi-host guide](multi-host.md) for preparation authentication
+and rank placement. On GB10, a TP2 core with sixteen concurrent requests
+and 8192-token chunks allocates 85.3 GiB per rank and, at the default 4 GiB
+reserve, 14.4 GiB of KV cache. Image requests and four-Spark TP4 have not
+been run on GB10.
+
 V4 uses 256-token logical pages containing 64 C4 latent records with an FP8
 retrieval index, or two C128 latent records with dense history attention. Each latent page
 stores FP8/BF16 payloads followed by its own scale footer. Continuation rows
@@ -847,6 +875,69 @@ token and seven proposals. Helios uses the shared speculative execution contract
 draft modeling and state updates are captured by Ignition. The vision encoder
 publishes compact image features for causal text prefill. Loading with
 `--mtp-draft-tokens 0` selects ordinary execution without draft-state updates.
+Image resize bounds and normalization come from the checkpoint's
+`preprocessor_config.json` and are packaged for the native frontend.
+
+## MiMo V2.6 Flash RL
+
+MiMo V2.6 Flash RL uses `XiaomiMiMo/MiMo-V2.6-Flash-RL` at revision
+`f657ba2f7d24c9adc5730675baaa2d34de878a49`, a 48-layer, 256-expert sibling of
+MiMo V2.6 Pro MOPD with the same checkpoint formats, chat template, tokenizer,
+and DFlash draft structure. Its global-attention layers store four KV heads and
+its sliding-window layers eight, and its fused-QKV projections are stored as four
+checkpoint shards, so the `mimo-v2.6-flash-rl` alias prepares two or four ranks.
+The alias prepares text, images, and seven DFlash draft tokens with adaptive
+verification; audio is not prepared. The API advertises the model as
+`MiMo-V2.6-Flash-RL`.
+
+The 173 GB checkpoint exceeds one DGX Spark's memory, so Spark serving runs
+tensor-parallel across two hosts, one rank per host, reducing through RoCEnante
+over their ConnectX-7 ports. Multi-host export requires the checkpoint, including
+its `dflash/` directory, in rank zero's hub cache at the declared revision; it
+does not download. The example prepares sixteen concurrent requests with
+8192-token prefill chunks on two Sparks, following the
+[multi-host guide](multi-host.md) for preparation authentication and rank
+placement. `--lock-gpu-clocks` needs root or passwordless `sudo` for
+`nvidia-smi` on both hosts; omit it otherwise. On rank zero, whose preparation
+address is `10.200.0.12`:
+
+```sh
+.venv/bin/ignition export mimo-v2.6-flash-rl --ranks 2 \
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 16 \
+  --prefill-chunk-size 8192 --native-dense-activations \
+  --autotune-effort audit --lock-gpu-clocks
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors
+```
+
+On the peer:
+
+```sh
+.venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 2
+```
+
+A `[models."mimo-v2.6-flash-rl"]` section with `max_concurrency = 16` in the
+[configuration file](cli-design.md#33-configuration-file) makes that capacity the
+host's default; the chunk size and tuning options are command-line flags.
+
+Serve the core through `flare orbit run` with a two-node cluster whose
+first node holds the core, or from both hosts directly:
+
+```sh
+flare orbit run spark1:/data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors \
+  --cluster sparks --name mimo --host 0.0.0.0
+
+./flare/target/release/flare run /data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors \
+  --rank 0 --rendezvous maxwell:29800
+./flare/target/release/flare run --rank 1 --rendezvous maxwell:29800
+```
+
+Orbit sends the peer its rank's data once over the ConnectX-7 link, about
+88 GB, before loading starts.
+
+On one host with two or four GPUs, select them with `--gpus` as for the Pro
+checkpoint. On GB10, a TP2 core with sixteen concurrent requests and
+8192-token chunks loads 93.9 GiB per rank and, at the default 4 GiB reserve,
+9.9 GiB of KV cache. Image requests have not been qualified on GB10.
 
 ## Step-5 Preview
 
@@ -1010,9 +1101,11 @@ The checkpoint's native MXFP4 expert weights use losslessly compressed block
 scales during preparation. The sparse indexer retains its BF16 checkpoint
 projections and LayerNorm weights, including with `--online-mxfp8`.
 `--online-mxfp8` converts only the fused target KDA inputs (`q_proj`, `k_proj`,
-`v_proj`, `f_a_proj`, `g_proj`, and `b_proj`). Other target projections and
-DSpark and DFlash2 draft weights retain checkpoint precision. Omit the flag to retain
-checkpoint precision for every projection.
+`v_proj`, `f_a_proj`, `g_proj`, and `b_proj`) by default. Other target projections and
+DSpark and DFlash2 draft weights retain checkpoint precision. With DFlash2,
+`--online-mxfp8-scope all` converts every eligible target and draft projection, including
+attention output/latent projections, shared experts, and MoE latent projections. Omit the
+flag to retain checkpoint precision for every projection.
 Index queries and keys use neither RoPE nor Hadamard rotation. Head-gate
 projection and normalization round in BF16. Query scales round upward to powers
 of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
@@ -1152,12 +1245,18 @@ taps and full-context BF16 cache; the two draft formats are not interchangeable.
 With seven drafts, each continuation row uses 35,450,112 bytes, including five
 1024-token latent rings. Target cache pages retain their 2,174,976-byte size.
 
-The body and shared target vocabulary head remain BF16 with the KDA-input-only
-online conversion. An explicit `--draft-head-quantization mxfp8` or `nvfp4`
-prepares a separate proposal-head copy; it does not convert the target head.
-Preparation rejects the flag for the Inferact DSpark draft.
-Its additional weight storage and effect on acceptance must be evaluated for
-the workload. The example keeps the BF16 head.
+The body and shared target vocabulary head remain BF16 with the default
+KDA-input-only online conversion. `--draft-body-quantization mxfp8` converts
+eligible DFlash2 body context, attention latent/query/output, and MLP projections
+independently of target conversion; it does not require `--online-mxfp8`.
+`--online-mxfp8-scope all` also converts these body projections together with the
+broader target conversion described above. Normalization, convolution,
+candidate-selector, and absorbed key/value weights retain their precision.
+An explicit `--draft-head-quantization mxfp8` or `nvfp4` prepares a separate
+proposal-head copy; it does not convert the target head. Preparation rejects
+body or head conversion for the Inferact DSpark draft. Quantized draft weight
+storage and the effect on acceptance must be evaluated for the workload. The
+example keeps the BF16 body and head.
 
 Qualified by checkpoint-backed numerical tests: MLA attention and
 accepted-context projection. To validate TP16 graph replay of the draft body and
@@ -1202,6 +1301,61 @@ weight budget for this encoding; loading reports its actual allocation.
 .venv/bin/ignition export minimax-m3-1-flash --gpus 0-3
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors
 flare-cli/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0,1,2,3
+```
+
+## Inkling 2 Small NVFP4
+
+The `inkling-2-small-nvfp4` alias selects the local checkpoint
+`/data/models/Inkling-2-Small-NVFP4`. Preparation requires four SM120 GPUs and
+the bundled DSpark weights in `mtp.safetensors`. Target experts retain the
+checkpoint's static NVFP4 scales, with A4 activations for prefill and A16
+activations for decoding and speculative verification. DSpark uses MXFP8
+feed-forward projections and BF16 attention and recurrent state. Target and
+draft attention use b12x. The pinned FlashInfer dependency provides relative
+bias, private paged-attention tails, and explicit expert activation selection.
+
+The recipe declares a 1048576-token context, eight concurrent requests,
+4096-token prefill chunks, and seven draft tokens per round. Adaptive packed
+verification has 64 target rows and a 64-graph budget, plus width-one graphs
+that preserve DSpark context. The vision encoder accepts padded 20-pixel
+patches, merges each 2-by-2 group, and supports four images per request and
+four concurrent image requests. Native TMLv0 encoding and parsing provide
+reasoning, tool calls, and structured responses. Sampling defaults are
+temperature 1.0 and top-p 1.0; the prompt encoder defaults to reasoning effort
+0.9 when the request does not specify one.
+
+Export with default tuning and Torch compilation:
+
+```sh
+ulimit -Sn 65536
+.venv/bin/ignition export /data/models/Inkling-2-Small-NVFP4 \
+  --gpus 0,1,2,3 --max-concurrency 8 --image-concurrency 4 \
+  --prefill-chunk-size 4096 --mtp-draft-tokens 7 \
+  --speculative-token-capacity 64 --speculative-graph-budget 64 \
+  --autotune-effort default
+```
+
+Pass the printed `Exported cache entry` path to `flare run`:
+
+```sh
+flare-cli/target/release/flare run CACHE_ENTRY --gpus 0,1,2,3 \
+  --mtp-draft-tokens 7 --no-history-drafts
+```
+
+On four RTX PRO 6000 Blackwell Max-Q GPUs, this configuration compiled and
+captured all 130 graphs and passed native text, eight-request concurrency,
+streaming, prefix reuse and branching, tool, structured-response, and multi-image
+tests at the default reasoning effort. The captured graph pool uses 1580 MiB
+per GPU. Native loading used 85.72 GiB per GPU and allocated 1761280 aggregate
+KV-token slots. Admission is bounded by that shared pool as well as the declared
+per-request context limit. A raw completion
+with 1048575 repeated input tokens and one generated token passed the context
+capacity check; an over-limit prompt was rejected. Run the default-effort
+serving checks with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 FLARE_INKLING2_TEST_URL=http://127.0.0.1:8000 \
+  .venv/bin/python -m pytest tests/server/test_inkling2.py -k default-effort -q
 ```
 
 ## Muse Spark Open

@@ -21,7 +21,7 @@ from ignition.recipes.declaration import SamplingDefaults, SamplingRange
 @pytest.mark.parametrize("recipe", recipes(), ids=lambda recipe: recipe.name)
 def test_default_mode_uses_manually_declared_model_card_sampling(recipe):
     qwen = recipe.name in ("qwen38", "qwen38_dense")
-    expected = dict(seed=0, temperature=1., top_p=1. if recipe.name in ("deepseek41", "kimi3") else .95,
+    expected = dict(seed=0, temperature=1., top_p=1. if recipe.name in ("deepseek41", "kimi3", "inkling2") else .95,
         top_k=20 if qwen else 64 if recipe.name == "gemma4" else -1, min_p=0., repetition_penalty=1., presence_penalty=0., frequency_penalty=0.)
     if qwen:
         expected["ranges"] = {"temperature": {"min": .7, "max": 1.}, "top_p": {"min": .8, "max": .95},
@@ -86,6 +86,32 @@ def test_image_metadata_is_a_tight_consumed_contract():
             image_settings(changed, model, "qwen")
 
 
+def mimo_source(min_pixels, max_pixels, mean, std):
+    processor = dict(processor_class="Qwen2_5_VLProcessor", image_processor_type="Qwen2VLImageProcessor",
+        patch_size=16, temporal_patch_size=2, merge_size=2, min_pixels=min_pixels, max_pixels=max_pixels,
+        image_mean=mean, image_std=std)
+    model = dict(model_type="mimo_v2", image_token_id=151655,
+        vision_config=dict(patch_size=16, temporal_patch_size=2, spatial_merge_size=2))
+    return processor, model
+
+
+@pytest.mark.parametrize("area,mean,std", [
+    ((3136, 12845056), [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+    ((8192, 8388608), [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+def test_mimo_image_profile_packages_the_checkpoint_resize_area_and_normalization(area, mean, std):
+    processor, model = mimo_source(*area, mean, std)
+    assert image_settings(processor, model, "mimo") == {"mimo": dict(
+        min_pixels=area[0], max_pixels=area[1], image_mean=mean, image_std=std)}
+    for key, value in (("min_pixels", 0), ("min_pixels", area[1] + 1), ("max_pixels", 1.5),
+                       ("image_mean", mean[:2]), ("image_mean", [float("nan"), 0.5, 0.5]),
+                       ("image_std", [0.2, 0., 0.2]), ("merge_size", 3)):
+        with pytest.raises(ValueError, match="unsupported image processor"):
+            image_settings({**processor, key: value}, model, "mimo")
+    with pytest.raises(ValueError, match="unsupported model configuration"):
+        image_settings(processor, {**model, "model_type": "qwen4_exp"}, "mimo")
+
+
 def test_glm_image_profile_validates_checkpoint_structure():
     fixture = json.loads((Path(__file__).parents[1] / "frontend/glm53_images.json").read_text())
     processor, model = fixture["processor"], fixture["model"]
@@ -95,6 +121,31 @@ def test_glm_image_profile_validates_checkpoint_structure():
         changed = {**processor, "image_processor": {**processor["image_processor"], key: value}}
         with pytest.raises(ValueError, match="unsupported GLM"):
             image_settings(changed, model, "glm")
+
+
+def test_padded_grid_image_profile_validates_processor_and_vision_configs():
+    fixture = json.loads((Path(__file__).parents[1] / "frontend/inkling2_images.json").read_text())
+    processor, model = fixture["processor"], fixture["model"]
+    assert image_settings(processor, model, "padded_grid") == {"padded_grid": {}}
+    for key, value in (("size", {"height": 32, "width": 32}), ("image_mean", [0.48145466, 0.4578275, 0.40821073]),
+                       ("rescale_factor", 1.), ("do_convert_rgb", 1), ("do_resize", True)):
+        changed = {**processor, "image_processor": {**processor["image_processor"], key: value}}
+        with pytest.raises(ValueError, match="unsupported padded-grid image processor"):
+            image_settings(changed, model, "padded_grid")
+    for key, value in (("native_patch_size", 16), ("adapter_merge_size", 1), ("posemb_grid_size", 48),
+                       ("temporal_patch_size", 1)):
+        changed = {**model, "vision_config": {**model["vision_config"], key: value}}
+        with pytest.raises(ValueError, match="unsupported padded-grid vision configuration"):
+            image_settings(processor, changed, "padded_grid")
+    with pytest.raises(ValueError, match="unsupported padded-grid processor"):
+        image_settings({**processor, "processor_class": "Qwen3VLProcessor"}, model, "padded_grid")
+    with pytest.raises(ValueError, match="unsupported padded-grid model configuration"):
+        image_settings(processor, {**model, "model_type": "glm5_next"}, "padded_grid")
+    source = server()
+    source["frontend"]["image"] = image_settings(processor, model, "padded_grid")
+    index = ModelIndex(version=4, ranks=[BundleIndex()])
+    serving(index, source)
+    assert index.frontend.image.WhichOneof("profile") == "padded_grid"
 
 
 def server():

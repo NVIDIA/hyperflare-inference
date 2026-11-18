@@ -6,6 +6,7 @@
 
 import json
 import hashlib
+import math
 from enum import IntEnum
 from pathlib import Path
 
@@ -14,6 +15,7 @@ class PromptEncoder(IntEnum):
     PROMPT_JINJA = 0
     DEEPSEEK_V4 = 1
     DEEPSEEK_V41 = 2
+    TML_V0 = 3
 
 
 TOKEN_FIELDS = ("bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token")
@@ -76,6 +78,20 @@ def _expected(config, values, label):
 
 
 def image_settings(config, model, profile):
+    if profile == "padded_grid":
+        # Inkling 2 ships the processor in processor_config.json; `size` is the token cell, not a resize target.
+        _expected(config, {"processor_class": "Inkling2Processor"}, "padded-grid processor")
+        image = config.get("image_processor")
+        expected = {"image_processor_type": "Inkling2ImageProcessor", "size": {"height": 40, "width": 40},
+            "image_mean": [0.5] * 3, "image_std": [0.5] * 3, "rescale_factor": 1 / 255,
+            "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
+        if not isinstance(image, dict) or set(image) != set(expected):
+            raise ValueError("unsupported padded-grid image processor fields")
+        _expected(image, expected, "padded-grid image processor")
+        _expected(model, {"model_type": "inkling2"}, "padded-grid model configuration")
+        _expected(model["vision_config"], {"native_patch_size": 20, "adapter_merge_size": 2,
+            "posemb_grid_size": 32, "temporal_patch_size": 2}, "padded-grid vision configuration")
+        return {"padded_grid": {}}
     if profile == "glm":
         _expected(config, {"processor_class": "Glm5NextProcessor"}, "GLM processor")
         image = config["image_processor"]
@@ -130,12 +146,11 @@ def image_settings(config, model, profile):
     if profile not in ("qwen", "mimo"):
         raise ValueError("unsupported image preprocessing profile")
     qwen = profile == "qwen"
-    mean = [0.5] * 3 if qwen else [0.48145466, 0.4578275, 0.40821073]
-    std = [0.5] * 3 if qwen else [0.26862954, 0.26130258, 0.27577711]
+    if qwen:
+        _expected(config, {"image_mean": [0.5] * 3, "image_std": [0.5] * 3}, "image processor")
     _expected(config, {"processor_class": "Qwen3VLProcessor" if qwen else "Qwen2_5_VLProcessor",
         "image_processor_type": "Qwen2VLImageProcessorFast" if qwen else "Qwen2VLImageProcessor",
-        "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
-        "image_mean": mean, "image_std": std}, "image processor")
+        "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2}, "image processor")
     optional = {"resample": 3, "rescale_factor": 1 / 255,
         "do_resize": True, "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
     _expected(config, {key: value for key, value in optional.items() if key in config}, "image processor")
@@ -152,9 +167,21 @@ def image_settings(config, model, profile):
                 raise ValueError(f"invalid model {name}")
             result[name] = value
     else:
-        _expected(config, {"min_pixels": 3136, "max_pixels": 12845056}, "resize area")
+        # MiMo checkpoints publish their own resize area and normalization; the native frontend
+        # consumes the packaged values, so preparation validates their form rather than fixing them.
         _expected(model, {"image_token_id": 151655}, "model configuration")
-        result = dict(min_pixels=3136, max_pixels=12845056, image_mean=mean, image_std=std)
+        result = dict(min_pixels=config.get("min_pixels"), max_pixels=config.get("max_pixels"),
+                      image_mean=config.get("image_mean"), image_std=config.get("image_std"))
+        if (any(type(result[key]) is not int for key in ("min_pixels", "max_pixels"))
+                or not 0 < result["min_pixels"] <= result["max_pixels"]):
+            raise ValueError("unsupported image processor resize area")
+        for key in ("image_mean", "image_std"):
+            values = result[key]
+            if (not isinstance(values, list) or len(values) != 3
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)
+                    or key == "image_std" and any(v <= 0 for v in values)):
+                raise ValueError(f"unsupported image processor {key}")
+            result[key] = [float(v) for v in values]
     return {profile: result}
 
 

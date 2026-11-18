@@ -447,6 +447,7 @@ explicit flags take precedence.
 | `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2; Kimi K3.1 Pro defaults to its DSpark draft and also supports DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
 | `--mtp-only` | Omit MTP-disabled prefill, decode, maintenance, and mixed graphs during preparation. Retain width-one speculative rounds and vision graphs. Requires positive draft depth; rejects `--no-mtp`. The core cannot load with native `--mtp-draft-tokens 0`. | Capture both execution modes |
+| `--draft-body-quantization {mxfp8}` | Prepare eligible DFlash2 body context, attention latent/query/output, and MLP projections as MXFP8, independently of target conversion and proposal-head precision. Kimi K3.1 Pro requires `--speculative-method dflash2` and positive learned draft depth; DSpark and other recipes reject it. Normalization, convolution, candidate-selector, and absorbed key/value weights retain their precision. Omission preserves checkpoint precision or the existing `online_mxfp8_scope all` behavior. | No additional override |
 | `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. Flash Next supports both with `--speculative-method dflash2` and a BF16 target vocabulary head. Kimi K3.1 Pro supports both with `--speculative-method dflash2` only. This does not quantize the draft body. | Checkpoint precision |
 | `--markov-head-quantization {nvfp4,fp8}` | Prepare the draft Markov transition projection as NVFP4 or row-scaled E4M3 FP8. DeepSeek V4 supports NVFP4; DeepSeek V4.1 supports both. Requires positive draft depth. | Checkpoint precision |
 | `--vocabulary-parallel-sampling` | Prepare vocabulary-sharded DSpark proposals and block rejection sampling. DeepSeek V4.1 on four GPUs only; three-GPU preparation rejects it. Requires positive draft depth and recipe sampling defaults without top-k, top-p, or min-p filtering, and rejects `--markov-head-quantization nvfp4`. | Full-vocabulary sampling |
@@ -468,7 +469,8 @@ explicit flags take precedence.
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
 | `--force-moe-decode-a16` / `--no-force-moe-decode-a16` | Prepare Qwen3.8 Flash NVFP4 target routed experts as one packed weight owner: decode and speculative verification use W4A16 at every token-row count, and separate prefill graphs use calibrated A4. Requires SM120/121, checkpoint activation scales, and rank-local expert intermediate width divisible by 64 (TP1/2). Mixed prefill and other recipes/precisions reject the flag. Shared experts and stored A16 MTP experts retain their precision. Overrides `[preparation] force_moe_decode_a16`; the resolved value is recorded in the plan and core rebuild metadata. | off |
 | `--native-dense-activations` | Replace dense projection `auto` precision with b12x `quantized`: A8 for FP8 weights and A4 for FP4 weights. Explicit recipe precision and routed MoE precision are retained. NVFP4 requires a checkpoint activation global scale; unsupported native paths fail preparation. | Recipe precision |
-| `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3.1 converts only fused target KDA inputs; other target and draft projections retain checkpoint precision. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Flash Next with `--speculative-method dflash2` converts only DFlash2 projections; target precision is retained. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
+| `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3.1 converts fused target KDA inputs by default; `--online-mxfp8-scope all` also converts eligible attention output/latent projections, shared experts, MoE latent projections, and DFlash2 draft projections. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Flash Next with `--speculative-method dflash2` converts only DFlash2 projections; target precision is retained. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
+| `--online-mxfp8-scope SCOPE` | Select a conversion group declared by the recipe. Kimi K3.1 supports `kda-input` and `all`; the broader group changes target as well as DFlash2 draft projection storage. Other recipes retain their declared conversion set. Command line only; requires `--online-mxfp8` for a non-default group. | Recipe scope |
 | `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Recipes without a separable encoder reject it. | The recipe's image support |
 
 Speculative method, token capacity, and packed graph budget also accept
@@ -486,7 +488,7 @@ recipes default to 32 concurrent requests and 128 target-token rows.
 Qwen3.8 Flash and GLM 5.3 use rectangular catalogs covering five
 drafts through batch 16 and three at batch 32. Step-5's rectangular catalog
 covers its full three-draft depth at batch 32. Qwen3.8 27B, DeepSeek V4/V4.1,
-MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, MiniMax M3.1, and Muse
+MiMo V2.6 Pro, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, MiniMax M3.1, and Muse
 Spark use packed catalogs with a default
 budget of 64 round graphs plus width-one continuations. Each recipe selects
 its proposal and prefix-allocation mode.
@@ -878,10 +880,10 @@ flare run ORG/MODEL@gb202 --filename model.safetensors --gpus 0,1,2,3
 
 These examples use `ORG/MODEL` as a repository placeholder. Repositories contain
 prepared Flare cores, not source Transformers checkpoints. Hardware variants
-are separate Hugging Face revisions named `gb10`, `gb202`, and `gb300`. Automatic selection
+are separate Hugging Face revisions named `ga102`, `gb10`, `gb202`, and `gb300`. Automatic selection
 queries the selected GPUs' PCI device identifiers through NVML without initializing
 CUDA. GB10 selects `gb10`; known GB202 devices, including RTX PRO
-6000 Blackwell, select `gb202`; GB300 selects `gb300`. All selected GPUs must belong to the same family.
+6000 Blackwell, select `gb202`; GB300 selects `gb300`; known GA102 devices select `ga102`. All selected GPUs must belong to the same family.
 An unknown identifier or a driver unable to report it requires an explicit
 revision. GPU selection follows `CUDA_VISIBLE_DEVICES` for both commands.
 Revision detection runs in a short-lived process so NVML's worker threads cannot
@@ -912,7 +914,7 @@ Both commands accept these download options:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10`, `gb202`, or `gb300` |
+| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `ga102`, `gb10`, `gb202`, or `gb300` |
 | `--filename FILE` | Repository-relative prepared core filename | Sole primary `.safetensors` file |
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
@@ -1061,7 +1063,16 @@ Export always writes the directory canonical form in the cache.
 single-file core; `ignition convert CACHE_ENTRY --output DIR` writes a
 standalone directory. `CACHE_ENTRY` is the path printed by export. Both forms use
 the same metadata, payloads, signatures, and location records. Converting between them
-needs no signing key or GPU. `--output` refuses an existing destination. A
+needs no signing key or GPU. Conversion reports its work as the export does, on
+standard error with elapsed time and byte counts: `Verify core`, `Verify stored
+data`, `Write packed core` or `Write core companions`, and the final
+publication of the destination. `Verify core` checks the metadata structure,
+the commitment digests, and that every selected payload is present; conversion
+does not authenticate signatures, which the loader does. `Verify stored data`
+hashes each payload once against its signed identity and counts payload bytes.
+The write phases count every byte written to the destination, including
+container headers and alignment padding, so a finished write phase reports the
+size of the files it produced. `--output` refuses an existing destination. A
 destination on another filesystem is assembled by copying bytes, so those files
 share no storage with the cache; a destination on the cache's filesystem shares
 inodes where it can. Payload-format cores keep the semantic payload boundaries their export declared. No

@@ -15,6 +15,21 @@ pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/flare.runtime.rs"));
 }
 
+impl wire::RebuildManifest {
+    /// Resolve the recorded draft-body conversion for preparation compatibility.
+    /// An omitted DFlash2 override inherits online conversion's `all` scope;
+    /// an omitted scope itself means `all` in persisted rebuild metadata.
+    pub fn effective_draft_body_quantization(&self) -> Option<&str> {
+        let speculation = self.speculation.as_ref()?;
+        speculation.draft_body_quantization.as_deref().or_else(|| {
+            (speculation.method == "dflash2"
+                && self.online_mxfp8
+                && matches!(self.online_mxfp8_scope.as_str(), "" | "all"))
+            .then_some("mxfp8")
+        })
+    }
+}
+
 impl wire::ExecutionGraph {
     pub(super) fn packed_tokens(&self) -> u64 {
         if self.kind == "mixed" {
@@ -158,6 +173,7 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                 Profile::Step(_) => serde_json::json!({"step": {}}),
                 Profile::Radio(_) => serde_json::json!({"radio": {}}),
                 Profile::Glm(_) => serde_json::json!({"glm": {}}),
+                Profile::PaddedGrid(_) => serde_json::json!({"padded_grid": {}}),
             })
         })
         .transpose()?;
@@ -333,6 +349,46 @@ pub(super) fn edge(value: wire::Edge) -> Result<Edge> {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    fn draft_body_precision_resolves_only_documented_inheritance() {
+        for (method, online, scope, explicit, expected) in [
+            ("dflash2", true, "all", None, Some("mxfp8")),
+            ("dflash2", true, "", None, Some("mxfp8")),
+            ("dflash2", false, "all", None, None),
+            ("dflash2", false, "", None, None),
+            ("dflash2", true, "kda-input", None, None),
+            ("dflash2", true, "unknown", None, None),
+            ("mtp", true, "all", None, None),
+            ("", true, "all", None, None),
+            ("dflash2", true, "all", Some("mxfp8"), Some("mxfp8")),
+            ("dflash2", true, "kda-input", Some("mxfp8"), Some("mxfp8")),
+            ("dflash2", false, "all", Some("mxfp8"), Some("mxfp8")),
+            ("dflash2", true, "all", Some("unknown"), Some("unknown")),
+            ("dflash2", true, "all", Some(""), Some("")),
+        ] {
+            let manifest = wire::RebuildManifest {
+                online_mxfp8: online,
+                online_mxfp8_scope: scope.into(),
+                speculation: Some(wire::RebuildSpeculation {
+                    method: method.into(),
+                    draft_body_quantization: explicit.map(str::to_owned),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let encoded = manifest.encode_to_vec();
+            let decoded = wire::RebuildManifest::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.effective_draft_body_quantization(), expected);
+            assert_eq!(decoded.encode_to_vec(), encoded);
+        }
+        let no_draft = wire::RebuildManifest {
+            online_mxfp8: true,
+            online_mxfp8_scope: "all".into(),
+            ..Default::default()
+        };
+        assert_eq!(no_draft.effective_draft_body_quantization(), None);
+    }
 
     #[test]
     fn supported_contract_versions_preserve_their_declared_version() {
@@ -622,8 +678,30 @@ mod tests {
     }
 
     #[test]
+    fn serialized_padded_grid_profile_selects_only_image_preparation() {
+        // Field 10 adds the padded-grid profile without changing any preceding profile tag.
+        let bytes = &[0x0a, 0x00, 0x12, 0x02, 0x52, 0x00, 0x1a, 0x01, 0x01][..];
+        let decoded = wire::FrontendSettings::decode(bytes).unwrap();
+        let json = frontend_settings(decoded).unwrap();
+        assert_eq!(json["image"], serde_json::json!({"padded_grid": {}}));
+        #[cfg(feature = "server")]
+        {
+            let frontend: crate::frontend::FrontendSettings = serde_json::from_value(json).unwrap();
+            let settings = frontend.image.unwrap();
+            assert_eq!(
+                settings.preparation_kind(),
+                crate::model::contract::ImagePreparationKind::PaddedGrid
+            );
+            let processor =
+                crate::frontend::images::ImageProcessor::load(settings, Default::default())
+                    .unwrap();
+            assert_eq!(processor.geometry(81, 40).unwrap().tokens, 3);
+        }
+    }
+
+    #[test]
     fn prompt_encoder_round_trip_preserves_explicit_image_token_and_rejects_unknown_encoder() {
-        for encoder in [1, 2] {
+        for encoder in [1, 2, 3] {
             let value = wire::FrontendSettings {
                 tokenizer: Some(wire::TokenizerSettings::default()),
                 eos_token_ids: vec![1],

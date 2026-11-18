@@ -26,7 +26,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         drafting = dict(speculative_widths=plan.speculation.widths, speculative_fixed_width=plan.speculation.fixed_width,
                         speculative_token_capacity=plan.speculative_token_capacity,
                         speculative_graph_budget=plan.speculation.graph_budget or 64,
-                        draft_head_quantization=plan.speculation.draft_head_quantization)
+                        draft_head_quantization=plan.speculation.draft_head_quantization,
+                        draft_body_quantization=plan.speculation.draft_body_quantization)
         directory = DRAFT_DIRECTORY if draft_directory is None else draft_directory
         if (Path(snapshot) / directory).is_dir():
             drafting["draft_checkpoint"] = str(Path(snapshot) / directory)
@@ -48,6 +49,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
+        context_parallel_size=plan.context_parallel_size or plan.world_size,
         vision=not plan.language_model_only, sampling_defaults=recipe.sampling_defaults.as_dict(),
         frontend_template=str(Path(__file__).parent.parent / recipe.name / "assets" / "chat_template.jinja"),
         **drafting)
@@ -69,15 +71,18 @@ RECIPE = Recipe(
         ranges={"top_p": SamplingRange(.95, 1.)}),
     checkpoints=(Checkpoint(alias="kimi-k3-mxfp4-csf", repository="/data/models/Kimi-K3-MXFP4-CSF",
         revision="local", architecture="KimiK3ForConditionalGeneration",
-        stored_bytes=1_491_026_420_236, device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000),
+        stored_bytes=1_491_026_420_236, device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000,
+        scale_compressed_device_bytes={"csf": 1_498_926_420_236}),
         # The native checkpoint's block scales are compressed while loading, as resident as the CSF copy's.
         Checkpoint(alias="kimi-k3", repository="moonshotai/Kimi-K3",
         revision="2496450e92e425c886db095102a52a6682ca3970", architecture="KimiK3ForConditionalGeneration",
-        stored_bytes=1_560_860_324_864, device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000),
+        stored_bytes=1_560_860_324_864, device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000,
+        scale_compressed_device_bytes={"csf": 1_498_926_420_236}),
         # A local target checkpoint carrying Red Hat's DSpark weights in dspark/.
         Checkpoint(alias="kimi-k3-dspark", repository="/data/kimi-k3-dspark", revision="local",
         architecture="KimiK3ForConditionalGeneration", stored_bytes=1_500_516_228_062,
-        device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000)),
+        device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000,
+        scale_compressed_device_bytes={"csf": 1_498_926_420_236})),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     verification_rows=0,

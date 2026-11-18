@@ -684,6 +684,18 @@ class PreparedVocabularySoftmax:
 
     def run(self, logits, candidates, *, pending=None, seeds=None, offsets=None,
             probabilities=None, valid=None, tokens=None):
+        return self._run_steps(self.steps, logits, candidates, pending=pending, seeds=seeds,
+            offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens)
+
+    def run_step(self, step, logits, candidates, *, pending=None, seeds=None, offsets=None,
+                 probabilities=None, valid=None, tokens=None):
+        """Draw one prepared position after its recurrent correction becomes available."""
+        if not self.sample or not 0 <= step < self.width:
+            raise ValueError("a proposal step must select one prepared sampling position")
+        return self._run_steps(self.steps[step:step + 1], logits, candidates, pending=pending,
+            seeds=seeds, offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens)
+
+    def _run_steps(self, steps, logits, candidates, *, pending, seeds, offsets, probabilities, valid, tokens):
         local = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                  for name, (shape, dtype) in self.local_layout.items()
                  if name not in ("logits", "candidates", "pending", "seeds", "offsets")}
@@ -691,7 +703,7 @@ class PreparedVocabularySoftmax:
         for name, value in (("probabilities", probabilities), ("valid", valid), ("tokens", tokens)):
             if value is not None:
                 local[name] = value
-        for score, summary, normalize in self.steps:
+        for score, summary, normalize in steps:
             for operation in (score, summary):
                 args = list(operation.args)
                 for index, name in operation.local_slots:
