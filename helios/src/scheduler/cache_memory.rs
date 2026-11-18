@@ -66,18 +66,6 @@ fn select_snapshots(
             Some((id, cost))
         })
         .collect();
-    // Bound the pair-enumeration work. With heavily shared prefixes every posting list
-    // carries almost every candidate, so the pair loop approaches O(n^2 * pages) and a
-    // single quote can burn seconds of scheduler time. Candidates arrive in id order,
-    // and ties already prefer lower ids, so truncating keeps the documented preference
-    // while capping the worst case.
-    const MAX_PAIR_CANDIDATES: usize = 128;
-    let truncated = candidates.len() > MAX_PAIR_CANDIDATES;
-    let candidates = if truncated {
-        candidates.into_iter().take(MAX_PAIR_CANDIDATES).collect::<Vec<_>>()
-    } else {
-        candidates
-    };
     if count == 1 {
         // The lowest cost, ties to the lowest id, skipping candidates whose cost exceeds the
         // spare pages. One row is the shape of a quote for an anchor-only capture, so this
@@ -124,6 +112,19 @@ fn select_snapshots(
     // lowest ids, among pairs whose union fits the spare pages. The union is
     // |a| + |b| - |a ∩ b|; the inverted index counts the shared pages for every pair, so
     // the pair loop never builds or merges a set.
+    //
+    // With heavily shared prefixes every posting list carries almost every candidate,
+    // so the pair loop approaches O(n^2 * pages) and one quote can burn seconds of
+    // scheduler time (see GH #319). Bound the enumerated set to the cheapest candidates
+    // by (cost, id); ids alone are only a tie-break, so the cheapest K is kept rather
+    // than the first K ids, and zero-cost candidates always sort first. Inputs with at
+    // most K candidates run the exact original enumeration unchanged.
+    const MAX_PAIR_CANDIDATES: usize = 128;
+    let mut candidates = candidates;
+    if candidates.len() > MAX_PAIR_CANDIDATES {
+        candidates.sort_unstable_by_key(|(id, pages)| (pages.len(), *id));
+        candidates.truncate(MAX_PAIR_CANDIDATES);
+    }
     let budget = available - keep_pages;
     let mut counts = vec![0usize; backing.len()];
     for (_, pages) in &candidates {
@@ -156,7 +157,17 @@ fn select_snapshots(
         }
         for b in a + 1..candidates.len() {
             let union = pages.len() + candidates[b].1.len() - overlap[b] as usize;
-            if union <= budget && best.is_none_or(|(cost, _, _)| union < cost) {
+            if union > budget {
+                continue;
+            }
+            // Ties prefer the lexicographically lowest id pair; the candidate list may
+            // be cost-sorted, so compare ids explicitly instead of relying on scan order.
+            let better = best.is_none_or(|(cost, ba, bb)| {
+                union < cost
+                    || (union == cost
+                        && (candidates[a].0, candidates[b].0) < (candidates[ba].0, candidates[bb].0))
+            });
+            if better {
                 best = Some((union, a, b));
             }
         }
@@ -1510,5 +1521,26 @@ mod wedge_bench {
         // Guard against the pathological pair-enumeration blowup: unbounded this
         // takes ~9.4 s on this input; leave generous margin for slower CI hosts.
         assert!(elapsed < std::time::Duration::from_secs(5), "pair enumeration is unbounded again");
+    }
+
+    // Review case from GH #326: the only feasible (zero-cost) candidates sit past
+    // index 127; bounding must keep them reachable for both row counts.
+    #[test]
+    fn cheapest_candidates_beyond_the_bound_stay_selectable() {
+        let base_pages = 2;
+        let backing = vec![true; base_pages];
+        let protected = vec![0u32; base_pages];
+        let mut ranges = vec![0u32..base_pages as u32; 128];
+        ranges.push(0u32..0); // id 128: zero cost
+        ranges.push(0u32..0); // id 129: zero cost
+        let candidates: BTreeSet<SnapshotId> =
+            (0..130u32).map(SnapshotId).collect();
+
+        let one = select_snapshots(&backing, &protected, &ranges, &candidates, base_pages, 1);
+        assert_eq!(one, Some(vec![SnapshotId(128)]), "single row must pick the zero-cost id 128");
+
+        let two = select_snapshots(&backing, &protected, &ranges, &candidates, base_pages, 2);
+        assert_eq!(two, Some(vec![SnapshotId(128), SnapshotId(129)]),
+                   "two rows must pick the zero-cost pair 128/129");
     }
 }
