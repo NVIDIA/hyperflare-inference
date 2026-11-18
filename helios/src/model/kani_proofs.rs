@@ -21,7 +21,7 @@ fn completion_fixture(tokens_below_vocabulary: bool) -> CompletionFixture {
     let lag: u32 = kani::any();
     let has_cursor: bool = kani::any();
     let speculative: bool = kani::any();
-    let graph = GraphContract {
+    let graph = GraphContract { terminal_prefill_min_tokens: 0,
         graph: String::new(),
         kind: GraphOperation::Speculative,
         inputs: Vec::new(),

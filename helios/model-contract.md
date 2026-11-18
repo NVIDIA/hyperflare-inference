@@ -76,7 +76,7 @@ serving contract and replay path unchanged.
 
 | Field | Meaning |
 |---|---|
-| `version` | Semantic contract version, 1, 2, or 3; exporters write 3 |
+| `version` | Semantic contract version, 1 through 4; terminal prefill requires 4 |
 | `vocabulary` | Valid sampled token range and histogram/mask geometry |
 | `input_vocabulary` | Valid input range, including declared nonsampled image sentinels |
 | `vision` | Feature-slot and per-window feature capacities, patch-to-feature ratio, and captured patch capacities |
@@ -128,11 +128,51 @@ remembered page-table lengths. Buffers remain alive through execution drain.
 A `StateView` describes a byte offset, row stride, and byte extent within a
 registered persistent buffer. Each graph lists read, write, or read/write
 accesses. Device-owned pending tokens name a readable state view. Initialization,
-restoration, prefill, scored prefill, resume, decode, speculative generation, and
-mixed generation declare writes when they produce that state. A host-owned
+restoration, complete prefill, scored prefill, resume, decode, speculative
+generation, and mixed generation declare writes when they produce that state.
+With a terminal-prefill catalog, terminal graphs declare the prefill producer;
+intermediate graphs need not write the pending token. A host-owned
 pending token instead declares a value binding. Completion dependencies are
 derived for each selected graph from its actual inputs, rather than from the
 union of another operation's inputs.
+
+### Intermediate and terminal prefill
+
+A catalog containing `TERMINAL_PREFILL` separates prompt consumption from
+completion of continuation state. Its `PREFILL` graphs consume prompt tokens
+and update the histories required by subsequent prompt chunks, without sampling
+or guaranteeing a complete continuation. `TERMINAL_PREFILL` consumes prompt
+tokens and completes all continuation state, including speculative histories
+and the hidden vector used by resume. It samples only at the end of the prompt.
+Without terminal graphs, `PREFILL` retains its complete-state semantics.
+
+Each terminal graph declares the same positive `terminal_prefill_min_tokens`:
+the minimum number of actual prompt tokens needed to reconstruct complete state
+after an intermediate prefill. Padding does not count. A terminal graph may
+consume fewer tokens when its input state is already complete, including a
+short fresh prompt or a short extension of a restored checkpoint. Ordinary and
+terminal catalogs must cover the same token capacities, and the largest
+capacity must hold the reconstruction minimum. The field is zero on all other
+operations. These semantics require model contract version 4.
+
+The scheduler fixes the next completion boundary when it submits an intermediate
+chunk. It shortens that chunk when necessary to reserve the reconstruction
+minimum for the terminal chunk. If an atomic input span prevents reserving
+that tail, a terminal graph completes the span first and the short tail continues
+from complete state. Boundaries include the prompt end, selected
+prefix checkpoints, and conditioned-input window transitions. Until a terminal
+graph completes, the request cannot publish a checkpoint, generate, resume, or
+enter a mixed graph. Cancellation discards the private state after its last-use
+fence drains. Scored prefill continues to execute complete model computation for
+every scored token.
+
+DeepSeek V4.1 declares 129 tokens because its bounded decoder replay resets the
+128-token window only when the incoming chunk is larger than that window. Its
+intermediate graph produces encoder state and global key/value history; its
+terminal graph also executes the decoder suffix and saves target and speculative
+continuation state. Graph preparation captures both operations before serving when its maximum
+prefill capacity exceeds the window. Preparations limited to 128 or fewer
+tokens retain complete prefill graphs without deferral.
 
 ### Complete speculative generation
 

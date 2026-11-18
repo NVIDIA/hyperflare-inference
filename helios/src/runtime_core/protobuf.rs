@@ -54,7 +54,7 @@ pub(super) fn serving_contract(
     value: wire::ServingContract,
     _prepared_concurrency: u64,
 ) -> Result<serde_json::Value> {
-    if value.model_contract.as_ref().is_none_or(|contract| !(1..=3).contains(&contract.version)) {
+    if value.model_contract.as_ref().is_none_or(|contract| !(1..=4).contains(&contract.version)) {
         return Err(invalid("unsupported prepared model contract version; re-export the model core"));
     }
     let mut value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn supported_contract_versions_preserve_their_declared_version() {
-        for version in [1, 2, 3] {
+        for version in [1, 2, 3, 4] {
             let contract = wire::ServingContract {
                 model_contract: Some(wire::ModelContract { version, ..Default::default() }),
                 ..Default::default()
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn unknown_prepared_contract_versions_are_rejected() {
-        for version in [0, 4, u32::MAX] {
+        for version in [0, 5, u32::MAX] {
             let value = wire::ServingContract { model_contract: Some(wire::ModelContract {
                 version, ..Default::default()
             }), ..Default::default() };

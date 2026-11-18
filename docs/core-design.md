@@ -991,9 +991,10 @@ enum values, invalid storage views, and incompatible input geometry reject loadi
 
 Each selected program's pending-token inputs determine its completion dependency.
 Host-fed pending tokens wait for the preceding completion. Device-fed generation
-declares a persistent read, and initialization, restoration, prefill, scored
-prefill, resume, decode, speculative, and mixed producers declare their state
-writes.
+declares a persistent read, and initialization, restoration, complete prefill,
+scored prefill, resume, decode, speculative, and mixed producers declare their
+state writes. When a catalog separates intermediate and terminal prefill,
+terminal graphs produce the pending token; intermediate graphs need not write it.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft

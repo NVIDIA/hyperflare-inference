@@ -3576,12 +3576,32 @@ fn image_preparation_wait_does_not_block_unrelated_prefill() {
 
 #[test]
 fn scored_requests_bypass_prefix_lookup_and_keep_their_own_prefill_catalog() {
+    scored_request_catalog(false);
+}
+
+#[test]
+fn terminal_prefill_keeps_scored_requests_on_complete_per_token_execution() {
+    scored_request_catalog(true);
+}
+
+fn scored_request_catalog(terminal: bool) {
     let mut scheduler = scheduler(4, 128, 16);
     let mut scored = spec(700, 0);
     scored.prompt_logprobs = true;
     assert!(scheduler.admit(scored.clone()).is_err());
     scheduler.scored_prefill_graphs(&[128, 512]).unwrap();
     let mut graphs = duration_graphs(4);
+    if terminal {
+        let capacities = scheduler.prefill_catalog.clone();
+        scheduler.terminal_prefill_graphs(129, &capacities).unwrap();
+        let terminal_graphs: Vec<_> = graphs.iter().filter(|g| g.kind == GraphKind::Prefill)
+            .cloned().map(|mut graph| {
+                graph.kind = GraphKind::TerminalPrefill;
+                graph.name = format!("terminal-{}", graph.name);
+                graph
+            }).collect();
+        graphs.extend(terminal_graphs);
+    }
     let scored_graphs: Vec<_> = graphs.iter().filter(|g| g.kind == GraphKind::Prefill
         && [128, 512].contains(&g.token_capacity)).cloned().map(|mut graph| {
             graph.kind = GraphKind::ScoredPrefill;
@@ -3605,6 +3625,7 @@ fn scored_requests_bypass_prefix_lookup_and_keep_their_own_prefill_catalog() {
         scheduler.commit(&step, Fence(fence)).unwrap();
         scheduler.complete(Fence(fence), &records(handle, fence, consumed as i64, 0, -1,
             if consumed == 700 { 2 } else { 1 }), Default::default()).unwrap();
+        assert!(scheduler.request(handle).unwrap().deferred_prefill_end.is_none());
         fence += 1;
     }
     assert_eq!(scheduler.request(handle).unwrap().generated_tokens, 0);

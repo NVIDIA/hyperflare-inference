@@ -121,7 +121,7 @@ impl Inputs {
                             }
                             LiveRows | PrefillRow => binding.indexing == Scalar,
                             ImageFeatureSlot => binding.indexing == Scalar && elements == 1
-                                && matches!(graph.kind, GraphKind::Vision | GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Mixed),
+                                && matches!(graph.kind, GraphKind::Vision | GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill | GraphKind::Mixed),
                             PageTable | LiveStateRows => binding.indexing == RequestRow,
                             PromptToken | PromptTargetToken
                             | PromptAndPendingToken

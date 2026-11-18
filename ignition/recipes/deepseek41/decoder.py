@@ -254,16 +254,18 @@ class PreparedDecoder:
         self.table_requests = PreparedTableRequests(tables, metadata, pool, session=session, name=name + ".table_requests")
         decoder_start = weights.config.decoder_start
         self.packing = None
-        if mode == "prefill" and metadata.positions.numel() > 128 and decoder_start is not None and scoring is None:
+        deferred_prefill = mode == "prefill" and decoder_start is not None and scoring is None
+        if deferred_prefill:
             if (any(layer.engram is not None for layer in weights.layers[decoder_start:])
                     or any(source.layer > decoder_start for source in weights.config.sources)):
                 raise ValueError("decoder suffix replay requires Engram and compressed KV sources before its boundary")
-            self.packing = PreparedDecoderSuffix(metadata)
+            if metadata.positions.numel() > 128:
+                self.packing = PreparedDecoderSuffix(metadata)
         self.output_metadata = metadata if self.packing is None else self.packing.metadata
         self.output_scratch = scratch if self.packing is None else Scratch.allocate(
             128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device)
         self.aux_layers = () if weights.draft is None else weights.config.draft.target_layers
-        if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
+        if deferred_prefill and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
         self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
         self.auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)
@@ -350,7 +352,7 @@ class PreparedDecoder:
         self.scratch = self.metadata = self.output_scratch = self.output_metadata = None
         self.auxiliary = self.safe_tokens = self.head_hidden = self.local_logits = None
 
-    def __call__(self, metadata):
+    def __call__(self, metadata, *, terminal=True):
         source_metadata = metadata
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)
@@ -370,9 +372,21 @@ class PreparedDecoder:
         suffix, records = None, []
         for index, layer in enumerate(self.layers):
             boundary = None
+            if not terminal and index == self.weights.config.decoder_start and layer.boundary is None:
+                # Commit global KV and compressor history before deferring the
+                # decoder's queries, windows, experts and vocabulary projection.
+                attn_mix = torch.zeros_like(pre_mix)
+                _, _, _, normalized = layer.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
+                layer.attention.global_kv(normalized, layer.attention.selectors[0], metadata,
+                                          indices.compressed(layer.attention.ratio))
+                self.table_requests.commit(source_metadata.lengths, raw_history, source_metadata)
+                return
             if layer.boundary is not None:
                 suffix, state, attn_mix = layer.boundary(incoming, pre_mix, metadata, indices,
                                                         layer.attention.selectors[0])
+                if not terminal:
+                    self.table_requests.commit(source_metadata.lengths, raw_history, source_metadata)
+                    return
                 metadata = suffix.metadata
                 indices = self.suffix_window_metadata(metadata, replay_start=suffix.replay_start)
                 boundary = state, attn_mix

@@ -250,6 +250,7 @@ pub struct LiveRequest {
     reserved_pages: Vec<PageId>,
     max_new_tokens: u32,
     scheduled_consumed: u64,
+    deferred_prefill_end: Option<usize>,
     last_use: Fence,
     pending: usize,
     terminal_snapshot_ready: bool,
@@ -660,6 +661,7 @@ pub struct RequestScheduler {
     speculative_fixed_width: Option<usize>,
     speculative_catalog: [Vec<usize>; 7],
     prefill_catalog: Vec<usize>,
+    terminal_prefill_min_tokens: usize,
     scored_prefill_catalog: Vec<usize>,
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
@@ -751,6 +753,7 @@ impl RequestScheduler {
             speculative_fixed_width: None,
             speculative_catalog: Default::default(),
             prefill_catalog: prefill_capacities(limits.prefill_chunk_size).collect(),
+            terminal_prefill_min_tokens: 0,
             scored_prefill_catalog: Vec::new(),
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
@@ -801,6 +804,19 @@ impl RequestScheduler {
             );
         }
         self.prefill_catalog = catalog;
+        Ok(())
+    }
+
+    pub fn terminal_prefill_graphs(&mut self, minimum: usize, capacities: &[usize]) -> Result<()> {
+        if self.slots.iter().any(|s| s.request.is_some()) || self.submitted != Fence(0) || (minimum == 0) != capacities.is_empty() {
+            return Err("terminal prefill geometry must be configured before admission".into());
+        }
+        let mut catalog = capacities.to_vec();
+        catalog.sort_unstable();
+        if minimum != 0 && (minimum > self.limits.prefill_chunk_size || catalog != self.prefill_catalog) {
+            return Err("terminal prefill must cover the ordinary prefill catalog and its minimum".into());
+        }
+        self.terminal_prefill_min_tokens = minimum;
         Ok(())
     }
 
@@ -1355,7 +1371,7 @@ impl RequestScheduler {
         let request = self.request_mut(handle)?;
         request.preempted = preempted;
         request.phase = RequestPhase::Finishing;
-        if request.consumed_tokens <= request.prefix_tokens || request.error_code.is_some() {
+        if request.consumed_tokens <= request.prefix_tokens || request.error_code.is_some() || request.deferred_prefill_end.is_some() {
             return Ok(());
         }
         let unused = std::mem::take(&mut request.reserved_pages);
@@ -1662,6 +1678,7 @@ impl RequestScheduler {
             reserved_pages,
             max_new_tokens: spec.max_new_tokens,
             scheduled_consumed: consumed,
+            deferred_prefill_end: None,
             last_use: Fence(0),
             pending: 0,
             terminal_snapshot_ready: false,
@@ -2188,6 +2205,14 @@ impl RequestScheduler {
         let mut needed = Vec::new();
         for lane in &step.lanes {
             let request = self.request(lane.request)?;
+            if self.terminal_prefill_min_tokens != 0 && step.kind.is_prefill() {
+                let end = lane.start_position as usize + lane.tokens;
+                if (step.kind == GraphKind::Prefill && end >= self.prefill_boundary(request))
+                    || (step.kind == GraphKind::TerminalPrefill && request.deferred_prefill_end.is_some()
+                        && lane.tokens < self.terminal_prefill_min_tokens) {
+                    return Err("prefill submission cannot establish its required terminal state".into());
+                }
+            }
             let through = lane
                 .start_position
                 .checked_add(lane.tokens as u64)
@@ -2238,6 +2263,8 @@ impl RequestScheduler {
         self.commit_checkpoint_plans(&plan.checkpoint_plans)?;
         self.commit_checkpoint_copies(step)?;
         for (handle, pages, next_consumed_ceiling) in needed {
+            let deferred_end = (self.terminal_prefill_min_tokens != 0 && step.kind == GraphKind::Prefill)
+                .then(|| self.prefill_boundary(self.request(handle).unwrap()));
             let request = self.request_mut(handle)?;
             let allocated: Vec<_> = (0..pages)
                 .map(|_| request.reserved_pages.pop().unwrap())
@@ -2245,6 +2272,7 @@ impl RequestScheduler {
             request.private_pages.extend(allocated);
             request.scheduled_consumed = next_consumed_ceiling;
             request.last_use = fence;
+            if deferred_end.is_some() { request.deferred_prefill_end = deferred_end; }
             request.pending += 1;
             if let Some(prefix) = request.prefix {
                 self.cache.mark_used(prefix, fence)?;
@@ -2426,6 +2454,12 @@ impl RequestScheduler {
                 }
             }
             let emitted = record.generated_tokens - request.generated_tokens as i64;
+            if self.terminal_prefill_min_tokens != 0 && kind.is_prefill() && record.status != 3
+                && (record.consumed_tokens as u64 != lane.start_position + lane.tokens as u64
+                    || (step.kind == GraphKind::Prefill && (emitted != 0 || record.status != 1))
+                    || (record.consumed_tokens < request.prompt_tokens as i64 && emitted != 0)) {
+                return Err("prefill completion cannot publish output or incomplete continuation state".into());
+            }
             let width = if matches!(kind, GraphKind::Speculative) {
                 step.token_capacity as i64
             } else {
@@ -2562,6 +2596,9 @@ impl RequestScheduler {
             if record.status != 3 {
                 request.accounting.credit(prefill, output, now_ns);
                 useful_tokens[lane.request.slot as usize] = prefill + u64::from(output);
+            }
+            if kind == GraphKind::TerminalPrefill && record.status != 3 {
+                request.deferred_prefill_end = None;
             }
             request.consumed_tokens = record.consumed_tokens as u64;
             if record.generated_tokens > request.generated_tokens as i64 {

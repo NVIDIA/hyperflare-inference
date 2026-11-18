@@ -41,10 +41,16 @@ def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag,
     pending = c.state_view("request_pending_token", 8)
     graphs = c.graph_contracts(signatures, inputs, continuation=continuation, pending=pending,
         cursor=cursor, rows=rows, embedding_tables=embedding_tables)
+    for graph in graphs:
+        if graph["kind"] == p.TERMINAL_PREFILL:
+            graph["terminal_prefill_min_tokens"] = pool.config.text["sliding_window"] + 1
     vision = any(s.kind == "vision" for s in signatures.values())
-    return c.model_contract(vocabulary=VOCABULARY, input_vocabulary=INPUT_VOCABULARY if vision else VOCABULARY,
+    result = c.model_contract(vocabulary=VOCABULARY, input_vocabulary=INPUT_VOCABULARY if vision else VOCABULARY,
         page_tokens=page_tokens, page_tables=[dict(buffer="page_tables", page_offset=0),
             *([dict(buffer="draft_page_tables", page_offset=1)] if "draft_page_tables" in buffers else [])],
         regions=[dict(kind=p.CONTINUATION_STATE, storage=continuation, tokens_per_record=1, window_tokens=0), *regions],
         graphs=graphs, vision={**VISION, "feature_slots": image_slots} if vision else TEXT_VISION,
         frontend=VISION_FRONTEND if vision else FRONTEND)
+    if any(graph["kind"] == p.TERMINAL_PREFILL for graph in graphs):
+        result["version"] = 4
+    return result

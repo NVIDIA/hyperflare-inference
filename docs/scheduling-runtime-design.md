@@ -18,7 +18,7 @@ only for decode rounds, and it estimates graph costs with a 7/8 moving average
 that reverts to unmeasured after 30 seconds. The duration estimates, funded
 refresh, and acceptance learning specified below describe Helios alone.
 
-The native catalog contains prefill, scored prefill, ordinary decode, complete
+The native catalog contains prefill, terminal prefill, scored prefill, ordinary decode, complete
 speculative generation, mixed prefill/generation, vision, and state operations.
 A complete speculative graph contains proposal generation, optional confidence
 and prefix allocation, target verification, and accepted-state commit. Proposal
@@ -170,6 +170,22 @@ A batch-four candidate serving three requests competes with a batch-two
 candidate serving two requests. Bounded cost-refresh probes are separate
 from ordinary selection. Selection does not enumerate exponentially many
 request subsets.
+
+When a catalog declares terminal prefill, intermediate prompt chunks leave
+continuation state incomplete. Before submitting one, the scheduler reserves
+the declared minimum actual tokens for a terminal graph at the next selected
+checkpoint, conditioned-input boundary, or prompt end. Only completed terminal
+state can be snapshotted or used for generation. Both graph families compete
+using their own measured costs and the useful tokens their capacities permit.
+When the remaining span to the next completion boundary fits one terminal
+graph, each intermediate candidate's useful-work rate includes the measured
+terminal execution needed for its tail. This
+prevents a cheap intermediate chunk from winning by omitting the remaining
+completion cost. The estimate uses the smallest fitting terminal capacity and
+the next declared completion boundary. Unknown terminal costs retain ordinary
+discovery behavior. Only the selected graph is submitted; the scheduler replans
+after its completion, and decode waiting is priced over that graph's duration.
+See [the terminal-prefill contract](../helios/model-contract.md#intermediate-and-terminal-prefill).
 
 Each prefill capacity competes using the actual tokens it can consume. Atomic
 image spans, system boundaries, and prompt length restrict logical work. A
