@@ -230,17 +230,49 @@ impl Requests {
                 rows,
             } => {
                 let ready = unsafe { &*(flag as *const AtomicU64) };
-                while ready.load(Ordering::Acquire) != sequence {
+                loop {
+                    let seen = ready.load(Ordering::Acquire);
+                    if seen == sequence {
+                        break;
+                    }
                     if cancelled.load(Ordering::Acquire) {
                         return Err("n-gram request cancelled".into());
                     }
-                    std::hint::spin_loop();
+                    wait_for_request_flag(flag, seen);
                 }
                 Ok(unsafe { std::slice::from_raw_parts(address as *const i64, rows) }.to_vec())
             }
         }
     }
 }
+/// Longest intentional WFET wait per check of a graph-published request flag. The GPU's store of the
+/// next sequence may end it early; cancellation, which a CPU thread stores elsewhere, waits for the
+/// deadline or GB10's WFE event stream.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const REQUEST_WAIT_LIMIT_US: u64 = 100;
+
+/// One step of the reader thread's wait for the graph to publish its request IDs. The graph's store
+/// of the sequence to the mapped flag is the only signal; on Linux aarch64 cores with FEAT_WFxT the
+/// thread waits for it in WFET with the exclusive monitor armed on the flag instead of spinning, as
+/// [`crate::execution::GraphExecutor::park`] does for frame completion. The caller rereads the flag
+/// after every step, so a store that does not clear the monitor only costs the deadline.
+fn wait_for_request_flag(flag: usize, seen: u64) {
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        use crate::execution::host_wait;
+        if host_wait::available() {
+            let deadline = host_wait::ticks() + host_wait::frequency() * REQUEST_WAIT_LIMIT_US / 1_000_000;
+            // SAFETY: `flag` is the live, 8-byte aligned request flag the caller just read; its low
+            // half on little-endian aarch64 is an aligned u32 in the same coherent mapped line, and
+            // `available` confirmed WFxT.
+            unsafe { host_wait::wait_change(flag as *const u32, seen as u32, deadline) };
+            return;
+        }
+    }
+    let _ = (flag, seen);
+    std::hint::spin_loop();
+}
+
 const STAGING_FRAMES: usize = 2;
 
 struct Job {
@@ -805,5 +837,25 @@ mod tests {
         flag.store(0, Ordering::Release);
         cancelled.store(true, Ordering::Release);
         assert!(request().read(&cancelled).is_err());
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    fn request_flag_wait_returns_without_low_word_change() {
+        if !crate::execution::host_wait::available() {
+            return;
+        }
+
+        let flag = AtomicU64::new(0);
+        let address = &flag as *const AtomicU64 as usize;
+
+        // No publisher: the helper must return without a store.
+        wait_for_request_flag(address, 0);
+
+        // Simulate a publication between the outer load and ldxr
+        // which changes only the upper half.
+        flag.store(1_u64 << 32, Ordering::Release);
+        wait_for_request_flag(address, 0);
+        assert_eq!(flag.load(Ordering::Acquire), 1_u64 << 32);
     }
 }

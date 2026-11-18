@@ -20,6 +20,8 @@ mod threaded;
 pub use rank_stream::RankStream;
 pub use ranks::RankPeers;
 mod transport;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub(crate) use transport::host_wait;
 pub(crate) use transport::validate_speculative_survival;
 mod worker;
 pub use parallel::{TensorParallelExecutor, serve_rank};

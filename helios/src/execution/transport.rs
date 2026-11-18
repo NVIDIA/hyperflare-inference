@@ -28,25 +28,25 @@ struct CompletionWake {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-mod host_wait {
+pub(crate) mod host_wait {
     use std::sync::OnceLock;
 
     const HWCAP2_WFXT: libc::c_ulong = 1 << 31;
 
-    pub(super) fn available() -> bool {
+    pub(crate) fn available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         // SAFETY: getauxval reads the process auxiliary vector and has no preconditions.
         *AVAILABLE.get_or_init(|| unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_WFXT != 0)
     }
 
-    pub(super) fn ticks() -> u64 {
+    pub(crate) fn ticks() -> u64 {
         let ticks: u64;
         // SAFETY: CNTVCT_EL0 is readable at EL0 on Linux; the ISB orders the read after earlier loads.
         unsafe { std::arch::asm!("isb", "mrs {t}, cntvct_el0", t = out(reg) ticks, options(nostack)) };
         ticks
     }
 
-    pub(super) fn frequency() -> u64 {
+    pub(crate) fn frequency() -> u64 {
         let hz: u64;
         // SAFETY: CNTFRQ_EL0 is readable at EL0 on Linux.
         unsafe { std::arch::asm!("mrs {f}, cntfrq_el0", f = out(reg) hz, options(nomem, nostack)) };
@@ -58,7 +58,7 @@ mod host_wait {
     ///
     /// # Safety
     /// `word` must point to a live, 4-byte aligned u32 in coherent memory, and WFxT must be available.
-    pub(super) unsafe fn wait_change(word: *const u32, old: u32, deadline: u64) {
+    pub(crate) unsafe fn wait_change(word: *const u32, old: u32, deadline: u64) {
         unsafe {
             std::arch::asm!(
                 "sevl",
