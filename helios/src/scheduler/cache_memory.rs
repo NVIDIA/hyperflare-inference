@@ -83,6 +83,21 @@ fn select_snapshots(
         }
         return best.map(|(_, id)| vec![id]);
     }
+    // Bound the enumerated set for every multi-row path. With heavily shared prefixes
+    // (agent-style traffic reusing one long context) the greedy witness below and the
+    // two-row pair loop both degrade — the pair loop toward O(n^2 * pages) and the
+    // greedy witness toward O(count * n * pages) with a BTreeSet probe per page — and a
+    // single quote can burn seconds of scheduler time (see GH #319; an engine livelock
+    // was reproduced live through both paths). Keep the cheapest MAX_MULTI_ROW_CANDIDATES
+    // by (cost, id): ids alone are only a tie-break after cost, so the cheapest set is
+    // kept rather than the first ids, and zero-cost candidates always survive. Inputs
+    // with at most that many candidates run the exact original algorithms unchanged.
+    const MAX_MULTI_ROW_CANDIDATES: usize = 128;
+    let mut candidates = candidates;
+    if candidates.len() > MAX_MULTI_ROW_CANDIDATES {
+        candidates.sort_unstable_by_key(|(id, pages)| (pages.len(), *id));
+        candidates.truncate(MAX_MULTI_ROW_CANDIDATES);
+    }
     if count > 2 {
         // Future capture capacity uses a conservative witness without enumerating subsets.
         let mut selected = BTreeSet::<SnapshotId>::new();
@@ -112,19 +127,6 @@ fn select_snapshots(
     // lowest ids, among pairs whose union fits the spare pages. The union is
     // |a| + |b| - |a ∩ b|; the inverted index counts the shared pages for every pair, so
     // the pair loop never builds or merges a set.
-    //
-    // With heavily shared prefixes every posting list carries almost every candidate,
-    // so the pair loop approaches O(n^2 * pages) and one quote can burn seconds of
-    // scheduler time (see GH #319). Bound the enumerated set to the cheapest candidates
-    // by (cost, id); ids alone are only a tie-break, so the cheapest K is kept rather
-    // than the first K ids, and zero-cost candidates always sort first. Inputs with at
-    // most K candidates run the exact original enumeration unchanged.
-    const MAX_PAIR_CANDIDATES: usize = 128;
-    let mut candidates = candidates;
-    if candidates.len() > MAX_PAIR_CANDIDATES {
-        candidates.sort_unstable_by_key(|(id, pages)| (pages.len(), *id));
-        candidates.truncate(MAX_PAIR_CANDIDATES);
-    }
     let budget = available - keep_pages;
     let mut counts = vec![0usize; backing.len()];
     for (_, pages) in &candidates {
@@ -1521,6 +1523,29 @@ mod wedge_bench {
         // Guard against the pathological pair-enumeration blowup: unbounded this
         // takes ~9.4 s on this input; leave generous margin for slower CI hosts.
         assert!(elapsed < std::time::Duration::from_secs(5), "pair enumeration is unbounded again");
+    }
+
+    // The count>2 greedy witness path blew up the same way in the live engine
+    // (see GH #319 evidence-1118_1807): BTreeSet probes per page over every candidate.
+    #[test]
+    fn multi_row_witness_shared_prefix_blowup() {
+        let pages: usize = 327_680;
+        let base_pages: usize = 45;
+        let n_candidates: usize = 1986;
+        let backing = vec![true; pages];
+        let protected = vec![0u32; pages];
+        let ranges: Vec<_> = (0..n_candidates)
+            .map(|i| 0u32..(base_pages as u32 + i as u32 * 4 + 4))
+            .collect();
+        let candidates: BTreeSet<SnapshotId> =
+            (0..n_candidates).map(|i| SnapshotId(i as u32)).collect();
+        let t = std::time::Instant::now();
+        let r = select_snapshots(&backing, &protected, &ranges, &candidates, pages / 2, 7);
+        let elapsed = t.elapsed();
+        assert!(r.is_some(), "greedy witness must still select a conservative set");
+        println!("select(count=7, shared-prefix, {} candidates) took {:?}", n_candidates, elapsed);
+        assert!(elapsed < std::time::Duration::from_secs(5),
+                "multi-row witness enumeration is unbounded again");
     }
 
     // Review case from GH #326: the only feasible (zero-cost) candidates sit past
