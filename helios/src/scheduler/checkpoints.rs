@@ -113,7 +113,7 @@ impl RequestScheduler {
     }
 
     /// If this opens the cache, the caller must call `end_checkpoint_planning`.
-    /// While open, only `advance_to` and `commit` may change checkpoint-selection inputs.
+    /// Once populated, only `advance_to` and `commit` may change checkpoint-selection inputs.
     pub(crate) fn begin_checkpoint_planning(&self) -> bool {
         let mut cache = self.checkpoint_selections.borrow_mut();
         if cache.is_some() {

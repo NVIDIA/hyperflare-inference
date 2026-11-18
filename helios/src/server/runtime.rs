@@ -1103,8 +1103,10 @@ impl<'a> Worker<'a> {
             }
             progress |= self.publish()?;
             progress |= self.service_store()?;
-            // Only clock advancement separates selection from commit; commit clears
-            // checkpoint decisions before changing request or storage state.
+            // The cache is empty through pool retries and copy-proposal updates in
+            // plan; scheduler.plan() computes the first selections. After that,
+            // only clock advancement precedes commit, which clears selections
+            // before changing request or storage state.
             self.scheduler.begin_checkpoint_planning();
             let planned = (|| -> Result<bool> {
                 let (step, mut progress) = self.plan(executor.outstanding())?;

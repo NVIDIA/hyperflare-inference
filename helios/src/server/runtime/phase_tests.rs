@@ -1284,6 +1284,78 @@ fn output_clock_advances_only_after_stop_buffering_releases_tokens() {
 }
 
 #[test]
+fn worker_checkpoint_selections_match_uncached_submission_after_cost_expiry() {
+    let submit = |cached: bool, expire: bool| {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, _generation) = fixture.incoming(vec![0; 100], 8);
+        incoming.prompt.message_boundaries = vec![16, 32, 64, 96];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker
+            .scheduler
+            .configure_policy(crate::scheduler::PolicyConfig {
+                checkpoint_extra_work_fraction: 1.0,
+                estimate_ttl_ns: u64::MAX / 4,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut graphs = crate::model::testing::manifest(&fixture.config).graphs;
+        for graph in &mut graphs {
+            graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot {
+                1
+            } else {
+                1000
+            };
+        }
+        worker.scheduler.measured_graph_durations(&graphs).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        if cached {
+            worker.scheduler.begin_checkpoint_planning();
+        }
+        let (step, _) = worker.plan(0).unwrap();
+        let step = step.unwrap();
+        assert_eq!(step.kind, GraphKind::Init);
+        // Submission advances the clock after planning; expiry must discard the
+        // cached extra captures before commit computes service participants.
+        let now = super::super::observation::monotonic_ns();
+        worker
+            .scheduler
+            .advance_to(if expire { u64::MAX / 2 } else { now })
+            .unwrap();
+        crate::scheduler::tests::take_storage_simulations();
+        worker.reserve_and_pack(&step, Fence(1)).unwrap();
+        let simulations = crate::scheduler::tests::take_storage_simulations();
+        if cached || expire {
+            assert_eq!(simulations, 0);
+        } else {
+            assert!(simulations > 0);
+        }
+        worker.scheduler.end_checkpoint_planning();
+        let mut frame = completion(&worker, &step, 1, None);
+        frame.timing.gpu_ns[0] = Some(1000);
+        worker
+            .scheduler
+            .complete(Fence(1), &frame.records, frame.timing)
+            .unwrap();
+        let following = worker.scheduler.plan().unwrap();
+        (
+            (*following).clone(),
+            following.selection_value_rate().to_bits(),
+            following.selection_log_scale().to_bits(),
+        )
+    };
+    let fresh = submit(false, false);
+    let expired = submit(false, true);
+    assert_ne!(
+        fresh, expired,
+        "expiry must change the checkpoint decision or its service price"
+    );
+    assert_eq!(submit(true, false), fresh);
+    assert_eq!(submit(true, true), expired);
+}
+
+#[test]
 fn packing_sees_reserved_pages_and_pack_failure_retains_submission_until_drain() {
     let fixture = Fixture::new();
     let (sender, receiver) = mpsc::channel();

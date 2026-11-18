@@ -6,6 +6,10 @@
 
 use super::*;
 
+pub(crate) fn take_storage_simulations() -> usize {
+    super::cache_memory::STORAGE_SIMULATIONS.replace(0)
+}
+
 pub(super) fn measured_costs(graphs: &[crate::execution::GraphDescriptor]) -> cost::ActionCosts {
     let mut costs = cost::ActionCosts::prepared(graphs, 16).unwrap();
     for graph in graphs {
