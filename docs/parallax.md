@@ -645,8 +645,14 @@ the owner to retain its buffers and CUDA context. GPU allocations, graph
 parameters and physical plane addresses remain fixed; a canonical expert's
 resolved address changes with its row map.
 
-The backend borrows storage through an unsafe Rust construction API. It is not
-connected to authenticated core loading or the serving residency option.
+The backend borrows storage through an unsafe Rust construction API. Its
+[`package resolver`](../helios/src/parallax/residency/rows/package.rs) reads the
+signed `Execution.expert_rows` declaration and resolves plane names through the
+prepared-weight catalog. It accepts dense rows with transposed inner axes,
+requires identical host/HBM row layouts, and validates fixed tier allocations,
+payload coverage and a dedicated mapping buffer. Missing declarations reject
+row movement; ordinary static loading does not require them. The resolver and
+backend are not connected to the serving residency option.
 GB300 storage qualification covers twenty exchanges at each of two four-plane
 geometries: 37/17/65/9-byte rows and 11,796,480/737,280/5,898,240/368,640-byte
 rows. One instantiated memcpy graph per geometry reads from fixed mapping-buffer
@@ -655,7 +661,9 @@ bytes, pinned and immutable backing bytes, reader-gated publication and device
 allocation stability. CPU tests cover geometry, initial placement, pinned
 eviction rejection and partial-publication rollback. This is synthetic storage
 qualification, not captured MoE arithmetic, full-model correctness or serving
-performance. Driver-failure recovery has CPU protocol coverage only.
+performance. Driver-failure recovery has CPU protocol coverage only. CPU export
+and resolution tests cover typed metadata, compressed catalogs and malformed
+bindings; a full DeepSeek export with this declaration is not qualified.
 
 Run the GPU storage check only on an assigned idle GPU:
 

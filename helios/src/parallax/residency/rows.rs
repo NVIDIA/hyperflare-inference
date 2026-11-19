@@ -13,6 +13,7 @@ use std::{
 };
 
 mod layout;
+pub mod package;
 use layout::Layout;
 pub use layout::{Layer, Plane};
 
