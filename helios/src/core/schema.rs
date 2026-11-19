@@ -308,6 +308,14 @@ pub fn validate_rank_contract(
     deployment: &wire::DeploymentBody,
     rank: &wire::RankBody,
 ) -> Result<()> {
+    if rank.tensor_contract.is_some()
+        && (deployment.contract.is_some() || deployment.cluster.is_some()
+            || deployment.engram.is_some() || deployment.ranks.len() > 1
+            || deployment.tensor_parallel > 1)
+    {
+        return Err(invalid("tensor contract requires one independent rank without token-serving metadata"));
+    }
+    crate::runtime_core::tensor_contract::validate_rank(rank)?;
     if deployment.contract.is_none() {
         if rank.execution.is_some() {
             return Err(invalid(
@@ -493,6 +501,10 @@ pub fn validate_rank(
     catalog: &mut Catalog,
     resource_ids: &mut BTreeSet<u64>,
 ) -> Result<()> {
+    if body.tensor_contract.is_some() && ranks != 1 {
+        return Err(invalid("tensor contract requires one independent rank"));
+    }
+    crate::runtime_core::tensor_contract::validate_rank(body)?;
     bounded_name(&body.deployment_id, 128, "deployment id")?;
     catalog.insert_all(&body.payloads)?;
     if body.rank >= ranks {

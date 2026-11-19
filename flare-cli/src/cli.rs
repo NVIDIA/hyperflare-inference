@@ -697,7 +697,7 @@ pub struct Run {
     #[arg(value_name = "CORE", required_unless_present = "rank")]
     pub core: Option<PathBuf>,
 
-    /// Execute one fixed tensor graph request from JSON, then exit.
+    /// Supply named input files to the core's signed tensor contract, then exit.
     #[arg(long, value_name = "PATH", requires = "tensor_output", conflicts_with_all = ["rank", "hosts", "rendezvous", "stage_only", "roce_ring", "roce_chain"], help_heading = "Tensor execution")]
     pub tensor_request: Option<PathBuf>,
 

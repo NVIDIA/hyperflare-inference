@@ -780,12 +780,16 @@ and resource owner until process exit.
 
 The [`flare run` tensor options](cli-design.md#fixed-tensor-execution) expose
 this single-request path for exported graph qualification and offline execution.
-A preparation-generated JSON sidecar describes graph order and contiguous
-allocation views. The runner validates byte geometry against loaded storage;
-the sidecar does not supply signed semantic tensor admission or scheduler
-metadata. The core's normal signatures, executable-resource validation,
-architecture checks, and allocation ownership remain in force. This interface
-does not add diffusion requests to the HTTP server or its continuous scheduler.
+The signed rank-local `TensorContract` fixes graph order and named input/output
+bindings, including dtype, shape and allocation-relative ranges. Preparation
+resolves captured addresses into these bindings before signing. Helios validates
+the contract against the authenticated graph and storage catalog; the resource
+owner retains it for `TensorRunner`. Requests supply only named input files and
+cannot replace execution metadata. Tensor execution requires one independent
+rank with fixed allocations, device-resident tensor bindings and no token-serving
+execution metadata.
+This interface does not add diffusion requests to the HTTP server or its
+continuous scheduler.
 
 ## 6. Tensor-parallel ranks as threads
 

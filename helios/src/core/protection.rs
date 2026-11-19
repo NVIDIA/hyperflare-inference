@@ -1249,6 +1249,7 @@ mod tests {
             roce: None,
             prepared_weights: None,
             compressed_prepared_weights: None,
+            tensor_contract: None,
         }
     }
 

@@ -1323,6 +1323,7 @@ mod tests {
             graphs: vec![],
             reservations: vec![],
             execution: None,
+            tensor_contract: None,
             context: Context::default(),
             allocations: [
                 ("state", 0, row_bytes, 4096),

@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 from ignition.recipes.sdxl.prepare import (
     CASES, TensorSignature, graph_order, remove_output_capture_hooks,
-    save_captured_outputs, save_tensor, tensor_view, verify_eager_forwards, write_json,
+    save_captured_outputs, save_tensor, tensor_contract, tensor_request, verify_eager_forwards, write_json,
 )
 
 MODEL_ID = "PixArt-alpha/PixArt-XL-2-512x512"
@@ -398,14 +398,10 @@ def prepare_graphs(pipe, storage, images, cases, args):
     with export_options(args.output / "core-cache"):
         package.write(sources, graphs, execution=None, sources=True, zero_ranges=zero_ranges,
                       discover_allocations=True, numeric=numeric, parameter_layouts=parameter_layouts,
-                      inactive=inactive, granularity=storage.granularity, roots=())
+                      inactive=inactive, granularity=storage.granularity, roots=(),
+                      tensor_contract=tensor_contract(order, buffers, cases["case_a"]))
         for case, inputs in cases.items():
-            request = dict(graphs=list(order),
-                           inputs=[dict(**tensor_view(name, buffers[name], package.allocations), file=f"inputs/{name}.bin")
-                                   for name in inputs],
-                           outputs=[tensor_view(name, value, package.allocations)
-                                    for name, value in buffers.items() if name not in inputs])
-            write_json(args.output / case / "request.json", request)
+            write_json(args.output / case / "request.json", tensor_request(inputs))
         result = combine(args.output / "core", [sources], [], publisher=publisher, form="directory")
     write_json(args.output / "publisher.json", [dict(name="PixArt local qualification", namespace=publisher.namespace,
                 public_key=list(publisher.public_key), development=True)])

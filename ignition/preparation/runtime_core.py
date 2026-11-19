@@ -108,7 +108,7 @@ class RuntimeCore:
     def write(self, path, graphs, *, execution=None, server=None, progress=None, core_data=None,
               publisher=None, sources=False, rebuild_weights=None, zero_ranges=(),
               discover_allocations=False, numeric=(), parameter_layouts=None, inactive=(),
-              granularity=256, roots=None):
+              granularity=256, roots=None, tensor_contract=None):
         import flare_heliopause
         from .core_snapshot import _OPTIONS
         from .rebuild_manifest import rebuild_weights_metadata, weight_payload_request
@@ -129,6 +129,7 @@ class RuntimeCore:
             cupti_path=_cupti_path(), publisher=_publisher_metadata(publisher),
             reservations=[(r["address"], r["nbytes"]) for r in self.reservations], events=self.events,
             transports=self.transports, device_address_floor=self.device_address_floor, execution=execution,
+            tensor_contract=tensor_contract,
             server=server, core_data=None if core_data is None else core_data.export_metadata(),
             rebuild_weights=None if rebuild_weights is None else rebuild_weights_metadata(rebuild_weights),
             weight_payload=weight_payload_request(rebuild_weights),

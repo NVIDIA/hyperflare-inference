@@ -5,132 +5,53 @@
 
 //! Fixed tensor requests over authenticated, exported CUDA graphs.
 
-use std::{collections::HashSet, path::PathBuf, time::Instant};
+use std::{collections::HashMap, path::PathBuf, time::Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{NativeResources, format::invalid};
+use super::{NativeResources, format::invalid, tensor_contract::PreparedTensorContract};
 use crate::{
     BufferSpan, Result,
     cuda::{Event, Stream},
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TensorView {
-    pub name: String,
-    pub allocation: String,
-    #[serde(default)]
-    pub offset: usize,
-    pub dtype: String,
-    pub shape: Vec<usize>,
-}
-
-impl TensorView {
-    pub fn nbytes(&self) -> Result<usize> {
-        if self.name.is_empty()
-            || !self
-                .name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-        {
-            return Err(invalid(
-                "tensor names require letters, digits, underscores or hyphens",
-            ));
-        }
-        if self.allocation.is_empty() || self.shape.is_empty() || self.shape.contains(&0) {
-            return Err(invalid(
-                "tensor views require an allocation and positive dimensions",
-            ));
-        }
-        let width: usize = match self.dtype.as_str() {
-            "U8" => 1,
-            "F16" | "BF16" => 2,
-            "F32" | "I32" => 4,
-            "I64" => 8,
-            _ => {
-                return Err(invalid(format!(
-                    "unsupported tensor dtype {:?}",
-                    self.dtype
-                )));
-            }
-        };
-        if self.offset % width != 0 {
-            return Err(invalid("tensor offset is not aligned to its element size"));
-        }
-        self.shape
-            .iter()
-            .try_fold(width, |bytes, extent| bytes.checked_mul(*extent))
-            .ok_or_else(|| invalid("tensor byte extent overflows"))
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TensorInput {
-    #[serde(flatten)]
-    pub view: TensorView,
+    pub name: String,
     pub file: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TensorRequest {
-    pub graphs: Vec<String>,
     pub inputs: Vec<TensorInput>,
-    pub outputs: Vec<TensorView>,
 }
 
 impl TensorRequest {
-    pub fn validate(&self) -> Result<()> {
-        let mut graphs = HashSet::new();
-        if self.graphs.is_empty()
-            || self
-                .graphs
-                .iter()
-                .any(|name| name.is_empty() || !graphs.insert(name))
-        {
-            return Err(invalid(
-                "tensor requests require a nonempty sequence of unique graph names",
-            ));
+    /// Match files by name; only the signed contract determines binding order.
+    pub fn bind(&self, contract: &PreparedTensorContract) -> Result<Vec<&TensorInput>> {
+        if self.inputs.len() != contract.inputs().len() {
+            return Err(invalid("input tensor count differs from signed contract"));
         }
-        if self.inputs.is_empty() || self.outputs.is_empty() {
-            return Err(invalid("tensor requests require inputs and outputs"));
-        }
-        let mut names = HashSet::new();
-        for view in self
-            .inputs
-            .iter()
-            .map(|input| &input.view)
-            .chain(&self.outputs)
-        {
-            view.nbytes()?;
-            if !names.insert(&view.name) {
-                return Err(invalid(format!("duplicate tensor name {:?}", view.name)));
+        let mut inputs = HashMap::new();
+        for input in &self.inputs {
+            if inputs.insert(input.name.as_str(), input).is_some() {
+                return Err(invalid(format!("duplicate input tensor {:?}", input.name)));
             }
-        }
-        for (index, input) in self.inputs.iter().enumerate() {
             if input.file.as_os_str().is_empty() {
                 return Err(invalid("input tensor file path is empty"));
             }
-            let end = input
-                .view
-                .offset
-                .checked_add(input.view.nbytes()?)
-                .ok_or_else(|| invalid("input tensor range overflows"))?;
-            for other in &self.inputs[..index] {
-                let other_end = other
-                    .view
-                    .offset
-                    .checked_add(other.view.nbytes()?)
-                    .ok_or_else(|| invalid("input tensor range overflows"))?;
-                if input.view.allocation == other.view.allocation
-                    && input.view.offset < other_end
-                    && other.view.offset < end
-                {
-                    return Err(invalid("input tensor allocation ranges overlap"));
-                }
-            }
         }
-        Ok(())
+        contract
+            .inputs()
+            .iter()
+            .map(|view| {
+                inputs.remove(view.name.as_str()).ok_or_else(|| {
+                    invalid(format!("request is missing signed input {:?}", view.name))
+                })
+            })
+            .collect()
     }
 }
 
@@ -163,19 +84,13 @@ pub struct TensorRunner {
     stream: Option<Stream>,
     events: Vec<Event>,
     graphs: Vec<usize>,
-    inputs: Vec<TensorView>,
-    outputs: Vec<TensorView>,
+    contract: PreparedTensorContract,
 }
 
 impl TensorRunner {
-    pub fn new(owner: NativeResources, request: &TensorRequest) -> Result<Self> {
-        request.validate()?;
-        for view in request
-            .inputs
-            .iter()
-            .map(|input| &input.view)
-            .chain(&request.outputs)
-        {
+    pub fn new(owner: NativeResources) -> Result<Self> {
+        let contract = owner.tensor_contract()?.clone();
+        for view in contract.inputs().iter().chain(contract.outputs()) {
             range_address(
                 &owner.allocation(&view.allocation)?,
                 view.offset,
@@ -183,8 +98,8 @@ impl TensorRunner {
             )?;
         }
         let bundle = owner.graph_bundle();
-        let graphs = request
-            .graphs
+        let graphs = contract
+            .graphs()
             .iter()
             .map(|name| {
                 owner
@@ -204,25 +119,20 @@ impl TensorRunner {
             stream: Some(stream),
             events,
             graphs,
-            inputs: request
-                .inputs
-                .iter()
-                .map(|input| input.view.clone())
-                .collect(),
-            outputs: request.outputs.clone(),
+            contract,
         })
     }
 
     /// Upload all request inputs and execute every graph once without intergraph
     /// host synchronization. Outputs remain resident until explicitly downloaded.
     pub fn run(&mut self, inputs: &[Vec<u8>]) -> Result<TensorTiming> {
-        if inputs.len() != self.inputs.len() {
-            return Err(invalid("input tensor count differs from request"));
+        if inputs.len() != self.contract.inputs().len() {
+            return Err(invalid("input tensor count differs from signed contract"));
         }
-        for (view, bytes) in self.inputs.iter().zip(inputs) {
+        for (view, bytes) in self.contract.inputs().iter().zip(inputs) {
             if bytes.len() != view.nbytes()? {
                 return Err(invalid(format!(
-                    "input tensor {:?} byte extent differs from request",
+                    "input tensor {:?} byte extent differs from signed contract",
                     view.name
                 )));
             }
@@ -230,7 +140,7 @@ impl TensorRunner {
         let owner = self.owner.as_ref().unwrap();
         let stream = self.stream.as_ref().unwrap();
         let upload = Instant::now();
-        for (view, bytes) in self.inputs.iter().zip(inputs) {
+        for (view, bytes) in self.contract.inputs().iter().zip(inputs) {
             owner.upload_range(&view.allocation, view.offset, bytes)?;
         }
         let input_upload_wall_ns = nanos(upload.elapsed());
@@ -258,7 +168,8 @@ impl TensorRunner {
 
     pub fn outputs(&self) -> Result<Vec<Vec<u8>>> {
         let owner = self.owner.as_ref().unwrap();
-        self.outputs
+        self.contract
+            .outputs()
             .iter()
             .map(|view| owner.download_range(&view.allocation, view.offset, view.nbytes()?))
             .collect()
@@ -305,63 +216,98 @@ impl Drop for TensorRunner {
 mod tests {
     use super::*;
 
-    fn request() -> TensorRequest {
-        serde_json::from_value(serde_json::json!({
-            "graphs": ["encode", "step", "decode"],
-            "inputs": [{"name":"noise","allocation":"storage","offset":0,"dtype":"F16","shape":[1,4,8,8],"file":"noise.bin"}],
-            "outputs": [{"name":"image","allocation":"storage","offset":512,"dtype":"F32","shape":[1,3,64,64]}]
-        })).unwrap()
+    fn contract() -> PreparedTensorContract {
+        use super::super::wire;
+        let binding = |name: &str, offset, dtype| wire::TensorBinding {
+            name: name.into(),
+            reference: Some(wire::Reference {
+                allocation: "storage".into(),
+                offset,
+            }),
+            dtype: dtype as i32,
+            shape: vec![1],
+        };
+        PreparedTensorContract::parse(&wire::TensorContract {
+            version: 1,
+            graphs: vec!["encode".into(), "step".into(), "decode".into()],
+            inputs: vec![
+                binding("noise", 0, wire::TensorDtype::F16),
+                binding("guidance", 4, wire::TensorDtype::F32),
+            ],
+            outputs: vec![binding("image", 8, wire::TensorDtype::F32)],
+        })
+        .unwrap()
+    }
+
+    fn request(names: &[&str]) -> TensorRequest {
+        TensorRequest {
+            inputs: names
+                .iter()
+                .map(|name| TensorInput {
+                    name: (*name).into(),
+                    file: PathBuf::from(format!("{name}.bin")),
+                })
+                .collect(),
+        }
     }
 
     #[test]
-    fn validates_tensor_bytes_and_safe_output_names() {
-        let mut value = request();
-        value.validate().unwrap();
-        assert_eq!(value.inputs[0].view.nbytes().unwrap(), 512);
-        assert_eq!(value.outputs[0].nbytes().unwrap(), 49152);
-        value.outputs[0].name = "../image".into();
-        assert!(value.validate().is_err());
+    fn binds_files_by_signed_names_in_contract_order() {
+        let contract = contract();
+        let request = request(&["guidance", "noise"]);
+        let bound = request.bind(&contract).unwrap();
+        assert_eq!(
+            bound
+                .iter()
+                .map(|input| input.name.as_str())
+                .collect::<Vec<_>>(),
+            ["noise", "guidance"]
+        );
+        assert_eq!(bound[0].file, PathBuf::from("noise.bin"));
     }
 
     #[test]
-    fn rejects_invalid_shape_dtype_alignment_and_overflow() {
-        for (shape, dtype, offset) in [
-            (vec![], "F16", 0),
-            (vec![0], "F16", 0),
-            (vec![usize::MAX, 2], "U8", 0),
-            (vec![1], "unknown", 0),
-            (vec![1], "F32", 2),
+    fn rejects_missing_unknown_duplicate_and_empty_inputs() {
+        let contract = contract();
+        for names in [
+            &[][..],
+            &["noise"],
+            &["noise", "guidance", "extra"],
+            &["noise", "extra"],
+            &["noise", "noise"],
         ] {
-            let mut value = request();
-            value.inputs[0].view.shape = shape;
-            value.inputs[0].view.dtype = dtype.into();
-            value.inputs[0].view.offset = offset;
-            assert!(value.validate().is_err());
+            assert!(request(names).bind(&contract).is_err(), "{names:?}");
         }
+        let mut request = request(&["noise", "guidance"]);
+        request.inputs[0].file = PathBuf::new();
+        assert!(request.bind(&contract).is_err());
     }
 
     #[test]
-    fn rejects_empty_or_duplicate_graphs_and_tensor_names() {
-        for graphs in [vec![], vec!["step".into(), "step".into()], vec!["".into()]] {
-            let mut value = request();
-            value.graphs = graphs;
-            assert!(value.validate().is_err());
+    fn request_cannot_override_signed_execution_or_bindings() {
+        let request = serde_json::json!({"inputs":[
+            {"name":"noise", "file":"noise.bin"},
+            {"name":"guidance", "file":"guidance.bin"}
+        ]});
+        assert!(serde_json::from_value::<TensorRequest>(request.clone()).is_ok());
+        for (field, value) in [
+            ("graphs", serde_json::json!(["decode"])),
+            ("outputs", serde_json::json!([])),
+        ] {
+            let mut altered = request.clone();
+            altered[field] = value;
+            assert!(serde_json::from_value::<TensorRequest>(altered).is_err());
         }
-        let mut value = request();
-        value.outputs[0].name = "noise".into();
-        assert!(value.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_overlapping_input_ranges_but_accepts_adjacent_ranges() {
-        let mut value = request();
-        let mut second = value.inputs[0].clone();
-        second.view.name = "noise2".into();
-        second.view.offset = 510;
-        value.inputs.push(second);
-        assert!(value.validate().is_err());
-        value.inputs[1].view.offset = 512;
-        value.validate().unwrap();
+        for (field, value) in [
+            ("allocation", serde_json::json!("weights")),
+            ("offset", serde_json::json!(8)),
+            ("dtype", serde_json::json!("I64")),
+            ("shape", serde_json::json!([1024])),
+        ] {
+            let mut altered = request.clone();
+            altered["inputs"][0][field] = value;
+            assert!(serde_json::from_value::<TensorRequest>(altered).is_err());
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Native tensor requests preserve the exported allocation bounds."""
+"""Preparation declares tensor geometry separately from runtime input files."""
 
 from types import SimpleNamespace
 import argparse
@@ -11,39 +11,40 @@ import pytest
 
 from ignition.recipes.sdxl.prepare import (
     DecodeForward, GRAPH_ORDER, PreparationNamespace, canonical_reference,
-    graph_order, positive_steps, remove_output_capture_hooks, tensor_view,
+    graph_order, positive_steps, remove_output_capture_hooks, tensor_binding, tensor_contract, tensor_request,
 )
 
 
-def tensor(address=1040, *, contiguous=True):
-    return SimpleNamespace(data_ptr=lambda: address, numel=lambda: 8,
+def tensor(address=1040, *, contiguous=True, elements=8):
+    return SimpleNamespace(data_ptr=lambda: address, numel=lambda: elements,
                            element_size=lambda: 2, shape=(2, 4), dtype="torch.float16",
                            is_contiguous=lambda: contiguous)
 
 
-def test_request_uses_exported_allocation_and_byte_offset():
-    allocation = SimpleNamespace(name="retained-device-0", address=1024, nbytes=64)
-    assert tensor_view("latent", tensor(), [allocation]) == dict(
-        name="latent", allocation="retained-device-0", offset=16, dtype="F16", shape=[2, 4])
+def test_preparation_binding_retains_address_extent_and_geometry():
+    assert tensor_binding("latent", tensor()) == dict(
+        name="latent", address=1040, nbytes=16, dtype="F16", shape=[2, 4])
 
 
-@pytest.mark.parametrize("address", [1016, 1080])
-def test_request_rejects_tensor_crossing_allocation_boundary(address):
-    allocation = SimpleNamespace(name="storage", address=1024, nbytes=64)
-    with pytest.raises(ValueError, match="expected one exported allocation"):
-        tensor_view("latent", tensor(address), [allocation])
-
-
-def test_request_rejects_ambiguous_allocation_ownership():
-    allocations = [SimpleNamespace(name=name, address=1024, nbytes=64) for name in ("first", "second")]
-    with pytest.raises(ValueError, match="expected one exported allocation"):
-        tensor_view("latent", tensor(), allocations)
-
-
-def test_request_rejects_noncontiguous_tensor():
-    allocation = SimpleNamespace(name="storage", address=1024, nbytes=64)
+@pytest.mark.parametrize("options", [{"contiguous": False}, {"elements": 0}])
+def test_preparation_rejects_unrepresentable_tensor_views(options):
     with pytest.raises(ValueError, match="nonempty and contiguous"):
-        tensor_view("latent", tensor(contiguous=False), [allocation])
+        tensor_binding("latent", tensor(**options))
+
+
+@pytest.mark.parametrize("steps", [4, 30])
+def test_prepared_contract_owns_schedule_and_views_while_request_only_names_files(steps):
+    inputs = {"initial_noise": tensor()}
+    buffers = {**inputs, "initialized_latent": tensor(1100)}
+    buffers.update({f"latent_after_step_{index}": tensor(1200 + index * 16) for index in range(steps)})
+    buffers["decoded_image"] = tensor(4096)
+    contract = tensor_contract(graph_order(steps), buffers, inputs)
+    assert contract["version"] == 1
+    assert contract["graphs"] == list(graph_order(steps))
+    assert contract["inputs"] == [tensor_binding("initial_noise", inputs["initial_noise"])]
+    assert [item["name"] for item in contract["outputs"]] == list(buffers)[1:]
+    assert contract["outputs"][-2]["name"] == f"latent_after_step_{steps - 1}"
+    assert tensor_request(inputs) == {"inputs": [{"name": "initial_noise", "file": "inputs/initial_noise.bin"}]}
 
 
 def test_prepare_removes_only_transformers_output_observation_hooks():

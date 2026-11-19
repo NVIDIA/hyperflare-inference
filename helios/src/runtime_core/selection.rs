@@ -472,6 +472,7 @@ mod tests {
             functions,
             modules,
             execution: Some(execution),
+            tensor_contract: None,
             context: Context::default(),
             reservations: vec![],
             allocations: ["weights", "mtp-weights", "scratch"]

@@ -9,9 +9,9 @@ solver arithmetic and image decoding remain prepared model computation.
 This path executes one fixed tensor request on one GPU. Shapes and schedules
 are fixed during preparation; changing the step count requires another core.
 It does not provide concurrent admission, cancellation, continuation, native
-prompt tokenization or an HTTP image endpoint. The request JSON describes
-physical allocation views and graph order, not a signed semantic serving
-contract, and must match the preparation that exported the core.
+prompt tokenization or an HTTP image endpoint. The signed tensor contract fixes
+graph order, input/output names, dtypes, shapes and storage bindings. Request
+JSON supplies only named input files; it cannot change that contract.
 
 See the [tensor CLI](cli-design.md#fixed-tensor-execution) for request fields,
 validation and output files; the [runtime contract](runtime-core-design.md#fixed-tensor-requests)

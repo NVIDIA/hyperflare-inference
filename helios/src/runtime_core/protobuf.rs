@@ -237,6 +237,7 @@ pub(super) fn node(value: wire::Node) -> Result<Node> {
 }
 
 pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
+    let tensor_contract = super::tensor_contract::validate_bundle(&value)?;
     if let Some(execution) = &mut value.execution {
         for graph in &mut execution.graphs {
             if graph.kind == "speculative" && graph.packed_token_capacity == 0 {
@@ -317,6 +318,7 @@ pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
             })
         })?,
         execution: value.execution,
+        tensor_contract,
     };
     Ok(core)
 }
@@ -1062,6 +1064,7 @@ pub(super) fn payload_rank(
             })
         })?,
         execution: rank.execution.clone(),
+        tensor_contract: super::tensor_contract::validate_rank(rank)?,
         context: Context {
             flags: context.flags,
             cache: context.cache,
@@ -1178,6 +1181,7 @@ mod payload_tests {
             roce: None,
             prepared_weights: None,
             compressed_prepared_weights: None,
+            tensor_contract: None,
         }
     }
 

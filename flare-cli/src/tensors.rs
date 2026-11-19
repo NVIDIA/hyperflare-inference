@@ -7,12 +7,41 @@
 
 use flare_helios::runtime_core::{
     AuthorizedCore, NativeResources,
+    tensor_contract::PreparedTensorContract,
     tensors::{TensorRequest, TensorRunner},
 };
 use serde_json::json;
 use std::{fs, path::Path, time::Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn read_inputs(path: &Path, contract: &PreparedTensorContract) -> Result<Vec<Vec<u8>>> {
+    let request: TensorRequest = serde_json::from_slice(&fs::read(path)?)?;
+    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    request
+        .bind(contract)?
+        .into_iter()
+        .zip(contract.inputs())
+        .map(|(input, view)| {
+            let file = root.join(&input.file);
+            let expected = view.nbytes()?;
+            if fs::metadata(&file)?.len() != expected as u64 {
+                return Err(format!(
+                    "input {:?} file length differs from signed contract",
+                    input.name
+                )
+                .into());
+            }
+            let bytes = fs::read(file)?;
+            if bytes.len() != expected {
+                return Err(
+                    format!("input {:?} file changed size while reading", input.name).into(),
+                );
+            }
+            Ok(bytes)
+        })
+        .collect()
+}
 
 pub fn run(args: &crate::cli::Run, authorized: AuthorizedCore) -> Result<()> {
     let path = args
@@ -23,25 +52,8 @@ pub fn run(args: &crate::cli::Run, authorized: AuthorizedCore) -> Result<()> {
         .tensor_output
         .as_ref()
         .ok_or("missing tensor output directory")?;
-    let request: TensorRequest = serde_json::from_slice(&fs::read(path)?)?;
-    request.validate()?;
-    let root = path.parent().unwrap_or_else(|| Path::new("."));
-    let inputs = request
-        .inputs
-        .iter()
-        .map(|input| {
-            let file = root.join(&input.file);
-            let expected = input.view.nbytes()?;
-            if fs::metadata(&file)?.len() != expected as u64 {
-                return Err(format!(
-                    "input {:?} file length differs from declared shape and dtype",
-                    input.view.name
-                )
-                .into());
-            }
-            Ok(fs::read(file)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let contract = authorized.tensor_contract()?;
+    let inputs = read_inputs(path, &contract)?;
     if destination.exists() {
         return Err("tensor output directory already exists".into());
     }
@@ -54,7 +66,7 @@ pub fn run(args: &crate::cli::Run, authorized: AuthorizedCore) -> Result<()> {
     // SAFETY: The CLI authenticated and accepted this core before loading. The
     // runner owns its context and resources through confirmed stream drain.
     let owner = unsafe { NativeResources::load(authorized, 0)? };
-    let mut runner = TensorRunner::new(owner, &request)?;
+    let mut runner = TensorRunner::new(owner)?;
     let load_wall_ms = loading.elapsed().as_secs_f64() * 1000.0;
     let correctness_timing = runner.run(&inputs)?;
     let downloading = Instant::now();
@@ -82,7 +94,7 @@ pub fn run(args: &crate::cli::Run, authorized: AuthorizedCore) -> Result<()> {
     runner.close()?;
     fs::create_dir_all(destination)?;
     let mut descriptors = Vec::new();
-    for ((view, bytes), repeat) in request.outputs.iter().zip(outputs).zip(repeated_outputs) {
+    for ((view, bytes), repeat) in contract.outputs().iter().zip(outputs).zip(repeated_outputs) {
         let file = format!("{}.bin", view.name);
         let repeat_file = format!("{}.repeat.bin", view.name);
         fs::write(destination.join(&file), bytes)?;
@@ -92,7 +104,7 @@ pub fn run(args: &crate::cli::Run, authorized: AuthorizedCore) -> Result<()> {
     let report = json!({
         "executor":"flare-helios-exported-cuda-graphs",
         "core_envelope_sha256":digest,
-        "graphs":request.graphs,
+        "graphs":contract.graphs(),
         "outputs":descriptors,
         "load_wall_ms":load_wall_ms,
         "output_download_wall_ms":output_download_wall_ms,
@@ -114,9 +126,74 @@ pub fn run(args: &crate::cli::Run, authorized: AuthorizedCore) -> Result<()> {
     )?;
     println!(
         "Wrote {} tensors and {} native replay measurements to {}",
-        request.outputs.len(),
+        contract.outputs().len(),
         timings.len(),
         destination.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flare_helios::runtime_core::wire;
+
+    fn contract() -> PreparedTensorContract {
+        let binding = |name: &str, offset| wire::TensorBinding {
+            name: name.into(),
+            reference: Some(wire::Reference {
+                allocation: "storage".into(),
+                offset,
+            }),
+            dtype: wire::TensorDtype::I32 as i32,
+            shape: vec![2],
+        };
+        PreparedTensorContract::parse(&wire::TensorContract {
+            version: 1,
+            graphs: vec!["run".into()],
+            inputs: vec![binding("first", 0), binding("second", 8)],
+            outputs: vec![binding("result", 16)],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn reads_named_files_relative_to_request_in_signed_order() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.bin"), [1u8; 8]).unwrap();
+        fs::write(root.path().join("b.bin"), [2u8; 8]).unwrap();
+        let request = root.path().join("request.json");
+        fs::write(
+            &request,
+            r#"{"inputs":[{"name":"second","file":"b.bin"},{"name":"first","file":"a.bin"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_inputs(&request, &contract()).unwrap(),
+            vec![vec![1; 8], vec![2; 8]]
+        );
+        for nbytes in [7, 9] {
+            fs::write(root.path().join("a.bin"), vec![1u8; nbytes]).unwrap();
+            let error = read_inputs(&request, &contract()).unwrap_err().to_string();
+            assert!(error.contains("file length differs from signed contract"));
+        }
+    }
+
+    #[test]
+    fn rejects_request_metadata_before_reading_input_files() {
+        let root = tempfile::tempdir().unwrap();
+        let request = root.path().join("request.json");
+        for data in [
+            r#"{"graphs":["run"],"inputs":[]}"#,
+            r#"{"inputs":[{"name":"first","file":"absent","allocation":"weights"}]}"#,
+            r#"{"inputs":[{"name":"first","file":"absent"},{"name":"unknown","file":"absent"}]}"#,
+        ] {
+            fs::write(&request, data).unwrap();
+            let error = read_inputs(&request, &contract()).unwrap_err().to_string();
+            assert!(
+                error.contains("unknown field") || error.contains("missing signed input"),
+                "{error}"
+            );
+        }
+    }
 }

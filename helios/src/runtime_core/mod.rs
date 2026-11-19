@@ -49,6 +49,7 @@ mod serving;
 #[cfg(test)]
 mod shared_memory_tests;
 pub mod tensors;
+pub mod tensor_contract;
 pub use archive::{CoreFile, core_companions};
 pub use limits::{KvCacheLimit, MemoryLimit};
 pub use model::{
@@ -95,6 +96,7 @@ pub struct NativeResources {
     names: Vec<String>,
     reservations: Vec<(u64, usize)>,
     execution: Option<protobuf::wire::Execution>,
+    tensor_contract: Option<tensor_contract::PreparedTensorContract>,
     // An integrated GPU (GB10) registers host memory without pinning it.
     integrated: bool,
     events: HashMap<String, Handle>,
@@ -352,6 +354,7 @@ impl NativeResources {
                 names: vec![],
                 reservations: vec![],
                 execution: core.execution.clone(),
+                tensor_contract: core.tensor_contract.clone(),
                 integrated: integrated != 0,
                 events: HashMap::new(),
                 cache: None,
@@ -1099,6 +1102,11 @@ impl NativeResources {
             address: a.address as usize,
             nbytes: a.nbytes,
         })
+    }
+
+    /// Fixed request geometry validated from the authenticated rank metadata.
+    pub fn tensor_contract(&self) -> Result<&tensor_contract::PreparedTensorContract> {
+        self.tensor_contract.as_ref().ok_or_else(|| invalid("core has no signed tensor contract; prepare and export a tensor core"))
     }
 
     /// Copy an allocation after the caller has drained every replay that uses it.

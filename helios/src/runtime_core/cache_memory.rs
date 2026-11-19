@@ -240,6 +240,7 @@ mod tests {
                 graphs: vec![],
                 reservations: vec![],
                 execution: None,
+                tensor_contract: None,
                 context: Context::default(),
                 allocations: vec![],
             };

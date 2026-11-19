@@ -225,6 +225,23 @@ pub struct AuthorizedCore {
 }
 
 impl AuthorizedCore {
+    /// Read fixed request geometry only from the authenticated rank metadata.
+    pub fn tensor_contract(&self) -> Result<super::tensor_contract::PreparedTensorContract> {
+        let contract = match &self.kind {
+            AuthorizedKind::Legacy { index, .. } => {
+                super::tensor_contract::validate_model(index)?;
+                index.ranks.first().map(super::tensor_contract::validate_bundle).transpose()?.flatten()
+            }
+            AuthorizedKind::Payload(core) => {
+                if core.cores.len() != 1 {
+                    return Err(invalid("tensor contract requires one independent rank"));
+                }
+                core.cores[0].tensor_contract.clone()
+            }
+        };
+        contract.ok_or_else(|| invalid("core has no signed tensor contract; prepare and export a tensor core"))
+    }
+
     /// Canonical model ID followed by serving aliases from the signed serving contract.
     pub fn model_names(&self) -> Result<Vec<&str>> {
         let contract = match &self.kind {
@@ -1100,6 +1117,10 @@ impl Protection {
             data.push(stored_data(stored, payload_size, index.version)?);
             index.ranks.push(bundle);
         }
+        if metadata.ranks != 1 && index.ranks.iter().any(|bundle| bundle.tensor_contract.is_some()) {
+            return Err(invalid("tensor contract requires one independent rank"));
+        }
+        super::tensor_contract::validate_model(&index)?;
         let protection = Self {
             publisher,
             official_source: metadata.official_source,

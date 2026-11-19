@@ -587,6 +587,30 @@ message BundleIndex {
   RoceTransport roce = 11;
   // Absent in cores without a prepared-weight catalog. Ignored during replay.
   RebuildWeights rebuild_weights = 12;
+  TensorContract tensor_contract = 13;
+}
+
+// One fixed request on one independent rank; all model arithmetic is captured.
+message TensorContract {
+  uint32 version = 1;
+  repeated string graphs = 2;
+  repeated TensorBinding inputs = 3;
+  repeated TensorBinding outputs = 4;
+}
+message TensorBinding {
+  string name = 1;
+  Reference reference = 2;
+  TensorDtype dtype = 3;
+  repeated uint64 shape = 4;
+}
+enum TensorDtype {
+  TENSOR_DTYPE_UNSPECIFIED = 0;
+  TENSOR_DTYPE_U8 = 1;
+  TENSOR_DTYPE_F16 = 2;
+  TENSOR_DTYPE_BF16 = 3;
+  TENSOR_DTYPE_F32 = 4;
+  TENSOR_DTYPE_I32 = 5;
+  TENSOR_DTYPE_I64 = 6;
 }
 // A RoCEnante (b12x.comm.roce) transport whose kernels the rank's graphs launch. Its pinned region
 // and device counters are allocations restored at their recorded addresses and zeroed; the native

@@ -365,17 +365,21 @@ class DecodeForward:
         self.output.copy_(self.vae.decode(latents, return_dict=False)[0])
 
 
-def tensor_view(name, tensor, allocations):
+def tensor_binding(name, tensor):
     if not tensor.is_contiguous() or tensor.numel() == 0:
-        raise ValueError(f"native tensor view {name} must be nonempty and contiguous")
-    start, size = tensor.data_ptr(), tensor.numel() * tensor.element_size()
-    candidates = [value for value in allocations
-                  if value.address <= start and start + size <= value.address + value.nbytes]
-    if len(candidates) != 1:
-        raise ValueError(f"expected one exported allocation for {name}, got {len(candidates)}")
-    allocation = candidates[0]
-    return dict(name=name, allocation=allocation.name, offset=start - allocation.address,
+        raise ValueError(f"prepared tensor binding {name} must be nonempty and contiguous")
+    return dict(name=name, address=tensor.data_ptr(), nbytes=tensor.numel() * tensor.element_size(),
                 dtype=DTYPES[str(tensor.dtype)], shape=list(tensor.shape))
+
+
+def tensor_contract(order, buffers, inputs):
+    return dict(version=1, graphs=list(order),
+                inputs=[tensor_binding(name, buffers[name]) for name in inputs],
+                outputs=[tensor_binding(name, value) for name, value in buffers.items() if name not in inputs])
+
+
+def tensor_request(inputs):
+    return dict(inputs=[dict(name=name, file=f"inputs/{name}.bin") for name in inputs])
 
 
 def verify_eager_forwards(functions, buffers, cases, root, *, steps=DEFAULT_STEPS):
@@ -489,14 +493,10 @@ def prepare_graphs(pipe, storage, images, cases, args):
     with export_options(args.output / "core-cache"):
         package.write(sources, graphs, execution=None, sources=True, zero_ranges=zero_ranges,
                       discover_allocations=True, numeric=numeric, parameter_layouts=parameter_layouts,
-                      inactive=inactive, granularity=storage.granularity, roots=())
+                      inactive=inactive, granularity=storage.granularity, roots=(),
+                      tensor_contract=tensor_contract(order, buffers, cases["case_a"]))
         for case, inputs in cases.items():
-            request = dict(graphs=list(order),
-                           inputs=[dict(**tensor_view(name, buffers[name], package.allocations), file=f"inputs/{name}.bin")
-                                   for name in inputs],
-                           outputs=[tensor_view(name, value, package.allocations)
-                                    for name, value in buffers.items() if name not in inputs])
-            write_json(args.output / case / "request.json", request)
+            write_json(args.output / case / "request.json", tensor_request(inputs))
         result = combine(args.output / "core", [sources], [], publisher=publisher, form="directory")
     write_json(args.output / "publisher.json", [dict(name="SDXL local qualification", namespace=publisher.namespace,
                 public_key=list(publisher.public_key), development=True)])
