@@ -884,6 +884,17 @@ impl NativeResources {
                                         value.as_ptr().cast(),
                                     );
                                 }
+                                if status != 0 && value.iter().all(|word| *word == 0) {
+                                    // Drivers reject kernel-node attributes added after their
+                                    // CUDA release. A zero-valued attribute carries no behavior,
+                                    // so a replay driver older than the preparing driver can
+                                    // safely skip it instead of failing the whole core load.
+                                    eprintln!(
+                                        "skipping kernel-node attribute id={} rejected by this driver (status={}) in graph {} node {}",
+                                        attribute.id, status, graph.name, nodes.len()
+                                    );
+                                    continue;
+                                }
                                 driver.check("cuGraphKernelNodeSetAttribute", status)?;
                             }
                         }
