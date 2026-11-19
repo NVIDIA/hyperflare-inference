@@ -3895,6 +3895,165 @@ fn text_preemption_restores_or_recomputes_every_attention_contract() {
 }
 
 #[test]
+fn steered_pool_lookup_retry_preserves_salted_history_and_steering_scale() {
+    let mut fixture = Fixture::new();
+    fixture.config.contract = crate::model::testing::metadata();
+    fixture.config.sampling_ranges.steering_scale = Some(crate::model::SamplingRange {
+        min: 0.0,
+        max: 1.0,
+    });
+    let (sender, receiver) = mpsc::channel();
+    let (mut incoming, _generation) = fixture.incoming(vec![7; 70], 2);
+    incoming.prompt.sampling.steering_scale = 0.75;
+
+    let mut steered_history =
+        crate::cache::PrefixHistory::with_steering_scale(fixture.config.identity, 0.75);
+    steered_history.append(&incoming.prompt.tokens, &[]).unwrap();
+    let mut unsteered_history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    unsteered_history.append(&incoming.prompt.tokens, &[]).unwrap();
+    assert_ne!(steered_history.key_at(64), unsteered_history.key_at(64));
+
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(Some(host_hit(&steered_history, 64)));
+    store.pooled = true;
+    store.refused_lookups = 1;
+    worker.attach_store(Some(Box::new(store)));
+
+    sender.send(vec![incoming]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let handle = worker.active[0].as_ref().unwrap().request;
+    let live = worker.scheduler.request(handle).unwrap();
+    assert_eq!(
+        (live.phase, live.reused_prompt_tokens(), live.steering_scale()),
+        (RequestPhase::Inbound, 64, 0.75)
+    );
+    let store = fake_store(&mut worker);
+    assert_eq!(store.begun, vec![70, 70]);
+    assert_eq!(store.tickets_seen, vec![true]);
+    assert_eq!(store.fetched.len(), 1);
+}
+
+#[test]
+fn steered_preemption_preserves_steering_scale_and_prefix_history() {
+    let mut fixture = Fixture::new();
+    fixture.config.contract = crate::model::testing::metadata();
+    fixture.config.sampling_ranges.steering_scale = Some(crate::model::SamplingRange {
+        min: 0.0,
+        max: 1.0,
+    });
+    fixture.config.prepared_sequence_tokens = 4096;
+    fixture.config.limits.max_sequence_tokens = 4096;
+    fixture.config.limits.pages = 6;
+    fixture.config.limits.max_active = 2;
+    let page_tokens = crate::model::scheduler_capabilities(&fixture.config).page_tokens;
+    let budget = (page_tokens * 4) as u32;
+    let data = |n: usize| PromptData {
+        positions: (0..n).map(|p| [p as i64; 3]).collect(),
+        vision_token_indices: vec![-1; n],
+        ..Default::default()
+    };
+    let (sender, receiver) = mpsc::channel();
+    let (mut first, mut first_gen) = fixture.incoming_for(vec![3; 60], budget, data(60));
+    let (mut second, mut second_gen) = fixture.incoming_for(vec![5; 60], budget, data(60));
+    first.prompt.sampling.steering_scale = 0.75;
+    second.prompt.sampling.steering_scale = 0.75;
+    sender.send(vec![first, second]).unwrap();
+    let mut worker = fixture.worker_for(receiver);
+    let manifest = crate::model::testing::manifest(&fixture.config);
+    worker.inputs = Some(crate::model::Inputs::new(&fixture.config, &manifest).unwrap());
+    let mut graphs = manifest.graphs;
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
+    }
+    worker.scheduler.measured_graph_durations(&graphs).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+
+    let mut sequence = 0;
+    while worker.parked.is_empty() {
+        sequence += 1;
+        assert!(sequence < (page_tokens * 8) as u64);
+        let step = worker.plan(0).unwrap().0.unwrap();
+        worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
+        let sample = match step.kind {
+            GraphKind::Decode | GraphKind::Resume => Some(1),
+            GraphKind::Prefill => {
+                let lane = &step.lanes[0];
+                let live = worker.scheduler.request(lane.request).unwrap();
+                (lane.start_position as usize + lane.tokens == live.prompt_tokens).then_some(1)
+            }
+            _ => None,
+        };
+        let mut frame = completion(&worker, &step, sequence, sample);
+        frame.timing.gpu_ns[0] = Some(if step.kind == GraphKind::Snapshot { 10 } else { 1000 });
+        worker.complete(step.kind, frame).unwrap();
+        worker.publish().unwrap();
+        while first_gen.events.try_recv().is_ok() {}
+        while second_gen.events.try_recv().is_ok() {}
+    }
+    let (parked_incoming, _) = worker.parked.front().unwrap();
+    assert_eq!(parked_incoming.prompt.sampling.steering_scale, 0.75);
+    let parked_tokens = parked_incoming.prompt.tokens.clone();
+
+    let unsteered_spec = RequestSpec {
+        prompt: parked_tokens,
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 1,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    let running = worker.active.iter().flatten().map(|a| a.request).collect::<Vec<_>>();
+    worker.retire(&running).unwrap();
+    assert_eq!(
+        worker
+            .scheduler
+            .plan_admission(&unsteered_spec)
+            .unwrap()
+            .resident_tokens(),
+        0
+    );
+    assert!(
+        worker
+            .scheduler
+            .plan_admission_with_steering(&unsteered_spec, 0.75)
+            .unwrap()
+            .resident_tokens()
+            > 0
+    );
+
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.parked.is_empty());
+    let readmitted_slot = worker.active.iter().position(|s| s.is_some()).unwrap();
+    let readmitted_handle = worker.active[readmitted_slot].as_ref().unwrap().request;
+    assert!(
+        worker
+            .scheduler
+            .request(readmitted_handle)
+            .unwrap()
+            .reused_prompt_tokens()
+            > 0
+    );
+    sequence += 1;
+    let restore_step = worker.plan(0).unwrap().0.unwrap();
+    assert_eq!(restore_step.kind, GraphKind::Restore);
+    worker.reserve_and_pack(&restore_step, Fence(sequence)).unwrap();
+    let uploads = worker.inputs.as_ref().unwrap().uploads();
+    let params = uploads
+        .iter()
+        .find(|u| u.buffer == "admission_parameters")
+        .unwrap();
+    let lane_row = restore_step
+        .lanes
+        .iter()
+        .position(|lane| lane.request == readmitted_handle)
+        .unwrap();
+    let base = lane_row * 7 * 4;
+    assert_eq!(&params.bytes[base + 24..base + 28], &0.75f32.to_le_bytes());
+}
+
+#[test]
 fn reasoning_budget_survives_preemption_and_checkpoint_recomputation() {
     for evict in [false, true] {
         for close in [1, 4] {

@@ -31,7 +31,9 @@ class _LayerTrial:
     def __call__(self):
         f = self.fixture
         indices = f.indices(f.metadata, replay_start=f.replay_start)
-        incoming, _, _, _ = self.layer(f.incoming, f.pre_mix, f.metadata, indices, f.selection)
+        incoming, _, _, _ = self.layer(
+            f.incoming, f.pre_mix, f.metadata, indices, f.selection,
+            token_scale=f.token_scale)
         f.output.copy_(incoming[0])
 
 
@@ -42,7 +44,9 @@ class _LayerObservation:
     def __call__(self):
         f = self.fixture
         indices = f.indices(f.metadata, replay_start=f.replay_start)
-        *_, observations = self.layer._run(f.incoming, f.pre_mix, f.metadata, indices, f.selection)
+        *_, observations = self.layer._run(
+            f.incoming, f.pre_mix, f.metadata, indices, f.selection,
+            token_scale=f.token_scale)
         for name, destination in f.observations.items():
             source = observations[name]
             if isinstance(destination, tuple):
@@ -92,6 +96,9 @@ class CatalogLayerFixture:
         self.tokens = self.metadata.positions.numel()
         self.batch = self.metadata.starts.numel()
         self.width = self.metadata.max_query_tokens
+        self.token_scale = (None if self.layer.steering is None else
+                            torch.ones((self.tokens, 1), dtype=torch.float32,
+                                       device=self.metadata.positions.device))
         self.label = f"{name}.layer{layer_index}"
         kind = "prefill" if attention.mode == "prefill" else "decode" if attention.mode == "decode" else "speculative"
         self.trial_signature = GraphSignature(kind, self.batch, self.width,
@@ -402,4 +409,4 @@ class CatalogLayerFixture:
     def release_examples(self):
         self.close()
         self.scratch = self.metadata = self.replay_start = self.incoming = self.pre_mix = None
-        self.selection = self.output = self.observations = self.target_decoder = None
+        self.selection = self.output = self.observations = self.target_decoder = self.token_scale = None

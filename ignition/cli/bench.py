@@ -167,7 +167,8 @@ def run(args):
         force_moe_decode_a16=args.force_moe_decode_a16,
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
-        prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
+        prompt_logprobs=args.prompt_logprobs, steering_sidecar=args.steering_sidecar,
+        expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(
@@ -239,7 +240,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
             "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
-            "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}
+            "online_mxfp8", "online_mxfp8_scope", "language_model_only", "steering_sidecar")}}
 
     if settings.speculation_study:
         details["configuration"]["speculation_study"] = dict(

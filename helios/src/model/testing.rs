@@ -246,7 +246,15 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         for b in &graph.inputs {
             use ValueSource::*;
             let width = match b.source {
-                SamplingParameters => 6,
+                SamplingParameters => {
+                    if config.sampling_ranges.steering_scale.is_some()
+                        || config.sampling_defaults.steering_scale != 0.
+                    {
+                        7
+                    } else {
+                        6
+                    }
+                }
                 EosTokenIds | LiveStateRows => 8,
                 PromptHistogram => config.contract.vocabulary,
                 GrammarMask => config.contract.vocabulary.div_ceil(32),

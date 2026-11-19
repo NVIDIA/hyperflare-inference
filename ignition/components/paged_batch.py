@@ -45,6 +45,17 @@ class BatchInputs:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
 
 
+def gather_token_steering_scale(parameters, row_slot_ids, token_requests, token_positions):
+    """Gather one request-owned steering scale for every packed token row."""
+    if parameters.ndim != 2 or parameters.shape[1] != 7:
+        raise ValueError("steering scale requires seven request parameter columns")
+    capacity = parameters.shape[0]
+    safe_slots = row_slot_ids.long().clamp(0, capacity - 1)
+    lane_scales = torch.where(row_slot_ids >= 0, parameters[safe_slots, 6], 0.0)
+    token_scales = torch.where(token_positions >= 0, lane_scales[token_requests], 0.0)
+    return token_scales.unsqueeze(1)
+
+
 @dataclass(frozen=True)
 class Metadata:
     token_ids: torch.Tensor
@@ -59,9 +70,11 @@ class Metadata:
     token_page_table: torch.Tensor
     live_counts: torch.Tensor
     max_query_tokens: int
+    steering_scale: torch.Tensor | None = None
 
     @classmethod
-    def allocate(cls, tokens, rows, blocks, device, *, samples=None, buffers=None, max_query_tokens=None):
+    def allocate(cls, tokens, rows, blocks, device, *, samples=None, buffers=None, max_query_tokens=None,
+                 steering=False):
         query_capacity = (tokens + rows - 1) // rows if max_query_tokens is None else max_query_tokens
         if type(query_capacity) is not int or query_capacity < 1:
             raise ValueError("per-request query capacity must be a positive integer")
@@ -83,9 +96,11 @@ class Metadata:
             per_token,
             zeros(2),
             query_capacity,
+            zeros((tokens, 1), torch.float32) if steering else None,
         )
 
-    def set(self, starts, lengths, state_rows, pages, tokens, live_rows):
+    def set(self, starts, lengths, state_rows, pages, tokens, live_rows, *,
+            parameters=None, row_slot_ids=None):
         rows, width = tokens.shape
         offsets = torch.arange(self.token_ids.numel(), device=tokens.device)
         ends = lengths.cumsum(0)
@@ -111,10 +126,16 @@ class Metadata:
         self.sample_indices.copy_(
             (begins[:, None] + columns).clamp(0, self.token_ids.numel() - 1).reshape(-1)
         )
+        if self.steering_scale is not None:
+            if parameters is None or row_slot_ids is None:
+                raise ValueError("steering metadata requires request parameters and row slot IDs")
+            self.steering_scale.copy_(
+                gather_token_steering_scale(parameters, row_slot_ids, request, self.positions)
+            )
 
     @classmethod
     def pack(cls, starts, lengths, state_rows, pages, tokens, live_rows, *, token_capacity,
-             sample_count=None, max_query_tokens=None):
+             sample_count=None, max_query_tokens=None, parameters=None, row_slot_ids=None):
         """Return packed metadata with forward-local destinations."""
         rows, width = tokens.shape
         if rows < 1 or width < 1 or type(token_capacity) is not int or token_capacity < 1:
@@ -135,6 +156,12 @@ class Metadata:
         indices = (request * width + column).clamp(0, tokens.numel() - 1)
         columns = torch.arange(sample_count // rows, device=tokens.device)
         packed_pages = pages.to(dtype=torch.int32, copy=True)
+        token_positions = torch.where(live, starts[request] + column, -1).to(torch.int64)
+        steering_scale = (
+            gather_token_steering_scale(parameters, row_slot_ids, request, token_positions)
+            if parameters is not None and row_slot_ids is not None and parameters.shape[1] == 7
+            else None
+        )
         return cls(
             torch.where(live, tokens.reshape(-1)[indices], 0).to(torch.int64),
             (begins[:, None] + columns).clamp(0, token_capacity - 1).reshape(-1).to(torch.int64),
@@ -143,11 +170,12 @@ class Metadata:
             starts.to(dtype=torch.int64, copy=True),
             lengths.to(dtype=torch.int32, copy=True),
             request,
-            torch.where(live, starts[request] + column, -1).to(torch.int64),
+            token_positions,
             packed_pages,
             packed_pages.expand(token_capacity, -1) if rows == 1 else packed_pages[request],
             torch.cat((ends[-1:].to(torch.int32), live_rows.clamp(0, rows).reshape(1).to(torch.int32))),
             query_capacity,
+            steering_scale,
         )
 
 
@@ -275,6 +303,10 @@ class PreparedBatch:
         live = offsets < ends[-1]
         pages = torch.where(active[:, None], b.page_tables[slots], -1)
         tokens = b.token_ids[:self.tokens] if self.mode == "prefill" else pending_tokens[request]
+        token_positions = torch.where(live, positions[request] + offsets - starts[request], -1)
+        steering_scale = (gather_token_steering_scale(
+            r.parameters, b.row_slot_ids[:self.rows], request, token_positions)
+            if r.parameters.shape[1] == 7 else None)
         return Metadata(
             torch.where(live, tokens, 0),
             (ends - 1).clamp(min=0).to(torch.int64).expand(self.sample_count),
@@ -283,11 +315,12 @@ class PreparedBatch:
             positions,
             lengths,
             request,
-            torch.where(live, positions[request] + offsets - starts[request], -1),
+            token_positions,
             pages,
             pages.expand(self.tokens, -1) if self.rows == 1 else pages[request],
             torch.cat((ends[-1:], b.live_rows.clamp(0, self.rows))),
             self.max_query_tokens,
+            steering_scale,
         )
 
     def finish(self, metadata):

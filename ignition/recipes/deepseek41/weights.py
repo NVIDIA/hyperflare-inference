@@ -15,6 +15,7 @@ from ignition.components.markov_sampling import fp8_markov_head
 from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
 
 from .config import ModelConfig
+from .steering import SteeringSidecar
 
 
 @dataclass(frozen=True)
@@ -74,11 +75,12 @@ class ModelWeights:
     draft: DSparkWeights | None
     allocated_bytes: int
     vision: dict | None = None
+    steering: SteeringSidecar | None = None
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False):
+             vocabulary_parallel_sampling=False, steering_sidecar=None):
         config = ModelConfig.load(manifest.metadata_path)
         before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
@@ -101,8 +103,12 @@ class ModelWeights:
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)
+        steering = (None if steering_sidecar is None
+                    else SteeringSidecar.load(steering_sidecar, device))
+        if steering is not None and len(layers) <= max(steering.layers):
+            raise ValueError("steering sidecar names a layer outside the DeepSeek decoder")
         return cls(config, shard, embedding, norm, head, layers, draft,
-                   allocated_tensor_bytes(device) - before, vision)
+                   allocated_tensor_bytes(device) - before, vision, steering)
 
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):

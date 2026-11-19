@@ -74,6 +74,9 @@ impl Admission {
             || self.handle.generation == 0
             || self.handle.generation > i64::MAX as u64
             || self.sampling.top_k > config.contract.vocabulary as i32
+            || !self
+                .sampling
+                .in_steering_bounds(&config.sampling_defaults, &config.sampling_ranges)
             || (self.max_new_tokens == 0 && !self.prompt_logprobs)
             || self.max_new_tokens > i32::MAX as u32
             || self.prompt.is_empty()
@@ -129,6 +132,15 @@ impl Admission {
 #[cfg(feature = "server")]
 pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> Result<()> {
     prompt.sampling.validate()?;
+    if !prompt
+        .sampling
+        .in_steering_bounds(&config.sampling_defaults, &config.sampling_ranges)
+    {
+        return Err(crate::Error::admission(
+            crate::AdmissionError::Invalid,
+            "steering_scale is outside the model core's declared sampling bounds",
+        ));
+    }
     if !prompt.logprob_token_ids.is_empty() {
         if config.logprob_token_id_capacity == 0 {
             return Err("logprob_token_ids are not available in this model core; re-export to enable them".into());

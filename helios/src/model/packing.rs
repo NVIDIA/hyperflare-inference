@@ -64,6 +64,7 @@ impl Inputs {
 
     pub fn new(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<Self> {
         config.contract.validate(manifest)?;
+        let mut parameter_width: Option<usize> = None;
         let graphs = manifest
             .graphs
             .iter()
@@ -174,7 +175,22 @@ impl Inputs {
                             }
                         }
                         let expected_width = match binding.source {
-                            ValueSource::SamplingParameters => 6,
+                            ValueSource::SamplingParameters => {
+                                if !matches!(width, 6 | 7) {
+                                    return Err(format!(
+                                        "invalid shape or dtype for semantic input {}",
+                                        binding.buffer
+                                    )
+                                    .into());
+                                }
+                                if *parameter_width.get_or_insert(width) != width {
+                                    return Err(
+                                        "sampling-parameter bindings must have a uniform width"
+                                            .into(),
+                                    );
+                                }
+                                width
+                            }
                             ValueSource::EosTokenIds => 8,
                             ValueSource::LiveStateRows => {
                                 if width < semantics.state_rows_per_request {
@@ -257,6 +273,19 @@ impl Inputs {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let steering_declared = config.sampling_ranges.steering_scale.is_some()
+            || config.sampling_defaults.steering_scale != 0.;
+        if steering_declared && parameter_width != Some(7) {
+            return Err(
+                "steering sampling metadata requires a 7-column SamplingParameters input".into(),
+            );
+        }
+        if !steering_declared && parameter_width == Some(7) {
+            return Err(
+                "7-column SamplingParameters input requires declared steering sampling metadata"
+                    .into(),
+            );
+        }
         let maximum = graphs
             .iter()
             .flat_map(|g| &g.inputs)
@@ -477,6 +506,20 @@ impl Inputs {
                 };
                 token_offset += lane.tokens;
                 if binding.source == ValueSource::SamplingParameters {
+                    if input.width == 6 && admission.sampling.steering_scale != 0. {
+                        return Err(
+                            "nonzero steering_scale requires a 7-column SamplingParameters input"
+                                .into(),
+                        );
+                    }
+                    if admission.sampling.canonical_steering_scale().to_bits()
+                        != live.steering_scale().to_bits()
+                    {
+                        return Err(
+                            "packing steering_scale does not match the request's planned prefix history"
+                                .into(),
+                        );
+                    }
                     self.staging.put(
                         &binding.buffer,
                         destination * 4,
@@ -484,6 +527,7 @@ impl Inputs {
                             .sampling
                             .values()
                             .into_iter()
+                            .take(input.width)
                             .flat_map(f32::to_le_bytes),
                     );
                     continue;

@@ -65,6 +65,7 @@ pub(super) fn serving_contract(
 pub(super) fn sampling_defaults(
     value: wire::DefaultSamplingParameters,
 ) -> Result<serde_json::Value> {
+    let steering_scale = value.steering_scale;
     let sampling = crate::model::SamplingParameters {
         seed: required(value.seed, "sampling seed")?,
         temperature: required(value.temperature, "sampling temperature")?,
@@ -74,6 +75,7 @@ pub(super) fn sampling_defaults(
         repetition_penalty: required(value.repetition_penalty, "sampling repetition_penalty")?,
         presence_penalty: required(value.presence_penalty, "sampling presence_penalty")?,
         frequency_penalty: required(value.frequency_penalty, "sampling frequency_penalty")?,
+        steering_scale: steering_scale.unwrap_or(0.),
     };
     sampling
         .validate()
@@ -84,8 +86,28 @@ pub(super) fn sampling_defaults(
         "repetition_penalty": sampling.repetition_penalty, "presence_penalty": sampling.presence_penalty,
         "frequency_penalty": sampling.frequency_penalty,
     });
+    let has_steering_range = value
+        .ranges
+        .as_ref()
+        .is_some_and(|ranges| ranges.steering_scale.is_some());
+    if steering_scale.is_some() != has_steering_range || sampling.steering_scale != 0. {
+        return Err(invalid(
+            "steering metadata requires a zero default and a 0..1 range",
+        ));
+    }
+    if let Some(steering_scale) = steering_scale {
+        result["steering_scale"] = steering_scale.into();
+    }
     if let Some(ranges) = value.ranges {
         let ranges = sampling_ranges(ranges)?;
+        if ranges
+            .steering_scale
+            .is_some_and(|range| range != crate::model::SamplingRange { min: 0., max: 1. })
+        {
+            return Err(invalid(
+                "steering metadata requires a zero default and a 0..1 range",
+            ));
+        }
         ranges
             .validate(&sampling)
             .map_err(|error| invalid(error.to_string()))?;
@@ -110,6 +132,7 @@ fn sampling_ranges(value: wire::SamplingRanges) -> Result<crate::model::Sampling
         repetition_penalty: value.repetition_penalty.map(float).transpose()?,
         presence_penalty: value.presence_penalty.map(float).transpose()?,
         frequency_penalty: value.frequency_penalty.map(float).transpose()?,
+        steering_scale: value.steering_scale.map(float).transpose()?,
         top_k: value
             .top_k
             .map(|range| -> Result<SamplingRange<i32>> {
@@ -458,6 +481,7 @@ mod tests {
             presence_penalty: Some(0.),
             frequency_penalty: Some(0.),
             ranges: None,
+            steering_scale: None,
         }
     }
 
@@ -470,12 +494,33 @@ mod tests {
         assert_eq!(json["seed"].as_u64(), Some(u64::MAX));
         assert_eq!(json["top_k"], -1);
         assert_eq!(json["frequency_penalty"], 0.);
+        assert!(json.get("steering_scale").is_none());
         #[cfg(feature = "server")]
         {
             let sampling: crate::model::SamplingParameters = serde_json::from_value(json).unwrap();
             assert_eq!(sampling.seed, u64::MAX);
             assert_eq!(sampling.top_k, -1);
+            assert_eq!(sampling.steering_scale, 0.);
         }
+    }
+
+    #[test]
+    fn steering_sampling_metadata_round_trips_exact_bounds() {
+        let mut value = defaults();
+        value.steering_scale = Some(0.);
+        value.ranges = Some(wire::SamplingRanges {
+            steering_scale: Some(wire::SamplingFloatRange {
+                min: Some(0.),
+                max: Some(1.),
+            }),
+            ..Default::default()
+        });
+        let json = sampling_defaults(value).unwrap();
+        assert_eq!(json["steering_scale"], 0.);
+        assert_eq!(
+            json["ranges"]["steering_scale"],
+            serde_json::json!({"min":0.,"max":1.})
+        );
     }
 
     #[test]

@@ -116,6 +116,13 @@ impl Bootstrap {
                     ))
                 })?;
         }
+        if sampling_defaults.steering_scale != 0.
+            || sampling_ranges
+                .steering_scale
+                .is_some_and(|range| range != crate::model::SamplingRange { min: 0., max: 1. })
+        {
+            return Err("steering metadata requires a zero default and a 0..1 range".into());
+        }
         let contract = serde_json::from_value(
             object
                 .get("model_contract")

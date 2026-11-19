@@ -364,6 +364,19 @@ mod tests {
         assert_eq!(vision["flare"]["max_image_tokens_per_image"], 256);
         assert_eq!(vision["flare"]["max_image_pixels"], 64 * 1024 * 1024);
         assert_eq!(vision["flare"]["max_image_bytes"], 32 * 1024 * 1024);
+        assert_eq!(text["flare"]["sampling_defaults"]["steering_scale"], 0.0);
+        assert!(text["flare"]["sampling_ranges"]["steering_scale"].is_null());
+
+        model.sampling_ranges.steering_scale = Some(crate::model::SamplingRange {
+            min: 0.0,
+            max: 1.0,
+        });
+        let steered = ModelCatalog::new(&model, &[], None).card;
+        assert_eq!(steered["flare"]["sampling_defaults"]["steering_scale"], 0.0);
+        assert_eq!(
+            steered["flare"]["sampling_ranges"]["steering_scale"],
+            json!({"min": 0.0, "max": 1.0})
+        );
     }
 
     #[test]

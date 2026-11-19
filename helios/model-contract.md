@@ -66,6 +66,11 @@ are chosen after graph loading and replace preparation's working-set counts.
 History drafting is a startup option that requires enabled learned speculation
 and concrete copied-token inputs in each selected wider graph. Export records
 no history preference. Core defaults fill missing settings; explicit startup options take precedence.
+`SamplingParameters` bindings declare either six FP32 columns (temperature,
+top-p, min-p, repetition penalty, presence penalty, frequency penalty) or seven
+columns when the prepared graphs also consume per-request `steering_scale`.
+Input packing reads the declared row width from the bound buffer, and admission
+enforces the core's declared `steering_scale` bounds.
 
 The optional core rebuild manifest and per-rank weight catalogs describe
 preparation inputs and stored tensor views. They do not select serving behavior.

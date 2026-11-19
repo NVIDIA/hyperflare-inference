@@ -104,7 +104,8 @@ def _shortlist_candidates(Scores, Ids, Candidates, id_stride, V: tl.constexpr,
 @triton.jit
 def _select_and_sample(Candidates, Selected, Probabilities, Valid, TopK, TopP, Params, Slots, Seed,
                        Offset, Sampled, V: tl.constexpr, BLOCKS: tl.constexpr, POOL: tl.constexpr, K: tl.constexpr,
-                       SLOTS: tl.constexpr, SupportIds, SupportProbabilities, WRITE_SUPPORT: tl.constexpr):
+                       SLOTS: tl.constexpr, SupportIds, SupportProbabilities, WRITE_SUPPORT: tl.constexpr,
+                       PARAMETERS: tl.constexpr = 6):
     row = tl.program_id(0)
     index = tl.arange(0, POOL)
     pool = tl.load(Candidates + row * BLOCKS * K + index, index < BLOCKS * K, other=-9223372036854775808)
@@ -125,7 +126,7 @@ def _select_and_sample(Candidates, Selected, Probabilities, Valid, TopK, TopP, P
     finite = present & (scores == scores) & (scores != float("inf")) & (scores != -float("inf"))  # noqa: PLR0124
 
     slot = tl.minimum(tl.maximum(tl.load(Slots + row), 0), SLOTS - 1)
-    min_p = tl.load(Params + slot * 6 + 2)
+    min_p = tl.load(Params + slot * PARAMETERS + 2)
     top_p = tl.load(TopP + row)
 
     # Top-k keeps every candidate tied with the k-th score.
@@ -196,7 +197,7 @@ def _restore_draft_support(Selected, SupportIds, SupportProbabilities, Probabili
 def _draft_score_values(Logits, Bias, Histogram, Candidates, Slots, Params, GrammarMask, GrammarEnabled,
                         hist_stride, mask_stride, candidate_stride, logit_stride, bias_stride,
                         ADD_BIAS: tl.constexpr, CAPACITY: tl.constexpr, V: tl.constexpr,
-                        PREFIX: tl.constexpr, BLOCK: tl.constexpr):
+                        PREFIX: tl.constexpr, BLOCK: tl.constexpr, PARAMETERS: tl.constexpr = 6):
     # One vocabulary block of one row: the committed histogram plus the row's earlier drafts give the penalty
     # counts; repetition, presence and frequency penalties, temperature and the grammar mask follow the
     # unfused order of operations. The caller reduces each block's maximum.
@@ -207,10 +208,10 @@ def _draft_score_values(Logits, Bias, Histogram, Candidates, Slots, Params, Gram
     score = tl.load(Logits + row * logit_stride + token, mask=inside, other=0.).to(tl.float32)
     if ADD_BIAS:
         score = score + tl.load(Bias + row * bias_stride + token, mask=inside, other=0.).to(tl.float32)
-    temperature = tl.load(Params + safe * 6)
-    repetition = tl.load(Params + safe * 6 + 3)
-    presence = tl.load(Params + safe * 6 + 4)
-    frequency = tl.load(Params + safe * 6 + 5)
+    temperature = tl.load(Params + safe * PARAMETERS)
+    repetition = tl.load(Params + safe * PARAMETERS + 3)
+    presence = tl.load(Params + safe * PARAMETERS + 4)
+    frequency = tl.load(Params + safe * PARAMETERS + 5)
     # Nonnegative counts and positive-zero penalties leave signed logits unchanged.
     # Prefix validity remains a separate check in _draft_scores_finish.
     neutral = ((repetition == 1.) & (presence.to(tl.int32, bitcast=True) == 0)
@@ -234,10 +235,11 @@ def _draft_score_values(Logits, Bias, Histogram, Candidates, Slots, Params, Gram
 @triton.jit
 def _draft_scores(Logits, Histogram, Candidates, Slots, Params, GrammarMask, GrammarEnabled, Scores, BlockMax,
                   hist_stride, mask_stride, candidate_stride, CAPACITY: tl.constexpr, V: tl.constexpr,
-                  PREFIX: tl.constexpr, BLOCK: tl.constexpr, BLOCKS: tl.constexpr):
+                  PREFIX: tl.constexpr, BLOCK: tl.constexpr, BLOCKS: tl.constexpr,
+                  PARAMETERS: tl.constexpr = 6):
     token, inside, score = _draft_score_values(Logits, Logits, Histogram, Candidates, Slots, Params,
         GrammarMask, GrammarEnabled, hist_stride, mask_stride, candidate_stride, V, V,
-        False, CAPACITY, V, PREFIX, BLOCK)
+        False, CAPACITY, V, PREFIX, BLOCK, PARAMETERS)
     row, block = tl.program_id(0), tl.program_id(1)
     tl.store(Scores + row * V + token, score, mask=inside)
     score = tl.where(inside, score, -float("inf"))
@@ -250,10 +252,11 @@ def _draft_score_candidates(Logits, Bias, Histogram, PrefixIds, Slots, Params, G
                             TopK, Probabilities, LocalCandidates, BlockMax, hist_stride, mask_stride,
                             candidate_stride, logit_stride, bias_stride, ADD_BIAS: tl.constexpr,
                             CAPACITY: tl.constexpr, V: tl.constexpr, PREFIX: tl.constexpr,
-                            BLOCK: tl.constexpr, BLOCKS: tl.constexpr, K: tl.constexpr):
+                            BLOCK: tl.constexpr, BLOCKS: tl.constexpr, K: tl.constexpr,
+                            PARAMETERS: tl.constexpr = 6):
     tokens, inside, scores = _draft_score_values(Logits, Bias, Histogram, PrefixIds, Slots, Params,
         GrammarMask, GrammarEnabled, hist_stride, mask_stride, candidate_stride, logit_stride,
-        bias_stride, ADD_BIAS, CAPACITY, V, PREFIX, BLOCK)
+        bias_stride, ADD_BIAS, CAPACITY, V, PREFIX, BLOCK, PARAMETERS)
     row, block = tl.program_id(0), tl.program_id(1)
     # Validity depends on every score, including nonfinite entries outside the selected support.
     tl.store(BlockMax + row * BLOCKS + block, tl.max(tl.where(inside, scores, -float("inf")), 0))
@@ -282,7 +285,8 @@ def _selected_row(Slots, Generations, Generation, live_rows, row, CAPACITY: tl.c
 def _draft_scores_finish(BlockMax, Candidates, Slots, Generations, LiveRows, Generation, Status, TopK,
                          Params, Maximum, Valid, PackedTopK, PackedTopP, candidate_stride,
                          CAPACITY: tl.constexpr, BATCH: tl.constexpr, V: tl.constexpr, PREFIX: tl.constexpr,
-                         BLOCKS: tl.constexpr, BLOCK_COUNT: tl.constexpr, RUNNING: tl.constexpr):
+                         BLOCKS: tl.constexpr, BLOCK_COUNT: tl.constexpr, RUNNING: tl.constexpr,
+                         PARAMETERS: tl.constexpr = 6):
     # The row maximum, then the row's liveness (as speculation's _live), validity and filters.
     row = tl.program_id(0)
     block = tl.arange(0, BLOCK_COUNT)
@@ -305,7 +309,7 @@ def _draft_scores_finish(BlockMax, Candidates, Slots, Generations, LiveRows, Gen
     tl.store(Valid + row, live & prefix_valid & finite)
     top_k = tl.load(TopK + safe)
     tl.store(PackedTopK + row, tl.where(top_k > 0, top_k, V))
-    tl.store(PackedTopP + row, tl.load(Params + safe * 6 + 1))
+    tl.store(PackedTopP + row, tl.load(Params + safe * PARAMETERS + 1))
 
 
 _SCORE_BLOCK = BLOCK
@@ -329,6 +333,7 @@ class PreparedDraftProposal:
                 raise ValueError("draft proposal scratch requires contiguous Int64 tensors on the score device")
         pool = triton.next_power_of_2(self.blocks * DRAFT_CANDIDATES)
         self._block_args = (scores, probabilities, top_k, self.candidates, vocab, self.blocks, BLOCK, DRAFT_CANDIDATES)
+        self._parameter_count = params.shape[1]
         self._select_args = (self.selected, probabilities, valid, top_k, top_p, params, slots,
                              seed, offset, sampled, vocab)
         self._candidate_source = self.candidates
@@ -371,7 +376,7 @@ class PreparedDraftProposal:
         support = (self.selected, self._block_args[1]) if self._support is None else self._support
         return prepare_triton(_select_and_sample,
                               (self._candidate_source, *self._select_args, *self._candidate_geometry, *support), self._grids[1],
-                              WRITE_SUPPORT=self._support is not None, num_warps=4)
+                              WRITE_SUPPORT=self._support is not None, PARAMETERS=self._parameter_count, num_warps=4)
 
     def prepare(self, *, candidates_prepared=False):
         from ignition.preparation.triton import prepare_triton
@@ -489,18 +494,19 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         state = self.state
         batch, _, vocab = self.logits.shape
         blocks = self.block_max.shape[1]
+        parameter_count = state.parameters.shape[1]
         self._score_kernels = (
             prepare_triton(_draft_scores, (self.logits, state.histogram, self.candidates, self.slots,
                 state.parameters, state.grammar_mask, state.grammar_enabled, self.scores, self.block_max,
                 state.histogram.stride(0), state.grammar_mask.stride(0), self.candidates.stride(0)),
                 (batch, blocks, 1), CAPACITY=state.capacity, V=vocab, PREFIX=self.prefix_offset, BLOCK=_SCORE_BLOCK,
-                BLOCKS=blocks, num_warps=8, enable_fp_fusion=False),
+                BLOCKS=blocks, PARAMETERS=parameter_count, num_warps=8, enable_fp_fusion=False),
             prepare_triton(_draft_scores_finish, (self.block_max, self.candidates, self.slots,
                 self.generations, self.live_rows, state.generation, state.status, state.top_k, state.parameters,
                 self.maximum, self.valid, self.packed_top_k,
                 self.packed_top_p, self.candidates.stride(0)), (batch, 1, 1), CAPACITY=state.capacity, BATCH=batch,
                 V=vocab, PREFIX=self.prefix_offset, BLOCKS=blocks, BLOCK_COUNT=triton.next_power_of_2(blocks),
-                RUNNING=RUNNING, num_warps=1))
+                RUNNING=RUNNING, PARAMETERS=parameter_count, num_warps=1))
         if self.source_logits is not None:
             bias = self.source_logits if self.source_bias is None else self.source_bias
             self._candidate_kernels = (
@@ -511,7 +517,7 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
                     self.source_logits.stride(0), bias.stride(0)), (batch, blocks, 1),
                     ADD_BIAS=self.source_bias is not None, CAPACITY=state.capacity, V=vocab,
                     PREFIX=self.prefix_offset, BLOCK=BLOCK, BLOCKS=blocks, K=DRAFT_CANDIDATES,
-                    num_warps=8, enable_fp_fusion=False), self._score_kernels[1])
+                    PARAMETERS=parameter_count, num_warps=8, enable_fp_fusion=False), self._score_kernels[1])
         self._prepared = True
         self.prepare_scores()
         if self._candidate_kernels is not None:

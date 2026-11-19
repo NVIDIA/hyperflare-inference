@@ -650,6 +650,18 @@ Malformed types return HTTP 400; `top_k` must be an integer. `seed` is
 request-controlled and uses its prepared default when omitted. Sampling defaults
 and ranges come from the model author's recommendations declared in the recipe,
 except for DeepSeek V4.1's repetition-penalty range based on measured use.
+Chat Completions and raw Completions accept `steering_scale` as a top-level
+extension field on the request body; `chat_template_kwargs.steering_scale` is
+also consumed when the top-level field is absent, and conflicting duplicate
+values return HTTP 400 before clamping; other protocols reject the field with
+HTTP 400. As with other distribution parameters, requests are clamped to the
+core's declared `steering_scale` interval (`{"min": 0.0, "max": 1.0}` on
+`/v1/models` when exported with `--steering-sidecar`, or `null` and fixed at
+the `0.0` default when unsteered). Zero scale (including `-0.0`, normalized to
+`0.0`) preserves unsteered prefix-cache keys within a core's model identity. Nonzero effective scales
+salt the prefix-history root digest with their exact FP32 bits, while the
+sidecar digest folded into the core's model identity isolates distinct sidecar
+exports across shared prefix stores.
 
 The recipes use these default-mode settings. Parameters without an interval in
 the table are fixed at their defaults. Bounds span the minimum and maximum values

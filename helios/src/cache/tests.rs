@@ -125,6 +125,37 @@ fn hash_matches_independent_blake2b128_vectors() {
 }
 
 #[test]
+fn steering_scales_preserve_unsteered_hashes_and_isolate_nonzero_scales() {
+    let tokens = (0..130).collect::<Vec<_>>();
+    let build = |identity, scale| {
+        let mut history = PrefixHistory::with_steering_scale(identity, scale);
+        history.append(&tokens, &[]).unwrap();
+        history
+    };
+    let baseline = {
+        let mut history = PrefixHistory::new([7; 32]);
+        history.append(&tokens, &[]).unwrap();
+        history
+    };
+    let zero = build([7; 32], 0.);
+    let neg_zero = build([7; 32], -0.);
+    for pos in [0, 5, 64, 128, 130] {
+        assert_eq!(zero.key_at(pos), baseline.key_at(pos));
+        assert_eq!(neg_zero.key_at(pos), baseline.key_at(pos));
+    }
+    let half = build([7; 32], 0.5);
+    let full = build([7; 32], 1.0);
+    let other_core = build([8; 32], 1.0);
+    assert_eq!(full.identity(), [7; 32]);
+    for pos in [0, 5, 64, 128, 130] {
+        assert_ne!(zero.key_at(pos), half.key_at(pos));
+        assert_ne!(zero.key_at(pos), full.key_at(pos));
+        assert_ne!(half.key_at(pos), full.key_at(pos));
+        assert_ne!(full.key_at(pos), other_core.key_at(pos));
+    }
+}
+
+#[test]
 fn chunking_retains_partial_tokens_and_conditioning_until_complete() {
     let mut whole = PrefixHistory::new([7; 32]);
     let events = [

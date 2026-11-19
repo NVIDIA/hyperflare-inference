@@ -68,6 +68,7 @@ def _score_tiles(
     SAMPLE: tl.constexpr,
     STEP: tl.constexpr,
     BLOCK: tl.constexpr,
+    PARAMETERS: tl.constexpr = 6,
 ):
     tile, lane_row = tl.program_id(0), tl.program_id(1)
     position = STEP if SAMPLE else lane_row % WIDTH
@@ -83,10 +84,10 @@ def _score_tiles(
         predecessor = tl.minimum(tl.maximum(predecessor, 0), VOCAB - 1)
         value += _transition_bias(Embedding, Head, HeadScale, predecessor, local_id, present, RANK, 64, BLOCK, FP8)
     slot = tl.minimum(tl.maximum(tl.load(Slots + request_row).to(tl.int64), 0), CAPACITY - 1)
-    temperature = tl.load(Params + slot * 6)
-    repeat = tl.load(Params + slot * 6 + 3)
-    presence = tl.load(Params + slot * 6 + 4)
-    frequency = tl.load(Params + slot * 6 + 5)
+    temperature = tl.load(Params + slot * PARAMETERS)
+    repeat = tl.load(Params + slot * PARAMETERS + 3)
+    presence = tl.load(Params + slot * PARAMETERS + 4)
+    frequency = tl.load(Params + slot * PARAMETERS + 5)
     if (repeat != 1) | (presence.to(tl.int32, bitcast=True) != 0) | (frequency.to(tl.int32, bitcast=True) != 0):
         count = tl.load(Histogram + slot * hist_stride + global_id, present, other=0)
         for preceding in tl.static_range(PREFIX):
@@ -107,7 +108,7 @@ def _score_tiles(
     if not SAMPLE:
         top_k = tl.load(TopK + slot)
         invalid |= (top_k > 0) & (top_k < VOCAB)
-        invalid |= (tl.load(Params + slot * 6 + 1) != 1) | (tl.load(Params + slot * 6 + 2) != 0)
+        invalid |= (tl.load(Params + slot * PARAMETERS + 1) != 1) | (tl.load(Params + slot * PARAMETERS + 2) != 0)
     maximum = tl.max(value, 0)
     stable_max = tl.where(tl.abs(maximum) < float("inf"), maximum, 0.0)
     mass = tl.sum(tl.exp(value - stable_max), 0)
@@ -177,6 +178,7 @@ def _finish_distribution(
     SAMPLE: tl.constexpr,
     BLOCK: tl.constexpr,
     RANK_PAD: tl.constexpr,
+    PARAMETERS: tl.constexpr = 6,
 ):
     tile, distribution = tl.program_id(0), tl.program_id(1)
     row = distribution if SAMPLE else distribution // WIDTH
@@ -207,7 +209,7 @@ def _finish_distribution(
     probability = tl.exp(score - maximum) / total
     if not SAMPLE:
         slot = tl.minimum(tl.maximum(tl.load(Slots + row).to(tl.int64), 0), CAPACITY - 1)
-        probability = tl.where(tl.load(Params + slot * 6) > 0, probability, (token_id == token).to(tl.float32))
+        probability = tl.where(tl.load(Params + slot * PARAMETERS) > 0, probability, (token_id == token).to(tl.float32))
     tl.store(destination, tl.where(valid, probability, (token_id == 0).to(tl.float32)), col < LOCAL)
     if tile == 0:
         tl.store(Valid + row * WIDTH + position, valid)
@@ -619,6 +621,7 @@ class PreparedVocabularySoftmax:
                 SAMPLE=self.sample,
                 STEP=step,
                 BLOCK=256,
+                PARAMETERS=state.parameters.shape[1],
                 num_warps=4,
                 enable_fp_fusion=False,
             )
@@ -657,6 +660,7 @@ class PreparedVocabularySoftmax:
                 SAMPLE=self.sample,
                 BLOCK=256,
                 RANK_PAD=triton.next_power_of_2(self.world),
+                PARAMETERS=state.parameters.shape[1],
                 num_warps=4,
                 enable_fp_fusion=False,
             )

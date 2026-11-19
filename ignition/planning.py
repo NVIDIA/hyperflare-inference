@@ -182,6 +182,7 @@ class Plan:
     stream_overlap: bool = True
     mixed_prefill: bool = False
     prompt_logprobs: bool = False
+    steering_sidecar: Path | None = None
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
     roce_ring: bool = False
@@ -207,6 +208,13 @@ class Plan:
     benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
+        if self.steering_sidecar is not None:
+            if self.recipe.name != "deepseek41":
+                raise UsageError("--steering-sidecar requires DeepSeek V4.1")
+            path = Path(self.steering_sidecar).expanduser().resolve()
+            if not path.is_file():
+                raise UsageError(f"--steering-sidecar is not a file: {path}")
+            object.__setattr__(self, "steering_sidecar", path)
         if self.context_parallel_size is not None:
             if (type(self.context_parallel_size) is not int or not 1 <= self.context_parallel_size <= self.world_size
                     or self.world_size % self.context_parallel_size):
@@ -381,6 +389,8 @@ class Plan:
             "stream_overlap": self.stream_overlap,
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
+            "steering_sidecar": (None if self.steering_sidecar is None else
+                                 str(self.steering_sidecar)),
             "expert_scale_compression": self.expert_scale_compression,
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
@@ -428,6 +438,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         speculation: Speculation | None, prefill_chunk: int | None = None,
         context_parallel: bool = True, context_parallel_size: int | None = None, stream_overlap: bool = True, cache_states: int | None = None,
         mixed_prefill: bool = False, prompt_logprobs: bool = False,
+        steering_sidecar: Path | None = None,
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
@@ -495,18 +506,26 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         # planner consume only 64 pages of that saving and retain the rest as headroom.
         credit = min(849_346_560, 64 * costs.page_bytes)
         costs = replace(costs, graph_bytes=costs.graph_bytes - credit)
+    if steering_sidecar is not None:
+        if recipe.name != "deepseek41":
+            raise UsageError("--steering-sidecar requires DeepSeek V4.1")
+        steering_sidecar = Path(steering_sidecar).expanduser().resolve()
+        if not steering_sidecar.is_file():
+            raise UsageError(f"--steering-sidecar is not a file: {steering_sidecar}")
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
-                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
+                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression),
+                costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 context_parallel_size=context_parallel_size,
-                stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
+                stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill,
+                prompt_logprobs=prompt_logprobs, steering_sidecar=steering_sidecar,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 mla_compute_mode=mla_compute_mode,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
-                    if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
-                language_model_only=language_model_only)
+                    if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
+                online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
     if cache_states is not None:
@@ -559,6 +578,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          prefill_chunk: int | None = None, context_parallel: bool = True, context_parallel_size: int | None = None,
          stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
+         steering_sidecar: Path | None = None,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
          language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
@@ -626,10 +646,11 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    context_parallel_size=context_parallel_size,
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
+                   steering_sidecar=steering_sidecar,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
-                   online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,
-                   mla_compute_mode=mla_compute_mode)
+                   online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
+                   language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
 
     def automatic(world_size, **settings):
         """Plan the first GPUs that each fit, else the GPUs with the most free memory."""
