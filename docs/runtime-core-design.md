@@ -406,9 +406,12 @@ execution catalog; this preparation setting adds no runtime policy.
 
 `flare inspect --json` reports the manifest as `rebuild` and per-rank tensor
 counts as `rebuild_weights` for logical-resource cores; `--all` includes the
-tensor catalogs. Absent manifests are reported as null. For payload cores both
-fields are null even when `DeploymentBody.rebuild` and a rank catalog are
-present. Designed, not implemented: reporting them for payload cores.
+tensor catalogs. Absent manifests are reported as null. For payload cores
+`rebuild` is the selected deployment's `DeploymentBody.rebuild`, read after the
+signatures verify, or from the bounded primary-file metadata with
+`--unverified`. With `--unverified` it is null when no single deployment is
+selected, and each `deployments[]` entry carries its own `rebuild`.
+`rebuild_weights` is null for payload cores.
 Helios ignores rebuild metadata during loading and replay, including unfamiliar
 catalog versions. Serving validates the execution layout and prepared model contract independently.
 Changing signed rebuild metadata requires signing the core again.
