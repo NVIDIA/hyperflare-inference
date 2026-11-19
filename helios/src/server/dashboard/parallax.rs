@@ -18,7 +18,11 @@ fn physical_status(report: &Value) -> String {
     if let Some(error) = state["error"].as_str() { return format!("Physical storage: {error}"); }
     if state.is_object() {
         let control = if report["active_policy"]["failure"].is_string() { "static fallback" }
-            else { report["active_policy"]["predictor"].as_str().unwrap_or("initial placement") };
+            else {
+                report["active_policy"]["predictor"].as_str()
+                    .or_else(|| report["active_policy"]["policy"].as_str())
+                    .unwrap_or("initial placement")
+            };
         format!("Actual weights: {} HBM / {} Grace experts · {control} · generation {}",
             state["hbm_experts"],state["grace_experts"],state["generation"])
     } else {
@@ -147,15 +151,30 @@ pub(super) fn render(frame: &mut Frame, area: Rect, report: Value) {
 
 fn render_actual(frame: &mut Frame, area: Rect, report: Value) {
     let ledger=&report["actual_ledger"];
-    let areas=Layout::vertical([Constraint::Length(3),Constraint::Length(9),Constraint::Min(4),Constraint::Length(5)]).split(area);
+    let areas=Layout::vertical([Constraint::Length(3),Constraint::Length(10),Constraint::Min(4),Constraint::Length(5)]).split(area);
+    let controller = match (
+        report["active_policy"]["predictor"].as_str(),
+        report["active_policy"]["policy"].as_str(),
+    ) {
+        (Some(predictor), Some(policy)) => format!("{predictor} · {policy}"),
+        (None, Some(policy)) => format!("reactive · {policy}"),
+        _ => "static · fixed initial placement".into(),
+    };
     frame.render_widget(Paragraph::new(vec![
-        Line::from(Span::styled(format!("PARALLAX · {} · ACTUAL RESIDENCY LEDGER",mode(&report)),Style::default().fg(CYAN))),
+        Line::from(Span::styled(format!("PARALLAX · {} · ACTUAL RESIDENCY LEDGER · {} frames",mode(&report),ledger["observed_frames"]),Style::default().fg(CYAN))),
         Line::from(physical_status(&report)),
-        Line::from(format!("Controller: {} · {}",report["active_policy"]["predictor"].as_str().unwrap_or("static"),
-            report["active_policy"]["policy"].as_str().unwrap_or("fixed initial placement"))),
+        Line::from(format!("Controller: {controller}")),
     ]),areas[0]);
     let ms=|key| ledger[key].as_f64().map(|v|format!("{:+.2} ms",v/1e6)).unwrap_or("learning".into());
+    let (hbm_rate, hbm_scope) = match (ledger["hbm_routes"].as_u64(), ledger["cold_routes"].as_u64()) {
+        (Some(hbm), Some(cold)) if hbm + cold > 0 => (
+            format!("{:.2}%", (hbm as f64) * 100.0 / ((hbm + cold) as f64)),
+            format!("{hbm} HBM / {cold} cold routes"),
+        ),
+        _ => ("—".into(), "Awaiting observed routes".into()),
+    };
     let rows=vec![
+        Row::new(vec!["HBM route hit rate".into(),hbm_rate,hbm_scope]),
         Row::new(vec!["Copy GPU time".into(),ms("copy_gpu_ns"),format!("{} timed transactions; startup excluded",ledger["timed_copy_transactions"])]),
         Row::new(vec!["Publication CPU time".into(),ms("publication_host_ns"),"Actual mapping calls".into()]),
         Row::new(vec!["Ready → publication wait".into(),ms("ready_wait_ns"),"Lower bound from first ready poll; not GPU idle time".into()]),
@@ -173,7 +192,7 @@ fn render_actual(frame: &mut Frame, area: Rect, report: Value) {
             number(row,"prediction_compute_p50_ns",1e-6),w["dropped_busy"].to_string()])
     }).collect::<Vec<_>>()).unwrap_or_default();
     frame.render_widget(Table::new(workers,[Constraint::Min(16),Constraint::Length(12),Constraint::Length(12),Constraint::Length(12),Constraint::Length(8)])
-        .header(Row::new(["Predictor","Coverage %","Lead ms","Compute ms","Drops"]).style(Style::default().fg(CYAN))),areas[2]);
+        .header(Row::new(["Shadow predictor","Coverage %","Lead ms","Compute ms","Drops"]).style(Style::default().fg(CYAN))),areas[2]);
     let error=ledger["error"].as_str().or(report["error"].as_str()).unwrap_or("Ledger complete for observed frames.");
     frame.render_widget(Paragraph::new(format!("{error}\n{} frames overlapped movement; excluded from cost fitting.\nCost model: matching graph/batch/rows; cold and total distinct weight bytes.\nBalance is observational, not measured serving improvement.\nCopy interference and predictor CPU overhead are not attributed.",ledger["movement_overlap_frames"]))
         .style(Style::default().fg(MUTED)).wrap(Wrap{trim:false}),areas[3]);
@@ -266,6 +285,26 @@ mod tests {
         assert!(physical_status(&report).contains("ewma"));
         report["active_policy"]["failure"]=serde_json::json!("provider failed");
         assert!(physical_status(&report).contains("static fallback"));
+    }
+    #[test]
+    fn reactive_decayed_lru_displays_live_hit_rate_and_controller_identity() {
+        use ratatui::{Terminal,backend::TestBackend};
+        let report=serde_json::json!({"actual_ledger":{"observed_frames":42,"modeled_frames":40,
+            "hbm_routes":950,"cold_routes":50,"copy_gpu_ns":1000000,"publication_host_ns":500000,
+            "ready_wait_ns":2000000,"submission_gate_closed_ns":2500000,"timed_copy_transactions":5},
+            "physical_residency":{"hbm_experts":11680,"grace_experts":3680,"generation":5},
+            "active_policy":{"predictor":null,"policy":"decayed_miss_lru","failure":null},
+            "workers":{"ewma":{"dropped_busy":0}},"contenders":{}});
+        for width in [80,120] {
+            let mut terminal=Terminal::new(TestBackend::new(width,28)).unwrap();
+            terminal.draw(|frame|render(frame,frame.area(),report.clone())).unwrap();
+            let text=terminal.backend().buffer().content.iter().map(|c|c.symbol()).collect::<String>();
+            for label in ["HBM route hit rate","95.00%","reactive · decayed_miss_lru","Shadow predictor","42 frames"] {
+                assert!(text.contains(label),"missing {label} at width {width}");
+            }
+            assert!(!text.contains("· initial placement"));
+            assert!(!text.contains("Controller: static"));
+        }
     }
 
 }
