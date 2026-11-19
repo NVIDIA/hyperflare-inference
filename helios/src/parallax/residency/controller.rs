@@ -30,6 +30,7 @@ pub struct Snapshot {
     pub generation: u64,
     pub experts: BTreeMap<ExpertId, bool>,
     pub free_slots: usize,
+    pub free_slots_by_group: BTreeMap<usize, usize>,
     pub hbm_allocated_bytes: usize,
     pub backing_allocated_bytes: usize,
     pub readers: usize,
@@ -131,6 +132,7 @@ impl<B: Backend> Controller<B> {
                     return Err(Error::Invalid("initial expert location has no backing copy".into()));
                 }
                 Location::Hbm(slot) if slot >= backend.slots()
+                    || backend.region_group(region) != backend.slot_group(slot)
                     || !backend.slot_accepts(region, slot) || !occupied.insert(slot) => {
                     return Err(Error::Invalid("invalid or overlapping initial HBM slots".into()));
                 }
@@ -139,6 +141,9 @@ impl<B: Backend> Controller<B> {
         }
         for parts in experts.values() {
             let in_hbm = matches!(locations[parts[0]], Location::Hbm(_));
+            if parts.iter().any(|i| backend.region_group(*i) != backend.region_group(parts[0])) {
+                return Err(Error::Invalid("expert parts must share one placement group".into()));
+            }
             if parts.iter().any(|i| matches!(locations[*i], Location::Hbm(_)) != in_hbm) {
                 return Err(Error::Invalid("initial expert parts must occupy the same tier".into()));
             }
@@ -216,6 +221,13 @@ impl<B: Backend> Controller<B> {
             })
             .collect()
     }
+    pub fn placement_constraints(&self) -> BTreeMap<ExpertId, PlacementConstraint> {
+        let backend = self.backend.as_ref().unwrap();
+        self.experts.iter().map(|(e, parts)| (*e, PlacementConstraint {
+            group: backend.region_group(parts[0]),
+            evictable: parts.iter().all(|i| backend.has_backing(*i)),
+        })).collect()
+    }
     pub fn snapshot(&self) -> Snapshot {
         let backend = self.backend.as_ref().unwrap();
         let mut used: BTreeSet<usize> = self
@@ -231,6 +243,10 @@ impl<B: Backend> Controller<B> {
             .collect();
         if let Some(p) = &self.pending {
             used.extend(&p.slots);
+        }
+        let mut free_slots_by_group = BTreeMap::new();
+        for slot in 0..backend.slots() {
+            *free_slots_by_group.entry(backend.slot_group(slot)).or_default() += usize::from(!used.contains(&slot));
         }
         Snapshot {
             catalog_id: self.catalog_id.clone(),
@@ -248,6 +264,7 @@ impl<B: Backend> Controller<B> {
                 })
                 .collect(),
             free_slots: backend.slots() - used.len(),
+            free_slots_by_group,
             hbm_allocated_bytes: (0..backend.slots())
                 .map(|slot| backend.slot_capacity(slot))
                 .sum(),
@@ -332,7 +349,9 @@ impl<B: Backend> Controller<B> {
         for expert in &plan.promote {
             for &region in &self.experts[expert] {
                 let slot = (0..backend.slots())
-                    .find(|slot| !reserved.contains(slot) && backend.slot_accepts(region, *slot))
+                    .find(|slot| !reserved.contains(slot)
+                        && backend.region_group(region) == backend.slot_group(*slot)
+                        && backend.slot_accepts(region, *slot))
                     .ok_or(Error::Capacity)?;
                 reserved.insert(slot);
                 bytes = bytes

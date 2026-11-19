@@ -7,6 +7,7 @@ use crate::{
         residency::{
             Controller, Plan, Progress, Region,
             gb300::{Gb300, Limits},
+            rows::{Layer, Plane, Rows},
         },
     },
     runtime_core::driver::{Driver, Handle},
@@ -27,7 +28,7 @@ fn error(e: impl std::fmt::Display) -> PyErr {
 /// any tensor or graph can reference its addresses. Views must not write weights.
 #[pyclass(module = "flare_heliopause", unsendable)]
 pub(crate) struct ExpertResidencyTestStorage {
-    controller: Option<Controller<Gb300>>,
+    controller: Option<Box<dyn TestController>>,
     driver: Driver,
     context: usize,
     owner: OwnerLease<Py<PyAny>>,
@@ -96,14 +97,69 @@ impl ExpertResidencyTestStorage {
             )
         }
         .map_err(error)?;
-        Ok(Self {
-            controller: Some(
-                Controller::new("kernel-qualification".into(), backend).map_err(error)?,
-            ),
+        Self::attach(
+            Controller::new("kernel-qualification".into(), backend).map_err(error)?,
             driver,
             context,
-            owner: OwnerLease(Some(owner)),
-        })
+            owner,
+        )
+    }
+
+    /// Borrow prepared canonical maps and weight planes for kernel qualification.
+    /// Each layer supplies its identity, expert count, tier IDs, map address,
+    /// and (host address, HBM address, row bytes) for every weight plane.
+    #[staticmethod]
+    fn from_rows(
+        py: Python<'_>,
+        owner: Py<PyAny>,
+        layers: Vec<(
+            usize,
+            usize,
+            Vec<usize>,
+            Vec<usize>,
+            u64,
+            Vec<(u64, u64, usize)>,
+        )>,
+    ) -> PyResult<Self> {
+        if owner.bind(py).is_none() || layers.is_empty() {
+            return Err(PyValueError::new_err(
+                "retain the weight planes, maps and context in owner",
+            ));
+        }
+        let (context, device) = crate::current_context().map_err(error)?;
+        let driver = Driver::load().map_err(error)?;
+        driver
+            .check("cuCtxSynchronize", unsafe { (driver.context_sync)() })
+            .map_err(error)?;
+        let layers = layers
+            .into_iter()
+            .map(
+                |(layer, experts, host_experts, hbm_experts, mapping_address, planes)| Layer {
+                    layer,
+                    experts,
+                    host_experts,
+                    hbm_experts,
+                    mapping_address,
+                    planes: planes
+                        .into_iter()
+                        .map(|(host_address, hbm_address, row_bytes)| Plane {
+                            host_address,
+                            hbm_address,
+                            row_bytes,
+                        })
+                        .collect(),
+                },
+            )
+            .collect();
+        // SAFETY: This qualification API requires exclusive test ownership of
+        // these prepared arrays. OwnerLease retains them through confirmed drain.
+        let backend = unsafe { Rows::new(context, device, layers) }.map_err(error)?;
+        Self::attach(
+            Controller::new("kernel-qualification".into(), backend).map_err(error)?,
+            driver,
+            context,
+            owner,
+        )
     }
 
     fn address(&self, layer: usize, expert: usize, part: usize) -> PyResult<u64> {
@@ -122,51 +178,37 @@ impl ExpertResidencyTestStorage {
         evict: Vec<(usize, usize)>,
     ) -> PyResult<u64> {
         self.drain()?;
-        let c = self
-            .controller
+        self.controller
             .as_mut()
-            .ok_or_else(|| error("storage is closed"))?;
-        let start = Instant::now();
-        let plan = Plan {
-            version: 1,
-            catalog_id: "kernel-qualification".into(),
-            generation: c.snapshot().generation,
-            valid_until_ns: u64::MAX,
-            promote: promote
-                .into_iter()
-                .map(|(layer, expert)| ExpertId { layer, expert })
-                .collect(),
-            evict: evict
-                .into_iter()
-                .map(|(layer, expert)| ExpertId { layer, expert })
-                .collect(),
-        };
-        c.begin(plan, 0).map_err(error)?;
-        loop {
-            // SAFETY: The test is the sole context submitter and drain completed.
-            match unsafe { c.progress(0) }.map_err(error)? {
-                Progress::Noop | Progress::Committed(_) => break,
-                Progress::WaitingForTransfer if start.elapsed() < Duration::from_secs(10) => {
-                    std::thread::sleep(Duration::from_millis(1))
-                }
-                state => {
-                    return Err(error(format!(
-                        "residency test transaction did not finish: {state:?}"
-                    )));
-                }
-            }
-        }
-        Ok(start.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .ok_or_else(|| error("storage is closed"))?
+            .exchange(promote, evict)
     }
 
     fn close(&mut self) -> PyResult<()> {
         self.drain()?;
+        if let Some(controller) = &mut self.controller {
+            controller.closeable()?;
+        }
         drop(self.controller.take());
         drop(self.owner.take_after_drain());
         Ok(())
     }
 }
 impl ExpertResidencyTestStorage {
+    fn attach<B: crate::parallax::residency::Backend + Send + 'static>(
+        controller: Controller<B>,
+        driver: Driver,
+        context: usize,
+        owner: Py<PyAny>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            controller: Some(Box::new(controller)),
+            driver,
+            context,
+            owner: OwnerLease(Some(owner)),
+        })
+    }
+
     fn drain(&self) -> PyResult<()> {
         self.driver
             .check("cuCtxSetCurrent", unsafe {
@@ -183,12 +225,80 @@ impl Drop for ExpertResidencyTestStorage {
         if self.controller.is_none() {
             return;
         }
-        if self.drain().is_ok() {
-            drop(self.controller.take());
-            drop(self.owner.take_after_drain());
-        } else if let Some(c) = self.controller.take() {
-            std::mem::forget(c);
-            // OwnerLease retains Python resources when a drain is unconfirmed.
+        if self.close().is_err() {
+            if let Some(controller) = self.controller.take() {
+                std::mem::forget(controller);
+            }
+            // OwnerLease retains Python resources when drain or rollback is unconfirmed.
         }
+    }
+}
+
+// Qualification retains one ownership/drain path for VMM and row controllers.
+trait TestController {
+    fn address(&self, expert: ExpertId, part: usize) -> crate::parallax::residency::Result<u64>;
+    fn exchange(
+        &mut self,
+        promote: Vec<(usize, usize)>,
+        evict: Vec<(usize, usize)>,
+    ) -> PyResult<u64>;
+    fn closeable(&mut self) -> PyResult<()>;
+}
+impl<B: crate::parallax::residency::Backend> TestController for Controller<B> {
+    fn address(&self, expert: ExpertId, part: usize) -> crate::parallax::residency::Result<u64> {
+        self.address(expert, part)
+    }
+    fn exchange(
+        &mut self,
+        promote: Vec<(usize, usize)>,
+        evict: Vec<(usize, usize)>,
+    ) -> PyResult<u64> {
+        let start = Instant::now();
+        self.begin(
+            Plan {
+                version: 1,
+                catalog_id: "kernel-qualification".into(),
+                generation: self.snapshot().generation,
+                valid_until_ns: u64::MAX,
+                promote: promote
+                    .into_iter()
+                    .map(|(layer, expert)| ExpertId { layer, expert })
+                    .collect(),
+                evict: evict
+                    .into_iter()
+                    .map(|(layer, expert)| ExpertId { layer, expert })
+                    .collect(),
+            },
+            0,
+        )
+        .map_err(error)?;
+        loop {
+            // SAFETY: The qualification caller drains the sole submitting context
+            // and excludes graph submissions throughout this transaction.
+            match unsafe { self.progress(0) }.map_err(error)? {
+                Progress::Noop | Progress::Committed(_) => break,
+                Progress::WaitingForTransfer if start.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                state => {
+                    return Err(error(format!(
+                        "residency test transaction did not finish: {state:?}"
+                    )));
+                }
+            }
+        }
+        Ok(start.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+    }
+    fn closeable(&mut self) -> PyResult<()> {
+        let state = self.snapshot();
+        if state.poisoned || state.readers != 0 {
+            return Err(error(
+                "expert test storage has unconfirmed readers or mappings",
+            ));
+        }
+        if self.cancel().map_err(error)? == Progress::WaitingForTransfer {
+            return Err(error("expert test storage still has an active transfer"));
+        }
+        Ok(())
     }
 }

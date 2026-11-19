@@ -1,7 +1,7 @@
 //! One executor owns publication; policy threads can only enqueue a bounded plan.
 use super::*;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -10,6 +10,7 @@ use std::{
 
 trait Storage: Send {
     fn expert_storage(&self) -> Vec<(ExpertId, u64, usize)>;
+    fn placement_constraints(&self) -> BTreeMap<ExpertId, PlacementConstraint>;
     fn snapshot(&self) -> Snapshot;
     fn statistics(&self) -> Statistics;
     fn reader(&mut self) -> Result<ReaderLease>;
@@ -21,6 +22,9 @@ trait Storage: Send {
 impl<B: Backend + Send> Storage for Controller<B> {
     fn expert_storage(&self) -> Vec<(ExpertId, u64, usize)> {
         self.expert_storage()
+    }
+    fn placement_constraints(&self) -> BTreeMap<ExpertId, PlacementConstraint> {
+        self.placement_constraints()
     }
     fn snapshot(&self) -> Snapshot {
         self.snapshot()
@@ -181,6 +185,10 @@ impl ExecutionBinding {
             .storage
             .as_ref()
             .map(|s| s.snapshot())
+            .ok_or_else(|| Error::Invalid("expert storage is closed".into()))
+    }
+    pub fn placement_constraints(&self) -> Result<BTreeMap<ExpertId, PlacementConstraint>> {
+        self.state()?.storage.as_ref().map(|s| s.placement_constraints())
             .ok_or_else(|| Error::Invalid("expert storage is closed".into()))
     }
     pub fn report(&self) -> Result<ExecutionReport> {

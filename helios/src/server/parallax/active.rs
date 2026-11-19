@@ -1,6 +1,6 @@
 //! Bounded economic proposals against authoritative physical residency.
 use super::prediction::{Expert, Forecast, Profile};
-use crate::parallax::residency::{Plan, Snapshot, execution::ExecutionBinding};
+use crate::parallax::residency::{PlacementConstraint, Plan, Snapshot, execution::ExecutionBinding};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +48,7 @@ pub struct Active {
     config: Config,
     binding: ExecutionBinding,
     storage: BTreeMap<Expert, (u64, usize)>,
+    constraints: BTreeMap<Expert, PlacementConstraint>,
     held_until: BTreeMap<Expert, u64>,
     next_ns: u64,
     proposed: u64,
@@ -79,10 +80,12 @@ impl Active {
         if storage.keys().copied().collect::<Vec<_>>() != profile.model.experts {
             return Err("active policy requires the complete canonical storage catalog".into());
         }
+        let constraints = binding.placement_constraints().map_err(|e| e.to_string())?;
         Ok(Some(Self {
             config: config.clone(),
             binding,
             storage,
+            constraints,
             held_until: BTreeMap::new(),
             next_ns: 0,
             proposed: 0,
@@ -127,6 +130,7 @@ impl Active {
             &self.config,
             &state,
             &self.storage,
+            &self.constraints,
             &self.held_until,
             forecast,
             profile,
@@ -164,6 +168,7 @@ fn propose(
     config: &Config,
     state: &Snapshot,
     storage: &BTreeMap<Expert, (u64, usize)>,
+    constraints: &BTreeMap<Expert, PlacementConstraint>,
     held: &BTreeMap<Expert, u64>,
     f: &Forecast,
     profile: &Profile,
@@ -193,25 +198,26 @@ fn propose(
     let mut hot: Vec<_> = state
         .experts
         .iter()
-        .filter(|(e, hot)| **hot && eligible(e))
+        .filter(|(e, hot)| **hot && eligible(e) && constraints[*e].evictable)
         .map(|(e, _)| *e)
         .collect();
     hot.sort_by(|a, b| score(a).total_cmp(&score(b)).then(a.cmp(b)));
     let (mut promote, mut evict, mut removed) = (Vec::new(), Vec::new(), BTreeSet::new());
-    let (mut slots, mut copy_ns, mut gain) = (state.free_slots, 0f64, 0f64);
+    let (mut slots, mut copy_ns, mut gain) = (state.free_slots_by_group.clone(), 0f64, 0f64);
     for expert in cold {
         if promote.len() == config.max_promotions {
             break;
         }
         let (bytes, parts) = storage[&expert];
-        if parts > slots {
+        let group = constraints[&expert].group;
+        if parts > slots.get(&group).copied().unwrap_or(0) {
             continue;
         }
         // Equal representation sizes preserve the resident byte budget. The
         // backend independently admits each exact physical size class.
         let Some(victim) = hot
             .iter()
-            .find(|v| !removed.contains(*v) && storage[v] == (bytes, parts))
+            .find(|v| !removed.contains(*v) && storage[v] == (bytes, parts) && constraints[v].group == group)
         else {
             continue;
         };
@@ -226,7 +232,7 @@ fn propose(
         {
             continue;
         }
-        slots -= parts;
+        *slots.get_mut(&group).unwrap() -= parts;
         copy_ns += copy;
         gain += benefit;
         removed.insert(*victim);
@@ -257,6 +263,9 @@ mod tests {
         calibration::{Calibration, CopyCost},
         prediction_tests::{fixture, profile},
     };
+    fn constraints(storage: &BTreeMap<Expert, (u64, usize)>) -> BTreeMap<Expert, PlacementConstraint> {
+        storage.keys().map(|e| (*e, PlacementConstraint { group: 0, evictable: true })).collect()
+    }
     fn inputs() -> (
         Config,
         Profile,
@@ -296,6 +305,7 @@ mod tests {
             generation: 4,
             experts,
             free_slots: 2,
+            free_slots_by_group: [(0, 2)].into(),
             hbm_allocated_bytes: 300,
             backing_allocated_bytes: 400,
             readers: 1,
@@ -319,7 +329,7 @@ mod tests {
         let (plan, gain) = propose(
             &config,
             &state,
-            &storage,
+            &storage, &constraints(&storage),
             &BTreeMap::new(),
             &forecast,
             &profile,
@@ -348,13 +358,13 @@ mod tests {
     fn physical_policy_rejects_late_unprofitable_uncalibrated_and_held_moves() {
         let (mut config, mut profile, state, storage, mut forecast) = inputs();
         let held = storage.keys().map(|e| (*e, 100)).collect();
-        assert!(propose(&config, &state, &storage, &held, &forecast, &profile, 20).is_none());
+        assert!(propose(&config, &state, &storage, &constraints(&storage), &held, &forecast, &profile, 20).is_none());
         forecast.expected_demand_ns = 200;
         assert!(
             propose(
                 &config,
                 &state,
-                &storage,
+                &storage, &constraints(&storage),
                 &BTreeMap::new(),
                 &forecast,
                 &profile,
@@ -368,7 +378,7 @@ mod tests {
             propose(
                 &config,
                 &state,
-                &storage,
+                &storage, &constraints(&storage),
                 &BTreeMap::new(),
                 &forecast,
                 &profile,
@@ -382,7 +392,7 @@ mod tests {
             propose(
                 &config,
                 &state,
-                &storage,
+                &storage, &constraints(&storage),
                 &BTreeMap::new(),
                 &forecast,
                 &profile,
@@ -400,18 +410,40 @@ mod tests {
         assert!(profile.validate().is_err());
     }
     #[test]
+    fn physical_policy_preserves_pinned_experts_and_pool_capacity() {
+        let (config, profile, mut state, storage, forecast) = inputs();
+        let mut limits = constraints(&storage);
+        let id = |expert| Expert { layer: 0, expert };
+        limits.get_mut(&id(0)).unwrap().evictable = false;
+        let (plan, _) = propose(&config, &state, &storage, &limits, &BTreeMap::new(), &forecast, &profile, 20).unwrap();
+        assert_eq!(plan.evict, [id(1)]);
+        limits.get_mut(&id(2)).unwrap().group = 1;
+        limits.get_mut(&id(3)).unwrap().group = 1;
+        state.free_slots_by_group = [(0, 2), (1, 2)].into();
+        assert!(propose(&config, &state, &storage, &limits, &BTreeMap::new(), &forecast, &profile, 20).is_none(),
+            "a free slot cannot make an eviction in another physical pool valid");
+        limits.get_mut(&id(1)).unwrap().group = 1;
+        state.free_slots_by_group = [(0, 4), (1, 0)].into();
+        assert!(propose(&config, &state, &storage, &limits, &BTreeMap::new(), &forecast, &profile, 20).is_none(),
+            "unused slots in another pool cannot stage this promotion");
+        state.free_slots_by_group = [(0, 0), (1, 2)].into();
+        let (plan, _) = propose(&config, &state, &storage, &limits, &BTreeMap::new(), &forecast, &profile, 20).unwrap();
+        assert_eq!(plan.promote, [id(2)]);
+        assert_eq!(plan.evict, [id(1)]);
+    }
+    #[test]
     fn ranking_explores_without_a_cold_price_but_keeps_deadlines_and_hold_limits() {
         let (mut config, mut profile, state, storage, mut forecast) = inputs();
         config.policy = Policy::PredictorRank;
         profile.hardware.cold_cost_ns = 0;
-        assert!(propose(&config,&state,&storage,&BTreeMap::new(),&forecast,&profile,20).is_some());
+        assert!(propose(&config,&state,&storage, &constraints(&storage),&BTreeMap::new(),&forecast,&profile,20).is_some());
         let held=storage.keys().map(|e|(*e,100)).collect();
-        assert!(propose(&config,&state,&storage,&held,&forecast,&profile,20).is_none());
+        assert!(propose(&config,&state,&storage, &constraints(&storage),&held,&forecast,&profile,20).is_none());
         forecast.expected_demand_ns=100;
-        assert!(propose(&config,&state,&storage,&BTreeMap::new(),&forecast,&profile,20).is_none());
+        assert!(propose(&config,&state,&storage, &constraints(&storage),&BTreeMap::new(),&forecast,&profile,20).is_none());
         // An uninformed uniform forecast must not churn placement on tie order.
         forecast.expected_demand_ns = 10000;
         for (_, score) in &mut forecast.scores { *score = 1.; }
-        assert!(propose(&config,&state,&storage,&BTreeMap::new(),&forecast,&profile,20).is_none());
+        assert!(propose(&config,&state,&storage, &constraints(&storage),&BTreeMap::new(),&forecast,&profile,20).is_none());
     }
 }

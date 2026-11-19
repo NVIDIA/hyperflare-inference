@@ -254,7 +254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config: flare_helios::runtime_core::ResidencyOptions =
             serde_json::from_slice(&std::fs::read(path)?)?;
         let profile = parallax_profile.as_ref().ok_or("expert residency requires a Parallax profile")?;
-        if config.catalog_id != profile.model.identity || config.canonical != profile.model.experts {
+        if config.catalog_id() != profile.model.identity || config.canonical() != profile.model.experts {
             return Err("physical residency and predictor catalogs must match exactly".into());
         }
         options.parallax_residency = Some(config);

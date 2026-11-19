@@ -72,6 +72,14 @@ pub struct Capabilities {
     pub cold_moe_execution_qualified: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PlacementConstraint {
+    /// Slots cannot move between these physical pools. Exact part/size admission
+    /// remains the backend's responsibility within a pool.
+    pub group: usize,
+    pub evictable: bool,
+}
+
 /// # Safety
 /// Implementations keep all addresses valid while readers or copies can use them.
 /// `stage` touches only free staging slots. A recoverable publication error means
@@ -85,6 +93,8 @@ pub unsafe trait Backend {
     fn regions(&self) -> &[Region];
     fn initial_location(&self, _region: usize) -> Location { Location::Backing }
     fn has_backing(&self, _region: usize) -> bool { true }
+    fn region_group(&self, _region: usize) -> usize { 0 }
+    fn slot_group(&self, _slot: usize) -> usize { 0 }
     fn slots(&self) -> usize;
     fn slot_bytes(&self) -> usize;
     fn slot_capacity(&self, _slot: usize) -> usize {
