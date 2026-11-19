@@ -1,15 +1,59 @@
 # Parallax findings and predictor experiments
 
-Parallax runs compiled expert-demand predictors inside Flare, evaluates their
-forecasts independently, and can submit bounded Grace/HBM exchanges through the
-native residency backend. This guide records the measured scope of the GB300
-prototype, explains how to write a predictor, and provides traffic for broader
-experiments. [Architecture](parallax.md) describes the subsystem boundaries;
-[running Parallax](parallax-demo.md) covers packages, profiles and serving flags.
+Parallax runs compiled expert-demand predictors and reactive controls inside
+Flare, evaluates them independently against causal routing histories, and
+commits bounded Grace/HBM exchanges through native residency backends. This
+guide summarizes what controlled GB300 experiments establish across full-model
+DeepSeek V4.1 row residency and forced-offload GLM-5.3-Flash virtual-memory
+residency, explains how to interpret the live cost ledger, and specifies how to
+author and evaluate predictors aimed at beating reactive caching.
+[Architecture](parallax.md) defines the subsystem contracts and research
+directions; [running Parallax](parallax-demo.md) covers profiles, serving flags,
+and replay.
 
 ## What the GB300 experiments establish
 
-On 6 November 2026, an EWMA-driven residency policy completed a comparison against
+### Full-model DeepSeek V4.1 expert-row residency
+
+On single-GPU GB300 (`SM103`, `TP1`, concurrency 16, 8,192-token prefill chunks),
+DeepSeek V4.1 (`15,360` routed target experts across `40` layers) exceeds single
+GPU HBM and places `11,680` target experts in HBM (`7,840` protected calibration
+residents plus `3,840` replaceable slots), `40` spare HBM staging rows (`1` per
+layer), and `3,680` cold experts in Grace DRAM through `Execution.expert_rows`.
+Comparing static placement, frame-history `EWMA` (`predictor_rank`), and
+reactive `decayed_miss_lru` under identical cores and initial placements
+establishes a clear hierarchy:
+
+| Workload (`TP1` GB300) | Static placement | EWMA `predictor_rank` | `decayed_miss_lru` |
+| --- | ---: | ---: | ---: |
+| Authored mixed waves (`64` requests, core `63bf1d05...`) | `333.0 tok/s` (`79.8%` HBM) | `428.9 tok/s` (`89.5%` HBM) | `572.4 tok/s` (`95.7%` HBM) |
+| Held-out public waves (`24` requests, core `63bf1d05...`) | `267.8 tok/s` (`80.2%` HBM) | `334.5 tok/s` (`88.3%` HBM) | `438.7 tok/s` (`94.8%` HBM) |
+| Seeded `C1 / C8 / C16` decode (`16 x 2,048`, `MTP-3`, core `13e47a84...`) | `166.3 / 528.7 / 730.9 tok/s` | — | `243.1 / 993.1 / 1,478.9 tok/s` |
+| Seeded `C1 / C8 / C16` decode (`16 x 2,048`, `MTP-5`, core `13e47a84...`) | — | — | `246.9 / 985.5 / 1,496.1 tok/s` |
+| Uncached `8K / 32K / 128K` prefill (`N=10` median, core `13e47a84...`) | `41.2K / 52.1K / 55.8K tok/s` | — | `58.6K / 72.4K / 79.3K tok/s` |
+
+Two conclusions guide predictor research:
+
+1. **Active expert movement delivers large end-to-end serving gains on real
+   HBM-exceeding checkpoints.** Raising HBM route coverage from `~80%` to
+   `~95%` nearly doubles `C8` and `C16` speculative decode throughput (`+88%`
+   and `+102%`) and accelerates uncached 128K prefill by `42%` even when Context
+   Encoder layers (`0..19`) also stage cold experts inside the graph.
+2. **Reactive `decayed_miss_lru` is the baseline that forecasting must beat.**
+   Aggregate frame-history `EWMA` improves throughput by `25–29%` over static
+   residency, but trails `decayed_miss_lru` by `~6` percentage points of HBM
+   coverage (`~89%` versus `~95%`). Because `EWMA` observes only completed
+   frame histograms without token or cross-layer features, it reacts to topic
+   shifts at roughly the same timescale as decayed miss counts while lacking
+   explicit miss-only filtering and minimum slot-age protection. Surpassing
+   `decayed_miss_lru` requires genuine causal lookahead—such as predicting
+   downstream layer demand from early encoder activations/routes within a pass
+   or conditioning on drafted token sequences before verification.
+
+### Forced-offload GLM-5.3-Flash virtual-memory residency
+
+On 6 November 2026, an EWMA-driven residency policy completed an initial
+virtual-memory (`gb300` backend) comparison against
 static placement using GLM-5.3-Flash on one GB300. Both configurations used the
 same forced-offload split, release Flare runtime, fixed MTP3, and disabled adaptive
 verification. The policy ranked experts without assigning a synthetic monetary

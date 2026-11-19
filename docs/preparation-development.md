@@ -42,6 +42,12 @@ before the session's capture guard forbids further kernel resolution.
 
 ## Complete-forward compilation and capture
 
+Compiled forwards retain memory-pool planning and storage reuse, but disable
+Inductor's peak-memory operation reordering. That pass can move independent
+main-stream work before an opaque auxiliary-stream launch, turning a prepared
+fork into serial execution. Validate captured dependencies as well as outputs
+and temporary lifetimes when changing branch scheduling.
+
 - **Compile complete prepared forwards.** Use
   [capture_forwards](../ignition/preparation/capture.py), which restores compiled
   forwards before tracing and compiles missing variants with static shapes and
@@ -176,6 +182,11 @@ dependencies to reuse storage within a combined pool. A temporary allocated
 inside an opaque operator cannot participate in that planning.
 Tensors retained by constructors appear as external storage inputs to compilation.
 Their owners keep those allocations alive across graph variants.
+
+Cloned temporaries that opaque operations mutate retain an explicit materialization
+boundary during compilation. Their views address the clone's storage, including
+when its source is a slice with a nonzero offset. Folding such a clone into its
+source would invalidate the offsets used to reconstruct mutable operands.
 
 Constructors use example tensors to declare layouts and prepare kernels.
 The [declaration tensor helper](../ignition/preparation/examples.py) shares examples

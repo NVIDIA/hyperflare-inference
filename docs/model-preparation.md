@@ -578,6 +578,25 @@ expansion buffers reused by serial expert layers. Planning conservatively estima
 to BF16; `--mla-compute-mode auto` lets b12x select arithmetic while preserving
 packed KV storage.
 
+With prefill capacities above 128 tokens, DeepSeek prepares intermediate graphs
+that defer decoder suffix work and terminal graphs that complete continuation
+state. This split is experimental: full-model state equivalence and exported-core
+serving performance are not yet qualified. The terminal contract declares
+a 129-token reconstruction minimum. Helios reserves those actual tokens by
+shortening a preceding chunk; short fresh prompts and short extensions of a
+complete cached prefix can use fewer. Prompt scoring retains complete per-token
+execution. See the [terminal-prefill contract](../helios/model-contract.md#intermediate-and-terminal-prefill).
+
+For a TP1 state comparison, build Heliopause with its `qualification` feature and
+run `python -m qualify.deepseek41_terminal_prefill --help`. The diagnostic takes
+a local checkpoint, a Flare configuration file, the explicit SM103 preparation
+configuration described below, an assigned GPU UUID, and an output JSON path.
+It prepares 8192-token chunks and seven-token speculation, then compares declared
+continuation regions and assigned pages after complete per-chunk execution and
+after deferred execution with identical chunk boundaries. Synthetic token inputs
+and a repeated complete reference isolate state preservation; this diagnostic
+cannot establish model quality or exported-core serving performance.
+
 The experimental GB300 TP1 path exports MegaMoE expert execution with explicit
 HBM/Grace placement and prepared FlashMLA attention. Install the optional
 preparation dependency with:
@@ -605,37 +624,60 @@ storage accounting and exclusion of mutable residency state from the weight
 catalog.
 
 For experimental TP1 export, `--sm103-preparation PATH` reads a version-1 JSON
-object with `placements`, `flashmla_library`, `deepselect_library`, and
-`host_lane_clusters`. Library paths resolve relative to the JSON file. Each
+object with `placements`, `host_lane_clusters`, optional `execution`
+(`"hybrid"` by default or `"reference"`), optional `context`, and—when
+`execution` is `"hybrid"`—`flashmla_library` and `deepselect_library`. Library
+paths resolve relative to the JSON file. Each
 placement is keyed by `layers.N.ffn` or `mtp.N.ffn` and contains `experts`,
 `host`, and `hbm`; the two arrays give canonical IDs in physical row order.
 Supply all 40 target layers and, when MTP is enabled, all three draft layers.
 Unknown fields, duplicate keys, missing experts, and repeated IDs within a tier
 are rejected. Both tiers may contain the same expert.
 
-An optional `prefill_staging` object prepares temporary expert prefetch:
+Setting `"execution": "reference"` selects the complete DeepInfer SM103 model
+computation in `ignition.recipes.deepseek41`, including its 40-layer target
+transformer, three-layer DFlash draft model (`dspark_target_layer_ids = [37, 38, 39]`)
+with confidence-guided packed prefix allocation, 32-block vision encoder and
+projector, native Engram table delivery, and tiered MegaMoE storage. Optional
+`"context"` overrides the prepared sequence capacity (for example `262144`)
+without changing checkpoint metadata; `--prompt-logprobs`, `flashmla_library`,
+and `deepselect_library` are rejected in `"reference"` mode because the
+reference forward owns its attention and sparse indexer. When the maximum
+prefill chunk exceeds `144` tokens, `"reference"` enables Context-Encoder-Decoder
+(CED) consumer compaction (`keep_tokens = 144`, `terminal_prefill_min_tokens = 144`):
+intermediate `prefill` graphs execute only the 20 Context Encoder layers
+(`0..19`) and store the YOCO KV cache without running consumer layers (`20..39`)
+or vocabulary projection, while `terminal_prefill` graphs compact the consumer
+suffix (`<= 144` tokens) after layer 19. Exporting `"execution": "reference"`
+requires the `deepinfer` preparation package in the Python environment; exported
+cores load in `flare run` with no Python dependency. Run the miniature
+end-to-end export and fresh-process `flare run` check on SM103 with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 python -m pytest -q tests/preparation/test_reference_core_export_cuda.py
+```
+
+An optional `prefill_staging` object prepares temporary expert prefetch on both
+`"hybrid"` and `"reference"` SM103 preparations:
 
 ```json
 "prefill_staging": {"min_rows": 1024, "min_cold_experts": 8}
 ```
 
 Omission disables staging. Target prefill layers qualify by their prepared row
-count; a compact decoder suffix below `min_rows` keeps direct-host execution.
-Two auxiliary streams start copies ahead of the consuming layers. Captured copy
-kernels inspect the live canonical map and skip HBM-resident duplicates. The
-preceding invocation's distinct host demand selects staging only when it reaches
-`min_cold_experts`; otherwise the consumer reads original host weights. Decode
-and MTP graphs do not use this prefill mechanism. The copies use SMs, not DMA
-engines, and still reserve full host-plane scratch extents. Planning includes a
-three-plane-set scratch allowance; capture measures the actual graph pool.
-Preparation clears the demand history after capture, before export.
-`--no-stream-overlap` keeps these copies on the calling capture stream.
-
-This is experimental preparation wiring. Component checks establish exact
-checkpoint-expert replay and selective copying; full-model export, fixed memory,
-serving noninterference and performance are not qualified. Changing this setting
-changes the preparation manifest, so use ordinary export rather than
-`--reuse-weights` across different staging configurations.
+count; when `yoco_keep_tokens < min_rows`, staging attaches only to Context
+Encoder layers (`0..19`) and leaves the compact consumer suffix (`20..39`) on
+direct-host execution. Two auxiliary streams start copies ahead of the consuming
+layers. Captured copy kernels inspect the live canonical map and skip
+HBM-resident duplicates. The preceding invocation's distinct host demand selects
+staging only when it reaches `min_cold_experts`; otherwise the consumer reads
+original host weights. Decode and MTP graphs do not use this prefill mechanism.
+The copies use SMs, not DMA engines, and reserve a three-plane-set scratch
+allowance inside the shared CUDA graph pool. Preparation clears the demand
+history after capture, before export. `--no-stream-overlap` keeps these copies
+on the calling capture stream. Changing this setting changes the preparation
+manifest, so use ordinary export rather than `--reuse-weights` across different
+staging configurations.
 
 The explicit configuration admits one local SM103 GPU and expanded native
 expert scales. It does not change the recipe's ordinary TP selection. Planning
@@ -649,6 +691,13 @@ an already downloaded checkpoint because placement sizing reads tensor headers.
 Use `ignition export` followed by release `flare run`; `debug-serve` and
 multi-host preparation reject this option.
 
+The reference index selector orders selected token IDs descending before
+attention, leaving invalid padding after the valid IDs. It preserves the
+selected set while preventing atomic scatter order from changing attention's
+floating-point reduction order. Tied cutoff scores still use the selector's
+tie-breaking behavior. The ordering is captured computation and requires
+re-export when changed.
+
 Full-model preparation and exported release serving have passed initial text
 integration checks on GB300 TP1 with concurrency one, 256-token prefill, native
 expert scales, static HBM/Grace placement, and seven adaptive drafts. Twenty
@@ -658,17 +707,35 @@ execution, repeated seeded token output, 786-token chunked prefill, prefix reuse
 independent requests, token accounting, and clean shutdown. The six tested token
 sequences agree between ordinary and MTP execution.
 
-The TP1 concurrency-sixteen, 8192-token prefill, three-draft configuration has
-also completed native text integration checks with expanded native expert scales
+The TP1 concurrency-sixteen, 8192-token prefill, three-draft `"hybrid"`
+configuration has also completed native text integration checks with expanded native expert scales
 and static HBM/Grace placement. Its 111 compiled forwards and 141 captured graphs
 load through release Flare. Checks cover a 12,842-token prompt crossing prefill
 chunks, exact cold/warm output token agreement, prefix reuse and branching,
 sixteen simultaneous requests, token accounting, and request drain. Native
 counters confirm speculative execution at batch sixteen. The checks also cover
-direct-destination prefill cache assembly in an exported core. They do not
-establish full-model numerical equivalence, vision replay, long-context
-correctness, ordinary/MTP equivalence at concurrency sixteen, or adaptive expert
-movement.
+direct-destination prefill cache assembly in an exported core.
+
+With `"execution": "reference"`, `"context": 262144`, and
+`"prefill_staging": {"min_rows": 1024, "min_cold_experts": 8}`, the TP1
+concurrency-sixteen, 8,192-token prefill, seven-draft configuration
+(`--speculative-token-capacity 128`, `--speculative-graph-budget 80`,
+`--image-concurrency 1`, `--parallax-routing`, 11,680 active target HBM experts
+plus 40 spare exchange rows and 3,680 Grace experts) compiles 283 forwards and
+exports 313 graphs (`44` `terminal_prefill` graphs, `9.13 GiB` shared CUDA graph
+pool, `234.1 GiB` loaded device memory, `131.7 GiB` mapped host memory) in core
+`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` (and 207
+forwards / 237 graphs without CED or staging at `--speculative-graph-budget 64`
+in core `63bf1d05b2011d9a4ffeda37a4f3fb9f98144733b6eb0ddd08439a477ecde79a`).
+Fresh-process `flare run` allocates 18,029,568 logical KV tokens and 1,568
+shared snapshot slots (`15.01 GiB` cache budget) and passes
+`tests/server/test_deepseek41_sm103.py`, 2,080-token continuations, 36-request
+long-C16 acceptance, ordinary decode (`--mtp-draft-tokens 0`), and adaptive
+speculative execution at runtime draft limits 3, 5, and 7. Vision encoder
+varlen attention zero-initializes padded query rows before `_flash_attn_fwd` so
+non-128-aligned image patch counts cannot read uninitialized graph-pool values.
+Prompt log-probabilities and multi-GPU TP2+ composition are not supported on
+the `"reference"` path.
 
 `--parallax-routing` adds optional target-routing variants for ordinary and packed
 MTP execution. Runtime selection remains off by default. DeepSeek's capture wiring

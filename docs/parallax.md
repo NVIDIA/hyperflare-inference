@@ -1,34 +1,90 @@
-# Parallax: predictive expert residency
+# Parallax: predictive and adaptive expert residency
 
-Parallax evaluates whether forecasting Mixture-of-Experts (MoE) demand can make
-expert weight placement cheaper than static residency or reactive caching. A
-useful forecast must identify demand early enough to complete a transfer, and the
-execution savings must exceed prediction, movement and synchronization costs.
+Parallax manages Mixture-of-Experts (MoE) weight placement across GPU HBM and
+coherent host memory inside Flare, and evaluates whether demand forecasting can
+outperform static placement and reactive caching. Sparse MoE models whose total
+expert parameters exceed single-GPU HBM—such as DeepSeek V4.1 (`15,360` routed
+target experts across `40` layers, roughly `355 GiB` of weights versus `256 GiB`
+of usable HBM on a single GB300)—activate only a small subset of experts per
+token (`6` of `384`, `1.56%`). Coherent CPU-GPU fabrics such as Grace-Blackwell
+NVLink-C2C allow prepared CUDA graphs to execute cold experts directly from
+pinned host DRAM, turning an HBM capacity limit into a placement problem: keep
+heavily reused experts in HBM and stage or promote cold experts early enough
+that execution savings exceed transfer, synchronization, and eviction costs.
 
-The implementation provides deterministic offline replay, statistical predictors,
-independent residency simulations and a native routing feed for shadow evaluation.
-Shadow evaluation runs predictors against serving observations while leaving
-physical expert placement unchanged. GLM-5.3-Flash preparation includes optional
-routing instrumentation for single-GPU decode, prefill and MTP verification. Instrumented
-LIL GLM serving has been exercised on GB300 with routing capture and exact offline
-replay. Full-model numerical/state qualification and sustained high-concurrency
-overhead qualification remain outstanding. The [native serving guide](parallax-demo.md)
-describes in-process providers, the serving dashboard and CPU-only replay. The
-[research guide](parallax-research.md) records measured findings, the native
-predictor contract, a canary implementation and workload examples.
+## Design thesis and research direction
 
-An experimental storage backend implements GB300 Grace/HBM allocation, staging
-and quiescent virtual-address remapping in Helios. Explicit residency configuration
-connects it to package loading and native graph execution. An optional economic
-or rank-based policy submits real exchanges from one selected predictor; other contenders keep
-independent shadow state. GB300-to-RTX transfers and remote expert execution are
-outside the implemented path. Startup calibration measures idle pinned-host
-copies in both directions. An observational graph-time model estimates cold-weight
-costs during serving; it does not isolate all contention costs. A bounded fixed-MTP3
-forced-offload comparison observed 18.8% higher request throughput with EWMA-driven
-movement. General serving gains and full correctness qualification remain
-unestablished; the [findings and limitations](parallax-research.md#what-the-gb300-experiments-establish)
-define that result's scope.
+Parallax is structured around three architectural invariants so residency
+experimentation never weakens Flare's serving guarantees:
+
+1. **Prepared CUDA graphs remain the execution boundary.** Serving uses no
+   Python callbacks, runtime compilation, graph recapture, or steady-state GPU
+   allocation. Physical backends update expert residency at quiescent
+   inter-graph boundaries either by remapping CUDA virtual-memory pages
+   (`helios/src/parallax/residency/gb300.rs`) or by updating canonical-to-physical
+   `int32` expert row maps (`helios/src/parallax/residency/rows.rs`) while all
+   captured device pointers and kernel launch parameters stay fixed. When
+   `--parallax-routing` is omitted, counter-free graphs load with zero routing
+   readback.
+2. **Inter-round residency and intra-graph staging operate at complementary
+   timescales.** Background residency policies (`decayed_miss_lru`,
+   `predictor_rank`, `economic_exchange`) consume asynchronous per-layer routing
+   histograms (`parallax_routes_v1`), copy promoted experts into spare HBM
+   slots on a low-priority stream while active graphs hold reader leases, and
+   publish updates atomically with rollback on failure. During wide prefill
+   chunks, optional captured staging
+   (`ignition/components/megamoe_staging.py`) prefetches cold host experts on
+   auxiliary streams ahead of consuming layers while skipping experts already
+   resident in HBM—so long-lived residency shrinks cold prefill volume and
+   intra-graph staging overlaps the remainder with HBM compute.
+3. **Forecasting, policy, physical movement, and evaluation stay decoupled.**
+   Compiled statistical providers (`recent`, `ewma`, `frequency`,
+   `uniform_canary`) and reactive controls (`static_core_lru`,
+   `decayed_miss_lru`) run on bounded background Rust threads against the same
+   causal observation stream, scored by an observatory that tracks independent
+   virtual residency ledgers, usable lead time, and deterministic offline
+   replay (`flare parallax --replay`).
+
+### Established scope and research aspirations
+
+On single-GPU GB300 (`SM103`), full-model DeepSeek V4.1 serving with
+`Execution.expert_rows` (`11,680` HBM target experts, `3,680` Grace experts,
+and `40` spare exchange rows) establishes that active `decayed_miss_lru`
+residency raises HBM route coverage from roughly `80%` under static placement
+to `95–96%`, doubling concurrency-16 speculative decode throughput (`730.9` to
+`1,478.9–1,496.1 tokens/s`) and lifting uncached 128K-token prefill throughput
+by `42%` (`55.8K` to `79.3K tokens/s`) on top of Context-Encoder-Decoder (CED)
+prefill and intra-graph Encoder staging. Aggregate frame-history forecasting
+(`EWMA` with `predictor_rank`, roughly `89%` coverage) improves substantially
+over static placement on mixed traffic and forced-offload GLM-5.3-Flash checks
+(`+18.8%` to `+29%`), while trailing `decayed_miss_lru` because aggregate
+per-frame counts offer limited multi-frame lookahead across topic shifts.
+
+The modular separation between providers, policies, storage backends, and the
+observatory targets three unimplemented research directions:
+
+- **Proactive multi-step forecasting beyond reactive LRU.** Surpass
+  `decayed_miss_lru` across workload shifts, prefill-to-decode transitions, and
+  low-locality batches by exploiting richer causal inputs—cross-layer routing
+  correlations from early encoder layers, speculative draft-token lookahead, and
+  compact learned predictors—evaluated against `decayed_miss_lru` and offline
+  oracle bounds under identical transfer deadlines and CPU/GPU budgets.
+- **Calibrated economic movement control.** Replace heuristic cold-route
+  penalties and fixed interval throttles with calibrated cold-execution,
+  copy-contention, and reader-drain pricing so promotions execute only when
+  expected wall-time savings are positive.
+- **Broader NVIDIA tiered-memory topologies.** Extend reader-gated residency
+  within Flare's prepared-graph contract from single-GPU Grace-Blackwell (`TP1`)
+  to multi-rank tensor-parallel deployments (`TP2+`) and explicit event-gated
+  PCIe pinned-host staging, without introducing interchangeable kernel backends
+  or runtime recapture. GB300-to-RTX transfers, remote expert execution, live
+  policy hot-swapping, and TP2+ movement are not implemented.
+
+This document specifies Parallax's architecture, contracts, storage backends,
+and qualification scope. The [native serving guide](parallax-demo.md) covers
+runtime profiles, CLI flags, dashboard inspection, and offline replay. The
+[research guide](parallax-research.md) records controlled GB300 experiments,
+cost-ledger interpretation, predictor authoring, and evaluation methodology.
 
 ## Component boundaries
 
@@ -271,15 +327,20 @@ execution mode. Packages exported with only ordinary traced variants still requi
 `--mtp-draft-tokens 0`; enabling MTP tracing requires a package with traced MTP
 graphs. Mixed tracing fails admission.
 
-DeepSeek V4.1 TP1 capture wiring has checkpoint component coverage and bounded
-exported native text coverage on GB300. Its ordinary, scored-prefill and packed
-MTP variants count canonical target IDs before physical expert mapping.
-Verification counts include rejected target candidates; draft experts are not
-part of this feed. Each layer records its executed row count, including the
-shorter decoder suffix during bounded prefill. Histogram token totals therefore
-need not be equal across layers. The checkpoint expert-block check covers
-1, 17, 64, 128 and 8192 rows, exact plain/traced outputs and IDs, inactive rows,
-alternating frames, untouched plain telemetry buffers and allocation-free replay.
+DeepSeek V4.1 TP1 capture wiring has checkpoint component coverage and exported
+native serving coverage on GB300 across both `"hybrid"` and `"reference"` SM103
+executions (`decoder.py` and `reference_experts.py`). Its ordinary,
+terminal-prefill, scored-prefill, and packed MTP variants count canonical
+target IDs before physical expert mapping. Verification counts include rejected
+target candidates; draft experts are not part of this feed. Each layer records
+its executed row count, including the compact consumer suffix on
+`terminal_prefill` graphs; intermediate `prefill` graphs on cores that omit
+consumer layers (`20..39`) report histograms for the `20` executed Context
+Encoder layers (`0..19`). Histogram layer counts and token totals therefore
+follow actual layer execution rather than a uniform 40-layer assumption. The
+checkpoint expert-block check covers 1, 17, 64, 128, and 8192 rows, exact
+plain/traced outputs and IDs, inactive rows, alternating frames, untouched plain
+telemetry buffers, and allocation-free replay.
 
 The exported native check uses concurrency sixteen, 8192-token prefill and three
 adaptive drafts. It compares the same core and release runtime with tracing off
@@ -325,7 +386,9 @@ Its producer uses `try_lock` and records contention drops without waiting for an
 HTTP reader. Retention eviction is visible as a sequence gap. The authenticated
 [`GET /v1/parallax/routing?after=N`](api.md#experimental-routing-observations)
 endpoint returns model/session identity, geometry, routing and submission
-sequences, execution phase, batch size, histograms, timestamps and loss counters.
+sequences, submitted graph operation and token capacity, execution phase, batch size, histograms,
+timestamps and loss counters. The operation distinguishes intermediate from
+terminal prefill while both retain the `prefill` phase.
 Concurrency is sampled from active requests at completion; the collector clamps
 it to at least one. It is a workload-stratification proxy rather than dispatch-time
 scheduler history.
@@ -748,48 +811,53 @@ CUDA_VISIBLE_DEVICES=GPU_UUID FLARE_RUN_CUDA_TESTS=1 cargo test --release \
 ### Captured temporary expert staging
 
 `ignition.components.megamoe_staging.PreparedExpertStage` prepares selective
-host-to-HBM copies ahead of a MegaMoE consumer. It follows DerpSeek's use of
-temporary prompt staging and previous cold demand, with the decisions and copies
-inside captured graphs. It is a preparation component, not a native residency
-policy. Experimental DeepSeek SM103 preparation can insert it into target
-prefill through the `prefill_staging` setting described in
-[model preparation](model-preparation.md#deepseek-v41-flash). Eligibility follows
-prepared row counts, excluding compact suffix layers below the threshold and
-all decode and MTP graphs. Full-model serving with this wiring is not qualified.
+host-to-HBM copies ahead of a MegaMoE consumer. It adapts DerpSeek's temporary
+prompt staging and previous cold-demand gate so all decisions and copies run
+inside captured CUDA graphs. It is a preparation component, not a native
+residency policy. DeepSeek SM103 preparation (`"hybrid"` and `"reference"`)
+inserts it into eligible target prefill layers through the `prefill_staging`
+setting described in [model preparation](model-preparation.md#deepseek-v41-flash).
+Eligibility follows prepared row counts: when `yoco_keep_tokens < min_rows`,
+staging attaches only to Context Encoder layers (`0..19`), excluding compact
+consumer suffix layers (`20..39`) and all decode and MTP graphs.
 
 The component reads the authoritative canonical map on every replay and copies
-only host rows without a selected HBM copy. Prepared copy kernels use SMs;
-these selective transfers do not use DMA copy engines. Preparation can tune
-64, 128 or 256 copy CTAs. Each instance retains the preceding invocation's
-distinct host-expert count. Below its prepared threshold, the copy kernels skip
-their payload work and the consumer binds the original host weights. Zero
-history selects direct-host execution. Export must clear preparation observations
-after warmup and capture drain. A prediction miss changes cost, not which experts
-execute.
+only host rows without a selected HBM copy, so experts promoted into HBM by
+live Parallax residency are skipped automatically. Prepared copy kernels use
+SMs rather than DMA copy engines; preparation tunes 64, 128, or 256 copy CTAs.
+Each instance retains the preceding invocation's distinct host-expert count.
+Below `min_cold_experts`, the copy kernels skip payload work and the consumer
+binds the permanent host weights; zero history selects direct-host execution.
+Export resets `stager.decision` after warmup and capture drain so packaged
+graphs start from clean history. A staging miss changes execution cost, not
+which experts execute.
 
 Each forward owns its staging planes and private control block. The copy stream
 waits for its input dependency; the consumer joins that stream before reading
 staged weights. The private control block retains the original physical row
 indices and selects either staged HBM pointers or the permanent host pointers.
-The consumer's counters update the next invocation's decision. Permanent weight
-storage, residency maps and control counters remain unchanged. Native residency
-publication must exclude readers for the entire graph, including its copies.
-Two auxiliary streams permit lookahead; stream reuse follows the preceding
-consumer, with all source and destination lifetimes visible to compilation.
-Serialized tuning trials borrow the shared preparation scratch arena; they do
-not allocate a separate expert-copy destination for each candidate.
-Native promotion counters describe permanent residency transactions. Temporary
-staging costs require separate graph measurements; per-copy staging telemetry
-is not exported.
+The consumer's counters update the following invocation's decision. Permanent
+weight storage, residency maps, and control counters remain unchanged. Native
+residency publication excludes readers for the entire graph, including its
+staging copies. Two auxiliary streams permit two-layer lookahead, borrowing a
+bounded three-plane-set HBM scratch footprint (`~3.53 GiB` for 64 host experts
+per Encoder layer) inside the shared CUDA graph pool; serialized tuning trials
+share the preparation scratch arena rather than allocating per-candidate
+destinations. Native promotion counters describe permanent residency
+transactions; per-copy temporary staging telemetry is not exported.
 
-GB300 component checks cover exact checkpoint-expert output agreement at
-256/1024/8192 rows across staging and direct-host transitions, changing routes
-and padding, two-stream reuse and allocation-free replay. Native row-storage
-checks cover sixteen physical exchanges at 1/16/64/256 rows with exact output
-agreement. An exported component fixture passes 32 native Helios replays across
-1/16/256/1024 rows, with exact all-HBM reference agreement, poisoned outputs and
-no replay-time CUDA allocation. These checks do not establish full-model serving
-support or a serving performance improvement.
+GB300 component checks (`tests/components/test_megamoe_staging_cuda.py` and
+`tests/components/test_megamoe_encoded_cuda.py`) cover bitwise checkpoint-expert
+output agreement (`rtol=0, atol=0`) at 256, 1,024, and 8,192 rows across
+staging and direct-host transitions, changing routes and padding, two-stream
+reuse, and allocation-free replay. Full-model `"execution": "reference"`
+serving with `prefill_staging` (`min_rows = 1024`, `min_cold_experts = 8`) and
+CED prefill (`keep_tokens = 144`) is qualified on GB300 TP1, reducing uncached
+8K, 32K, and 128K median TTFT from `355.1`, `1,093.8`, and `4,203.4 ms`
+(complete-chunk un-staged core `63bf1d05...`) to `139.7`, `452.7`, and
+`1,653.0 ms` (`58.6K`, `72.4K`, and `79.3K tokens/s`) with active
+`decayed_miss_lru` residency (`198.6`, `629.5`, and `2,351.0 ms` under static
+residency on the same staged core).
 
 ### Connecting storage to serving
 
@@ -900,8 +968,12 @@ execution-generation hit/miss classification. Slot replacement age changes only
 when a physical publication commits, not when a plan is proposed. Copy admission
 requires calibrated transfer costs, spare capacity and completion within the
 observation's validity window. These checks bound movement without estimating a
-cold-execution benefit. CPU tests cover decision and publication accounting;
-physical serving remains unqualified. See the
+cold-execution benefit. CPU tests cover decision and publication accounting; GB300 TP1 native checks
+cover static and active serving across DeepSeek V4.1 cores with both complete
+prefill (`63bf1d05...`) and CED terminal prefill plus Encoder staging
+(`13e47a84...`) at runtime draft depths 0, 3, 5, and 7. Exact tensor-level
+state equivalence under concurrent non-greedy sampling remains unqualified. See
+the measured scope below and
 [active policy configuration](parallax-demo.md#experimental-gb300-residency).
 
 The prediction endpoint and dashboard distinguish actual HBM/Grace counts and
@@ -975,6 +1047,44 @@ actual movement alongside an observational execution-cost ledger. The
 record its package, workload, static/active throughput and qualification limits.
 The [ledger explanation](parallax-research.md#what-the-cost-ledger-means)
 distinguishes estimated resource savings from measured serving time.
+
+On the DeepSeek V4.1 `"execution": "reference"` complete-chunk core
+`63bf1d05b2011d9a4ffeda37a4f3fb9f98144733b6eb0ddd08439a477ecde79a` (`TP1`,
+concurrency 16, 8,192-token prefill chunks, adaptive draft depths through seven,
+version-2 `Execution.expert_rows` residency with 11,680 HBM target experts,
+7,840 protected residents, 40 spare exchange rows, and 3,680 Grace experts),
+default-off serving loads counter-free graphs without routing readback, while
+traced shadow-observed, static, EWMA `predictor_rank`, and `decayed_miss_lru`
+runs each match the untraced control bit-for-bit across 20 short/chunked
+acceptance requests and 16 concurrent 240-integer C16 requests at adaptive draft
+depth three, with zero invalid or dropped routing frames and zero rollbacks.
+Two divergent continuations sharing a primed 12,800-token prefix restore all
+12,800 cached tokens and produce exact answers after unrelated traffic advances
+physical residency from generation 103 to 156. Across six authored mixed waves
+(64 requests) and three held-out public waves (24 requests), pooled throughput
+reaches 572.4 and 438.7 tokens/s with `decayed_miss_lru` (95.7% and 94.8% HBM
+route coverage), 428.9 and 334.5 tokens/s with EWMA `predictor_rank` (89.5% and
+88.3%), and 333.0 and 267.8 tokens/s with static placement (79.8% and 80.2%).
+
+Adding CED consumer prefill compaction (`keep_tokens = 144`,
+`terminal_prefill_min_tokens = 144`), intermediate-chunk decoder skipping
+(`layers 0..19`), Encoder `prefill_staging` (`min_rows = 1024`,
+`min_cold_experts = 8`), vectorized cache transactions, and
+`--speculative-graph-budget 80` in core
+`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` (`313`
+graphs, `18,029,568` KV tokens) lifts sixteen-request 2,048-token seeded decode
+with `decayed_miss_lru` from `166.3`, `528.7`, and `730.9 tokens/s` (static) to
+`243.1`, `414.2`, `667.0`, `993.1`, and `1,478.9 tokens/s` at concurrencies 1,
+2, 4, 8, and 16 under adaptive `MTP-3` (`8.91`, `10.21`, `11.79`, `14.45`, and
+`18.02 ms` mean verification graph time), and to `246.9` (`C1`) and
+`1,496.1 tokens/s` (`C16`) under adaptive `MTP-5` (`249.6 tokens/s` at `C1`
+with `--mtp-adaptive-verification-alpha 0.5`). Uncached 8K, 32K, and 128K
+median prefill reaches `58.6K`, `72.4K`, and `79.3K tokens/s` (`139.7`,
+`452.7`, and `1,653.0 ms`) with `decayed_miss_lru` versus `41.2K`, `52.1K`, and
+`55.8K tokens/s` (`198.6`, `629.5`, and `2,351.0 ms`) under static placement on
+the same core, demonstrating that active residency reduces cold C2C traffic
+even when Encoder layers stage cold experts. Free-form seeded concurrent outputs
+at positive temperature still vary with batch composition and placement timing.
 
 Production qualification requires measured cold-execution and publication costs,
 broader correctness coverage and comparable static-placement serving benchmarks.

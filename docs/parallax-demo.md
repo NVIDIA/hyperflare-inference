@@ -471,8 +471,22 @@ window; it is not a forecast of future demand or a claim of positive savings.
 The controller independently validates generations, capacity and reader safety.
 The `active_policy` report exposes proposals, accounted commits, stale
 observations and failures. CPU checks cover delayed generations, cancellation,
-copy deadlines, spare capacity and protected victims. Physical serving of this
-policy is not qualified.
+copy deadlines, spare capacity and protected victims.
+
+Native GB300 TP1 checks with DeepSeek V4.1 match token IDs, completion reasons,
+and messages between static and active placement across 36 seeded requests,
+including cold, cached, and branched 12,800–12,842-token prompts, sixteen
+concurrent short generations, and sixteen concurrent 240-integer `C16`
+generations, with zero movement faults or rollbacks across both complete-chunk
+prefill (`63bf1d05...`) and CED terminal-prefill plus Encoder-staged cores
+(`13e47a84...`). Runtime speculative execution with active `decayed_miss_lru`
+is exercised across `--mtp-draft-tokens` `0`, `3`, `5`, and `7` and
+`--mtp-adaptive-verification-alpha` `0.5`, `0.75`, and `1.0`: default
+`alpha = 1.0` with `--mtp-draft-tokens 5` maximizes concurrent throughput
+(`1,496.1 tok/s` at `C16`, `246.9 tok/s` at `C1`), while `alpha = 0.5–0.75`
+increases single-stream `C1` acceptance depth inside the 8-row MMA tile
+(`249.2–249.6 tok/s`). Exact tensor-level state equivalence under concurrent
+non-greedy sampling and multi-GPU TP2+ movement remain unqualified.
 
 With physical storage enabled, the dashboard displays the actual residency
 ledger. GPU-timed copies and host mapping publication exclude startup placement.
