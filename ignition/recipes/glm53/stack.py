@@ -42,7 +42,7 @@ class DecoderScratch:
 
     @classmethod
     def allocate(cls, tokens, blocks, mode, device, *, shard: TensorParallelShard, sample_rows, context_ranks=1,
-                 remote=False):
+                 remote=False, gather_context=False):
         """Allocate declaration examples for each operator's layouts and tuning."""
         if type(sample_rows) is not int or not 0 < sample_rows <= tokens:
             raise ValueError("GLM sampling capacity must be positive and fit the token capacity")
@@ -50,7 +50,7 @@ class DecoderScratch:
             return torch.zeros(shape, dtype=torch.bfloat16, device=device)
         layers = (KDAScratch.allocate(tokens, 64 // shard.world_size, device),
             MLAScratch.allocate(tokens, 64 // shard.world_size, blocks, mode, device, context_ranks=context_ranks,
-                                remote=remote),
+                                remote=remote, gather_context=gather_context),
             MLPScratch.allocate(tokens, 4096, 12288 // shard.world_size, device),
             MoeScratch.allocate(tokens, shard.world_size, device))
         return cls(buffer(tokens, 4096), buffer(tokens, 4, 4096), buffer(sample_rows, 4, 4096),

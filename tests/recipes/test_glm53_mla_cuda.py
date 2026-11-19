@@ -300,8 +300,12 @@ def test_cp_prefill_query_reuse_matches_separate_values_across_slices(model_weig
                 # Isolate the production CP slice loop with real projections, attention and peer-cache reads.
                 op = PreparedGlmMLA.__new__(PreparedGlmMLA)
                 op.scratch, op.metadata, op.state = s, metadata, SimpleNamespace(peers=peers)
-                op.context = SimpleNamespace(shards=ContextShards.on(0, world, device))
-                op.windows, op.slices = (), []
+                from ignition.recipes.glm53.dcp import PreparedContextGather
+
+                op.context = SimpleNamespace(shards=ContextShards.on(0, world, device),
+                    remote=False, records=None, selection_tuning=None)
+                op.context_gather = PreparedContextGather(op.state, s, op.context, session=session, name="cp")
+                op.slices = []
                 caps = sparse_mla.Caps(device=device, num_q_heads=heads, max_q_rows=PREFILL_SLICE_ROWS, max_width=2051,
                     softmax_scale=module.scaling, max_batch=PREFILL_SLICE_ROWS, max_kv_rows=s.slab.shape[0],
                     kv_dtype=torch.uint8, head_dim=512, v_head_dim=512, page_size=64,
@@ -323,7 +327,8 @@ def test_cp_prefill_query_reuse_matches_separate_values_across_slices(model_weig
         for key, op in operations.items():
             def forward(op=op):
                 op.scratch.query.copy_(queries[:op.scratch.query.shape[0]])
-                op.attend_gathered_context()
+                op.attend_gathered_context(op.scratch, op.metadata, op.scratch.query,
+                                           op.scratch.index.physical, op.scratch.index.selected_lengths)
                 arena.tensor.fill_(255)
             compiled[key] = compile_forward(forward)
             compiled[key]()

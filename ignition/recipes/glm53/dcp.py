@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ignition.components.collectives import PreparedVarlenGather
+
 GROUP = 4
 PAGE_RECORDS = 256
 POOL_TOPK = 512
@@ -303,8 +305,8 @@ def pull_context(addresses, table, end, slab, shards):
             WORLD=shards.world, TOKENS=_PULL_TOKENS, WORDS=132, WORD_BLOCK=256, num_warps=4)
 
 
-# Latent records each rank contributes per gather window when ranks on separate hosts gather prefill
-# context: its pinned RoCE rows and staging scale with the window rather than the context.
+# Latent records each rank contributes per prefill gather window; transport staging scales
+# with the window rather than the context.
 WINDOW_RECORDS = 65536
 
 
@@ -337,6 +339,69 @@ def scatter_records(records, end, slab, shards, first):
             words.stride(0)), WORLD=shards.world, TOKENS=_PULL_TOKENS, WORDS=132, WORD_BLOCK=256, num_warps=4)
 
 
+class PreparedContextGather:
+    """Produce the global latent slab of one prefill layer.
+
+    `implementation` is "ring" (pack this rank's records, gather them in windows, scatter them into the
+    slab) or "pull" (read every peer's cache directly). Contexts across hosts always use the ring. On one
+    host the implementation is "pull" until preparation's race binds the measured winner with `bind`.
+    The `implementation` argument of `__call__` lets the race trial run either transport on one operation;
+    serving never passes it.
+    """
+
+    IMPLEMENTATIONS = ("pull", "ring")
+
+    def __init__(self, state, scratch, context, *, session, name):
+        if context.remote and context.records is None:
+            raise ValueError("a context across hosts gathers through its records runtime")
+        self.state, self.context = state, context
+        self.implementation = "ring" if context.remote else "pull"
+        self.positions = scratch.slab.shape[0]
+        self.window = scratch.records.shape[1] // 528
+        self.windows = ()
+        if context.records is not None:
+            if not self.window:
+                raise ValueError("context gather windows require scratch records")
+            self.windows = tuple((first, PreparedVarlenGather(scratch.records, scratch.record_counts,
+                runtime=context.records, session=session, coordinator=context.coordinator,
+                name=f"{name}.gather_records{first}"))
+                for first in range(0, self.positions // context.shards.world, self.window))
+        if context.selection_tuning is not None:
+            context.selection_tuning.register(self)
+
+    @property
+    def uses_records(self):
+        """Whether a forward must allocate the records its ring windows pack into."""
+        return self.implementation == "ring"
+
+    def bind(self, implementation):
+        """Select the transport of every later call; the ring needs the windows this gather prepared."""
+        if implementation not in self.IMPLEMENTATIONS or implementation == "ring" and not self.windows:
+            raise ValueError("context gather was not prepared for this implementation")
+        self.implementation = implementation
+
+    def plans(self, implementation):
+        """The prepared kernel plans the transport runs: one gather per window for the ring, none for peer pull."""
+        return tuple((f"window{first}", gather.plan) for first, gather in self.windows) if implementation == "ring" else ()
+
+    def functional(self, *, session):
+        for _, gather in self.windows:
+            gather.functional(session=session)
+
+    def __call__(self, s, table, end, *, implementation=None):
+        shards = self.context.shards
+        if (self.implementation if implementation is None else implementation) == "ring":
+            cache = self.state.cache.view(torch.int32).view(-1, 132)
+            for first, gather in self.windows:
+                pack_records(cache, table, end, s.records, shards, first)
+                s.record_counts.copy_(window_counts(end, shards.world, first, self.window))
+                gather(output=s.records, counts=s.record_counts)
+                scatter_records(s.records, end, s.slab.view(torch.int32), shards, first)
+        else:
+            # The indexer's candidate gather orders this layer's peer cache writes before these reads.
+            pull_context(self.state.peers, table, end, s.slab.view(torch.int32), shards)
+
+
 # Rows per collective slice: bounds exchange staging and gathered-head scratch for chunked prefill.
 SLICE_ROWS = 512
 # Prefill attention under context parallelism gathers the whole context into a local slab, then
@@ -354,6 +419,11 @@ class ContextParallel:
     coordinator: object
     # Ranks on separate hosts exchange through one RoCEnante runtime instead of CUDA IPC.
     remote: bool = False
+    # Gathers the latent-record windows of prefill context: the RoCEnante runtime across hosts, or a
+    # variable-length all-gather runtime on one host when preparation races the ring against peer pull.
+    records: object = None
+    # Chooses between peer pull and the ring at preparation time; absent when no race runs.
+    selection_tuning: object = None
 
     def slices(self, rows):
         return [(start, min(start + SLICE_ROWS, rows)) for start in range(0, rows, SLICE_ROWS)]

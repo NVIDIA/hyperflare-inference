@@ -43,3 +43,20 @@ def test_mtp_catalog_defaults_to_five_drafts_and_reserves_draft_pages():
     large = PreparationConfig(mtp=True, max_active=64)
     assert len(large.speculative_shapes) == 31
     assert large.speculative_shapes[-1] == (64, 1)
+
+
+@pytest.mark.parametrize("settings,world,capability,races", [
+    ({}, 4, (12, 0), True),
+    ({"autotune_effort": "audit"}, 4, (12, 0), True),
+    ({"autotune_effort": "off"}, 4, (12, 0), False),
+    ({"compile_decoder": False}, 4, (12, 0), False),
+    ({"collective_tuning": "runtime"}, 4, (12, 0), False),
+    ({}, 2, (12, 0), False),
+    ({}, 4, (12, 1), False),
+    ({}, 4, (10, 3), False)])
+def test_context_transport_race_runs_only_on_the_qualified_cell(monkeypatch, settings, world, capability, races):
+    import torch
+    from ignition.recipes.glm53.bootstrap import races_context_transport
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    assert races_context_transport(PreparationConfig(**settings), world, "cpu") is races

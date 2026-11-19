@@ -61,13 +61,13 @@ class MLAScratch:
     # Ranks on separate hosts stage the head shards each peer combines, and every rank's packs.
     exchange_send: torch.Tensor
     exchange_received: torch.Tensor
-    # Prefill across hosts gathers one window of every rank's latent records at a time, [world, window * 528]
+    # Prefill gathers one window of every rank's latent records at a time, [world, window * 528]
     # bytes, with each rank's byte count in the window.
     records: torch.Tensor
     record_counts: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, heads, blocks, mode, device, *, context_ranks=1, remote=False):
+    def allocate(cls, tokens, heads, blocks, mode, device, *, context_ranks=1, remote=False, gather_context=False):
         if heads not in (16, 32, 64):
             raise ValueError("GLM MLA scratch requires TP1, TP2 or TP4 head partitions")
         from .dcp import PREFILL_SLICE_ROWS, SLICE_ROWS
@@ -93,7 +93,7 @@ class MLAScratch:
         width = pack_width(context_ranks, heads * context_ranks, 512) if remote and exchange else 0
         from .dcp import WINDOW_RECORDS
 
-        window = min(WINDOW_RECORDS, blocks * 256) if remote and prefill else 0
+        window = min(WINDOW_RECORDS, blocks * 256) if prefill and (remote or gather_context) else 0
         return cls(projected, projected[:, :1536], buffer(1536), projected[:, 1536:2048], buffer(512),
             query, zeros(absorbed, heads, 512), zeros(absorbed, heads, 512), expanded,
             buffer(4096), zeros(tokens, dtype=torch.int32), index,
@@ -300,6 +300,8 @@ class PreparedGlmMLA:
         self.module, self.scratch, self.state, self.cache, self.metadata = module, scratch, state, state.cache, metadata
         # Decode projects and absorbs queries while records are selected; shared RoCE gathers follow the join.
         self.query_chain = None
+        # Only context-parallel prefill gathers context into a slab.
+        self.context_gather = None
         for key in ("q_a_layernorm", "kv_a_layernorm"):
             module.get_submodule(key).weight = torch.nn.Parameter(weights[f"{key}.weight"], requires_grad=False)
         self.projections = {}
@@ -378,17 +380,9 @@ class PreparedGlmMLA:
                 model_type=sparse_mla.ModelType.GLM_NEXT, cache_record_bytes=528, mode="extend")
             if scratch.slab.shape[0] != metadata.block_table.shape[1] * context.shards.page_tokens:
                 raise ValueError("GLM prefill slab must hold every position of the prepared context")
-            self.windows = ()
-            if context.remote:
-                # Ranks on separate hosts gather their records window by window instead of reading peers'
-                # caches through CUDA IPC; windows past the context's end carry no bytes.
-                from ignition.components.collectives import PreparedVarlenGather
+            from .dcp import PreparedContextGather
 
-                window = scratch.records.shape[1] // 528
-                self.windows = tuple((first, PreparedVarlenGather(scratch.records, scratch.record_counts,
-                    runtime=context.heads, session=session, coordinator=context.coordinator,
-                    name=f"{name}.gather_records{first}"))
-                    for first in range(0, scratch.slab.shape[0] // context.shards.world, window))
+            self.context_gather = PreparedContextGather(state, scratch, context, session=session, name=name)
             self.slices = []
             for start in range(0, rows, step):
                 end = min(start + step, rows)
@@ -437,23 +431,8 @@ class PreparedGlmMLA:
 
     def attend_gathered_context(self, s, m, query, physical, selected_lengths):
         """Attend one prefill request over its context gathered from every rank, one query slice at a time."""
-        from .dcp import pull_context
-
         end = (m.positions.max() + 1).reshape(1)
-        shards = self.context.shards
-        if self.windows:
-            from .dcp import pack_records, scatter_records, window_counts
-
-            cache = self.state.cache.view(torch.int32).view(-1, 132)
-            window = s.records.shape[1] // 528
-            for first, gather in self.windows:
-                pack_records(cache, m.block_table[0], end, s.records, shards, first)
-                s.record_counts.copy_(window_counts(end, shards.world, first, window))
-                gather(output=s.records, counts=s.record_counts)
-                scatter_records(s.records, end, s.slab.view(torch.int32), shards, first)
-        else:
-            # The indexer's candidate gather orders this layer's peer cache writes before these reads.
-            pull_context(self.state.peers, m.block_table[0], end, s.slab.view(torch.int32), shards)
+        self.context_gather(s, m.block_table[0], end)
         # Selected indices are global positions, which index the slab directly.
         s.visible.copy_(m.positions + 1)
         for start, end, absorb, attention, expand in self.slices:
@@ -490,8 +469,8 @@ class PreparedGlmMLA:
             for operator in item[2:]:
                 if hasattr(operator, "functional"):
                     operator.functional(session=session)
-        for _, gather in getattr(self, "windows", ()):
-            gather.functional(session=session)
+        if self.context_gather is not None:
+            self.context_gather.functional(session=session)
         self.scratch = self.metadata = self.end = None
         return self
 
@@ -500,8 +479,11 @@ class PreparedGlmMLA:
         return output
 
     def forward(self, source, metadata):
+        # A prefill forward allocates records only for a gather that packs them: its selected ring windows.
+        gather = self.context_gather
         s = MLAScratch.allocate(source.shape[0], self.heads, self.blocks, self.mode, self.device,
-            context_ranks=self.context_ranks, remote=self.remote)
+            context_ranks=self.context_ranks, remote=self.remote,
+            gather_context=gather is not None and gather.uses_records)
         p = self.projections
         projected = p["qkv_a_proj"](source)
         s.projected_input.copy_(projected)

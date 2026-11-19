@@ -119,6 +119,15 @@ def create_all_gather_runtime(group, device, *, max_rows, columns, ipc=None):
         max_batch_size=max_rows, total_heads=columns // 64, head_dim=64, stream_affine=False, ipc=ipc)
 
 
+# Staging bank of one single-host variable-length gather (PreparedVarlenGather), in bytes.
+VARLEN_BANK_BYTES = 4 << 20
+
+
+def create_varlen_gather_runtime(group, device, *, ipc=None):
+    """Allocate b12x staging for PreparedVarlenGather on one host: a single row of VARLEN_BANK_BYTES."""
+    return create_all_gather_runtime(group, device, max_rows=1, columns=VARLEN_BANK_BYTES // 2, ipc=ipc)
+
+
 def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
     """Allocate one local PCIe channel covering every declared result payload.
 

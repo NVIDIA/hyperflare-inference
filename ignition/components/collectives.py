@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 from b12x.preparation import CollectiveRequirement, PreparedCall
 
+from ignition.preparation.collectives import VARLEN_BANK_BYTES
 from ignition.preparation.tuning import declare, register_finalizer
 
 _OWNERS = weakref.WeakValueDictionary()
@@ -833,7 +834,7 @@ class PreparedAllGather:
         return output
 
 
-@torch.library.custom_op("flare::roce_all_gather_varlen", mutates_args=("output",))
+@torch.library.custom_op("flare::all_gather_varlen", mutates_args=("output",))
 def _all_gather_varlen(source: torch.Tensor, counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
     # Rank-local slicing stays inside the opaque call so every rank shares the compiled input layout.
@@ -846,20 +847,22 @@ def _fake_all_gather_varlen(source, counts, output, handle):
 
 
 class PreparedVarlenGather:
-    """Gather byte prefixes of every rank's row of `output` [world, capacity] to every rank over RoCEnante.
+    """Gather byte prefixes of every rank's row of `output` [world, capacity] to every rank.
 
     Each rank writes its contribution into its own row in place; `counts` is a [world] int64 device
     tensor of each rank's bytes, a multiple of 16, holding the same values on every rank and free to
     change between replays. Row r then holds rank r's first counts[r] bytes on every rank; bytes
     past them keep their values. Operations sharing the runtime must execute serially on every rank.
+
+    `runtime` is a RoCEnante runtime across hosts. On one host it is a PCIe all-gather runtime created by
+    create_varlen_gather_runtime, which admits two or four ranks.
     """
 
     def __init__(self, output, counts, *, runtime, session, coordinator, name):
         import torch.distributed as dist
 
-        if not _roce(runtime):
-            raise ValueError("variable-length gathers run over RoCEnante")
-        ranks = tuple(dist.get_process_group_ranks(runtime._group))
+        roce = _roce(runtime)
+        ranks = tuple(dist.get_process_group_ranks(runtime._group if roce else runtime.exchange_group))
         if (output.shape[0] != len(ranks) or not output.is_contiguous() or counts.shape != (len(ranks),)
                 or counts.dtype != torch.int64 or output[0].numel() * output.element_size() % 16):
             raise ValueError("variable-length gathers require one contiguous 16-byte-multiple row per rank")
@@ -867,11 +870,24 @@ class PreparedVarlenGather:
         # A rank's own row is its source, so the gather leaves it in place.
         self.local_rank = ranks.index(dist.get_rank())
         self.source = output[self.local_rank]
-        self.plan = _roce_plan(runtime, coordinator, "AllReduce.all_gather_varlen")
-        declare(session, (self.plan.request(name=name,
-            prepare_call=lambda state: PreparedCall(
-                run=lambda: runtime._run_prepared_all_gather_varlen(self.source, counts, prepared=state, out=output),
-                output=output, owners=(runtime, self.source, counts, output)),
+        if roce:
+            self.plan = _roce_plan(runtime, coordinator, "AllReduce.all_gather_varlen")
+
+            def prepare_call(state):
+                return PreparedCall(
+                    run=lambda: runtime._run_prepared_all_gather_varlen(self.source, counts, prepared=state, out=output),
+                    output=output, owners=(runtime, self.source, counts, output))
+        else:
+            from b12x.comm import pcie
+
+            query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_varlen",
+                call={"out": output, "counts": counts, "bank_bytes": VARLEN_BANK_BYTES})
+            self.plan = pcie.plan(query, runtime=runtime)
+
+            def prepare_call(state):
+                return PreparedCall(run=lambda: state.run(out=output, counts=counts),
+                    output=output, owners=(runtime, counts, output))
+        declare(session, (self.plan.request(name=name, prepare_call=prepare_call,
             collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self

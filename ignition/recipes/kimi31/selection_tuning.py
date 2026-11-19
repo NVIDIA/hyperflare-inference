@@ -9,9 +9,8 @@ from b12x.preparation import PreparedCall
 
 from ignition.components.candidate_selection import PreparedCandidateSelection, CandidateSelectionForward
 from ignition.preparation.capture import capture_forwards
-from ignition.preparation.composition_tuning import PreparedComposition, plan_identity, race_compositions
+from ignition.preparation.composition_tuning import PreparedComposition, plan_identity, race_compositions, trial_session
 from ignition.preparation.execution import GraphSignature
-from ignition.preparation.tuning import RecordedPreparationSession
 
 from .indexer import SharedBuffers
 
@@ -103,17 +102,10 @@ class CandidateSelectionTuning:
     def tune(self, session):
         if not self.selections:
             return []
-        namespace = session.namespace.to_dict()
-        checkpoint, schema, numerics = (namespace.pop(key) for key in (
-            "checkpoint", "workload_schema", "numerical_policy"))
         coordinator = self.context.coordinator
         device = self.context.shards.index.device
         report, graphs, compiled = [], {}, {}
-        with RecordedPreparationSession(device=device, checkpoint=checkpoint, workload_schema=schema,
-                numerical_policy=numerics, namespace=namespace, coordinator=coordinator,
-                compile_workers=session.requested_compile_workers,
-                autotune_effort=session.autotune_effort, collective_tuning="static",
-                headroom_bytes=session.headroom_bytes, lock_gpu_clocks=session.lock_gpu_clocks) as trials:
+        with trial_session(session, device=device, coordinator=coordinator, collective_tuning="static") as trials:
             fixtures = {rows: _Fixture(rows, self.context, self.reduction, trials)
                         for rows in sorted(self.selections)}
             trials.tune(show_progress=False)

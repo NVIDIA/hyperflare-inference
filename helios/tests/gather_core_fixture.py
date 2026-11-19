@@ -16,9 +16,13 @@ from signing import publisher
 
 
 def _rank(rank, directory):
-    from ignition.components.collectives import PreparedAllGather
+    # Compiled forwards are pickled to compile workers, so their classes must live in an importable module.
+    from tests.components.gather_core_forwards import GatherForward, RecordForward
+    from ignition.components.collectives import PreparedAllGather, PreparedVarlenGather
+    from ignition.recipes.glm53.dcp import ContextShards
     from ignition.preparation.capture import capture_forwards
-    from ignition.preparation.collectives import CollectivePreparation, create_all_gather_runtime
+    from ignition.preparation.collectives import (
+        CollectivePreparation, create_all_gather_runtime, create_varlen_gather_runtime)
     from ignition.preparation.collective_ladder import load
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.model import PreparedModel
@@ -57,18 +61,31 @@ def _rank(rank, directory):
                     output = outputs[name] = torch.empty((rows, source.shape[1] * 4), dtype=dtype, device=device)
                     operations[name] = PreparedAllGather(source, output, runtime=runtimes[channel], session=session,
                         coordinator=coordinator, name=name)
+                runtimes.append(create_varlen_gather_runtime(dist.group.WORLD, device, ipc=storage.peer_storage))
+                window = 16
+                cache = sources["prefill256"] = torch.zeros((16, 64, 528), dtype=torch.uint8, device=device)
+                table_values = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
+                table = table_values.to(device)
+                output = outputs["prefill256"] = torch.empty((256, 528), dtype=torch.uint8, device=device)
+                records = torch.empty((4, window * 528), dtype=torch.uint8, device=device)
+                counts = torch.zeros(4, dtype=torch.int64, device=device)
+                windows = tuple((first, PreparedVarlenGather(records, counts, runtime=runtimes[-1],
+                    session=session, coordinator=coordinator, name=f"records{first}")) for first in range(0, 64, window))
+                record_call = RecordForward(windows, ContextShards.on(rank, 4, device), cache, table, output, window)
                 session.tune(show_progress=False)
                 # BF16 and FP32 views share a producer; an independent channel has its own.
                 assert len(session._startup_collectives.groups) == 4
                 signatures = {name: GraphSignature("prefill" if name.startswith("prefill") else name, 1,
                     int(name.removeprefix("prefill")) if name.startswith("prefill") else 1) for name in shapes}
+                signatures["prefill256"] = GraphSignature("prefill", 1, 256)
                 signatures.update({name: GraphSignature(name, 1, 1) for name in ("restore", "snapshot")})
-                def forward(name):
-                    return lambda: operations[name](sources[name])
-                functions = {name: forward(name if name in operations else "init") for name in signatures}
+                functions = {name: GatherForward(operations[name if name in operations else "init"],
+                    sources[name if name in operations else "init"]) for name in signatures}
+                functions["prefill256"] = record_call
                 stream = torch.cuda.Stream(device=device)
+                # Every forward is a class instance, so capture compiles them all as serving does.
                 graphs, _ = capture_forwards(functions, signatures, session=session, device=device, stream=stream,
-                    pool=storage.graph_pool.id, coordinator=coordinator, compile_decoder=False, retain_graphs=True)
+                    pool=storage.graph_pool.id, coordinator=coordinator, compile_decoder=True, retain_graphs=True)
                 session.freeze()
                 state = storage.device_allocate("continuations", (4, 32), torch.uint8,
                     group="STATE_ROWS", maximum=4, units=4)
@@ -85,9 +102,10 @@ def _rank(rank, directory):
                 records[..., 16:] = -1
                 buffers.update({f"source-{name}": value.view(torch.uint8) for name, value in sources.items()})
                 buffers.update({f"output-{name}": value.view(torch.uint8) for name, value in outputs.items()})
+                configuration = dict(_configuration(folder, signatures), prefill_chunk_size=256, max_sequence_tokens=256)
                 prepared = PreparedModel(device=rank, graphs=graphs, buffers=buffers, signatures=signatures,
-                    max_active=1, session=session, memory_report={}, server_config=_configuration(folder, signatures),
-                    close_resources=runtimes, resources=(operations, sources, outputs, storage, stream))
+                    max_active=1, session=session, memory_report={}, server_config=configuration,
+                    close_resources=runtimes, resources=(operations, sources, outputs, storage, stream, record_call))
                 assert prepared.tuned_bindings["init"][0].tuning_graph == prepared.tuned_bindings["decode"][0].tuning_graph
                 assert prepared.tuned_bindings["resume"][0].tuning_graph != prepared.tuned_bindings["init"][0].tuning_graph
                 profiles = []
@@ -109,6 +127,18 @@ def _rank(rank, directory):
                         (folder / expected_path).write_bytes(expected.numpy().tobytes())
                         cases.append(dict(graph=name, source=f"source-{name}", output=f"output-{name}",
                             input=f"rank-{rank}/{input_path}", expected=f"rank-{rank}/{expected_path}", step=step))
+                    values = ((torch.arange(4 * 16 * 64 * 528).reshape(4, 16, 64, 528)
+                        + torch.arange(4).view(4, 1, 1, 1) * 37 + step * 53) % 256).to(torch.uint8)
+                    expected = torch.zeros((256, 528), dtype=torch.uint8)
+                    for token in range(128):
+                        peer = (token // 4) % 4
+                        local = (token // 16) * 4 + token % 4
+                        expected[token] = values[peer].view(1024, 528)[table_values[local // 256] * 256 + local % 256]
+                    input_path, expected_path = f"input-records-{step}.bin", f"expected-records-{step}.bin"
+                    (folder / input_path).write_bytes(values[rank].numpy().tobytes())
+                    (folder / expected_path).write_bytes(expected.numpy().tobytes())
+                    cases.append(dict(graph="prefill256", source="source-prefill256", output="output-prefill256",
+                        input=f"rank-{rank}/{input_path}", expected=f"rank-{rank}/{expected_path}", step=step))
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 storage.peer_storage.reset()

@@ -165,3 +165,30 @@ def test_collective_choice_keys_distinguish_alternatives_and_finalist_policy():
     assert len({static, runtime_without_finalists, runtime}) == 3
     assert static == key("oneshot", None)
     assert runtime == key("joint_latency", joint_finalist_policy())
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_single_host_varlen_gather_plans_the_pcie_counted_byte_surface(monkeypatch, world):
+    from b12x.comm import pcie
+    from ignition.components import collectives
+    from ignition.preparation.collectives import VARLEN_BANK_BYTES
+
+    queries, requests = [], []
+    plan = SimpleNamespace(request=lambda **kwargs: requests.append(kwargs) or object())
+    runtime = SimpleNamespace(exchange_group=object(), world_size=world)
+    monkeypatch.setattr(pcie, "query_from_runtime",
+                        lambda runtime, *, surface, call: queries.append((surface, call)) or "query")
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: plan if query == "query" else None)
+    monkeypatch.setattr(collectives, "_roce", lambda _: False)
+    monkeypatch.setattr(collectives, "declare", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: list(range(world)))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    output = torch.zeros((world, 528 * 16), dtype=torch.uint8)
+    counts = torch.zeros(world, dtype=torch.int64)
+    operation = collectives.PreparedVarlenGather(output, counts, runtime=runtime, session=None,
+                                                 coordinator=None, name="records")
+    assert operation.plan is plan
+    assert [(surface, call["bank_bytes"]) for surface, call in queries] == [
+        ("DcpAllToAll.all_gather_varlen", VARLEN_BANK_BYTES)]
+    assert queries[0][1]["out"] is output and queries[0][1]["counts"] is counts
+    assert [request["name"] for request in requests] == ["records"]

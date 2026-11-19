@@ -555,3 +555,35 @@
     leaves the controls the template writes unchanged, and that text spelling an
     added token that is neither special nor named by the chat template (a
     lexical token) keeps that token. Close when each tokenizer passes it.
+
+[ ] Make the GLM-5.3 ring gather cost follow the context length. It runs every
+    window of the prepared slab at any context length, so with the ring selected a
+    prefill chunk whose whole context is below a few hundred positions is slower
+    than peer pull by up to about 1 ms at a 1,048,576-position slab. Close when
+    the ring's per-chunk cost at 5 and 64 positions is within 0.2 ms of peer pull,
+    or the race scores short contexts separately and binds a length-dependent
+    choice.
+
+[ ] Qualify the GLM-5.3 prefill context transport race at TP2, on GPUs behind
+    PCIe switches or in host-bridge arrangements other than the qualified host's,
+    on SM121, and by loading a core exported before the race existed.
+    docs/model-preparation.md lists the qualified cell. Close when each of these
+    configurations passes on hardware and the document lists it.
+
+[ ] Qualify GLM-5.3 windowed context packing and gathering over RoCE.
+    The PCIe byte gather admits only DCP2 and DCP4. Close when a two-host
+    GLM-5.3 export and prefill replay pass, with the result stated in
+    docs/multi-host.md.
+
+[ ] Fix test_glm_mla_checkpoint_native_replay, which fails in all 18 cases with
+    the NVIDIA GLM-5.3 Flash snapshot, at TP1, TP2 and TP4, on the base commit and
+    with the prefill context transport race. The failure is a defect in the test:
+    PreparedGlmMLA.forward never writes scratch.attended, so the test compares an
+    all-zero tensor with the recomputed attention output. Serving numerics are
+    unaffected, because the graph's attention output equals the recompute bit for
+    bit and the later stages (expanded, output) match. The test fix, which skips
+    the attended comparison, is proposed separately. With the calibrated snapshot
+    the test fails earlier, in PreparedGlmMLA.__init__, where q_b_proj is a plain
+    tensor. The TP4 overlap decode case also fails runs_concurrently, and its cause
+    is not found. Close when the test passes in every case or each remaining
+    failure has a stated cause.

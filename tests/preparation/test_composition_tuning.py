@@ -119,3 +119,19 @@ def test_collective_signature_agrees_semantics_but_preserves_rank_local_cache_in
     assert choices.default["implementation"] == "replicated"
     changed = FrozenMapping({**payload, "geometry": {"rows": 1}})
     assert _CONTRACT.collective_signature(first) != _CONTRACT.collective_signature(changed)
+
+
+def test_trial_session_inherits_the_model_sessions_identity_and_limits(monkeypatch):
+    from ignition.preparation import composition_tuning, tuning
+
+    created = []
+    monkeypatch.setattr(tuning, "RecordedPreparationSession", lambda **kwargs: created.append(kwargs) or "trial")
+    namespace = dict(checkpoint="model", workload_schema="schema", numerical_policy="exact", mode="decode")
+    session = SimpleNamespace(namespace=SimpleNamespace(to_dict=lambda: dict(namespace)),
+        requested_compile_workers=3, autotune_effort="audit", headroom_bytes=7, lock_gpu_clocks=True)
+    coordinator = object()
+    assert composition_tuning.trial_session(session, device="cuda:1", coordinator=coordinator,
+                                            collective_tuning="static") == "trial"
+    assert created == [dict(device="cuda:1", checkpoint="model", workload_schema="schema",
+        numerical_policy="exact", namespace={"mode": "decode"}, coordinator=coordinator, compile_workers=3,
+        autotune_effort="audit", headroom_bytes=7, lock_gpu_clocks=True, collective_tuning="static")]

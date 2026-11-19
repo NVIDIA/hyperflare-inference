@@ -547,6 +547,61 @@ captured capacities from 64 through 32,768 patches. Each feature slot holds an
 advance. `--image-concurrency` defaults to the smaller of four and text
 concurrency. `--language-model-only` omits image weights and graphs.
 
+### Prefill context transport
+
+Context-parallel prefill builds each layer's global latent slab from every rank's
+cache with one of two transports. Peer pull reads the peers' caches directly. The
+ring packs each rank's latent records, gathers them in windows of 65,536 records
+per rank through b12x's neighbor-only ring byte gather (a kernel run by eight CTAs
+through the channel's peer-accessible staging banks, not a copy engine), and
+scatters them into the slab. Peer pull is the default.
+
+With one host, four ranks on SM120 GPUs, compiled forwards,
+`--collective-tuning static`, and `--autotune-effort default` or `audit`, the
+"Tune prefill context transport" phase races the two transports. It runs after
+child kernel tuning and before model-forward compilation and capture, and binds the
+winner to every prefill gather. Both transports must reproduce exact latent bytes
+and slab padding, and the winner must also reproduce them at a length the race never
+times. The race scores each transport by its mean latency over gathers at 5
+positions, 8,191 positions, and the full slab, so the longest context dominates the
+choice. Every rank must select the same transport, or preparation fails. The
+selected implementation and the race's record are reported under
+`context_compositions` in preparation measurements.
+
+Control. `--autotune-effort off`, `--collective-tuning runtime`, eager forwards
+(`--no-compile`), and `--no-context-parallel` prepare without the race and keep peer
+pull. Other GPU architectures, other rank counts, and TP1 never run it, and
+cross-host preparation keeps its RoCE gather. If the race fails, preparation stops
+with its error; use one of the options above to prepare without it.
+
+Costs. The race compiles and captures one trial forward per transport on every
+preparation, as the Kimi candidate-selection race does; a cached selection skips
+only the timing. The ring's staging and kernel plans exist whenever the race runs,
+even if pull wins. When the ring is selected, each prefill forward allocates a
+record window in its graph pool: 65,536 records of 528 bytes for each of the
+context-parallel ranks, 132 MiB at four ranks. The ring runs
+every window of the prepared slab whatever the context length, so its latency has a
+floor proportional to the window count, one per 65,536 records per rank; for short
+contexts peer pull is faster, and peer pull's latency grows with the context. The
+private trial holds a full slab, the peer cache and a record window per GPU, in
+addition to the model's memory, and is released before KV sizing.
+
+Qualification. Qualified: TP4 on one host with four RTX PRO 6000 Blackwell GPUs
+(SM120, PCIe Gen4 x16) in which `nvidia-smi topo -m` reports every GPU pair as NODE
+(PCIe through host bridges, one NUMA node). There the race selects the ring, and a
+TP4 core of `nvidia/GLM-5.3-Flash-FP4-Local` prepared with FlashInfer 598c8547
+serves prompts of 258,000 tokens with the ring. Not qualified: TP2, GPUs
+behind PCIe switches or in host-bridge arrangements other than this host's, SM121,
+and loading cores prepared before the race existed.
+
+Selection cache keys cover geometry and executable identities, as for every
+collective race; they do not cover PCIe wiring. Both transports reproduce the same
+bytes, so a winner cached under different wiring costs speed only, not
+correctness. To race again after changing a host's wiring, delete the `preparation`
+directory under `<kernel_cache>/b12x` (by default `~/.cache/flare/kernels/b12x/preparation`).
+That discards every cached tuning selection kept there, and the next export tunes
+again.
+
 ## DeepSeek V4.1 Flash
 
 The `deepseek-v4.1-flash` alias selects `deepseek-ai/DeepSeek-V4.1-Flash-1017`

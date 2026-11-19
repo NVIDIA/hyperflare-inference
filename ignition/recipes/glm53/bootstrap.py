@@ -8,7 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -39,6 +39,7 @@ from ignition.preparation.collectives import (
     create_dma_all_reduce_runtime,
     create_head_exchange,
     create_roce_runtime,
+    create_varlen_gather_runtime,
 )
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
@@ -69,6 +70,17 @@ _COMPILED_KINDS = ("prefill", "scored_prefill", "decode", "resume", "speculative
 _DMA_PREFILL_TOKENS = 1024
 # Allocator granularity and fragmentation slack beyond the headroom kept after the final KV allocation.
 _KV_ALLOCATION_MARGIN = 64 << 20
+
+
+def races_context_transport(config, world_size, device):
+    """Whether single-host preparation races peer pull against the ring for prefill context.
+
+    The race captures compiled forwards, needs a tuning effort above off, and needs static
+    collectives because runtime tuning owns the transports' launch parameters. It is qualified
+    on four ranks of SM120 GPUs; every other cell keeps peer pull.
+    """
+    return (config.compile_decoder and config.autotune_effort != "off" and config.collective_tuning == "static"
+            and world_size == 4 and torch.cuda.get_device_capability(device) == (12, 0))
 
 
 @dataclass(frozen=True)
@@ -401,6 +413,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
         context = None
+        tune_context = False
         if config.context_parallel and group is not None:
             from .dcp import SLICE_ROWS, ContextParallel, ContextShards
 
@@ -408,8 +421,9 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             if coordinator.spans_hosts:
                 # The ranks' one RoCEnante runtime carries every context-parallel exchange.
                 context = ContextParallel(owned, heads=collective, candidates=collective, coordinator=coordinator,
-                                          remote=True)
+                                          records=collective, remote=True)
             else:
+                tune_context = races_context_transport(config, shard.world_size, device)
                 # Only decode exchanges heads; prefill gathers context blocks instead.
                 exchange_rows = min(SLICE_ROWS, max(config.request_capacity,
                     max((b * w for b, w in config.speculative_shapes), default=1) if config.mtp else 1))
@@ -418,11 +432,17 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                                                ipc=ipc),
                     candidates=create_all_gather_runtime(group, device,
                         max_rows=min(config.token_capacity, SLICE_ROWS), columns=2048 * shard.world_size, ipc=ipc),
-                    coordinator=coordinator)
+                    coordinator=coordinator,
+                    records=create_varlen_gather_runtime(group, device, ipc=ipc) if tune_context else None)
+                if tune_context:
+                    from .selection_tuning import ContextGatherTuning
+
+                    context = replace(context, selection_tuning=ContextGatherTuning(
+                        context, cache_root=config.kernel_cache))
         shards = None if context is None else context.shards
         remote = context is not None and context.remote
         prefill_storage = DecoderScratch.allocate(config.prefill_chunk_size, blocks, "prefill", device,
-            shard=shard, sample_rows=1, context_ranks=context_ranks, remote=remote)
+            shard=shard, sample_rows=1, context_ranks=context_ranks, remote=remote, gather_context=tune_context)
         decode_rows = max(config.request_capacity,
                           max((b * w for b, w in config.speculative_shapes), default=1) if config.mtp else 1)
         decoder_storage = DecoderScratch.allocate(decode_rows, blocks, "decode", device,
@@ -544,6 +564,13 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     memory(f"after graph catalog (operator scratch {arena.nbytes >> 20} MiB)")
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
+    if context is not None and context.selection_tuning is not None:
+        with phase(progress, "Tune prefill context transport"), (
+                contextlib.nullcontext() if core_storage is None else core_storage.transient()):
+            tuning["context_compositions"] = context.selection_tuning.tune(session)
+        # Trial tensors are freed; return their blocks before in-process KV sizing measures free memory.
+        torch.cuda.empty_cache()
+        report(f"prefill context transport: {tuning['context_compositions']}")
     report(f"selected kernels: {tuning['selection_counts']}")
     report(f"after tuning: free={torch.cuda.mem_get_info(device)[0] >> 20} MiB, "
            f"allocated={torch.cuda.memory_allocated(device) >> 20} MiB, reserved={torch.cuda.memory_reserved(device) >> 20} MiB, "
@@ -697,7 +724,9 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         forwards={name: compiled.get(name, forward) for name, forward in forwards.items()},
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()), *completion.zero_ranges()),
         close_resources=(*((scoring,) if scoring is not None else ()),
-                         *(() if context is None else (context.heads, context.candidates)), *shared_pages,
+                         *(() if context is None else (context.heads, context.candidates)),
+                         *(() if context is None or context.records is None else (context.records,)),
+                         *shared_pages,
                          *(() if virtual_pages is None else (virtual_pages,)),
                          *(runtime for runtime in (prefill_collective, vocabulary_collective, collective)
                            if runtime is not None)),
