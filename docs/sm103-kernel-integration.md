@@ -324,8 +324,9 @@ Exported full-model serving is qualified on one GB300 across both the
 complete-chunk core
 `63bf1d05b2011d9a4ffeda37a4f3fb9f98144733b6eb0ddd08439a477ecde79a` (`207`
 compiled forwards, `237` graphs, `--speculative-graph-budget 64`) and the CED +
-Encoder-staged core
-`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` (`TP1`,
+Encoder-staged cores
+`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` and
+`d11fbfb8f184555bc26b10ce172773b2b1e92a85406d5e0722c671f8dee23b80` (`TP1`,
 262,144-token context, concurrency 16, 8,192-token prefill chunks, adaptive
 draft depths through seven, 128-token packed verification capacity,
 `--speculative-graph-budget 80`, image concurrency one, `--parallax-routing`,
@@ -335,18 +336,26 @@ CED + staged core compiles 283 forwards and exports 313 graphs (`35,409` total
 CUDA graph kernel nodes, fewer than the 237-graph core's `37,300` nodes after
 vectorizing `ReferenceCacheTransaction` ring snapshots/commits across the
 contiguous ring slice) using a `9.13 GiB` shared CUDA graph pool; fresh-process
-`flare run` verifies all shards, loads without Python, and allocates
+`flare run` verifies all 50 shards, loads without Python, allocates
 `18,029,568` logical KV tokens and `1,568` snapshot slots (`15.01 GiB` cache
-budget). Because `dspark_target_layer_ids` (`[37, 38, 39]`) lies entirely in the
-consumer half (`layers 20..39`), `"reference"` enables CED consumer compaction
-(`yoco_prefill_truncation="compact"`, `keep_tokens = 144` >= `window_tokens = 135`,
-`terminal_prefill_min_tokens = 144`), skips consumer `layers 20..39` and LM-head
-projection on intermediate `prefill` chunks (`terminal=False`), raises the
-sparse-indexer scoring workspace limit to `256 MiB` (`512` query rows), and
-stages cold Context Encoder experts (`layers 0..19`) two layers ahead on two
-auxiliary streams. Vision encoder varlen attention zero-initializes its output
-buffer before `_flash_attn_fwd` so non-128-aligned live patch counts cannot
-propagate `NaN` values left in the shared graph pool.
+budget; `18,010,752` KV tokens with Parallax enabled), and passes
+`tests/server/test_deepseek41_sm103.py`, 2,080-token continuations, single- and
+multi-image (up to three images) generation, mid-stream cancellation, ordinary
+decode (`--mtp-draft-tokens 0`), adaptive speculative execution at runtime
+limits 3, 5, and 7, and exact 36-request seeded parity across Parallax
+disabled, observed, static, `decayed_miss_lru`, and EWMA `predictor_rank` modes
+including 12,800-token prefix restoration across physical residency generations
+104 to 159. Because `dspark_target_layer_ids` (`[37, 38, 39]`) lies entirely in
+the consumer half (`layers 20..39`), `"reference"` enables CED consumer
+compaction (`yoco_prefill_truncation="compact"`, `keep_tokens = 144` >=
+`window_tokens = 135`, `terminal_prefill_min_tokens = 144`), skips consumer
+`layers 20..39` and LM-head projection on intermediate `prefill` chunks
+(`terminal=False`), raises the sparse-indexer scoring workspace limit to
+`256 MiB` (`512` query rows), and stages cold Context Encoder experts
+(`layers 0..19`) two layers ahead on two auxiliary streams. Vision encoder
+varlen attention zero-initializes its output buffer before `_flash_attn_fwd` in
+core `d11fbfb8...` so non-128-aligned live patch counts cannot propagate `NaN`
+values left in the shared graph pool.
 
 Under the equal 11,680-expert HBM budget on core `13e47a84...`, sixteen
 completed 2,048-token responses per cell with distinct request seeds deliver

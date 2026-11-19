@@ -971,7 +971,7 @@ observation's validity window. These checks bound movement without estimating a
 cold-execution benefit. CPU tests cover decision and publication accounting; GB300 TP1 native checks
 cover static and active serving across DeepSeek V4.1 cores with both complete
 prefill (`63bf1d05...`) and CED terminal prefill plus Encoder staging
-(`13e47a84...`) at runtime draft depths 0, 3, 5, and 7. Exact tensor-level
+(`13e47a84...` and `d11fbfb8...`) at runtime draft depths 0, 3, 5, and 7. Exact tensor-level
 state equivalence under concurrent non-greedy sampling remains unqualified. See
 the measured scope below and
 [active policy configuration](parallax-demo.md#experimental-gb300-residency).
@@ -1070,9 +1070,14 @@ Adding CED consumer prefill compaction (`keep_tokens = 144`,
 `terminal_prefill_min_tokens = 144`), intermediate-chunk decoder skipping
 (`layers 0..19`), Encoder `prefill_staging` (`min_rows = 1024`,
 `min_cold_experts = 8`), vectorized cache transactions, and
-`--speculative-graph-budget 80` in core
-`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` (`313`
-graphs, `18,029,568` KV tokens) lifts sixteen-request 2,048-token seeded decode
+`--speculative-graph-budget 80` in cores
+`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` and
+`d11fbfb8f184555bc26b10ce172773b2b1e92a85406d5e0722c671f8dee23b80` (`313`
+graphs, `18,029,568` KV tokens; `18,010,752` with Parallax enabled) preserves
+exact 36-request seeded parity across disabled, observed, static, EWMA
+`predictor_rank`, and `decayed_miss_lru` modes (including 12,800-token prefix
+restoration across generations 104 to 159 and 1–3 image vision checks on
+`d11fbfb8...`), and lifts sixteen-request 2,048-token seeded decode
 with `decayed_miss_lru` from `166.3`, `528.7`, and `730.9 tokens/s` (static) to
 `243.1`, `414.2`, `667.0`, `993.1`, and `1,478.9 tokens/s` at concurrencies 1,
 2, 4, 8, and 16 under adaptive `MTP-3` (`8.91`, `10.21`, `11.79`, `14.45`, and

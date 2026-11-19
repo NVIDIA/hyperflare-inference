@@ -481,7 +481,8 @@ including cold, cached, and branched 12,800–12,842-token prompts, sixteen
 concurrent short generations, and sixteen concurrent 240-integer `C16`
 generations, with zero movement faults or rollbacks across both complete-chunk
 prefill (`63bf1d05...`) and CED terminal-prefill plus Encoder-staged cores
-(`13e47a84...`). Runtime speculative execution with active `decayed_miss_lru`
+(`13e47a84...` and `d11fbfb8...`, including 12,800-token restored branches
+across residency generations 104 to 159). Runtime speculative execution with active `decayed_miss_lru`
 is exercised across `--mtp-draft-tokens` `0`, `3`, `5`, and `7` and
 `--mtp-adaptive-verification-alpha` `0.5`, `0.75`, and `1.0`: default
 `alpha = 1.0` with `--mtp-draft-tokens 5` maximizes concurrent throughput

@@ -724,18 +724,21 @@ concurrency-sixteen, 8,192-token prefill, seven-draft configuration
 plus 40 spare exchange rows and 3,680 Grace experts) compiles 283 forwards and
 exports 313 graphs (`44` `terminal_prefill` graphs, `9.13 GiB` shared CUDA graph
 pool, `234.1 GiB` loaded device memory, `131.7 GiB` mapped host memory) in core
-`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` (and 207
+`d11fbfb8f184555bc26b10ce172773b2b1e92a85406d5e0722c671f8dee23b80` (and 207
 forwards / 237 graphs without CED or staging at `--speculative-graph-budget 64`
 in core `63bf1d05b2011d9a4ffeda37a4f3fb9f98144733b6eb0ddd08439a477ecde79a`).
 Fresh-process `flare run` allocates 18,029,568 logical KV tokens and 1,568
-shared snapshot slots (`15.01 GiB` cache budget) and passes
-`tests/server/test_deepseek41_sm103.py`, 2,080-token continuations, 36-request
-long-C16 acceptance, ordinary decode (`--mtp-draft-tokens 0`), and adaptive
-speculative execution at runtime draft limits 3, 5, and 7. Vision encoder
-varlen attention zero-initializes padded query rows before `_flash_attn_fwd` so
-non-128-aligned image patch counts cannot read uninitialized graph-pool values.
-Prompt log-probabilities and multi-GPU TP2+ composition are not supported on
-the `"reference"` path.
+shared snapshot slots (`15.01 GiB` cache budget; `18,010,752` KV tokens with
+Parallax enabled) and passes `tests/server/test_deepseek41_sm103.py`,
+2,080-token continuations, single- and multi-image (up to three images)
+generation, mid-stream cancellation, clean `SIGTERM` drain, 36-request
+long-C16 exact parity across Parallax disabled, observed, static,
+`decayed_miss_lru`, and EWMA `predictor_rank` modes, ordinary decode
+(`--mtp-draft-tokens 0`), and adaptive speculative execution at runtime draft
+limits 3, 5, and 7. Vision encoder varlen attention zero-initializes padded
+query rows before `_flash_attn_fwd` so non-128-aligned image patch counts
+cannot read uninitialized graph-pool values. Prompt log-probabilities and
+multi-GPU TP2+ composition are not supported on the `"reference"` path.
 
 `--parallax-routing` adds optional target-routing variants for ordinary and packed
 MTP execution. Runtime selection remains off by default. DeepSeek's capture wiring
