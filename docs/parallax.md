@@ -1,34 +1,78 @@
-# Parallax: predictive expert residency
+# Parallax: predictive and adaptive expert residency
 
-Parallax evaluates whether forecasting Mixture-of-Experts (MoE) demand can make
-expert weight placement cheaper than static residency or reactive caching. A
-useful forecast must identify demand early enough to complete a transfer, and the
-execution savings must exceed prediction, movement and synchronization costs.
+Parallax manages Mixture-of-Experts (MoE) weight placement across GPU HBM and
+coherent host memory inside Flare, and evaluates whether demand forecasting can
+outperform static placement and reactive caching. Sparse MoE models whose total
+expert parameters exceed single-GPU HBM activate only a small fraction of
+experts per token. Coherent CPU-GPU fabrics such as Grace-Blackwell NVLink-C2C
+allow prepared CUDA graphs to execute cold experts directly from pinned host
+DRAM, turning an HBM capacity limit into a placement problem: keep heavily
+reused experts in HBM and promote cold experts early enough that execution
+savings exceed transfer, synchronization, and eviction costs.
 
-The implementation provides deterministic offline replay, statistical predictors,
-independent residency simulations and a native routing feed for shadow evaluation.
-Shadow evaluation runs predictors against serving observations while leaving
-physical expert placement unchanged. GLM-5.3-Flash preparation includes optional
-routing instrumentation for single-GPU decode, prefill and MTP verification. Instrumented
-LIL GLM serving has been exercised on GB300 with routing capture and exact offline
-replay. Full-model numerical/state qualification and sustained high-concurrency
-overhead qualification remain outstanding. The [native serving guide](parallax-demo.md)
-describes in-process providers, the serving dashboard and CPU-only replay. The
+## Design thesis and research direction
+
+Parallax is structured around three architectural invariants so residency
+experimentation never weakens Flare's serving guarantees:
+
+1. **Prepared CUDA graphs remain the execution boundary.** Serving uses no
+   Python callbacks, runtime compilation, graph recapture, or steady-state GPU
+   allocation. Physical backends update expert residency at quiescent
+   inter-graph boundaries either by remapping CUDA virtual-memory pages
+   (`helios/src/parallax/residency/gb300.rs`) or by updating canonical-to-physical
+   `int32` expert row maps (`helios/src/parallax/residency/rows.rs`) while all
+   captured device pointers and kernel launch parameters stay fixed. When
+   `--parallax-routing` is omitted, counter-free graphs load with zero routing
+   readback.
+2. **Physical storage contracts stay model-agnostic.** Recipes declare either
+   virtual-memory expert regions (version-1 residency configuration) or
+   authenticated `Execution.expert_rows` plane layouts and mapping buffers
+   (version-2 residency configuration). Native Helios manages staging into spare
+   HBM slots on a low-priority stream while active graphs hold reader leases,
+   and publishes updates atomically with rollback on recoverable upload failure.
+3. **Forecasting, policy, physical movement, and evaluation stay decoupled.**
+   Compiled statistical providers (`recent`, `ewma`, `frequency`,
+   `uniform_canary`) and reactive controls (`static_core_lru`,
+   `decayed_miss_lru`) run on bounded background Rust threads against the same
+   causal observation stream (`parallax_routes_v1`), scored by an observatory
+   that tracks independent virtual residency ledgers, usable lead time, and
+   deterministic offline replay (`flare parallax --replay`).
+
+### Established scope and research aspirations
+
+This subsystem provides deterministic offline replay, statistical predictors,
+reactive baselines (`static_core_lru` and `decayed_miss_lru`), independent
+shadow simulations, a live routing observatory, and two physical GB300
+residency backends (virtual-address remapping and reader-gated expert-row
+exchange). GLM-5.3-Flash preparation includes optional routing instrumentation
+for single-GPU decode, prefill, and MTP verification; a bounded fixed-MTP3
+forced-offload comparison on GB300 observed 18.8% higher request throughput
+with EWMA-driven virtual-memory movement. The [native serving guide](parallax-demo.md)
+describes in-process providers, the serving dashboard, and CPU-only replay; the
 [research guide](parallax-research.md) records measured findings, the native
-predictor contract, a canary implementation and workload examples.
+predictor contract, a canary implementation, and workload examples.
 
-An experimental storage backend implements GB300 Grace/HBM allocation, staging
-and quiescent virtual-address remapping in Helios. Explicit residency configuration
-connects it to package loading and native graph execution. An optional economic
-or rank-based policy submits real exchanges from one selected predictor; other contenders keep
-independent shadow state. GB300-to-RTX transfers and remote expert execution are
-outside the implemented path. Startup calibration measures idle pinned-host
-copies in both directions. An observational graph-time model estimates cold-weight
-costs during serving; it does not isolate all contention costs. A bounded fixed-MTP3
-forced-offload comparison observed 18.8% higher request throughput with EWMA-driven
-movement. General serving gains and full correctness qualification remain
-unestablished; the [findings and limitations](parallax-research.md#what-the-gb300-experiments-establish)
-define that result's scope.
+The modular separation between providers, policies, storage backends, and the
+observatory targets three forward research directions:
+
+- **Proactive multi-step forecasting beyond reactive LRU.** Surpass
+  `decayed_miss_lru` across workload shifts, prefill-to-decode transitions, and
+  low-locality batches by exploiting richer causal inputs—cross-layer routing
+  correlations from early layers, speculative draft-token lookahead, and
+  compact learned predictors—evaluated against `decayed_miss_lru` and offline
+  oracle bounds under identical transfer deadlines and CPU/GPU budgets.
+- **Calibrated economic movement control.** Replace heuristic cold-route
+  penalties and fixed interval throttles with calibrated cold-execution,
+  copy-contention, and reader-drain pricing so active controllers skip marginal
+  transfers under high-concurrency prefill or copy contention.
+- **Multi-GPU and multi-tier residency.** Extend the authenticated
+  `Execution.expert_rows` storage contract from single-rank Grace-HBM exchange
+  to cross-rank TP coordination and broader hardware topologies without altering
+  the graph execution boundary.
+
+GB300-to-RTX transfers and remote expert execution are outside the implemented
+path. General serving gains across other models and full numerical/state
+qualification under active movement require model-specific serving checks.
 
 ## Component boundaries
 
