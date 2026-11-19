@@ -597,3 +597,31 @@ fn expanded_live_workers_keep_a_ledger_after_trace_retention_fills() {
     assert_eq!(super::replay(&output.join("capture.json")).unwrap(),saved);
     std::fs::remove_dir_all(output).unwrap();
 }
+
+#[test]
+fn observer_reuses_existing_output_directory_and_rejects_regular_file() {
+    let mut first = profile("restart-reuse");
+    let root = first.settings.output.clone();
+    let nested = root.join("nested");
+    first.settings.output = nested.clone();
+    let second = first.clone();
+
+    let observer = Observer::start(first, Registry::builtins()).unwrap();
+    observer.publish(record(1));
+    observer.close();
+    assert!(nested.join("capture.json").is_file());
+
+    let restarted = Observer::start(second, Registry::builtins()).unwrap();
+    restarted.publish(record(2));
+    restarted.close();
+    assert_eq!(restarted.snapshot()["routing_frames"], 1);
+    assert!(nested.join("capture.json").is_file());
+
+    let file_path = root.join("not-a-directory");
+    std::fs::write(&file_path, b"occupied").unwrap();
+    let mut bad = profile("restart-file-error");
+    bad.settings.output = file_path;
+    assert!(Observer::start(bad, Registry::builtins()).is_err());
+
+    std::fs::remove_dir_all(root).unwrap();
+}

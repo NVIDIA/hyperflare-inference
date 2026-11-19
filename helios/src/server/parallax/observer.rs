@@ -174,7 +174,7 @@ impl Observer {
             Ok::<_, String>(super::ledger::Ledger::new(b.snapshot().map_err(|e|e.to_string())?,
                 b.expert_storage().map_err(|e|e.to_string())?))
         }).transpose()?;
-        fs::create_dir(&profile.settings.output).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&profile.settings.output).map_err(|e| e.to_string())?;
         let (input, rx) = mpsc::sync_channel::<Arc<Record>>(512);
         let stop = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));

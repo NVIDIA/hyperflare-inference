@@ -390,8 +390,10 @@ flare run /path/to/package --gpus 0 --mtp-draft-tokens 3 \
 
 Select **Parallax** in the serving dashboard. This command owns prediction,
 evaluation, physical residency and HTTP serving in one process. No demonstration
-launcher is required. The profile's output directory must not already exist;
-select a fresh capture path for each run. GPU selection and memory limits follow
+launcher is required. Missing parent directories for the profile's output path
+are created automatically and an existing output directory is reused across
+restarts (updating capture JSON files atomically); select a distinct path when
+retaining separate run traces. GPU selection and memory limits follow
 the normal `flare run` options.
 
 MTP observations count target verification work, including candidates later
