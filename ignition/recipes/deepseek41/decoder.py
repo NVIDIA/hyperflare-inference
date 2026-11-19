@@ -8,21 +8,299 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import (PreparedAllReduce, PreparedChunkedGatherShards,
+    PreparedGatherShards, PreparedReduceScatter)
+from ignition.preparation.persistent import persistent_zeros
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.expert_overlap import ConcurrentSharedExpert
 from ignition.components.ring_commit import PreparedRingCommit
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mhc import MHCWeights, MHCScratch, PreparedMHC, PreparedMHCPost
 from ignition.components.mlp import MLPScratch, PreparedMLP
-from ignition.components.moe import RouterScratch, PreparedRouter, PreparedRoutedExperts
+from ignition.components.moe import RouteRecord, RouterScratch, PreparedRouter, PreparedRoutedExperts
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
 from .decoder_prefill import PreparedDecoderSuffix
-from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+from .engram import EngramScratch, PreparedEngram, PreparedTableRequests, owner_input_fits
+
+
+# Row-shard eligibility uses 512-row blocks. This constant does not bound mHC calls;
+# callers select bounded calls only by passing max_rows_per_call to PreparedMHC.
+MHC_CALL_ROWS = 512
+
+
+@dataclass(frozen=True)
+class RowShard:
+    """One rank's contiguous rows of a row-sharded prefill decoder.
+
+    Every rank declares the same shard sizes, so a traced forward keeps one layout and the ranks
+    differ only in the values the collectives exchange. These tensors are declaration surfaces:
+    they size the prepared reductions, gathers and mHC calls, and `functional()` leaves the
+    graph's own copies to the traced forward, where compilation plans them.
+    """
+
+    world: int
+    rank: int
+    rows: int
+    start: int
+    rows_index: torch.Tensor
+    attention_output: torch.Tensor
+    mlp_output: torch.Tensor
+    residual: torch.Tensor
+    pre_mix: torch.Tensor
+    attn_mix: torch.Tensor
+    attention_hc: MHCScratch
+    ffn_hc: MHCScratch
+    # Row-sharded attention: the shard's own attention scratch, the full-row KV latent the window
+    # writer stores, the shard's router logits before its own top-k runs, and the route records
+    # that top-k writes and one gather spreads over every row.
+    attention: AttentionScratch | None = None
+    window_values: torch.Tensor | None = None
+    router_logits: torch.Tensor | None = None
+    routes: RouteRecord | None = None
+    gathered_routes: RouteRecord | None = None
+    # Every graph's `rows_index` is a view of this table, one segment per shard row count (see
+    # `_row_table_layout`). One compiled forward binds every rank, and binding compares storage
+    # offsets, so a segment sits at the same offset on every rank and only its contents, this rank's
+    # row numbers, differ.
+    rows_table: torch.Tensor | None = None
+
+    @classmethod
+    def allocate(cls, tokens, world, rank, device, *, candidate_tokens=None, attention=False,
+                 experts=384, top_k=6):
+        """This rank's shard declarations for a decoder of `tokens` rows, or None when rows do not divide."""
+        if world < 2 or tokens % world or tokens // world % MHC_CALL_ROWS:
+            return None
+        rows, start = tokens // world, rank * (tokens // world)
+        def zeros(*shape, dtype=torch.bfloat16):
+            return torch.zeros(shape, dtype=dtype, device=device)
+        def scratch():
+            return MHCScratch.allocate(rows, 5120, device)
+        layout = _row_table_layout(rows)
+        rows_values = torch.cat([torch.arange(rank * count, (rank + 1) * count, dtype=torch.int64)
+                                 for count, _ in layout])
+        # The table is snapshot storage: prefill scratch is exported as zeros, and a captured graph
+        # reads these row numbers as data. `persistent_zeros` routes to the core-owned arena while a
+        # preparation exports, and to ordinary storage on a CPU test.
+        rows_table = persistent_zeros(rows_values.shape, rows_values.dtype, device).copy_(rows_values)
+        first = layout[-1][1]
+        return cls(world, rank, rows, start, rows_table[first:first + rows], zeros(rows, 5120),
+                   zeros(rows, 5120), zeros(rows, 4, 5120), zeros(rows, 4, dtype=torch.float32),
+                   zeros(rows, 4, dtype=torch.float32), scratch(), scratch(),
+                   (AttentionScratch.allocate(tokens, world, device, candidate_tokens=candidate_tokens,
+                                              shard_rows=rows) if attention else None),
+                   zeros(tokens, 512) if attention else None,
+                   zeros(rows, experts, dtype=torch.float32) if attention else None,
+                   RouteRecord.allocate(rows, top_k, device) if attention else None,
+                   RouteRecord.allocate(tokens, top_k, device) if attention else None,
+                   rows_table)
+
+    def graph(self, tokens):
+        """The shard a decoder of `tokens` rows uses, or None when its rows do not divide."""
+        rows = tokens // self.world
+        if tokens % self.world or rows % MHC_CALL_ROWS or rows > self.rows:
+            return None
+        # A narrower graph holds fewer rows per rank, so this rank's block begins earlier than it
+        # does in the captured layout: the graph reads its row count's segment of the table.
+        start = self.rank * rows
+        layout = _row_table_layout(self.rows)
+        index = [count for count, _ in layout].index(rows)
+        first = layout[index][1]
+        return replace(self, rows=rows, start=start,
+                       rows_index=self.rows_table[first:first + rows],
+                       attention_output=self.attention_output[:rows], mlp_output=self.mlp_output[:rows],
+                       residual=self.residual[:rows], pre_mix=self.pre_mix[:rows], attn_mix=self.attn_mix[:rows],
+                       attention_hc=self.attention_hc.rows(rows), ffn_hc=self.ffn_hc.rows(rows),
+                       attention=None if self.attention is None else self.attention.rows(rows, tokens),
+                       window_values=None if self.window_values is None else self.window_values[:tokens],
+                       router_logits=None if self.router_logits is None else self.router_logits[:rows],
+                       routes=None if self.routes is None else self.routes.rows(rows),
+                       gathered_routes=None if self.gathered_routes is None
+                       else self.gathered_routes.rows(tokens))
+
+
+def _row_table_layout(rows):
+    """Each shard row count up to `rows` a graph can use, with its segment's first table element.
+
+    The layout depends only on `rows`, which every rank shares, so a segment's storage offset is the
+    same on every rank.
+    """
+    layout, first = [], 0
+    for count in range(1, rows + 1):
+        if count % MHC_CALL_ROWS == 0:
+            layout.append((count, first))
+            first += count
+    return layout
+
+
+def row_shard_ready(scratch, shard, runtime):
+    """True when a runtime serves every row-sharded reduction and gather over this scratch."""
+    return (PreparedReduceScatter.fits(runtime, scratch.attention.output, shard.attention_output)
+            and PreparedReduceScatter.fits(runtime, scratch.mlp_partial, shard.mlp_output)
+            and PreparedGatherShards.fits(runtime, shard.attention_hc.normalized,
+                                          scratch.attention_hc.normalized)
+            and PreparedGatherShards.fits(runtime, shard.ffn_hc.normalized, scratch.ffn_hc.normalized)
+            and PreparedGatherShards.fits(runtime, shard.pre_mix.view(torch.bfloat16),
+                                          scratch.pre_mix.view(torch.bfloat16))
+            and PreparedChunkedGatherShards.fits(runtime, shard.residual, scratch.residual))
+
+
+def attention_shard_ready(scratch, shard, runtime):
+    """True when a runtime serves the gathers row-sharded attention adds to the same scratch.
+
+    The KV latent, the selected route records and the carried selection are gathered whole. A
+    selected row is the widest shard-row operand a shard gathers, so proving it proves the
+    compressor's two input projections, which are gathered whole at the same row width and no
+    wider.
+    """
+    if shard is None or shard.attention is None:
+        return False
+    return (PreparedGatherShards.fits(runtime, shard.attention.window_values, shard.window_values)
+            and PreparedGatherShards.fits(runtime, shard.routes.packed, shard.gathered_routes.packed)
+            and PreparedGatherShards.fits(runtime, shard.attention.selected.view(torch.bfloat16),
+                                          scratch.attention.selected.view(torch.bfloat16)))
+
+
+def outgoing_owner_ready(index, schedule, *, mode, scoring, packing, engram_layers, aux_layers, decoder_start,
+                         metadata, scratch, owner, runtime):
+    """Whether a packed full-row FFN can hand owner rows to its next layer."""
+    if (mode != "prefill" or scoring is not None or packing is None or owner is None or runtime is None
+            or index not in engram_layers or index + 1 >= len(schedule) or decoder_start is None
+            or index + 1 >= decoder_start or index in aux_layers or index + 1 in aux_layers
+            or metadata.positions.numel() != 8192 or metadata.starts.numel() != 1
+            or owner.world != 4 or runtime.world_size != owner.world or owner.rows != 2048
+            or runtime.pipe_bytes != 80 << 20 or not 0 <= owner.rank < owner.world
+            or owner.start != owner.rank * owner.rows):
+        return False
+    current, following = schedule[index], schedule[index + 1]
+    if current[0] or current[1] or not following[0] or not following[2]:
+        return False
+    device = scratch.mlp_partial.device
+    fields = ((scratch.mlp_partial, (8192, 5120), torch.bfloat16),
+              (scratch.ffn_hc.residual, (8192, 4, 5120), torch.bfloat16),
+              (scratch.ffn_hc.post, (8192, 4), torch.float32),
+              (scratch.ffn_hc.comb, (8192, 4, 4), torch.float32),
+              (scratch.pre_mix, (8192, 4), torch.float32),
+              (owner.rows_index, (2048,), torch.int64),
+              (owner.mlp_output, (2048, 5120), torch.bfloat16),
+              (owner.residual, (2048, 4, 5120), torch.bfloat16),
+              (owner.pre_mix, (2048, 4), torch.float32))
+    if any(tuple(value.shape) != shape or value.dtype != dtype or value.device != device
+           or not value.is_contiguous() for value, shape, dtype in fields):
+        return False
+    return PreparedReduceScatter.fits(runtime, scratch.mlp_partial, owner.mlp_output)
+
+
+def shard_schedule(config, stop, sharded, aux_layers=()):
+    """Per-layer `(shard, defer, reseed)` for a prefill decoder whose shard exists.
+
+    The layers `config.shardable_attention_layers` names keep this rank's rows. An Engram layer
+    keeps attention and FFN work full-row, and the layers on either side of it change row
+    dimension: a layer that lands on the far side of such a change runs its own post, so the
+    full-row residual its consumer reads is complete, and the first sharded layer after a full-row
+    run reseeds the shard from the rows it owns.
+    """
+    shardable = set(config.shardable_attention_layers(stop, aux_layers))
+    engram = set(config.text["engram_layer_ids"])
+    def sharded_at(index):
+        return sharded is not None and index in shardable
+    schedule = []
+    for index in range(config.layers):
+        shard = sharded_at(index)
+        # Deferred post hands this layer's four streams to the next layer's attention mHC, which
+        # reads them only when both layers hold the same rows.
+        defer = (index + 1 < config.layers and index + 1 not in engram
+                 and index + 1 not in aux_layers and sharded_at(index + 1) == shard)
+        schedule.append((shard, defer, shard and index > 0 and not sharded_at(index - 1)))
+    return schedule
+
+
+@dataclass(frozen=True)
+class SelectionMove:
+    """One attention layer's move of the selection state it reads into the rows it runs in.
+
+    `selected` and `candidates` name a direction each, because the sparse indices and the candidate
+    shortlist are written by different layers and so carry different row representations.
+    """
+
+    source: int
+    selected: str | None = None
+    candidates: str | None = None
+
+
+def selection_moves(config, schedule, *, attention_shard):
+    """Per-layer moves of the selection state an attention-sharded prefill decoder carries.
+
+    Attention reads the sparse indices an index source wrote against that source's latent pages, so
+    its consumer must hold that source's selection in the rows it runs in. The decoder carries one
+    selection value from layer to layer, so the value holds the rows of the layer that last wrote
+    it: a layer that runs in the other representation moves it before its attention reads it. The
+    candidate shortlist has its own producer and its own consumers, so it is tracked apart.
+    """
+    if not attention_shard:
+        return (None,) * len(schedule)
+    candidate = config.text["candidate_source_layer_id"]
+    rows = ["shard" if sharded else "full" for sharded, _, _ in schedule]
+    def direction(held, index):
+        if held == rows[index]:
+            return None
+        return "full_to_shard" if held == "full" else "shard_to_full"
+    moves, held, shortlist = [], rows[0], None
+    for index in range(len(rows)):
+        source = config.index_source(index)
+        selected = candidates = None
+        if source == index:
+            # An index source writes its own selection, so it reads no carried one.
+            held = rows[index]
+        elif source is not None:
+            selected, held = direction(held, index), rows[index]
+        if index == candidate:
+            shortlist = rows[index]
+        elif source == index and index > candidate:
+            candidates, shortlist = direction(shortlist, index), rows[index]
+        moves.append(None if selected is None and candidates is None
+                     else SelectionMove(source if source is not None else candidate, selected, candidates))
+    return tuple(moves)
+
+
+class PreparedSelectionRefill:
+    """Move the carried selection state into the rows the next attention layer reads.
+
+    A full-to-shard move copies the rows this rank owns out of the replicated full state, and the
+    candidate shortlist and its counts move with the same rows. A shard-to-full move gathers every
+    rank's selected rows through a BF16 view of the same words. Both run before the layer's selectors
+    or attention read the state.
+    """
+
+    def __init__(self, move, *, full, shard, rows_index, runtime, session, coordinator, name):
+        self.move, self.rows_index, self.gather = move, rows_index, None
+        if move.candidates == "shard_to_full":
+            # The shard gather moves whole 16-byte rows; a count row is four bytes.
+            raise ValueError(f"layer {move.source} reads index source {move.source}'s candidate"
+                             " shortlist, which only a shard produced; its counts cannot be gathered"
+                             " with the shard-row gather")
+        if move.selected == "shard_to_full":
+            self.gather = PreparedGatherShards(shard.selected.view(torch.bfloat16),
+                full.selected.view(torch.bfloat16), runtime=runtime, session=session,
+                coordinator=coordinator, name=name + ".selected")
+
+    def functional(self, *, session):
+        if self.gather is not None:
+            self.gather.functional(session=session)
+
+    def __call__(self, selection):
+        selected, candidates, counts = selection
+        if self.move.selected == "full_to_shard":
+            selected = selected.index_select(0, self.rows_index)
+        elif self.move.selected == "shard_to_full":
+            selected = self.gather(selected.view(torch.bfloat16)).view(torch.int32)
+        if self.move.candidates == "full_to_shard":
+            candidates = None if candidates is None else candidates.index_select(0, self.rows_index)
+            counts = None if counts is None else counts.index_select(0, self.rows_index)
+        return selected, candidates, counts
 
 
 @dataclass(frozen=True)
@@ -50,6 +328,7 @@ class Scratch:
     hidden: torch.Tensor
     local_logits: torch.Tensor
     logits: torch.Tensor
+    row_shard: RowShard | None = None
 
     def rows(self, tokens, samples):
         def select(value, count):
@@ -58,14 +337,20 @@ class Scratch:
             if is_dataclass(value):
                 return type(value)(*(select(getattr(value, field.name), count) for field in fields(value)))
             raise TypeError("decoder scratch must contain tensors and tensor dataclasses")
-        return type(self)(*(select(getattr(self, field.name), samples if field.name in
-            ("hidden", "local_logits", "logits") else tokens) for field in fields(self)))
+        def field_value(name):
+            if name == "row_shard":
+                return None if self.row_shard is None else self.row_shard.graph(tokens)
+            return select(getattr(self, name), samples if name in
+                          ("hidden", "local_logits", "logits") else tokens)
+        return type(self)(*(field_value(field.name) for field in fields(self)))
 
     @classmethod
     def allocate(cls, tokens, samples, world, device, *, experts=384, top_k=6,
-                 candidate_tokens=None):
+                 candidate_tokens=None, row_shard=None, attention_shard=False):
         def zeros(*shape, dtype=torch.bfloat16):
             return torch.zeros(shape, dtype=dtype, device=device)
+        shard = (None if row_shard is None else RowShard.allocate(tokens, world, row_shard.rank, device,
+            candidate_tokens=candidate_tokens, attention=attention_shard, experts=experts, top_k=top_k))
         residual, engram_residual = zeros(tokens, 4, 5120), zeros(tokens, 4, 5120)
         pre_mix, attn_mix = zeros(tokens, 4, dtype=torch.float32), zeros(tokens, 4, dtype=torch.float32)
         attention_hc = MHCScratch.allocate(tokens, 5120, device)
@@ -84,7 +369,7 @@ class Scratch:
         routed, partial = zeros(tokens, 5120), zeros(tokens, 5120)
         return cls(embedding, residual, engram_residual, engram, pre_mix, attn_mix, attention_hc, ffn_hc,
             attention, attention_output, shared, router_logits, router, routed, partial, mlp_output,
-            hidden, local_logits, logits)
+            hidden, local_logits, logits, shard)
 
 
 
@@ -129,43 +414,128 @@ class PreparedLayer:
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
-                 window_metadata=None, examples=None):
+                 window_metadata=None, examples=None, row_shard=None, attention_shard=False,
+                 selection_move=None, reseed=False, engram_input=None, output_rows=None):
         s, text = scratch, pool.config.text
-        self.scratch, self.carry = s, carry
+        self.scratch, self.carry, self.row_shard = s, carry, row_shard
+        self.output_row_indices = None if output_rows is None or row_shard is not None else output_rows.rows_index
+        if output_rows is not None and ((row_shard is not None and row_shard is not output_rows)
+                or defer_post or boundary is not None or mode != "prefill"
+                or weights.engram is None or metadata.positions.numel() != 8192):
+            raise ValueError("owner FFN output requires a completed packed post boundary")
+        if weights.engram is not None and row_shard is not None and (
+                engram_input is None or engram_input[0] is not row_shard or engram_input[1] is not None
+                or output_rows is not row_shard or attention_shard or carry or reseed):
+            raise ValueError("owner Engram mHC requires owner input and output with full-row attention")
+        self.attention_shard = attention_shard
+        # A full-row layer owns the rows since this shard last ran, so the shard is refilled here.
+        self.reseed = reseed and row_shard is not None
         self.metadata = metadata
         self.image_mask = (torch.zeros(metadata.token_ids.shape, dtype=torch.bool, device=metadata.token_ids.device)
                            if mode == "prefill" and weights.experts.vision_correction is not None else None)
         self.boundary = boundary
         self.engram = None
+        engram_output = None
         if weights.engram is not None:
-            self.engram = PreparedEngram(index, weights.engram, tables, s.residual, s.engram_residual,
+            engram_output = s.engram_residual if row_shard is None else s.engram_residual[:row_shard.rows]
+            owner, output_gather = (None, None) if engram_input is None else engram_input
+            source = s.residual if owner is None else owner.residual
+            self.engram = PreparedEngram(index, weights.engram, tables, source, engram_output,
                 metadata, pool,
                 scratch=s.engram, session=session, name=name + ".engram", workspace=workspace,
-                runtime=runtime, coordinator=coordinator, examples=examples)
-        source = s.engram_residual if self.engram is not None else s.residual
+                runtime=runtime, coordinator=coordinator, examples=examples,
+                owner_rows=None if owner is None else owner.rows_index, output_gather=output_gather)
+        # A row shard reduces into this rank's rows and normalizes them there; the full-size scratch
+        # holds the branch input every consumer reads, which a gather fills before that consumer runs.
+        attention_scratch = s.attention_hc if row_shard is None else row_shard.attention_hc
+        ffn_scratch = s.ffn_hc if row_shard is None else row_shard.ffn_hc
+        pre_mix = s.pre_mix if row_shard is None else row_shard.pre_mix
+        attn_mix = s.attn_mix if row_shard is None else row_shard.attn_mix
+        residual = s.residual if row_shard is None else row_shard.residual
+        attention_output = s.attention_output if row_shard is None else row_shard.attention_output
+        mlp_output = s.mlp_output if row_shard is None else row_shard.mlp_output
+        source = engram_output if self.engram is not None else residual
         options = dict(rms_eps=text["rms_norm_eps"], norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"],
                        sinkhorn_iters=text["hc_sinkhorn_iters"])
-        incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb) if carry else (source,))
+        attention_options = ffn_options = options
+        if self.engram is not None and row_shard is not None:
+            from b12x.norm.mhc import MhcConfig
+
+            # Match the full-row TF32 projection accumulation at the Engram boundary.
+            # The 2,048-row queries retain their own binding and scratch capacities.
+            common = dict(backend="tf32_tma", projection_num_n_warps=1, projection_k_splits=1,
+                          lagged_prepare=False, partials_per_cta=4)
+            attention_options = dict(options, tuning_config=MhcConfig(
+                projection_tile_m=128, projection_tile_n=32, projection_tile_k=128,
+                projection_num_stages=2, projection_num_m_warps=8, **common))
+            ffn_options = dict(options, tuning_config=MhcConfig(
+                projection_tile_m=192, projection_tile_n=32, projection_tile_k=64,
+                projection_num_stages=3, projection_num_m_warps=12, **common))
+        incoming = ((mlp_output, ffn_scratch.residual, ffn_scratch.post, ffn_scratch.comb) if carry else (source,))
         self.attention_hc = None if boundary is not None else PreparedMHC(
-            incoming, _mhc_weights(weights, "attn", "attn_norm"), s.attention_hc,
-            session=session, name=name + ".attn_hc", workspace=workspace, pre_mix=s.pre_mix, pre_out=s.attn_mix, **options)
-        self.attention = PreparedAttention(index, weights.attention, s.attention_hc.normalized, s.attention,
+            incoming, _mhc_weights(weights, "attn", "attn_norm"), attention_scratch,
+            session=session, name=name + ".attn_hc", workspace=workspace, pre_mix=pre_mix, pre_out=attn_mix, **attention_options)
+        # Row-sharded attention reads and writes only this rank's rows, computes every head and
+        # output group, and therefore needs neither the branch-input gather nor a reduction.
+        attention_source = attention_scratch.normalized if attention_shard else s.attention_hc.normalized
+        attention_buffer = row_shard.attention if attention_shard else s.attention
+        self.attention = PreparedAttention(index, weights.attention, attention_source, attention_buffer,
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode,
-            window_metadata=window_metadata, examples=examples)
-        self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
-            coordinator=coordinator, session=session, name=name + ".attention_reduce")
-        self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
-            _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
-            pre_mix=s.attn_mix, pre_out=s.pre_mix, **options)
-        self.router_projection = UnquantizedProjection(s.ffn_hc.normalized, weights.experts.router, s.router_logits,
+            window_metadata=window_metadata, examples=examples, runtime=runtime, coordinator=coordinator,
+            row_shard=row_shard if attention_shard else None,
+            window_target=row_shard.window_values if attention_shard else None)
+        # A layer on one side of a row transition reads a selection the other side wrote, so its
+        # forward moves that state into the rows its attention reads before it runs.
+        self.selection_move = None
+        if selection_move is not None:
+            # The layer that crosses back to full rows runs full-row, so it holds no shard of its
+            # own and reads the carried selection through the decoder's shard instead.
+            carried = row_shard if row_shard is not None else s.row_shard
+            if carried is None or carried.attention is None:
+                raise ValueError("a selection move requires the row shard's attention scratch")
+            self.selection_move = PreparedSelectionRefill(selection_move, full=s.attention,
+                shard=carried.attention, rows_index=carried.rows_index, runtime=runtime,
+                session=session, coordinator=coordinator, name=name + ".selection")
+        self.attention_gather = None if row_shard is None or attention_shard else PreparedGatherShards(
+            attention_scratch.normalized, s.attention_hc.normalized, runtime=runtime, coordinator=coordinator,
+            session=session, name=name + ".attention_gather")
+        if attention_shard:
+            self.attention_reduce = None
+        elif row_shard is None:
+            self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
+                coordinator=coordinator, session=session, name=name + ".attention_reduce")
+        else:
+            self.attention_reduce = PreparedReduceScatter(s.attention.output, attention_output, runtime=runtime,
+                coordinator=coordinator, session=session, name=name + ".attention_reduce")
+        self.ffn_hc = PreparedMHC((attention_output, attention_scratch.residual, attention_scratch.post,
+            attention_scratch.comb), _mhc_weights(weights, "ffn", "ffn_norm"), ffn_scratch, session=session,
+            name=name + ".ffn_hc", workspace=workspace, pre_mix=attn_mix, pre_out=pre_mix, **ffn_options)
+        self.ffn_gather = None if row_shard is None else PreparedGatherShards(
+            ffn_scratch.normalized, s.ffn_hc.normalized, runtime=runtime, coordinator=coordinator,
+            session=session, name=name + ".ffn_gather")
+        # Top-k is row-local, so a shard projects and routes the logits it owns and one gather
+        # hands every rank the selected routes for all rows. The MoE keeps all rows.
+        router_source = ffn_scratch.normalized if attention_shard else s.ffn_hc.normalized
+        router_logits = s.router_logits if not attention_shard else row_shard.router_logits
+        self.router_projection = UnquantizedProjection(router_source, weights.experts.router, router_logits,
             session=session, name=name + ".router")
-        self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
+        self.route_gather = None if not attention_shard else PreparedGatherShards(
+            row_shard.routes.packed, row_shard.gathered_routes.packed, runtime=runtime,
+            coordinator=coordinator, session=session, name=name + ".route_gather")
+        # The shard router's FP32 selected logits reuse the full-row router's scratch, which no
+        # prepared call reads once the route records replace the gathered logits.
+        route_scratch = (s.router if not attention_shard
+                         else row_shard.routes.router_scratch(s.router.selected_logits[:row_shard.rows]))
+        router_image_mask = self.image_mask
+        if attention_shard and router_image_mask is not None:
+            router_image_mask = router_image_mask[row_shard.start:row_shard.start + row_shard.rows]
+        self.router = PreparedRouter(router_logits, route_scratch, session=session, name=name + ".topk",
             score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
             routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
             image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
-            image_mask=self.image_mask)
+            image_mask=router_image_mask)
         self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
             s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
             router_plan=self.router.plan)
@@ -178,16 +548,46 @@ class PreparedLayer:
                 parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
                 session=session, workspace=workspace,
                 defer_launch=s.ffn_hc.normalized.shape[0] > 4)
-        self.mlp_reduce = PreparedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
-            coordinator=coordinator, session=session, name=name + ".mlp_reduce")
-        self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
-            s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")
+        mlp_destination = mlp_output if output_rows is None else output_rows.mlp_output
+        if row_shard is None and output_rows is None:
+            self.mlp_reduce = PreparedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
+                coordinator=coordinator, session=session, name=name + ".mlp_reduce")
+        else:
+            self.mlp_reduce = PreparedReduceScatter(s.mlp_partial, mlp_destination, runtime=runtime,
+                coordinator=coordinator, session=session, name=name + ".mlp_reduce")
+        if output_rows is None or row_shard is not None:
+            self.post = None if defer_post else PreparedMHCPost(mlp_output, ffn_scratch.residual,
+                ffn_scratch.post, ffn_scratch.comb, residual, session=session, name=name + ".post")
+        else:
+            rows = output_rows.rows
+            self.post = PreparedMHCPost(mlp_destination, ffn_scratch.residual[:rows],
+                ffn_scratch.post[:rows], ffn_scratch.comb[:rows], output_rows.residual,
+                session=session, name=name + ".post")
+        # A deferred post runs in the next layer's attention mHC over the same rows, so only a layer
+        # that runs its own post widens this rank's four-stream residual back to every row.
+        self.residual_gather = self.mix_gather = None
+        if row_shard is not None and not defer_post and output_rows is None:
+            self.residual_gather = PreparedChunkedGatherShards(row_shard.residual, s.residual, runtime=runtime,
+                session=session, coordinator=coordinator, name=name + ".residual_gather")
+            # A BF16 view gathers the FP32 lagged mix through the same prepared surface.
+            self.mix_gather = PreparedGatherShards(row_shard.pre_mix.view(torch.bfloat16),
+                s.pre_mix.view(torch.bfloat16), runtime=runtime, coordinator=coordinator,
+                session=session, name=name + ".mix_gather")
 
         if self.attention_hc is not None:
             self.attention_hc.functional()
-        self.attention_reduce.functional(session=session)
+        if self.selection_move is not None:
+            self.selection_move.functional(session=session)
+        if self.attention_gather is not None:
+            self.attention_gather.functional(session=session)
+        if self.attention_reduce is not None:
+            self.attention_reduce.functional(session=session)
         self.ffn_hc.functional()
+        if self.ffn_gather is not None:
+            self.ffn_gather.functional(session=session)
         self.router_projection.functional(session=session)
+        if self.route_gather is not None:
+            self.route_gather.functional(session=session)
         self.router.functional(session=session)
         self.experts.functional(session=session)
         if self.concurrent_shared is None:
@@ -197,11 +597,19 @@ class PreparedLayer:
         self.mlp_reduce.functional(session=session)
         if self.post is not None:
             self.post.functional()
+        if self.residual_gather is not None:
+            self.residual_gather.functional(session=session)
+            self.mix_gather.functional(session=session)
         self.has_image_mask = self.image_mask is not None
         register_finalizer(session, self.release_examples)
 
     def release_examples(self):
         self.scratch = self.metadata = self.image_mask = None
+        if self.row_shard is not None:
+            self.row_shard = replace(self.row_shard, attention_output=None, mlp_output=None,
+                residual=None, pre_mix=None, attn_mix=None, attention_hc=None, ffn_hc=None,
+                attention=None, window_values=None, router_logits=None,
+                routes=None, gathered_routes=None)
         if self.concurrent_shared is not None:
             self.shared = None
 
@@ -211,6 +619,12 @@ class PreparedLayer:
         return incoming, next_mix, records, selection
 
     def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
+        shard = self.row_shard
+        if self.reseed:
+            # The full-row layers since this shard last ran own every row, so take this rank's rows
+            # out of them through the row numbers the graph reads.
+            incoming = tuple(value.index_select(0, shard.rows_index) for value in incoming)
+            pre_mix = pre_mix.index_select(0, shard.rows_index)
         if self.engram is not None:
             incoming = (self.engram(incoming[0], metadata),)
         if boundary is None:
@@ -218,26 +632,64 @@ class PreparedLayer:
             residual, post, comb, normalized = self.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
         else:
             (residual, post, comb, normalized), attn_mix = boundary
+        if self.attention_gather is not None:
+            normalized = self.attention_gather(normalized)
         attention_normalized = normalized
+        if self.selection_move is not None:
+            selection = self.selection_move(selection)
         attended, records, selection, observations = self.attention._run(normalized, metadata, selection,
             indices=indices, window_cache=window_cache)
-        attention_output = self.attention_reduce(attended)
+        # A shard's own rows are complete once its output projection has summed all groups.
+        attention_output = attended if self.attention_reduce is None else self.attention_reduce(attended)
         next_mix = torch.zeros_like(attn_mix)
         residual, post, comb, normalized = self.ffn_hc(attention_output, residual, post, comb,
             pre_mix=attn_mix, pre_out=next_mix)
+        router_source = normalized
+        if self.ffn_gather is not None:
+            normalized = self.ffn_gather(normalized)
         pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
-        image_mask = metadata.token_ids >= 129280 if self.has_image_mask else None
-        router_logits = self.router_projection(normalized)
+        image_mask = None
+        if self.has_image_mask:
+            # The router reads the image mask over the rows it routes, and a sharded router routes
+            # only this rank's block.
+            image_mask = (metadata.token_ids if not self.attention_shard
+                          else metadata.token_ids.index_select(0, shard.rows_index)) >= 129280
+        router_logits = self.router_projection(router_source if self.attention_shard else normalized)
         route = self.router(router_logits, image_mask=image_mask)
-        routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
+        route_ids, route_weights = route.ids, route.weights
+        if self.route_gather is not None:
+            # Pack live route outputs and unpack gathered words into forward-local storage.
+            # Explicit operands let compilation plan these temporaries with the expert inputs.
+            packed_routes = RouteRecord.allocate(route_ids.shape[0], route_ids.shape[1], route_ids.device)
+            packed_routes.write(route_ids, route_weights)
+            gathered = self.route_gather(packed_routes.packed)
+            shape = (normalized.shape[0], route_ids.shape[1])
+            route_ids = torch.empty(shape, dtype=route_ids.dtype, device=route_ids.device)
+            route_weights = torch.empty(shape, dtype=route_weights.dtype, device=route_weights.device)
+            RouteRecord(gathered.view(torch.int32)).read(route_ids, route_weights)
+        routed = self.experts(normalized, route_ids, route_weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
         shared = (self.shared(normalized) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(pending, routed))
         output = self.mlp_reduce(routed + shared)
+        if self.output_row_indices is not None:
+            rows = self.output_row_indices
+            residual = residual.index_select(0, rows)
+            post = post.index_select(0, rows)
+            comb = comb.index_select(0, rows)
+            next_mix = next_mix.index_select(0, rows)
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
+        if self.mix_gather is not None:
+            # The next full-row mHC still reads every FP32 pre-mix word.
+            full_mix = torch.empty((metadata.token_ids.numel(), 4), dtype=next_mix.dtype,
+                                   device=next_mix.device)
+            self.mix_gather(next_mix.view(torch.bfloat16), full_mix.view(torch.bfloat16))
+            next_mix = full_mix
+        if self.residual_gather is not None:
+            incoming = (self.residual_gather(incoming[0]),)
         observations = {"attention." + key: value for key, value in observations.items()}
-        observations.update({"attention_hc.normalized": attention_normalized, "router.ids": route.ids,
+        observations.update({"attention_hc.normalized": attention_normalized, "router.ids": route_ids,
                              "output": incoming[0]})
         return incoming, next_mix, records, selection, observations
 
@@ -245,7 +697,8 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None):
+                 vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
+                 row_shard_attention=False):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
@@ -265,6 +718,18 @@ class PreparedDecoder:
         self.aux_layers = () if weights.draft is None else weights.config.draft.target_layers
         if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
+        # Layers below the prefill's stop run row-sharded; the layer at `stop - 1` materializes
+        # every row again so the decoder suffix keeps its full-row boundary and replay gather.
+        stop = weights.config.prefill_stop(self.packing is None)
+        self.row_shard = scratch.row_shard
+        if (self.row_shard is None or mode != "prefill" or stop < 1
+                or not row_shard_ready(scratch, self.row_shard, runtime)):
+            self.row_shard = None
+        # Attention joins the shard only when the bootstrap asked and its gathers are served too.
+        self.attention_shard = (self.row_shard is not None and mode == "prefill" and row_shard_attention
+                                and attention_shard_ready(scratch, self.row_shard, runtime))
+        schedule = shard_schedule(weights.config, stop, self.row_shard, self.aux_layers)
+        moves = selection_moves(weights.config, schedule, attention_shard=self.attention_shard)
         self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
         self.auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)
         self.safe_tokens = torch.zeros_like(metadata.token_ids) if self.vision is not None else metadata.token_ids
@@ -291,6 +756,7 @@ class PreparedDecoder:
                 page_size=128 + self.output_metadata.max_query_tokens, width=128,
                 replay_start=self.packing.replay_start, ratios=set(ratios[decoder_start:]) - {0})
         self.layers, carry = [], False
+        previous_owner_output = False
         for index, layer in enumerate(weights.layers):
             boundary = replay_start = None
             layer_scratch, layer_metadata = scratch, metadata
@@ -304,8 +770,25 @@ class PreparedDecoder:
                         source_indices=self.window_metadata)
                     layer = replace(layer, attention={key: value for key, value in layer.attention.items()
                                                       if key not in ("compressor", "index_k", "index_norm")})
-            defer = (index + 1 < len(weights.layers) and weights.layers[index + 1].engram is None
-                     and index + 1 not in self.aux_layers)
+            sharded, defer, reseed = schedule[index]
+            sharded = self.row_shard if sharded else None
+            layer_attention_shard = self.attention_shard and sharded is not None
+            reseed = reseed and not previous_owner_output
+            output_rows = self.row_shard if layer.engram is not None and outgoing_owner_ready(index, schedule, mode=mode,
+                scoring=scoring, packing=self.packing, engram_layers=weights.config.text["engram_layer_ids"],
+                aux_layers=self.aux_layers, decoder_start=decoder_start,
+                metadata=layer_metadata, scratch=layer_scratch, owner=self.row_shard, runtime=runtime) else None
+            engram_input = None
+            if (self.packing is not None and scoring is None and index > 0 and index < decoder_start
+                    and index not in self.aux_layers and layer.engram is not None and sharded is None and not carry):
+                previous = self.layers[-1]
+                if (previous.post is not None and previous.residual_gather is not None and previous.mix_gather is not None
+                        and owner_input_fits(previous.row_shard, metadata, scratch, tables, runtime)):
+                    engram_input = previous.row_shard, previous.residual_gather
+            if engram_input is not None and output_rows is not None:
+                # The residual and mHC stay owned while attention keeps its full-row selection.
+                sharded = engram_input[0]
+                engram_input = sharded, None
             self.layers.append(PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
                 shard=weights.shard, mode=mode, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
@@ -313,7 +796,15 @@ class PreparedDecoder:
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
-                examples=examples))
+                examples=examples, row_shard=sharded, attention_shard=layer_attention_shard,
+                selection_move=moves[index], reseed=reseed,
+                **({"engram_input": engram_input} if engram_input is not None else {}),
+                **({"output_rows": output_rows} if output_rows is not None else {})))
+            previous_owner_output = output_rows is not None
+            if engram_input is not None:
+                previous.residual_gather = None
+                if sharded is not None:
+                    previous.mix_gather = None
             carry = defer
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
@@ -348,6 +839,11 @@ class PreparedDecoder:
 
     def release_outputs(self):
         self.scratch = self.metadata = self.output_scratch = self.output_metadata = None
+        if self.row_shard is not None:
+            self.row_shard = replace(self.row_shard, attention_output=None, mlp_output=None,
+                residual=None, pre_mix=None, attn_mix=None, attention_hc=None, ffn_hc=None,
+                attention=None, window_values=None, router_logits=None,
+                routes=None, gathered_routes=None)
         self.auxiliary = self.safe_tokens = self.head_hidden = self.local_logits = None
 
     def __call__(self, metadata):
@@ -362,8 +858,15 @@ class PreparedDecoder:
         pre_mix = torch.zeros((embedding.shape[0], 4), dtype=torch.float32, device=embedding.device)
         pre_mix[:, 0].fill_(1)
         incoming = (residual,)
+        if self.row_shard is not None:
+            # The first layer keeps this rank's rows, so enter with them.
+            incoming = (residual.index_select(0, self.row_shard.rows_index),)
+            pre_mix = pre_mix.index_select(0, self.row_shard.rows_index)
         indices = self.window_metadata(metadata)
-        selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
+        # The carried selection holds this rank's rows from the first layer on; every later change
+        # of row representation moves it in the layer that crosses over.
+        selection_rows = self.row_shard.rows if self.attention_shard else embedding.shape[0]
+        selection = (torch.full((selection_rows, 512), -1, dtype=torch.int32, device=embedding.device), None, None)
         staging = (None if self.staging_shape is None else torch.zeros(
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
         auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
