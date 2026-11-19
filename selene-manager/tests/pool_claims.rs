@@ -489,6 +489,91 @@ async fn c6_no_pin_answer_times_out_and_a_late_pin_is_released() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_loss_ends_unanswered_exports_before_the_pin_deadline() {
+    let mut w = world_with(v2::Tier::Gpu, &[1024], |host| {
+        host.config.limits.pin_deadline_ms = 5_000;
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let candidate = w.candidate(900, 1024).await;
+    for id in 1..=2 {
+        w.requester
+            .claim(w.requester.claim_for(id, &candidate, 0, true))
+            .await;
+        w.source.export_request().await;
+    }
+    assert!(w.staging_now().await > 0, "staging reserved before pinning");
+
+    // The process lives, but its session ends before either pin answer.
+    w.source = w.pool.open(&w.source_ident).await;
+    for id in 1..=2 {
+        let terminal = w.requester.claim_terminal(id).await;
+        assert_eq!(terminal.state, v2::ClaimState::Failed as i32);
+        assert_eq!(terminal.reason, v2::ClaimReason::SourceLost as i32);
+        assert!(!terminal.fence_required, "no windows were issued");
+    }
+    assert!(started.elapsed() < Duration::from_millis(5_000));
+    w.staging_settles_at(0).await;
+    assert_eq!(w.host.gauge("pool_quarantined_bytes"), 0);
+    w.host.wait(|host| host.gauge("pool_claim_records") == 0);
+
+    // Both export slots are available without an ExportEnd from the source.
+    w.source.snapshot(chain(&w.tokens, v2::Tier::Gpu)).await;
+    let candidate = w.candidate(901, 1024).await;
+    for id in 3..=4 {
+        w.requester
+            .claim(w.requester.claim_for(id, &candidate, 0, true))
+            .await;
+    }
+    for id in 3..=4 {
+        let request = w.source.export_request().await;
+        w.source
+            .pin_refused(&request, v2::ClaimReason::SourceBusy)
+            .await;
+        assert_eq!(
+            w.requester.claim_terminal(id).await.reason,
+            v2::ClaimReason::SourceBusy as i32
+        );
+    }
+    w.staging_settles_at(0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_unanswered_exports_release_source_slots_after_reconnect() {
+    let mut w = world(v2::Tier::Gpu, &[1024]).await;
+    let candidate = w.candidate(900, 1024).await;
+    for id in 1..=2 {
+        w.requester
+            .claim(w.requester.claim_for(id, &candidate, 0, true))
+            .await;
+    }
+    // The frozen source never reads either ExportRequest or ExportCancel.
+    for id in 1..=2 {
+        let terminal = w.requester.claim_terminal(id).await;
+        assert_eq!(terminal.reason, v2::ClaimReason::SourceTimeout as i32);
+        assert!(!terminal.fence_required);
+    }
+    w.requester
+        .claim(w.requester.claim_for(3, &candidate, 0, true))
+        .await;
+    assert_eq!(
+        w.requester.claim_terminal(3).await.reason,
+        v2::ClaimReason::SourceLimit as i32
+    );
+
+    // The same process reconnects without knowing the abandoned export ids.
+    w.source = w.pool.open(&w.source_ident).await;
+    w.source.snapshot(chain(&w.tokens, v2::Tier::Gpu)).await;
+    w.host.wait(|host| host.gauge("pool_claim_records") == 0);
+    w.claim(4, 1024, 0, true).await;
+    let request = w.source.export_request().await;
+    let records = w.pin(&request).await;
+    w.requester.claim_granted(4).await;
+    w.copy_all(4, &request, &records).await;
+    w.staging_settles_at(0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c7_and_c8_a_release_that_crosses_the_pin_ack_never_grants() {
     let mut w = world(v2::Tier::Gpu, &[1024]).await;
     // C7: released before the source answers; the source drops the request.

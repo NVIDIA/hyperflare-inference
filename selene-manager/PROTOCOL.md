@@ -344,8 +344,14 @@ requester     manager                     source
 
 Source rule: exactly one `PinAck` per `ExportRequest`; if it is `PINNED`, exactly
 one `ExportEnd` later. The manager frees the source's export slot on `PinAck
-REFUSED` or on `ExportEnd`, never on its own terminal transition (the source may
-still hold the pin). A `PINNED` ack for a terminal claim never produces a grant.
+REFUSED`, on `ExportEnd`, or on session loss while the export is still
+`Requested`, never on its own terminal transition (the source may still hold
+the pin). Session loss ends an unanswered export and releases its slot: no copy
+windows were issued, and `pin_ack` accepts an acknowledgment only while the
+export is `Requested`. The source may still hold a pin it acknowledged on the
+lost session for as long as it remains stalled; it releases the pin after it
+resumes and drains. That pin has no windows, so fencing is unaffected. A `PINNED`
+ack for a terminal claim never produces a grant.
 
 ### Race: late grant
 
@@ -371,7 +377,7 @@ that does not know it (restarted, or the claim was cancelled and forgotten).
 | `WindowReleased` | each (claim, index) returns its credit once |
 | `CopyResult` | first one counts; others ignored |
 | `FenceAck`, `ExportEnd` | first per (claim, party) counts |
-| `PinAck` | first per export counts; a late `PINNED` is released |
+| `PinAck` | counts only while the export is `Requested`; `PINNED` for a terminal claim triggers `ExportCancel`; ignored after session loss ends the unanswered export |
 | `ExportCancel` | idempotent; unknown export answered `ExportEnd{EXPORT_RELEASED, DRAINED}` |
 | `NoticeBatch` | applied in stream order |
 | `PutCancel` | idempotent |
@@ -646,7 +652,9 @@ On stream end or process exit the manager:
 
 1. removes the source's entries immediately (decision 18) so no new lookup offers
    them;
-2. fails every claim served by it `SOURCE_LOST`;
+2. fails each nonterminal claim served by it `SOURCE_LOST` and ends every
+   unanswered (`Requested`) export, including those of terminal claims,
+   releasing their export slots; these exports have no issued windows;
 3. quarantines the windows in `SOURCE_WRITE` until the source process is
    confirmed exited. Windows in `REQUESTER_READ` hold valid bytes the source
    does not touch and follow the requester's fence;
@@ -659,6 +667,13 @@ its `ExportEnd{fence}` for old exports arrives on the new session
 dying: a hold protects against eviction only (`ClaimGranted` in selene.proto).
 
 ### 8.5 Session loss summary
+
+Source session loss ends every unanswered (`Requested`) export and releases its
+slot, whether its claim is still active or already terminal. No windows were
+issued for these exports. A shared-memory source's pinned exports retain their
+drain and quarantine requirements; a channel source's export ends with its
+session, because it reaches its windows only through the manager's handler,
+whose exit fences them. An already terminal claim keeps its original reason.
 
 | Event | Claims as requester | Claims as source | Entries | Windows |
 |---|---|---|---|---|

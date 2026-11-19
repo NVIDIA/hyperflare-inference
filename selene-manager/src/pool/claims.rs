@@ -2045,12 +2045,15 @@ impl Core {
         }
     }
 
-    /// A session ended: its claims, as requester and as source, fail.
+    /// A session ended: fail its active claims and end its unanswered source exports.
     pub(super) fn session_claims_lost(&mut self, sid: u64, session: &Session) {
         let keys: Vec<(ClaimKey, bool)> = self
             .claims
             .iter()
-            .filter(|(_, claim)| !claim.is_terminal())
+            .filter(|(_, claim)| {
+                !claim.is_terminal()
+                    || (claim.source_sid == sid && claim.export == ExportState::Requested)
+            })
             .filter_map(|(key, claim)| {
                 if claim.requester_sid == sid {
                     Some((*key, true))
@@ -2063,11 +2066,10 @@ impl Core {
             .collect();
         for (key, as_requester) in keys {
             if !as_requester {
-                // A source without shared memory reaches the claim's windows only through
-                // the manager's handler, whose exit is the fence. Its session ending
-                // clears what it owed for the export itself.
+                // No windows were issued before PINNED. A channel source reaches them only
+                // through the manager's handler, whose exit fences its accesses.
                 if let Some(claim) = self.claims.get_mut(&key) {
-                    if claim.source_channel().is_some() {
+                    if claim.export == ExportState::Requested || claim.source_channel().is_some() {
                         claim.export = ExportState::Ended;
                         if let Some(proc) = claim.source_proc {
                             attest(&mut claim.parties, Owner::Proc(proc), Party::Drained, false);

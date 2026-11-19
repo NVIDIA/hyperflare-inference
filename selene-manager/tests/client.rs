@@ -537,6 +537,99 @@ fn a_busy_source_restores_every_request_through_shared_memory() {
 }
 
 #[test]
+fn a_source_keepalive_timeout_releases_exports_and_resumes_waiting_restores() {
+    let mut manager = Manager::new();
+    manager.config.limits.pin_deadline_ms = 100;
+    manager.config.h2_keepalive = Some((Duration::from_millis(100), Duration::from_secs(1)));
+    manager.config.metrics = Some(free_address());
+    manager.run();
+    // Keep the copier handle to block the client's runtime during the stall.
+    let (copier, memory) = SimulatedGpu::shared(&geo()).unwrap();
+    let client = PoolClient::start(
+        config(&manager, 1),
+        None,
+        copier.clone(),
+        Arc::new(OkRegistrar),
+        flare_selene::pool::Roots::System,
+        STARTUP_WAIT,
+    )
+    .unwrap();
+    let mut source = Instance {
+        client,
+        gpu: memory,
+        events: Vec::new(),
+    };
+    let mut requester = instance(&manager, 2);
+    source.ready();
+    requester.ready();
+    let history = history();
+    let pages = 4;
+    let scratch = [100, 101, 102, 103];
+    let key = offer_host_record(&source, &requester, &history, pages);
+    let fetch = fetch_for(&mut requester, &history, pages, &scratch);
+
+    // Block the source's runtime, including HTTP/2 keepalive processing.
+    let paused = copier.lock().unwrap();
+    // Allow three 20 ms idle ticks to reach the locked copier before sending claims.
+    thread::sleep(Duration::from_millis(60));
+    requester.client.fetch(fetch.clone()).unwrap();
+    requester.client.fetch(fetch.clone()).unwrap();
+    for _ in 0..2 {
+        let failure = requester.event("a timed-out source claim", |event| match event {
+            PoolEvent::Fetched { result, .. } => {
+                Some(result.as_ref().unwrap_err().error.to_string())
+            }
+            _ => None,
+        });
+        assert!(failure.contains("SourceTimeout"), "{failure}");
+    }
+    let waiting = requester.client.fetch(fetch).unwrap();
+    wait("a source-slot refusal", || {
+        manager.metrics().contains("selene_pool_claims_refused_total{reason=\"SourceLimit\"}")
+    });
+    wait("the source's keepalive timeout", || {
+        manager.gauge("pool_sessions") == 1
+    });
+    drop(paused);
+
+    let resumed = Instant::now();
+    let failure = requester.event("the waiting restore to fail over", |event| match event {
+        PoolEvent::Fetched { id, result } => {
+            assert_eq!(*id, waiting);
+            Some(result.as_ref().unwrap_err().error.to_string())
+        }
+        _ => None,
+    });
+    assert!(
+        failure.contains("UnknownSource") || failure.contains("StaleSource"),
+        "{failure}"
+    );
+    // Allow scheduling slack beyond the keepalive timeout, but not the 12 s fetch deadline.
+    assert!(resumed.elapsed() < Duration::from_secs(3));
+    wait("both sessions to reconnect", || {
+        manager.gauge("pool_sessions") == 2
+    });
+    source.ready();
+    let fetch = fetch_for(&mut requester, &history, pages, &scratch);
+    requester.client.fetch(fetch).unwrap();
+    let export = source.event("an export request after reconnect", |event| match event {
+        PoolEvent::Export(request) => Some(request.export),
+        _ => None,
+    });
+    source.client.host_pinned(export, pin_for(key, pages));
+    assert_eq!(
+        finish_restore(&mut requester),
+        Ok((pages * PAGE + ROW) as u64)
+    );
+    check_restored(&requester, &scratch, pages);
+    wait("claim records to clear", || {
+        manager.gauge("pool_claim_records") == 0
+    });
+    source.client.close().unwrap();
+    requester.client.close().unwrap();
+}
+
+#[test]
 fn a_busy_source_restores_every_request_over_tcp() {
     let mut manager = network_manager(false);
     manager.stop();
