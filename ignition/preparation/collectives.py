@@ -32,6 +32,7 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
     the runtime is registered for export, so a native rank can rebuild the transport over it.
     `varlen_bytes` sizes each rank's contribution to variable-length gathers; zero prepares none.
     """
+    import flare_heliopause
     from b12x.comm import roce
 
     if any(type(value) is not int or value <= 0 for value in (max_tokens, pipe_tokens, hidden_size, gather_bytes)):
@@ -47,8 +48,10 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
         lambda size: core_storage.host_allocate("roce", (size,), torch.uint8).host_view)
     if type(varlen_bytes) is not int or varlen_bytes < 0 or varlen_bytes % 16:
         raise ValueError("variable-length gather capacity must be a nonnegative multiple of 16 bytes")
+    # Each host uses the GID index native serving discovers for it.
     runtime = roce.AllReduce(exchange_group=group, device=device, max_size=nbytes, max_gather_bytes=gather_bytes,
                              pipe_bytes=pipe_bytes, region_allocator=region,
+                             gid_index=flare_heliopause.roce_gid_index(),
                              ring=ring, **({"ring_open": True} if ring_open else {}),
                              **({"max_varlen_bytes": varlen_bytes} if varlen_bytes else {}))
     if core_storage is not None:
