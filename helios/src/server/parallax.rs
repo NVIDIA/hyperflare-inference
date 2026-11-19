@@ -28,6 +28,8 @@ const CAPACITY: usize = 32;
 struct Record {
     sequence: u64,
     graph: usize,
+    operation: crate::execution::GraphKind,
+    token_capacity: usize,
     phase: &'static str,
     batch_size: usize,
     concurrency: usize,
@@ -82,6 +84,7 @@ impl Telemetry {
         readout: RoutingReadout,
         graph: usize,
         kind: crate::execution::GraphKind,
+        token_capacity: usize,
         batch_size: usize,
         concurrency: usize,
     ) {
@@ -97,6 +100,8 @@ impl Telemetry {
         let record = Arc::new(Record {
             sequence,
             graph,
+            operation: kind,
+            token_capacity,
             phase: if kind.is_prefill() {
                 "prefill"
             } else if kind == crate::execution::GraphKind::Speculative {
@@ -224,10 +229,26 @@ mod tests {
     }
 
     #[test]
+    fn submitted_prefill_operations_remain_distinct_in_routing_records() {
+        let telemetry = Telemetry::default();
+        for kind in [GraphKind::Prefill, GraphKind::TerminalPrefill, GraphKind::ScoredPrefill] {
+            telemetry.publish(sample(), 0, kind, 8192, 1, 1);
+        }
+        let value = telemetry.snapshot(0, "fixture");
+        let frames = value["frames"].as_array().unwrap();
+        for (frame, expected) in frames.iter().zip(["prefill", "terminal_prefill", "scored_prefill"]) {
+            assert_eq!(frame["operation"], expected);
+            assert_eq!(frame["phase"], "prefill");
+            assert_eq!(frame["token_capacity"], 8192);
+        }
+        assert_eq!(frames.len(), 3);
+    }
+
+    #[test]
     fn retention_and_cursor_are_bounded_and_loss_is_visible() {
         let telemetry = Telemetry::default();
         for _ in 0..40 {
-            telemetry.publish(sample(), 0, GraphKind::Decode, 1, 2);
+            telemetry.publish(sample(), 0, GraphKind::Decode, 1, 1, 2);
         }
         let value = telemetry.snapshot(0, "fixture");
         assert_eq!(value["frames"].as_array().unwrap().len(), CAPACITY);
@@ -244,9 +265,9 @@ mod tests {
     #[test]
     fn telemetry_content_failure_and_busy_consumer_never_block_producer() {
         let telemetry = Telemetry::default();
-        telemetry.publish(RoutingReadout::Invalid, 0, GraphKind::Decode, 1, 1);
+        telemetry.publish(RoutingReadout::Invalid, 0, GraphKind::Decode, 1, 1, 1);
         let lock = telemetry.history.lock().unwrap();
-        telemetry.publish(sample(), 0, GraphKind::Decode, 1, 1);
+        telemetry.publish(sample(), 0, GraphKind::Decode, 1, 1, 1);
         drop(lock);
         let value = telemetry.snapshot(0, "fixture");
         assert_eq!(value["invalid_total"], 1);

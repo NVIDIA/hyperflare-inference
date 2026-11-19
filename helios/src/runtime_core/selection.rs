@@ -45,7 +45,7 @@ pub struct LoadOptions {
 }
 
 fn routing_target(graph: &super::wire::ExecutionGraph) -> bool {
-    matches!(graph.kind.as_str(), "decode" | "prefill" | "scored_prefill" | "speculative")
+    matches!(graph.kind.as_str(), "decode" | "prefill" | "terminal_prefill" | "scored_prefill" | "speculative")
 }
 
 fn validate_routing_catalog(execution: &super::wire::Execution, enabled: bool, speculation: bool) -> Result<()> {
@@ -269,7 +269,7 @@ impl LoadOptions {
                         && graph.prefill_capacity <= config["prefill_chunk_size"].as_u64().unwrap_or(0)
                         && graph.speculation_enabled.is_some()
                         && if speculative { (1..=crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) as u64).contains(&graph.token_capacity) } else { graph.token_capacity == 1 },
-                    GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Vision => graph.batch_capacity == 1 && graph.token_capacity > 0,
+                    GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill | GraphKind::Vision => graph.batch_capacity == 1 && graph.token_capacity > 0,
                     GraphKind::Speculative => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && (1..=crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) as u64).contains(&graph.token_capacity),
                     _ => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && graph.token_capacity == 1,
                 };
@@ -1383,15 +1383,16 @@ mod tests {
     fn prefill_selection_matches_the_decode_mode() {
         for drafts in [0, 5] {
             let mut p = core();
-            for enabled in [false, true] {
-                let name = format!("prefill64-{enabled}");
+            for (kind, enabled) in ["prefill", "terminal_prefill"].into_iter()
+                .flat_map(|kind| [false, true].map(|enabled| (kind, enabled))) {
+                let name = format!("{kind}64-{enabled}");
                 p.execution
                     .as_mut()
                     .unwrap()
                     .graphs
                     .push(wire::ExecutionGraph {
                         name: name.clone(),
-                        kind: "prefill".into(),
+                        kind: kind.into(),
                         sampling_mode: "general".into(),
                         estimated_duration_ns: 1000,
                         batch_capacity: 1,
@@ -1401,7 +1402,7 @@ mod tests {
                     });
                 p.graphs.push(Graph {
                     name,
-                    resource: "prefill".into(),
+                    resource: kind.into(),
                     node_count: 1,
                     edge_count: 0,
                     flags: 0,
@@ -1420,10 +1421,10 @@ mod tests {
                 .unwrap()
                 .graphs
                 .iter()
-                .filter(|g| g.kind == "prefill")
+                .filter(|g| matches!(g.kind.as_str(), "prefill" | "terminal_prefill"))
                 .collect();
-            assert_eq!(selected.len(), 1);
-            assert_eq!(selected[0].speculation_enabled, Some(drafts > 0));
+            assert_eq!(selected.len(), 2);
+            assert!(selected.iter().all(|g| g.speculation_enabled == Some(drafts > 0)));
         }
     }
     fn mixed_core() -> Core {

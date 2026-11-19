@@ -184,7 +184,7 @@ pub fn metadata() -> PreparedContract {
                         binding("vision_feature_slot", ImageFeatureSlot, Scalar, 0, -1),
                     ]);
                 }
-                graphs.push(GraphContract { tuned_bindings: vec![],
+                graphs.push(GraphContract { terminal_prefill_min_tokens: 0, tuned_bindings: vec![],
                     graph: format!("{kind:?}-{batch}-{width}"),
                     kind: kind.try_into().unwrap(),
                     inputs,
@@ -346,6 +346,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 GraphOperation::Restore => GraphKind::Restore,
                 GraphOperation::Snapshot => GraphKind::Snapshot,
                 GraphOperation::Prefill => GraphKind::Prefill,
+                GraphOperation::TerminalPrefill => GraphKind::TerminalPrefill,
                 GraphOperation::ScoredPrefill => GraphKind::ScoredPrefill,
                 GraphOperation::Decode => GraphKind::Decode,
                 GraphOperation::Resume => GraphKind::Resume,

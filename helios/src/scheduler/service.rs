@@ -164,7 +164,8 @@ impl RequestScheduler {
                 consider(GraphKind::Snapshot, batch, 1, 0.0, true);
             }
         } else if prefill {
-            for &capacity in &self.prefill_catalog {
+            for &capacity in self.prefill_catalog(request.prefill_kind()) {
+                let kind = self.prefill_operation(request, capacity);
                 let work = self.prefill_work(request, capacity);
                 if work == 0 {
                     continue;
@@ -172,7 +173,7 @@ impl RequestScheduler {
                 let first_output =
                     request.consumed_tokens + work as u64 == request.prompt_tokens as u64;
                 consider(
-                    GraphKind::Prefill,
+                    kind,
                     1,
                     capacity,
                     work as f64 + f64::from(first_output),
@@ -264,7 +265,7 @@ impl RequestScheduler {
                 .iter()
                 .find(|l| l.request == request.handle);
             let (tokens, delivery) = match (submission.kind, lane) {
-                (GraphKind::Prefill | GraphKind::ScoredPrefill, Some(l)) => (l.tokens as f64, 0.0),
+                (GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill, Some(l)) => (l.tokens as f64, 0.0),
                 (GraphKind::Decode | GraphKind::Speculative, Some(_)) =>
                     (submission.expected_tokens[request.handle.slot as usize], 1.0),
                 _ => (0.0, 0.0),

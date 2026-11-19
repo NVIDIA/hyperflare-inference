@@ -121,7 +121,7 @@ default residency. Cores without them retain static loading behavior. See
 [row storage](../docs/parallax.md#expert-row-storage) for implementation and
 qualification scope.
 
-Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `scored_prefill`,
+Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `terminal_prefill`, `scored_prefill`,
 `decode`, `speculative`, `mixed`, `resume`, and `vision`. Decode and speculative
 batch capacities are powers of two through 64. Decode has one token per lane.
 A speculative graph performs complete proposal, optional confidence/allocation,
@@ -138,7 +138,7 @@ A mixed graph has a power-of-two batch capacity from 2 through the request
 storage capacity, W from 1 through T, and a `prefill_capacity` that is a positive
 multiple of 64. It binds the `int32[1]` `prefill_row` input. Every other kind
 sets `prefill_capacity` to zero.
-Prefill and scored prefill have batch capacity 1. Their token capacities are 1,
+Prefill, terminal prefill, and scored prefill have batch capacity 1. Their token capacities are 1,
 16, or a positive multiple of 64. The model configuration separately requires the captured
 catalog for its `prefill_chunk_size`; transport validation does not infer a
 scheduling policy or substitute a missing graph.
@@ -233,7 +233,7 @@ this output from the execution manifest, preventing routing readback. Explicit
 `--parallax-routing` requires traced counterparts for every target graph in the
 selected ordinary or MTP mode. Packages with only ordinary traced graphs still
 require MTP disabled when tracing. Paired variants must agree on geometry and
-input bindings. Decode, prefill, scored-prefill and complete speculative graphs reset the selected frame and
+input bindings. Decode, prefill, terminal-prefill, scored-prefill and complete speculative graphs reset the selected frame and
 write one row per canonical layer:
 `[submission_sequence, valid_tokens, top_k, invalid_route_count, expert_counts...]`.
 Dense layers write zero token/top-K/count fields. Counts exclude padded rows and

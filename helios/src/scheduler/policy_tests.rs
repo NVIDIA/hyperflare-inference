@@ -10,6 +10,42 @@ use crate::execution::{ExecutionTiming, SamplingMode, TokenVector};
 
 const MS: u64 = 1_000_000;
 
+#[test]
+fn intermediate_prefill_prices_the_measured_terminal_tail_before_selecting_a_chunk() {
+    for (intermediate_ms, tail_ms, expected_kind, expected_tokens) in [
+        (25, 50, GraphKind::TerminalPrefill, 512),
+        (10, 20, GraphKind::Prefill, 256),
+    ] {
+        let mut s = engine(1, false);
+        let capacities = [256, 512];
+        s.prefill_graphs(&capacities).unwrap();
+        s.terminal_prefill_graphs(129, &capacities).unwrap();
+        let mut graphs = super::tests::duration_graphs(1);
+        let terminal: Vec<_> = graphs.iter().filter(|g| g.kind == GraphKind::Prefill
+            && capacities.contains(&g.token_capacity)).cloned().map(|mut g| {
+                g.kind = GraphKind::TerminalPrefill;
+                g.name = format!("terminal-{}", g.token_capacity);
+                g
+            }).collect();
+        graphs.extend(terminal);
+        s.measured_graph_durations(&graphs).unwrap();
+        set_cost(&mut s, GraphKind::Prefill, 1, 256, intermediate_ms * MS);
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, 256, tail_ms * MS);
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, 512, 60 * MS);
+        let handle = add(&mut s, 1, 512, 1);
+        assert_eq!(step(&mut s, 0).kind, GraphKind::Init);
+        let plan = s.plan().unwrap();
+        assert_eq!((plan.kind, plan.lanes[0].tokens), (expected_kind, expected_tokens));
+        assert_eq!(plan.lanes[0].request, handle);
+        assert_eq!(s.request(handle).unwrap().consumed_tokens, 0);
+        // Planning future completion neither commits the tail nor extends the
+        // duration of the one graph actually submitted.
+        assert_eq!(plan.estimated_duration_ns(), if expected_kind == GraphKind::Prefill {
+            intermediate_ms * MS
+        } else { 60 * MS });
+    }
+}
+
 #[path = "planning_tests.rs"]
 mod planning_tests;
 
@@ -2532,6 +2568,86 @@ fn initial_unknown_graph_completions_neither_earn_nor_spend_refresh_credit() {
         assert_eq!(s.refresh_credit_ns(), 0.0);
         assert!(!s.refresh.active());
     }
+}
+
+#[test]
+fn optional_prefill_discovery_does_not_displace_competing_measured_service() {
+    for competing in [false, true] {
+        let mut s = cold_engine(2, false);
+        let decoder = competing.then(|| add(&mut s, 1, 64, 4096));
+        if let Some(handle) = decoder { ready(&mut s, &[handle]); }
+        set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+        let prompt = add(&mut s, 2, 2048, 1);
+        initialize(&mut s, prompt);
+        s.refresh.credit_ns = 0.0;
+        let first = measured_step(&mut s, 200 * MS, 0);
+        assert_eq!((first.kind, first.token_capacity, first.origin),
+                   (GraphKind::Prefill, 512, PlanOrigin::Discovery));
+        let next = s.plan().unwrap();
+        if competing {
+            assert_eq!(next.origin, PlanOrigin::Ordinary);
+            assert!(next.estimated_duration_ns() > 0);
+        } else {
+            assert_eq!((next.kind, next.token_capacity, next.origin),
+                       (GraphKind::Prefill, 256, PlanOrigin::Discovery));
+        }
+    }
+}
+
+#[test]
+fn optional_discovery_spends_measured_time_and_requires_fresh_funding() {
+    let mut s = cold_engine(2, false);
+    let decoder = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[decoder]);
+    set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+    let prompt = add(&mut s, 2, 2048, 1);
+    initialize(&mut s, prompt);
+    measured_step(&mut s, 200 * MS, 0);
+    s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+    let probe = s.plan().unwrap();
+    assert_eq!((probe.kind, probe.token_capacity, probe.origin),
+               (GraphKind::Prefill, 256, PlanOrigin::DiscoveryStart));
+    let fence = Fence(s.submitted.0 + 1);
+    s.refresh.credit_ns = 0.0;
+    assert!(s.commit(&probe, fence).is_err());
+    assert_eq!(s.request(prompt).unwrap().consumed_tokens, 512);
+    assert_eq!(s.request(prompt).unwrap().pending, 0);
+    s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+    s.commit(&probe, fence).unwrap();
+    assert!(s.submitted_step(fence).unwrap().requires_feedback);
+    let timing = s.submitted_timing(fence).unwrap();
+    assert_eq!(timing.origin, TimingOrigin::Discovery);
+    assert_eq!(timing.refresh_episode, Some(fence.0));
+    s.advance_to(s.now_ns + 100 * MS).unwrap();
+    complete_timed(&mut s, &probe, fence, 0, true, gpu_time(100 * MS));
+    assert_eq!(s.refresh_credit_ns(), refresh::CREDIT_CAP_NS - (100 * MS) as f64);
+    assert!(!s.refresh.active());
+    let mut measured = s.plan().unwrap();
+    assert_eq!(measured.origin, PlanOrigin::Ordinary);
+    measured.origin = PlanOrigin::DiscoveryStart;
+    s.refresh.credit_ns = refresh::CREDIT_CAP_NS;
+    let before = s.request(prompt).unwrap().consumed_tokens;
+    assert!(s.commit(&measured, Fence(fence.0 + 1)).unwrap_err().to_string()
+        .contains("unmeasured physical graph"));
+    assert_eq!(s.request(prompt).unwrap().consumed_tokens, before);
+    assert_eq!(s.refresh_credit_ns(), refresh::CREDIT_CAP_NS);
+}
+
+#[test]
+fn discovery_debt_does_not_block_a_requests_untimed_prerequisites() {
+    let mut s = cold_engine(2, false);
+    let decoder = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[decoder]);
+    set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+    let prompt = add(&mut s, 2, 2048, 1);
+    s.refresh.credit_ns = -((100 * MS) as f64);
+    let init = measured_step(&mut s, MS, 0);
+    assert_eq!((init.kind, init.origin), (GraphKind::Init, PlanOrigin::Discovery));
+    assert_eq!(init.lanes[0].request, prompt);
+    let prefill = measured_step(&mut s, 200 * MS, 0);
+    assert_eq!((prefill.kind, prefill.origin), (GraphKind::Prefill, PlanOrigin::Discovery));
+    assert_eq!(prefill.lanes[0].request, prompt);
+    assert_eq!(s.refresh_credit_ns(), -((100 * MS) as f64));
 }
 
 #[test]

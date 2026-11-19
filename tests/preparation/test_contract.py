@@ -168,3 +168,21 @@ def test_prompt_scoring_is_an_additive_catalog_and_serialization_contract():
     old_prefill = p.GraphContract.FromString(before[0].SerializeToString())
     assert old_prefill.kind == p.PREFILL
     assert not any(b.source == p.PROMPT_TARGET_TOKEN for b in old_prefill.inputs)
+
+
+def test_terminal_prefill_preserves_inputs_and_declares_reconstruction_minimum():
+    from ignition.recipes.deepseek41.contract import prepare
+
+    signatures = {kind: GraphSignature(kind, 1, 512, tuple(c.text_inputs(kind)),
+        speculation_enabled=True, routing_trace=True)
+        for kind in ("prefill", "terminal_prefill")}
+    pool = SimpleNamespace(pages={}, config=SimpleNamespace(text={"sliding_window": 128}),
+        layout=SimpleNamespace(row_bytes=32, region=lambda _: SimpleNamespace(offset=24, nbytes=8)))
+    encoded = ParseDict(prepare(signatures, {}, pool, page_tokens=128, draft_lag=0), p.ModelContract())
+    assert encoded.version == 4
+    ordinary, terminal = encoded.graphs
+    assert ordinary.kind == p.PREFILL and terminal.kind == p.TERMINAL_PREFILL
+    assert ordinary.terminal_prefill_min_tokens == 0
+    assert terminal.terminal_prefill_min_tokens == 129
+    assert ordinary.inputs == terminal.inputs
+    assert ordinary.state == terminal.state

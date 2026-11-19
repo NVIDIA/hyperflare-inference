@@ -18,6 +18,7 @@ def state_view(buffer, stride, *, offset=0, nbytes=None):
 
 def text_inputs(kind):
     """Uploads for the shared admission, paged-text, and state-transfer components."""
+    kind = "prefill" if kind == "terminal_prefill" else kind
     b = binding
     values = [b("request_state_rows", p.LIVE_STATE_ROWS, p.REQUEST_ROW)]
     if kind not in ("init", "restore"):
@@ -71,15 +72,15 @@ def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, r
     """Bind semantic uploads to the captured catalog; omitted transfers retain device bytes."""
     result = []
     for name, signature in signatures.items():
-        kind = signature.kind
-        selected = dict(inputs[kind])
+        kind = "prefill" if signature.kind == "terminal_prefill" else signature.kind
+        selected = dict(inputs[signature.kind])
         if kind == "speculative" and "speculative_prefix_limits" in signature.inputs:
             selected["speculative_prefix_limits"] = binding("speculative_prefix_limits", p.SPECULATIVE_PREFIX_LIMIT)
         values = [selected[field] for field in signature.inputs if field in selected]
         states = [] if kind == "vision" else [dict(view=continuation, access=p.READ_WRITE)]
         if pending is not None and kind not in ("snapshot", "vision"):
             states.append(dict(view=pending, access=p.WRITE if kind in ("init", "restore") else p.READ_WRITE))
-        result.append(dict(graph=name, kind=p.GraphOperation.Value(kind.upper()), inputs=values, state=states,
+        result.append(dict(graph=name, kind=p.GraphOperation.Value(signature.kind.upper()), inputs=values, state=states,
             tuned_bindings=[],
             state_rows_per_request=signature.token_capacity if rows is None and kind == "speculative" else (rows or 1),
             draft_cursor=cursor if signature.speculation_enabled and kind in ("speculative", "mixed") else None,

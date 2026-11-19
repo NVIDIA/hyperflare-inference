@@ -135,10 +135,11 @@ def _prefill(model, runner, layout, case, tokenizer, seed, generation):
 
             request = prefilling[0]
             count = min(case.context_tokens - request.consumed, layout.prefill_chunk)
-            step = scheduler._step("prefill", count, [Lane(request, request.consumed, count)])
+            kind = "terminal_prefill" if layout.terminal_prefill_min_tokens else "prefill"
+            step = scheduler._step(kind, count, [Lane(request, request.consumed, count)])
         else:
             step = scheduler.plan()
-        if step is None or step.kind not in ("init", "prefill", "resume"):
+        if step is None or step.kind not in ("init", "prefill", "terminal_prefill", "resume"):
             raise RuntimeError(f"benchmark prefill could not reach context {case.context_tokens}")
         elapsed = runner.run(_message(scheduler, step))
         records = _complete(model, runner, scheduler, step, elapsed)
@@ -186,7 +187,8 @@ def _prefill_step(scheduler, case):
     requests = scheduler.active
     if len(requests) != 1 or requests[0].phase != "prefill" or requests[0].consumed != case.context_tokens:
         raise RuntimeError("prefill benchmark state does not match the requested prefix")
-    step = scheduler._step("prefill", case.chunk_tokens,
+    kind = "terminal_prefill" if scheduler.layout.terminal_prefill_min_tokens else "prefill"
+    step = scheduler._step(kind, case.chunk_tokens,
                            [Lane(requests[0], case.context_tokens, case.chunk_tokens)])
     if step.width != case.chunk_tokens:
         raise ValueError("prefill benchmark requires an exact chunk graph without capacity padding")
@@ -386,7 +388,8 @@ def run_benchmark(prepared, tokenizer, *, scenarios, warmup=5, repetitions=20, s
         if case.context_tokens + required > layout.context or case.batch > layout.max_active:
             raise ValueError(f"benchmark case exceeds prepared capacities: {case}")
         if isinstance(case, PrefillCase):
-            if ("prefill", 1, case.chunk_tokens) not in layout.graphs or case.chunk_tokens != layout.prefill_chunk:
+            kind = "terminal_prefill" if layout.terminal_prefill_min_tokens else "prefill"
+            if (kind, 1, case.chunk_tokens) not in layout.graphs or case.chunk_tokens != layout.prefill_chunk:
                 raise ValueError(f"benchmark case has no exact prepared prefill chunk: {case}")
             continue
         _round_shape = ("speculative", case.batch, case.width, case.packed_tokens)

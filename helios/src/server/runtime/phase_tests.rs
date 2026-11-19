@@ -5504,7 +5504,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
         });
         manifest.input_frame_bytes += 16;
     }
-    fixture.config.contract.graphs.push(GraphContract { tuned_bindings: vec![],
+    fixture.config.contract.graphs.push(GraphContract { terminal_prefill_min_tokens: 0, tuned_bindings: vec![],
         graph: "Vision-1-256".into(),
         kind: GraphOperation::Vision,
         inputs: semantic,

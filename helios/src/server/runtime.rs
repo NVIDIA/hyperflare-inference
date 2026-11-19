@@ -652,7 +652,11 @@ impl ModelRuntime {
                                 .filter(|graph| graph.kind == crate::execution::GraphKind::Prefill)
                                 .map(|graph| graph.token_capacity)
                                 .collect::<Vec<_>>(),
-                        )
+                        )?;
+                        let minimum = worker_config.contract.graphs.iter()
+                            .map(|g| g.terminal_prefill_min_tokens).max().unwrap_or(0);
+                        scheduler.terminal_prefill_graphs(minimum, &executor.manifest().graphs.iter()
+                            .filter(|g| g.kind == GraphKind::TerminalPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())
                     })
                     .and_then(|()| {
                         scheduler.speculative_graphs(
@@ -1636,6 +1640,7 @@ impl<'a> Worker<'a> {
         if matches!(
             kind,
             GraphKind::Prefill
+                | GraphKind::TerminalPrefill
                 | GraphKind::ScoredPrefill
                 | GraphKind::Decode
                 | GraphKind::Speculative
@@ -1686,7 +1691,7 @@ impl<'a> Worker<'a> {
                 verification_drafts, verification_rounds);
         self.metrics.replay_completed(completion.timing);
         if let Some(routing) = completion.routing.take() {
-            self.metrics.parallax.publish(routing, completion.graph_index, kind,
+            self.metrics.parallax.publish(routing, completion.graph_index, kind, measured_step.token_capacity,
                 measured_step.lanes.len(), self.scheduler.stats().active_requests);
         }
         if prefill > 0 && self.store.is_some() {

@@ -474,6 +474,8 @@ mod tests {
         Record {
             sequence,
             graph: 0,
+            operation: crate::execution::GraphKind::Decode,
+            token_capacity: 1,
             phase: "decode",
             batch_size: 1,
             concurrency: 1,
