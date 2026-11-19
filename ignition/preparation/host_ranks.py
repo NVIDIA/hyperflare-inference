@@ -500,7 +500,7 @@ class HostRankGroup:
                 # `combine` still sees them after peer processes exit.
                 result = combine(None if cache_only else path, roots, [], publisher=publisher,
                                  cluster=(self.rendezvous.world, export_id), form=form,
-                                 cache_only=cache_only)
+                                 cache_only=cache_only, stage=native_stage)
             print_inventory(inventories, console=getattr(progress, "console", None))
         finally:
             with phase(progress, "Clear export staging"):
