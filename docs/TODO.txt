@@ -510,3 +510,11 @@
     helios/src/output/xtml.rs fails the call with "invalid XTML JSON argument".
     Close when XTML retains the text with tests, or docs/api.md states that the
     difference is intended.
+
+[ ] Fold Muse Glimmer's attention back onto Muse Spark's.
+    ignition/recipes/muse_glimmer_nvfp4/attention.py takes packed metadata per
+    forward and returns local values, which PreparedGeneration and
+    PreparedParallelDraftRound require; ignition/recipes/muse_spark/attention.py
+    binds its metadata and scratch at construction. Remove the Glimmer module
+    when Spark's attention accepts per-forward metadata, by importing it with
+    Glimmer's separate gate projection and unnormalized gate input.
