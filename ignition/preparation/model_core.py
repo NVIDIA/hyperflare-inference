@@ -34,7 +34,6 @@ def export_core(prepared, images, storage, path, *, options, publisher, progress
     # Native chooses the workspace; a cache-only export has no destination.
     native_stage = flare_heliopause.NativeExportStage(
         None if cache_only else Path(path), staging, settings.cache)
-    stage = Path(native_stage.path)
     token = _OPTIONS.set(settings)
     result = None
     try:
@@ -72,7 +71,7 @@ def export_core(prepared, images, storage, path, *, options, publisher, progress
             for region in storage.host_regions:
                 region.close()
         result = combine(None if cache_only else path, roots, peers,
-                         publisher=publisher, form=form, cache_only=cache_only)
+                         publisher=publisher, form=form, cache_only=cache_only, stage=native_stage)
         print_inventory(inventories, console=console or getattr(progress, "console", None))
     finally:
         _OPTIONS.reset(token)

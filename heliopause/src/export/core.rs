@@ -489,7 +489,7 @@ fn export_payload(
     .map_err(py_error)
 }
 #[pyfunction]
-#[pyo3(signature=(path,ranks,peer_memory,publisher,cluster,cache,no_weights=false,form="directory"))]
+#[pyo3(signature=(path,ranks,peer_memory,publisher,cluster,cache,no_weights=false,form="directory",*,stage=None))]
 fn export_combine(
     py: Python<'_>,
     path: String,
@@ -500,8 +500,10 @@ fn export_combine(
     cache: Option<String>,
     no_weights: bool,
     form: &str,
+    stage: Option<PyRef<'_, super::binding::NativeExportStage>>,
 ) -> PyResult<String> {
-    py.detach(|| {
+    let stage = stage.as_deref();
+    let publish = |workspace: Option<&Path>| -> Result<String> {
         let sources: Result<Vec<_>> = ranks.iter().map(|p| read_sources(Path::new(p))).collect();
         let sources = sources?;
         let peers: Vec<wire::PeerMemory> = serde_json::from_str(&peer_memory)?;
@@ -514,7 +516,7 @@ fn export_combine(
             .map(|p| p.publisher())
             .transpose()?;
         let publisher = publisher.ok_or_else(|| invalid("export requires a publisher identity"))?;
-        let result = publish_payload(
+        let result = publish_payload_in(
             Path::new(&path),
             &sources,
             peers,
@@ -523,8 +525,13 @@ fn export_combine(
             cache.map(PathBuf::from),
             no_weights,
             form,
+            workspace,
         )?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(serde_json::to_string(&result)?)
+        Ok(serde_json::to_string(&result)?)
+    };
+    py.detach(|| match stage {
+        Some(stage) => stage.with_workspace(|directory| publish(Some(directory))),
+        None => publish(None),
     })
     .map_err(py_error)
 }
@@ -604,6 +611,23 @@ pub(crate) fn publish_payload(
     no_weights: bool,
     form: &str,
 ) -> Result<serde_json::Value> {
+    publish_payload_in(
+        path, ranks, peer_memory, cluster, publisher, cache, no_weights, form, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_payload_in(
+    path: &Path,
+    ranks: &[RankOutput],
+    peer_memory: Vec<wire::PeerMemory>,
+    cluster: Option<wire::Cluster>,
+    publisher: &protection::Publisher,
+    cache: Option<PathBuf>,
+    no_weights: bool,
+    form: &str,
+    workspace: Option<&Path>,
+) -> Result<serde_json::Value> {
     if !matches!(form, "directory" | "packed") {
         return Err(invalid(format!("unknown core form {form:?}")));
     }
@@ -638,10 +662,22 @@ pub(crate) fn publish_payload(
             .unwrap_or(Path::new("."))
     };
     fs::create_dir_all(parent)?;
-    let staging_directory = tempfile::Builder::new()
-        .prefix(".flare-payload-")
-        .tempdir_in(parent)?;
+    let scratch_in = |directory: &Path| {
+        tempfile::Builder::new()
+            .prefix(".flare-payload-")
+            .tempdir_in(directory)
+    };
+    // Standalone packed files and directory trees are linked or renamed beside
+    // the destination. Plain assembly files only need the live export workspace.
+    let staging_directory = scratch_in(if cache_only { workspace.unwrap_or(parent) } else { parent })?;
     let staging = staging_directory.path().to_path_buf();
+    let assembly_directory = workspace
+        .filter(|_| !cache_only)
+        .map(scratch_in)
+        .transpose()?;
+    let assembly_path = assembly_directory
+        .as_ref()
+        .map_or(staging.as_path(), |directory| directory.path());
     let progress = helios_core::startup::StartupProgress::stderr_rows();
     let result = (|| -> Result<serde_json::Value> {
         let assembly = progress.phase("Assemble core payloads", Some(ranks.len() as u64));
@@ -672,7 +708,7 @@ pub(crate) fn publish_payload(
             let (id, nbytes, source) = payload_source(
                 root_payload,
                 span,
-                &staging,
+                assembly_path,
                 &format!("frontend-{position}.payload"),
             )?;
             let tensor = format!(
@@ -760,7 +796,7 @@ pub(crate) fn publish_payload(
                 core_engram(
                     engram,
                     root_payload,
-                    &staging,
+                    assembly_path,
                     &deployment_id,
                     &mut engram_payloads,
                 )
@@ -790,7 +826,7 @@ pub(crate) fn publish_payload(
                 position as u32,
                 rank_count,
                 &peer_memory,
-                &staging,
+                assembly_path,
                 &deployment_id,
                 cache_root.as_ref(),
                 &mut leases,

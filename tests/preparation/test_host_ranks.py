@@ -235,6 +235,7 @@ def test_host_export_cache_only_uses_native_workspace_and_staging(tmp_path, monk
     class Stage:
         def __init__(self, destination, staging, cache):
             calls['stage'] = (destination, staging, cache)
+            calls['stage_owner'] = self
             self.path = str(tmp_path / 'workspace')
             (tmp_path / 'workspace').mkdir(exist_ok=True)
 
@@ -295,6 +296,7 @@ def test_host_export_cache_only_uses_native_workspace_and_staging(tmp_path, monk
     destination, _roots, kwargs = calls['combine']
     assert destination is None
     assert kwargs['cache_only'] is True
+    assert kwargs['stage'] is calls['stage_owner']
     assert result.model == 'm'
 
 
