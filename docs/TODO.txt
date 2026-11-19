@@ -509,3 +509,9 @@
     test_every_recipe_passes_collective_policy_to_preparation rewrites a TP4
     ladder to DeepSeek V4.1 TP3 or Muse Spark TP8; b12x rejects those gather
     and word-exchange candidates before the preparation handoff is tested.
+
+[ ] Decide whether an XTML typed argument value that is not valid JSON is
+    retained as a string, as tagged and DeepSeek string="false" values are.
+    helios/src/output/xtml.rs fails the call with "invalid XTML JSON argument".
+    Close when XTML retains the text with tests, or docs/api.md states that the
+    difference is intended.
