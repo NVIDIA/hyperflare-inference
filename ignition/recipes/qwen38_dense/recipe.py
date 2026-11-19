@@ -34,7 +34,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         online_mxfp8=plan.online_mxfp8,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         max_active=plan.concurrency if selection is None else selection.max_batch, context=plan.context,
-        prefill_chunk_size=plan.prefill_chunk,
+        image_concurrency=plan.image_concurrency, prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, mtp=speculation is not None,
@@ -67,6 +67,7 @@ RECIPE = Recipe(
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64,
                             method="dflash2"), max_draft_tokens=15, verification_rows=0,
     online_mxfp8=True, draft_head_quantizations=("mxfp8", "nvfp4"),
+    max_images=4, image_bytes=32 << 20,
     # Reserve continuation memory for the supported sixteen-token verification capacity.
     ranks=MappingProxyType({1: RankCosts(193_865_984, 4_194_304, 4 << 30)}),
     plain_ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30)}),

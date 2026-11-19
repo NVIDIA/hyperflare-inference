@@ -15,6 +15,7 @@ from ignition.components.tensor_fp8 import TensorFP8Weight
 from ignition.components.weights import DirectWeightLoader, quantize_bf16_linear_as_mxfp8
 
 from .config import ModelConfig, TEXT_PREFIX
+from .vision import VisionWeights
 
 
 def _gdn_projection_groups(config, loader):
@@ -45,6 +46,7 @@ class ModelWeights:
     shard: TensorParallelShard = TensorParallelShard(0, 1)
     draft: object = None
     draft_head: object = None
+    vision: object = None
 
     @classmethod
     def load(cls, manifest, device, *, progress=None, mtp=False, draft_snapshot=None,
@@ -60,7 +62,7 @@ class ModelWeights:
         tree = canonical_tree(Qwen3_5TextModel, Qwen3_5TextConfig.from_dict(config.text))
         projections = {}
         before = allocated_tensor_bytes(device)
-        with DirectWeightLoader(manifest, device, prefixes=(TEXT_PREFIX + ".", "lm_head."),
+        with DirectWeightLoader(manifest, device, prefixes=(TEXT_PREFIX + ".", "lm_head.", "model.visual."),
                                 progress=progress) as loader:
             mlp_groups = {
                 f"layers.{index}.mlp.": tuple(TEXT_PREFIX + f".layers.{index}.mlp." + field
@@ -176,6 +178,13 @@ class ModelWeights:
                                 [module.out_features for module in modules]), strict=True):
                             module.weight = torch.nn.Parameter(tensor, requires_grad=False)
                 projections[name] = combined
+            vision = None
+            if config.vision is not None:
+                from transformers import Qwen3_5VisionConfig, Qwen3_5VisionModel
+
+                vision_tree = canonical_tree(Qwen3_5VisionModel,
+                    Qwen3_5VisionConfig.from_dict(config.vision))
+                vision = VisionWeights.load(vision_tree, loader)
         draft = None
         draft_head = None
         if mtp:
@@ -190,4 +199,4 @@ class ModelWeights:
                 converters = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}
                 draft_head = converters[draft_head_quantization](head)
         return cls(config, tree, projections, head, allocated_tensor_bytes(device) - before,
-                   draft=draft, draft_head=draft_head)
+                   draft=draft, draft_head=draft_head, vision=vision)

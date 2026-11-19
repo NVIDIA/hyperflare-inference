@@ -154,7 +154,11 @@ def image_settings(config, model, profile):
     optional = {"resample": 3, "rescale_factor": 1 / 255,
         "do_resize": True, "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
     _expected(config, {key: value for key, value in optional.items() if key in config}, "image processor")
-    _expected(model, {"model_type": "qwen4_exp" if qwen else "mimo_v2"}, "model configuration")
+    if qwen:
+        if model.get("model_type") not in ("qwen4_exp", "qwen3_5"):
+            raise ValueError("unsupported model configuration model_type")
+    else:
+        _expected(model, {"model_type": "mimo_v2"}, "model configuration")
     vision = model["vision_config"]
     _expected(vision, {"patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2}, "vision configuration")
     if qwen:

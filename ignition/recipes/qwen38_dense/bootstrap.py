@@ -21,7 +21,7 @@ from ignition.components.prompt_logprobs import (
 from ignition.components.dflash2 import PreparedContext
 from ignition.components.capacity import (
     parallel_speculative_shapes, batch_capacities, prefill_capacities,
-    request_capacity, speculative_token_capacity, serving_modes,
+    request_capacity, speculative_token_capacity, serving_modes, image_capacity,
 )
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
@@ -50,6 +50,14 @@ from .decoder import PreparedDecoder, Scratch
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
 from .dflash import SpeculativePreparation
+from .vision import PreparedVision, VisionScratch
+from .vision_state import (
+    PreparedEmbeddingInjection,
+    PreparedVisionGeneration,
+    PreparedVisionHandoff,
+    VisionFeatureState,
+    VisionInputs,
+)
 
 
 @dataclass(frozen=True)
@@ -81,6 +89,7 @@ class PreparationConfig:
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = 128
     mtp_only: bool = False
+    image_concurrency: int | None = None
 
     def __post_init__(self):
         if self.mtp_only and (not self.mtp
@@ -88,6 +97,7 @@ class PreparationConfig:
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 16:
             raise ValueError("Qwen dense supports at most fifteen draft tokens")
+        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         request_capacity(self.max_active)
         selection = self.benchmark_selection
         if selection is not None:
@@ -169,7 +179,8 @@ def _declared_weight_roots(weights):
     declared `layers.N.` prefix here, never by native path inference.
     """
     roots = {'embedding': weights.tree.embed_tokens, 'norm': weights.tree.norm,
-             'head': weights.head, 'draft': weights.draft, 'draft_head': weights.draft_head}
+             'head': weights.head, 'draft': weights.draft, 'draft_head': weights.draft_head,
+             'vision': weights.vision}
     components = {name: name for name in roots}
     prepared = dict(weights.projections)
     for index, layer in enumerate(weights.tree.layers):
@@ -228,9 +239,15 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
+        has_vision = weights.vision is not None
+        vision_inputs = VisionInputs.allocate(device) if has_vision else None
+        features = (VisionFeatureState.allocate(device, capacity=slots, image_slots=config.image_concurrency,
+            feature_slot=inputs.vision_feature_slot) if has_vision else None)
+        vision_scratch = {}
         coordinator = None
         identity = hashlib.sha256(json.dumps({
-            "config": weights.config.text, "headers": [s.header_sha256 for s in manifest.shards],
+            "config": weights.config.text, "vision": weights.config.vision,
+            "headers": [s.header_sha256 for s in manifest.shards],
             "draft": None if weights.config.draft is None else weights.config.draft.text,
             "draft_headers": draft_headers,
             "draft_block_size": config.verification_width if config.mtp else None,
@@ -253,6 +270,7 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         decode_storage = Scratch.allocate(decode_tokens, config.decode_samples, weights.config, device)
         buffers = dict(inputs.buffers(), **commands.buffers(),
             **{name: getattr(admission, name) for name in admission.__dataclass_fields__},
+            **({} if not has_vision else vision_inputs.buffers()),
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
             request_pending_token=requests.pending_token,
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
@@ -269,6 +287,7 @@ def prepare(snapshot, config, *, progress=None, core_storage):
                 study_width=study_width)
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame)
     forwards, signatures = {}, {}
+    vision_owners = []
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     if config.benchmark_selection is not None:
         prefill_sizes = config.benchmark_selection.prefill_capacities(config.prefill_chunk_size)
@@ -283,6 +302,24 @@ def prepare(snapshot, config, *, progress=None, core_storage):
             forwards[name] = forward
             signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled, packed_token_capacity=packed)
 
+        if has_vision:
+            from transformers import Qwen3_5VisionConfig, Qwen3_5VisionModel
+
+            vision_fields = (*vision_inputs.__dataclass_fields__, "vision_feature_slot")
+            for capacity in (16384, 4096, 1024, 256):
+                s = vision_scratch[capacity] = VisionScratch.allocate(capacity, device)
+                handoff = PreparedVisionHandoff(vision_inputs, features, requests, s.output, completion,
+                    frame, sequence, pixels=s.patches)
+                handoff.prepare()
+                with torch.device("meta"):
+                    module = Qwen3_5VisionModel(Qwen3_5VisionConfig.from_dict(weights.config.vision))
+                module.eval().requires_grad_(False)
+                encoder = PreparedVision(module, s, handoff.metadata, weights.vision, session=session,
+                    name=f"vision{capacity}", projection_workspace=arena, attention_workspace=arena)
+                add(f"vision{capacity}", PreparedVisionGeneration(handoff, encoder), "vision", 1, capacity,
+                    vision_fields, None)
+                vision_owners.extend((handoff, encoder))
+
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
         for enabled in modes:
             suffix = "-no-mtp" if config.mtp and not enabled else ""
@@ -294,9 +331,17 @@ def prepare(snapshot, config, *, progress=None, core_storage):
                     name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
                     m = Metadata.allocate(capacity, rows, blocks, device)
                     scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
+                    injection = None
+                    if has_vision and rows == 1:
+                        injection = PreparedEmbeddingInjection(features, requests,
+                            inputs.vision_token_indices[:capacity], inputs.row_slot_ids,
+                            inputs.row_generations, inputs.query_lengths, inputs.live_rows,
+                            scratch.activations, rows=rows)
+                        injection.prepare()
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
-                        vocabulary_runtime=None, coordinator=coordinator, session=session, name=name, workspace=arena)
+                        vocabulary_runtime=None, coordinator=coordinator, session=session, name=name,
+                        workspace=arena, embedding_injection=injection)
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool)
                     context = (partial(PreparedContext, runtime=None, coordinator=None,
                         compact_prefill=mode == "prefill") if enabled else None)
@@ -346,7 +391,7 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         stream=stream, pool=graph_pool, collective=None, coordinator=coordinator,
         compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
         retain_graphs=config.retain_graphs, materialize=pool.clear_for_preparation, warmup_storage=core_storage,
-        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "init", "restore", "snapshot"))
+        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "init", "restore", "snapshot", "vision"))
     for study in studies.values():
         study.capture(session=session, device=device, stream=stream, pool=graph_pool,
             compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
@@ -379,9 +424,11 @@ def prepare(snapshot, config, *, progress=None, core_storage):
     eos_ids = list(dict.fromkeys([*(eos if isinstance(eos, list) else [eos]), tokenizer_eos]))
     server_config = dict(identity=identity, model_id=snapshot.name, max_sequence_tokens=config.context,
         prefill_chunk_size=config.prefill_chunk_size, pages=pages, state_rows=state_rows, snapshots=snapshots,
-        page_tokens=PAGE_TOKENS, frontend=prepare_frontend(snapshot, eos_token_ids=eos_ids),
+        page_tokens=PAGE_TOKENS, frontend=prepare_frontend(snapshot, eos_token_ids=eos_ids,
+            image_profile="qwen" if has_vision else None),
         sampling_defaults=RECIPE.sampling_defaults.as_dict(), assets=assets,
-        model_contract=prepare_contract(signatures, buffers, pool, vocabulary=vocabulary))
+        model_contract=prepare_contract(signatures, buffers, pool, vocabulary=vocabulary,
+            image_slots=config.image_concurrency))
     if config.mtp and config.speculative_round_shapes:
         server_config.update(speculative_widths=config.speculative_widths,
             speculative_fixed_width=config.speculative_fixed_width,
@@ -433,10 +480,10 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         close_resources=(() if scoring is None else (scoring,)),
         graph_resources=(() if observers is None else (observers,)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
-                           *storage_ranges([arena.tensor,
+                           *storage_ranges([arena.tensor, vision_scratch,
                                             [f.scratch_tensors() for f in forwards.values() if hasattr(f, "scratch_tensors")]]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, compiled, stream, graph_pool, session, coordinator,
-                   speculation, studies, observers))
+                   vision_inputs, features, vision_scratch, vision_owners, speculation, studies, observers))
 
     if studies:
         from ignition.bench.study import StudyModel

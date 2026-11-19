@@ -20,6 +20,7 @@ class ModelConfig:
     text: dict
     quantization: dict
     draft: object = None
+    vision: dict | None = None
 
     @classmethod
     def load(cls, snapshot):
@@ -51,7 +52,7 @@ class ModelConfig:
             raise ValueError("Qwen dense preparation requires default partial rotary embeddings")
         if not 0 < float(rope.get("rope_theta", 0)) or not 0 < float(text.get("rms_norm_eps", 0)):
             raise ValueError("Qwen rotary frequency base and normalization epsilon must be positive")
-        return cls(text, dict(quantized_layers(raw)))
+        return cls(text, dict(quantized_layers(raw)), vision=raw.get("vision_config"))
 
     @property
     def layers(self):

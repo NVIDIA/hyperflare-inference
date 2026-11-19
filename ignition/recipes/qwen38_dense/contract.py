@@ -9,14 +9,22 @@ from ignition.preparation import runtime_core_pb2 as p
 from .config import PAGE_TOKENS
 
 
+VISION = {'features_per_request': 16384, 'max_images': 4, 'patches_per_feature': 4,
+          'patch_capacities': [256, 1024, 4096, 16384]}
 FRONTEND = c.frontend(tools=p.QWEN_CODER, wrapping_newlines=1, terminal_markers=["<tool_call>"],
     assistant_marker="<|im_start|>assistant\n", message_end_markers=["<|im_end|>"],
     prefix_boundary=c.prefix_boundary(["system", "developer"], append_role="user", minimum_messages=0,
-        required_start="<|im_start|>system\n", required_marker="<|im_end|>"))
+        required_start="<|im_start|>system\n", required_marker="<|im_end|>"),
+    image_tokens=dict(feature_token=248056, span=None),
+    image_preparation=p.QWEN_IMAGE_PREPARATION, image_layout=p.QWEN_IMAGE_LAYOUT, position_dimensions=3)
 
 
-def prepare(signatures, buffers, pool, *, vocabulary):
-    inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()}}
+def prepare(signatures, buffers, pool, *, vocabulary, image_slots=4):
+    inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()} if kind != "vision"}
+    has_vision = any(s.kind == "vision" for s in signatures.values())
+    if has_vision:
+        inputs["vision"] = c.vision_inputs({field for s in signatures.values() if s.kind == "vision"
+                                            for field in s.inputs})
     if "decode" in inputs:
         inputs["decode"].pop("token_ids", None)
     continuation = c.state_view("state_pool", pool.layout.row_bytes)
@@ -32,4 +40,5 @@ def prepare(signatures, buffers, pool, *, vocabulary):
         regions=[dict(kind=p.CONTINUATION_STATE, storage=continuation, tokens_per_record=1, window_tokens=0),
                  *regions],
         graphs=c.graph_contracts(signatures, inputs, continuation=continuation, pending=pending, cursor=cursor),
+        vision={**VISION, "feature_slots": image_slots} if has_vision else None,
         frontend=FRONTEND)

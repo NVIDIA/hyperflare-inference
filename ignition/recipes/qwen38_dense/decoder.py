@@ -295,8 +295,10 @@ class FullAttention(torch.nn.Module):
 
 class PreparedDecoder:
     def __init__(self, weights, scratch, metadata, pool, *, mode, vocabulary_runtime,
-                 coordinator, session, name, workspace, scoring=None, records=None):
+                 coordinator, session, name, workspace, scoring=None, records=None,
+                 embedding_injection=None):
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
+        self.embedding_injection = embedding_injection
         self.embedding = PreparedEmbedding(weights.tree.embed_tokens.weight, metadata.token_ids,
             scratch.activations, num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
         self.delta = DeltaMetadata.allocate(metadata.starts.numel(), scratch.activations.device,
@@ -461,7 +463,11 @@ class PreparedDecoder:
         frequency = m.positions.float()[:, None] * self.inverse_frequency[None, :]
         embedding = torch.cat((frequency, frequency), dim=-1)
         position_embeddings = embedding.cos().bfloat16(), embedding.sin().bfloat16()
+        if self.embedding_injection is not None:
+            self.embedding_injection.validate()
         hidden = self.embedding(token_ids=m.token_ids, num_rows=m.live_counts[:1])
+        if self.embedding_injection is not None:
+            self.embedding_injection.inject()
         records = (GDNLayerRecords.allocate(self.record_layers, self.record_rows, hidden.device,
             key_heads=16, value_heads=48, width=self.record_width) if self.record_layers else None)
         if self.context_capture is not None:
