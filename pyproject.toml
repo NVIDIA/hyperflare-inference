@@ -35,6 +35,9 @@ prepare = [
     "rich>=13",
 ]
 
+[tool.uv]
+override-dependencies = ["nvidia-cublas==13.6.1.10"]
+
 [[tool.uv.index]]
 name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"

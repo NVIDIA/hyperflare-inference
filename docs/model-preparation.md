@@ -74,6 +74,20 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
+`pyproject.toml` overrides the cuBLAS requirement of the locked CUDA 13.2
+packages and pins `nvidia-cublas` 13.6.1.10, which publishes wheels for x86_64
+and aarch64; the override applies to `uv` only. `cuda-toolkit` 13.2.2, which
+PyTorch requires, depends on `nvidia-cublas==13.4.1.3.*`, so a direct
+requirement conflicts with it. Preparation of every recipe uses this version;
+native serving (`flare run`) does not load cuBLAS. cuBLAS 13.4.1.3 is not
+supported for preparation: on SM120 its strided batched GEMM, called by the
+BF16 `torch.bmm` in `ignition/components/linear.py`, has returned
+`CUBLAS_STATUS_INTERNAL_ERROR` in GLM-5.3-Flash tests and in one TP4
+preparation of `local-inference-lab/GLM-5.3-Flash-NVFP4`; the cause is not
+established. Only x86_64 with SM120 is qualified with 13.6.1.10. SM103, SM121
+and aarch64, and the numerical difference between the two versions, are not
+qualified.
+
 `ignition.runtime_patches` installs process-local fixes for PyTorch 2.14.1+cu132
 and Triton 3.8.0. Preparation commands set dependency paths and GPU visibility
 before installation. Spawned ranks, tuning replicas, b12x compiler workers, and

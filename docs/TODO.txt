@@ -463,27 +463,6 @@
     six test_actual_dense_and_attention_shards cases with NVIDIA's snapshot read
     .weight of grouped projections, which have none. Close when they pass.
 
-[ ] Resolve the CUDA illegal memory access of the GLM MLA replay tests with
-    cuBLAS 13.4.1.3, which uv.lock pins. After test_autotuned_shared_routed_graph
-    [2-True-False-False-1] and the replay cases [1-decode-2-True],
-    [1-decode-1-False], [1-decode-2-False], [1-prefill-65-True] and
-    [2-decode-1-True] in one process, [2-decode-2-True] raises
-    CUBLAS_STATUS_INTERNAL_ERROR in cublasGemmStridedBatchedEx, called by torch.bmm
-    in _bmm_out (ignition/components/linear.py), and the CUDA error then persists
-    in the process. Upstream main fails the same sequence with NVIDIA's snapshot
-    and the locked cuBLAS, and passes it with cuBLAS 13.6.1.10. Close when the
-    locked cuBLAS passes this sequence, or the operand layout that triggers the
-    error is found.
-
-[ ] Explain the one TP4 preparation failure of glm-5.3-flash-nvfp4 at warmup 44
-    with cuBLAS 13.4.1.3, which the lock file pins. Six later preparation runs
-    with 13.4.1.3 passed every warmup, one of them at default tuning, and no
-    operand layout of the failing batched matrix multiplication was found
-    unusual. The failing call, torch.bmm in _bmm_out, is the call that fails in
-    the MLA replay sequence above with 13.4.1.3; whether it is the same defect
-    is not established. Close when the cause of both failures is found, or when
-    the locked cuBLAS no longer fails either.
-
 [ ] Run the host offload isolation measurements for the memory tier and the
     composite store with qualify/host_cache_isolation.py. Every threshold in
     prefix-cache-offload.md section 4 must hold before derived host-store
