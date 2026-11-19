@@ -35,7 +35,7 @@ impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             memory_limit: String::new(),
-            kv_cache_limit: "memory".into(),
+            kv_cache_limit: "context".into(),
             host: "127.0.0.1".into(),
             port: 8000,
             max_concurrency: None,
@@ -193,7 +193,7 @@ impl RuntimeIdentity {
 mod tests {
     use super::*;
     #[test]
-    fn defaults_disable_disk_and_weight_verification() {
+    fn desktop_defaults_apply_one_context_and_disable_disk_and_weight_verification() {
         let runtime = RuntimeSettings::default();
         let options = runtime
             .apply(LoadOptions::default(), PathBuf::from("cache/prefix-cache"))
@@ -201,7 +201,7 @@ mod tests {
         assert!(!runtime.verify_weights);
         assert_eq!(options.prefix_cache.disk, None);
         assert_eq!(options.prefix_cache.disk_limit, None);
-        assert_eq!(options.kv_cache_limit, KvCacheLimit::Memory);
+        assert_eq!(options.kv_cache_limit, KvCacheLimit::Context);
         assert_eq!(options.memory_limit, None);
     }
     #[test]

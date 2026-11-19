@@ -2646,6 +2646,8 @@ mod runtime_settings_tests {
         let app=Controller::new(Some(config.clone())).unwrap();
         let mut desired=app.snapshot().runtime_settings;
         assert!(!desired.verify_weights);assert!(!desired.prefix_cache_disk_enabled);
+        assert_eq!(desired.kv_cache_limit, "context");
+        desired.kv_cache_limit = "memory".into();
         desired.host="0.0.0.0".into();desired.port=9001;desired.memory_limit="0.8".into();
         let operation=app.submit(Command::SetRuntimeSettings(desired.clone())).unwrap();
         let saved=wait_settings(&app,operation);
