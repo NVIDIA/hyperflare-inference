@@ -35,7 +35,7 @@ def vocab_size(request):
 
 
 class CapturedSampler:
-    def __init__(self, rows, *, vocab_size, compile_forward=False, workspace=None):
+    def __init__(self, rows, *, vocab_size, compile_forward=False, workspace=None, draft_context_lag=1):
         assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign a CUDA device explicitly"
         self.rows = rows
         self.state = DeviceRequestState.allocate("cuda", vocab_size=vocab_size)
@@ -50,7 +50,7 @@ class CapturedSampler:
         for slot in range(4):
             self.admit(slot)
         self.sampler = PreparedSampling(self.logits, self.state, self.slots, self.epochs,
-            self.live, completion_outputs(self.records), self.frame, self.sequence, sample_enabled=self.enabled, workspace=workspace)
+            self.live, completion_outputs(self.records), self.frame, self.sequence, sample_enabled=self.enabled, workspace=workspace, draft_context_lag=draft_context_lag)
         self.sampler.prepare()
         self.call = self.sampler
         if compile_forward == 'aot':
@@ -96,8 +96,9 @@ class CapturedSampler:
 
 
 @contextmanager
-def captured(rows, *, vocab_size, compile_forward=False):
-    owner = CapturedSampler(rows, vocab_size=vocab_size, compile_forward=compile_forward)
+def captured(rows, *, vocab_size, compile_forward=False, draft_context_lag=1):
+    owner = CapturedSampler(rows, vocab_size=vocab_size, compile_forward=compile_forward,
+                            draft_context_lag=draft_context_lag)
     owner.worker = owner.bundle.start_worker()
     try:
         yield owner
@@ -289,3 +290,26 @@ def test_native_flashinfer_mixed_temperatures_eos_and_budget_stop_are_terminal(v
         after = snapshot(owner.state)
         for name in before:
             assert torch.equal(before[name], after[name]), name
+
+
+@pytest.mark.parametrize("lag", [None, 0, 1, 3])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_completion_draft_cursor_tracks_declared_context(lag, compiled):
+    with captured(4, vocab_size=4096, compile_forward=compiled, draft_context_lag=lag) as h:
+        h.live.fill_(3)
+        h.epochs[1] = 99
+        for consumed in (0, 2, 7):
+            for slot in range(4):
+                h.admit(slot)
+                h.state.consumed_tokens[slot] = consumed
+            h.state.status[2] = FINISHED
+            before = snapshot(h.state)
+            records = h.replay()
+            expected = -1 if lag is None else max(consumed - lag, 0)
+            assert records[0, 13] == records[2, 13] == expected
+            assert records[1, 13] == records[3, 13] == (-1 if lag is None else 0)
+            assert records[0, 8] == 1
+            assert torch.all(records[1:, 8] == 0)
+            after = snapshot(h.state)
+            for name in before:
+                torch.testing.assert_close(after[name][1:], before[name][1:], rtol=0, atol=0)

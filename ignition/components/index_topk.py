@@ -88,7 +88,9 @@ class PreparedIndexTopK:
     relative to those starts. BF16 scores use DeepSelect; FP32 prefill uses per-row
     selection, and FP32 decode uses cooperative selection through 64 rows,
     then persistent selection. Decode launchers receive the prepared capacity
-    as their maximum length bound. Outputs shorter than 512 are -1 padded.
+    as their maximum length bound. Selected IDs are ordered descending, with
+    -1 padding last. This fixes the consumer's reduction order for a given
+    selected set; selection among tied cutoff scores remains kernel-defined.
     """
 
     def __init__(self, logits, lengths, *, prefill, kernel_cache, library=None, session, name):
@@ -129,4 +131,6 @@ class PreparedIndexTopK:
         elif self.plan.query.implementation != "prefill" or _spec(starts) != self.specs[1]:
             raise ValueError("packed starts require FP32 prefill selection and matching int32 bounds")
         _run(logits, lengths, starts, output, workspace, self.plan.handle)
-        return output
+        # Native selection scatters with atomics. Canonicalize IDs before
+        # attention so execution order cannot perturb its floating-point sum.
+        return output.sort(dim=-1, descending=True).values

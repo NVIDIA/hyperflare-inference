@@ -6,6 +6,7 @@
 from dataclasses import dataclass
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import triton
@@ -69,6 +70,14 @@ class MegaMoeWorkspace:
             self.views = self.slice_inputs(self.buffer)
 
 
+class _LocalRank:
+    """Rank metadata for DeepGEMM's single-device launch wrapper."""
+
+    @staticmethod
+    def rank():
+        return 0
+
+
 @dataclass(frozen=True)
 class MegaMoeQuery:
     rows: int
@@ -84,6 +93,7 @@ class MegaMoeQuery:
     clamp: float
     host_rows: int = 0
     host_lane_clusters: int = 0
+    host_shared_first: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "x_sf_stride", tuple(self.x_sf_stride))
@@ -160,18 +170,25 @@ class _State:
         self.stager[(triton.cdiv(q.rows, 8 if q.rows >= 64 else 1), q.hidden // 128, 1)](
             source, x, sf, shared_sf if q.shared_experts else None,
             ids, probabilities, padding, out_ids, out_weights, *_stage_constants(q))
+        self.run_encoded(matrices, output, buffer, control, descriptors)
+
+    def run_encoded(self, matrices, output, buffer, control=None, descriptors=None):
+        q = self.query
         shared_gate = tuple(matrices[4:6]) if q.shared_experts else None
         shared_down = tuple(matrices[6:8]) if q.shared_experts else None
         if self.host_binding is not None:
             views = self.workspace.slice_inputs(buffer)
             self.host_binding.launch(output, list(views[4:]), matrices[:4],
                 matrices[4:8] if q.shared_experts else [], control, buffer,
-                q.capacity, q.experts, q.host_rows, q.top_k, q.hidden, q.intermediate, q.clamp)
+                q.capacity, q.experts, q.host_rows, q.top_k, q.hidden, q.intermediate, q.clamp,
+                q.host_shared_first)
             return
-        self.workspace.library._C.fp8_fp4_mega_moe(
-            output, tuple(matrices[:2]), tuple(matrices[2:4]), shared_gate, shared_down,
-            None, buffer, [buffer.data_ptr()], 0, q.capacity, q.experts, q.top_k,
-            (1, 1, 32), "swiglu", q.clamp, True, 1., 0.)
+        binding = SimpleNamespace(buffer=buffer, handle=SimpleNamespace(buffer_ptrs=[buffer.data_ptr()]),
+            group=_LocalRank(), num_max_tokens_per_rank=q.capacity, num_experts=q.experts, num_topk=q.top_k)
+        self.workspace.library.fp8_fp4_mega_moe(
+            output, tuple(matrices[:2]), tuple(matrices[2:4]), binding,
+            shared_l1_weights=shared_gate, shared_l2_weights=shared_down,
+            recipe=(1, 1, 32), activation="swiglu", activation_clamp=q.clamp, fast_math=True)
 
 
 @torch.library.custom_op("flare::megamoe", mutates_args=("output", "workspace", "control", "descriptors"))
@@ -188,11 +205,33 @@ def _run_fake(source, ids, probabilities, padding, matrices, output, workspace, 
     pass
 
 
+@torch.library.custom_op("flare::megamoe_encoded", mutates_args=("output", "workspace", "control", "descriptors"))
+def _run_encoded(source: torch.Tensor, encoded: list[torch.Tensor], matrices: list[torch.Tensor], output: torch.Tensor,
+                 workspace: torch.Tensor, control: torch.Tensor | None,
+                 descriptors: torch.Tensor | None, handle: int) -> None:
+    plan = plan_from_handle(handle)
+    state = require_prepared(plan, plan.component_id, source.device)
+    views = state.workspace.slice_inputs(workspace)
+    rows = plan.query.rows
+    if len(encoded) != 4 or any(
+            actual.data_ptr() != expected.data_ptr() or actual.shape != expected[:rows].shape
+            or actual.stride() != expected.stride() or actual.dtype != expected.dtype
+            for actual, expected in zip(encoded, views[:4])):
+        raise ValueError("encoded MegaMoE inputs must alias the prepared activation, scale and route views")
+    state.run_encoded(matrices, output, workspace, control, descriptors)
+
+
+@_run_encoded.register_fake
+def _run_encoded_fake(source, encoded, matrices, output, workspace, control, descriptors, handle):
+    pass
+
+
 class PreparedMegaMoe:
     """Declare fused expert execution with compiler-visible weights and protocol storage."""
 
     def __init__(self, source, ids, probabilities, padding, routed, shared, *,
-                 workspace: MegaMoeWorkspace, clamp: float, session, name, host_tier=None):
+                 workspace: MegaMoeWorkspace, clamp: float, session, name, host_tier=None,
+                 host_shared_first: bool = False):
         g = workspace.geometry
         rows = source.shape[0]
         _validate_inputs(source, ids, probabilities, padding, g, workspace.buffer.device, rows)
@@ -224,7 +263,8 @@ class PreparedMegaMoe:
             1, g.experts, g.capacity, rows, g.top_k, "fp8xfp4") if shared is not None else 1
         q = MegaMoeQuery(rows, g.experts, g.capacity, g.top_k, g.hidden, g.intermediate,
             g.shared_experts, tuple(workspace.views[1].stride()),
-            tuple(workspace.views[5].stride()) if shared is not None else (0, 0), block_m, clamp, host_rows, 0 if host_tier is None else host_tier.host_lane_clusters)
+            tuple(workspace.views[5].stride()) if shared is not None else (0, 0), block_m, clamp,
+            host_rows, 0 if host_tier is None else host_tier.host_lane_clusters, host_shared_first)
         self.workspace = workspace
         self.plan = native_plan(contract=CONTRACT, query=q, device=source.device,
             scratch_bytes=lambda tactic: 0,
@@ -262,3 +302,42 @@ class PreparedMegaMoe:
         if staged is not None:
             stager.observe(control)
         return output
+
+    def encoded(self, source, inputs=None, *, staged=None):
+        """Consume activations, scales and routes written into this workspace.
+
+        The producer must write every active input row and shared-expert scale
+        row in the layout returned by ``encoded_inputs``. It must mask inactive
+        routes before this call. The workspace cannot serve another invocation
+        until the fused expert kernel completes.
+        """
+        q = self.plan.query
+        if (source.shape != (q.rows, q.hidden) or source.dtype != torch.bfloat16
+                or source.device != self.workspace.buffer.device or not source.is_contiguous()):
+            raise ValueError("encoded MegaMoE requires its prepared BF16 producer shape and device")
+        output = torch.empty_like(source)
+        if inputs is None:
+            inputs = self.encoded_inputs()[:2]
+        # The native view slicer creates separate Tensor storages over one CUDA
+        # allocation. Explicit reads order producers even when the compiler
+        # cannot infer that those storages alias the protocol buffer.
+        routed = self.encoded_inputs()[2:4]
+        matrices, control = self.matrices, self.control
+        if staged is not None:
+            stager, pending = staged
+            if stager.tier is not self.host_tier:
+                raise ValueError("expert staging must use the consumer's immutable host rows")
+            planes, control = stager.finish(pending, source)
+            matrices = [*self.matrices[:-4], *planes]
+        _run_encoded(source, [*inputs, *routed], matrices, output, self.workspace.buffer,
+                     control, self.descriptors, self.plan.handle)
+        if staged is not None:
+            stager.observe(control)
+        return output
+
+    def encoded_inputs(self):
+        """Return producer views and the selected shared-scale row grouping."""
+        q = self.plan.query
+        x, scales, ids, probabilities, _, shared_scales, *_ = self.workspace.views
+        return (x[:q.rows], scales[:q.rows], ids[:q.rows], probabilities[:q.rows],
+                shared_scales[:q.rows] if q.shared_experts else None, q.shared_block_m)

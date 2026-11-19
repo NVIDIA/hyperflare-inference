@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preparation-only binding of the unchanged DerpSeek MegaMoE reference kernel."""
+"""Preparation bindings for DeepGEMM and isolated DerpSeek host-tier kernels."""
 
 from functools import cache
 import errno
@@ -13,14 +13,13 @@ import tempfile
 
 @cache
 def initialize(kernel_cache: Path):
-    """Bind a private header tree without changing the installed DeepGEMM package.
+    """Use DeepGEMM with the headers matching its installed native launcher.
 
-    All compilation and resource discovery happen during preparation. Exported
-    graphs retain compiled CUDA modules; Helios neither imports this package nor
-    compiles kernels when serving them.
+    Host-tier launchers own a separate runtime and bind ``header_root`` there.
+    Repointing DeepGEMM's global runtime at those headers mixes kernel template
+    signatures and scheduling layouts from different implementations.
     """
     import deep_gemm
-    deep_gemm._C.init(str(header_root(kernel_cache)))
     return deep_gemm
 
 

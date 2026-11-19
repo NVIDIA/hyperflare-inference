@@ -48,7 +48,7 @@ def test_native_text_replay_and_prefix_reuse():
     def ask(prompt, barrier=None):
         # Sampling follows the core's declared defaults; only seed is overridden.
         body = dict(model=model["id"], messages=[dict(role="user", content=prompt)],
-                    seed=1234, max_tokens=512 if concurrency == 16 else 256,
+                    seed=1234, max_tokens=1536 if concurrency == 16 else 256,
                     enable_thinking=False, return_token_ids=True)
         request = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
                                          {"Content-Type": "application/json"})
@@ -89,12 +89,12 @@ def test_native_text_replay_and_prefix_reuse():
         barrier = threading.Barrier(concurrency)
 
         def concurrent_request(index):
-            start = index * 100 + 1
+            start = index * 1000 + 1
             _, answer, _ = ask(
-                f"Write every integer from {start} through {start + 79} inclusive, "
+                f"Write every integer from {start} through {start + 239} inclusive, "
                 "separated by commas, with no other text.", barrier,
             )
-            assert [int(value) for value in re.findall(r"\d+", answer)] == list(range(start, start + 80)), answer
+            assert [int(value) for value in re.findall(r"\d+", answer)] == list(range(start, start + 240)), answer
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             list(executor.map(concurrent_request, range(concurrency)))

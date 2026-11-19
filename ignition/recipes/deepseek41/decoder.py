@@ -301,16 +301,18 @@ class PreparedDecoder:
         self.table_requests = PreparedTableRequests(tables, metadata, pool, session=session, name=name + ".table_requests")
         decoder_start = weights.config.decoder_start
         self.packing = None
-        if mode == "prefill" and metadata.positions.numel() > 128 and decoder_start is not None and scoring is None:
+        deferred_prefill = mode == "prefill" and decoder_start is not None and scoring is None
+        if deferred_prefill:
             if (any(layer.engram is not None for layer in weights.layers[decoder_start:])
                     or any(source.layer > decoder_start for source in weights.config.sources)):
                 raise ValueError("decoder suffix replay requires Engram and compressed KV sources before its boundary")
-            self.packing = PreparedDecoderSuffix(metadata)
+            if metadata.positions.numel() > 128:
+                self.packing = PreparedDecoderSuffix(metadata)
         self.output_metadata = metadata if self.packing is None else self.packing.metadata
         self.output_scratch = scratch if self.packing is None else Scratch.allocate(
             128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device)
         self.aux_layers = () if weights.draft is None else weights.config.draft.target_layers
-        if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
+        if deferred_prefill and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
         self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
         self.auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)
@@ -411,7 +413,7 @@ class PreparedDecoder:
         traced.release_outputs()
         return traced
 
-    def __call__(self, metadata):
+    def __call__(self, metadata, *, terminal=True):
         if self.routing_trace is not None:
             self.routing_trace.begin()
         source_metadata = metadata
@@ -431,13 +433,28 @@ class PreparedDecoder:
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
         auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
         suffix, records = None, []
+        stage_layers = self.stage_layers if terminal else tuple(
+            index for index in self.stage_layers if index < self.weights.config.decoder_start)
         pending_experts = {index: self.expert_stagers[index].start(embedding)
-                           for index in self.stage_layers[:2]}
+                           for index in stage_layers[:2]}
         for index, layer in enumerate(self.layers):
             boundary = None
+            if not terminal and index == self.weights.config.decoder_start and layer.boundary is None:
+                # Small chunks use the unpacked layer's existing projections.
+                # Global KV and compressor history must commit before deferring
+                # queries, decoder windows, experts, and vocabulary projection.
+                attn_mix = torch.zeros_like(pre_mix)
+                _, _, _, normalized = layer.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
+                layer.attention.global_kv(normalized, layer.attention.selectors[0], metadata,
+                                          indices.compressed(layer.attention.ratio))
+                self.table_requests.commit(source_metadata.lengths, raw_history, source_metadata)
+                return
             if layer.boundary is not None:
                 suffix, state, attn_mix = layer.boundary(incoming, pre_mix, metadata, indices,
                                                         layer.attention.selectors[0])
+                if not terminal:
+                    self.table_requests.commit(source_metadata.lengths, raw_history, source_metadata)
+                    return
                 metadata = suffix.metadata
                 indices = self.suffix_window_metadata(metadata, replay_start=suffix.replay_start)
                 boundary = state, attn_mix
@@ -450,14 +467,14 @@ class PreparedDecoder:
                 column = self.aux_layers.index(index)
                 auxiliary[:, column * 5120:(column + 1) * 5120].copy_(feedback)
             expert_stage = ((self.expert_stagers[index], pending_experts.pop(index))
-                            if index in self.expert_stagers else None)
+                            if index in stage_layers else None)
             incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
                 boundary=boundary, window_cache=None if staging is None else staging[index], expert_stage=expert_stage)
             records.append(record)
             if expert_stage is not None:
-                following = self.stage_layers.index(index) + 2
-                if following < len(self.stage_layers):
-                    next_index = self.stage_layers[following]
+                following = stage_layers.index(index) + 2
+                if following < len(stage_layers):
+                    next_index = stage_layers[following]
                     pending_experts[next_index] = self.expert_stagers[next_index].start(incoming[0])
         residual, = incoming
         samples = metadata.sample_indices

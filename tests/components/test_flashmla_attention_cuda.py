@@ -155,6 +155,62 @@ def test_compiled_catalog_exposes_storage_and_preserves_results(binding):
             graph.reset()
 
 
+def test_selected_prefill_replays_with_reference_indices_and_exact_output(binding):
+    from ignition.components.index_topk import PreparedIndexTopK
+
+    _, cache, library = binding
+    rows = 257
+    args = list(operands(rows, False, False))
+    args[4] = torch.cat((args[4], args[4][:128]), dim=0)
+    scores = torch.stack([torch.randperm(2048, device="cuda").float() for _ in range(rows)])
+    ends = torch.full((rows,), 2048, device="cuda", dtype=torch.int32)
+    wanted = scores.topk(512, dim=-1).indices.int().sort(-1, descending=True).values
+    window = torch.arange(128, device="cuda", dtype=torch.int32)[None, :].repeat(rows, 1)
+    args[5] = torch.cat((window, wanted + 128), dim=-1).unsqueeze(1)
+    actual, expected = _outputs(rows, args[0].device), _outputs(rows, args[0].device)
+    observed_ids = torch.empty_like(wanted)
+    with RecordedPreparationSession(device="cuda:0", checkpoint="synthetic-selected-prefill",
+            workload_schema="selection-attention-replay", numerical_policy="flashmla-bitwise",
+            compile_workers=2, autotune_effort="off") as session:
+        selector = PreparedIndexTopK(scores, ends, prefill=True, kernel_cache=cache,
+                                    session=session, name="selection")
+        attention = PreparedFlashMLA(*args, scale=512 ** -.5, kernel_cache=cache,
+                                     library=library, session=session, name="attention")
+        session.tune()
+
+        def forward():
+            selected = selector(scores, ends)
+            observed_ids.copy_(selected)
+            indices = torch.cat((window, selected + 128), dim=-1).unsqueeze(1)
+            output, scales = attention(*args[:5], indices, *args[6:])
+            actual[0].copy_(output)
+            actual[1].copy_(scales)
+
+        compiled = compile_forward(forward)
+        compiled()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            compiled()
+        session.freeze()
+        try:
+            reference(args, *expected)
+            torch.cuda.synchronize()
+            for _ in range(20):
+                actual[0].view(torch.uint8).fill_(255)
+                actual[1].fill_(-999)
+                torch.cuda.synchronize()
+                allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                assert torch.equal(observed_ids, wanted)
+                assert torch.equal(actual[0].view(torch.uint8), expected[0].view(torch.uint8))
+                assert torch.equal(actual[1], expected[1])
+        finally:
+            graph.reset()
+
+
 def test_binding_writes_reference_statistics(binding):
     module, _, _ = binding
     for rows, paged, compressed in ((7, False, False), (77, True, True), (25, True, False)):

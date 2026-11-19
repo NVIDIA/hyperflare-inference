@@ -33,7 +33,8 @@ static void sm100_fp8_fp4_mega_moe(
     const float& activation_clamp,
     const float& activation_alpha,
     const float& activation_beta,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& shared_first
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -207,7 +208,7 @@ static void __instantiate_kernel() {{
         to_string(activation_alpha),
         to_string(activation_beta),
         fast_math ? "true" : "false",
-        to_string(l1_weights.scalar_type())));
+        to_string(l1_weights.scalar_type()) + ", " + (shared_first ? "true" : "false")));
 
     // Launch
     jit->launch(

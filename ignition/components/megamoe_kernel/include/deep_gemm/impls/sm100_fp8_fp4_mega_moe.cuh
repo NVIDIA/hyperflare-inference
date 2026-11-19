@@ -225,6 +225,7 @@ template <
     float kActivationBeta,
     bool kFastMath,
     typename weight_dtype_t,
+    bool kSharedFirst = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1950,7 +1951,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t u = 0; u < kUnroll; ++ u) {
                             float2 r[4] = {{0.f, 0.f}, {0.f, 0.f}, {0.f, 0.f}, {0.f, 0.f}};
                             #pragma unroll
-                            for (uint32_t k = 0; k < kNumSlots; ++ k) {
+                            for (uint32_t order = 0; order < kNumSlots; ++ order) {
+                                const uint32_t k = kSharedFirst && kHasShared ?
+                                    (order == 0 ? kNumTopk : order - 1) : order;
                                 if ((total_mask >> k) & 1u) {
                                     const auto bf = reinterpret_cast<const nv_bfloat162*>(&v[u][k]);
                                     #pragma unroll
@@ -2011,7 +2014,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 float2 r0 = {0.f, 0.f}, r1 = {0.f, 0.f};
                 #pragma unroll
-                for (uint32_t k = 0; k < kNumSlots; ++ k) {
+                for (uint32_t order = 0; order < kNumSlots; ++ order) {
+                    const uint32_t k = kSharedFirst && kHasShared ?
+                        (order == 0 ? kNumTopk : order - 1) : order;
                     if ((total_mask >> k) & 1u) {
                         ptx::accumulate(r0, *reinterpret_cast<const nv_bfloat162*>(&v[k].x));
                         ptx::accumulate(r1, *reinterpret_cast<const nv_bfloat162*>(&v[k].y));
@@ -2050,7 +2055,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto move_mask_and_load = [&](const uint32_t& i) {
                 if (mask) {
                     // Move
-                    const uint32_t slot_idx = __ffs(mask) - 1;
+                    const uint32_t slot_idx = kSharedFirst && (mask >> kNumTopk) ?
+                        kNumTopk : __ffs(mask) - 1;
                     mask ^= 1 << slot_idx;
 
                     // Load

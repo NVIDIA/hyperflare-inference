@@ -13,7 +13,8 @@ void initialize(const std::string& root) { flare_megamoe_host::init_jit(root); }
 void launch(torch::Tensor y, std::vector<std::optional<torch::Tensor>> acts,
             std::vector<torch::Tensor> weights, std::vector<torch::Tensor> shared,
             torch::Tensor control, torch::Tensor buffer, int capacity,
-            int experts, int host_rows, int topk, int hidden, int intermediate, float clamp) {
+            int experts, int host_rows, int topk, int hidden, int intermediate, float clamp,
+            bool shared_first) {
     TORCH_CHECK(acts.size() == 8 && weights.size() == 4);
     TORCH_CHECK(shared.size() == 0 || shared.size() == 4);
     TORCH_CHECK(control.scalar_type() == torch::kInt && control.is_contiguous());
@@ -46,7 +47,8 @@ void launch(torch::Tensor y, std::vector<std::optional<torch::Tensor>> acts,
         shared.empty() ? absent : shared[0], shared.empty() ? absent : shared[2],
         shared.empty() ? absent : shared[1], shared.empty() ? absent : shared[3],
         control, {reinterpret_cast<int64_t>(buffer.data_ptr())}, 0, capacity, experts,
-        shared.empty() ? 0 : 1, y.size(0), topk, hidden, intermediate, clamp, 1.f, 0.f, true);
+        shared.empty() ? 0 : 1, y.size(0), topk, hidden, intermediate, clamp, 1.f, 0.f, true,
+        shared_first);
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("initialize", &initialize);

@@ -73,7 +73,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         try:
             sm103 = SM103Config.load(sm103_preparation)
             recipe, checkpoint = sm103.planning_inputs(model.recipe, model.checkpoint,
-                model.snapshot(configuration.directory("hub_cache")), dspark=speculation is not None)
+                model.snapshot(configuration.directory("hub_cache")), dspark=speculation is not None,
+                draft_tokens=None if speculation is None else speculation.draft_tokens)
         except (OSError, ValueError, TypeError, KeyError) as error:
             raise UsageError(f"--sm103-preparation: {error}") from error
         model = replace(model, recipe=recipe, checkpoint=checkpoint)

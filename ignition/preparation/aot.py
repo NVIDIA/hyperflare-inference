@@ -4,6 +4,7 @@
 
 """Serializable compiled forwards with caller-owned storage and runtime handles."""
 
+import enum
 import hashlib
 import importlib
 import inspect
@@ -125,17 +126,26 @@ class _GuardPickler(GuardsStatePickler):
             with torch._C._DisableTorchDispatch():
                 meta = torch.empty_strided(obj.shape, obj.stride(), dtype=obj.dtype,
                                           device="meta", requires_grad=obj.requires_grad)
-            from .forward_metadata import _TENSOR_KINDS
+            from .forward_metadata import _TENSOR_KINDS, _set_state, _tensor_user_attributes
             kinds = _TENSOR_KINDS.get()
             kind = torch._subclasses.FakeTensor if kinds is None else kinds.get(obj, torch._subclasses.FakeTensor)
             deferred = kind is torch._subclasses.FakeTensor
-            return type(self)._unpickle_tensor, (meta, obj.device, torch.Tensor if deferred else kind,
-                torch._C._dispatch_keys(obj).raw_repr(), obj.grad, deferred)
+            args = (meta, obj.device, torch.Tensor if deferred else kind,
+                    torch._C._dispatch_keys(obj).raw_repr(), obj.grad, deferred)
+            user_attrs = _tensor_user_attributes(obj)
+            if user_attrs:
+                state = {key: value if id(value) in self.guard_tree_values
+                         else _Missing('unguarded attribute')
+                         for key, value in user_attrs.items()}
+                return type(self)._unpickle_tensor, args, state, None, None, _set_state
+            return type(self)._unpickle_tensor, args
         if isinstance(obj, JITFunction):
             return _deserialize_triton_kernel, (_serialize_triton_kernel(obj),)
         if (hasattr(obj, '__dict__')
-                and type(obj).__module__.startswith(('ignition.', 'b12x.'))
-                and not inspect.isclass(obj) and not isinstance(obj, (torch.Tensor, torch.nn.Module))):
+                and type(obj).__module__.startswith(('ignition.', 'b12x.', 'deepinfer.'))
+                and not inspect.isclass(obj)
+                and not isinstance(obj, (torch.Tensor, torch.nn.Module, enum.Enum,
+                                         int, float, str, bytes, dict, list, tuple, set, frozenset))):
             state = {key: value if id(value) in self.guard_tree_values
                      else _Missing('unguarded attribute')
                      for key, value in vars(obj).items()}

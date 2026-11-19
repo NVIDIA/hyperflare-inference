@@ -9,16 +9,33 @@ release. The public source repository includes the preparation tools and their
 dependency declarations. Model weights, datasets, prepared model cores, and
 container images are not included in the binary release.
 
+## DeepInfer reference preparation
+
+The experimental DeepSeek V4.1 reference bindings use
+[DeepInfer](https://github.com/deepseek-ai/DeepInfer), licensed under Apache-2.0,
+as an external preparation dependency. The captured attention metadata adapters in
+`ignition/recipes/deepseek41/reference_metadata.py` follow DeepInfer's native
+input builder's cache-indexing rules, expressed as tensor operations over
+Flare's packed requests. They add explicit inactive-row write masking and
+prepared-capacity validation. Prefill cache-load descriptors also follow the
+native builder, with zero-filled unused capacity for captured graphs. The
+request-history binding in `ignition/recipes/deepseek41/reference_engram.py`
+uses the reference vocabulary compression and native builder's n-gram/image
+boundary rules. Complete reference-model serving is not qualified.
+
 ## MegaMoE preparation kernels
 
-Ignition carries unchanged DerpSeek MegaMoE headers in
+Ignition carries headers derived from DerpSeek's MegaMoE implementation in
 [megamoe_kernel](ignition/components/megamoe_kernel/NOTICE), with MIT license
 texts from DeepSeek, ds41 and DerpSeek. The optional `megamoe` preparation extra
 pins the DeepGEMM host binding used to compile them. Exported CUDA graphs retain
 the compiled kernels; the native CLI has no Python or DeepGEMM host dependency.
 The host-tier preparation launcher carries DeepGEMM host headers and its
 DeepJIT headers under their MIT licenses. It separates logical expert count
-from physical weight extents without changing the carried CUDA arithmetic.
+from physical weight extents. Flare adds a preparation-time shared-first
+accumulation order to match DeepInfer's reference, retaining routed-first
+accumulation by default. This preserves expert contributions but can change
+final BF16 rounding through FP32 addition order.
 The input stager retains vLLM v0.32.0's Apache-2.0 Triton kernel, with a wrapper
 that selects MXFP8 and validates its buffers without importing vLLM.
 Full-model DeepSeek serving through this preparation path is not qualified.
@@ -78,8 +95,8 @@ availability notice accompanies binary distributions containing that dependency.
 
 ### Code adapted into this repository
 
-The native Parallax decayed-miss LRU shadow policy adapts chronarion's DerpSeek
-residency decision rules. [NOTICE](NOTICE) identifies the source and scope;
+The native Parallax decayed-miss LRU policies share decision rules adapted from
+chronarion's DerpSeek. [NOTICE](NOTICE) identifies the source and scope;
 `helios/licenses/DerpSeek.txt` retains the MIT license and copyright for source
 and binary distribution.
 

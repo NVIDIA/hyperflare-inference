@@ -285,3 +285,42 @@ assert "torch" not in sys.modules
     result = subprocess.run([sys.executable, "-c", script, str(tmp_path), str(snapshot), str(path)],
                             text=True, capture_output=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_reference_execution_configuration_and_planning_costs(options, snapshot, tmp_path):
+    from ignition import planning
+    from ignition.components.capacity import request_capacity
+    from ignition.recipes.deepseek41.recipe import RECIPE
+    from ignition.recipes.deepseek41.sm103 import _reference_cache_costs
+    from ignition.recipes.deepseek41.config import ModelConfig
+
+    reference = SM103Config(options.placements, host_lane_clusters=4, execution="reference", context=262144)
+    path = tmp_path / "sm103-reference.json"
+    path.write_text(json.dumps(reference.to_dict()))
+    assert SM103Config.load(path) == reference
+    assert "flashmla_library" not in reference.to_dict()
+    staged_reference = replace(reference, prefill_staging=PrefillExpertStaging(1024, 8))
+    staged_path = tmp_path / "sm103-reference-staged.json"
+    staged_path.write_text(json.dumps(staged_reference.to_dict()))
+    assert SM103Config.load(staged_path) == staged_reference
+    assert staged_reference.to_dict()["prefill_staging"] == {"min_rows": 1024, "min_cold_experts": 8}
+    with pytest.raises(ValueError, match="hybrid library paths"):
+        SM103Config(options.placements, options.flashmla_library, options.deepselect_library, execution="reference")
+    with pytest.raises(ValueError, match="128-aligned"):
+        SM103Config(options.placements, execution="reference", context=300)
+
+    recipe, checkpoint = reference.planning_inputs(RECIPE, RECIPE.checkpoints[0], snapshot,
+                                                   dspark=True, draft_tokens=7)
+    model = ModelConfig.load(snapshot)
+    expected_spec, expected_page = _reference_cache_costs(model, verification_width=8, dspark=True)
+    expected_plain, _ = _reference_cache_costs(model, verification_width=1, dspark=False)
+    assert recipe.ranks[1].state_row_bytes == expected_spec == 3_311_616
+    assert recipe.plain_ranks[1].state_row_bytes == expected_plain == 2_855_424
+    assert recipe.ranks[1].page_bytes == expected_page == 113_920
+    assert recipe.verification_rows == 0
+    assert recipe.context == 262144
+    gpu = planning.Gpu(0, "GB300", "GPU-gb300", 256 << 30, 250 << 30, (10, 3))
+    plan = planning.plan(recipe, checkpoint, (gpu,), selected=(0,), concurrency=16,
+                         reserve_bytes=0, speculation=recipe.speculation, prefill_chunk=8192)
+    assert plan.live_rows == 1 + request_capacity(16)
+    assert plan.context == 262144

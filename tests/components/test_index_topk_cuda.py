@@ -60,9 +60,8 @@ def test_ragged_selection_and_captured_input_changes(rows, dtype, prefill, tmp_p
                 graph.replay()
                 torch.cuda.synchronize()
                 assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-                # Reference cooperative selection scatters indices with atomics.
-                # Compare token sets; score values are checked independently below.
-                assert torch.equal(output.sort(-1).values, expected.sort(-1).values)
+                assert torch.equal(output, output.sort(-1, descending=True).values)
+                assert torch.equal(output, expected)
                 for row, length in enumerate(lengths.tolist()):
                     n = min(length, 512)
                     ids = output[row, :n].long()

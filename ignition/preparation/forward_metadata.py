@@ -21,6 +21,17 @@ from torch.utils.weak import WeakIdKeyDictionary
 _MODE = ContextVar('flare_forward_metadata_mode')
 _TENSOR_KINDS = ContextVar('flare_forward_tensor_kinds', default=None)
 _LOCK_TYPES = (type(Lock()), type(RLock()))
+_FAKE_TENSOR_ATTRS = frozenset(
+    vars(FakeTensor(FakeTensorMode(), torch.empty(0, device='meta'), torch.device('cpu')))
+) | {'_is_param', '_debug_context'}
+
+
+def _tensor_user_attributes(tensor):
+    if not vars(tensor):
+        return {}
+    if isinstance(tensor, FakeTensor):
+        return {key: value for key, value in vars(tensor).items() if key not in _FAKE_TENSOR_ATTRS}
+    return dict(vars(tensor))
 
 
 class _Unavailable:
@@ -106,8 +117,12 @@ class _ForwardPickler(pickle.Pickler):
                 raise TypeError(f'unsupported forward tensor subclass: {type(value)}')
             storage = value.untyped_storage()
             owner = self.storages.setdefault(storage._cdata, _Storage(storage.nbytes()))
-            return _tensor, (owner, tuple(value.shape), value.stride(), value.storage_offset(),
-                             value.dtype, value.device, value.requires_grad, type(value))
+            args = (owner, tuple(value.shape), value.stride(), value.storage_offset(),
+                    value.dtype, value.device, value.requires_grad, type(value))
+            user_attrs = _tensor_user_attributes(value)
+            if user_attrs:
+                return _tensor, args, user_attrs, None, None, _set_state
+            return _tensor, args
         if isinstance(value, _PreparedSlot):
             # Tracing needs selected layouts; normal plan pickling clears prepared state.
             return _object, (type(value),), dict(vars(value)), None, None, _set_state
@@ -140,8 +155,12 @@ class _ForwardPickler(pickle.Pickler):
         if not isinstance(value, type) and (hasattr(type(value), '__del__')
                 or type(value).__module__.startswith('cutlass._mlir.')):
             return _Unavailable, (f'{type(value).__module__}.{type(value).__qualname__}',)
-        if isinstance(value, types.BuiltinMethodType) and isinstance(value.__self__, (*_LOCK_TYPES, local)):
-            return _Unavailable, (f'{type(value.__self__).__qualname__}.{value.__name__}',)
+        if isinstance(value, types.BuiltinMethodType) and (
+                isinstance(value.__self__, (*_LOCK_TYPES, local))
+                or not value.__name__
+                or value.__name__ == '<lambda>'):
+            owner = type(value).__qualname__ if value.__self__ is None else type(value.__self__).__qualname__
+            return _Unavailable, (f'{owner}.{value.__name__ or "<anonymous>"}',)
         if isinstance(value, types.FunctionType) and (
                 '<locals>' in value.__qualname__ or value.__name__ == '<lambda>'):
             return _Unavailable, (value.__qualname__,)
@@ -165,6 +184,10 @@ class _ForwardUnpickler(pickle.Unpickler):
         if module.startswith('transformers_modules.'):
             from transformers.dynamic_module_utils import init_hf_modules
             init_hf_modules()
+        elif module.startswith('deepinfer.'):
+            from deepinfer.model_executor.parallel_utils.parallel_state import PG
+            if PG.world is None and not torch.distributed.is_initialized():
+                PG.initialize_local()
         return super().find_class(module, name)
 
 
