@@ -177,6 +177,8 @@ def test_shared_capture_records_after_all_warmups_without_reinstantiation(monkey
                             mem_get_info=lambda device: (1024, 2048), memory_allocated=lambda device: 0,
                             memory_reserved=lambda device: 0).items():
         monkeypatch.setattr(torch.cuda, name, value)
+    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
     functions = {name: lambda name=name: calls.append((name, state["capturing"]))
                  for name in ("first", "second")}
     graphs, compiled = capture.capture_forwards(functions,
@@ -335,6 +337,8 @@ def test_export_preserves_collective_consumer_associations(monkeypatch, recorder
     for name, value in dict(current_stream=lambda device: stream, stream=lambda stream: nullcontext(),
                             synchronize=lambda device: None, graph=graph_scope).items():
         monkeypatch.setattr(torch.cuda, name, value)
+    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
     graphs, _ = capture.capture_forwards({"decode": forward}, {"decode": SimpleNamespace(kind="decode")},
         session=session, device="cpu", stream=stream, pool=storage.graph_pool.id, compile_decoder=False,
         retain_graphs=True, warmup_storage=storage)

@@ -26,6 +26,8 @@ def capture_options(monkeypatch):
         "memory_reserved": lambda device: 0,
     }.items():
         monkeypatch.setattr(capture.torch.cuda, name, value)
+    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
     monkeypatch.setattr(capture.torch.distributed, "is_initialized", lambda: False)
     session = SimpleNamespace(namespace=SimpleNamespace(to_dict=lambda: {}), capture=nullcontext)
     return dict(session=session, device="cpu", stream=stream, pool=None)
