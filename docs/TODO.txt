@@ -1,13 +1,124 @@
-[ ] Measure native row-map publication and serving impact after bitmap occupancy
-    validation. CPU map construction is measured separately; repeat GPU row
-    exchange checks and the same-core MTP3 active/static serving comparison.
+[ ] Qualify intermediate/terminal DeepSeek V4.1 prefill on SM103 through native
+    serving. Controlled-choice TP1 diagnostics preserve compared continuation
+    state and valid FP32 target vocabulary logits across seven chunk cases through
+    131072 tokens and two seven-draft rounds. Every recorded attention selection
+    is checked against fresh native score values. Repeated complete execution
+    with native selections changes state and logits at 131072 tokens with the
+    recorder present; uninstrumented repeatability remains unqualified.
+    Resolve this control variability without relaxing the deferral comparison.
+    Validate exported serving with decoder execution omitted from intermediate
+    graphs of 128 or fewer tokens. Seven controlled-choice TP1 chunk cases through
+    8449 tokens preserve continuation state and target logits, including two
+    speculative rounds, with 128-token intermediates and 129-token terminal tails.
+    Existing exported cores still execute the small intermediate decoder work.
+    Extend native routing and lifecycle checks beyond three-draft execution to
+    ordinary and seven-draft execution. Compare complete continuation state for
+    scheduler-selected mixtures that include small intermediate graphs; cover
+    scored prefill, inactive rows, and MTP transitions. Extend terminal-tail
+    cost pricing checks beyond TP1 single-request prefill and fixed-residency
+    C16 interleaving to held-out mixed traffic with active expert movement.
+    Recover the remaining 8K deficit against complete-per-chunk prefill without
+    losing long-prompt throughput or decode responsiveness.
 
-[ ] Qualify decayed-miss LRU on held-out live routing alongside predictive
-    contenders; measure CPU overhead and compare policy decisions against DerpSeek
-    under matched readback grouping and slot order. Validate the active policy
-    through physical row transactions and matched native serving before claiming
-    serving equivalence; retain execution-generation and commit-age checks.
-    See parallax-demo.md#decayed-miss-lru-comparison.
+[ ] Qualify funded optional timing discovery before using it for serving
+    comparisons. Resolve the observed long-prompt wait increase and remaining
+    individual delivery pause under mixed load. Preserve progress for untimed
+    prerequisites; compare cold and warm catalogs, request delivery gaps, and
+    low-concurrency throughput against unrestricted discovery.
+
+[ ] Extend DeepSeek SM103 native qualification beyond the TP1 C1/256/MTP7 and
+    C16/8192/MTP3 text integration checks; validate long-context correctness,
+    vision replay and ordinary/MTP agreement at C16.
+    Extend routing checks beyond bounded tracing-off/on token agreement and
+    canonical histogram collection: validate full state, scored-prefill tracing
+    and isolated overhead. Free-form seeded C1 outputs vary with tracing off
+    and on; request timing alone cannot establish instrumentation cost.
+    Extend expert-row movement qualification beyond the checkpoint component
+    exchanges and bounded C1/C8/C16 native output-parity checks in parallax.md.
+    Calibrate publication/reader-drain costs and reduce cancelled staging; the
+    ranking policy has no measured cold-execution price. Match virtual placement
+    capacity to physical per-layer pools before treating it as their simulator.
+    Compare exported Flare/Parallax serving with DerpSeek exact using matched
+    workloads, memory budgets, arithmetic and speculative settings.
+
+[ ] Extend numerical qualification of DeepSeek TP1 SM103 attention, cache writers,
+    compressor and hierarchical indexer across long contexts and graph capacities.
+    The installed b12x compressed-MLA auto mode emits unsupported block-scaled MMA
+    on SM103; the recipe's default BF16 mode has not been checked separately.
+    Its MXFP4 indexer also emits an unsupported SM103 MMA. Qualify the composed
+    reference query/key encoding, full/candidate paged scoring and selection
+    across all shared-source layers and long contexts. Validate the composed
+    contiguous prefill indexer's numerical behavior at long contexts; exported
+    C16/8192/MTP3 native text integration passes.
+    Compare captured SM-based prefill staging with DerpSeek's DMA staging on
+    matched workloads, and attribute remaining C1/C16 decode differences with
+    paired native and reference kernel timelines, accounting for DerpSeek
+    exact's W8 output projection, low-latency GEMMs and fused preparation seams.
+    Compare the emitted target and draft paths through normalization/quantization,
+    query/cache/indexer forks, routing/packing, expert combine, Engram projection,
+    context preparation, vocabulary projection, Markov sampling and accepted-state
+    commit. Verify enabled reference paths against its trace, including router
+    readiness, shared-weight prefetch and six-bit scales. Separate draft-only
+    arithmetic changes and proposal-policy differences from target-path fusion;
+    do not infer numerical compatibility from the reference's exact profile name.
+    Validate prepared overlap of independent mHC mixing and expert execution
+    with measured SM allocation, disjoint scratch and complete stream joins.
+    Evaluate the small-row lagged mHC candidate set on SM103: below 1024 rows
+    b12x restricts it to the fused TF32 path. Compare complete-layer cost,
+    including any duplicated boundary work and SM capacity reserved for overlap.
+    Package the DeepInfer SM103 preparation bindings (including the varlen ViT
+    attention zero-initialization, YOCO consumer-view mask indexing, and
+    optional non-terminal prefill exit) as a pinned preparation dependency, and
+    evaluate static 262,144-token prefill page-table gather reduction, prompt
+    log-probabilities, and RoCEnante TP2+ composition if multi-GPU reference
+    serving is requested (docs/sm103-kernel-integration.md).
+    Qualify DeepGEMM and TileKernels mHC replacements against checkpoint-backed
+    arithmetic. DeepGEMM's fused projection uses uncompensated TF32 weights;
+    preserve FP32 mixing precision before full-layer and native serving tests.
+    Evaluate DeepGEMM's simultaneous BF16 and MXFP8 mHC outputs with the consuming
+    projections and experts. Verify normalized values, scale packing and consumer
+    arithmetic before removing separate encoding; preserve BF16 outputs required
+    by other branches. Measure the complete dependent path, including coefficient
+    readiness and any remaining synchronization.
+    Preserve four-stream contraction rounding, normalization reduction order
+    and rounded division, as well as FP32 mixing weights. Test changing-input
+    graph replay without intervening eager launches: launch identifiers can
+    repeat, so persistent barrier state must not admit stale partials. Include
+    reset and precision-compensation costs in replacement timings.
+    Check complete-layer outputs, routing weights
+    and verification records before interpreting overlap timings.
+    Compare repeated whole-step graphs separately from reference preparation
+    and uncaptured work; profiler wall time is not a serving throughput result.
+    Prioritize the complete normalization, attention, projection and routing
+    dependency chain for the requested roughly 30% C1 throughput improvement.
+    Select replacements using real decode activations, restored cache state
+    and the serving kernel plans. Synthetic layer inputs with tuning disabled
+    establish bounded arithmetic checks, not representative serving costs.
+    Reconcile every candidate's complete-round change with the native timeline,
+    including work hidden behind expert calls and draft/head execution.
+    Qualify fused boundaries and independent work overlapping expert execution
+    together, with identical inputs and complete output/state checks, before
+    another serving-core export. Compare elapsed inter-expert intervals at equal
+    physical verification rows; overlapping kernel durations cannot be summed
+    into predicted savings. Keep the isolated projection export campaign stopped.
+    Qualify peak-memory reordering disabled in complete prepared forwards:
+    measure layer/round latency and fixed memory, then exported C1/C2/C4 serving.
+    Compare query/cache/indexer fork dependencies before capture, in stored graph
+    resources and after native loading at each physical target width. Distinguish
+    ordinary completion edges from programmatic dependencies; an enabled overlap
+    setting does not establish that independent branches survived preparation.
+    Check independent branches in DeepSeek V4/V4.1, GLM, Kimi and Nemotron;
+    component fork topology and exact outputs do not establish model-level gains.
+    Qualify the SM103 low-latency MXFP8 tuning candidate in fresh-process exported
+    serving and complete-model graph transitions. Component checkpoint arithmetic,
+    worker compilation, native replay and the eight-row selection boundary pass;
+    complete-forward latency and serving benefit remain unmeasured. Attribute
+    shape-dependent compiler overhead before extrapolating component gains.
+
+[ ] Extend decayed-miss LRU native qualification on terminal-prefill cores from
+    TP1 DeepSeek V4.1 `"execution": "reference"` (docs/parallax.md) to `"hybrid"`
+    and GLM-5.3-Flash cores, and evaluate exact tensor-level state equivalence
+    under concurrent positive-temperature sampling.
 
 [ ] Compare Inkling 2 effort-zero generation with the canonical target using
     the static NVFP4 checkpoint. Native TP4 emits analysis in content_text and

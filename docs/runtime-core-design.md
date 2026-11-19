@@ -173,9 +173,9 @@ a typed `ServingContract`. It declares serving defaults
 and a versioned `ModelContract` containing vocabulary bounds, vision capacities,
 attention-history storage, page-table views, graph value sources and dependencies,
 completion cursors, and frontend syntax. `ModelIndex` field 4 is reserved; arbitrary Protobuf
-`Struct` configuration is not accepted. Execution ABI 6, model contract 3, and
-payload format 2 are the versions Ignition writes; they are independent version
-domains. Helios loads model contract versions 1 through 3 and rejects others.
+`Struct` configuration is not accepted. Execution ABI 6 and payload format 2 are independent of the model contract.
+Ignition writes model contract 4 for catalogs with terminal prefill and 3
+otherwise. Helios loads model contract versions 1 through 4 and rejects others.
 
 Two prepared-contract fields fail validation when absent or out of
 range. `vision` (Protobuf message `VisionCapacity`, Rust type
@@ -350,6 +350,13 @@ is marked explicitly and carries no asserted upstream revision. Runtime
 collective preparation records the complete offline ladder as
 `RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
 original ladder file path. Helios does not interpret that preparation input.
+
+Experimental SM103 expert-tier exports record their resolved preparation
+configuration in `RebuildManifest.sm103_preparation_json`: canonical expert IDs
+in physical host/HBM row order, prepared library paths, and host-lane cluster
+count. Missing metadata means no explicit SM103 configuration. Weight reuse and
+core combination require identical recorded configurations; loading and replay
+use the captured programs and do not interpret these preparation settings.
 
 Online MXFP8 conversion records its resolved projection group in
 `RebuildManifest.online_mxfp8_scope`. An absent or empty field means `all`,
@@ -806,7 +813,7 @@ Helios validates the core before reconstruction:
 the core's GPU architecture matches the selected device, the recorded
 address range is free, free device memory covers the recorded footprint, and
 the core's prepared model contract version is one the Helios build
-supports (versions 1 through 3). It does not pin a driver version or a Helios build, because sm_120
+supports (versions 1 through 4). It does not pin a driver version or a Helios build, because sm_120
 SASS loads on any driver that supports the architecture and a core stays
 valid across Helios builds that keep the contract.
 

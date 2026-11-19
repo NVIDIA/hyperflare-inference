@@ -331,8 +331,11 @@ finish faster. The [completion oracle](scheduling-oracle.md) is the reference
 for that effect. Neither an EOS prior nor a finite-tail continuation is part of
 this ongoing-service policy.
 
-Native dispatch compares unknown costs optimistically and projects queued work
-into service prices before selecting a second frame. For prerequisites that
+Native dispatch compares unknown costs optimistically. When measured alternatives
+can advance every selected request, discovering another physical shape while
+excluding other measured runnable work uses the timing-probe budget described in
+[prepared-graph scheduling](scheduling-runtime-design.md#funded-timing-refresh).
+Queued work projects into service prices before selecting a second frame. For prerequisites that
 immediately enable token production, it compares complete two-graph sequences,
 including already ready streams in the following batch. The simulator's
 `UtilityScheduler.score(..., preceding_ms=...)` evaluates the corresponding

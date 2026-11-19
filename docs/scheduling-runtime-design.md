@@ -18,7 +18,7 @@ only for decode rounds, and it estimates graph costs with a 7/8 moving average
 that reverts to unmeasured after 30 seconds. The duration estimates, funded
 refresh, and acceptance learning specified below describe Helios alone.
 
-The native catalog contains prefill, scored prefill, ordinary decode, complete
+The native catalog contains prefill, terminal prefill, scored prefill, ordinary decode, complete
 speculative generation, mixed prefill/generation, vision, and state operations.
 A complete speculative graph contains proposal generation, optional confidence
 and prefix allocation, target verification, and accepted-state commit. Proposal
@@ -171,6 +171,22 @@ candidate serving two requests. Bounded cost-refresh probes are separate
 from ordinary selection. Selection does not enumerate exponentially many
 request subsets.
 
+When a catalog declares terminal prefill, intermediate prompt chunks leave
+continuation state incomplete. Before submitting one, the scheduler reserves
+the declared minimum actual tokens for a terminal graph at the next selected
+checkpoint, conditioned-input boundary, or prompt end. Only completed terminal
+state can be snapshotted or used for generation. Both graph families compete
+using their own measured costs and the useful tokens their capacities permit.
+When the remaining span to the next completion boundary fits one terminal
+graph, each intermediate candidate's useful-work rate includes the measured
+terminal execution needed for its tail. This
+prevents a cheap intermediate chunk from winning by omitting the remaining
+completion cost. The estimate uses the smallest fitting terminal capacity and
+the next declared completion boundary. Unknown terminal costs retain ordinary
+discovery behavior. Only the selected graph is submitted; the scheduler replans
+after its completion, and decode waiting is priced over that graph's duration.
+See [the terminal-prefill contract](../helios/model-contract.md#intermediate-and-terminal-prefill).
+
 Each prefill capacity competes using the checkpoint selection loop's predicted
 work, including optional cuts and their split and copy budgets
 ([checkpoint retention](#prerequisites-and-completion)), without quoting snapshot
@@ -179,17 +195,21 @@ planning scope. Both paths reuse a stored selection when it contains any
 non-anchor cut. Submission quotes storage for the winning prompt row. When no
 quote fails, estimated and submitted work agree. Storage shortage can change
 which cuts fit the work budget, so the estimate and quoted selection can differ
-in either direction. If the quoted work differs from the winning estimate, an
-ordinary prefill or mixed plan advances toward the quoted cut up to the catalog
-maximum and uses the smallest catalog capacity covering that work, with duration
-and value recomputed. Mixed plans resize only the prompt capacity among shapes
-with the same batch capacity and decode width; decode lanes retain their token
-counts. If a required lookup is unavailable, it retains the winning candidate
-and clips work to that candidate's capacity. Refresh and discovery plans
-retain their capacities and clip work to fit. Atomic image spans, feature windows,
-and prompt length also restrict logical work. A graph with 64 useful prompt tokens
-earns 64 prompt units and at most one output token, regardless of physical capacity.
-Candidate scoring has no smallest-fitting-shape filter, duration ceiling, forced
+in either direction. If the quoted work or required prefill operation differs
+from the winning estimate, an ordinary prefill or mixed plan advances toward the
+quoted cut up to the catalog maximum and uses the smallest catalog capacity
+covering that work, selecting the intermediate or terminal prefill operation
+required by the quoted boundary, with duration and value recomputed. Mixed plans
+resize only the prompt capacity among shapes with the same batch capacity and
+decode width; decode lanes retain their token counts. If a required lookup is
+unavailable, it retains the winning candidate and clips work to that candidate's
+capacity, switching an intermediate prefill to terminal prefill if the quoted
+boundary leaves fewer than the reconstruction minimum tokens. Refresh and
+discovery plans retain their capacities and clip work to fit under the same
+terminal-boundary rule. Atomic image spans, feature windows, and prompt length
+also restrict logical work. A graph with 64 useful prompt tokens earns 64 prompt
+units and at most one output token, regardless of physical capacity. Candidate
+scoring has no smallest-fitting-shape filter, duration ceiling, forced
 oldest-request filter, or per-chunk prefill lateness cost.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
@@ -305,8 +325,17 @@ Prefill exploration excludes a larger unmeasured graph when a smaller prepared
 capacity consumes the same tokens up to the next message or prompt endpoint.
 Measured graphs remain eligible according to their observed costs.
 
-An indeterminate candidate wins over a determinate candidate, then competes by
-expected useful value. Equal values prefer shorter known time, more served
+An indeterminate candidate normally wins over a determinate candidate, then
+competes by expected useful value. Discovery of an unmeasured physical graph
+uses timing-probe credit when every selected request has a measured alternative
+that can advance it and other runnable requests with measured work are excluded
+from the candidate. Without credit, those alternatives compete by their measured
+useful-work rates. An untimed operation needed for a request to progress remains
+eligible without credit; so does discovery that excludes no measured runnable
+work. This prevents optional shape discovery from monopolizing execution while
+other requests wait. It does not bound an individual graph's duration.
+
+Equal values prefer shorter known time, more served
 requests, less recently used requests, and smaller physical padding, in that
 order. Unknown graphs require an empty
 submission queue and completion feedback. A lone cold request consequently tries
@@ -321,11 +350,12 @@ because a saved plan can outlive the estimate's freshness interval.
 Ordinary valid completions earn `0.002 / 0.998` times their measured execution
 duration, capped at 5 ms. For queued executions, credited time is the maximum
 positive device interval; for isolated executions it is the larger of that
-interval and wall time. Initial discovery earns no credit. Idle discards
+interval and wall time. Unfunded discovery earns no credit. Idle discards
 positive credit and preserves debt.
 
-Full credit permits one stale alternative to displace the ordinary measured
-winner. Feasible alternatives are ordered by the later of their last valid
+Full credit permits one optional discovery or stale alternative to displace the
+ordinary measured winner. Optional discoveries compete by useful value and take
+precedence over stale alternatives. Feasible stale alternatives are ordered by the later of their last valid
 observation and last attempted dispatch, then by ordinary useful-value ranking.
 Attempts advance only on committed execution. Invalid timing does not make
 the estimate fresh, and its isolated wall time pays for the attempt.
@@ -337,8 +367,9 @@ that program's actual duration once, including proposal and verification work.
 Cancellation suppresses publication without inventing a timing observation.
 Another episode requires full credit after the preceding episode closes.
 
-For credited ordinary duration `O`, refresh duration `P`, and the actual duration
-`D` of the current or last refresh episode:
+For credited ordinary duration `O`, charged timing-probe duration `P`, and the
+actual duration `D` of the current or last timing-probe episode, including funded
+discovery:
 
 ```text
 P <= 0.002 / 0.998 * O + D.

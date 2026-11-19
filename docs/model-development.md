@@ -10,6 +10,9 @@ the Ignition CLI offers. Follow [repository guidance](../AGENTS.md),
 [preparation development](preparation-development.md), and the relevant
 [model preparation and serving instructions](model-preparation.md).
 Performance changes also require [GPU performance work](performance-work.md).
+For adapting a model to GB300, follow the
+[SM103 kernel integration process](sm103-kernel-integration.md) to inspect and
+adapt weight, activation, state, and graph boundaries and verify the emitted path.
 
 ## Canonical model structure and semantics
 

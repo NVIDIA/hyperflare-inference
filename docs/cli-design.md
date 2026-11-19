@@ -412,6 +412,7 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--reuse-weights` | Reuse the cached default version's weight hashes and mappings without reading live or cached weight payloads; requires matching checkpoint and prepared layouts. `export` only. | Off |
 | `--publisher-key PATH` | Public publisher profile authenticating the cached weight source; repeatable. `export` only. | Embedded profiles and the local development profile |
 | `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target printed with the exported entry path. Export validates the identifier; the value is not stored in the entry and does not change its cache location. `export` only. | Recipe `export_repository` when declared; otherwise no target is printed |
+| `--sm103-preparation PATH` | Experimental DeepSeek V4.1 TP1 export with explicit host/HBM expert rows and prepared reference libraries; see [SM103 preparation](model-preparation.md#deepseek-v41-flash). Complete serving is not qualified. | Off |
 | `--official-source URL` | Published repository URL under the configured publisher namespace | `[publishing] official_source` |
 
 Normal export reuses matching cached weight payloads automatically after hashing
@@ -446,7 +447,7 @@ explicit flags take precedence.
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, Step-5 NVFP4 scales including BF16 experts converted to W4A16, or MiniMax M3.1 Flash NVFP4 scales. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; the MiniMax M3.1 Flash declaration estimates none. Actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
 | `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2; Kimi K3.1 Pro defaults to its DSpark draft and also supports DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
-| `--parallax-routing` | Prepare counter-free and traced target graphs, including MTP. Requires the GLM or LIL GLM recipe on one GPU. Telemetry stays disabled until selected during serving. | off |
+| `--parallax-routing` | Prepare counter-free and traced target graphs, including MTP. Requires GLM, LIL GLM, or DeepSeek V4.1 on one GPU. Telemetry stays disabled until selected during serving. See [capture qualification](parallax.md#native-capture-and-live-comparison). | off |
 | `--mtp-only` | Omit MTP-disabled prefill, decode, maintenance, and mixed graphs during preparation. Retain width-one speculative rounds and vision graphs. Requires positive draft depth; rejects `--no-mtp`. The core cannot load with native `--mtp-draft-tokens 0`. | Capture both execution modes |
 | `--draft-body-quantization {mxfp8}` | Prepare eligible DFlash2 body context, attention latent/query/output, and MLP projections as MXFP8, independently of target conversion and proposal-head precision. Kimi K3.1 Pro requires `--speculative-method dflash2` and positive learned draft depth; DSpark and other recipes reject it. Normalization, convolution, candidate-selector, and absorbed key/value weights retain their precision. Omission preserves checkpoint precision or the existing `online_mxfp8_scope all` behavior. | No additional override |
 | `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. Flash Next supports both with `--speculative-method dflash2` and a BF16 target vocabulary head. Kimi K3.1 Pro supports both with `--speculative-method dflash2` only. This does not quantize the draft body. | Checkpoint precision |
@@ -496,14 +497,15 @@ its proposal and prefix-allocation mode.
 DeepSeek V4.1 defaults to seven draft tokens, concurrency 32, a 4096-token
 prefill chunk, 128 physical target rows, and at most 64 packed round graphs,
 with packed GPU prefix selection.
-Its catalog contains combined proposal/allocation/verification rounds and
-width-one graphs; ordinary graphs serve `--mtp-draft-tokens 0`.
+Its catalog contains combined proposal/allocation/verification rounds at each
+depth from one through the configured maximum, plus width-one graphs;
+ordinary graphs serve `--mtp-draft-tokens 0`.
 The [model preparation guide](model-preparation.md#deepseek-v41-flash) defines
 the packed capacity selection. The row cap bounds target work and storage;
 raising it permits longer aggregate prefixes at larger batches. The independent
-graph budget controls catalog density between each batch's smallest wider round
-and its maximum physical extent. Width-one and ordinary graphs do not consume
-that budget. Budgets below the required endpoint count fail during planning;
+graph budget covers the complete rounds across all depths, refining physical
+capacities after mandatory depth and batch coverage. Width-one and ordinary
+graphs do not consume that budget. Insufficient budgets fail during planning;
 budgets above the number of distinct valid capacities capture every capacity.
 In export/conversion examples, `CACHE_ENTRY` is the directory path printed by
 `ignition export`. For eight requests with five drafts each, this example limits
@@ -516,8 +518,11 @@ physical target capacity to 24 rows while retaining six-token per-request prefix
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors
 ```
 
-Packed cores require adaptive execution at their captured draft depth, or
-`--mtp-draft-tokens 0` for ordinary execution. Native serving uses all captured
+Packed cores require a captured draft depth within the requested runtime limit,
+or `--mtp-draft-tokens 0` for ordinary execution. A single-depth core cannot
+select a smaller positive depth. DeepSeek V4.1 preparation includes lower-depth
+rounds for runtime comparison; their full-model execution is not qualified.
+Native serving uses all captured
 packed capacities by default. Prefer `--mtp-max-verification-token-budget N` to
 retain every captured capacity at or below a ceiling. This example limits the
 24-row core above to at most 16 target rows per round:

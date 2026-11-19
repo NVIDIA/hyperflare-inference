@@ -577,6 +577,630 @@ expansion buffers reused by serial expert layers. Planning conservatively estima
 `--expert-scale-compression native` preserves native scales. MLA arithmetic defaults
 to BF16; `--mla-compute-mode auto` lets b12x select arithmetic while preserving
 packed KV storage.
+
+With prefill capacities above 128 tokens, DeepSeek prepares intermediate graphs
+that defer decoder suffix work and terminal graphs that complete continuation
+state. This split is experimental: full-model state equivalence and exported-core
+serving performance are not yet qualified. The terminal contract declares
+a 129-token reconstruction minimum. Helios reserves those actual tokens by
+shortening a preceding chunk; short fresh prompts and short extensions of a
+complete cached prefix can use fewer. Prompt scoring retains complete per-token
+execution. See the [terminal-prefill contract](../helios/model-contract.md#intermediate-and-terminal-prefill).
+
+For a TP1 state comparison, build Heliopause with its `qualification` feature and
+run `python -m qualify.deepseek41_terminal_prefill --help`. The diagnostic takes
+a local checkpoint, a Flare configuration file, the explicit SM103 preparation
+configuration described below, an assigned GPU UUID, and an output JSON path.
+It prepares 8192-token chunks and seven-token speculation, then compares declared
+continuation regions and assigned pages after complete per-chunk execution and
+after deferred execution with identical chunk boundaries. Synthetic token inputs
+and a repeated complete reference isolate state preservation; this diagnostic
+cannot establish model quality or exported-core serving performance.
+
+The experimental GB300 TP1 path exports MegaMoE expert execution with explicit
+HBM/Grace placement and prepared FlashMLA attention. Install the optional
+preparation dependency with:
+
+```sh
+uv sync --locked --extra prepare --extra test --extra megamoe
+```
+
+The Python preparation bootstrap accepts `PreparationConfig.sm103`, an
+`SM103Config` from `ignition.recipes.deepseek41.sm103`. It names prepared
+FlashMLA and DeepSelect libraries and an `ExpertPlacement` for every enabled
+target and draft FFN. Each placement lists canonical expert IDs in physical
+host and HBM row order. Every expert must be present; an expert may have one
+copy in each tier, with the HBM copy selected initially. No placement changes
+occur during preparation or replay through this API.
+
+The bootstrap connects the tier loader, shared MegaMoE workspaces, fused
+attention and 512-byte-aligned cache storage. It records the placement and
+separate host/HBM expert extents in its memory report. Expert extents include
+expanded scales and duplicate copies; they exclude shared experts, projections,
+allocator padding and execution storage. Workspace construction is checked on
+GB300 for all 40 target and three draft layers, including separate capacities
+for target and draft calls. CPU checks cover admission, placement completeness,
+storage accounting and exclusion of mutable residency state from the weight
+catalog.
+
+For experimental TP1 export, `--sm103-preparation PATH` reads a version-1 JSON
+object with `placements`, `host_lane_clusters`, optional `execution`
+(`"hybrid"` by default or `"reference"`), optional `context`, and—when
+`execution` is `"hybrid"`—`flashmla_library` and `deepselect_library`. Library
+paths resolve relative to the JSON file. Each
+placement is keyed by `layers.N.ffn` or `mtp.N.ffn` and contains `experts`,
+`host`, and `hbm`; the two arrays give canonical IDs in physical row order.
+Supply all 40 target layers and, when MTP is enabled, all three draft layers.
+Unknown fields, duplicate keys, missing experts, and repeated IDs within a tier
+are rejected. Both tiers may contain the same expert.
+
+Setting `"execution": "reference"` selects the complete DeepInfer SM103 model
+computation in `ignition.recipes.deepseek41`, including its 40-layer target
+transformer, three-layer DFlash draft model (`dspark_target_layer_ids = [37, 38, 39]`)
+with confidence-guided packed prefix allocation, 32-block vision encoder and
+projector, native Engram table delivery, and tiered MegaMoE storage. Optional
+`"context"` overrides the prepared sequence capacity (for example `262144`)
+without changing checkpoint metadata; `--prompt-logprobs`, `flashmla_library`,
+and `deepselect_library` are rejected in `"reference"` mode because the
+reference forward owns its attention and sparse indexer. When the maximum
+prefill chunk exceeds `144` tokens, `"reference"` enables Context-Encoder-Decoder
+(CED) consumer compaction (`keep_tokens = 144`, `terminal_prefill_min_tokens = 144`):
+intermediate `prefill` graphs execute only the 20 Context Encoder layers
+(`0..19`) and store the YOCO KV cache without running consumer layers (`20..39`)
+or vocabulary projection, while `terminal_prefill` graphs compact the consumer
+suffix (`<= 144` tokens) after layer 19. Exporting `"execution": "reference"`
+requires the `deepinfer` preparation package in the Python environment; exported
+cores load in `flare run` with no Python dependency. Run the miniature
+end-to-end export and fresh-process `flare run` check on SM103 with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 python -m pytest -q tests/preparation/test_reference_core_export_cuda.py
+```
+
+An optional `prefill_staging` object prepares temporary expert prefetch on both
+`"hybrid"` and `"reference"` SM103 preparations:
+
+```json
+"prefill_staging": {"min_rows": 1024, "min_cold_experts": 8}
+```
+
+Omission disables staging. Target prefill layers qualify by their prepared row
+count; when `yoco_keep_tokens < min_rows`, staging attaches only to Context
+Encoder layers (`0..19`) and leaves the compact consumer suffix (`20..39`) on
+direct-host execution. Two auxiliary streams start copies ahead of the consuming
+layers. Captured copy kernels inspect the live canonical map and skip
+HBM-resident duplicates. The preceding invocation's distinct host demand selects
+staging only when it reaches `min_cold_experts`; otherwise the consumer reads
+original host weights. Decode and MTP graphs do not use this prefill mechanism.
+The copies use SMs, not DMA engines, and reserve a three-plane-set scratch
+allowance inside the shared CUDA graph pool. Preparation clears the demand
+history after capture, before export. `--no-stream-overlap` keeps these copies
+on the calling capture stream. Changing this setting changes the preparation
+manifest, so use ordinary export rather than `--reuse-weights` across different
+staging configurations.
+
+The explicit configuration admits one local SM103 GPU and expanded native
+expert scales. It does not change the recipe's ordinary TP selection. Planning
+counts physical expert copies at their expanded native size and estimates other
+device weights from checkpoint headers. It checks host memory for mapped expert
+weights plus 8 GiB of preparation headroom; file-backed Engram tables and later
+compiler/cache demand still require separate host-memory budgeting. The printed
+plan reports HBM weight estimates and Grace expert bytes. Graph storage remains
+an estimate until capture measures it. This path requires a local checkpoint or
+an already downloaded checkpoint because placement sizing reads tensor headers.
+Use `ignition export` followed by release `flare run`; `debug-serve` and
+multi-host preparation reject this option.
+
+The reference index selector orders selected token IDs descending before
+attention, leaving invalid padding after the valid IDs. It preserves the
+selected set while preventing atomic scatter order from changing attention's
+floating-point reduction order. Tied cutoff scores still use the selector's
+tie-breaking behavior. The ordering is captured computation and requires
+re-export when changed.
+
+Full-model preparation and exported release serving have passed initial text
+integration checks on GB300 TP1 with concurrency one, 256-token prefill, native
+expert scales, static HBM/Grace placement, and seven adaptive drafts. Twenty
+model forwards compiled and 26 graphs captured, including ordinary, speculative,
+maintenance, and vision graphs. Native text checks cover ordinary and MTP
+execution, repeated seeded token output, 786-token chunked prefill, prefix reuse,
+independent requests, token accounting, and clean shutdown. The six tested token
+sequences agree between ordinary and MTP execution.
+
+The TP1 concurrency-sixteen, 8192-token prefill, three-draft `"hybrid"`
+configuration has also completed native text integration checks with expanded native expert scales
+and static HBM/Grace placement. Its 111 compiled forwards and 141 captured graphs
+load through release Flare. Checks cover a 12,842-token prompt crossing prefill
+chunks, exact cold/warm output token agreement, prefix reuse and branching,
+sixteen simultaneous requests, token accounting, and request drain. Native
+counters confirm speculative execution at batch sixteen. The checks also cover
+direct-destination prefill cache assembly in an exported core.
+
+With `"execution": "reference"`, `"context": 262144`, and
+`"prefill_staging": {"min_rows": 1024, "min_cold_experts": 8}`, the TP1
+concurrency-sixteen, 8,192-token prefill, seven-draft configuration
+(`--speculative-token-capacity 128`, `--speculative-graph-budget 80`,
+`--image-concurrency 1`, `--parallax-routing`, 11,680 active target HBM experts
+plus 40 spare exchange rows and 3,680 Grace experts) compiles 283 forwards and
+exports 313 graphs (`44` `terminal_prefill` graphs, `9.13 GiB` shared CUDA graph
+pool, `234.1 GiB` loaded device memory, `131.7 GiB` mapped host memory) in core
+`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` (and 207
+forwards / 237 graphs without CED or staging at `--speculative-graph-budget 64`
+in core `63bf1d05b2011d9a4ffeda37a4f3fb9f98144733b6eb0ddd08439a477ecde79a`).
+Fresh-process `flare run` allocates 18,029,568 logical KV tokens and 1,568
+shared snapshot slots (`15.01 GiB` cache budget) and passes
+`tests/server/test_deepseek41_sm103.py`, 2,080-token continuations, 36-request
+long-C16 acceptance, ordinary decode (`--mtp-draft-tokens 0`), and adaptive
+speculative execution at runtime draft limits 3, 5, and 7. Vision encoder
+varlen attention zero-initializes padded query rows before `_flash_attn_fwd` so
+non-128-aligned image patch counts cannot read uninitialized graph-pool values.
+Prompt log-probabilities and multi-GPU TP2+ composition are not supported on
+the `"reference"` path.
+
+`--parallax-routing` adds optional target-routing variants for ordinary and packed
+MTP execution. Runtime selection remains off by default. DeepSeek's capture wiring
+has checkpoint expert-block coverage through 8192 rows and bounded exported
+C16/8192/MTP3 text checks with identical tracing-off/on output token IDs. Native
+collection covers per-layer histograms through multi-chunk prefill and MTP;
+full-model tensor/state equivalence and isolated overhead remain unqualified.
+See [the routing contract](parallax.md#native-capture-and-live-comparison)
+for canonical IDs, per-layer valid counts and draft exclusion.
+
+Run the persistent native text regression against an idle release server with
+either qualified capacity pair and `--mtp-adaptive-verification`. Use runtime
+`--mtp-draft-tokens 7` for concurrency one or `--mtp-draft-tokens 3` for
+concurrency sixteen:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 FLARE_DEEPSEEK41_SM103_TEST_URL=http://127.0.0.1:8000 \
+  .venv/bin/python -m pytest -q tests/server/test_deepseek41_sm103.py
+```
+
+The test checks the advertised capacity pair before running. At concurrency
+sixteen it also submits sixteen simultaneous requests and requires a batch-sixteen
+speculative counter increase. The test uses the core's declared sampling defaults
+and an explicit seed. A requested sampling parameter without a declared range is clamped to its core
+default; requesting top-k one does not make this core greedy. Runtime draft
+limits select actual captured depths. A core containing only seven-draft rounds
+cannot serve a three-draft comparison; export the depth catalog described below.
+
+`ignition.components.megamoe_weights.load_mxfp4_planes` loads packed MXFP4 weights
+and expands CSF scales once into native UE8M0 bytes. `pack_mxfp4_planes` applies
+the DeepGEMM gate/up interleave and scale layout without requantizing weights.
+The shared-expert loader preserves FP8 weights and broadcasts native block
+scales into the fused kernel's 1x32 groups. Activation staging uses vLLM's
+MXFP8 Triton kernel with packed E8M0 scales and explicit padding masks.
+The reference kernel headers and their licenses are retained in
+`ignition/components/megamoe_kernel`; its initializer builds a private header
+tree under the supplied kernel cache and leaves the installed dependency intact.
+These components do not enable live expert movement or change the existing TP
+recipe's compressed-scale execution path.
+
+On an assigned GPU, validate synthetic source planes and checkpoint partitions
+with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_megamoe_weights_cuda.py tests/components/test_megamoe_inputs_cuda.py -q
+```
+
+Set `FLARE_DEEPSEEK41_CSF_SNAPSHOT` to an indexed lossless-CSF checkpoint to
+include real routed-expert comparisons from target layers 0, 20 and 39 and
+shared-expert comparisons from layers 0 and 39. Without it,
+those cases skip. The index must declare `metadata.total_size` equal to its
+stored tensor payload bytes; logical uncompressed sizes are not substitutes.
+The recipe accepts a `mxfp4_csf` quantization declaration with format version 1
+and `weight_scale_encoding: csf`, while requiring block-32 FP8 dense weights,
+UE8M0 scales, dynamic activations and FP4 experts. Scale payload readers retain
+their independent encoding and geometry checks.
+The staging tests compare quantization against an independent CPU calculation
+and replay graphs with changing activations, routing and padding masks.
+These checks establish component behavior, not full-model accuracy or serving speed.
+
+`ignition.components.megamoe.PreparedMegaMoe` declares MXFP8 staging and fused
+expert execution to the preparation session. Its calls expose weight reads,
+output writes, and workspace mutations to complete-forward compilation. A
+model-owned `MegaMoeWorkspace` retains the kernel's coordination state and ring
+storage, initialized once and shared by serialized calls with the same geometry.
+Its token capacity follows DeepGEMM's alignment. Declaration examples are released
+after tuning; invocation outputs belong to the compiled graph's memory plan.
+
+With `FLARE_DEEPSEEK41_CSF_SNAPSHOT` set, run the prepared-component checks:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_megamoe_cuda.py -q
+```
+
+The SM103 checks use eight real routed experts and optional shared FP8 weights.
+They compare compiled graphs against the reference at 1, 8, 64, and 256 rows,
+alternate graph capacities and routes, reject changed input geometry, and check
+declaration-storage release. The DeepSeek expert-block preparation accepts this
+component through explicit layer layouts; the CLI's full-model preparation does
+not select it.
+
+`ignition.components.megamoe_tiers.MegaMoeHostTier` allocates registered host
+rows through `CoreStorage` for the SM103 MegaMoE path. Allocate final HBM rows
+with `allocate_mxfp4_weights`; `load_mxfp4_weights_into` fills either those
+matrices or the tier's `cpu_weights` in bounded batches. It releases each
+batch's source and transformed tensors before loading the next batch, so
+host-bound weights do not accumulate in persistent GPU storage. The loader
+accepts explicit checkpoint prefixes, gate/up/down projection names, scale names
+and intermediate partitions. Recipes supply checkpoint mapping; the loader
+does not select placements. `copy_weights` also accepts already transformed
+batches, whose temporary ownership remains the caller's responsibility.
+Pass the remaining physical HBM matrices and this tier to `PreparedMegaMoe`.
+Its input expert IDs address host rows first, followed by HBM rows; the recipe
+must translate canonical routing IDs to that storage order. Logical expert
+count is independent of each tier's allocation extent. Both tiers must contain
+at least one row. This component does not implement placement policy or movement.
+
+Each layer owns the host pointers, route counters and tensor-map clone table.
+Their reads and mutations are visible to compilation, and the mapped host regions
+remain owned by core storage through native drain. `host_lane_clusters` selects
+the number of two-SM clusters available to the kernel's cold-expert lane; zero
+uses its ordinary task schedule. Four clusters is the reference default, not a
+measured optimum for every workload. The lane operates only where the carried
+kernel's schedule supports it; large calls retain its ordinary schedule.
+The C++ host binding and its kernel catalog are built during preparation.
+
+Run the host-tier composition checks with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_megamoe_tiers_cuda.py -q
+```
+
+`tests/components/test_megamoe_loading_cuda.py` checks exact tier contents and
+persistent allocation stability while loading synthetic CSF weights in partial
+batches. Run it with the same GPU opt-in. For a complete checkpoint-layer check,
+set `FLARE_MEGAMOE_REFERENCE_ROWMAP` to DerpSeek's
+`engine/rowmaps/exact-splitA-varied-mm.json` and set the snapshot variable above,
+then run `tests/components/test_megamoe_layer_cuda.py`. That fixture uses layer
+0's 224 static HBM experts, 96 cached HBM copies and 160 host experts, with
+checkpoint weights and generated activations and routes. It checks every
+physical copy and compares compiled execution with all-HBM execution,
+including quiescent mapping changes between existing host and cache copies.
+On GB300, outputs and route counts match exactly at 1, 8, 64 and 256 rows with
+zero and four cold-lane clusters, without allocations during captured replay.
+This check does not exercise concurrent replacement or physical movement.
+
+The tests compare compiled split-tier execution with all-HBM execution, including
+changing routes, padding, exact per-row counts and replay allocations. The real
+checkpoint case uses the snapshot variable above. A separate synthetic case
+changes expert count, widths and top-k and omits the shared expert; it validates
+the geometry contract, not predictive quality or serving performance.
+On GB300, these compiled checks pass with four host and four HBM checkpoint
+experts at 1, 8, 64 and 256 rows, and with five host and seven HBM synthetic
+experts at 1, 16 and 192 rows. Both zero and four host-lane clusters are checked.
+A separately exported checkpoint-component core passes 32 fresh native Helios
+replays with exact outputs and no CUDA allocations. These results do not qualify
+a model recipe, concurrent movement or end-to-end serving performance.
+
+`MegaMoeLayerLayout` pairs a protocol workspace with ordered canonical host and
+HBM expert IDs. It rejects missing experts, duplicate IDs within a tier and
+workspace mismatches before allocating weights. An ID present in both tiers
+has two physical copies; the initial map selects its HBM copy. Loading and
+mapping do not choose a placement policy.
+
+DeepSeek's `ModelWeights.load(..., megamoe_layouts=...)` accepts these layouts
+keyed by checkpoint FFN prefix, such as `layers.0.ffn` or `mtp.0.ffn`. A supplied
+inventory must cover every enabled target and draft layer. Its decoder composes
+the ordinary router with the canonical map and fused routed/shared execution;
+it does not also launch the standalone shared expert. The existing tensor-parallel
+expert path remains selected when layouts are absent.
+
+With the checkpoint and rowmap variables above, run
+`tests/components/test_megamoe_recipe_cuda.py` using the GPU opt-in to check the
+recipe's expert block. On GB300, target layer 0 matches canonical all-HBM
+execution at 1, 8, 64 and 256 rows, and draft layer 0 matches at 1, 8, 64 and
+192 rows. These checks use real router and expert weights with generated
+activations, changing padding and image-correction selection where declared.
+They check exact output/count agreement and allocation-free captured replay.
+They qualify the expert block, not full decoder state, learned speculation,
+vision processing or serving throughput.
+
+The SM103 fused decode-attention source in
+`ignition/components/mega_attention_kernel` is also available for component
+validation. It builds against the preparation environment's Torch ABI and needs
+the configured CUDA C++ toolchain and Ninja. It is not selected by the DeepSeek
+recipe. Its input contract uses BF16 queries with permuted head dimensions,
+page-separated cache payloads and scales, and packed MN-major output scales;
+the existing compressed-MLA cache buffers cannot be passed unchanged.
+
+`ignition.components.mega_attention.PreparedMegaAttention` declares this operator
+through the preparation session and exposes cache reads, output writes, and
+synchronization-state mutations to complete-forward compilation. Its
+`MegaAttentionWorkspace` retains epoch-tagged partials across serialized layers
+and graph variants. Invocation outputs and packed scales belong to the compiled
+graph's memory plan; declaration examples are released after tuning. The component
+implements the reference's window-only mode through 24 rows, parallel sparse mode
+through 16 rows, and cluster sparse mode through 76 rows. It rejects unsupported
+geometry; it does not supply prefill or cache writers. Cluster mode requires
+power-of-two pages and at most 128 window slots. All modes require at most 640
+combined key slots and 512-byte-aligned cache page strides.
+
+Build the reference library from
+[`vllm-project/FlashMLA` commit `0eee43b12f034b657133cf2afca6a72ebb6efccf`](https://github.com/vllm-project/FlashMLA/tree/0eee43b12f034b657133cf2afca6a72ebb6efccf)
+with its submodules and SM103 support. Set `FLARE_FLASHMLA_LIBRARY` to the
+resulting `_flashmla_C.abi3.so` file, then run on an assigned SM103 GPU:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mega_attention_cuda.py -q
+```
+
+Without the reference library these tests skip. They compare FP8 outputs and
+packed scales exactly across mixed-cache and window-only attention, 64- and
+128-token compressed pages, 128- and 136-token windows, and changing captured
+inputs and valid lengths. They check repeated replay and preparation rejection
+during capture. Full recipe composition and native serving are separate gates
+in the [SM103 integration process](sm103-kernel-integration.md).
+The prepared-component test also compiles two serialized attention calls sharing
+epoch state, alternates graph capacities at 1, 16, 17, 24, and 76 rows, and checks
+exact outputs, scale bytes, declaration-storage release, and geometry rejection.
+
+`ignition.components.mega_attention_cache` supplies matching cache layout and
+insertion components. `MegaCacheLayout` separates page payloads from scale rows
+and aligns page strides to 512 bytes. `PreparedMegaCacheWriter` prepares the
+unchanged vLLM rotary-and-insert CUDA kernel for MXFP8 windows and its Triton
+kernel for NVFP4 compressed rows. The latter publishes ratio-two rows only when
+a pair closes. Values, positions, slots, and rotary tables are explicit inputs;
+inactive slots and alignment padding remain unchanged. The continuation helpers
+copy both planes into a staging prefix and commit only accepted suffix tokens
+back to the 128-token ring. They do not copy a contiguous record prefix between
+pages of different sizes, because the scale region moves with the page size.
+
+`PreparedRingCommit` also accepts `record_planes=(512, 16)` and
+`staging_alignment=512` to commit multiple window layers in one launch. These
+describe the byte layout: payload rows precede scale rows, and staging pages
+include trailing alignment padding. Omitting them retains interleaved records.
+The single-window continuation helper uses the same commit kernel. Both preserve
+inactive rows, rejected suffixes, surrounding state fields and page padding.
+The cache's continuation backing must separately satisfy the reader's page-stride
+alignment; padding staging alone does not establish that contract.
+
+With the same FlashMLA reference library, run the cache-component checks:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mega_attention_cache_cuda.py -q
+```
+
+These checks cover encoded bytes against an independent encoder with identity
+rotation, inactive slots, pair boundaries, padded pages, partial ring commits,
+and compiled writer-to-attention composition against FlashMLA. The cache
+components are not selected by the DeepSeek recipe; full-model continuation,
+speculative state, and serving performance still require recipe integration.
+
+For batched commit checks, build the isolated Heliopause extension with native
+replay qualification and run:
+
+```sh
+uv pip install --python .venv/bin/python --no-deps --config-settings 'build-args=--features qualification' ./heliopause
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_ring_commit_cuda.py -q
+```
+
+On GB300 these checks cover both layouts across 40 window regions, batch sizes
+1, 4 and 64, partial acceptance, wraparound, strided request vectors and staging
+through 4,096 tokens. Compiled writer-to-commit checks compare committed bytes
+with an independent encoder and overwrite staging after its last consumer.
+Native replay checks exact state and stable CUDA allocation counters.
+
+`ignition.components.flashmla_attention.PreparedFlashMLA` supplies the reference
+fused attention for gathered BF16 prefill and paged MXFP8/NVFP4 decode. Unlike
+the small-row decode component, it accepts the larger row counts and staging
+page geometries needed by speculative verification. Pass the pinned FlashMLA
+library above as its `library` argument and a preparation kernel-cache path.
+The host binding links unchanged kernel instantiations; it does not compile a
+second copy of their GPU code. Its parameter and numeric-type headers are
+packaged with their licenses. Outputs, packed scales, and attention statistics
+are explicit tensors in the compiled forward, so the upstream host API's
+internal statistics allocations do not become opaque captured storage.
+
+Queries retain the reference head permutation. Prefill consumes already gathered
+BF16 keys; decode consumes page-separated quantized caches and physical indices.
+The caller owns cache writes, gathering and index translation. Mixed MXFP8/NVFP4
+decode requires a window index capacity divisible by eight. The component does
+not add normalization before attention; its caller supplies the required query
+arithmetic. Rotary transformation and output quantization remain in the fused
+kernel.
+
+With the same assigned GPU and `FLARE_FLASHMLA_LIBRARY`, run:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_flashmla_attention_cuda.py -q
+```
+
+The checks cover compiled prefill at 1, 257 and 1024 rows; window-only decode at
+25 rows; and mixed-cache decode at 77 and 192 rows with 136-token window pages.
+They compare outputs, scales and statistics with the upstream API, alternate
+capacities with changing inputs and masks, and check declaration lifetimes and
+replay allocations. These are synthetic component checks, not qualification of
+a DeepSeek serving recipe or speculative acceptance behavior.
+
+`ignition.components.mxfp4_logits.PreparedPagedMXFP4Logits` prepares the pinned
+DeepGEMM SM103 index-scoring kernel with explicit logits and scheduler scratch.
+It takes 32-head, 128-element MXFP4 queries, four packed UE8M0 scale bytes per
+head, FP32 head weights, and separate value/scale cache planes. Cache pages hold
+64 or 128 keys with a 512-byte-aligned page stride. Each query row supplies its
+own page table and visible length, allowing different speculative prefixes of
+one request. Columns outside that length are undefined and must be masked by
+the selection stage. `PreparedSparsePagedMXFP4Logits` scores candidate blocks
+using the reference's BF16 head weights and BF16 output. Its metadata and
+workspace are explicit forward-local tensors. Candidate block IDs must be
+sorted, unique in their live prefix, and padded by repeating the last live
+block. The selection stage receives a separate valid-column count.
+
+`PreparedContiguousMXFP4Logits` uses the reference FP32 prefill scorer over
+packed keys and their original scale bytes. Each query supplies a half-open
+interval in the packed key array. `PreparedMXFP4IndexGather` copies the paged
+cache into that array without dequantization; request prefix sums define the
+gathered segments. Empty requests read no pages. Storage beyond the gathered
+segments and scores outside query intervals are undefined and must remain
+excluded from selection. Both operations expose forward-local outputs to
+compilation and retain their prepared native resources through graph drain.
+
+With the `megamoe` preparation dependency installed and an assigned SM103 GPU:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mxfp4_logits_cuda.py -q
+```
+
+On GB300, generated packed inputs match the pinned DeepGEMM public API exactly
+at 1, 17 and 257 query rows, both page sizes, and a 2,049-key capacity. Tests
+change queries, lengths and page mappings between replays, include empty rows,
+and check cache preservation and allocation-free compiled graph replay.
+Compute Sanitizer memcheck reports zero errors for these cases. These
+checks qualify the storage binding; they do not qualify query quantization,
+top-K selection, full attention or exported native serving.
+
+The index-input helpers in `ignition.components.mxfp4_index_inputs` fuse query
+rotation and MXFP4 encoding, and key normalization, rotation and planar cache
+writes. They retain BF16 rounding at the reference boundaries. Head weights
+receive the two reference scaling multiplications in order. The key writer
+skips inactive slots and compression positions that do not close a record.
+
+`PreparedIndexTopK` uses the reference per-row FP32 prefill selector,
+cooperative FP32 decode selector through 64 rows, and persistent FP32 decode
+selector above that. BF16 sparse scores use an explicitly supplied DeepSelect
+library. The library is needed during preparation; serving replays the captured
+kernels. Cooperative decode and per-row prefill selection use atomic scatter,
+so token order can differ between identical invocations. Validate selected sets
+and scores separately
+from downstream floating-point reduction repeatability.
+
+`ignition.components.index_candidates` selects blocks by maximum score, retains
+the newest visible block, sorts and expands candidates for sparse scoring, and
+maps selected columns back to logical token IDs. Its candidate state contains
+block IDs, not flattened token IDs. These helpers preserve the reference's
+selection and padding rules.
+
+With an assigned SM103 GPU and `FLARE_DEEPSELECT_LIBRARY` pointing to a shared
+library providing the pinned reference `torch.ops.deep_select.topk` operator:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mxfp4_sparse_logits_cuda.py tests/components/test_mxfp4_index_inputs_cuda.py tests/components/test_index_topk_cuda.py tests/components/test_index_candidates_cuda.py -q
+```
+
+On GB300, sparse scoring matches the reference API at 1, 17 and 257 rows with
+64/128-key pages and 8/16-key sparse blocks. Input encoding matches an independent
+tensor reference exactly. Selection checks exact token sets, independently
+computed top-K score values, empty prefixes and changed replay inputs; candidate
+checks include partial blocks, newest-block retention and logical remapping.
+All check allocation-free compiled replay. These generated-input tests establish
+component behavior, not full-model attention or serving qualification. The BF16
+selection cases skip when the DeepSelect library is not supplied. Compute
+Sanitizer memcheck reports zero errors across these component cases and the
+full-cache scoring regressions.
+
+The layer-composition API uses `FusedMLAPreparation` to share rotary tables,
+MegaAttention synchronization storage and prepared-library paths. Pass it as
+`fused_attention` to `DeepSeekWeightLoader`, and allocate `ContinuationPool`
+with `window_record_planes=(512, 16)`. The loader applies the lossless query
+and output weight permutations; `PreparedAttention` composes projections,
+cache writes, index selection, attention and output projection. This API is
+restricted to TP1. `PreparationConfig.sm103` selects it in the Python bootstrap;
+the CLI accepts the explicit `--sm103-preparation` configuration described above.
+
+Window and compressed cache readers, prefill gathers, draft-context writers,
+snapshots and accepted-prefix commits use matching separated planes. Index
+pages and continuation rows retain 512-byte alignment, including padding in
+64-key index pages. Candidate-producing layers publish block IDs for later
+candidate-restricted layers. Scoring uses paged kernels in both decode and
+verification. Prefill gathers packed index keys once per attention layer and
+shares them across its 128-query scoring slices. It uses contiguous FP32
+scoring, masks scores with the published candidates where required, and
+returns request-local selected token IDs. This also keeps candidate-restricted
+prefill in FP32; BF16 sparse scoring is used for decode and verification.
+
+Prefill attention gathers compressed and window keys directly into disjoint
+regions of one BF16 buffer. The reference dequantization kernels retain their
+arithmetic and use explicit request strides; no concatenation copies the unused
+context capacity. Only live prefixes are initialized, and attention indices must
+exclude the remaining storage. Gather checks compare live keys with an independent
+cache decoder, preserve neighboring regions and inactive requests, and exercise
+compiled graph replay with changing page maps. Existing cores keep their captured
+cache assembly until re-exported.
+
+Synthetic GB300 checks compare contiguous scoring bitwise with the pinned
+DeepGEMM API at 1, 17, 257 and 8192 query rows, including a 131072-key case at
+128 rows. Gather tests compare encoded key and scale bytes under changing
+page mappings and empty requests. Composed prefill tests check selected score
+values and candidate blocks against independent tensor selection, with packed
+multi-request intervals and an 8192-row case. Worker-compiled graph replays
+preserve cache bytes and make no new Torch allocations. These checks establish
+component behavior; they do not establish full-model numerical agreement or
+native serving throughput. Existing exported cores retain their captured
+indexer path until re-exported.
+
+With the preparation dependencies installed and an assigned SM103 GPU:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python - <<'PY'
+from ignition import runtime_patches
+runtime_patches.apply()
+import pytest
+raise SystemExit(pytest.main([
+    "-q", "tests/components/test_mxfp4_contiguous_logits_cuda.py",
+    "tests/components/test_mxfp4_index_gather_cuda.py",
+    "tests/components/test_index_candidates_cuda.py",
+    "tests/components/test_reference_prefill_indexer_cuda.py",
+]))
+PY
+```
+
+Set `FLARE_DEEPSEEK41_CSF_SNAPSHOT` to the indexed checkpoint and supply the
+FlashMLA and DeepSelect libraries described above, then run:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_fused_mla_recipe_cuda.py tests/components/test_fused_mla_gather_cuda.py -q
+```
+
+On GB300, checkpoint-backed tests with stream overlap enabled preserve exact
+compiled/uncompiled outputs and continuation state for target layers 0, 2 and
+20, the layer-20/layer-24 candidate producer/consumer pair, and draft layer 0.
+Target shapes include 1-row decode, 17/64-row verification and 257-row prefill.
+Window-only attention, ratio-two layer 2, and the layer-20/layer-24 pair also
+cover 8192-row prefill. Draft shapes cover 8, 64 and 192 rows. The test checks
+selected token sets exactly, then orders the independently computed reference
+selection to match replay before comparing outputs and state bitwise. The
+reference selector's atomic scatter varies token order even without compilation;
+the resulting low-precision attention outputs need not be bitwise repeatable
+across independent executions. Production selection ordering is unchanged.
+Replays change inputs, request/page mappings, active lengths and accepted
+prefixes and allocate no device tensors. These layer tests do not qualify
+full-model speculation, long-context attention, native core export or serving.
+The snapshot/restore regression checks both cache layouts at consumed-token
+endpoints 1, 127, 128, 129, 255 and 256. It verifies complete continuation rows
+and partial physical pages, including padding, when two requests restore the
+same snapshot. Run `tests/recipes/test_deepseek41_state_transfer_cuda.py` with
+`FLARE_RUN_CUDA_TESTS=1` on an assigned GPU.
+
+The preparation helpers in `ignition.components.mega_attention_weights` apply
+the reference projection layouts once: query output rows are interleaved in
+16-element head chunks, while grouped output input columns are interleaved in
+32-element chunks. Their native scale bytes move with the corresponding values.
+Inputs use expanded per-row UE8M0 scales, not checkpoint block-scale grids or
+CSF containers. These coordinate layouts follow vLLM's fused-attention loading
+contract and FlashMLA's projection permutations.
+
+`PreparedGroupedFP8Projection` in `ignition.components.mega_attention_output`
+consumes the fused attention FP8 values and packed MN-major scales directly
+through DeepGEMM's grouped projection. It produces the reference BF16
+intermediate before the final dense projection. Weight reads and output writes
+are visible to compilation; declaration examples are released after tuning.
+It does not implement DerpSeek's small-row W8 fusion or the final dense projection.
+
+With both `FLARE_DEEPSEEK41_CSF_SNAPSHOT` and `FLARE_FLASHMLA_LIBRARY` set, run:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest tests/components/test_mega_attention_weights_cuda.py tests/components/test_mega_attention_output_cuda.py -q
+```
+
+Weight checks reconstruct canonical bytes and compare FlashMLA's transforms
+using target layers 0, 20 and 39, including all native scale-byte encodings in
+synthetic planes. The composed attention/projection check uses real layer-zero
+output weights with synthetic activations at 1, 17, 192, 257 and 8192 rows.
+It compares compiled outputs exactly against FlashMLA followed by DeepGEMM,
+changes inputs and masks, and checks replay allocations. Recipe selection,
+complete attention composition and full-model serving remain separate gates.
+
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses
@@ -601,41 +1225,37 @@ or `audit`. It adds preparation time without changing the serving graph catalog.
 
 `--speculative-token-capacity` bounds physical target rows;
 `--speculative-graph-budget` independently controls the number of packed rounds.
-For each power-of-two request bucket `B`, the catalog retains capacities
-`B + 1` and `min(token_capacity, B * (draft_tokens + 1))` when that interval is
-nonempty. These endpoints preserve the smallest positive aggregate draft budget
-and full-width verification wherever it fits. Width-one continuations cover
-every request bucket independently and do not consume the packed graph budget.
+For each power-of-two request bucket `B` and every draft depth from one through
+the configured maximum, the catalog retains target capacity
+`min(token_capacity, B * (depth + 1))` when it exceeds `B`. The maximum depth
+also retains capacity `B + 1`. Width-one continuations cover every request bucket
+independently and do not consume the packed graph budget. Each combined round
+records its actual proposal depth, allowing `flare run --mtp-draft-tokens N`
+to select captured depths up to `N` without recapture or relabeling.
 
 Additional graphs refine the largest ratio between adjacent capacities across
-all buckets. Each refinement inserts the integer nearest the geometric midpoint
-that minimizes the larger resulting ratio. Equal ratios prefer smaller batches,
-then smaller capacities. Comparing ratios gives each batch the same relative
-resolution rather than assigning all graphs to the largest absolute row range.
+batch and depth pairs, with the width-one continuation as the lower boundary.
+Each refinement inserts the integer nearest the geometric midpoint that minimizes
+the larger resulting ratio. Equal ratios prefer smaller batches, then smaller
+depths and capacities. The budget covers all depths together, so retaining more
+depths leaves fewer graphs to refine physical row capacities.
 At a fixed row cap, increasing the graph budget adds one distinct graph at a
 time and preserves every graph already selected. Integer row capacities limit
 the available resolution: larger budgets saturate at every valid capacity.
-Budgets below the endpoint count fail before preparation; the default request
-and token capacities require at least 12 packed graphs.
-
-With seven drafts, 128 target rows, and a 64-graph budget, the catalog contains:
-
-| Captured request capacity | Packed graphs | Minimum / maximum target rows |
-|---|---:|---:|
-| 1 | 7 | 2 / 8 |
-| 2 | 10 | 3 / 16 |
-| 4 | 12 | 5 / 32 |
-| 8 | 12 | 9 / 64 |
-| 16 | 14 | 17 / 128 |
-| 32 | 9 | 33 / 128 |
+Budgets below the mandatory coverage count fail before preparation. With
+concurrency 32, seven drafts and 128 target rows, at least 48 packed graphs
+are required. The default budget is 64.
 
 These 64 combined packed rounds and six width-one continuations are separate
 from ordinary decode, prefill, maintenance, and vision graphs. The persistent
 preparation catalog prints every selected capacity. At batch 32, the 128-row
-cap permits four target rows per request on average, while proposal generation
-still produces seven drafts per request. Raising the row cap permits longer
+cap permits four target rows per request on average; a seven-draft round still
+produces seven proposals per request. Raising the row cap permits longer
 aggregate verification prefixes; raising the graph budget improves resolution
 within that cap and increases capture and retained graph resources.
+The multiple-depth catalog is implemented; full-model export and native serving
+across runtime depths are not qualified. Previously exported
+single-depth cores retain their original runtime choices.
 
 The host owns admission, cohort membership, and cache reservations. The captured
 round assigns prefixes from native proposal confidence and reports one terminal

@@ -287,10 +287,16 @@ reading the endpoint does not activate counters. This endpoint neither changes r
 The response includes `version`, `session`, `model_id`, `enabled`, `geometry`
 (`[layers, experts]`), `clock`, `native_now_ns`, `demand_timing`, `demand_scope`, `capacity`,
 `latest_sequence`, `dropped_total`, `invalid_total`, and `frames`. Each frame has
-`sequence`, `graph`, `phase`, `batch_size`, `concurrency`, and a `sample` containing
+`sequence`, `graph`, `operation`, `token_capacity`, `phase`, `batch_size`,
+`concurrency`, and a `sample` containing
 `submission`, `demand_lower_bound_ns`, `available_ns`, and `layers`. Layer records
 contain canonical `layer`, valid `tokens`, `top_k`, and expert-indexed `counts`.
 No prompt content, token IDs or per-request identifiers are exposed.
+`operation` names the submitted graph family. `token_capacity` is the captured
+graph capacity; layer `tokens` counts actual valid rows. The `phase` remains `prefill` for
+`prefill`, `terminal_prefill`, and `scored_prefill` operations. Collectors can
+therefore distinguish intermediate and terminal execution in cores that declare
+terminal graphs. Cores without terminal graphs retain complete ordinary prefill.
 Phase `verify` reports target expert work from a complete speculative round,
 including candidates rejected after verification. Counts exclude padded target
 rows and draft-layer experts; they do not count only accepted output tokens.
