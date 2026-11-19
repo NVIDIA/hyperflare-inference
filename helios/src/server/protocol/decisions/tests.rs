@@ -386,6 +386,12 @@ fn contextual_labels_reject_prefix_retokenization_multi_token_and_special_ids() 
             .map(|text| tokenizers::AddedToken::from(text, true)),
         )
         .unwrap();
+    tokenizer
+        .add_special_tokens([
+            tokenizers::AddedToken::from("<strip>", true).rstrip(true),
+            tokenizers::AddedToken::from("<word>", true).single_word(true),
+        ])
+        .unwrap();
     let bytes = tokenizer.to_string(false).unwrap().into_bytes();
     let path = root.join("tokenizer.json");
     std::fs::write(&path, &bytes).unwrap();
@@ -484,6 +490,7 @@ fn contextual_labels_reject_prefix_retokenization_multi_token_and_special_ids() 
         assert_eq!(label_after(&spelled_tail, " A", vocabulary), Some(label), "{encoder:?}");
         let tokens = frontend.encode(":", false).unwrap();
         assert_eq!(label_after(&tokens, " A", vocabulary), Some(label));
+        assert_eq!(label_after(&frontend.encode("<think>", false).unwrap(), " A", vocabulary), Some(label));
         assert_eq!(label_after(&tokens, " C", vocabulary), None);
         assert_eq!(label_after(&tokens, "SPECIAL", vocabulary), None);
         assert_eq!(label_after(&tokens, " A", label as usize), None);
@@ -491,6 +498,14 @@ fn contextual_labels_reject_prefix_retokenization_multi_token_and_special_ids() 
             label_after(&frontend.encode(": ", false).unwrap(), "A", vocabulary),
             None
         );
+        // A token that strips the whitespace after it swallows the label's leading space when the
+        // label follows it directly; text between them, and a whole-word token, change nothing.
+        let strip = frontend.encode("a <strip>", false).unwrap();
+        assert_eq!(label_after(&strip, " A", vocabulary), None, "{encoder:?}");
+        for text in ["a <strip> b", "a <word>", "a <word> b"] {
+            let tokens = frontend.encode(text, false).unwrap();
+            assert_eq!(label_after(&tokens, " A", vocabulary), Some(label), "{encoder:?}: {text}");
+        }
     }
     std::fs::remove_dir_all(root).unwrap();
 }

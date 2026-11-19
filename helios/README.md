@@ -579,18 +579,24 @@ strings nested in default arrays or objects, are controls unless the request
 overrides that default.
 
 The frontend encodes the whole prompt first. A control is an added token that is
-special, or that the chat template or one of its defaults names, or the
-placeholder text that an image layout lets request text spell. The RADIO layout
-(the C-RADIO image encoder) is the one that does: its template lets message text
-place `<image>` placeholders, and cores prepared for it declare no placeholder
-token ID, so the layout supplies the text. Spelled RADIO placeholders stay
-controls when they and the placeholders the template wrote together account for
-every attached image; otherwise they are ordinary text. Other added tokens, such
-as GLM's `/nothink`, are lexical text, and request text that spells one
-tokenizes to that token. Only when a control overlaps ordinary text does the
-frontend re-encode the text between the other added tokens that contains the
-spelling, with a tokenizer built at load without added vocabulary, so a spelling
-of a control in request text never becomes that control's token. An added token
+special, or that the chat template or one of its defaults names, or that the
+prepared contract names as a marker, or the placeholder text that an image
+layout lets request text spell. The server adds the contract's markers when it
+loads the core: its reasoning delimiters and terminal markers, the markers of
+the tool-call parser kind it selects (its delimiters and, for GLM, its argument
+tags), and its image feature and span tokens. The RADIO layout (the C-RADIO
+image encoder) is the one that lets request text spell a placeholder: its
+template lets message text place `<image>` placeholders, and cores prepared for
+it declare no placeholder token ID, so the layout supplies the text. Spelled
+RADIO placeholders stay controls when they and the placeholders the template
+wrote together account for every attached image; otherwise they are ordinary
+text.
+Other added tokens, such as GLM's `/nothink`, are lexical text, and request text
+that spells one tokenizes to that token. Only when a control overlaps ordinary
+text does the frontend re-encode the text between the other added tokens that
+contains the spelling, with a tokenizer built at load without added vocabulary, so
+a spelling of a control in request text never becomes that control's token, except
+for a spelled RADIO placeholder that positions an attached image. An added token
 that strips adjacent whitespace (`lstrip` or `rstrip`) counts as spelled only
 when the request wrote the token's own bytes, not the whitespace beside it.
 

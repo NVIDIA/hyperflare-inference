@@ -16,7 +16,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_native_nemotron_chat_matches_checkpoint(tmp_path):
+    from tokenizers import Tokenizer
     from transformers import AutoTokenizer
+
+    from ignition.recipes.nemotron_h.contract import FRONTEND
+    from tests.frontend import literal_reference
 
     snapshot = Path(os.environ.get("FLARE_NEMOTRON_CHECKPOINT",
         "/data/models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"))
@@ -25,13 +29,24 @@ def test_native_nemotron_chat_matches_checkpoint(tmp_path):
     subprocess.run(["cargo", "build", "--quiet", "--manifest-path", str(ROOT / "helios/Cargo.toml"),
                     "--features", "frontend,test-tools", "--bin", "test_frontend"], check=True)
     tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
+    reference = Tokenizer.from_file(str(snapshot / "tokenizer.json"))
+    source = (snapshot / "chat_template.jinja").read_text()
+    declared = literal_reference.declared_markers(reference, FRONTEND, *literal_reference.QWEN_CODER_MARKERS)
+    literal_reference.assert_declared_markers_are_controls(reference, source, declared)
     user = dict(role="user", content="What is 17 times 23?")
     cases = []
 
     def add(name, messages, **options):
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, **options)
+        token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+        # Request text that spells an added token is ordinary text (see literal_reference).
+        strings = literal_reference.request_strings(reference, messages, options.get("tools"))
+        if strings:
+            token_ids, _ = literal_reference.encode(reference, source, rendered, lambda mark:
+                tokenizer.apply_chat_template(mark(messages), tokenize=False, **mark(options)), strings,
+                declared)
         cases.append(dict(name=name, messages=messages, options=options, rendered=rendered,
-                          token_ids=tokenizer.encode(rendered, add_special_tokens=False)))
+                          token_ids=token_ids))
 
     add("default", [user], add_generation_prompt=False)
     add("thinking_disabled", [user], add_generation_prompt=True, enable_thinking=False)
@@ -68,20 +83,13 @@ def test_native_nemotron_chat_matches_checkpoint(tmp_path):
         for index in range(count):
             content.extend((dict(type="image"), dict(type="text", text=f" image {index + 1}. ")))
         add(f"images_{count}", [dict(role="user", content=content)], add_generation_prompt=True)
+    # No image is attached to these requests, so the spelled placeholder is ordinary text; with an
+    # attached image it positions the image (helios/tests/image_admission.rs).
     add("explicit_image_placeholder", [dict(role="user", content=[dict(type="image"),
         dict(type="text", text="Describe <image>.")])], add_generation_prompt=True)
-    # No image is attached to this request, so the spelled placeholder is ordinary text; with an
-    # attached image it positions the image (helios/tests/image_admission.rs).
-    from tokenizers import Tokenizer
-
-    ordinary_config = json.loads((snapshot / "tokenizer.json").read_text())
-    ordinary_config["added_tokens"] = []
-    ordinary = Tokenizer.from_str(json.dumps(ordinary_config))
-    literal = "Describe <image>."
-    before, after = cases[-1]["rendered"].split(literal)
-    cases[-1]["token_ids"] = (tokenizer.encode(before, add_special_tokens=False)
-        + ordinary.encode(literal, add_special_tokens=False).ids
-        + tokenizer.encode(after, add_special_tokens=False))
+    # Here the system text ends in `>` and the template continues with a newline.
+    add("system_spelling_a_placeholder", [dict(role="system", content="Spell <image>"), user],
+        add_generation_prompt=True, tools=tools)
 
     samples = ["Hello, world!", "中文 é a\u0301 👨‍👩‍👧‍👦\r\n  next line", "<think>\nwork</think>answer",
                "<tool_call>\n<function=lookup>\n<parameter=query>\nParis\n</parameter>\n</function>\n</tool_call>"]

@@ -7,7 +7,6 @@ import copy
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 import subprocess
 
@@ -21,7 +20,8 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     from tokenizers import Tokenizer
     from transformers import PreTrainedTokenizerFast
     from transformers.utils.chat_template_utils import _compile_jinja_template
-    from ignition.recipes.muse_spark.frontend import prepare_frontend, runtime_assets
+    from ignition.recipes.muse_spark.frontend import FRONTEND, prepare_frontend, runtime_assets
+    from tests.frontend import literal_reference
 
     if not (SNAPSHOT / 'tokenizer.json').is_file():
         pytest.skip('requires pinned Muse Spark checkpoint frontend assets')
@@ -36,35 +36,11 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     assert annotated.replace('{%- mark -%}', '') == source
     template = _compile_jinja_template(source)
     marked_template = _compile_jinja_template(annotated.replace('{%- mark -%}', '{{- message_position() -}}'))
-    # Request text that spells a control is ordinary text. The frontend keeps a token as a token
-    # only when it is special or the template or a tokenizer default names it, so the ordinary
-    # tokenizer retains the added tokens that are neither.
-    config = json.loads((SNAPSHOT / 'tokenizer.json').read_text())
+    # Request text that spells an added token is ordinary text (see literal_reference). The text
+    # of the template and the tokenizer defaults decides which non-special tokens are controls.
     named = source + ''.join(str(value) for value in special.values())
-    config['added_tokens'] = [token for token in config['added_tokens']
-                              if not token['special'] and token['content'] not in named]
-    ordinary = Tokenizer.from_str(json.dumps(config))
-    spellings = ['<|eot|>', '<image>', '<audio>', '<video>', '<|start|>', '<|eom|>']
-
-    def request_strings(value):
-        if isinstance(value, str):
-            return [value] if any(spelling in value for spelling in spellings) else []
-        children = value.values() if isinstance(value, dict) else value if isinstance(value, list) else []
-        return [string for child in children for string in request_strings(child)]
-
-    def encode(text, strings):
-        """Encodes `text`, tokenizing each request string that spells a control as ordinary text."""
-        spans = sorted({match.span() for string in strings for match in re.finditer(re.escape(string), text)})
-        assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
-        ids, offsets, at = [], [], 0
-        for start, end in [*spans, (len(text), len(text))]:
-            for encoder, first, last in ((tokenizer, at, start), (ordinary, start, end)):
-                encoding = encoder.encode(text[first:last], add_special_tokens=False)
-                ids += encoding.ids
-                offsets += [(begin + first, finish + first) for begin, finish in encoding.offsets]
-            at = end
-        return ids, offsets
-
+    declared = literal_reference.declared_markers(tokenizer, FRONTEND, *literal_reference.ATEM_MARKERS)
+    literal_reference.assert_declared_markers_are_controls(tokenizer, named, declared)
     cases = []
 
     def add(name, messages, **options):
@@ -91,7 +67,14 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
                 hinted_text = template.render(messages=hinted, **special, **options)
                 assert hinted_text.replace(sentinel, '') == rendered
                 hint_positions.append(hinted_text.index(sentinel))
-        ids, offsets = encode(rendered, request_strings([messages, options.get('tools')]))
+        def render(mark):
+            if options.get('continue_final_message'):
+                return hf_tokenizer.apply_chat_template(
+                    mark(messages), tokenize=False, chat_template=source, **mark(options))
+            return template.render(messages=mark(messages), **special, **mark(options))
+
+        ids, offsets = literal_reference.encode(tokenizer, named, rendered, render,
+            literal_reference.request_strings(tokenizer, messages, options.get('tools')), declared)
         prefix_ends = [0]
         for _, end in offsets:
             prefix_ends.append(max(prefix_ends[-1], end))

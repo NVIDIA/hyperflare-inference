@@ -15,6 +15,11 @@ use serde_json::{Map, Value};
 #[cfg(test)]
 use crate::output::tagged::{OutputConfig, TaggedOutput};
 
+/// The argument tags that `ArgumentTags::parse` reads. They are markers of the parser that
+/// `ToolDialect` does not carry; `OutputPipeline::declared_markers` lists them.
+pub(crate) const ARGUMENT_MARKERS: [&str; 4] =
+    ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"];
+
 pub struct ArgumentTags;
 impl ToolDialect for ArgumentTags {
     const NAME: &'static str = "GLM";
@@ -120,6 +125,24 @@ mod tests {
                 "items":{"type":"array"}, "options":{"type":"object"}, "empty":{"type":"null"}
             }}}})],
         }
+    }
+
+    #[test]
+    fn declared_markers_are_the_tags_the_parser_reads() {
+        let [key, key_end, value, value_end] = ARGUMENT_MARKERS;
+        let parsed = ArgumentTags::parse(
+            &format!("run{key}text{key_end}{value}hello{value_end}"),
+            &config().tools,
+        )
+        .unwrap();
+        assert_eq!(parsed, [("run".to_owned(), r#"{"text":"hello"}"#.to_owned())]);
+        let syntax = serde_json::from_str::<crate::model::PreparedContract>(include_str!(
+            "../../tests/support/contracts/glm53.json"
+        ))
+        .unwrap()
+        .frontend;
+        let declared = crate::output::OutputPipeline::declared_markers(&syntax);
+        assert!(ARGUMENT_MARKERS.iter().all(|tag| declared.contains(tag)), "{declared:?}");
     }
 
     #[test]

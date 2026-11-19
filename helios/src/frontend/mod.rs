@@ -337,9 +337,10 @@ pub struct Frontend {
     tokenizer: Tokenizer,
     /// The tokenizer without its added vocabulary, for text that must not spell controls.
     ordinary_tokenizer: Tokenizer,
-    /// The added tokens that request text may not spell: the special tokens and the ones the
-    /// chat template or the image settings name. Other added tokens, such as `/nothink`, are
-    /// lexical: request text that spells one tokenizes to that token.
+    /// The added tokens that request text may not spell: the special tokens, the ones the chat
+    /// template or the image settings name, and the ones the prepared syntax names (see
+    /// `with_controls`). Other added tokens, such as `/nothink`, are lexical: request text that
+    /// spells one tokenizes to that token.
     controls: std::collections::HashSet<u32>,
     /// The control that request text positions images with, when the image layout allows it.
     spelled_image_placeholder: Option<u32>,
@@ -530,6 +531,20 @@ impl Frontend {
         };
         self.spelled_image_placeholder = text.and_then(|text| self.tokenizer.token_to_id(text));
         self.controls.extend(self.spelled_image_placeholder);
+        self
+    }
+
+    /// Adds the tokens that the prepared syntax names as markers (reasoning and tool-call
+    /// delimiters, image tokens) to the controls. Such a marker is a control even when the
+    /// tokenizer does not mark it special and the chat template does not name it. Tokens outside
+    /// the added vocabulary, and whitespace, are ignored.
+    pub fn with_controls(mut self, tokens: impl IntoIterator<Item = u32>) -> Self {
+        let added = self.tokenizer.get_added_vocabulary().get_added_tokens_decoder();
+        self.controls.extend(
+            tokens
+                .into_iter()
+                .filter(|id| added.get(id).is_some_and(|token| !token.content.trim().is_empty())),
+        );
         self
     }
 
@@ -915,6 +930,10 @@ impl Frontend {
     /// the segment encoded with the added vocabulary. Added tokens other than spelled controls
     /// (template controls and lexical tokens such as `/nothink`) delimit regions; only a region
     /// that holds a spelled control is encoded again, without the added vocabulary.
+    ///
+    /// That second encoding allocates host memory after the host cache is sized. The memory draws
+    /// on the headroom `host_pool_budget` (selene/src/offload.rs) leaves unallocated:
+    /// `HOST_SERVICE_HEADROOM_BYTES` (2 GiB) plus one twentieth of total memory.
     fn push_segment(
         &self,
         text: &str,

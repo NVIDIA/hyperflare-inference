@@ -339,6 +339,19 @@ pub struct ImageSpan {
     pub unscoped_tokens: Vec<u32>,
 }
 
+impl ImageTokenLayout {
+    /// The feature token and every token that the image span writes.
+    pub fn token_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        let span = self.span.iter().flat_map(|span| {
+            [span.start_token, span.end_token]
+                .into_iter()
+                .chain(span.interior_tokens.iter().copied())
+                .chain(span.unscoped_tokens.iter().copied())
+        });
+        std::iter::once(self.feature_token).chain(span)
+    }
+}
+
 impl PreparedContract {
     pub fn graph(&self, name: &str) -> Result<&GraphContract> {
         self.graphs

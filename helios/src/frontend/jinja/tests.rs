@@ -594,19 +594,101 @@ fn sliced_request_text_coalesces_ordinary_ranges() {
     assert_eq!(rendered.ordinary, vec![0..999]);
 }
 
-/// A filter on the exact list in `filter` must return its operands' characters unchanged; each
-/// other filter marks its whole result ordinary. A filter added to `filter_value` must be placed.
+/// Runs filters, methods and builtin functions over operands that mix template text
+/// (`<control>`) with request text (`<|image|>`). The first run takes the request text from the
+/// context; the second spells the same bytes as a template literal.
+///
+/// An exact builtin returns its operands' own characters: request characters stay ordinary and
+/// template characters do not. Any other builtin marks its whole result ordinary. With
+/// template text alone, nothing is ordinary in either case.
 #[test]
-fn every_filter_is_classified_for_provenance() {
-    let source = include_str!("vm.rs");
-    let end = source.find("fn method<").unwrap();
-    let exact = &source[source.find("fn filter<").unwrap()..source.find("fn filter_value").unwrap()];
-    let body = &source[source.find("fn filter_value").unwrap()..end];
-    let transforms = ["length", "count", "capitalize", "lower", "upper", "replace", "tojson", "fromjson", "int"];
-    for arm in body.lines().filter(|line| line.starts_with("        \"") && line.contains("=>")) {
-        for name in arm.split("=>").next().unwrap().split('|').map(|n| n.trim().trim_matches('"')) {
-            assert!(transforms.contains(&name) || exact.contains(&format!("\"{name}\"")), "unclassified filter {name}");
+fn builtins_keep_provenance_over_mixed_operands() {
+    let context = json!({"r": "<|image|>"});
+    // Each expression names its operands `{m}` (a string), `{l}` (a list) and `{d}` (a mapping),
+    // which mix `<control>` text with the request text `{r}`.
+    let expand = |expression: &str, request: &str| {
+        expression
+            .replace("{m}", "('<control>' + {r} + '</control>')")
+            .replace("{l}", "['<control>', {r}, '</control>']")
+            .replace("{d}", "{'<control>': {r}}")
+            .replace("{r}", request)
+    };
+    let render = |expression: &str, request: &str| {
+        CompiledTemplate::compile(&format!("{{{{ {} }}}}", expand(expression, request)))
+            .unwrap_or_else(|error| panic!("{expression}: {error}"))
+            .render(context.as_object().unwrap(), &[])
+            .unwrap_or_else(|error| panic!("{expression}: {error}"))
+    };
+    let overlaps = |rendered: &RenderedTemplate, at: usize, length: usize| {
+        rendered.ordinary.iter().any(|r| at < r.end && at + length > r.start)
+    };
+    // (expression, whether the result still holds the template's `<control>`)
+    let exact = [
+        ("{m}|safe", true),
+        ("{m}|trim", true),
+        ("{m}|string", true),
+        ("{m}|default('unused')", true),
+        ("{m}|d('unused')", true),
+        ("{l}|join", true),
+        ("{l}|join(',')", true),
+        ("{l}|list|join", true),
+        ("{l}|sort|join", true),
+        ("{l}|unique|join", true),
+        ("([{r}, '<control>']|last) + ([{r}, '<control>']|first)", true),
+        ("{d}|items|first|join", true),
+        ("{d}|dictsort|first|join", true),
+        ("({m}).strip()", true),
+        ("({m}).lstrip()", true),
+        ("({m}).rstrip()", true),
+        ("({m}).split('!')|join", true),
+        ("({m}).rsplit('!', 1)|join", true),
+        ("({m}).split('<control>')|join", false),
+        ("({d}).get('<control>')", false),
+        ("(({d}).keys()|first) + (({d}).values()|first)", true),
+        ("({d}).items()|first|join", true),
+        ("dict(a={m}).a", true),
+        ("namespace(a={m}).a", true),
+    ];
+    for (expression, control) in exact {
+        let rendered = render(expression, "r");
+        assert!(rendered.text.contains("<|image|>"), "{expression}: {rendered:?}");
+        assert_eq!(rendered.text.contains("<control>"), control, "{expression}: {rendered:?}");
+        for (at, _) in rendered.text.match_indices("<control>") {
+            assert!(!overlaps(&rendered, at, "<control>".len()), "{expression}: {rendered:?}");
         }
+        for (at, _) in rendered.text.match_indices("<|image|>") {
+            assert!(overlaps(&rendered, at, "<|image|>".len()), "{expression}: {rendered:?}");
+        }
+        let literal = render(expression, "'<|image|>'");
+        assert_eq!(literal.text, rendered.text, "{expression}");
+        assert!(literal.ordinary.is_empty(), "{expression}: {literal:?}");
+    }
+    let whole = [
+        "{m}|upper",
+        "{m}|lower",
+        "{m}|capitalize",
+        "{m}|replace('x', 'y')",
+        "({m}).upper()",
+        "({m}).lower()",
+        "({m}).capitalize()",
+        "({m}).replace('x', 'y')",
+        "{l}|string",
+        "{l}|tojson",
+        "{m}|tojson",
+        "{d}|tojson",
+        "('\"' + {r} + '\"')|fromjson",
+        "json_object_members('{\"k\": \"' + {r} + '\"}')|first|join",
+    ];
+    for expression in whole {
+        let rendered = render(expression, "r");
+        let mut covered = vec![false; rendered.text.len()];
+        for range in &rendered.ordinary {
+            covered[range.clone()].fill(true);
+        }
+        assert!(!covered.is_empty() && covered.iter().all(|byte| *byte), "{expression}: {rendered:?}");
+        let literal = render(expression, "'<|image|>'");
+        assert_eq!(literal.text, rendered.text, "{expression}");
+        assert!(literal.ordinary.is_empty(), "{expression}: {literal:?}");
     }
 }
 

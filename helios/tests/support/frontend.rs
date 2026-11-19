@@ -82,6 +82,16 @@ pub fn contract(name: &str) -> crate::model::PreparedContract {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
+/// The frontend syntax of a recipe: its `<name>_frontend.json` fixture when it has one (recipes
+/// whose tests need no full prepared contract), otherwise the frontend of the full contract.
+pub fn frontend_contract(name: &str) -> crate::model::contract::FrontendContract {
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/contracts");
+    match std::fs::read(directory.join(format!("{name}_frontend.json"))) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+        Err(_) => contract(name).frontend,
+    }
+}
+
 pub fn model_config(contract: crate::model::PreparedContract) -> crate::model::ModelConfig {
     crate::model::ModelConfig {
         completion_token_capacity: 16,

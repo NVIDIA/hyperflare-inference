@@ -171,10 +171,12 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
   mark the root call site after the helper returns. Handle each output branch,
   including tool-only messages and empty content with nonempty framing.
 - Name in the template text or in a recipe default every control token the
-  template writes. An added token that is neither special nor named there is
-  lexical: request text that spells it tokenizes to that token. A control
-  assembled from request fields (for example `'<|' + role + '|>'`) counts as
-  request text.
+  template writes. An added token that is neither special, named there, nor a
+  marker the recipe's prepared frontend contract names (its reasoning
+  delimiters and terminal markers, the markers of its tool-call parser kind,
+  and its image tokens) is lexical: request text that spells it tokenizes to
+  that token. A control assembled from request fields (for example
+  `'<|' + role + '|>'`) counts as request text.
 - Verify the recipe exports the annotated asset and Helios loads it through the
   shared compiler. Do not bypass the missing-annotation error or add a broad
   template fallback. Compatibility substitutions must match the exact template

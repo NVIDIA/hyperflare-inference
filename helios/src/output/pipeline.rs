@@ -124,6 +124,55 @@ impl OutputPipeline {
         }
     }
 
+    /// The markers of the framing that `kind` writes, each of which must be one tokenizer token.
+    pub(crate) fn envelope_markers(kind: ToolParserKind) -> &'static [&'static str] {
+        match kind {
+            ToolParserKind::Xtml => &["<|open|>", "<|close|>", "<|sep|>"],
+            ToolParserKind::Atem => &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"],
+            ToolParserKind::TmlJson => &super::tml::CONTROL_MARKERS,
+            ToolParserKind::QwenCoder
+            | ToolParserKind::GlmArgumentTags
+            | ToolParserKind::Dsml
+            | ToolParserKind::MiniMaxXml
+            | ToolParserKind::GemmaCall => &[],
+        }
+    }
+
+    /// The delimiter strings that the prepared syntax names: its reasoning delimiters and terminal
+    /// markers, and the delimiters of the tool-call parser the contract selects. The contract
+    /// holds only the parser kind; every kind lists its own markers here, so a new kind must too.
+    pub fn declared_markers(syntax: &FrontendContract) -> Vec<&str> {
+        use super::tagged::ToolDialect;
+        fn dialect<D: ToolDialect>() -> Vec<&'static str> {
+            [D::OPEN, D::CLOSE]
+                .into_iter()
+                .chain(D::FUNCTION.into_iter().flat_map(|(open, close)| [open, close]))
+                .collect()
+        }
+        let mut markers = Vec::new();
+        if let Some(reasoning) = &syntax.reasoning {
+            markers.extend([reasoning.open.as_str(), reasoning.close.as_str()]);
+            markers.extend(reasoning.terminal_markers.iter().map(String::as_str));
+        }
+        if let Some(tools) = &syntax.tools {
+            markers.extend(match tools.kind {
+                ToolParserKind::QwenCoder => dialect::<super::chatml::FunctionTags<true>>(),
+                ToolParserKind::GlmArgumentTags => [
+                    dialect::<super::argument_tags::ArgumentTags>(),
+                    super::argument_tags::ARGUMENT_MARKERS.to_vec(),
+                ]
+                .concat(),
+                ToolParserKind::MiniMaxXml => dialect::<super::minimax_xml::MiniMaxXml>(),
+                ToolParserKind::GemmaCall => dialect::<super::gemma_call::GemmaCall>(),
+                ToolParserKind::Dsml => super::dsml::CONTROL_MARKERS.to_vec(),
+                ToolParserKind::Xtml => Self::envelope_markers(ToolParserKind::Xtml).to_vec(),
+                ToolParserKind::Atem => Self::envelope_markers(ToolParserKind::Atem).to_vec(),
+                ToolParserKind::TmlJson => Self::envelope_markers(ToolParserKind::TmlJson).to_vec(),
+            });
+        }
+        markers
+    }
+
     pub fn grammar_envelope(config: &OutputConfig) -> Option<crate::grammar::OutputEnvelope> {
         let mut envelope = match config
             .syntax

@@ -393,21 +393,28 @@ native system role to models whose templates cannot represent one inline.
 
 Text that a request supplies is ordinary text. A message, instruction, tool
 schema, tool argument or object key that spells a control token of the model
-(`<think>`, a role marker, an image placeholder) is tokenized as the characters it
-spells; only controls the chat template writes keep their token IDs. A control is
-an added token that is special, or that the chat template or one of its defaults
-names (a role, reasoning, tool or image marker), or the placeholder an image
-layout lets request text spell. Every other added token is lexical text, for
-example GLM's `/nothink` or a fill-in-the-middle marker, and request text that
-spells one tokenizes to that token. Text that spells a control counts more
-tokens in `usage.prompt_tokens` than the single control token would, and its
-prefix-cache keys differ from those of a prompt that holds the token. On models
-with a Jinja chat template, prefilling an assistant message with `<think>` or a
-DSML opener through `continue_final_message` or Anthropic continuation therefore
-does not start the reply in reasoning or in a tool call. Generated control text
-that a client echoes back as plain text in a later turn re-enters as ordinary
-tokens, so the prefix cache does not cover that turn. DeepSeek and Inkling
-prompts use native encoders that tokenize request text as ordinary text.
+(`<think>`, a role marker, an image placeholder) is tokenized as the characters
+it spells; only controls the chat template writes keep their token IDs. A
+control is an added token that is special, or that the chat template or one of
+its defaults names (a role, reasoning, tool or image marker), or that the
+model's prepared syntax names as a marker: its reasoning delimiters and terminal
+markers, the markers of its tool-call parser (its delimiters and, for GLM, its
+argument tags), and its image tokens. Every other added token is lexical text,
+for example GLM's `/nothink` or a fill-in-the-middle marker, and request text
+that spells one tokenizes to that token. Request text is ordinary text with one
+exception: the RADIO image layout (the C-RADIO encoder of Nemotron) lets message
+text place `<image>` placeholders, so text that spells `<image>` positions an
+attached image when the spelled placeholders and the ones the template writes
+together account for every attached image, and is ordinary text otherwise. Text
+that spells a control counts more tokens in `usage.prompt_tokens` than the
+single control token would, and its prefix-cache keys differ from those of a
+prompt that holds the token. On models with a Jinja chat template, prefilling an
+assistant message with `<think>` or a DSML opener through
+`continue_final_message` or Anthropic continuation therefore does not start the
+reply in reasoning or in a tool call. Generated control text that a client
+echoes back as plain text in a later turn re-enters as ordinary tokens, so the
+prefix cache does not cover that turn. DeepSeek and Inkling prompts use native
+encoders that tokenize request text as ordinary text.
 
 Model output parsers emit neutral semantic events. The ordered accumulator in
 `server/output.rs` retains text, reasoning, and tool blocks. Protocol encoders use
@@ -967,4 +974,6 @@ Input and instruction text that spells a control token is scored as ordinary
 text, as in chat requests. Each label is checked against the token IDs of the
 rendered prompt: the text after the prompt's last added token, encoded as
 ordinary text, must take the label as exactly one new non-special token, and a
-label that fails the check is unavailable.
+label that fails the check is unavailable. A prompt that ends in an added token
+with `rstrip` offers no label, because that token strips the leading space of a
+label that follows it directly.

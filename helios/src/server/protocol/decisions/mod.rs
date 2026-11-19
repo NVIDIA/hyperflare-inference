@@ -677,10 +677,12 @@ fn candidates() -> Vec<String> {
 }
 
 /// The token `label` becomes when it follows the rendered prompt, or `None` when it would not be a
-/// single ordinary token there. No tokenizer merge crosses an added token, so only the text after
-/// the prompt's last one can change how the label tokenizes: the prompt's tokens from there on must
-/// stay as they are when the label is appended. That text is encoded as ordinary text, because
-/// request text that spells a control holds ordinary token IDs in `tokens`.
+/// single ordinary token there. Text on either side of an added token tokenizes separately, so only
+/// the text after the prompt's last added token can change how the label tokenizes: the prompt's
+/// tokens from there on must stay as they are when the label is appended. That text is encoded as
+/// ordinary text, because request text that spells a control holds ordinary token IDs in `tokens`.
+/// An added token with `rstrip` swallows the whitespace that follows it, including the leading
+/// space of a label that follows it directly, so a prompt that ends in one offers no label.
 fn label_id(
     frontend: &crate::frontend::Frontend,
     tokens: &[u32],
@@ -689,7 +691,11 @@ fn label_id(
     vocabulary: usize,
 ) -> Result<Option<u32>> {
     let added = added_vocabulary.get_added_tokens_decoder();
-    let tail = &tokens[tokens.iter().rposition(|id| added.contains_key(id)).map_or(0, |at| at + 1)..];
+    let last = tokens.iter().rposition(|id| added.contains_key(id));
+    let tail = &tokens[last.map_or(0, |at| at + 1)..];
+    if tail.is_empty() && last.is_some_and(|at| added[&tokens[at]].rstrip) {
+        return Ok(None);
+    }
     let decoded = frontend.decode(tail, false)?;
     let extended = frontend.encode_ordinary(&format!("{decoded}{label}"))?;
     let Some(&id) = extended.last() else {

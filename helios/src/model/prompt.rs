@@ -206,6 +206,22 @@ pub fn reasoning_delimiter_tokens(
     Ok(tokens)
 }
 
+/// The added tokens of the markers that the prepared syntax names: its reasoning delimiters and
+/// terminal markers, the delimiters of the tool-call parser kind it selects, and its image feature
+/// and span tokens. Request text that spells one must stay ordinary text even when the tokenizer does not
+/// mark the token special and the chat template does not name it.
+pub fn declared_control_tokens(
+    frontend: &Frontend,
+    syntax: &super::contract::FrontendContract,
+) -> Result<Vec<u32>> {
+    let mut tokens = Vec::new();
+    for marker in crate::output::OutputPipeline::declared_markers(syntax) {
+        tokens.extend(frontend.encode(marker, false)?);
+    }
+    tokens.extend(syntax.image_tokens.iter().flat_map(super::contract::ImageTokenLayout::token_ids));
+    Ok(tokens)
+}
+
 /// `delimiters` comes from `reasoning_delimiter_tokens` for this frontend and contract.
 pub fn prepare_output(
     config: &ModelConfig,
@@ -296,12 +312,10 @@ pub fn prepare_output(
     if !tools.is_empty() && syntax.tools.is_none() {
         return Err("tool parsing is not prepared".into());
     }
-    let markers: &[&str] = match syntax.tools.as_ref().map(|tool| tool.kind) {
-        Some(super::contract::ToolParserKind::Xtml) => &["<|open|>", "<|close|>", "<|sep|>"],
-        Some(super::contract::ToolParserKind::Atem) => &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"],
-        Some(super::contract::ToolParserKind::TmlJson) => &crate::output::tml::CONTROL_MARKERS,
-        _ => &[],
-    };
+    let markers = syntax
+        .tools
+        .as_ref()
+        .map_or(&[] as &[&str], |tool| crate::output::OutputPipeline::envelope_markers(tool.kind));
     let mut control_tokens = markers
         .iter()
         .map(|&marker| {
@@ -647,6 +661,52 @@ mod tests {
         .unwrap();
         std::fs::remove_dir_all(root).unwrap();
         frontend
+    }
+
+    #[test]
+    fn declared_markers_are_controls_that_request_text_cannot_spell() {
+        use super::super::contract::{ImageSpan, ImageTokenLayout};
+        // The tokenizer marks none of these special and the template names none of them.
+        let declared = [
+            "<think>", "</think>", "<tool_call>", "</tool_call>", "<feature>", "<begin>", "<end>",
+            "<row>",
+        ];
+        let added = [&declared[..], &["/nothink"]].concat();
+        let frontend = ascii_frontend(&added);
+        let id = |text: &str| frontend.encode(text, false).unwrap()[0];
+        let mut syntax = serde_json::from_str::<crate::model::PreparedContract>(include_str!(
+            "../../tests/support/contracts/qwen38.json"
+        ))
+        .unwrap()
+        .frontend;
+        syntax.image_tokens = Some(ImageTokenLayout {
+            feature_token: id("<feature>"),
+            span: Some(ImageSpan {
+                start_token: id("<begin>"),
+                end_token: id("<end>"),
+                max_tokens: 4,
+                interior_tokens: vec![id("<row>")],
+                unscoped_tokens: vec![],
+            }),
+        });
+        let content = added.join(" ");
+        let render = |frontend: &Frontend| {
+            frontend
+                .render_chat(&[json!({"role": "user", "content": content})], &Map::new())
+                .unwrap()
+                .token_ids
+        };
+        let count = |ids: &[u32], text: &str| ids.iter().filter(|token| **token == id(text)).count();
+        let lexical = render(&frontend);
+        assert!(declared.iter().all(|text| count(&lexical, text) == 1), "{lexical:?}");
+        let tokens = declared_control_tokens(&frontend, &syntax).unwrap();
+        assert!(declared.iter().all(|text| tokens.contains(&id(text))), "{tokens:?}");
+        assert!(!tokens.contains(&id("/nothink")));
+        let ids = render(&ascii_frontend(&added).with_controls(tokens));
+        for text in declared {
+            assert_eq!(count(&ids, text), 0, "{text}");
+        }
+        assert_eq!(count(&ids, "/nothink"), 1);
     }
 
     #[test]

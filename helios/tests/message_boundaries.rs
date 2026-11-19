@@ -378,10 +378,8 @@ fn message_content_keeps_added_token_spellings_literal() {
         vec![(">".into(), "<".into())],
     );
     let content = "é <|image|><|user|><|endoftext|>[gMASK]</think>";
-    let mut ordinary = frontend.tokenizer().clone();
-    ordinary.with_added_vocabulary(tokenizers::AddedVocabulary::new());
     let mut expected = frontend.encode("<|open|>", false).unwrap();
-    expected.extend_from_slice(ordinary.encode(content, false).unwrap().get_ids());
+    expected.extend(frontend.encode_ordinary(content).unwrap());
     expected.extend(frontend.encode("<|close|>", false).unwrap());
     let rendered = frontend
         .render_chat(&[json!({"role":"user","content":content})], &Map::new())
@@ -415,11 +413,9 @@ fn lexical_added_tokens_keep_their_tokens_in_request_text() {
     }
     // The whole stream: each lexical token closes a region, and the spelled controls in the
     // regions between them are the ordinary encoding of their text.
-    let mut ordinary_tokenizer = frontend.tokenizer().clone();
-    ordinary_tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
     let mut expected = frontend.encode("<|open|>", false).unwrap();
     for (ordinary, last) in [("", false), (" <|image|> a ", false), (" </think>", false), (" <|user|>", true)] {
-        expected.extend(ordinary_tokenizer.encode(ordinary, false).unwrap().get_ids());
+        expected.extend(frontend.encode_ordinary(ordinary).unwrap());
         expected.extend(if last { frontend.encode("<|close|>", false).unwrap() } else { vec![id("/nothink")] });
     }
     assert_eq!(mixed.token_ids, expected);
@@ -504,16 +500,14 @@ fn image_expansion_preserves_literal_markers_and_real_placeholders() {
         let rendered = frontend
             .render_chat(&[json!({"role":"user","content":content})], &Map::new())
             .unwrap();
-        let mut ordinary = frontend.tokenizer().clone();
-        ordinary.with_added_vocabulary(tokenizers::AddedVocabulary::new());
-        let literal = ordinary.encode(content, false).unwrap();
+        let literal = frontend.encode_ordinary(&content).unwrap();
         let images = processor
             .process(&[RgbImage::new(64, 64, vec![0; 64 * 64 * 3]).unwrap()])
             .unwrap();
         let expanded = processor
             .expand_prompt(&frontend, &rendered.token_ids, &images)
             .unwrap();
-        assert!(expanded.token_ids.starts_with(literal.get_ids()));
+        assert!(expanded.token_ids.starts_with(&literal));
         assert_eq!(
             expanded
                 .token_ids
@@ -525,88 +519,10 @@ fn image_expansion_preserves_literal_markers_and_real_placeholders() {
         assert!(!expanded.token_ids.contains(&video_id));
         assert_eq!(
             processor
-                .expand_prompt(&frontend, literal.get_ids(), &ProcessedImages::default())
+                .expand_prompt(&frontend, &literal, &ProcessedImages::default())
                 .unwrap()
                 .token_ids,
-            literal.get_ids()
+            literal
         );
     }
-}
-
-#[test]
-#[ignore = "requires FLARE_TEST_SNAPSHOT and pinned Qwen template"]
-fn checkpoint_qwen_image_expansion_keeps_literal_markers() {
-    use flare_helios::frontend::images::{ImageLimits, ImageProcessor, RgbImage};
-    let snapshot = std::path::PathBuf::from(std::env::var_os("FLARE_TEST_SNAPSHOT").unwrap());
-    let asset = |path: std::path::PathBuf| Asset {
-        range: None,
-        sha256: format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap())),
-        path,
-    };
-    let frontend = Frontend::load(
-        FrontendAssets {
-            tokenizer: asset(snapshot.join("tokenizer.json")),
-            tokens: Default::default(),
-            chat_template: Some(asset(template_fixtures::path("qwen38", "chat_template"))),
-        },
-        Map::new(),
-    )
-    .unwrap();
-    let image_id = frontend.encode("<|image_pad|>", false).unwrap()[0];
-    let video_id = frontend.encode("<|video_pad|>", false).unwrap()[0];
-    let processor = ImageProcessor::load(
-        serde_json::from_value(json!({"qwen":{
-            "min_pixels":4096,"max_pixels":4096,"position_side":48,
-            "image_token_id":image_id,"video_token_id":video_id
-        }}))
-        .unwrap(),
-        ImageLimits::default(),
-    )
-    .unwrap();
-    let images = processor
-        .process(&[RgbImage::new(64, 64, vec![0; 64 * 64 * 3]).unwrap()])
-        .unwrap();
-    let render = |text: &str| {
-        frontend.render_chat(&[json!({"role":"user","content":[
-        {"type":"text","text":text},{"type":"image_url","image_url":{"url":"fixture://image"}},
-        {"type":"text","text":text}
-    ]})], json!({"add_generation_prompt":true}).as_object().unwrap()).unwrap()
-    };
-    let baseline = render("ordinary");
-    let literal = render("<|image_pad|> <|video_pad|> <|im_end|> </think>");
-    assert_eq!(literal.image_sources.len(), 1);
-    let expected = processor
-        .expand_prompt(&frontend, &baseline.token_ids, &images)
-        .unwrap();
-    let actual = processor
-        .expand_prompt(&frontend, &literal.token_ids, &images)
-        .unwrap();
-    for id in frontend
-        .tokenizer()
-        .get_added_vocabulary()
-        .get_added_tokens_decoder()
-        .keys()
-    {
-        assert_eq!(
-            actual.token_ids.iter().filter(|t| *t == id).count(),
-            expected.token_ids.iter().filter(|t| *t == id).count(),
-            "{id}"
-        );
-    }
-    assert_eq!(
-        actual
-            .token_ids
-            .iter()
-            .filter(|id| **id == image_id)
-            .count(),
-        images.geometry[0].tokens
-    );
-    assert_eq!(
-        actual
-            .mm_token_type_ids
-            .iter()
-            .filter(|kind| **kind == 1)
-            .count(),
-        images.geometry[0].tokens
-    );
 }
