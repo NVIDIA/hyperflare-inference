@@ -229,6 +229,10 @@ def from_plan(model, plan, *, compiled_forwards):
         import json
 
         result["collective_ladder_json"] = json.dumps(plan.collective_ladder, separators=(",", ":"), sort_keys=True)
+    if plan.sm103 is not None:
+        import json
+
+        result["sm103_preparation_json"] = json.dumps(plan.sm103.to_dict(), separators=(",", ":"), sort_keys=True)
     if plan.expert_scale_compression is not None:
         result['expert_scale_compression'] = plan.expert_scale_compression
     if plan.force_moe_decode_a16:

@@ -128,6 +128,8 @@ def export(args) -> int:
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
     model = resolve_model(configuration, args.model)
+    if getattr(args, "sm103_preparation", None) is not None and args.ranks != 1:
+        raise UsageError("--sm103-preparation requires a single local rank")
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
         validate_repository(repository)
@@ -286,7 +288,7 @@ def _prepare(args):
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                       language_model_only=args.language_model_only,
-                      mla_compute_mode=args.mla_compute_mode)
+                      mla_compute_mode=args.mla_compute_mode, sm103_preparation=args.sm103_preparation)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
         # A caller's restriction changes which GPU each index names.
         restricted = "" if host.restriction is None else f" of CUDA_VISIBLE_DEVICES={host.restriction}"
@@ -300,12 +302,18 @@ def _prepare(args):
         if plan.roce_chain:
             serial += " · experimental RoCE chain (native neighbor relays, open ends)"
         ladder_name = f" · ladder {plan.collective_ladder['name']}" if plan.collective_ladder is not None else ""
+        placement = ""
+        if plan.sm103 is not None:
+            placement = (f" · SM103 explicit expert placement"
+                         f" · estimated HBM weights {plan.weights_bytes / (1 << 30):.2f} GiB"
+                         f" · Grace expert weights {plan.checkpoint.mapped_host_bytes / (1 << 30):.2f} GiB")
         stage.update(f"GPU{'s' if plan.world_size > 1 else ''} {indices}{restricted}"
                      f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
                      f"{' · Parallax routing on' if plan.parallax_routing else ''}"
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
                      f" · mixed prefill {'on' if plan.mixed_prefill else 'off'}"
                      f" · expert scales {plan.expert_scale_compression or 'native'}"
+                     f"{placement}"
                      f"{(' · online MXFP8 ' + plan.online_mxfp8_scope) if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
@@ -407,6 +415,8 @@ def debug_serve(args) -> int:
 
     _check_host_shape(args)
     _checkpoint_fabric(args)
+    if getattr(args, "sm103_preparation", None) is not None:
+        raise UsageError("--sm103-preparation is supported by ignition export; serve its core with flare run")
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
     if args.eager and not args.direct:

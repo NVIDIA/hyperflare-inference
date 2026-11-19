@@ -61,7 +61,8 @@ def test_decoder_suffix_rejects_unsupported_packing_geometry(rows, tokens):
         PreparedDecoderSuffix(Metadata.allocate(tokens, rows, 2, "cpu"))
 
 
-def test_decoder_feedback_at_replay_boundary_is_rejected_before_component_construction(monkeypatch):
+@pytest.mark.parametrize("capacity", (128, 256))
+def test_decoder_feedback_at_replay_boundary_is_rejected_before_component_construction(monkeypatch, capacity):
     from ignition.recipes.deepseek41 import decoder
 
     monkeypatch.setattr(decoder, "PreparedTableRequests", lambda *args, **kwargs: None)
@@ -75,6 +76,6 @@ def test_decoder_feedback_at_replay_boundary_is_rejected_before_component_constr
     scratch = SimpleNamespace(embedding=torch.zeros(1), hidden=torch.zeros((1, 5120)),
         local_logits=torch.zeros((1, 1)), logits=torch.zeros((1, 1)))
     with pytest.raises(ValueError, match="draft target layers after"):
-        decoder.PreparedDecoder(weights, None, scratch, Metadata.allocate(256, 1, 2, "cpu"), None,
+        decoder.PreparedDecoder(weights, None, scratch, Metadata.allocate(capacity, 1, 2, "cpu"), None,
             mode="prefill", runtime=None, vocabulary_runtime=None, coordinator=None,
             session=None, name="boundary", workspace=None)

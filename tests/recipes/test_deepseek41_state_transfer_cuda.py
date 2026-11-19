@@ -18,10 +18,11 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @pytest.mark.parametrize("endpoint", [1, 127, 128, 129, 255, 256])
+@pytest.mark.parametrize("planes", [(528,), (512, 16)])
 @torch.no_grad()
-def test_snapshot_forks_restore_windows_carry_history_and_partial_pages(endpoint):
+def test_snapshot_forks_restore_windows_carry_history_and_partial_pages(endpoint, planes):
     device = "cuda:0"
-    pool = ContinuationPool.allocate(config(), 8, 5, device)
+    pool = ContinuationPool.allocate(config(), 8, 5, device, window_record_planes=planes)
     commands = StateCommands.allocate(device, capacity=4)
     tables = torch.full((4, 3), -1, dtype=torch.int32, device=device)
     consumed = pool.region("consumed_tokens")

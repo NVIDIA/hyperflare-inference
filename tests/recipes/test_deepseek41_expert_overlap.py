@@ -60,6 +60,7 @@ def test_layer_overlap_uses_physical_capacity_and_enabled_workspace(monkeypatch,
 
 def test_layer_consumes_standalone_router_results_with_runtime_image_mask():
     layer = object.__new__(decoder.PreparedLayer)
+    layer.megamoe = None
     layer.engram = layer.concurrent_shared = None
     layer.has_image_mask = True
     residual = torch.arange(12, dtype=torch.float32).reshape(3, 4)

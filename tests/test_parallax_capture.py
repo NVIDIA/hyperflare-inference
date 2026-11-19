@@ -102,6 +102,65 @@ def test_route_geometry_and_valid_token_metadata(layers, experts, tokens, top_k)
         validate_output(output[:1], frame, sequence)
 
 
+def test_packed_target_tracing_preserves_proposals_and_per_layer_capacities():
+    from ignition.components.paged_generation import PreparedGeneration
+    from ignition.components.parallel_draft import PreparedParallelDraftRound
+    from ignition.components.packed_speculation import PreparedPackedSpeculativeRound
+    from ignition.recipes.deepseek41.decoder import PreparedDecoder, PreparedLayer
+
+    counters = []
+
+    class Trace:
+        def functional_counter(self, layer, tokens, top_k):
+            counters.append((layer, tokens, top_k))
+            return object()
+
+    decoder = PreparedDecoder.__new__(PreparedDecoder)
+    decoder.routing_trace = None
+    decoder.scratch = decoder.metadata = object()
+    decoder.layers = []
+    for rows in (8192, 128):
+        layer = PreparedLayer.__new__(PreparedLayer)
+        layer.routing_counter, layer.routing_shape = None, (rows, 6)
+        layer.concurrent_shared = None
+        layer.scratch = layer.metadata = layer.image_mask = object()
+        layer.router, layer.expert_map, layer.megamoe = object(), object(), object()
+        decoder.layers.append(layer)
+    target = PreparedParallelDraftRound.__new__(PreparedParallelDraftRound)
+    target.proposal_only, target.decoder = False, decoder
+    target.operations, target.owner, target.context = object(), object(), object()
+    packed = PreparedPackedSpeculativeRound.__new__(PreparedPackedSpeculativeRound)
+    packed.source, packed.target = object(), target
+    packed.prefix_limits, packed.confidence_output = object(), object()
+    trace = Trace()
+    traced = packed.with_routing_trace(trace)
+    assert counters == [(0, 8192, 6), (1, 128, 6)]
+    assert traced.source is packed.source and traced.target is not target
+    assert traced.prefix_limits is packed.prefix_limits and traced.confidence_output is packed.confidence_output
+    assert traced.target.operations is target.operations and traced.target.context is target.context
+    assert traced.target.owner is target.owner and traced.target.decoder is not decoder
+    assert decoder.routing_trace is None and traced.target.decoder.routing_trace is trace
+    assert decoder.scratch is not None and traced.target.decoder.scratch is None
+    assert traced.target.decoder.metadata is None
+    for plain, instrumented in zip(decoder.layers, traced.target.decoder.layers):
+        assert plain.routing_counter is None and instrumented.routing_counter is not None
+        assert instrumented.router is plain.router and instrumented.expert_map is plain.expert_map
+        assert instrumented.megamoe is plain.megamoe
+        assert plain.scratch is not None and instrumented.scratch is None
+        assert instrumented.metadata is None and instrumented.image_mask is None
+    with pytest.raises(ValueError, match="untraced"):
+        traced.with_routing_trace(trace)
+    target.proposal_only = True
+    with pytest.raises(ValueError, match="proposal-only"):
+        target.with_routing_trace(trace)
+    generation = PreparedGeneration.__new__(PreparedGeneration)
+    generation.decoder, generation.context = decoder, object()
+    generation.batch, generation.completion = object(), object()
+    observed = generation.with_routing_trace(trace)
+    assert observed.context is generation.context and observed.batch is generation.batch
+    assert observed.completion is generation.completion and generation.decoder.routing_trace is None
+
+
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicitly selected idle test GPU")
 @pytest.mark.parametrize("compiled", [False, True])
 def test_captured_route_counts_preserve_ids_and_alternating_frame_lifetimes(compiled):

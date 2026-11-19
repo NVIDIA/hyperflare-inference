@@ -27,6 +27,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
         collective_tuning=plan.collective_tuning,
         collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
+        parallax_routing=plan.parallax_routing,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         joint_tuning=plan.joint_tuning,
@@ -40,13 +41,16 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=HEADROOM_BYTES + plan.reserve_bytes, kernel_cache=kernel_cache,
         dspark=speculation is not None,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression,
-        mla_compute_mode=plan.mla_compute_mode, **drafting)
+        mla_compute_mode=plan.mla_compute_mode, sm103=plan.sm103, **drafting)
+    if plan.world_size == 1:
+        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 
 def usage(prepared):
-    return tuple(RankUsage(rank["pages"], rank["free_device_bytes"]) for rank in prepared.memory_report["ranks"])
+    report = prepared.memory_report
+    return tuple(RankUsage(rank["pages"], rank["free_device_bytes"]) for rank in report.get("ranks", (report,)))
 
 
 RECIPE = Recipe(

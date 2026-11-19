@@ -1,0 +1,242 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Explicit TP1 expert placement and reference attention preparation on SM103."""
+
+from dataclasses import dataclass, replace
+import json
+from math import lcm
+from pathlib import Path
+
+from ignition.components.expert_placement import ExpertPlacement, PrefillExpertStaging
+
+
+def _reference_cache_costs(model, *, verification_width, dspark, page_tokens=128):
+    def align(size, step=256):
+        return (size + step - 1) // step * step
+
+    window_bytes = align((model.text["sliding_window"] + verification_width - 1) * 528)
+    layers = model.layers + (model.draft.layers if dspark else 0)
+    row = layers * window_bytes
+    pages = 0
+    for source in model.sources:
+        records = source.records(page_tokens)
+        pages += records * (288 + 68)
+        row += align(records * 288) + align(records * 68)
+        if source.ratio == 2:
+            row += align((source.ratio + verification_width - 1) * 2 * model.text["head_dim"] * 4)
+    row += align(model.text["hidden_size"] * 2) + align(8) + align(24)
+    return align(row, lcm(256, 528)), pages
+
+
+@dataclass(frozen=True)
+class SM103Config:
+    placements: tuple[tuple[str, ExpertPlacement], ...]
+    flashmla_library: Path | None = None
+    deepselect_library: Path | None = None
+    host_lane_clusters: int = 4
+    prefill_staging: PrefillExpertStaging | None = None
+    execution: str = "hybrid"
+    context: int | None = None
+
+    @classmethod
+    def load(cls, path):
+        path = Path(path).resolve(strict=True)
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"duplicate SM103 preparation field: {key}")
+                result[key] = value
+            return result
+        value = json.loads(path.read_text(), object_pairs_hook=unique)
+        if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1:
+            raise ValueError("SM103 preparation requires version 1")
+        execution = value.get("execution", "hybrid")
+        if execution == "hybrid":
+            required = {"version", "placements", "flashmla_library", "deepselect_library", "host_lane_clusters"}
+            optional = {"execution", "prefill_staging", "context"}
+        elif execution == "reference":
+            required = {"version", "execution", "placements", "host_lane_clusters"}
+            optional = {"context", "prefill_staging"}
+        else:
+            raise ValueError("SM103 execution must be 'hybrid' or 'reference'")
+        if not required <= set(value) or set(value) - required - optional or not isinstance(value["placements"], dict):
+            raise ValueError("SM103 preparation fields do not match the selected execution mode")
+        placements = []
+        for name, rows in value["placements"].items():
+            if (not isinstance(rows, dict) or set(rows) != {"experts", "host", "hbm"}
+                    or not isinstance(rows["host"], list) or not isinstance(rows["hbm"], list)):
+                raise ValueError(f"{name}: placement requires experts, host and hbm arrays")
+            placements.append((name, ExpertPlacement(rows["experts"], tuple(rows["host"]), tuple(rows["hbm"]))))
+        libraries = [None, None]
+        if execution == "hybrid":
+            libraries = []
+            for name in ("flashmla_library", "deepselect_library"):
+                if not isinstance(value[name], str) or not value[name]:
+                    raise ValueError(f"{name} must name a prepared shared library")
+                libraries.append(path.parent / value[name])
+        staging = value.get("prefill_staging")
+        if staging is not None:
+            if not isinstance(staging, dict) or set(staging) != {"min_rows", "min_cold_experts"}:
+                raise ValueError("prefill_staging requires min_rows and min_cold_experts")
+            staging = PrefillExpertStaging(**staging)
+        return cls(tuple(placements), *libraries, value["host_lane_clusters"], staging,
+                   execution=execution, context=value.get("context"))
+
+    def __post_init__(self):
+        if (not isinstance(self.placements, tuple) or not self.placements
+                or any(not isinstance(item, tuple) or len(item) != 2
+                       or not isinstance(item[0], str) or not isinstance(item[1], ExpertPlacement)
+                       for item in self.placements)
+                or len(dict(self.placements)) != len(self.placements)):
+            raise ValueError("SM103 preparation requires distinct named expert placements")
+        if self.execution not in ("hybrid", "reference"):
+            raise ValueError("SM103 execution must be 'hybrid' or 'reference'")
+        if self.context is not None and (
+                type(self.context) is not int or not 128 <= self.context <= 1048576 or self.context % 128):
+            raise ValueError("SM103 context must be 128-aligned in [128, 1048576]")
+        if type(self.host_lane_clusters) is not int or not 0 <= self.host_lane_clusters < 76:
+            raise ValueError("SM103 host lane clusters must be in [0, 75]")
+        if self.prefill_staging is not None and not isinstance(self.prefill_staging, PrefillExpertStaging):
+            raise ValueError("SM103 prefill staging requires explicit row and cold-demand thresholds")
+        if self.execution == "hybrid":
+            for name in ("flashmla_library", "deepselect_library"):
+                raw = getattr(self, name)
+                if raw is None:
+                    raise ValueError(f"{name} must name a prepared shared library")
+                path = Path(raw).resolve(strict=True)
+                if not path.is_file():
+                    raise ValueError(f"{name} must name a prepared shared library")
+                object.__setattr__(self, name, path)
+        elif self.flashmla_library is not None or self.deepselect_library is not None:
+            raise ValueError("reference SM103 preparation does not accept hybrid library paths")
+
+    def validate_model(self, model, *, dspark):
+        expected = {f"layers.{i}.ffn": model.text["n_routed_experts"] for i in range(model.layers)}
+        if dspark:
+            expected.update({f"mtp.{i}.ffn": model.draft.experts for i in range(model.draft.layers)})
+        if {name: placement.experts for name, placement in self.placements} != expected:
+            raise ValueError("SM103 placements must match every enabled target and draft layer's canonical experts")
+
+    def to_dict(self):
+        result = dict(version=1, placements={name: placement.to_dict() for name, placement in self.placements},
+                      host_lane_clusters=self.host_lane_clusters)
+        if self.execution == "reference":
+            result["execution"] = "reference"
+        else:
+            result["flashmla_library"] = str(self.flashmla_library)
+            result["deepselect_library"] = str(self.deepselect_library)
+        if self.prefill_staging is not None:
+            result["prefill_staging"] = self.prefill_staging.to_dict()
+        if self.context is not None:
+            result["context"] = self.context
+        return result
+
+    def staging_bytes(self, model):
+        """Conservative three-plane-set allowance for two-consumer lookahead."""
+        if self.prefill_staging is None:
+            return 0
+        per_expert = 3 * model.text["hidden_size"] * model.text["moe_intermediate_size"] * 17 // 32
+        rows = [len(p.host) for name, p in self.placements if name.startswith("layers.")
+                and len(p.host) >= self.prefill_staging.min_cold_experts]
+        if not rows:
+            raise ValueError("prefill staging requires a target host tier that can meet its cold-demand threshold")
+        return 3 * max(rows) * per_expert
+
+    def expert_bytes(self, model, *, dspark):
+        """Native packed MXFP4 payload and expanded UE8M0 scales, including copies."""
+        self.validate_model(model, dspark=dspark)
+        elements = 3 * model.text["hidden_size"] * model.text["moe_intermediate_size"]
+        per_expert = elements // 2 + elements // 32
+        return {tier: sum(len(getattr(placement, tier)) for _, placement in self.placements) * per_expert
+                for tier in ("hbm", "host")}
+
+    def planning_inputs(self, recipe, checkpoint, snapshot, *, dspark, draft_tokens=None):
+        """Estimate native tensor extents from headers, independently of CSF file sizes."""
+        from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+        from ignition.recipes.declaration import RankCosts
+        from .config import ModelConfig
+
+        if recipe.name != "deepseek41":
+            raise ValueError("SM103 reference preparation is integrated with DeepSeek V4.1")
+        model = ModelConfig.load(snapshot)
+        has_draft = dspark and (draft_tokens is None or draft_tokens > 0)
+        tier = self.expert_bytes(model, dspark=has_draft)
+        manifest = inspect_indexed_checkpoint(snapshot)
+        other = draft = 0
+        for name, tensor in manifest.tensors.items():
+            if ".ffn.experts." in name or ".engram.embed." in name:
+                continue
+            is_draft = name.startswith("mtp.")
+            if is_draft and not has_draft:
+                continue
+            # Native 1x32 scale planes replace block scales for eligible FP8
+            # projections. Retaining the source scale bytes makes this an upper
+            # estimate, including projections that retain their block format.
+            size = tensor.nbytes + (tensor.nbytes // 32 if tensor.dtype == "F8_E4M3" else 0)
+            size = (size + 511) // 512 * 512
+            other += size
+            if is_draft:
+                draft += size
+        if has_draft:
+            # Draft context uses another grouped copy of each layer's KV weight.
+            context = sum(t.nbytes + (t.nbytes // 32 if t.dtype == "F8_E4M3" else 0)
+                for name, t in manifest.tensors.items() if name.startswith("mtp.") and ".attn.wkv." in name)
+            other += context
+            draft += context
+            per_expert = 3 * model.text["hidden_size"] * model.text["moe_intermediate_size"] * 17 // 32
+            draft += sum(len(p.hbm) for name, p in self.placements if name.startswith("mtp.")) * per_expert
+        # Physical row/page costs are checked against ContinuationPool in tests.
+        # Graph storage is an estimate; measured capture accounting supersedes it.
+        graph_bytes = (8 << 30) + self.staging_bytes(model)
+        if self.execution == "reference":
+            width = ((recipe.max_draft_tokens if draft_tokens is None else draft_tokens) + 1
+                     if has_draft else 1)
+            spec_row, ref_page = _reference_cache_costs(model, verification_width=width, dspark=has_draft)
+            plain_row, _ = _reference_cache_costs(model, verification_width=1, dspark=False)
+            ranks = {1: RankCosts(spec_row, ref_page, graph_bytes)}
+            plain = {1: RankCosts(plain_row, ref_page, graph_bytes)}
+            recipe_updates = dict(ranks=ranks, plain_ranks=plain, verification_rows=0,
+                                  expert_scale_compression=None)
+        else:
+            ranks = {1: RankCosts(3_045_888, 114_688, graph_bytes)}
+            plain = {1: RankCosts(2_843_136, 114_688, graph_bytes)}
+            recipe_updates = dict(ranks=ranks, plain_ranks=plain, expert_scale_compression=None)
+        if self.context is not None:
+            recipe_updates["context"] = self.context
+        return (replace(recipe, **recipe_updates),
+                replace(checkpoint, device_bytes=tier["hbm"] + other, draft_bytes=draft,
+                    mapped_host_bytes=tier["host"], expansion_bytes=0,
+                    scale_compressed_device_bytes={}, ranks=ranks, plain_ranks=plain))
+
+    def prepare(self, model, config, *, device, storage):
+        import torch
+        from ignition.components.fused_mla import FusedMLAPreparation
+        from ignition.components.megamoe import MegaMoeGeometry, MegaMoeWorkspace
+        from ignition.components.megamoe_tiers import MegaMoeLayerLayout
+        from ignition.components.rotary import CompressedRotary
+
+        if self.execution != "hybrid":
+            raise ValueError("reference SM103 execution prepares through ReferenceExpertPreparation")
+        self.validate_model(model, dspark=config.dspark)
+        if torch.cuda.get_device_capability(device) != (10, 3):
+            raise ValueError("reference TP1 expert and attention preparation requires SM103")
+        workspaces, layouts = {}, {}
+        for name, placement in self.placements:
+            draft = name.startswith("mtp.")
+            capacity = (max(config.request_capacity * config.draft_tokens, 1) if draft else
+                        max(config.prefill_chunk_size, config.decode_tokens))
+            geometry = MegaMoeGeometry(placement.physical_rows, capacity,
+                model.draft.top_k if draft else model.text["num_experts_per_tok"],
+                model.text["hidden_size"], model.text["moe_intermediate_size"],
+                model.text["n_shared_experts"])
+            if geometry not in workspaces:
+                workspaces[geometry] = MegaMoeWorkspace(geometry, device=device, kernel_cache=config.kernel_cache)
+            layouts[name] = MegaMoeLayerLayout(workspaces[geometry], placement.host, placement.hbm,
+                                              storage, self.host_lane_clusters)
+        rotary = CompressedRotary(model, device)
+        attention = FusedMLAPreparation.create((rotary.frequencies[False], rotary.frequencies[True]),
+            config.context, kernel_cache=config.kernel_cache, library=self.flashmla_library,
+            deepselect_library=self.deepselect_library)
+        return layouts, attention
