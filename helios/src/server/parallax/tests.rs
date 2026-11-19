@@ -260,6 +260,8 @@ fn record(sequence: u64) -> Arc<Record> {
     Arc::new(Record {
         sequence,
         graph: 0,
+        operation: crate::execution::GraphKind::Decode,
+        token_capacity: 1,
         phase: "decode",
         batch_size: 1,
         concurrency: 1,
@@ -367,9 +369,10 @@ fn speculative_routing_reports_target_work_as_verification() {
             gpu_ns: None,
         submission: 7, demand_lower_bound_ns: 100, available_ns: 200,
         layers: vec![LayerDemand { layer: 3, tokens: 5, top_k: 2, counts: vec![6, 4] }],
-    }), 0, crate::execution::GraphKind::Speculative, 2, 2);
+    }), 0, crate::execution::GraphKind::Speculative, 3, 2, 2);
     let report = telemetry.snapshot(0, "synthetic");
     assert_eq!(report["frames"][0]["phase"], "verify");
+    assert_eq!(report["frames"][0]["operation"], "speculative");
     assert_eq!(report["frames"][0]["sample"]["layers"][0]["tokens"], 5);
     assert_eq!(report["frames"][0]["sample"]["layers"][0]["counts"], json!([6, 4]));
     assert_eq!(report["invalid_total"], 0);

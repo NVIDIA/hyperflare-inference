@@ -33,15 +33,20 @@ def test_fifteen_draft_round_selects_and_packs_native_graph():
 
 
 @pytest.mark.parametrize("context", [0, 128, 1152])
-def test_prefill_step_consumes_exact_chunk_after_prefix(context):
+@pytest.mark.parametrize("terminal", [False, True])
+def test_prefill_step_consumes_exact_chunk_after_prefix(context, terminal):
     from copy import deepcopy
     from ignition.bench.runner import PrefillCase, _prefill_step
     from ignition.direct.scheduler import Lane, Scheduler
     from tests.direct.test_scheduler import layout, records, request, uploads
 
-    catalog = layout(max_active=1, prefill_chunk=512,
-                     graphs={("init", 1, 1): "init1", ("prefill", 1, 128): "prefill128",
-                             ("prefill", 1, 512): "prefill512"})
+    graphs = {("init", 1, 1): "init1", ("prefill", 1, 128): "prefill128",
+              ("prefill", 1, 512): "prefill512"}
+    kind = "terminal_prefill" if terminal else "prefill"
+    if terminal:
+        graphs.update({(kind, 1, count): f"terminal{count}" for count in (128, 512)})
+    catalog = layout(max_active=1, prefill_chunk=512, graphs=graphs,
+                     terminal_prefill_min_tokens=129 if terminal else 0)
     scheduler = Scheduler(catalog, prefix_cache=False)
     member = request(1, [10] * (context + 512), limit=2)
     scheduler.submit(member)
@@ -49,7 +54,7 @@ def test_prefill_step_consumes_exact_chunk_after_prefix(context):
     scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
     while member.consumed < context:
         count = min(context - member.consumed, 512)
-        step = scheduler._step("prefill", count, [Lane(member, member.consumed, count)])
+        step = scheduler._step(kind, count, [Lane(member, member.consumed, count)])
         assert uploads(scheduler, step)["sample_enabled"][0][0] == 0
         scheduler.complete(step, records(scheduler, step, {member: (1, member.consumed + count, [], 0)}))
     baseline = deepcopy(scheduler, {id(catalog): catalog})
@@ -58,7 +63,7 @@ def test_prefill_step_consumes_exact_chunk_after_prefix(context):
         step = _prefill_step(scheduler, PrefillCase(512, context))
         member = step.lanes[0].request
         assert (step.graph, step.width, step.lanes[0].start, step.lanes[0].tokens) == (
-            "prefill512", 512, context, 512)
+            "terminal512" if terminal else "prefill512", 512, context, 512)
         assert uploads(scheduler, step)["sample_enabled"][0][0] == 1
         scheduler.complete(step, records(scheduler, step, {member: (1, context + 512, [42], 0)}))
         assert member.phase == "decode" and member.generated == [42]

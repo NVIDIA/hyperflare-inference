@@ -480,6 +480,8 @@ mod tests {
         Record {
             sequence,
             graph: 0,
+            operation: crate::execution::GraphKind::Decode,
+            token_capacity: 1,
             phase: "decode",
             batch_size: 1,
             concurrency: 1,
@@ -849,6 +851,8 @@ mod tests {
         let make_record = |sequence: u64, available_ns: u64, counts: Vec<u32>| Record {
             sequence,
             graph: 0,
+            operation: crate::execution::GraphKind::Decode,
+            token_capacity: 1,
             phase: "decode",
             batch_size: 1,
             concurrency: 1,

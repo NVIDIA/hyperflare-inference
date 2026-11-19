@@ -34,10 +34,10 @@ class GraphSignature:
     def __post_init__(self):
         if type(self.routing_trace) is not bool:
             raise TypeError("routing trace selection must be a boolean")
-        if self.routing_trace and (self.kind not in ("decode", "prefill", "scored_prefill", "speculative")
+        if self.routing_trace and (self.kind not in ("decode", "prefill", "terminal_prefill", "scored_prefill", "speculative")
                                    or self.speculation_enabled is None):
             raise ValueError("routing trace graphs require target execution and an explicit speculation mode")
-        if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
+        if self.kind not in ("init", "restore", "snapshot", "prefill", "terminal_prefill", "scored_prefill", "decode", "resume",
                              "vision", "speculative", "mixed"):
             raise ValueError("unknown prepared graph operation")
         if self.kind == "scored_prefill" and (self.batch_capacity != 1

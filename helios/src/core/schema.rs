@@ -42,6 +42,8 @@ pub const MAX_PIECE_AXES: usize = 6;
 /// Bound on declared logical source axes. Source tensors and flattened prepared
 /// owners have independent coordinate domains, so this is not the owner rank.
 pub const MAX_SOURCE_AXES: usize = 8;
+/// Bound on parameters declared by one CUDA kernel, matching the 32 KiB constant parameter bank.
+pub const MAX_FUNCTION_PARAMETERS: usize = 4096;
 
 
 fn bounded_name(value: &str, limit: usize, what: &str) -> Result<()> {
@@ -556,7 +558,7 @@ pub fn validate_rank(
             return Err(invalid("function names an absent module"));
         }
         symbol_name(&function.symbol, "function symbol")?;
-        if function.parameter_sizes.len() > 128 {
+        if function.parameter_sizes.len() > MAX_FUNCTION_PARAMETERS {
             return Err(invalid("function declares too many parameters"));
         }
     }
@@ -1192,6 +1194,28 @@ mod tests {
                 assert!(error.to_string().contains(if global { "module symbol" } else { "function symbol" }));
             }
         }
+    }
+
+    #[test]
+    fn cuda_functions_support_fused_parameter_lists_up_to_bank_bound() {
+        let (mut rank, mut catalog) = module_rank();
+        rank.functions.push(wire::Function {
+            module: "model".into(),
+            symbol: "fused_commit".into(),
+            parameter_sizes: vec![8; 256],
+            ..Default::default()
+        });
+        validate_rank(&rank, 1, &mut catalog, &mut BTreeSet::new()).unwrap();
+
+        let (mut rank, mut catalog) = module_rank();
+        rank.functions.push(wire::Function {
+            module: "model".into(),
+            symbol: "excess_params".into(),
+            parameter_sizes: vec![8; MAX_FUNCTION_PARAMETERS + 1],
+            ..Default::default()
+        });
+        let error = validate_rank(&rank, 1, &mut catalog, &mut BTreeSet::new()).unwrap_err();
+        assert!(error.to_string().contains("too many parameters"));
     }
 
     #[test]

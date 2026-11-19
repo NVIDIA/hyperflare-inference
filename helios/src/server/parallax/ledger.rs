@@ -238,7 +238,7 @@ mod tests {
             staged_bytes:100,copy_gpu_ns:Some(10),publication_host_ns:5,ready_wait_ns:7,submission_gate_closed_ns:20}
     }
     fn record(sequence:u64,generation:u64,start:u64)->Record {
-        Record {sequence,graph:1,phase:"verify",batch_size:1,concurrency:1,
+        Record {sequence,graph:1,operation:crate::execution::GraphKind::Speculative,token_capacity:4,phase:"verify",batch_size:1,concurrency:1,
             sample:RoutingSample {submission:sequence,residency_generation:Some(generation),gpu_ns:Some(50),
                 demand_lower_bound_ns:start,available_ns:start+10,
                 layers:vec![LayerDemand {layer:3,tokens:5,top_k:1,counts:vec![2,3,0,0]}]}}

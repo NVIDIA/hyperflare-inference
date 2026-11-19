@@ -118,6 +118,8 @@ message RebuildManifest {
   string online_mxfp8_scope = 30;
   // Preparation context group size; zero/absent retains full-TP context sharding when enabled.
   uint32 context_parallel_size = 31;
+  // Preparation-only reference operator libraries and physical expert row assignments.
+  string sm103_preparation_json = 32;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;
@@ -324,6 +326,7 @@ enum GraphOperation {
   reserved 10, 11, 13;
   reserved "PROPOSAL", "VERIFICATION", "PACKED_SPECULATIVE";
   SCORED_PREFILL = 12;
+  TERMINAL_PREFILL = 14;
 
 }
 message TunedBinding { string buffer = 1; string tuning_graph = 2; }
@@ -339,6 +342,8 @@ message GraphContract {
   StateView pending_token = 7;
   GraphOperation kind = 8;
   repeated TunedBinding tuned_bindings = 9;
+  // Minimum valid input rows that rebuild complete continuation after ordinary prefill.
+  uint64 terminal_prefill_min_tokens = 10;
 }
 enum ToolParserKind {
   TOOL_PARSER_UNSPECIFIED = 0;

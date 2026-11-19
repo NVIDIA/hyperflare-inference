@@ -80,7 +80,7 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     layout = StateLayout.from_specs((("consumed_tokens", (1,), torch.int64),))
     storage = StateStorage.allocate(layout, capacity * 8 + 1, "cpu")
     pool = SimpleNamespace(layout=layout, pages={}, backing=storage.backing,
-        config=SimpleNamespace(text={"compress_ratios": []}))
+        config=SimpleNamespace(text={"compress_ratios": [], "sliding_window": 128}))
     buffers.update(state_pool=storage.backing, memory_capacity=storage.memory_capacity,
         request_pending_token=torch.zeros(capacity, dtype=torch.int64),
         sampling_grammar_mask=torch.zeros((capacity, (vocabulary + 31) // 32), dtype=torch.int32),
@@ -111,7 +111,7 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
                 fields = [*row_fields, "sampling_grammar_mask"]
             else:
                 fields = [*inputs.buffers(), "sampling_grammar_mask"]
-                if kind in ("prefill", "scored_prefill"):
+                if kind in ("prefill", "terminal_prefill", "scored_prefill"):
                     fields.extend(("vision_token_indices", "vision_feature_slot"))
                 if kind == "scored_prefill":
                     fields.append("prompt_target_tokens")
@@ -139,6 +139,8 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     for tokens in getattr(config, "prefill_capacities", prefill_capacities(config.prefill_chunk_size)):
         for enabled in ((True, False) if recipe == "deepseek41" else (None,)):
             add("prefill", 1, tokens, enabled=enabled)
+            if recipe == "deepseek41" and config.prefill_chunk_size > pool.config.text["sliding_window"]:
+                add("terminal_prefill", 1, tokens, enabled=enabled)
     from ignition.components.prompt_logprobs import scored_prefill_capacities
     for tokens in scored_prefill_capacities(config.prefill_chunk_size):
         for enabled in ((True, False) if recipe == "deepseek41" else (None,)):
@@ -309,3 +311,12 @@ def test_native_capacity_one_omits_survival_without_narrowing_state_row_storage(
     assert "completion_speculative_survival" not in fields
     assert all(graph["kind"] != "speculative" for graph in manifest["graphs"])
     flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+
+
+def test_deepseek_short_chunk_catalog_retains_complete_prefill_semantics():
+    import flare_heliopause
+
+    _, contract, manifest = _recipe_metadata("deepseek41", config_options={"prefill_chunk_size": 128})
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    assert contract["version"] == 3
+    assert not any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])

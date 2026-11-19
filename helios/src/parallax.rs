@@ -37,7 +37,7 @@ pub fn now_ns() -> u64 {
 pub fn consumes(kind: GraphKind) -> bool {
     matches!(
         kind,
-        GraphKind::Decode | GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Speculative
+        GraphKind::Decode | GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill | GraphKind::Speculative
     )
 }
 
