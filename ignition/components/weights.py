@@ -40,6 +40,9 @@ for _container, _fields in (
     # Shared Ignition weight containers: only these fields hold stored weights.
     ('ignition.components.weights.MLPWeights', ('gate_up', 'down')),
     ('ignition.components.weights.GroupedLinearWeights', ('parts',)),
+    ('ignition.components.megamoe_tiers.MegaMoeLayerWeights', ('routed', 'shared', 'host_tier')),
+    ('ignition.components.megamoe_tiers.MegaMoeHostTier', ('weights',)),
+    ('ignition.components.fused_mla.FusedMLAPreparation', ()),
     ('ignition.components.dflash2_weights.DraftLayerWeights',
      ('qkv', 'output', 'query_norm', 'key_norm', 'input_norm', 'post_attention_norm',
       'mlp', 'attention_conv', 'mlp_conv')),

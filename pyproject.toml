@@ -17,6 +17,9 @@ ignition = "ignition.__main__:main"
 [project.optional-dependencies]
 test = ["pytest>=9,<10", "tiktoken>=0.12,<1"]
 api-test = ["pytest>=9,<10", "openai>=2,<3", "anthropic>=0.70,<1"]
+megamoe = [
+    "deep-gemm @ git+https://github.com/vllm-project/DeepGEMM.git@1e1842a833699298f7afc02eefb2ed168fff6938",
+]
 prepare = [
     "cryptography>=46,<52",
     "torch==2.14.1+cu132",
@@ -45,10 +48,18 @@ torch = { index = "pytorch-cu132" }
 torchvision = { index = "pytorch-cu132" }
 flare-heliopause = { path = "heliopause" }
 
+[tool.uv.extra-build-dependencies]
+deep-gemm = ["torch==2.14.1+cu132", "packaging", "wheel"]
+
 [tool.setuptools.packages.find]
 include = ["ignition*"]
 
 [tool.setuptools.package-data]
+"ignition.components.index_topk_kernel" = ["bindings.cpp", "csrc/*.cu", "csrc/*.h", "csrc/*.cuh", "csrc/core/*.h", "LICENSE.*", "NOTICE"]
+"ignition.components.flashmla_kernel" = ["bindings.cu", "csrc/**/*.h", "csrc/**/*.hpp", "LICENSE.*", "NOTICE"]
+"ignition.components.mega_cache_kernel" = ["bindings.cpp", "csrc/*.cu", "csrc/*.h", "csrc/*.cuh", "csrc/core/*.h", "LICENSE.*", "NOTICE"]
+"ignition.components.mega_attention_kernel" = ["csrc/*.cu", "include/w1/*.cuh", "include/w7/*.cuh", "include/w8/*.cuh", "LICENSE.*", "NOTICE*"]
+"ignition.components.megamoe_kernel" = ["host_bindings.cpp", "mqa_bindings.cpp", "host/**/*.hpp", "host/**/*.h", "include/deep_gemm/impls/*.cuh", "include/deep_gemm/scheduler/*.cuh", "LICENSE.*", "NOTICE"]
 "ignition.preparation" = ["ladders/*.json"]
 "ignition.recipes.deepseek41" = ["assets/*"]
 "ignition.recipes.deepseek4" = ["assets/*"]

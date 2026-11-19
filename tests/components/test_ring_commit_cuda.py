@@ -18,8 +18,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @pytest.mark.parametrize("batch,width,strided", [(1, 4, False), (4, 8, True), (64, 8, False), (1, 4096, False)])
+@pytest.mark.parametrize("planes,alignment", [(None, 1), ((512, 16), 512)])
 @torch.no_grad()
-def test_compiled_ring_commits_share_state_and_preserve_producer_consumer_lifetimes(batch, width, strided):
+def test_compiled_ring_commits_share_state_and_preserve_producer_consumer_lifetimes(batch, width, strided, planes, alignment):
     device = torch.device("cuda", 0)
     torch.manual_seed(4190 + batch + width)
     regions, window, record = 40, 128, 528
@@ -37,21 +38,26 @@ def test_compiled_ring_commits_share_state_and_preserve_producer_consumer_lifeti
             view.copy_(value)
             vectors.append(view)
         rows, starts, counts = vectors
-    operations, sources, functions, graphs = {}, {}, {}, {}
-    staging = torch.empty((regions, batch, (window + width) * record), dtype=torch.uint8, device=device)
+    operations, sources, targets, functions, graphs = {}, {}, {}, {}, {}
+    staged_bytes = ((window + width) * record + alignment - 1) // alignment * alignment
+    staging = torch.empty((regions, batch, staged_bytes), dtype=torch.uint8, device=device)
     worker = None
     try:
         for capacity in (max(1, width // 2), width):
             operation = PreparedRingCommit(backing, offsets, rows, starts, token_capacity=capacity,
-                                           window_tokens=window, record_bytes=record, staging=staging)
+                window_tokens=window, record_bytes=record, staging=staging,
+                record_planes=planes, staging_alignment=alignment)
             assert operation.staging.data_ptr() == staging.data_ptr()
             source = torch.randint(0, 256, operation.staging.shape, dtype=torch.uint8, device=device)
+            target = operation.staging
+            operation.functional()
+            assert operation.staging is None and operation.rows is None and operation.starts is None
 
-            def forward(operation=operation, source=source):
-                operation.staging.copy_(source)
-                operation(counts)
+            def forward(operation=operation, source=source, target=target):
+                target.copy_(source)
+                operation(counts, staging=target, rows=rows, starts=starts)
                 # Recycling follows the commit's last read in the same compiled forward.
-                operation.staging.fill_(0xDE)
+                target.fill_(0xDE)
 
             function = compile_forward(forward)
             function()
@@ -60,6 +66,7 @@ def test_compiled_ring_commits_share_state_and_preserve_producer_consumer_lifeti
             with torch.cuda.graph(graph):
                 function()
             operations[capacity], sources[capacity] = operation, source
+            targets[capacity] = target
             functions[capacity], graphs[str(capacity)] = function, graph
         bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={"backing": backing},
             resources=(operations, sources, functions, rows, starts, counts))
@@ -76,15 +83,19 @@ def test_compiled_ring_commits_share_state_and_preserve_producer_consumer_lifeti
             if iteration == 3:
                 rows[-1] = 0
             expected = backing.cpu()
-            staged = source.cpu().reshape(regions, batch, window + capacity, record)
+            staged = source.cpu()
             row_ids, positions = rows.tolist(), starts.tolist()
             for region, destination in enumerate(offsets):
                 for request, (row, start, length) in enumerate(zip(row_ids, positions, accepted)):
                     if row <= 0:
                         continue
                     for token in range(max(0, length - window), length):
-                        offset = destination + ((start + token) % window) * record
-                        expected[row, offset:offset + record] = staged[region, request, window + token]
+                        prefix = 0
+                        for plane in planes or (record,):
+                            offset = destination + prefix * window + ((start + token) % window) * plane
+                            origin = prefix * (window + capacity) + (window + token) * plane
+                            expected[row, offset:offset + plane] = staged[region, request, origin:origin + plane]
+                            prefix += plane
             originals = [value.clone() for value in (source, rows, starts, counts, operation.offsets)]
             torch.cuda.synchronize()
             before = torch.cuda.memory_stats()
@@ -96,7 +107,7 @@ def test_compiled_ring_commits_share_state_and_preserve_producer_consumer_lifeti
                         "segment.all.allocated", "segment.all.freed"):
                 assert before[key] == after[key], key
             assert torch.equal(backing.cpu(), expected)
-            assert operation.staging.eq(0xDE).all()
+            assert targets[capacity].eq(0xDE).all()
             for value, original in zip((source, rows, starts, counts, operation.offsets), originals, strict=True):
                 assert torch.equal(value, original)
     finally:
@@ -106,11 +117,16 @@ def test_compiled_ring_commits_share_state_and_preserve_producer_consumer_lifeti
             graph.reset()
 
 
+@pytest.mark.parametrize("separated", [False, True])
 @torch.no_grad()
-def test_b12x_cache_writers_feed_batched_commits_before_staging_reuse():
+def test_cache_writers_feed_batched_commits_before_staging_reuse(tmp_path, separated):
     from b12x.attention._shared.mla.compressed_reference import pack_deepseek_v41_cache_reference
     from b12x.preparation import PreparationSession
     from ignition.components.compressed_mla import PreparedCompressedCacheWriter
+    from ignition.components.mega_attention_cache import MegaCacheLayout, PreparedMegaCacheWriter
+
+    if separated and torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("the separated cache writer requires SM103")
 
     device = torch.device("cuda", 0)
     torch.manual_seed(4148)
@@ -122,21 +138,34 @@ def test_b12x_cache_writers_feed_batched_commits_before_staging_reuse():
     starts = torch.tensor([127, 255, 4095, 88], dtype=torch.int64, device=device)
     counts = torch.zeros(batch, dtype=torch.int32, device=device)
     operation = PreparedRingCommit(backing, offsets, rows, starts, token_capacity=width,
-                                   window_tokens=window, record_bytes=record)
+        window_tokens=window, record_bytes=record, record_planes=(512, 16) if separated else None,
+        staging_alignment=512 if separated else 1)
     values = torch.randn((regions, batch * width, 512), dtype=torch.bfloat16, device=device) * .2
     slots = (torch.arange(batch, device=device)[:, None] * (window + width)
              + window + torch.arange(width, device=device)).reshape(-1).long()
+    positions = torch.zeros(batch * width, dtype=torch.int64, device=device)
+    cs = torch.cat((torch.ones((1, 32), device=device), torch.zeros((1, 32), device=device)), -1)
     graph = worker = None
     try:
         with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-            writers = tuple(PreparedCompressedCacheWriter(values[layer], operation.staging[layer], slots,
-                page_size=window + width, kind="swa", session=session, name=f"window{layer}")
-                for layer in range(regions))
+            if separated:
+                layout = MegaCacheLayout(window + width, record)
+                caches = tuple(layout.view(operation.staging[layer]) for layer in range(regions))
+                writers = tuple(PreparedMegaCacheWriter(values[layer], positions, cs, caches[layer], slots,
+                    ratio=1, kernel_cache=tmp_path, session=session, name=f"window{layer}")
+                    for layer in range(regions))
+            else:
+                writers = tuple(PreparedCompressedCacheWriter(values[layer], operation.staging[layer], slots,
+                    page_size=window + width, kind="swa", session=session, name=f"window{layer}")
+                    for layer in range(regions))
 
             def forward():
                 for layer, writer in enumerate(writers):
-                    writer(values[layer])
-                operation(counts)
+                    if separated:
+                        writer(values[layer], positions, cs, caches[layer], slots)
+                    else:
+                        writer(values[layer], slots)
+                operation(counts, staging=operation.staging, rows=rows, starts=starts)
                 operation.staging.fill_(0xDE)
 
             compiled = compile_forward(forward)
@@ -161,8 +190,11 @@ def test_b12x_cache_writers_feed_batched_commits_before_staging_reuse():
                         if row <= 0:
                             continue
                         for token in range(count):
-                            offset = destination + ((start + token) % window) * record
-                            expected[row, offset:offset + record] = packed[request, window + token]
+                            prefix = 0
+                            for plane in (512, 16) if separated else (record,):
+                                offset = destination + prefix * window + ((start + token) % window) * plane
+                                expected[row, offset:offset + plane] = packed[request, window + token, prefix:prefix + plane]
+                                prefix += plane
                 original = values.clone()
                 torch.cuda.synchronize()
                 before = torch.cuda.memory_stats()

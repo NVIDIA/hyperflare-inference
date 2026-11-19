@@ -11,7 +11,9 @@ like b12x plans, while FlashInfer kernels execute the arithmetic.
 MXFP8 weights keep b12x's packed storage. Their UE8M0 scales already use the
 F8_128x4 layout that FlashInfer's MXFP8 GEMMs read, and b12x's Triton quantizer
 packs activations into caller workspace in that same layout. Tuning chooses the
-FlashInfer GEMM backend and its kernel tactic for each shape.
+FlashInfer GEMM backend and its kernel tactic for each shape. Shapes through
+eight rows also admit FlashInfer's low-latency block-scaled GEMM with the same
+packed operands and scale layout.
 
 NVFP4 weights without an activation scale run with BF16 activations through
 FlashInfer's BF16-by-FP4 GEMM, which reads b12x's packed values and F8_128x4
@@ -43,6 +45,7 @@ from .native_operator import native_contract, native_plan
 CAPABILITY = (10, 3)
 COMPONENT = "flare.sm103.packed_projection"
 _QUANTIZED_BACKENDS = ("cute-dsl", "cutlass")
+_LOW_LATENCY_BACKEND = "cutedsl_low_latency"
 _BF16_BACKENDS = ("cute-dsl", "tinygemm", "cutlass")
 _FP4_BACKENDS = ("cute-dsl",)
 # FlashInfer's MXFP8 GEMMs need at least one 128-row output tile.
@@ -91,14 +94,24 @@ def _mxfp8_runner(backend, device):
     major, minor = torch.cuda.get_device_capability(device)
     if backend == "cutlass":
         return gemm_base.get_cutlass_mxfp8_gemm_module(major).cutlass_mxfp8_gemm_runner()
+    if backend == _LOW_LATENCY_BACKEND:
+        return gemm_base._cutedsl_low_latency_blockscaled_gemm_runner(major * 10 + minor, True)
     return gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, torch.bfloat16)
+
+
+def _mxfp8_backends(query):
+    # CUTLASS requires 32-aligned output features; the low-latency kernel bounds M at eight.
+    backends = tuple(backend for backend in _QUANTIZED_BACKENDS
+                     if backend != "cutlass" or query.out_features % 32 == 0)
+    if query.rows <= 8 and query.padded_in_features % 128 == 0:
+        backends += (_LOW_LATENCY_BACKEND,)
+    return backends
 
 
 def _mxfp8_tactics(query, device):
     """FlashInfer's valid MXFP8 kernel tactics for one shape, encoded as config strings."""
     if device is None:
-        return tuple(f"{backend}:-1" for backend in _QUANTIZED_BACKENDS
-                     if backend != "cutlass" or query.out_features % 32 == 0)
+        return tuple(f"{backend}:-1" for backend in _mxfp8_backends(query))
     # The identity describes the architecture; enumerate on the process's current device of that architecture.
     target = torch.device("cuda", torch.cuda.current_device())
     rows, k, n = query.rows, query.padded_in_features, query.out_features
@@ -109,13 +122,10 @@ def _mxfp8_tactics(query, device):
     out = torch.empty((rows, n), dtype=torch.bfloat16, device="meta")
     inputs = [a, b, sf, sf, torch.bfloat16, out, sf]
     candidates = []
-    for backend in _QUANTIZED_BACKENDS:
-        # FlashInfer's CUTLASS MXFP8 GEMM requires 32-aligned output features (GLM's TP4 KDA input has 6288).
-        if backend == "cutlass" and n % 32:
-            continue
+    for backend in _mxfp8_backends(query):
         candidates.append(f"{backend}:-1")
         for tactic in _mxfp8_runner(backend, target).get_valid_tactics(inputs, None):
-            if backend == "cutlass" or _curated_cute_tactic(tactic, rows):
+            if backend != "cute-dsl" or _curated_cute_tactic(tactic, rows):
                 candidates.append(f"{backend}:{tactic!r}")
     return tuple(dict.fromkeys(candidates))
 
@@ -173,7 +183,7 @@ def _validate_config(query, config, device):
         raise ValueError(f"{COMPONENT} requires a backend configuration")
     if query.mode == "quantized":
         backend, _ = _decode_tactic(config.backend)
-        if backend not in _QUANTIZED_BACKENDS:
+        if backend not in _mxfp8_backends(query):
             raise ValueError(f"unsupported {COMPONENT} MXFP8 backend {config.backend!r}")
     elif config.backend not in _backends(query, device):
         raise ValueError(f"unsupported {COMPONENT} backend {getattr(config, 'backend', None)!r}")
@@ -183,6 +193,7 @@ TUNING = TuningContract(
     component_id=COMPONENT,
     query_schema_version=1,
     config_schema_version=2,
+    candidate_contract_version=2,
     query_fields=frozenset(field.name for field in fields(PackedProjectionQuery)),
     config_fields=frozenset({"backend"}),
     encode_query=lambda query: {field.name: getattr(query, field.name)
@@ -604,12 +615,17 @@ def bf16_out(source, weight, out, plan_handle):
     """Run a prepared BF16 projection by its plan handle: FlashInfer's GEMM on SM103, b12x's GEMV elsewhere."""
     plan = plan_from_handle(plan_handle)
     if plan.component_id == DENSE_COMPONENT:
-        from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
-
-        workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=source.device)
-        _dense_out_workspace(source, weight, out, workspace, plan_handle)
+        dense_out(source, weight, out, plan_handle)
         return
     torch.ops.b12x.bf16_gemv_small_n_out(source, weight, out, plan_handle, None)
+
+
+def dense_out(source, weight, out, plan_handle):
+    """Run a selected SM103 dense plan with compiler-visible workspace."""
+    from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+
+    workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=source.device)
+    _dense_out_workspace(source, weight, out, workspace, plan_handle)
 
 
 @torch.library.custom_op("flare::sm103_dense_out", mutates_args=("out",))
