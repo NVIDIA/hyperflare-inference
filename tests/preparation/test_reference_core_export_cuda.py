@@ -648,6 +648,11 @@ def _verify_exported_mini_core(core_dir: Path, cache_dir: Path, pub: Publisher, 
         "--parallax-residency", str(residency_path),
     ])
     try:
+        # Exercise YOCO-compacted terminal_prefill (> yoco_keep_tokens) under async Parallax routing.
+        compacted_prompt = " ".join(f"record {j} value {(j * 17) % 97}" for j in range(80))
+        res_compacted = chat(url, compacted_prompt, max_tokens=8, seed=499)
+        assert res_compacted["usage"]["prompt_tokens"] > 144
+        assert len(res_compacted["choices"][0]["token_ids"]) == 8
         for i in range(6):
             res = chat(url, f"Parallax routing & residency exchange wave {i} with varied tokens {i * 97}",
                        max_tokens=20, seed=500 + i)

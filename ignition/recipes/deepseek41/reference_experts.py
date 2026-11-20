@@ -208,7 +208,10 @@ class TracedReferenceExperts(nn.Module):
                      ids, probabilities, routes, base.scaling)
         stream_handle = self.stream_handle if self._async_trace else None
         if self._async_trace:
-            valid_tokens = getattr(input_metadata, "_trace_valid_buffer", None)
+            if getattr(input_metadata, "_trace_valid_rows", None) == rows:
+                valid_tokens = getattr(input_metadata, "_trace_valid_buffer", None)
+            else:
+                valid_tokens = None
             if valid_tokens is None:
                 source = getattr(input_metadata, "valid_token_count", None)
                 if source is None:
@@ -216,6 +219,8 @@ class TracedReferenceExperts(nn.Module):
                 if self._valid_buffer is not None:
                     self._valid_buffer.copy_(source)
                     valid_tokens = self._valid_buffer
+                    input_metadata._trace_valid_buffer = self._valid_buffer
+                    input_metadata._trace_valid_rows = rows
                 else:
                     valid_tokens = source
                     stream_handle = None

@@ -352,6 +352,7 @@ class TracedReferenceModel:
             self._valid_buffer.copy_(valid_tokens)
             metadata = copy(metadata)
             metadata._trace_valid_buffer = self._valid_buffer
+            metadata._trace_valid_rows = metadata.valid_token_mask.numel()
         self.trace.begin(stream_handle=self.stream_handle if self._async_trace else None)
         if hidden_states is None and metadata.is_prompt:
             hidden_states = DeepseekVLForCausalLM.get_input_embeddings(self, metadata)
