@@ -163,6 +163,7 @@ impl tonic::transport::server::Connected for Box<dyn crate::data::channel::Conn>
 
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(270);
 const H2_KEEPALIVE: Duration = Duration::from_secs(10);
 const H2_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -171,6 +172,7 @@ pub use serve as run;
 /// Stops the manager's threads and removes its socket, whether startup failed or serving
 /// ended. Dropping it releases the store's instance and root locks with the owner thread.
 struct Cleanup {
+    deadline: Option<Instant>,
     stop: Arc<AtomicBool>,
     commands: mpsc::Sender<StoreCommand>,
     owner: Option<thread::JoinHandle<()>>,
@@ -179,17 +181,74 @@ struct Cleanup {
     socket: PathBuf,
 }
 
+pub(crate) fn run_store_owner(
+    mut store: Store,
+    mut receiver: mpsc::Receiver<StoreCommand>,
+    owner_stop: Arc<AtomicBool>,
+    owner_error: Arc<Mutex<Option<io::Error>>>,
+) {
+    let mut checked_regions = Instant::now();
+    'outer: while let Some(mut command) = receiver.blocking_recv() {
+        if !owner_stop.load(Ordering::Acquire)
+            && checked_regions.elapsed() >= Duration::from_secs(1)
+        {
+            checked_regions = Instant::now();
+            if let Err(error) = store.check_regions() {
+                *owner_error.lock().unwrap() = Some(error);
+                owner_stop.store(true, Ordering::Release);
+            }
+        }
+        // Drain the batch before dispatching so queued operations are ordered by the
+        // scheduler rather than by arrival.
+        let mut batch = 64;
+        loop {
+            if let StoreCommand::Shutdown { deadline } = command {
+                if !store.drain_until(deadline) {
+                    eprintln!(
+                        "selene: shutdown deadline reached with unfinished checkpoint writes"
+                    );
+                    // A blocked kernel I/O still owns its registered buffers and the root lock.
+                    thread::spawn(move || drop(store));
+                    return;
+                }
+                break 'outer;
+            }
+            store.handle(command);
+            batch -= 1;
+            if batch == 0 {
+                break;
+            }
+            match receiver.try_recv() {
+                Ok(next) => command = next,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break 'outer,
+            }
+        }
+        store.pump();
+    }
+}
+
 impl Cleanup {
-    fn finish(&mut self) {
+    fn begin_shutdown(&mut self) -> Instant {
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + SHUTDOWN_BUDGET);
         self.stop.store(true, Ordering::Release);
+        deadline
+    }
+
+    fn finish(&mut self) {
+        let deadline = self.begin_shutdown();
         // Unlink the socket while this process still holds the store's locks: no replacement
         // manager can have bound a new socket under the same path yet.
         let _ = fs::remove_file(&self.socket);
         // Delivery is guaranteed even when another sender is alive (the tick thread, the pool
         // or a handler task) and even with a full queue; the owner always exits, so the Store
         // and its locks are released. `serve` calls this from its own thread.
-        let _ = self.commands.blocking_send(StoreCommand::Shutdown);
-        // The tick and metrics threads exit on the flag.
+        let _ = self
+            .commands
+            .blocking_send(StoreCommand::Shutdown { deadline });
+        // The tick thread exits when the owner closes its receiver. Metrics exits on the flag.
         if let Some(thread) = self.tick.take() {
             let _ = thread.join();
         }
@@ -225,7 +284,8 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let limits = config.limits.clone();
     #[cfg(not(any(test, feature = "test-support")))]
     let limits = flare_selene::shared::Limits::default();
-    let drain_wait = Duration::from_millis(u64::from(limits.max_claim_deadline_ms) + 2000);
+    let drain_wait = Duration::from_millis(u64::from(limits.max_claim_deadline_ms) + 2000)
+        .min(Duration::from_secs(240));
     let store = Store::open(config.clone())?;
     let regions = Arc::new(store.regions());
     let directory = config
@@ -257,7 +317,7 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
         ))
     })?;
-    let (commands, mut receiver) = mpsc::channel::<StoreCommand>(64);
+    let (commands, receiver) = mpsc::channel::<StoreCommand>(64);
     // Instances on other hosts copy through the data channel, which binds before the
     // pool exists so a taken port fails startup.
     let (channel, channel_events) = match config.data_address()? {
@@ -329,6 +389,7 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
         ))
     })?;
     let mut cleanup = Cleanup {
+        deadline: None,
         stop: stop.clone(),
         commands: commands.clone(),
         owner: None,
@@ -350,52 +411,29 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let owner_error = region_error.clone();
     let owner_stop = stop.clone();
     cleanup.owner = Some(thread::spawn(move || {
-        let mut store = store;
-        let mut checked_regions = Instant::now();
-        'outer: while let Some(mut command) = receiver.blocking_recv() {
-            if !owner_stop.load(Ordering::Acquire)
-                && checked_regions.elapsed() >= Duration::from_secs(1)
-            {
-                checked_regions = Instant::now();
-                if let Err(error) = store.check_regions() {
-                    *owner_error.lock().unwrap() = Some(error);
-                    owner_stop.store(true, Ordering::Release);
-                }
-            }
-            // Drain the batch before dispatching so queued operations are ordered by the
-            // scheduler rather than by arrival.
-            let mut batch = 64;
-            loop {
-                let shutdown = matches!(command, StoreCommand::Shutdown);
-                store.handle(command);
-                if shutdown {
-                    break 'outer;
-                }
-                batch -= 1;
-                if batch == 0 {
-                    break;
-                }
-                match receiver.try_recv() {
-                    Ok(next) => command = next,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break 'outer,
-                }
-            }
-            store.pump();
-        }
+        run_store_owner(store, receiver, owner_stop, owner_error);
     }));
     let stop_notice = Arc::new(Notify::new());
     let tick_notice = stop_notice.clone();
     let tick_commands = commands.clone();
     let tick_stop = stop.clone();
     cleanup.tick = Some(thread::spawn(move || {
-        while !tick_stop.load(Ordering::Acquire) {
+        let mut notified = false;
+        loop {
+            if tick_stop.load(Ordering::Acquire) && !notified {
+                tick_notice.notify_one();
+                notified = true;
+            }
             thread::sleep(Duration::from_millis(10));
-            let _ = tick_commands.try_send(StoreCommand::Tick);
+            if matches!(
+                tick_commands.try_send(StoreCommand::Tick),
+                Err(mpsc::error::TrySendError::Closed(_))
+            ) {
+                break;
+            }
         }
-        tick_notice.notify_one();
     }));
-    let async_stop = stop.clone();
+    let shutdown = &mut cleanup;
     // The network listener outlives the stop request until the pool has drained its claims.
     let serve_stop = Arc::new(Notify::new());
     let network_stop = serve_stop.clone();
@@ -465,29 +503,30 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
             }
             None => None,
         };
-        let signal_stop = async_stop.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = interrupt.recv() => {}
-            }
-            signal_stop.store(true, Ordering::Release);
-        });
         let server = server.serve_with_incoming(incoming);
         // A stop request first lets the pool finish the claims in flight, then closes
         // its sessions; only then do the listeners stop.
         let drain = {
             let events = pool_handle.events.clone();
             async move {
-                stop_notice.notified().await;
-                let (done, finished) = oneshot::channel();
-                if events
-                    .send(crate::pool::core::Event::Shutdown { done })
-                    .await
-                    .is_ok()
-                {
-                    let _ = tokio::time::timeout(drain_wait, finished).await;
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = interrupt.recv() => {}
+                    _ = stop_notice.notified() => {}
                 }
+                let deadline = shutdown.begin_shutdown();
+                let claim_deadline = deadline.min(Instant::now() + drain_wait);
+                let _ = tokio::time::timeout_at(claim_deadline.into(), async {
+                    let (done, finished) = oneshot::channel();
+                    if events
+                        .send(crate::pool::core::Event::Shutdown { done })
+                        .await
+                        .is_ok()
+                    {
+                        let _ = finished.await;
+                    }
+                })
+                .await;
             }
         };
         let local = tokio::select! {
@@ -638,6 +677,22 @@ fn serve_metrics(
 mod tests {
     use super::*;
 
+    #[test]
+    fn deployment_grace_exceeds_the_shutdown_budget() {
+        assert!(Duration::from_secs(300) > SHUTDOWN_BUDGET);
+        assert!(
+            include_str!("../deploy/selene.service")
+                .lines()
+                .any(|l| l == "TimeoutStopSec=300s")
+        );
+        for compose in [
+            include_str!("../deploy/compose.yaml"),
+            include_str!("../deploy/compose-network.yaml"),
+        ] {
+            assert!(compose.lines().any(|l| l.trim() == "stop_grace_period: 5m"));
+        }
+    }
+
     #[tokio::test]
     async fn unix_connect_info_leaves_visible_pid_unwatched() {
         let path =
@@ -697,6 +752,7 @@ mod tests {
         let (gated_tx, gated_rx) = std_mpsc::channel::<()>();
         let (removed_tx, removed_rx) = std_mpsc::channel::<bool>();
         let mut cleanup = Cleanup {
+            deadline: None,
             stop: Arc::new(Flag::new(false)),
             commands: commands.clone(),
             owner: None,
@@ -704,11 +760,16 @@ mod tests {
             metrics: None,
             socket: socket.clone(),
         };
+        let before_signal = Instant::now();
+        let signal_deadline = cleanup.begin_shutdown();
+        assert!(signal_deadline >= before_signal + Duration::from_secs(270));
+        assert!(signal_deadline <= Instant::now() + Duration::from_secs(270));
         cleanup.owner = Some(thread::spawn(move || {
             let mut store = Some(store);
             let mut gated = false;
             while let Some(command) = receiver.blocking_recv() {
-                if matches!(command, StoreCommand::Shutdown) {
+                if let StoreCommand::Shutdown { deadline } = command {
+                    assert_eq!(deadline, signal_deadline);
                     let _ = removed_tx.send(!worker_socket.exists());
                     break;
                 }

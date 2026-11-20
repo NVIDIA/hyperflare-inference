@@ -215,6 +215,19 @@ impl Extent {
     pub fn offset(&self) -> usize {
         self.offset
     }
+    pub fn truncate(&mut self, length: usize) {
+        assert!(length <= self.length);
+        let needed = length.max(4096).next_power_of_two();
+        let mut free = self.mapping.free.lock().unwrap();
+        while self.capacity > needed {
+            self.capacity /= 2;
+            free.entry(self.capacity)
+                .or_default()
+                .insert(self.offset + self.capacity);
+        }
+        self.length = length;
+    }
+
     fn free(&self) {
         let mut free = self.mapping.free.lock().unwrap();
         let mut offset = self.offset;

@@ -6,6 +6,7 @@ Description=Selene manager for Flare KV cache sharing
 After=local-fs.target
 
 [Service]
+TimeoutStopSec=300s
 # Create flare as a system account; local instances must use the same uid/gid.
 # With a normal login uid, configure logind RemoveIPC=no to preserve /dev/shm.
 User=flare

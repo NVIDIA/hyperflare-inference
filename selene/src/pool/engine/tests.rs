@@ -1688,6 +1688,10 @@ pub(super) fn host_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
         bucket: [4; 16],
         chain_pages: 3,
         tail_pages: 3,
+        capture_role: Default::default(),
+        child_paths: 0,
+        descendant_row: false,
+        next_child: None,
         row: true,
         source: crate::pool::PutSource::Host(Box::new(Bytes {
             data,
@@ -1734,6 +1738,22 @@ pub(super) fn puts(events: &[PoolEvent]) -> Vec<(u64, String)> {
 }
 
 #[test]
+fn an_unlinked_put_keeps_its_refusal_reason() {
+    let mut rig = Rig::new();
+    rig.open();
+    rig.command(Command::Put {
+        id: 1,
+        request: host_put(None),
+    });
+    rig.send(In::PutRefused(wire::PutRefused {
+        put_id: 1,
+        reason: wire::Reason::Invalid as i32,
+        detail: crate::shared::PUT_UNLINKED.into(),
+    }));
+    assert_eq!(puts(&rig.events()), [(1, "Refused(Unlinked)".to_string())]);
+}
+
+#[test]
 fn a_refusal_ends_the_put_and_present_is_a_success() {
     let mut rig = Rig::new();
     rig.open();
@@ -1747,6 +1767,41 @@ fn a_refusal_ends_the_put_and_present_is_a_success() {
         detail: String::new(),
     }));
     assert_eq!(puts(&rig.events()), [(1, "Present".to_string())]);
+}
+
+#[test]
+fn a_linked_endpoint_put_uses_the_row_shape_accepted_by_the_manager() {
+    for omit in [false, true] {
+        let mut rig = Rig::new();
+        rig.open();
+        let mut request = host_put(Some(key(64, 1)));
+        request.tail_pages = 2;
+        request.capture_role = crate::CaptureRole::Endpoint;
+        rig.command(Command::Put { id: 4, request });
+        let In::PutAccept(mut accepted) = accept(4, 1, record_len(2)) else {
+            unreachable!()
+        };
+        accepted.capture_role = crate::CaptureRole::Endpoint as i32;
+        accepted.has_parent = true;
+        accepted.parent = Some(super::super::codec::key_to(key(64, 1)));
+        if omit {
+            accepted.record_bytes -= ROW;
+        }
+        rig.send(In::PutAccept(accepted));
+        rig.send(grant_put(4, window(0, 0, 0, 2, !omit, 0)));
+        let mut out = Vec::new();
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(5));
+            out.extend(rig.tick(Duration::ZERO));
+            if !pick!(out, PutCommit).is_empty() {
+                break;
+            }
+        }
+        let filled = pick!(out, PutFilled);
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].has_row, !omit);
+        assert_eq!(pick!(out, PutCommit).len(), 1);
+    }
 }
 
 #[test]

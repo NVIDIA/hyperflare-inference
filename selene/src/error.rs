@@ -41,7 +41,8 @@ impl Error {
         }
     }
 
-    pub(crate) fn no_space(&self) -> bool {
+    /// A filesystem write exhausted available blocks or quota.
+    pub fn no_space(&self) -> bool {
         self.source.as_ref().is_some_and(|source| {
             source.downcast_ref::<std::io::Error>().is_some_and(|e| {
                 matches!(

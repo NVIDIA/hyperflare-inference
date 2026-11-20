@@ -216,6 +216,10 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
             put_id: 6,
             key: Some(pool::pkey(4096)),
             chain_pages: 64,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: false,
             published_parent: None,
@@ -230,6 +234,10 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
             put_id: 7,
             key: Some(pool::pkey(5120)),
             chain_pages: 80,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: false,
             published_parent: None,
@@ -279,6 +287,11 @@ async fn puts_reroot_at_half_the_chain_limit_and_restore_through_the_next_tail()
     writer.store(at_bound, parent).await;
     writer.store(root, Some(at_bound)).await;
     writer.store(child, Some(root)).await;
+    let metrics = host.metrics();
+    assert!(metrics.contains("selene_put_links_total{parent=\"root\"} 1\n"));
+    assert!(metrics.contains("selene_put_links_total{parent=\"linked\"} 2\n"));
+    drop(writer);
+    host.restart();
     host.durable(bound as usize + 2);
     for (record, expected_parent) in [(at_bound, parent), (root, None), (child, Some(root))] {
         let bytes =
@@ -303,9 +316,6 @@ async fn puts_reroot_at_half_the_chain_limit_and_restore_through_the_next_tail()
             child_bytes[child_header.page_segment as usize..].to_vec(),
         ]
     );
-    let metrics = host.metrics();
-    assert!(metrics.contains("selene_put_links_total{parent=\"root\"} 1\n"));
-    assert!(metrics.contains("selene_put_links_total{parent=\"linked\"} 2\n"));
 }
 
 fn rooted(label: &str) -> (std::path::PathBuf, selene_manager::store::Config) {
@@ -330,7 +340,6 @@ async fn first_life(config: &selene_manager::store::Config, tokens: &[u64]) {
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut writer = open(&mut pool, "writer").await;
     store_chain(&mut writer, 1, tokens).await;
-    host.durable(tokens.len());
     host.stop();
     host.base = std::env::temp_dir().join(format!("selene-unused-{}", std::process::id()));
 }
@@ -446,6 +455,58 @@ async fn a_requesters_stream_that_blips_keeps_the_manager_windows_until_it_repor
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_naming_the_arena_tier_is_served_from_disk_after_write_back_releases_the_arena() {
+    let (base, mut config) = rooted("released");
+    // An arena that holds four of these records, so later puts force write-back of the first.
+    config.memory = 512 * 1024;
+    let mut host = Host::open_config(config);
+    host.run();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut writer = open(&mut pool, "writer").await;
+    let mut reader = open(&mut pool, "reader").await;
+    let first = 1024u64;
+    store_chain(&mut writer, 1, &[first]).await;
+    let stale = reader.manager_candidate(1, first).await;
+    assert_eq!(stale.tier, v2::Tier::Dram as i32);
+    // Fill the arena with other roots until the first record's arena copy is released.
+    let mut next_put = 2;
+    let mut tokens = first + 64;
+    let mut current = stale.clone();
+    for _ in 0..40 {
+        if current.tier == v2::Tier::Nvme as i32 {
+            break;
+        }
+        store_chain(&mut writer, next_put, &[tokens]).await;
+        next_put += 1;
+        tokens += 64;
+        current = reader.manager_candidate(next_put, first).await;
+    }
+    assert_eq!(
+        current.tier,
+        v2::Tier::Nvme as i32,
+        "write-back never released the arena copy"
+    );
+    // The requester still holds the lookup that named the arena tier.
+    let (windows, granted) = read_claim(&mut reader, &stale, 1).await;
+    assert_eq!(granted.total_pages, 16);
+    let got: Vec<u8> = windows
+        .iter()
+        .flat_map(|(_, bytes, _)| bytes.clone())
+        .collect();
+    assert_eq!(vec![got], expected(&[first], 0, 0, true));
+    reader.barrier().await;
+    reader.copy_result(1, v2::CopyOutcome::CopyOk).await;
+    assert_eq!(
+        reader.claim_terminal(1).await.state,
+        v2::ClaimState::Copied as i32
+    );
+    reader.fence(1, v2::FenceOutcome::Drained).await;
+    host.stop();
+    host.base = std::env::temp_dir().join(format!("selene-unused4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a8_damage_at_rest_never_reaches_a_restore() {
     let (base, config) = rooted("a8");
     first_life(&config, &[1024]).await;
@@ -532,6 +593,10 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
             put_id: 1,
             key: Some(pool::pkey(1024)),
             chain_pages: 16,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: false,
             published_parent: None,
@@ -658,6 +723,10 @@ async fn put_grants_are_record_relative_when_the_published_parent_is_stored() {
             put_id: 2,
             key: Some(selene_manager::pool::key_to(key(2048))),
             chain_pages: 32,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: true,
             published_parent: Some(selene_manager::pool::key_to(key(1024))),

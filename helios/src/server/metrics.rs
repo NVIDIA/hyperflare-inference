@@ -266,6 +266,10 @@ pub(super) struct Metrics {
     host_reused_tokens: AtomicU64,
     host_stored: AtomicU64,
     host_row_refills: AtomicU64,
+    host_retirement: [AtomicU64; 4],
+    host_retirement_buckets: [AtomicU64; 8],
+    host_retirement_pinned: AtomicU64,
+    host_restores_by_tier: [AtomicU64; 3],
     host_lookup_outcomes: [AtomicU64; 5],
     host_store_reasons: [AtomicU64; 6],
     pub(super) host_retry_success: AtomicU64,
@@ -284,6 +288,9 @@ pub(super) struct Metrics {
     host_abandoned_stores: AtomicU64,
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 8],
+    host_refusal_drops: [AtomicU64; 5],
+    pub(super) host_reoffer_calls: AtomicU64,
+    pub(super) host_reoffer_present: AtomicU64,
     host_parked: AtomicU64,
     host_fetched: AtomicU64,
     host_fetch_failed: AtomicU64,
@@ -536,9 +543,34 @@ impl Metrics {
     /// Lookups, hits, and reused tokens come from the scheduler, which applies
     /// the fetch policy.
     pub fn store(&self, stats: StoreStats) {
+        for (gauge, value) in self
+            .host_retirement_buckets
+            .iter()
+            .zip(stats.retirement_latency_buckets)
+        {
+            gauge.store(value, Ordering::Relaxed);
+        }
+        self.host_retirement_pinned
+            .store(stats.retirement_pinned_bytes, Ordering::Relaxed);
+        for (gauge, count) in self
+            .host_restores_by_tier
+            .iter()
+            .zip(stats.restores_by_tier)
+        {
+            gauge.store(count, Ordering::Relaxed);
+        }
+        for (gauge, value) in self.host_retirement.iter().zip([
+            stats.retirement_paths,
+            stats.retirement_max_depth,
+            stats.retirement_ns,
+            stats.retirement_max_ns,
+        ]) {
+            gauge.store(value, Ordering::Relaxed);
+        }
         for (counter, value) in self
             .host_held
             .iter()
+            .chain(&self.host_refusal_drops)
             .chain(&self.host_dropped)
             .chain(&self.host_expired)
             .chain(&self.host_rows_thinned)
@@ -548,6 +580,7 @@ impl Metrics {
                 stats
                     .held
                     .into_iter()
+                    .chain(stats.refusal_drops)
                     .chain(stats.dropped)
                     .chain(stats.expired)
                     .chain(stats.rows_thinned)
@@ -592,7 +625,67 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
+        for (tier, count) in ["gpu", "dram", "nvme"]
+            .iter()
+            .zip(&self.host_restores_by_tier)
+        {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_restores_total{{tier=\"{tier}\"}} {}",
+                count.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(text, "# TYPE flare_host_cache_retirement_seconds histogram");
+        for (ms, count) in flare_selene::RETIREMENT_LATENCY_MS
+            .iter()
+            .zip(&self.host_retirement_buckets)
+        {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_retirement_seconds_bucket{{le=\"{}\"}} {}",
+                *ms as f64 / 1000.0,
+                count.load(Ordering::Relaxed)
+            );
+        }
+        let [paths, max_depth, elapsed_ns, max_ns] = self
+            .host_retirement
+            .each_ref()
+            .map(|value| value.load(Ordering::Relaxed));
+        let _ = writeln!(
+            text,
+            "flare_host_cache_retirement_seconds_bucket{{le=\"+Inf\"}} {paths}"
+        );
+        let _ = writeln!(text, "flare_host_cache_retirement_seconds_count {paths}");
+        let _ = writeln!(
+            text,
+            "flare_host_cache_retirement_seconds_sum {}",
+            elapsed_ns as f64 / 1e9
+        );
+        let _ = writeln!(
+            text,
+            "flare_host_cache_retirement_pinned_bytes {}",
+            self.host_retirement_pinned.load(Ordering::Relaxed)
+        );
+        for (name, value) in [
+            ("paths_total", paths),
+            ("max_depth", max_depth),
+            ("nanoseconds_total", elapsed_ns),
+            ("max_nanoseconds", max_ns),
+        ] {
+            let _ = writeln!(text, "flare_host_cache_retirement_{name} {value}");
+        }
         text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end, through oversize or I/O errors, or by a refused pool put.\n# TYPE flare_host_cache_dropped_total counter\n");
+        text.push_str("# TYPE flare_host_cache_pool_refusal_drops_total counter\n");
+        for (reason, count) in ["invalid", "unlinked", "oversize", "budget", "inflight"]
+            .iter()
+            .zip(&self.host_refusal_drops)
+        {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_pool_refusal_drops_total{{reason=\"{reason}\"}} {}",
+                count.load(Ordering::Relaxed)
+            );
+        }
         text.push_str("# TYPE flare_host_cache_expired_total counter\n");
         text.push_str("# HELP flare_host_cache_rows_thinned_total Rows eagerly dropped after a child commits.\n# TYPE flare_host_cache_rows_thinned_total counter\n");
         text.push_str("# HELP flare_host_cache_packed_records_total Records stored with identical rank bytes packed once.\n# TYPE flare_host_cache_packed_records_total counter\n# HELP flare_host_cache_per_rank_records_total Records stored with separate rank bytes.\n# TYPE flare_host_cache_per_rank_records_total counter\n# HELP flare_host_cache_abandoned_stores_total Stores abandoned after later rank bytes differed.\n# TYPE flare_host_cache_abandoned_stores_total counter\n");
@@ -961,6 +1054,16 @@ impl Metrics {
                 "host_cache_row_refills_total",
                 "Compacted endpoints restored by complete record replacement.",
                 &self.host_row_refills,
+            ),
+            (
+                "host_cache_reoffer_calls_total",
+                "Store calls for reoffered publications.",
+                &self.host_reoffer_calls,
+            ),
+            (
+                "host_cache_reoffer_present_total",
+                "Reoffered publication calls answered PRESENT.",
+                &self.host_reoffer_present,
             ),
             (
                 "host_cache_retry_success_total",
@@ -1541,6 +1644,10 @@ mod tests {
             abandoned_stores: 11,
             held: [3, 4],
             dropped: [1, 2, 3, 4, 5, 6, 7, 8],
+            refusal_drops: [1, 2, 3, 4, 5],
+            retirement_paths: 2,
+            retirement_ns: 1_250_000_000,
+            retirement_latency_buckets: [0, 0, 0, 1, 2, 2, 2, 2],
             outbound_rate: 2.5e9,
             ..StoreStats::default()
         });
@@ -1582,8 +1689,19 @@ mod tests {
                 "flare_host_cache_retry_abandoned_total{{reason=\"{reason}\"}} 0\n"
             )));
         }
+        assert!(text.contains("# TYPE flare_host_cache_retirement_seconds histogram\n"));
+        assert!(text.contains("flare_host_cache_retirement_seconds_bucket{le=\"0.5\"} 1\n"));
+        assert!(text.contains("flare_host_cache_retirement_seconds_bucket{le=\"+Inf\"} 2\n"));
+        assert!(text.contains("flare_host_cache_retirement_seconds_count 2\n"));
+        assert!(text.contains("flare_host_cache_retirement_seconds_sum 1.25\n"));
+        assert!(text.contains("flare_host_cache_retirement_paths_total 2\n"));
+        assert!(text.contains("flare_host_cache_retirement_nanoseconds_total 1250000000\n"));
+        assert!(!text.contains("flare_host_cache_replay_tokens_total"));
         assert!(text.contains("# TYPE flare_host_cache_parked_records gauge\n"));
         assert!(text.contains("flare_host_cache_parked_records 2\n"));
+        for (i, reason) in ["invalid", "unlinked", "oversize", "budget", "inflight"].iter().enumerate() {
+            assert!(text.contains(&format!("flare_host_cache_pool_refusal_drops_total{{reason=\"{reason}\"}} {}\n", i + 1)));
+        }
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
             assert!(text.contains(&format!(
                 "flare_host_cache_held_total{{tier=\"{tier}\"}} {}\n",

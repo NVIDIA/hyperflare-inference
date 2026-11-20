@@ -67,9 +67,11 @@ const MAINTENANCE_IN_FLIGHT: usize = crate::shard::BACKLOG / 2;
 pub struct DiskRecord {
     pub path: PathBuf,
     pub header: Header,
-    /// File length: the row is present when it covers the row segment. Zero
-    /// for the remnant of a failed write, which owns no file.
+    /// Reserved or committed file length. Unreserved DRAM records and
+    /// discarded writes consume zero disk bytes.
     pub bytes: u64,
+    /// A failed record remains indexed while its children refer to it.
+    failed: bool,
 }
 
 /// Completion the transport reports to the disk store.
@@ -110,6 +112,18 @@ pub trait DiskTransport {
         checkpoint: &PublishedCheckpoint,
         detect: bool,
     ) -> Result<()>;
+    /// Persist a zero-page Endpoint link without copying recurrent state.
+    fn store_empty(
+        &mut self,
+        id: super::JobId,
+        header: Header,
+        temporary: PathBuf,
+        path: PathBuf,
+    ) -> Result<()> {
+        self.staged_mut()
+            .ok_or_else(|| invalid("disk transport cannot store a header-only record"))?
+            .write_from(id, header, temporary, path, Vec::new(), None, None)
+    }
     /// Stream the chain into the ticket's ids: for each record, the page
     /// records `first..first + count` and, for the last record, the row.
     fn fetch(
@@ -1522,6 +1536,7 @@ impl DiskStore {
                     path: record.path.clone(),
                     header: record.header.clone(),
                     bytes: record.bytes,
+                    failed: false,
                 },
             )?;
             used += record.bytes;
@@ -1795,6 +1810,12 @@ impl DiskStore {
         self.transport.poll(events)
     }
 
+    fn accepts_children(&self, key: &PrefixKey) -> bool {
+        self.index
+            .node(key)
+            .is_some_and(|node| !node.location.failed)
+    }
+
     /// The record shape for a published checkpoint: a child of its parent when
     /// the parent is indexed, otherwise a root record holding the whole chain.
     /// The remnant of a failed write, which has neither a row nor readable
@@ -1808,11 +1829,7 @@ impl DiskStore {
             let first = parent.map_or(0, |p| p.consumed_tokens / self.layout.page_tokens) as usize;
             return (parent, checkpoint.chain_pages[first..].to_vec());
         }
-        let parent = checkpoint.parent.filter(|parent| {
-            self.index
-                .node(parent)
-                .is_some_and(|node| node.ready || node.row)
-        });
+        let parent = checkpoint.parent.filter(|key| self.accepts_children(key));
         let tail = match parent {
             Some(_) => checkpoint.tail().to_vec(),
             None => checkpoint.chain_pages.clone(),
@@ -1820,16 +1837,58 @@ impl DiskStore {
         (parent, tail)
     }
 
+    pub(crate) fn covered_endpoint(
+        &self,
+        checkpoint: &PublishedCheckpoint,
+        readable: impl Fn(&Node<DiskRecord>) -> bool,
+    ) -> bool {
+        let held = self.index.node(&checkpoint.key);
+        let parent = held.map_or_else(
+            || checkpoint.parent.filter(|p| self.accepts_children(p)),
+            |n| n.parent,
+        );
+        let role = held.map_or(checkpoint.capture_role, |n| {
+            n.location
+                .header
+                .capture_role()
+                .merge(checkpoint.capture_role)
+        });
+        self.index.covered_endpoint(
+            checkpoint.key,
+            parent,
+            role,
+            held.map_or(0, |n| n.children()),
+            readable,
+        )
+    }
+
+    fn needs_row(&self, checkpoint: &PublishedCheckpoint) -> bool {
+        !self.covered_endpoint(checkpoint, |n| {
+            n.ready || self.outbound.values().any(|write| write.key == n.key)
+        })
+    }
+
     pub fn store_status(&self, checkpoint: &PublishedCheckpoint) -> Result<Option<StoreOutcome>> {
+        self.store_status_with_row(checkpoint, self.needs_row(checkpoint))
+    }
+
+    pub(crate) fn store_status_with_row(
+        &self,
+        checkpoint: &PublishedCheckpoint,
+        row: bool,
+    ) -> Result<Option<StoreOutcome>> {
         if checkpoint.tail_pages > checkpoint.chain_pages.len() {
             return Err(invalid("published checkpoint tail exceeds its chain"));
         }
         if let Some(node) = self.index.node(&checkpoint.key) {
-            if node.ready && node.row && self.index.complete(&checkpoint.key) {
+            let stored = node.location.header.capture_role();
+            let covers = stored.merge(checkpoint.capture_role) == stored;
+            if node.ready && covers && ((node.row && self.index.complete(&checkpoint.key)) || !row)
+            {
                 return Ok(Some(StoreOutcome::Present));
             }
             if !node.ready
-                || node.row
+                || (node.row && covers)
                 || node.pinned()
                 || self
                     .maintenance
@@ -1853,17 +1912,20 @@ impl DiskStore {
             tail.len() as u32,
             SystemTime::now(),
         )?;
-        let mut footprint = header.length_with_row();
+        let mut footprint = header.length(row);
         let mut cursor = parent;
         while let Some(key) = cursor {
             let node = &self.index[&key];
-            footprint = footprint.saturating_add(if Some(key) != parent {
-                node.location.header.row_segment
-            } else if node.location.bytes == 0 {
-                node.location.header.length_with_row()
-            } else {
+            // Admission pins the immediate parent. Older protected rows still count.
+            let bytes = if Some(key) == parent && node.location.bytes != 0 {
                 node.location.bytes
-            });
+            } else {
+                let protected = Some(key) == parent
+                    || node.parent.is_none()
+                    || node.location.header.capture_role() != crate::CaptureRole::Endpoint;
+                node.location.header.length(node.row && protected)
+            };
+            footprint = footprint.saturating_add(bytes);
             cursor = node.parent;
         }
         Ok((footprint > self.limit).then_some(StoreOutcome::Oversize))
@@ -1873,11 +1935,11 @@ impl DiskStore {
     /// Make room for `tail_pages` and, when requested, a row; index it as writing, pin it,
     /// and return its header and file names; `None` when evicting every
     /// unpinned record would still not bring it under the limit. The key must
-    /// be absent and the parent, when named, indexed with a row or readable
-    /// pages. The parent is pinned while room is made, so eviction neither
+    /// be absent or eligible for replacement. Its parent may still be writing.
+    /// The parent is pinned while room is made, so eviction neither
     /// unlinks nor compacts it, and removing its other children never cascades
     /// into it, before the record names it.
-    pub fn reserve_record(
+    pub(crate) fn reserve_capture(
         &mut self,
         key: PrefixKey,
         parent: Option<PrefixKey>,
@@ -1885,10 +1947,15 @@ impl DiskStore {
         tail_pages: usize,
         row: bool,
         reserve: bool,
+        capture_role: crate::CaptureRole,
     ) -> Result<Option<(Header, PathBuf, PathBuf)>> {
         let parked = self.index.node(&key).is_some_and(|n| n.location.bytes == 0);
+        let capture_role = self.index.node(&key).map_or(capture_role, |node| {
+            node.location.header.capture_role().merge(capture_role)
+        });
         let replacement = if let Some(node) = self.index.node(&key).filter(|_| !parked) {
-            if node.row {
+            let stored = node.location.header.capture_role();
+            if node.row && stored == capture_role {
                 return Err(invalid("host record key is already indexed"));
             }
             if !node.ready
@@ -1907,10 +1974,7 @@ impl DiskStore {
             None
         };
         if let Some(parent) = &parent
-            && !self
-                .index
-                .node(parent)
-                .is_some_and(|node| node.ready || node.row)
+            && !self.accepts_children(parent)
         {
             return Err(invalid(
                 "host record parent is not indexed or is the remnant of a failed write",
@@ -1927,7 +1991,8 @@ impl DiskStore {
             bucket,
             tail,
             SystemTime::now(),
-        )?;
+        )?
+        .with_capture_role(capture_role);
         let bytes = header.length(row);
         if let Some(parent) = &parent {
             self.index.pin(parent)?;
@@ -1962,6 +2027,7 @@ impl DiskStore {
             path: path.clone(),
             header: header.clone(),
             bytes,
+            failed: false,
         };
         if parked {
             self.index.node_mut(&key).unwrap().location = location;
@@ -2036,11 +2102,13 @@ impl DiskStore {
                 self.stats.store_failed += 1;
                 if prior_readable {
                     self.used -= node.location.bytes;
+                    node.row = old.header.row_present(old.bytes);
                     node.location = old;
                     true
                 } else {
                     // A failed cleanup can leave a complete replacement on one rank.
                     self.used -= old.bytes;
+                    node.location.failed = true;
                     node.row = false;
                     false
                 }
@@ -2095,10 +2163,17 @@ impl DiskStore {
             let Some(key) = queued.next() else {
                 break;
             };
-            if !self.index.row_redundant(&key, true) || !self.index[&key].row {
+            if self.index[&key].location.header.capture_role() != crate::CaptureRole::Endpoint
+                || !self.index.row_redundant(&key, true)
+                || !self.index[&key].row
+            {
                 continue;
             }
             let node = &self.index[&key];
+            if !self.index.has_row_below(&key, |n| n.ready && n.row) {
+                self.thinning.insert(key);
+                continue;
+            }
             if !node.ready || node.pinned() {
                 self.thinning.insert(key);
             } else if self.compact(&key).is_ok() {
@@ -2130,7 +2205,15 @@ impl DiskStore {
                 return Ok(false);
             }
             // At the truncate cap, whole-record eviction can precede further row reclaim.
-            match self.index.evict(true, |_| true, |_| false) {
+            match self.index.evict(
+                true,
+                |node| {
+                    node.children() == 0
+                        || (node.parent.is_some()
+                            && node.location.header.capture_role() == crate::CaptureRole::Endpoint)
+                },
+                |_| false,
+            ) {
                 Some(Eviction::Leaves(nodes)) => {
                     self.stats.dropped[3] += nodes.len() as u64;
                     for node in nodes {
@@ -2204,13 +2287,23 @@ impl DiskStore {
                 break;
             };
             let retiring = Retiring {
+                descendant_row: false,
                 tier: PoolTier::Nvme,
+                capture_role: node.location.header.capture_role(),
+                child_paths: node.children(),
                 key,
                 parent: node.parent,
                 ancestor_keys: self.index.ancestor_keys(&key),
                 bucket: node.bucket,
                 tail_pages: node.tail_pages,
-                row: node.row,
+                row: node.row
+                    && !self.index.covered_endpoint(
+                        key,
+                        node.parent,
+                        node.location.header.capture_role(),
+                        node.children(),
+                        |n| n.ready,
+                    ),
             };
             let node_bytes = node.location.bytes;
             if self.index.pin(&key).is_err() {
@@ -2346,6 +2439,7 @@ impl DiskStore {
             .index
             .node_mut(key)
             .ok_or_else(|| invalid("cannot discard an unindexed host record"))?;
+        node.location.failed = true;
         let bytes = std::mem::take(&mut node.location.bytes);
         self.used = self.used.saturating_sub(bytes);
         if node.children() == 0 {
@@ -2446,6 +2540,7 @@ impl DiskStore {
                             self.reused(*key);
                         }
                         self.stats.fetched += 1;
+                        self.stats.restores_by_tier[crate::Tier::Nvme as usize] += 1;
                         self.stats.bytes_in += bytes;
                         self.stats.reused_tokens += job.tokens;
                         self.inbound_rate.observe(*bytes, job.started.elapsed());
@@ -2543,7 +2638,8 @@ impl HostStore for DiskStore {
     }
 
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
-        if let Some(outcome) = self.store_status(checkpoint)? {
+        let row = self.needs_row(checkpoint);
+        if let Some(outcome) = self.store_status_with_row(checkpoint, row)? {
             self.stats.store_skipped += 1;
             if outcome == StoreOutcome::Present {
                 self.index.touch_ancestors(&checkpoint.key);
@@ -2552,13 +2648,14 @@ impl HostStore for DiskStore {
             return Ok(outcome);
         }
         let (parent, tail) = self.plan_record(checkpoint);
-        let Some((header, temporary, path)) = self.reserve_record(
+        let Some((header, temporary, path)) = self.reserve_capture(
             checkpoint.key,
             parent,
             checkpoint.bucket,
             tail.len(),
+            row,
             true,
-            true,
+            checkpoint.capture_role,
         )?
         else {
             self.stats.store_skipped += 1;
@@ -2568,10 +2665,13 @@ impl HostStore for DiskStore {
         let detect = self.announce.is_none() && self.geometry.len() > 1;
         self.index
             .set_published_parent(&checkpoint.key, checkpoint.parent);
-        if let Err(error) = self
-            .transport
-            .store(id, header, temporary, path, checkpoint, detect)
-        {
+        let write = if row {
+            self.transport
+                .store(id, header, temporary, path, checkpoint, detect)
+        } else {
+            self.transport.store_empty(id, header, temporary, path)
+        };
+        if let Err(error) = write {
             self.commit_record(checkpoint.key, Err(error.clone()), None)?;
             return Err(error);
         }
@@ -2769,6 +2869,15 @@ mod tests {
         .unwrap()
     }
 
+    fn endpoint_header(
+        geometry: &[CacheGeometry],
+        history: &PrefixHistory,
+        consumed: u64,
+        parent: Option<u64>,
+    ) -> Header {
+        header(geometry, history, consumed, parent).with_capture_role(crate::CaptureRole::Endpoint)
+    }
+
     fn scanned(directory: &Path, header: Header, age: u64, row: bool) -> Scanned {
         let bytes = if row {
             header.length_with_row()
@@ -2790,6 +2899,10 @@ mod tests {
 
     #[derive(Debug)]
     enum Call {
+        Empty {
+            id: JobId,
+            header: Header,
+        },
         Store {
             id: JobId,
             header: Header,
@@ -2833,6 +2946,11 @@ mod tests {
     }
 
     impl DiskTransport for Recorder {
+        fn store_empty(&mut self, id: JobId, header: Header, _: PathBuf, _: PathBuf) -> Result<()> {
+            self.0.borrow_mut().calls.push(Call::Empty { id, header });
+            Ok(())
+        }
+
         fn store(
             &mut self,
             id: JobId,
@@ -2923,10 +3041,10 @@ mod tests {
     fn pressure_thinning_keeps_recovered_roots_branches_and_both_leaves() {
         let full = history(256);
         let headers = [
-            header(&geometry(), &full, 64, None),
-            header(&geometry(), &full, 128, Some(64)),
-            header(&geometry(), &full, 192, Some(128)),
-            header(&geometry(), &full, 256, Some(128)),
+            endpoint_header(&geometry(), &full, 64, None),
+            endpoint_header(&geometry(), &full, 128, Some(64)),
+            endpoint_header(&geometry(), &full, 192, Some(128)),
+            endpoint_header(&geometry(), &full, 256, Some(128)),
         ];
         let records = headers
             .iter()
@@ -2945,7 +3063,7 @@ mod tests {
         let full = history(5 * PAGE_TOKENS);
         let headers: Vec<_> = (1..=5)
             .map(|turn| {
-                header(
+                endpoint_header(
                     &geometry(),
                     &full,
                     turn * PAGE_TOKENS,
@@ -2992,9 +3110,9 @@ mod tests {
     fn maintenance_reclaims_parent_rows_before_retiring_leaves() {
         let full = history(66 * PAGE_TOKENS);
         let headers = [
-            header(&geometry(), &full, 64 * PAGE_TOKENS, None),
-            header(&geometry(), &full, 65 * PAGE_TOKENS, Some(64 * PAGE_TOKENS)),
-            header(&geometry(), &full, 66 * PAGE_TOKENS, Some(65 * PAGE_TOKENS)),
+            endpoint_header(&geometry(), &full, 64 * PAGE_TOKENS, None),
+            endpoint_header(&geometry(), &full, 65 * PAGE_TOKENS, Some(64 * PAGE_TOKENS)),
+            endpoint_header(&geometry(), &full, 66 * PAGE_TOKENS, Some(65 * PAGE_TOKENS)),
         ];
         let records = headers
             .iter()
@@ -3035,13 +3153,14 @@ mod tests {
                 for header in &headers {
                     assert!(
                         store
-                            .reserve_record(
+                            .reserve_capture(
                                 header.key,
                                 header.parent,
                                 header.bucket,
                                 header.tail_pages as usize,
                                 true,
                                 true,
+                                crate::CaptureRole::Endpoint,
                             )
                             .unwrap()
                             .is_some()
@@ -3089,12 +3208,62 @@ mod tests {
     }
 
     #[test]
+    fn recovered_message_and_anchor_rows_survive_a_same_page_endpoint() {
+        let full = history(256);
+        let records: Vec<_> = [
+            endpoint_header(&geometry(), &full, 32, None),
+            header(&geometry(), &full, 64, Some(32)),
+            header(&geometry(), &full, 128, Some(64))
+                .with_capture_role(crate::CaptureRole::Message),
+            header(&geometry(), &full, 130, Some(128))
+                .with_capture_role(crate::CaptureRole::Anchor),
+            endpoint_header(&geometry(), &full, 192, Some(130)),
+        ]
+        .into_iter()
+        .map(|h| scanned(&directory(), h, 0, true))
+        .collect();
+        let (mut store, log) = store_with(records, 1 << 30);
+        store.thin_rows();
+        let endpoint = checkpoint(
+            &mut Ids::new(),
+            &full,
+            134,
+            Some(130),
+            pages(0..2),
+            0,
+            StateSlotId(1),
+        );
+        assert_eq!(store.store(&endpoint).unwrap(), StoreOutcome::Queued);
+        let (id, header) = match log.borrow().calls.as_slice() {
+            [Call::Empty { id, header }] => (*id, header.clone()),
+            calls => panic!("expected a header-only link, got {calls:?}"),
+        };
+        complete(
+            &log,
+            TransportEvent::Stored {
+                id,
+                result: Ok(header.length(false)),
+                header: None,
+            },
+            &mut store,
+        );
+        assert_eq!(store.store(&endpoint).unwrap(), StoreOutcome::Present);
+        store.set_limit(store.used());
+        store.thin_rows();
+        for tokens in [32, 64, 128, 130, 192] {
+            assert!(store.index[&full.key_at(tokens).unwrap()].row);
+        }
+        assert!(!store.index[&endpoint.key].row);
+        assert_eq!(store.lookup(&full, 0, 135).unwrap().consumed_tokens, 130);
+    }
+
+    #[test]
     fn recovered_linear_chain_thins_and_reannounces_its_interior() {
         let full = history(192);
         let headers = [
-            header(&geometry(), &full, 64, None),
-            header(&geometry(), &full, 128, Some(64)),
-            header(&geometry(), &full, 192, Some(128)),
+            endpoint_header(&geometry(), &full, 64, None),
+            endpoint_header(&geometry(), &full, 128, Some(64)),
+            endpoint_header(&geometry(), &full, 192, Some(128)),
         ];
         let records = headers
             .iter()
@@ -3146,7 +3315,7 @@ mod tests {
         let full = history(records * PAGE_TOKENS);
         let headers: Vec<_> = (1..=records)
             .map(|i| {
-                header(
+                endpoint_header(
                     &geometry(),
                     &full,
                     i * PAGE_TOKENS,
@@ -3207,9 +3376,9 @@ mod tests {
     fn thinning_submission_failure_rolls_back_bytes_and_preserves_poll_events() {
         let full = history(192);
         let headers = [
-            header(&geometry(), &full, 64, None),
-            header(&geometry(), &full, 128, Some(64)),
-            header(&geometry(), &full, 192, Some(128)),
+            endpoint_header(&geometry(), &full, 64, None),
+            endpoint_header(&geometry(), &full, 128, Some(64)),
+            endpoint_header(&geometry(), &full, 192, Some(128)),
         ];
         let records = headers
             .iter()
@@ -3259,11 +3428,27 @@ mod tests {
     }
 
     #[test]
+    fn disk_pressure_keeps_the_last_row_under_a_covered_tip() {
+        let full = history(192);
+        let root = endpoint_header(&geometry(), &full, 64, None);
+        let parent = endpoint_header(&geometry(), &full, 128, Some(64));
+        let tip = endpoint_header(&geometry(), &full, 134, Some(128));
+        let records = [(&root, true), (&parent, true), (&tip, false)]
+            .into_iter()
+            .map(|(h, row)| scanned(&directory(), h.clone(), 0, row))
+            .collect();
+        let (mut store, _) = store_with(records, 1 << 30);
+        store.thin_rows_for(u64::MAX);
+        assert!(store.index[&parent.key].row);
+        assert_eq!(store.lookup(&full, 0, u64::MAX).unwrap().key, parent.key);
+    }
+
+    #[test]
     fn deferred_thinning_does_not_count_an_uncommitted_replacement_child() {
         let full = history(192);
-        let root = header(&geometry(), &full, 64, None);
-        let parent = header(&geometry(), &full, 128, Some(64));
-        let child = header(&geometry(), &full, 192, Some(128));
+        let root = endpoint_header(&geometry(), &full, 64, None);
+        let parent = endpoint_header(&geometry(), &full, 128, Some(64));
+        let child = endpoint_header(&geometry(), &full, 192, Some(128));
         let records = [&root, &parent, &child]
             .into_iter()
             .map(|h| scanned(&directory(), h.clone(), 0, true))
@@ -3274,7 +3459,15 @@ mod tests {
         store.poll(&mut Vec::new()).unwrap();
         store.expire(child.key).unwrap();
         store
-            .reserve_record(child.key, Some(parent.key), child.bucket, 1, true, true)
+            .reserve_capture(
+                child.key,
+                Some(parent.key),
+                child.bucket,
+                1,
+                true,
+                true,
+                crate::CaptureRole::Endpoint,
+            )
             .unwrap()
             .unwrap();
         store.index.unpin(&parent.key).unwrap();
@@ -3444,13 +3637,18 @@ mod tests {
     #[test]
     fn feasible_ancestor_row_compaction_is_not_oversize() {
         let full = history(192);
-        let root = header(&geometry(), &full, 64, None);
-        let parent = header(&geometry(), &full, 128, Some(64));
-        let leaf = header(&geometry(), &full, 192, Some(128));
-        let limit = root.row_segment + parent.length_with_row() + leaf.length_with_row();
+        let root = endpoint_header(&geometry(), &full, 1, None);
+        let interior = endpoint_header(&geometry(), &full, 64, Some(1));
+        let parent = endpoint_header(&geometry(), &full, 128, Some(64));
+        let leaf = endpoint_header(&geometry(), &full, 192, Some(128));
+        let limit = root.length_with_row()
+            + interior.row_segment
+            + parent.length_with_row()
+            + leaf.length_with_row();
         let (mut store, _) = store_with(
             vec![
-                scanned(&directory(), root.clone(), 0, true),
+                scanned(&directory(), root.clone(), 3, true),
+                scanned(&directory(), interior.clone(), 0, true),
                 scanned(&directory(), parent.clone(), 1, true),
             ],
             limit,
@@ -3465,8 +3663,22 @@ mod tests {
             StateSlotId(0),
         );
         assert_eq!(store.store(&record).unwrap(), StoreOutcome::Queued);
-        assert!(!store.index.node(&root.key).unwrap().row);
+        assert!(store.index[&root.key].row);
+        assert!(!store.index.node(&interior.key).unwrap().row);
         assert!(store.index.node(&parent.key).unwrap().row);
+
+        drop(store);
+        let message = interior.with_capture_role(crate::CaptureRole::Message);
+        let (mut store, log) = store_with(
+            vec![
+                scanned(&directory(), root, 3, true),
+                scanned(&directory(), message, 0, true),
+                scanned(&directory(), parent, 1, true),
+            ],
+            limit,
+        );
+        assert_eq!(store.store(&record).unwrap(), StoreOutcome::Oversize);
+        assert!(log.borrow().calls.is_empty());
     }
 
     #[test]
@@ -3583,7 +3795,15 @@ mod tests {
         assert!(store.pending_bytes() > 0);
         assert!(
             store
-                .reserve_record(key, None, candidate.bucket, 1, true, true)
+                .reserve_capture(
+                    key,
+                    None,
+                    candidate.bucket,
+                    1,
+                    true,
+                    true,
+                    crate::CaptureRole::Endpoint
+                )
                 .unwrap()
                 .is_some()
         );
@@ -3657,16 +3877,16 @@ mod tests {
     }
 
     #[test]
-    fn startup_inventory_applies_recency_to_leaves_and_compactable_ancestors() {
+    fn startup_pressure_keeps_the_last_row_above_a_page_only_leaf() {
         let geometry = geometry();
         let directory = directory();
         let full = history(2000);
-        let root = header(&geometry, &full, 700, None);
-        let child = header(&geometry, &full, 1300, Some(700));
-        let leaf = header(&geometry, &full, 1990, Some(1300));
+        let root = endpoint_header(&geometry, &full, 700, None);
+        let child = endpoint_header(&geometry, &full, 1300, Some(700));
+        let leaf = endpoint_header(&geometry, &full, 1990, Some(1300));
         let mut branch = history(1300);
         branch.append(&[5; 100], &[]).unwrap();
-        let sibling = header(&geometry, &branch, 1400, Some(1300));
+        let sibling = endpoint_header(&geometry, &branch, 1400, Some(1300));
         assert_eq!(
             (
                 root.tail_pages,
@@ -3699,11 +3919,18 @@ mod tests {
         assert_eq!(stats.outbound_rate, INITIAL_STAGED_DISK_RATE);
         assert_eq!(store.limit(), total);
 
-        // After the oldest sibling leaves, the older child compacts before
-        // the page-only leaf is removed; that removal also reclaims the child.
+        // After the older sibling leaves, only the child can restore this path.
         let key = full.key_at(300).unwrap();
         let (reserved, temporary, path) = store
-            .reserve_record(key, None, full.bucket_at(300).unwrap(), 4, true, true)
+            .reserve_capture(
+                key,
+                None,
+                full.bucket_at(300).unwrap(),
+                4,
+                true,
+                true,
+                crate::CaptureRole::Endpoint,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(reserved.tail_pages, 4);
@@ -3718,23 +3945,22 @@ mod tests {
             unlinked(&log),
             [
                 directory.join(record::file_name(&sibling.key)),
-                directory.join(record::file_name(&leaf.key)),
-                directory.join(record::file_name(&child.key))
+                directory.join(record::file_name(&leaf.key))
             ]
         );
-        assert_eq!(log.borrow().calls.len(), 4);
+        assert_eq!(log.borrow().calls.len(), 2);
         assert_eq!(
             store.used(),
-            total - sibling_bytes - leaf.row_segment - child.length_with_row() + bytes
+            total - sibling_bytes - leaf.row_segment + bytes
         );
-        assert_eq!(store.take_evicted(), [sibling.key, leaf.key, child.key]);
+        assert_eq!(store.take_evicted(), [sibling.key, leaf.key]);
         assert!(store.take_evicted().is_empty());
-        assert_eq!(store.index().len(), 2);
+        assert_eq!(store.index().len(), 3);
         let node = store.index().node(&key).unwrap();
         assert!(node.pinned() && !node.ready && node.row);
         assert_eq!(node.location.bytes, bytes);
-        assert!(store.index().node(&child.key).is_none());
-        assert_eq!(store.index().node(&root.key).unwrap().children(), 0);
+        assert!(store.index()[&child.key].row);
+        assert_eq!(store.index().node(&root.key).unwrap().children(), 1);
     }
 
     #[test]
@@ -4023,6 +4249,7 @@ mod tests {
         assert_eq!(store.stats().store_failed, 1);
 
         // The remnant is no parent for later records.
+        store.index.pin(&root.key).unwrap();
         let grandchild = checkpoint(
             &mut ids,
             &full,
@@ -4038,17 +4265,20 @@ mod tests {
         );
         assert!(
             store
-                .reserve_record(
+                .reserve_capture(
                     grandchild.key,
                     Some(root.key),
                     grandchild.bucket,
                     21,
                     true,
-                    true
+                    true,
+                    crate::CaptureRole::Endpoint,
                 )
                 .is_err()
         );
         assert!(store.record(&grandchild.key).is_none());
+
+        store.index.unpin(&root.key).unwrap();
 
         // The child becomes ready, but no chain passes through the remnant.
         complete(
@@ -4066,7 +4296,15 @@ mod tests {
         // Evicting the child takes the remnant with it; only the child's file is unlinked.
         let key = full.key_at(704).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(key, None, full.bucket_at(704).unwrap(), 11, true, true)
+            .reserve_capture(
+                key,
+                None,
+                full.bucket_at(704).unwrap(),
+                11,
+                true,
+                true,
+                crate::CaptureRole::Endpoint,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4166,7 +4404,7 @@ mod tests {
         let directory = directory();
         let full = history(2000);
         let root = header(&geometry, &full, 700, None);
-        let child = header(&geometry, &full, 1300, Some(700));
+        let child = endpoint_header(&geometry, &full, 1300, Some(700));
         let leaf = header(&geometry, &full, 1990, Some(1300));
         let records = vec![
             scanned(&directory, root.clone(), 0, true),
@@ -4236,11 +4474,19 @@ mod tests {
         store.fetch(again, ticket(16)).unwrap();
         assert_eq!(pins(&store), [0, 2, 2]);
 
-        // Pinned records survive eviction; the unpinned root compacts instead.
+        // Both reads pin their segments. Pressure must also preserve the unpinned root row.
         let key = full.key_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, full.bucket_at(300).unwrap(), 4, true, true)
+                .reserve_capture(
+                    key,
+                    None,
+                    full.bucket_at(300).unwrap(),
+                    4,
+                    true,
+                    true,
+                    crate::CaptureRole::Endpoint
+                )
                 .unwrap()
                 .is_some()
         );
@@ -4248,27 +4494,24 @@ mod tests {
         store.limit = store.used();
         assert!(
             store
-                .reserve_record(
+                .reserve_capture(
                     full.key_at(400).unwrap(),
                     None,
                     full.bucket_at(400).unwrap(),
                     6,
                     true,
-                    true
+                    true,
+                    crate::CaptureRole::Endpoint,
                 )
                 .unwrap()
                 .is_none()
         );
-        match &log.borrow().calls[2..] {
-            [Call::Truncate { id, path, length }] => {
-                assert_eq!(*id, JobId(3));
-                assert_eq!(*path, directory.join(record::file_name(&root.key)));
-                assert_eq!(*length, root.row_segment);
-            }
-            other => panic!("unexpected calls {other:?}"),
-        }
-        assert!(!store.index().node(&root.key).unwrap().row);
-        assert_eq!(store.record(&root.key).unwrap().bytes, root.row_segment);
+        assert!(log.borrow().calls[2..].is_empty());
+        assert!(store.index()[&root.key].row);
+        assert_eq!(
+            store.record(&root.key).unwrap().bytes,
+            root.length_with_row()
+        );
         assert_eq!(pins(&store), [0, 2, 2]);
 
         let events = complete(
@@ -4318,10 +4561,14 @@ mod tests {
         );
         assert_eq!(stats.reused_tokens, 990);
 
-        // A failed truncate leaves the row bytes in the file: the record and
-        // the budget regain them without a store event, and the row stays
-        // unmatchable.
+        // Releasing both readers lets the interior row compact. A failed truncate
+        // keeps its physical bytes charged, and the root still supplies its row.
         let used = store.used();
+        assert!(
+            matches!(log.borrow().calls.last(), Some(Call::Truncate { id: JobId(3), path, .. })
+            if *path == directory.join(record::file_name(&child.key)))
+        );
+        assert!(!store.index()[&child.key].row);
         let events = complete(
             &log,
             TransportEvent::Truncated {
@@ -4332,21 +4579,11 @@ mod tests {
         );
         assert!(events.is_empty());
         assert_eq!(
-            store.record(&root.key).unwrap().bytes,
-            root.length_with_row()
+            store.record(&child.key).unwrap().bytes,
+            child.length_with_row()
         );
-        assert!(!store.index().node(&root.key).unwrap().row);
+        assert!(store.index()[&root.key].row);
         assert_eq!(store.used(), used + ROW_RECORD);
-        // The final restore also released the interior child's row for eager truncation.
-        assert!(!store.index().node(&child.key).unwrap().row);
-        complete(
-            &log,
-            TransportEvent::Truncated {
-                id: JobId(4),
-                result: Ok(()),
-            },
-            &mut store,
-        );
         assert!(store.maintenance.is_empty());
     }
 
@@ -4500,19 +4737,28 @@ mod tests {
         // evicting anything.
         assert!(
             store
-                .reserve_record(root.key, None, root.bucket, 10, true, true)
+                .reserve_capture(
+                    root.key,
+                    None,
+                    root.bucket,
+                    10,
+                    true,
+                    true,
+                    crate::CaptureRole::Endpoint
+                )
                 .is_err()
         );
         let unknown = full.key_at(1000).unwrap();
         assert!(
             store
-                .reserve_record(
+                .reserve_capture(
                     full.key_at(1100).unwrap(),
                     Some(unknown),
                     full.bucket_at(1100).unwrap(),
                     1,
                     true,
-                    true
+                    true,
+                    crate::CaptureRole::Endpoint,
                 )
                 .is_err()
         );
@@ -4553,13 +4799,14 @@ mod tests {
         branch.append(&[5; 700], &[]).unwrap();
         let key = branch.key_at(1340).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(
+            .reserve_capture(
                 key,
                 Some(root.key),
                 branch.bucket_at(1340).unwrap(),
                 10,
                 true,
                 true,
+                crate::CaptureRole::Endpoint,
             )
             .unwrap()
             .unwrap();
@@ -4590,11 +4837,13 @@ mod tests {
         let geometry = geometry();
         let directory = directory();
         let full = history(2000);
-        let root = header(&geometry, &full, 700, None);
-        let child = header(&geometry, &full, 1300, Some(700));
-        let leaf = header(&geometry, &full, 1990, Some(1300));
+        let root = endpoint_header(&geometry, &full, 64, None);
+        let interior = endpoint_header(&geometry, &full, 700, Some(64));
+        let child = endpoint_header(&geometry, &full, 1300, Some(700));
+        let leaf = endpoint_header(&geometry, &full, 1990, Some(1300));
         let records = vec![
-            scanned(&directory, root.clone(), 0, true),
+            scanned(&directory, root.clone(), 40, true),
+            scanned(&directory, interior.clone(), 15, true),
             scanned(&directory, child.clone(), 10, true),
             scanned(&directory, leaf.clone(), 20, true),
         ];
@@ -4605,7 +4854,15 @@ mod tests {
         let bucket = full.bucket_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, bucket, 4, true, true)
+                .reserve_capture(
+                    key,
+                    None,
+                    bucket,
+                    4,
+                    true,
+                    true,
+                    crate::CaptureRole::Endpoint
+                )
                 .unwrap()
                 .is_none()
         );
@@ -4618,8 +4875,8 @@ mod tests {
         }
         assert_eq!(store.used(), total - 2 * ROW_RECORD);
 
-        // Redundant child rows are reclaimed before eviction compacts the root.
-        // The root's truncate fails: its file keeps the row bytes, so the
+        // Redundant child rows are reclaimed before eviction compacts the older interior row.
+        // The older interior row's truncate fails: its file keeps the row bytes, so the
         // record regains its length and the budget its bytes; the child's
         // succeeds and changes nothing further.
         let events = complete(
@@ -4632,10 +4889,10 @@ mod tests {
         );
         assert!(events.is_empty());
         assert_eq!(
-            store.record(&root.key).unwrap().bytes,
-            root.length_with_row()
+            store.record(&interior.key).unwrap().bytes,
+            interior.length_with_row()
         );
-        assert!(!store.index().node(&root.key).unwrap().row);
+        assert!(!store.index().node(&interior.key).unwrap().row);
         assert_eq!(store.used(), total - ROW_RECORD);
         complete(
             &log,
@@ -4652,11 +4909,22 @@ mod tests {
         // so its bytes stay charged although the record left the index.
         store.index_mut().unpin(&leaf.key).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(key, None, bucket, 4, true, true)
+            .reserve_capture(
+                key,
+                None,
+                bucket,
+                4,
+                true,
+                true,
+                crate::CaptureRole::Endpoint,
+            )
             .unwrap()
             .unwrap();
-        assert_eq!(store.take_evicted(), [leaf.key, child.key, root.key]);
-        assert_eq!(store.used(), reserved.length_with_row());
+        assert_eq!(store.take_evicted(), [leaf.key, child.key, interior.key]);
+        assert_eq!(
+            store.used(),
+            root.length_with_row() + reserved.length_with_row()
+        );
         match &log.borrow().calls[2..] {
             [
                 Call::Unlink { id: first, .. },
@@ -4674,11 +4942,17 @@ mod tests {
             let events = complete(&log, TransportEvent::Unlinked { id, result }, &mut store);
             assert!(events.is_empty());
         }
-        assert_eq!(store.used(), reserved.length_with_row() + child.row_segment);
+        assert_eq!(
+            store.used(),
+            root.length_with_row() + reserved.length_with_row() + child.row_segment
+        );
         let stats = store.stats();
         assert_eq!(
             (stats.disk_records, stats.disk_bytes),
-            (1, reserved.length_with_row() + child.row_segment)
+            (
+                2,
+                root.length_with_row() + reserved.length_with_row() + child.row_segment
+            )
         );
         assert!(store.maintenance.is_empty());
     }
@@ -4688,11 +4962,13 @@ mod tests {
         let geometry = geometry();
         let directory = directory();
         let full = history(2000);
-        let root = header(&geometry, &full, 700, None);
-        let child = header(&geometry, &full, 1300, Some(700));
-        let leaf = header(&geometry, &full, 1990, Some(1300));
+        let root = endpoint_header(&geometry, &full, 64, None);
+        let interior = endpoint_header(&geometry, &full, 700, Some(64));
+        let child = endpoint_header(&geometry, &full, 1300, Some(700));
+        let leaf = endpoint_header(&geometry, &full, 1990, Some(1300));
         let records = vec![
-            scanned(&directory, root.clone(), 0, true),
+            scanned(&directory, root.clone(), 40, true),
+            scanned(&directory, interior.clone(), 15, true),
             scanned(&directory, child.clone(), 10, true),
             scanned(&directory, leaf.clone(), 20, true),
         ];
@@ -4701,12 +4977,20 @@ mod tests {
         store.index_mut().pin(&leaf.key).unwrap();
 
         // With the leaf pinned, reclaim the redundant child row before
-        // eviction compacts the root. The record still does not fit.
+        // eviction compacts the older interior row. The record still does not fit.
         let key = full.key_at(300).unwrap();
         let bucket = full.bucket_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, bucket, 4, true, true)
+                .reserve_capture(
+                    key,
+                    None,
+                    bucket,
+                    4,
+                    true,
+                    true,
+                    crate::CaptureRole::Endpoint
+                )
                 .unwrap()
                 .is_none()
         );
@@ -4725,13 +5009,13 @@ mod tests {
             ] => {
                 assert_eq!(*first, directory.join(record::file_name(&child.key)));
                 assert_eq!(*first_length, child.row_segment);
-                assert_eq!(*second, directory.join(record::file_name(&root.key)));
-                assert_eq!(*second_length, root.row_segment);
+                assert_eq!(*second, directory.join(record::file_name(&interior.key)));
+                assert_eq!(*second_length, interior.row_segment);
             }
             other => panic!("unexpected calls {other:?}"),
         }
         assert_eq!(store.used(), total - 2 * ROW_RECORD);
-        assert!(!store.index().node(&root.key).unwrap().row);
+        assert!(!store.index().node(&interior.key).unwrap().row);
         assert!(!store.index().node(&child.key).unwrap().row);
         assert_eq!(store.record(&child.key).unwrap().bytes, child.row_segment);
         assert!(store.take_evicted().is_empty());
@@ -4740,23 +5024,41 @@ mod tests {
         // Page-only ancestors still supply pages to the leaf's chain but no
         // longer match on their own.
         let hit = store.lookup(&full, 0, u64::MAX).unwrap();
-        assert_eq!(hit.chain.nodes, [root.key, child.key, leaf.key]);
+        assert_eq!(
+            hit.chain.nodes,
+            [root.key, interior.key, child.key, leaf.key]
+        );
         assert_eq!(hit.pages, 31);
-        assert!(store.lookup(&history(1300), 0, u64::MAX).is_none());
+        assert_eq!(
+            store.lookup(&history(1300), 0, u64::MAX).unwrap().key,
+            root.key
+        );
 
         // Releasing the pin lets the leaf go, and its page-only ancestors follow.
         store.index_mut().unpin(&leaf.key).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(key, None, bucket, 4, true, true)
+            .reserve_capture(
+                key,
+                None,
+                bucket,
+                4,
+                true,
+                true,
+                crate::CaptureRole::Endpoint,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
             unlinked(&log),
-            [&leaf, &child, &root].map(|header| directory.join(record::file_name(&header.key)))
+            [&leaf, &child, &interior].map(|header| directory.join(record::file_name(&header.key)))
         );
-        assert_eq!(store.take_evicted(), [leaf.key, child.key, root.key]);
-        assert_eq!(store.used(), reserved.length_with_row());
-        assert_eq!(store.index().len(), 1);
+        assert_eq!(store.take_evicted(), [leaf.key, child.key, interior.key]);
+        assert_eq!(
+            store.used(),
+            root.length_with_row() + reserved.length_with_row()
+        );
+        assert_eq!(store.index().len(), 2);
+        assert!(store.index()[&root.key].row);
         assert!(store.index().node(&key).unwrap().pinned());
 
         // Committing the reserved record directly, as the composite does.
@@ -4766,7 +5068,7 @@ mod tests {
         let node = store.index().node(&key).unwrap();
         assert!(node.ready && !node.pinned());
         assert_eq!(store.stats().stored, 1);
-        assert!(store.commit_record(root.key, Ok(0), None).is_err());
+        assert!(store.commit_record(interior.key, Ok(0), None).is_err());
     }
 
     #[test]
@@ -5046,7 +5348,15 @@ mod tests {
         )
         .unwrap();
         let (replacement, temporary, path) = store
-            .reserve_record(root.key, None, root.bucket, 2, true, true)
+            .reserve_capture(
+                root.key,
+                None,
+                root.bucket,
+                2,
+                true,
+                true,
+                crate::CaptureRole::Endpoint,
+            )
             .unwrap()
             .unwrap();
         assert!(!store.index.complete(&child.key));

@@ -17,9 +17,13 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JobId(pub u64);
 
+/// Upper bounds in milliseconds for completed DRAM retirement paths.
+pub const RETIREMENT_LATENCY_MS: [u64; 8] = [10, 50, 100, 500, 1000, 5000, 15000, 30000];
+
 /// A GPU checkpoint the scheduler published, as the worker reports it to the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedCheckpoint {
+    pub capture_role: crate::CaptureRole,
     pub id: CheckpointId,
     pub key: PrefixKey,
     /// Key of the GPU parent checkpoint, or `None` at the root.
@@ -139,6 +143,14 @@ pub enum StoreEvent {
 /// Counters every store maintains; rates are bytes per second of completed transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoreStats {
+    pub retirement_paths: u64,
+    pub retirement_max_depth: u64,
+    pub retirement_ns: u64,
+    pub retirement_max_ns: u64,
+    pub retirement_latency_buckets: [u64; 8],
+    pub retirement_pinned_bytes: u64,
+    /// Completed restores by GPU, DRAM and NVMe source tier.
+    pub restores_by_tier: [u64; 3],
     pub lookups: u64,
     pub hits: u64,
     pub reused_tokens: u64,
@@ -152,6 +164,9 @@ pub struct StoreStats {
     pub held: [u64; 2],
     /// Each tier's end_of_chain/oversize/io_error, then DRAM/NVMe pool_refused.
     pub dropped: [u64; 8],
+    /// Discarded leaves and exhausted ancestor retries, by refusal reason:
+    /// invalid, unlinked, oversize, budget, inflight.
+    pub refusal_drops: [u64; 5],
     pub expired: [u64; 2],
     /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
     pub rows_thinned: [u64; 2],
@@ -200,6 +215,9 @@ pub enum StoreReason {
 /// chain it needs, until [`TierStore::retired`] says what became of its move.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retiring {
+    pub descendant_row: bool,
+    pub capture_role: crate::CaptureRole,
+    pub child_paths: u32,
     pub tier: PoolTier,
     pub key: PrefixKey,
     pub parent: Option<PrefixKey>,
@@ -215,6 +233,8 @@ pub struct Retiring {
 pub enum Retirement {
     /// The next tier holds a committed copy: the tier drops its own.
     Moved,
+    /// The leaf moved after an ancestor was refused. Its ancestors stay local.
+    MovedLeaf,
     /// The move cannot be completed; discard the source.
     Dropped,
     /// Keep the source and retry after progress.
@@ -330,6 +350,10 @@ pub trait TierStore: HostStore {
     /// Each stays in place until [`TierStore::retired`] reports its move.
     fn take_retiring(&mut self) -> Vec<Retiring> {
         Vec::new()
+    }
+    /// Retained DRAM predecessor on the selected leaf's path.
+    fn retirement_predecessor(&self, _key: PrefixKey) -> Option<Retiring> {
+        None
     }
     /// The move of a retiring record ended.
     fn retired(&mut self, _key: PrefixKey, _tier: PoolTier, _how: Retirement) {}

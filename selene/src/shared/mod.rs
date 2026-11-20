@@ -6,6 +6,9 @@
 //! Concepts shared by instances and the manager: protocol messages and framing, record
 //! layouts and checksums, the index tree, identities, rank slices, tiers and limits.
 
+/// Detail on an INVALID refusal when a page-only put cannot link to a held ancestor.
+pub const PUT_UNLINKED: &str = "page-only put has no held ancestor it can link to";
+
 pub mod frame;
 pub mod identity;
 pub mod index;

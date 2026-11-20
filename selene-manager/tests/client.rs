@@ -406,6 +406,10 @@ fn put_request(history: &TestHistory, pages: usize) -> (PutRequest, PrefixKey) {
             bucket: history.bucket_at(key.consumed_tokens).unwrap(),
             chain_pages: pages as u64,
             tail_pages: pages as u64,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             source: PutSource::Host(Box::new(Bytes { data, sums, row, page_bytes: PAGE, row_bytes: ROW })),
         },
@@ -1160,6 +1164,7 @@ fn publication(gpu: &GpuMemory, salt: u32, pages: usize) -> (PublishedCheckpoint
     gpu.rows.lock().unwrap().insert(salt, salted_row(salt));
     let key = history.key_at(pages as u64 * PT).unwrap();
     let checkpoint = PublishedCheckpoint {
+        capture_role: flare_selene::CaptureRole::Endpoint,
         id: CheckpointId::new(u64::from(salt)),
         key,
         parent: None,
@@ -1330,6 +1335,64 @@ fn an_evicted_dram_record_reaches_the_manager_store_and_is_restored_by_another_i
     flare_selene::HostStore::close(&mut store).unwrap();
 }
 
+#[test]
+fn a_retired_same_page_tip_restores_from_its_endpoint_parent() {
+    let manager = Manager::start();
+    let mut reader = instance(&manager, 2);
+    reader.ready();
+    let history = history_of((2 * PT + 1) as u32);
+    let geometry = geo();
+    let intake = flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1);
+    let pool = SlabPool::new(PAGE as u64, intake + 4, intake).unwrap();
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    let mut memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
+    for page in 0..2 {
+        gpu.pages
+            .lock()
+            .unwrap()
+            .insert(page, expected_page(page as usize));
+    }
+    let mut parent = None;
+    for (tokens, tail) in [(PT, 1), (2 * PT, 1), (2 * PT + 1, 0)] {
+        gpu.rows
+            .lock()
+            .unwrap()
+            .insert(tokens as u32, vec![tokens as u8; ROW]);
+        let key = history.key_at(tokens).unwrap();
+        store_and_wait(
+            &mut memory,
+            &PublishedCheckpoint {
+                capture_role: flare_selene::CaptureRole::Endpoint,
+                id: CheckpointId::new(tokens),
+                key,
+                parent,
+                bucket: history.bucket_at(tokens).unwrap(),
+                chain_pages: (0..(tokens / PT) as u32).map(PageId).collect(),
+                tail_pages: tail,
+                slot: StateSlotId(tokens as u32),
+            },
+        );
+        parent = Some(key);
+    }
+    assert_eq!(memory.stats().memory_records, 3);
+    let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let mut store =
+        PooledStore::connect(memory, config(&manager, 1), copier, Arc::new(OkRegistrar)).unwrap();
+    wait("Ready", || store.pool().status() == PoolStatus::Ready);
+    drive(&mut store, "the entire path to retire", |store| {
+        store.stats().memory_records == 0
+    });
+    store.close().unwrap();
+    wait_store_index(&reader, &history);
+    let parent_key = history.key_at(2 * PT).unwrap();
+    stored_candidate(&reader, &history, parent_key);
+    restore(&mut reader, &history, 2, &[100, 101]);
+    assert_eq!(
+        reader.gpu.rows.lock().unwrap()[&9],
+        vec![(2 * PT) as u8; ROW]
+    );
+}
+
 fn retire_leaf_over_root_hint(evict_hint: bool) {
     let manager = Manager::with_memory(128 << 10);
     let mut reader = instance(&manager, 2);
@@ -1384,6 +1447,7 @@ fn retire_leaf_over_root_hint(evict_hint: bool) {
             .collect();
         gpu.rows.lock().unwrap().insert(pages as u32, row);
         let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(pages as u64),
             key: history.key_at(pages as u64 * PT).unwrap(),
             parent,
@@ -1417,16 +1481,14 @@ fn retire_leaf_over_root_hint(evict_hint: bool) {
             return false;
         };
         let nodes = &candidate.plan.nodes;
-        if evict_hint {
-            assert_eq!(nodes.len(), 1);
-            assert_eq!(nodes[0].tail_pages, 4);
-        } else {
-            assert_eq!(nodes.len(), 2);
+        let first = usize::from(!evict_hint);
+        assert_eq!(nodes.len(), first + 3);
+        if !evict_hint {
             assert_eq!(nodes[0].key, hint);
-            assert_eq!(nodes[1].key, leaf);
-            assert_eq!(nodes[1].tail_pages, 3);
-            let first_page = leaf.consumed_tokens / PT - nodes[1].tail_pages as u64;
-            assert_eq!(first_page, hint.consumed_tokens / PT);
+        }
+        for (i, node) in nodes[first..].iter().enumerate() {
+            assert_eq!(node.key, history.key_at((2 + i as u64) * PT).unwrap());
+            assert_eq!(node.tail_pages, if evict_hint && i == 0 { 2 } else { 1 });
         }
         store.stats().memory_records < 3
     });
@@ -1552,6 +1614,7 @@ fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank
             .collect();
         gpu.rows.lock().unwrap().insert(turn as u32, row);
         let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(turn as u64),
             key,
             parent,
@@ -1942,6 +2005,7 @@ fn large_recovered_nvme_records_restore_consecutively() {
         }
         gpu.rows.lock().unwrap().insert(salt, salted_row(salt));
         let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(u64::from(salt)),
             key: history.key_at(110_000).unwrap(),
             parent: None,

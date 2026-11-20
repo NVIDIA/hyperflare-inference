@@ -313,6 +313,7 @@ impl CompositeStore {
         self.stats.stored += after.stored - before.stored;
         self.stats.store_failed += after.store_failed - before.store_failed;
         self.stats.fetched += after.fetched - before.fetched;
+        self.stats.restores_by_tier[crate::Tier::Nvme as usize] += after.fetched - before.fetched;
         self.stats.fetch_failed += after.fetch_failed - before.fetch_failed;
         self.stats.reused_tokens += after.reused_tokens - before.reused_tokens;
         self.stats.bytes_out += after.bytes_out - before.bytes_out;
@@ -434,26 +435,31 @@ impl CompositeStore {
             });
             return;
         }
-        let reserved = self.disk.reserve_record(
+        let record = self.memory.record(&key).unwrap();
+        let role = record.capture_role;
+        let row = record.row.is_some();
+        let reserved = self.disk.reserve_capture(
             key,
             parent,
             outbound.bucket,
             outbound.tail_pages,
+            row,
             true,
-            true,
+            role,
         );
         self.drop_evicted_copies();
         let reserved_file = matches!(&reserved, Ok(Some(_)));
         let reserved = match reserved {
             Ok(None) => self
                 .disk
-                .reserve_record(
+                .reserve_capture(
                     key,
                     parent,
                     outbound.bucket,
                     outbound.tail_pages,
-                    true,
+                    row,
                     false,
+                    role,
                 )
                 .map(|_| ()),
             Ok(Some(_)) => Ok(()),
@@ -536,7 +542,16 @@ impl CompositeStore {
         }
         let mut queued = self.disk.index().thinning_order(&mut self.thinning);
         for key in queued.by_ref() {
-            if !self.disk.index().row_redundant(&key, false) {
+            if self.disk.index()[&key].location.header.capture_role()
+                != crate::CaptureRole::Endpoint
+                || !self.disk.index().row_redundant(&key, false)
+            {
+                continue;
+            }
+            if !self.disk.index().has_row_below(&key, |n| {
+                n.row && (n.ready || self.resident(&n.key, n.tail_pages, true))
+            }) {
+                self.thinning.insert(key);
                 continue;
             }
             if self.parked.get(&key).is_some_and(|p| p.writing) || !self.memory.drop_row(&key) {
@@ -686,13 +701,14 @@ impl CompositeStore {
             let outbound = &self.outbound[&key];
             let row = self.memory.record(&key)?.row.is_some();
             if !matches!(
-                self.disk.reserve_record(
+                self.disk.reserve_capture(
                     key,
                     outbound.parent,
                     outbound.bucket,
                     outbound.tail_pages,
                     row,
-                    true
+                    true,
+                    self.memory.record(&key)?.capture_role,
                 ),
                 Ok(Some(_))
             ) {
@@ -1033,6 +1049,12 @@ impl CompositeStore {
                 }
                 self.disk.reused(key);
                 self.stats.fetched += 1;
+                let tier = if inbound.disk_started.is_some() {
+                    crate::Tier::Nvme
+                } else {
+                    crate::Tier::Dram
+                };
+                self.stats.restores_by_tier[tier as usize] += 1;
                 self.stats.bytes_in += bytes;
                 self.stats.reused_tokens += inbound.tokens;
                 self.stats.inbound_rate = self.memory.stats().inbound_rate;
@@ -1083,12 +1105,28 @@ impl HostStore for CompositeStore {
             )));
         }
         let key = checkpoint.key;
+        let covered = self.disk.covered_endpoint(checkpoint, |n| {
+            n.ready || self.resident(&n.key, n.tail_pages, true)
+        });
         if let Some(outbound) = self.outbound.get(&key) {
             self.stats.store_skipped += 1;
-            // A parked record is reusable while its row is still resident.
-            if self.parked.contains_key(&key) && self.resident(&key, outbound.tail_pages, true) {
+            if self.parked.contains_key(&key) && self.resident(&key, outbound.tail_pages, !covered)
+            {
+                let header = &mut self.disk.index_mut()[&key].location.header;
+                let role = header.capture_role().merge(checkpoint.capture_role);
+                if role != header.capture_role() {
+                    if self.parked[&key].writing {
+                        return Ok(StoreOutcome::Retry(StoreReason::Inflight));
+                    }
+                    *header = header.clone().with_capture_role(role);
+                    self.memory.promote_role(key, role);
+                }
                 self.disk.index_mut().touch_ancestors(&key);
                 return Ok(StoreOutcome::Present);
+            }
+            // A protected recapture can replace the parked page-only record once its link is durable.
+            if !covered && self.parked.get(&key).is_some_and(|p| !p.writing) {
+                self.spill(key);
             }
             let reason = if self.parked.get(&key).is_some_and(|p| !p.writing) {
                 StoreReason::Slabs
@@ -1097,7 +1135,7 @@ impl HostStore for CompositeStore {
             };
             return Ok(StoreOutcome::Retry(reason));
         }
-        if let Some(outcome) = self.disk.store_status(checkpoint)? {
+        if let Some(outcome) = self.disk.store_status_with_row(checkpoint, !covered)? {
             self.stats.store_skipped += 1;
             if outcome == StoreOutcome::Present {
                 self.disk.index_mut().touch_ancestors(&key);
@@ -1123,7 +1161,7 @@ impl HostStore for CompositeStore {
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
         let (parent, tail) = self.disk.plan_record(checkpoint);
-        let needed = self.memory.layout().record_slots(tail.len(), true);
+        let needed = self.memory.layout().record_slots(tail.len(), !covered);
         if self.memory.fits(needed) && self.memory.free_retention_slots() < needed {
             self.thin_rows_for(needed);
         }
@@ -1146,7 +1184,12 @@ impl HostStore for CompositeStore {
             self.stats.store_failed += 1;
             return Err(error);
         }
-        match self.memory.store_record(checkpoint, parent, &tail, false) {
+        let accepted = if covered {
+            self.memory.store_empty(checkpoint)
+        } else {
+            self.memory.store_record(checkpoint, parent, &tail, false)
+        };
+        match accepted {
             Ok(true) => {}
             Ok(false) => {
                 if let Some(parent) = &parent {
@@ -1772,6 +1815,9 @@ mod tests {
     ) -> (MemoryRecord, u64) {
         let tail = checkpoint.tail_pages;
         let record = landed(store, checkpoint.key, checkpoint.bucket, tail, seed);
+        store
+            .memory
+            .promote_role(checkpoint.key, checkpoint.capture_role);
         store.outbound.insert(
             checkpoint.key,
             Outbound {
@@ -1867,7 +1913,7 @@ mod tests {
         let mut expected_pages = Vec::new();
         let mut expected_row = Vec::new();
         for turn in 1..=8u32 {
-            let checkpoint = checkpoint(
+            let mut checkpoint = checkpoint(
                 &mut ids,
                 &full,
                 u64::from(turn) * PAGE_TOKENS,
@@ -1876,6 +1922,7 @@ mod tests {
                 1,
                 StateSlotId(turn),
             );
+            checkpoint.capture_role = crate::CaptureRole::Message;
             if let Some(parent) = checkpoint.parent {
                 store.disk.index_mut().pin(&parent).unwrap();
             }
@@ -2010,7 +2057,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_keeps_a_parents_row_while_headroom_remains() {
+    fn composite_keeps_the_row_at_a_message_boundary() {
         let Some(directory) = test_directory("composite", "keep-parent-row") else {
             return;
         };
@@ -2019,7 +2066,7 @@ mod tests {
         let mut ids = Ids::new();
         let mut checkpoints = Vec::new();
         for turn in 1..=3u32 {
-            let checkpoint = checkpoint(
+            let mut checkpoint = checkpoint(
                 &mut ids,
                 &full,
                 u64::from(turn) * PAGE_TOKENS,
@@ -2028,6 +2075,7 @@ mod tests {
                 1,
                 StateSlotId(turn),
             );
+            checkpoint.capture_role = crate::CaptureRole::Message;
             if let Some(parent) = checkpoint.parent {
                 store.disk.index_mut().pin(&parent).unwrap();
             }
@@ -2043,7 +2091,7 @@ mod tests {
                 .unwrap()
                 .row
                 .is_some(),
-            "the DRAM row of a recently stored parent was dropped with no memory pressure"
+            "the message boundary must retain its row"
         );
         let mut branch = history(2 * PAGE_TOKENS);
         branch
@@ -2124,9 +2172,13 @@ mod tests {
                         store.disk.index_mut().pin(&parent).unwrap();
                     }
                     written(&mut store, &checkpoint, checkpoint.parent, u64::from(salt));
+                    if turn == 2 {
+                        store.memory.pin_record(&checkpoint.key).unwrap();
+                    }
                     checkpoints.push(checkpoint);
                 }
                 assert!(store.thinning.contains(&checkpoints[1].key));
+                store.memory.unpin_record(&checkpoints[1].key).unwrap();
                 if remove_explicitly {
                     for checkpoint in checkpoints.iter().rev() {
                         store.disk.expire(checkpoint.key).unwrap();
@@ -2141,7 +2193,15 @@ mod tests {
                     };
                     store
                         .disk
-                        .reserve_record(key, None, [0; 16], 8, true, true)
+                        .reserve_capture(
+                            key,
+                            None,
+                            [0; 16],
+                            8,
+                            true,
+                            true,
+                            crate::CaptureRole::Endpoint,
+                        )
                         .unwrap();
                     store.drop_evicted_copies();
                     assert!(
@@ -2168,6 +2228,138 @@ mod tests {
             drop(store);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn composite_pressure_keeps_the_row_above_a_covered_tip() {
+        let Some(directory) = test_directory("composite", "last-row") else {
+            return;
+        };
+        let mut store = composite(&directory, 32, 0, 1 << 30);
+        let full = history(192);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 64, None, pages(0..1), 1, StateSlotId(0));
+        let parent = checkpoint(
+            &mut ids,
+            &full,
+            128,
+            Some(64),
+            pages(0..2),
+            1,
+            StateSlotId(1),
+        );
+        let tip = checkpoint(
+            &mut ids,
+            &full,
+            134,
+            Some(128),
+            pages(0..2),
+            0,
+            StateSlotId(2),
+        );
+        written(&mut store, &root, None, 1);
+        written(&mut store, &parent, parent.parent, 2);
+        assert_eq!(store.store(&tip).unwrap(), StoreOutcome::Queued);
+        poll_until(&mut store, &mut Vec::new(), |s| {
+            s.parked.contains_key(&tip.key)
+        });
+        assert!(store.memory.record(&tip.key).unwrap().row.is_none());
+        store.thin_rows_for(usize::MAX);
+        assert!(store.memory.record(&parent.key).unwrap().row.is_some());
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_same_page_endpoint_spills_its_link_and_preserves_the_message_row() {
+        let Some(directory) = test_directory("composite", "same-page-spill") else {
+            return;
+        };
+        let mut store = composite(&directory, 18, 0, 1 << 30);
+        let full = history(3 * PAGE_TOKENS);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 64, None, pages(0..1), 1, StateSlotId(0));
+        let mut anchor = checkpoint(
+            &mut ids,
+            &full,
+            128,
+            Some(64),
+            pages(0..2),
+            1,
+            StateSlotId(1),
+        );
+        anchor.capture_role = crate::CaptureRole::Message;
+        let deep = checkpoint(
+            &mut ids,
+            &full,
+            133,
+            Some(128),
+            pages(0..2),
+            0,
+            StateSlotId(2),
+        );
+        let next = checkpoint(
+            &mut ids,
+            &full,
+            192,
+            Some(133),
+            pages(0..3),
+            1,
+            StateSlotId(3),
+        );
+
+        written(&mut store, &root, None, 1);
+        store.disk.index_mut().pin(&root.key).unwrap();
+        let (record, bytes) = copy_landed(&mut store, &anchor, anchor.parent, 2);
+        let expected = record_bytes(&store, &record);
+        store.memory_stored(anchor.id, anchor.key, Ok(bytes), &mut Vec::new());
+        anchor.capture_role = crate::CaptureRole::Anchor;
+        assert_eq!(store.store(&anchor).unwrap(), StoreOutcome::Present);
+        assert_eq!(store.store(&deep).unwrap(), StoreOutcome::Queued);
+        poll_until(&mut store, &mut Vec::new(), |s| {
+            s.parked.contains_key(&deep.key)
+        });
+        assert!(store.memory.record(&deep.key).unwrap().row.is_none());
+        assert_eq!(store.store(&deep).unwrap(), StoreOutcome::Present);
+        store.disk.index_mut().pin(&deep.key).unwrap();
+        let (_, bytes) = copy_landed(&mut store, &next, next.parent, 3);
+        store.memory_stored(next.id, next.key, Ok(bytes), &mut Vec::new());
+        assert!(store.memory.record(&anchor.key).unwrap().row.is_some());
+
+        for capture in [&anchor, &deep, &next] {
+            if store.parked.get(&capture.key).is_some_and(|p| !p.writing) {
+                assert_eq!(store.spill(capture.key), Some(capture.key));
+            }
+            poll_until(&mut store, &mut Vec::new(), |s| {
+                !s.outbound.contains_key(&capture.key)
+            });
+        }
+        let anchor_file = store.disk.record(&anchor.key).unwrap();
+        let bytes = fs::read(&anchor_file.path).unwrap();
+        assert_eq!(bytes.len() as u64, anchor_file.header.length(true));
+        assert_eq!(
+            Header::decode(&bytes[..4096]).unwrap().capture_role(),
+            crate::CaptureRole::Anchor
+        );
+        assert_eq!(
+            &bytes
+                [anchor_file.header.page_segment as usize..anchor_file.header.row_segment as usize],
+            expected[0]
+        );
+        assert_eq!(
+            &bytes[anchor_file.header.row_segment as usize..],
+            expected[1]
+        );
+        let deep_file = store.disk.record(&deep.key).unwrap();
+        assert_eq!(
+            fs::metadata(&deep_file.path).unwrap().len(),
+            deep_file.header.length(false)
+        );
+        assert_eq!(store.lookup(&full, 0, 134).unwrap().key, anchor.key);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

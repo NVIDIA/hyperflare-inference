@@ -3234,7 +3234,9 @@ fn late_pool_replies_retry_all_capacity_blocked_requests() {
             .pool_lookup
             .as_ref()
             .unwrap()
-            .set_state(LookupState::Ready(Arc::new(Answer { candidates: vec![] })));
+            .set_state(LookupState::Ready(Arc::new(Answer {
+                candidates: vec![],
+            })));
     }
     fake_store(&mut worker).hit = Some(hit);
     let attempts = fake_store(&mut worker).tickets_seen.len();
@@ -3429,7 +3431,9 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
     use std::time::{Duration, Instant};
 
     for answer in [
-        Some(LookupState::Ready(Arc::new(Answer { candidates: vec![] }))),
+        Some(LookupState::Ready(Arc::new(Answer {
+            candidates: vec![],
+        }))),
         Some(LookupState::None),
         None,
     ] {
@@ -5968,6 +5972,31 @@ fn publication_copy_pins_survive_ancestor_compaction() {
     let notice = &fake_store(&mut worker).evicted[0];
     assert_eq!(notice.1.as_ref().unwrap().id, b);
     drop(generation);
+}
+
+#[test]
+fn reoffer_counters_count_actual_store_calls_and_present_replies() {
+    use flare_selene::StoreOutcome;
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.extend([
+        StoreOutcome::Present,
+        StoreOutcome::Present,
+        StoreOutcome::Queued,
+    ]);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    worker.service_store().unwrap();
+    for _ in 0..2 {
+        worker.scheduler.reoffer_publication(id);
+        worker.scheduler.reoffer_publication(id);
+        worker.service_store().unwrap();
+    }
+    let metrics = worker.metrics.render();
+    assert!(metrics.contains("flare_host_cache_reoffer_calls_total 2\n"));
+    assert!(metrics.contains("flare_host_cache_reoffer_present_total 1\n"));
 }
 
 #[test]

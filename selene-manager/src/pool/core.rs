@@ -9,10 +9,10 @@ use flare_selene::shared::Limits;
 
 use super::{
     Violation,
-    claims::{Claim, ClaimKey},
+    claims::{Claim, ClaimKey, Participant, Party},
     index::{InstanceId, ScopeIndex, SourceId},
     ranks::{Agent, Ranks},
-    store_bridge::{Link, PutKey, PutRec, StoreHandle},
+    store_bridge::{Link, PutKey, PutPhase, PutRec, StoreHandle},
     validate_scope,
 };
 use crate::{
@@ -1014,7 +1014,17 @@ impl Core {
     }
 
     fn drained(&self) -> bool {
-        self.claims.values().all(|claim| claim.is_terminal()) && self.channels.is_empty()
+        self.claims.values().all(|claim| claim.is_terminal())
+            && self.channels.is_empty()
+            && self.puts.values().all(|put| {
+                put.phase == PutPhase::Finished
+                    && put.mp.passes == 0
+                    // Only a connected owner with a pending fence can still attest.
+                    && !put.parties.iter()
+                        .filter(|party| party.state == Party::Pending)
+                        .filter_map(Participant::window_holder)
+                        .any(|proc| self.process_connected(proc))
+            })
     }
 
     fn finish_shutdown(&mut self) {
@@ -1028,6 +1038,23 @@ impl Core {
                 v2::ClosingReason::ClosingShutdown,
                 "the manager is shutting down",
             );
+        }
+        // Keep unfenced processes in the holder file when the next manager reuses the regions.
+        let holders: HashSet<_> = self
+            .puts
+            .values()
+            .flat_map(|put| &put.parties)
+            .chain(self.claims.values().flat_map(|claim| &claim.parties))
+            .filter_map(Participant::window_holder)
+            .collect();
+        let settled: Vec<_> = self
+            .procs
+            .keys()
+            .filter(|proc| !holders.contains(*proc))
+            .copied()
+            .collect();
+        for proc in settled {
+            self.drop_link(proc);
         }
         if let Some(done) = self.shutting_down.take() {
             let _ = done.send(());

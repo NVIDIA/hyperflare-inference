@@ -2448,6 +2448,19 @@ impl<'a> Worker<'a> {
             progress = true;
             self.scheduler.pin_checkpoint(publication.id)?;
             let outcome = store.store(&publication);
+            if self.scheduler.submitted_reoffer(
+                publication.id,
+                matches!(outcome, Ok(StoreOutcome::Retry(_))),
+            ) {
+                self.metrics
+                    .host_reoffer_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                if matches!(outcome, Ok(StoreOutcome::Present)) {
+                    self.metrics
+                        .host_reoffer_present
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
             if !matches!(outcome, Ok(StoreOutcome::Queued)) {
                 self.scheduler.unpin_checkpoint(publication.id)?;
             }

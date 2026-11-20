@@ -73,6 +73,10 @@ pub enum CancelAt {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PutOptions {
+    pub role: flare_selene::CaptureRole,
+    pub child_paths: u32,
+    pub descendant_row: bool,
+    pub next_child: Option<Key>,
     pub cancel: Option<CancelAt>,
     pub cancel_after_fills: Option<u32>,
     pub abort_after_commit: bool,
@@ -354,6 +358,10 @@ impl Client {
             put_id: id,
             key: Some(key_to(key)),
             chain_pages,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: parent.is_some(),
             published_parent: parent.map(key_to),
@@ -644,6 +652,20 @@ impl Client {
 
     /// Claims a chain and keeps whatever windows the manager issues, releasing none.
     pub async fn hold(&mut self, keys: &[Key], skip: u32, pages: u32) -> Held {
+        self.hold_after(keys, skip, pages, Duration::from_millis(100))
+            .await
+    }
+
+    /// Like `hold`, but waits up to `first_window` for the first window. A chain whose
+    /// records are only on disk reads every record's metadata before the first window
+    /// is read, so its first window takes as long as the chain is long.
+    pub async fn hold_after(
+        &mut self,
+        keys: &[Key],
+        skip: u32,
+        pages: u32,
+        first_window: Duration,
+    ) -> Held {
         let endpoint = keys.last().unwrap().consumed_tokens;
         let candidate = self
             .wait_candidate(endpoint, Duration::from_secs(5))
@@ -661,12 +683,10 @@ impl Client {
             M::WindowReady(ready) if ready.claim_id == id => Some(ready.clone()),
             _ => None,
         };
-        while let Some(ready) = self
-            .session
-            .take_within(Duration::from_millis(100), &mut quiet)
-            .await
-        {
+        let mut wait = first_window;
+        while let Some(ready) = self.session.take_within(wait, &mut quiet).await {
             windows.push(ready);
+            wait = Duration::from_millis(100);
         }
         Held {
             id,

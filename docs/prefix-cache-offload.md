@@ -269,13 +269,15 @@ shared or host-restored checkpoint, without refreshing earlier ancestors.
 Pressure can compact an older single-child ancestor while preserving the reused
 descendant's complete page chain and reporting its compaction heir. Direct
 copy-out pins and outstanding GPU-use fences still protect transfer resources.
-Host-store eviction independently removes the least recently used unpinned leaf;
-when every leaf is pinned, it compacts the least recently used unpinned
-single-child ancestor by
-dropping its row and keeping its pages. A compacted host node stays in the tree
-as page-only, no longer matches lookups, and continues to supply chain pages.
-The manager's store compacts a record under disk pressure only when its single
-child keeps its own row, so every chain retains a row to restore from.
+Host-store pressure can remove the least recently used eligible leaf. To
+free a row, Flare considers unpinned, single-child interior Endpoints in LRU
+order. A descendant on the unbranched path must still have a row. The
+parent's pages remain available to its children. Message, Anchor, root
+and fork rows remain eligible for exact restores while held.
+An Endpoint can omit its row when an ancestor already covers the same page.
+A child covered this way cannot justify dropping the covering parent's row.
+Under disk pressure the manager can compact a durable interior Endpoint
+when its only child has a durable row.
 A node is evictable only when its store's policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
@@ -735,6 +737,11 @@ Policy:
 
 Offload limits interference through bounded work and explicit ownership:
 
+- The manager has four write-back workers. Independent chains can flush
+  concurrently, with each parent written before its children. The claim
+  drain and flush share 270 seconds from the stop signal. The claim drain
+  allows the configured claim deadline plus two seconds (32 seconds by
+  default), capped at four minutes. The flush gets the remaining time.
 - The model stream never waits on an offload event. Host-observed completion
   orders transfers and scheduler visibility. Shared bandwidth and copy engines
   still require the interference measurements in section 4.

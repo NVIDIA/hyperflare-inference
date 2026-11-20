@@ -2674,6 +2674,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
     assert_eq!(
         scheduler.take_publications(),
         vec![PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: restored,
             key,
             parent: None,
@@ -2868,6 +2869,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     assert_eq!(
         scheduler.take_publications(),
         vec![PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: restored,
             key,
             parent: Some(ancestor_key),
@@ -3346,6 +3348,7 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
     assert_eq!(
         scheduler.take_publications(),
         vec![PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Anchor,
             id: system,
             key: history.key_at(64).unwrap(),
             parent: None,
@@ -3397,6 +3400,7 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
     assert_eq!(
         published,
         vec![PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: prompt,
             key: history.key_at(130).unwrap(),
             parent: Some(history.key_at(64).unwrap()),

@@ -46,11 +46,11 @@ pub use error::{Error, Result};
 pub use geometry::{CacheGeometry, Layout, Plane};
 pub use registrar::{HostRegistrar, Registration, SplitMapping};
 pub use store::{
-    ExportChain, ExportId, ExportNode, ExportRefusal, HostHit, HostStore,
-    INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId,
-    PublishedCheckpoint, Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason,
-    StoreStats, worth_fetching, worth_transfer,
+    ExportChain, ExportId, ExportNode, ExportRefusal, HostHit, HostStore, INITIAL_MEMORY_RATE,
+    INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, PublishedCheckpoint,
+    RETIREMENT_LATENCY_MS, Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason, StoreStats,
+    worth_fetching, worth_transfer,
 };
 pub use vocab::{CheckpointId, HASH_BLOCK_TOKENS, History, PageId, PrefixKey, StateSlotId};
 
-pub use shared::Tier;
+pub use shared::{Tier, wire::CaptureRole};

@@ -79,6 +79,7 @@ impl Rig {
             (0..ROW).map(|i| (i + first_id as usize) as u8).collect(),
         );
         PublishedCheckpoint {
+            capture_role: crate::CaptureRole::Endpoint,
             id: CheckpointId::new(self.next),
             key: self.history.key_at(consumed).unwrap(),
             parent: None,

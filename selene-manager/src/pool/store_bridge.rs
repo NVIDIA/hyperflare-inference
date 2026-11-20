@@ -396,6 +396,22 @@ impl Core {
             return Ok(());
         };
         let descriptor = self.scopes[&scope].valid.descriptor.clone();
+        let next_child = match m
+            .next_child
+            .as_ref()
+            .map(|key| key_from(Some(key)))
+            .transpose()
+        {
+            Ok(child)
+                if child.is_none_or(|child| child.consumed_tokens > record_key.consumed_tokens) =>
+            {
+                child
+            }
+            _ => {
+                self.put_refusal(sid, put_id, v2::Reason::Invalid, "invalid successor key");
+                return Ok(());
+            }
+        };
         let (events, mut answers) = mpsc::channel::<io::Result<PutAnswer>>(32);
         let begun = self.store_call(|reply| StoreCommand::PutBegin {
             connection: link.connection,
@@ -408,6 +424,10 @@ impl Core {
             bucket,
             chain_pages,
             published_tail_pages: tail_pages,
+            capture_role: m.capture_role(),
+            child_paths: m.child_paths,
+            descendant_row: m.descendant_row,
+            next_child,
             row: m.row,
             events,
             reply,
@@ -575,6 +595,7 @@ impl Core {
                         has_parent: accept.parent.is_some(),
                         parent: accept.parent.map(key_to),
                         record_bytes: accept.record_bytes,
+                        capture_role: accept.capture_role as i32,
                         channel,
                         rank_channels,
                     }),

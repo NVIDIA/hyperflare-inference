@@ -201,6 +201,22 @@ fn a_killed_peer_stops_rank_zero_and_quarantined_windows_wait_for_process_exit()
 }
 
 #[test]
+fn an_unfenced_peer_rank_holds_the_regions_across_a_clean_stop() {
+    let mut cluster = cluster(2, &[true]);
+    cluster.rank0.send("restore");
+    cluster.agents[0].expect("copy pending", 20);
+    cluster.rank0.kill();
+    cluster.source.kill();
+    cluster.manager.wait(|m| m.gauge("pool_sessions") == 0);
+
+    cluster.manager.restart();
+    cluster.manager.wait(|m| m.gauge("pool_ready") == 1);
+    assert_eq!(cluster.manager.gauge("pool_regions_held"), 1);
+    cluster.agents[0].kill();
+    cluster.manager.wait(|m| m.gauge("pool_regions_held") == 0);
+}
+
+#[test]
 fn a_killed_rank_zero_lets_the_agents_drain_attest_and_exit() {
     let mut cluster = cluster(2, &[true]);
     cluster.rank0.send("restore");

@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Pool handovers discard invalid or oversized records and retry budget or
-//! in-flight refusals once. Other failures keep local records and retry on
-//! manager progress or a short backoff.
+//! Budget and in-flight refusals retry the same put once. A permanent refusal
+//! or an exhausted retry on an ancestor leaves one attempt to send the leaf.
+//! Other failures keep the record local for a later move.
 //! Manager loss unwinds waiting selections; active moves retain their pins
 //! until the drained terminal event. While the manager cannot accept records,
 //! the local tier's LRU is the end of the chain.
@@ -95,6 +95,12 @@ impl PutBytes for PinBytes {
 struct Move {
     record: Retiring,
     failures: u8,
+    leaf_only: bool,
+    path: VecDeque<crate::PrefixKey>,
+    depth: u64,
+    /// Shapes offered on this pass, checked before releasing a locally promoted row.
+    offered: Vec<Retiring>,
+    started: Instant,
 }
 
 pub(crate) struct Cascade {
@@ -108,14 +114,25 @@ pub(crate) struct Cascade {
     pub(crate) now: Option<Instant>,
     /// Refusal discards by DRAM/NVMe source tier.
     pub(crate) dropped: [u64; 2],
+    pub(crate) refusal_drops: [u64; 5],
     page_bytes: usize,
     row_bytes: usize,
+    pub(crate) paths: u64,
+    pub(crate) max_depth: u64,
+    pub(crate) latency_ns: u64,
+    pub(crate) max_latency_ns: u64,
+    pub(crate) latency_buckets: [u64; 8],
 }
 
 impl Cascade {
     pub(crate) fn new(layout: &Layout) -> Self {
         let now = Instant::now();
         Self {
+            paths: 0,
+            max_depth: 0,
+            latency_ns: 0,
+            max_latency_ns: 0,
+            latency_buckets: [0; 8],
             pending: VecDeque::new(),
             moving: HashMap::new(),
             retry_after: now,
@@ -123,6 +140,7 @@ impl Cascade {
             #[cfg(test)]
             now: None,
             dropped: [0; 2],
+            refusal_drops: [0; 5],
             page_bytes: layout.page_record_bytes as usize,
             row_bytes: layout.row_record_bytes as usize,
         }
@@ -158,9 +176,40 @@ impl Cascade {
         for record in inner.take_retiring() {
             // A failed put's backoff holds the queue; it does not fail what waits in it.
             if up && self.pending.len() + self.moving.len() < PENDING_MAX + MOVES_MAX {
+                let mut path = VecDeque::new();
+                if record.tier == Tier::Dram && record.parent.is_some() {
+                    path.extend(record.ancestor_keys.iter().rev().copied());
+                    // The local root may name a predecessor held only by the manager.
+                    if path
+                        .front()
+                        .is_some_and(|key| inner.retirement_predecessor(*key).is_none())
+                    {
+                        path.pop_front();
+                    }
+                    // A page-only local root cannot start a manager chain. The first
+                    // row-bearing descendant can send those pages from its pinned chain.
+                    if path
+                        .front()
+                        .and_then(|key| inner.retirement_predecessor(*key))
+                        .is_some_and(|r| r.parent.is_none() && !r.row)
+                    {
+                        while path
+                            .front()
+                            .and_then(|key| inner.retirement_predecessor(*key))
+                            .is_some_and(|r| !r.row)
+                        {
+                            path.pop_front();
+                        }
+                    }
+                }
                 self.pending.push_back(Move {
+                    depth: 1 + path.len() as u64,
+                    started: self.now(),
+                    offered: Vec::new(),
+                    path,
                     record,
                     failures: 0,
+                    leaf_only: false,
                 });
             } else {
                 inner.retired(record.key, record.tier, Retirement::Failed);
@@ -183,20 +232,50 @@ impl Cascade {
         &mut self,
         inner: &mut S,
         pool: &mut P,
-        entry: Move,
+        mut entry: Move,
     ) {
-        let record = &entry.record;
+        let key = entry.path.front().copied().unwrap_or(entry.record.key);
+        let current = (entry.record.tier == Tier::Dram)
+            .then(|| inner.retirement_predecessor(key))
+            .flatten();
+        let record = match current.as_ref() {
+            Some(record) => record,
+            None if key == entry.record.key => &entry.record,
+            None => return self.failed(inner, &entry.record),
+        };
         let pin = match inner.pin_export(record.tier, record.key, 0, record.row) {
             Ok(pin) => pin,
-            Err(_) => return self.failed(inner, record),
+            Err(_) => return self.failed(inner, &entry.record),
+        };
+        if record.tier == Tier::Dram {
+            entry.offered.push(record.clone());
+        }
+        // The selected path already carries the ancestry, including the local root's hint.
+        let ancestors = &entry.record.ancestor_keys;
+        let first = if key == entry.record.key {
+            0
+        } else {
+            entry.path.len()
         };
         let request = PutRequest {
             key: record.key,
             parent: record.parent,
-            ancestor_keys: record.ancestor_keys.clone(),
+            ancestor_keys: ancestors[first..]
+                .iter()
+                .take(crate::shared::MAX_CHAIN_NODES as usize)
+                .copied()
+                .collect(),
             bucket: record.bucket,
             chain_pages: pin.chain().total_pages,
             tail_pages: record.tail_pages as u64,
+            capture_role: record.capture_role,
+            child_paths: record.child_paths,
+            descendant_row: record.descendant_row,
+            next_child: entry
+                .path
+                .get(1)
+                .copied()
+                .or_else(|| entry.path.front().map(|_| entry.record.key)),
             row: record.row,
             source: PutSource::Host(Box::new(PinBytes {
                 pin,
@@ -208,17 +287,17 @@ impl Cascade {
             Ok(id) => {
                 self.moving.insert(id, entry);
             }
-            Err(_) => self.failed(inner, record),
+            Err(_) => self.failed(inner, &entry.record),
         }
     }
 
-    fn back_off<S: crate::store::TierStore>(&mut self, inner: &mut S) {
+    fn back_off(&mut self) {
         self.retry_after = self.now() + Duration::from_millis(50);
-        inner.set_spill(false);
     }
 
     fn failed<S: crate::store::TierStore>(&mut self, inner: &mut S, record: &Retiring) {
-        self.back_off(inner);
+        self.back_off();
+        inner.set_spill(false);
         inner.retired(record.key, record.tier, Retirement::Failed);
     }
 
@@ -235,24 +314,93 @@ impl Cascade {
         let record = &entry.record;
         match outcome {
             PutOutcome::Stored { .. } | PutOutcome::Present => {
-                inner.retired(record.key, record.tier, Retirement::Moved);
-            }
-            PutOutcome::Refused(PutRefusal::Invalid | PutRefusal::Oversize) => {
-                self.dropped[usize::from(record.tier == Tier::Nvme)] += 1;
-                inner.retired(record.key, record.tier, Retirement::Dropped);
-            }
-            PutOutcome::Refused(PutRefusal::Budget | PutRefusal::Inflight) => {
-                self.back_off(inner);
-                self.refused_until = self.retry_after;
-                match crate::store::retry_once(&mut entry.failures) {
-                    Retirement::Failed => self.pending.push_back(entry),
-                    how => {
-                        self.dropped[usize::from(record.tier == Tier::Nvme)] += 1;
-                        inner.retired(record.key, record.tier, how);
+                if entry.path.pop_front().is_some() {
+                    entry.failures = 0;
+                    self.pending.push_front(entry);
+                } else {
+                    if record.tier == Tier::Dram {
+                        if entry.offered.iter().any(|old| {
+                            inner
+                                .retirement_predecessor(old.key)
+                                .is_some_and(|current| {
+                                    current.row
+                                        && (!old.row
+                                            || current.capture_role > old.capture_role
+                                            || (old.descendant_row && !current.descendant_row)
+                                            || (old.child_paths < 2 && current.child_paths >= 2))
+                                })
+                        }) {
+                            self.failed(inner, record);
+                            return true;
+                        }
+                        self.paths += 1;
+                        self.max_depth = self.max_depth.max(entry.depth);
+                        let elapsed = self.now().duration_since(entry.started).as_nanos() as u64;
+                        for (count, ms) in self
+                            .latency_buckets
+                            .iter_mut()
+                            .zip(crate::RETIREMENT_LATENCY_MS)
+                        {
+                            *count += u64::from(elapsed <= ms * 1_000_000);
+                        }
+                        self.latency_ns += elapsed;
+                        self.max_latency_ns = self.max_latency_ns.max(elapsed);
                     }
+                    let how = if entry.leaf_only {
+                        Retirement::MovedLeaf
+                    } else {
+                        Retirement::Moved
+                    };
+                    inner.retired(record.key, record.tier, how);
                 }
             }
-            _ => self.failed(inner, record),
+            PutOutcome::Refused(
+                reason @ (PutRefusal::Invalid
+                | PutRefusal::Unlinked
+                | PutRefusal::Oversize
+                | PutRefusal::Budget
+                | PutRefusal::Inflight),
+            ) => {
+                let temporary = matches!(reason, PutRefusal::Budget | PutRefusal::Inflight);
+                if temporary {
+                    self.back_off();
+                    self.refused_until = self.retry_after;
+                    if !entry.leaf_only
+                        && crate::store::retry_once(&mut entry.failures) == Retirement::Failed
+                    {
+                        entry.offered.pop();
+                        self.pending.push_back(entry);
+                        return true;
+                    }
+                }
+                let index = match reason {
+                    PutRefusal::Invalid => 0,
+                    PutRefusal::Unlinked => 1,
+                    PutRefusal::Oversize => 2,
+                    PutRefusal::Budget => 3,
+                    PutRefusal::Inflight => 4,
+                    _ => unreachable!(),
+                };
+                if temporary || entry.path.is_empty() {
+                    self.refusal_drops[index] += 1;
+                }
+                if entry.path.is_empty() {
+                    self.dropped[usize::from(record.tier == Tier::Nvme)] += 1;
+                    inner.retired(record.key, record.tier, Retirement::Dropped);
+                } else {
+                    entry.path.clear();
+                    entry.offered.clear();
+                    entry.leaf_only = true;
+                    entry.depth = 1;
+                    self.pending.push_front(entry);
+                }
+            }
+            _ => {
+                self.failed(inner, record);
+                if record.tier == Tier::Dram {
+                    self.refused_until = self.retry_after;
+                }
+            }
         }
         true
     }

@@ -49,6 +49,8 @@ enum Phase {
 }
 
 struct Put {
+    capture_role: crate::CaptureRole,
+    child_paths: u32,
     key: PrefixKey,
     bucket: [u8; 16],
     chain_pages: u64,
@@ -95,13 +97,16 @@ impl State {
     }
 }
 
-fn refusal(reason: i32) -> PutOutcome {
+fn refusal(reason: i32, detail: &str) -> PutOutcome {
     use wire::Reason as R;
     match R::try_from(reason) {
         Ok(R::Present) => PutOutcome::Present,
         Ok(R::Inflight) => PutOutcome::Refused(PutRefusal::Inflight),
         Ok(R::Budget) => PutOutcome::Refused(PutRefusal::Budget),
         Ok(R::Oversize) => PutOutcome::Refused(PutRefusal::Oversize),
+        Ok(R::Invalid) if detail == crate::shared::PUT_UNLINKED => {
+            PutOutcome::Refused(PutRefusal::Unlinked)
+        }
         Ok(R::Invalid) => PutOutcome::Refused(PutRefusal::Invalid),
         Ok(R::Queue) => PutOutcome::Refused(PutRefusal::Queue),
         Ok(R::Io) => PutOutcome::Refused(PutRefusal::Io),
@@ -177,6 +182,10 @@ impl Engine {
             put_id: id,
             key: Some(codec::key_to(request.key)),
             chain_pages: request.chain_pages,
+            capture_role: request.capture_role as i32,
+            child_paths: request.child_paths,
+            descendant_row: request.descendant_row,
+            next_child: request.next_child.map(codec::key_to),
             row: request.row,
             has_published_parent: request.parent.is_some(),
             published_parent: request.parent.map(codec::key_to),
@@ -196,6 +205,8 @@ impl Engine {
         self.writer.puts.insert(
             id,
             Put {
+                capture_role: request.capture_role,
+                child_paths: request.child_paths,
                 key: request.key,
                 bucket: request.bucket,
                 chain_pages: request.chain_pages,
@@ -266,6 +277,7 @@ impl Engine {
             (put.chain_pages - put.first_page) as u32,
             SystemTime::now(),
         )
+        .map(|header| header.with_capture_role(put.capture_role))
     }
 
     pub(crate) fn on_put_accept(&mut self, accept: wire::PutAccept) {
@@ -289,26 +301,26 @@ impl Engine {
                 Error::new("the manager accepted a put this client cannot carry out"),
             );
         };
-        if pages == 0 && !put.row {
-            return self.fail_put(
-                id,
-                Error::new("the manager accepted a put with nothing to write"),
-            );
-        }
+        let offered_row = put.row;
+        let role = accept.capture_role();
+        let can_send_pages_only = parent.is_some()
+            && put.capture_role == crate::CaptureRole::Endpoint
+            && role == crate::CaptureRole::Endpoint
+            && put.child_paths < 2;
         let put = self.writer.puts.get_mut(&id).expect("present");
+        put.capture_role = role;
         put.first_page = accept.first_page;
         put.parent = parent;
-        let expected = match self.put_header(self.writer.puts.get(&id).expect("present")) {
-            Ok(header) => {
-                if self.writer.puts[&id].row {
-                    header.length_with_row()
-                } else {
-                    header.row_segment
-                }
-            }
+        let header = match self.put_header(&self.writer.puts[&id]) {
+            Ok(header) => header,
             Err(error) => return self.fail_put(id, error),
         };
-        if accept.record_bytes != expected {
+        let expected = header.length(offered_row);
+        let row = if accept.record_bytes == expected {
+            offered_row
+        } else if offered_row && can_send_pages_only && accept.record_bytes == header.row_segment {
+            false
+        } else {
             return self.fail_put(
                 id,
                 Error::new(format!(
@@ -316,8 +328,15 @@ impl Engine {
                     accept.record_bytes
                 )),
             );
+        };
+        if pages == 0 && !row {
+            return self.fail_put(
+                id,
+                Error::new("the manager accepted a put with nothing to write"),
+            );
         }
         let put = self.writer.puts.get_mut(&id).expect("present");
+        put.row = row;
         put.coverage = Some(Coverage::new(vec![ExpectedRecord {
             key: put.key,
             first_page: 0,
@@ -529,7 +548,8 @@ impl Engine {
 
     pub(crate) fn on_put_refused(&mut self, refused: wire::PutRefused) {
         if let Some(put) = self.writer.puts.get_mut(&refused.put_id) {
-            put.refused.get_or_insert(refusal(refused.reason));
+            put.refused
+                .get_or_insert(refusal(refused.reason, &refused.detail));
             self.drive_put(refused.put_id);
         }
     }

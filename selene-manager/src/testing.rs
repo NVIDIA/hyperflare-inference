@@ -284,6 +284,8 @@ fn clean_regions(directory: &std::path::Path, remove_directory: bool) {
         "holders",
         "generation.tmp",
         "holders.tmp",
+        "last-shutdown",
+        "last-shutdown.tmp",
     ] {
         let path = directory.join(name);
         if std::fs::symlink_metadata(&path)

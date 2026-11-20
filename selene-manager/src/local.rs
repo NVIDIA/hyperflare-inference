@@ -171,6 +171,7 @@ impl Local {
             STAGING_FILE,
             GENERATION_FILE,
             HOLDERS_FILE,
+            "last-shutdown",
         ] {
             check_owned_file(&directory.join(name))?;
         }
@@ -550,7 +551,7 @@ fn check_owned_file(path: &Path) -> Result<()> {
 /// With the instance lock held, remove only this manager's unfinished metadata writes.
 fn reclaim_stale(directory: &Path) -> Result<usize> {
     let mut removed = 0;
-    for name in ["generation.tmp", "holders.tmp"] {
+    for name in ["generation.tmp", "holders.tmp", "last-shutdown.tmp"] {
         let path = directory.join(name);
         check_owned_file(&path)?;
         match fs::remove_file(path) {
@@ -690,7 +691,7 @@ fn new_generation() -> Result<u64> {
 }
 
 /// Replaces `path` with `contents` in one step, so a crash leaves the old file or the new one.
-fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension("tmp");
     fs::write(&temporary, contents)?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o660))?;
@@ -910,11 +911,13 @@ mod tests {
         }
         fs::write(directory.join("generation.tmp"), b"stale").unwrap();
         fs::write(directory.join("holders.tmp"), b"stale").unwrap();
+        fs::write(directory.join("last-shutdown.tmp"), b"stale").unwrap();
         fs::write(directory.join("leftover.tmp"), b"stale").unwrap();
         let second = reopen(&name);
         let _cleanup = Cleanup(directory.clone());
         assert!(!directory.join("generation.tmp").exists());
         assert!(!directory.join("holders.tmp").exists());
+        assert!(!directory.join("last-shutdown.tmp").exists());
         assert!(directory.join("leftover.tmp").exists());
         assert!(directory.join("lock").exists());
         assert!(second.arena_path().exists());

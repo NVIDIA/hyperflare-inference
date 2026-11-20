@@ -39,7 +39,7 @@ pub struct Node<L> {
     /// True once every byte of the record is readable from this store.
     pub ready: bool,
     pub location: L,
-    children: u32,
+    children: Vec<PrefixKey>,
     ready_children: u32,
     pins: u32,
     accessed: u64,
@@ -48,8 +48,13 @@ pub struct Node<L> {
 
 impl<L> Node<L> {
     pub fn children(&self) -> u32 {
-        self.children
+        self.children.len() as u32
     }
+
+    pub(crate) fn ready_children(&self) -> u32 {
+        self.ready_children
+    }
+
     pub fn pins(&self) -> u32 {
         self.pins
     }
@@ -207,6 +212,31 @@ impl<L> Index<L> {
         }
     }
 
+    /// A non-fork Endpoint can replay from a row on its own branch within this page.
+    pub fn covered_endpoint(
+        &self,
+        key: PrefixKey,
+        mut parent: Option<PrefixKey>,
+        role: crate::CaptureRole,
+        children: u32,
+        readable: impl Fn(&Node<L>) -> bool,
+    ) -> bool {
+        if role != crate::CaptureRole::Endpoint || children > 1 {
+            return false;
+        }
+        while let Some(node) = parent.and_then(|p| self.node(&p)) {
+            if node.key.consumed_tokens / self.page_tokens != key.consumed_tokens / self.page_tokens
+            {
+                break;
+            }
+            if node.row && readable(node) {
+                return true;
+            }
+            parent = node.parent;
+        }
+        false
+    }
+
     pub fn page_tokens(&self) -> u64 {
         self.page_tokens
     }
@@ -264,9 +294,21 @@ impl<L> Index<L> {
                 && if ready_only {
                     node.ready_children == 1
                 } else {
-                    node.children == 1
+                    node.children() == 1
                 }
         })
+    }
+
+    /// A row on the unbranched suffix can take over as this path's restore point.
+    pub fn has_row_below(&self, key: &PrefixKey, has_row: impl Fn(&Node<L>) -> bool) -> bool {
+        let mut node = &self[key];
+        while let [child] = node.children.as_slice() {
+            node = &self[child];
+            if has_row(node) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Drain queued row candidates in least-recently-used order, omitting removed records.
@@ -315,7 +357,7 @@ impl<L> Index<L> {
                     .nodes
                     .get_mut(&parent)
                     .ok_or_else(|| invalid("host record parent is not indexed"))?;
-                node.children += 1;
+                node.children.push(key);
                 (parent.consumed_tokens, node.chain_depth + 1)
             }
             None => (0, 1),
@@ -325,7 +367,7 @@ impl<L> Index<L> {
                 != tail_pages as u64
         {
             if let Some(parent) = parent {
-                self.nodes.get_mut(&parent).unwrap().children -= 1;
+                self.nodes.get_mut(&parent).unwrap().children.pop();
             }
             return Err(invalid(
                 "host record must extend its parent by exactly its tail pages",
@@ -354,7 +396,7 @@ impl<L> Index<L> {
                 row,
                 ready,
                 location,
-                children: 0,
+                children: Vec::new(),
                 ready_children: 0,
                 pins: 0,
                 accessed,
@@ -383,7 +425,7 @@ impl<L> Index<L> {
             .nodes
             .get(key)
             .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
-        if node.children != 0 || node.pinned() {
+        if node.children() != 0 || node.pinned() {
             return Err(invalid(
                 "cannot remove a pinned host record or one with children",
             ));
@@ -398,7 +440,7 @@ impl<L> Index<L> {
         }
         if let Some(parent) = node.parent {
             let parent = self.nodes.get_mut(&parent).unwrap();
-            parent.children -= 1;
+            parent.children.retain(|child| child != key);
             parent.ready_children -= u32::from(node.ready);
         }
         self.notify(NodeEvent::Gone, &node);
@@ -444,10 +486,10 @@ impl<L> Index<L> {
         let now = SystemTime::now();
         self.ordered()
             .take_while(|node| {
-                node.children > 0
+                node.children() > 0
                     || now.duration_since(node.last_used).unwrap_or_default() >= self.max_age
             })
-            .filter(|node| node.children == 0 && eligible(node))
+            .filter(|node| node.children() == 0 && eligible(node))
             .take(64)
             .map(|node| node.key)
             .collect()
@@ -626,7 +668,7 @@ impl<L> Index<L> {
             .nodes
             .get(key)
             .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
-        if node.children != 0 || node.pins != 0 {
+        if node.children() != 0 || node.pins != 0 {
             return Err(invalid(
                 "cannot remove a pinned host record or one with children",
             ));
@@ -645,9 +687,9 @@ impl<L> Index<L> {
             next = None;
             if let Some(parent) = node.parent {
                 let parent_node = self.nodes.get_mut(&parent).unwrap();
-                parent_node.children -= 1;
+                parent_node.children.retain(|child| *child != key);
                 parent_node.ready_children -= u32::from(node.ready);
-                if parent_node.children == 0
+                if parent_node.children() == 0
                     && !parent_node.row
                     && parent_node.pins == 0
                     && !keep(parent_node)
@@ -672,7 +714,10 @@ impl<L> Index<L> {
                 node.ready
                     && node.pins == 0
                     && evictable(node)
-                    && (node.children == 0 || (need_row && node.row && node.children == 1))
+                    && (node.children() == 0
+                        || (need_row
+                            && node.row
+                            && self.has_row_below(&node.key, |n| n.ready && n.row)))
             })
             .map(|node| node.key)
     }
@@ -686,7 +731,7 @@ impl<L> Index<L> {
         keep: impl Fn(&Node<L>) -> bool,
     ) -> Option<Eviction<L>> {
         let candidate = self.candidate(need_row, evictable)?;
-        if self.nodes[&candidate].children == 0 {
+        if self.nodes[&candidate].children() == 0 {
             return self.remove(&candidate, keep).ok().map(Eviction::Leaves);
         }
         self.drop_row(&candidate);
@@ -1080,8 +1125,9 @@ mod tests {
         index.drop_row(&child);
         index.drop_row(&child);
         assert_eq!(events(&sink), [(NodeEvent::RowDropped, 1300, false)]);
-        // The older parent compacts first, then the leaf goes and takes the
-        // page-only parent with it.
+        // The parent becomes compactable once the child's row returns.
+        assert!(index.candidate(true, |n| n.key != child).is_none());
+        index[&child].row = true;
         assert!(matches!(
             index.evict(true, |_| true, |_| false),
             Some(Eviction::Compacted(_))
@@ -1094,7 +1140,7 @@ mod tests {
         assert_eq!(
             events(&sink),
             [
-                (NodeEvent::Gone, 1300, false),
+                (NodeEvent::Gone, 1300, true),
                 (NodeEvent::Gone, 700, false)
             ]
         );
