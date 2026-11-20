@@ -124,33 +124,52 @@ def test_ollama_model_discovery(clients):
 
 def test_sdk_buffered_and_streaming_text(clients):
     o, a, _ = clients
-    chat = o.chat.completions.create(model="local", messages=USER, max_tokens=32, extra_body=EXTRA)
-    assert chat.choices[0].message.content == "OK"
+    # Generating through EOS gives every protocol the same explicit termination cause.
+    extra = {**EXTRA, "ignore_eos": True}
+    chat = o.chat.completions.create(model="local", messages=USER, max_tokens=32, extra_body=extra)
+    message = chat.choices[0].message
+    assert message.content or getattr(message, "reasoning_content", None)
+    assert chat.choices[0].finish_reason == "length"
+    assert chat.usage.completion_tokens == 32
     chunks = list(o.chat.completions.create(
         model="local", messages=USER, max_tokens=32, stream=True,
-        stream_options={"include_usage": True}, extra_body=EXTRA,
+        stream_options={"include_usage": True}, extra_body=extra,
     ))
-    assert "".join(c.choices[0].delta.content or "" for c in chunks if c.choices) == "OK"
-    assert chunks[-1].usage.total_tokens > 0
-    with a.messages.stream(model="local", messages=USER, max_tokens=32, extra_body=EXTRA) as stream:
-        assert "".join(stream.text_stream) == "OK"
-        message = stream.get_final_message()
-    assert message.stop_reason == "end_turn"
-    buffered = a.messages.create(model="local", messages=USER, max_tokens=32, extra_body=EXTRA)
-    assert [b.model_dump(exclude_none=True) for b in buffered.content] == [b.model_dump(exclude_none=True) for b in message.content]
-    assert message_input_tokens(buffered.usage) == message_input_tokens(message.usage)
-    with o.responses.stream(model="local", input=USER, max_output_tokens=32, extra_body=EXTRA) as stream:
+    choices = [c for chunk in chunks for c in chunk.choices]
+    assert any(c.delta.content or getattr(c.delta, "reasoning_content", None) for c in choices)
+    assert [c.finish_reason for c in choices if c.finish_reason] == ["length"]
+    assert choices[-1].finish_reason == "length"
+    assert chunks[-1].usage.completion_tokens == 32
+    with a.messages.stream(model="local", messages=USER, max_tokens=32, extra_body=extra) as stream:
         events = list(stream)
-        response = stream.get_final_response()
-    assert response.output_text == "OK"
-    assert response.status == "completed"
-    assert events[-1].type == "response.completed"
-    buffered = o.responses.create(model="local", input=USER, max_output_tokens=32, extra_body=EXTRA)
-    assert buffered.output_text == response.output_text
+        streamed = stream.get_final_message()
+    assert events[0].type == "message_start" and events[-1].type == "message_stop"
+    for index, block in enumerate(streamed.content):
+        parts = [event.delta for event in events if event.type == "content_block_delta" and event.index == index]
+        if block.type == "text":
+            assert "".join(d.text for d in parts if d.type == "text_delta") == block.text
+        elif block.type == "thinking":
+            assert "".join(d.thinking for d in parts if d.type == "thinking_delta") == block.thinking
+    buffered = a.messages.create(model="local", messages=USER, max_tokens=32, extra_body=extra)
+    for result in (buffered, streamed):
+        assert any(b.type in ("text", "thinking") for b in result.content)
+        assert result.stop_reason == "max_tokens"
+        assert result.usage.output_tokens == 32
+    assert message_input_tokens(buffered.usage) == message_input_tokens(streamed.usage)
+    with o.responses.stream(model="local", input=USER, max_output_tokens=32, extra_body=extra) as stream:
+        events = list(stream)
+    assert events[0].type == "response.created" and events[-1].type == "response.incomplete"
+    streamed = events[-1].response
+    assert "".join(e.delta for e in events if e.type == "response.output_text.delta") == streamed.output_text
+    buffered = o.responses.create(model="local", input=USER, max_output_tokens=32, extra_body=extra)
+    for result in (buffered, streamed):
+        assert any(item.type in ("message", "reasoning") for item in result.output)
+        assert result.status == "incomplete" and result.incomplete_details.reason == "max_output_tokens"
+        assert result.usage.output_tokens == 32
 
 
 def test_raw_completion_batch_and_zero_tokens(clients):
-    o, _, _ = clients
+    o, _, http = clients
     zero = o.completions.create(model="local", prompt=["Hello", "World"], n=2, echo=True, max_tokens=0)
     assert [c.text for c in zero.choices] == ["Hello", "Hello", "World", "World"]
     assert zero.usage.completion_tokens == 0
@@ -159,9 +178,23 @@ def test_raw_completion_batch_and_zero_tokens(clients):
     result = o.completions.create(model="local", prompt=["The capital of France is", "One plus one equals"], n=2, max_tokens=4, temperature=1)
     assert [c.index for c in result.choices] == [0, 1, 2, 3]
     assert all(c.text for c in result.choices)
-    chunks = list(o.completions.create(model="local", prompt=["Hello", "World"], n=2, max_tokens=2, stream=True, stream_options={"include_usage": True}, temperature=1))
-    assert {c.index for chunk in chunks for c in chunk.choices} == {0, 1, 2, 3}
-    assert chunks[-1].usage.completion_tokens == 8
+    before = http.get("/metrics?format=json").json()["generated_tokens"]
+    chunks = list(o.completions.create(
+        model="local", prompt=["Hello", "World"], n=2, max_tokens=2, stream=True,
+        stream_options={"include_usage": True}, temperature=1,
+    ))
+    after = http.get("/metrics?format=json").json()["generated_tokens"]
+    minimum = 0
+    for index in range(4):
+        choices = [c for chunk in chunks for c in chunk.choices if c.index == index]
+        assert [c.finish_reason for c in choices if c.finish_reason] == [choices[-1].finish_reason]
+        assert choices[-1].finish_reason in ("stop", "length")
+        minimum += 2 if choices[-1].finish_reason == "length" else 1
+    assert {c.index for chunk in chunks for c in chunk.choices} == set(range(4))
+    # On the idle test service, the committed-token counter includes terminating EOS tokens.
+    assert minimum <= after - before <= 8
+    assert chunks[-1].usage.completion_tokens == after - before
+    assert chunks[-1].usage.total_tokens == chunks[-1].usage.prompt_tokens + after - before
     raw = o.completions.create(model="local", prompt=[1, 2, 3], max_tokens=0)
     assert raw.usage.prompt_tokens == 3
 
@@ -264,10 +297,13 @@ def test_token_count_and_compressed_requests(clients):
     counted = a.messages.count_tokens(model="local", messages=USER, extra_body=EXTRA)
     message = a.messages.create(model="local", messages=USER, max_tokens=16, extra_body=EXTRA)
     assert counted.input_tokens == message_input_tokens(message.usage)
-    body = json.dumps({"input": "Reply with exactly OK.", "max_output_tokens": 16, **EXTRA}).encode()
+    body = json.dumps({"input": USER, "max_output_tokens": 16, "ignore_eos": True, **EXTRA}).encode()
     result = http.post("/v1/responses", content=gzip.compress(body), headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
     result.raise_for_status()
-    assert result.json()["output"][0]["content"][0]["text"] == "OK"
+    response = result.json()
+    assert response["status"] == "incomplete" and response["incomplete_details"]["reason"] == "max_output_tokens"
+    assert response["usage"]["output_tokens"] == 16
+    assert any(item["type"] in ("message", "reasoning") for item in response["output"])
 
 
 def test_messages_tool_history(clients):
@@ -529,11 +565,12 @@ def test_messages_inline_system_text_and_empty_controls(clients):
     counted = a.messages.count_tokens(model="local", messages=history, extra_body=EXTRA)
     empty = a.messages.count_tokens(model="local", messages=history + [controls], extra_body=EXTRA)
     assert counted.input_tokens == empty.input_tokens
-    with a.messages.stream(model="local", messages=history + [controls], max_tokens=32, extra_body=EXTRA) as stream:
-        assert "".join(stream.text_stream) == "OK"
+    with a.messages.stream(model="local", messages=history + [controls], max_tokens=32,
+                           extra_body={**EXTRA, "ignore_eos": True}) as stream:
+        list(stream)
         result = stream.get_final_message()
     assert message_input_tokens(result.usage) == counted.input_tokens
-    assert result.stop_reason == "end_turn"
+    assert result.stop_reason == "max_tokens" and result.usage.output_tokens == 32
 
 
 def test_responses_tool_history(clients):
@@ -698,15 +735,26 @@ def test_authenticated_protocol_headers(clients):
 
 
 def test_image_input(clients):
-    o, a, _ = clients
+    o, a, http = clients
     image = Path(__file__).parents[1] / "frontend/qwen38_images-inputs/RGB.png"
     data = base64.b64encode(image.read_bytes()).decode()
-    result = a.messages.create(model="local", max_tokens=48, messages=[{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}, {"type": "text", "text": "Describe the image briefly."}]}], extra_body=EXTRA)
-    assert any(b.type == "text" and b.text for b in result.content)
+    anthropic_messages = [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+        {"type": "text", "text": "Describe the image briefly."},
+    ]}]
     messages = [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}},
         {"type": "text", "text": "Describe the image briefly."},
     ]}]
+    if "image" not in http.get("/v1/models").json()["data"][0]["flare"]["input_modalities"]:
+        for path, payload in (("/v1/messages", anthropic_messages), ("/v1/chat/completions", messages)):
+            headers = {"anthropic-version": "2023-06-01"} if path == "/v1/messages" else {}
+            response = http.post(path, json={"model": "local", "messages": payload, "max_tokens": 1}, headers=headers)
+            assert response.status_code == 400
+            assert "does not support image inputs" in response.json()["error"]["message"]
+        return
+    result = a.messages.create(model="local", max_tokens=48, messages=anthropic_messages, extra_body=EXTRA)
+    assert any(b.type == "text" and b.text for b in result.content)
     extra = {**EXTRA, "return_token_ids": True}
     buffered = o.chat.completions.create(model="local", messages=messages, max_tokens=8, extra_body=extra)
     chunks = list(o.chat.completions.create(
