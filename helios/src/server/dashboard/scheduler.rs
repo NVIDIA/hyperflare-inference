@@ -658,11 +658,22 @@ mod tests {
     #[test]
     fn scheduler_pane_renders_at_terminal_sizes_with_legible_units_and_no_nan() {
         let (view, metrics, history) = fixture();
+        let parallax_view = parallax::ParallaxView::default();
+        let now = Instant::now();
         for (width, height) in [(150, 38), (100, 30), (80, 24), (40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
-                    render_pane(frame, "Qwen", &history, &view, &metrics, Pane::Scheduler)
+                    render_pane(
+                        frame,
+                        "Qwen",
+                        &history,
+                        &view,
+                        &parallax_view,
+                        &metrics,
+                        Pane::Scheduler,
+                        now,
+                    )
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();

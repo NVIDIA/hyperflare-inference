@@ -56,6 +56,7 @@ static VISIBLE: AtomicBool = AtomicBool::new(false);
 /// The rendering functions take `ratatui` types; `ratatui` and `crossterm` are
 /// re-exported so dependents render with the same versions.
 pub mod view {
+    pub use super::parallax::{ParallaxMode, ParallaxView, PlacementLens};
     pub use super::{
         BACKGROUND, CYAN, GOLD, GREEN, History, MUTED, PURPLE, Rates, Series, TEXT, gibibytes,
         kv_cache_lines, plot, rate, weight_bandwidth,
@@ -117,6 +118,7 @@ impl Dashboard {
                     let start = Instant::now();
                     let mut history = History::new(start, metrics.snapshot(learned_drafter));
                     let mut scheduler = scheduler::SchedulerView::default();
+                    let mut parallax_view = parallax::ParallaxView::new(start);
                     let mut pane = Pane::Overview;
                     let _telemetry = Telemetry(&metrics);
                     metrics.scheduler_trace.start();
@@ -130,6 +132,9 @@ impl Dashboard {
                                 &metrics.scheduler_trace,
                                 super::observation::monotonic_ns(),
                             );
+                            if pane == Pane::Parallax || metrics.parallax.is_active() {
+                                parallax_view.sample(now, metrics.parallax.predictions());
+                            }
                             sampled = now;
                             redraw = true;
                         }
@@ -141,7 +146,12 @@ impl Dashboard {
                                 }
                                 match event::read()? {
                                     Event::Key(key) => {
-                                        redraw |= navigate(&mut pane, &mut scheduler, key)
+                                        redraw |= navigate(
+                                            &mut pane,
+                                            &mut scheduler,
+                                            &mut parallax_view,
+                                            key,
+                                        )
                                     }
                                     Event::Resize(..) => redraw = true,
                                     _ => {}
@@ -150,7 +160,16 @@ impl Dashboard {
                         }
                         if redraw {
                             terminal.draw(|frame| {
-                                render_pane(frame, &title, &history, &scheduler, &metrics, pane)
+                                render_pane(
+                                    frame,
+                                    &title,
+                                    &history,
+                                    &scheduler,
+                                    &parallax_view,
+                                    &metrics,
+                                    pane,
+                                    now,
+                                )
                             })?;
                             redraw = false;
                         }
@@ -257,7 +276,12 @@ enum Pane {
     Parallax,
 }
 
-fn navigate(pane: &mut Pane, scheduler: &mut scheduler::SchedulerView, key: KeyEvent) -> bool {
+fn navigate(
+    pane: &mut Pane,
+    scheduler: &mut scheduler::SchedulerView,
+    parallax_view: &mut parallax::ParallaxView,
+    key: KeyEvent,
+) -> bool {
     if key.kind == KeyEventKind::Release {
         return false;
     }
@@ -279,17 +303,28 @@ fn navigate(pane: &mut Pane, scheduler: &mut scheduler::SchedulerView, key: KeyE
             scheduler.scroll(1);
             true
         }
+        KeyCode::Char('v' | 'V' | 'l' | 'L') if *pane == Pane::Parallax => {
+            parallax_view.toggle_mode();
+            true
+        }
+        KeyCode::Char('f' | 'F') if *pane == Pane::Parallax => {
+            parallax_view.cycle_lens();
+            true
+        }
         _ => false,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pane(
     frame: &mut Frame,
     title: &str,
     history: &History,
     scheduler: &scheduler::SchedulerView,
+    parallax_view: &parallax::ParallaxView,
     metrics: &Metrics,
     pane: Pane,
+    now: Instant,
 ) {
     let area = frame.area();
     frame.render_widget(
@@ -328,7 +363,9 @@ fn render_pane(
         rows[1],
     );
     match pane {
-        Pane::Parallax => parallax::render(frame,rows[2],metrics.parallax.predictions()),
+        Pane::Parallax => {
+            parallax_view.render_with_report(frame, rows[2], now, &metrics.parallax.predictions())
+        }
         Pane::Overview => render_overview(frame, history, rows[2]),
         Pane::Scheduler => {
             scheduler.render(frame, rows[2], history.snapshot, &metrics.scheduler_trace)
@@ -691,12 +728,24 @@ mod tests {
         history.sample(start + Duration::from_secs(23), Snapshot::default());
         let metrics = Metrics::default();
         let scheduler = scheduler::SchedulerView::default();
+        let parallax_view = parallax::ParallaxView::new(start);
         let title = "deepseek-ai/DeepSeek-V4.1-Flash · 127.0.0.1:8001";
         let mut headers = Vec::new();
         for pane in [Pane::Overview, Pane::Scheduler, Pane::Parallax] {
             let mut terminal = Terminal::new(TestBackend::new(150, 35)).unwrap();
             terminal
-                .draw(|frame| render_pane(frame, title, &history, &scheduler, &metrics, pane))
+                .draw(|frame| {
+                    render_pane(
+                        frame,
+                        title,
+                        &history,
+                        &scheduler,
+                        &parallax_view,
+                        &metrics,
+                        pane,
+                        start,
+                    )
+                })
                 .unwrap();
             let buffer = terminal.backend().buffer();
             let lines: Vec<String> = buffer
@@ -717,14 +766,15 @@ mod tests {
     fn arrows_switch_panes_without_treating_key_release_as_another_press() {
         let mut pane = Pane::Overview;
         let mut scheduler = scheduler::SchedulerView::default();
+        let mut parallax_view = parallax::ParallaxView::default();
         let mut key = KeyEvent::new(KeyCode::Right, event::KeyModifiers::NONE);
-        assert!(navigate(&mut pane, &mut scheduler, key));
+        assert!(navigate(&mut pane, &mut scheduler, &mut parallax_view, key));
         assert_eq!(pane, Pane::Scheduler);
         key.kind = KeyEventKind::Release;
-        assert!(!navigate(&mut pane, &mut scheduler, key));
+        assert!(!navigate(&mut pane, &mut scheduler, &mut parallax_view, key));
         assert_eq!(pane, Pane::Scheduler);
         key = KeyEvent::new(KeyCode::Left, event::KeyModifiers::NONE);
-        assert!(navigate(&mut pane, &mut scheduler, key));
+        assert!(navigate(&mut pane, &mut scheduler, &mut parallax_view, key));
         assert_eq!(pane, Pane::Overview);
     }
 

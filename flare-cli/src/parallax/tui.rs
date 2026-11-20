@@ -8,7 +8,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use flare_helios::server::view::{
-    BACKGROUND, CYAN, GOLD, GREEN, MUTED, PURPLE, TEXT, crossterm, ratatui,
+    BACKGROUND, CYAN, GOLD, GREEN, MUTED, PURPLE, ParallaxView, TEXT, crossterm, ratatui,
 };
 use ratatui::{
     Frame, Terminal,
@@ -340,6 +340,89 @@ pub fn run(view: &Shared) -> Result<(), Failure> {
     }
     Ok(())
 }
+pub fn watch(base_url: &str) -> Result<(), Failure> {
+    let endpoint = format!("{base_url}/v1/parallax/predictions");
+    let client = super::agent(5);
+    enable_raw_mode()?;
+    let _screen = Screen;
+    execute!(io::stderr(), EnterAlternateScreen, Hide)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stderr()))?;
+    terminal.clear()?;
+
+    let start = Instant::now();
+    let mut view = ParallaxView::new(start);
+    let mut last_poll = start - Duration::from_secs(1);
+    let mut last_error: Option<String> = None;
+
+    loop {
+        if crate::STOP.load(Ordering::Relaxed) {
+            break;
+        }
+        let now = Instant::now();
+        if now.duration_since(last_poll) >= Duration::from_millis(500) {
+            match super::get(&client, &endpoint) {
+                Ok(report) => {
+                    view.sample(now, report);
+                    last_error = None;
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
+            }
+            last_poll = now;
+        }
+        let age = now.saturating_duration_since(start).as_secs();
+        terminal.draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(
+                Block::default().style(Style::default().bg(BACKGROUND).fg(TEXT)),
+                area,
+            );
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+            let (status, status_color) = match &last_error {
+                Some(err) => (format!("● RECONNECTING ({err})"), GOLD),
+                None => ("● LIVE".into(), GREEN),
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        " FLARE ",
+                        Style::default()
+                            .fg(BACKGROUND)
+                            .bg(CYAN)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" / PARALLAX  ", Style::default().fg(CYAN)),
+                    Span::styled(status, Style::default().fg(status_color)),
+                    Span::styled(
+                        format!("    {:02}:{:02}:{:02}    {base_url}    [q] Quit", age / 3600, age / 60 % 60, age % 60),
+                        Style::default().fg(MUTED),
+                    ),
+                ])),
+                rows[0],
+            );
+            view.render(frame, rows[1], now);
+        })?;
+        if event::poll(Duration::from_millis(80))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q' | 'Q') | KeyCode::Esc => break,
+                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        break;
+                    }
+                    KeyCode::Char('v' | 'V' | 'l' | 'L') => view.toggle_mode(),
+                    KeyCode::Char('f' | 'F') => view.cycle_lens(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn plain(view: &Shared) -> Result<(), Failure> {
     let mut previous = String::new();
     loop {

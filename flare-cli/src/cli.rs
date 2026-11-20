@@ -2398,11 +2398,14 @@ mod cache_cli_tests {
 #[cfg(unix)]
 #[derive(Debug, Args)]
 pub struct ParallaxArgs {
+    /// Attach the live Parallax residency dashboard to a running Flare server URL.
+    #[arg(long, value_name = "URL", conflicts_with_all = ["experiment", "replay"])]
+    pub url: Option<String>,
     /// JSON package, catalog, cost model, GPU and compiled predictor configuration.
-    #[arg(long, value_name = "PATH", required_unless_present="replay", conflicts_with="replay")]
+    #[arg(long, value_name = "PATH", required_unless_present_any = ["replay", "url"], conflicts_with_all = ["replay", "url"])]
     pub experiment: Option<PathBuf>,
     /// Re-evaluate a saved native capture without loading a model or using a GPU.
-    #[arg(long, value_name="PATH")]
+    #[arg(long, value_name="PATH", conflicts_with = "url")]
     pub replay: Option<PathBuf>,
     /// Alternate evaluation JSON for recorded forecasts; leaves the saved capture unchanged.
     #[arg(long, value_name="PATH", requires="replay")]

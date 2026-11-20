@@ -386,6 +386,21 @@ fn observe(
 }
 
 pub fn run(args: crate::cli::ParallaxArgs) -> Result<(), Failure> {
+    if let Some(url) = args.url {
+        let base = url.trim_end_matches('/').to_owned();
+        if args.plain || !std::io::stderr().is_terminal() {
+            let client = agent(10);
+            let report = get(&client, &format!("{base}/v1/parallax/predictions"))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        // SAFETY: the handler only stores to the same atomic stop flag as normal serving.
+        unsafe {
+            libc::signal(libc::SIGINT, crate::stop as *const () as usize);
+            libc::signal(libc::SIGTERM, crate::stop as *const () as usize);
+        }
+        return tui::watch(&base);
+    }
     if let Some(path) = args.replay {
         let alternate = args.evaluation_config.is_some();
         let report = if let Some(config) = args.evaluation_config {

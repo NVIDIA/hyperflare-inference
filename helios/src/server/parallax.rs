@@ -13,6 +13,7 @@ pub use observer::{replay, reevaluate};
 pub use prediction::{Profile, Registry};
 
 use crate::parallax::{RoutingReadout, RoutingSample};
+use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -45,6 +46,7 @@ pub(super) struct Telemetry {
     invalid: AtomicU64,
     history: Mutex<VecDeque<Arc<Record>>>,
     observer: OnceLock<observer::Observer>,
+    protected_bitset: OnceLock<Option<String>>,
 }
 
 impl Default for Telemetry {
@@ -65,6 +67,7 @@ impl Default for Telemetry {
             invalid: AtomicU64::new(0),
             history: Mutex::new(VecDeque::with_capacity(CAPACITY)),
             observer: OnceLock::new(),
+            protected_bitset: OnceLock::new(),
         }
     }
 }
@@ -138,17 +141,23 @@ impl Telemetry {
         {
             return Err("catalog exceeds native routing geometry".into());
         }
+        let protected = profile_protected_bitset(&profile, layers, experts);
         let observer = observer::Observer::start_with_residency(profile, Registry::builtins(), self.residency.clone())?;
+        let _ = self.protected_bitset.set(protected);
         self.observer
             .set(observer)
             .map_err(|_| "prediction providers already started".into())
+    }
+    pub fn is_active(&self) -> bool {
+        self.observer.get().is_some() || self.residency.is_some()
     }
     pub fn predictions(&self) -> Value {
         let mut report = self.observer.get().map(|o| o.snapshot()).unwrap_or_else(
             || json!({"enabled":false,"contenders":{},"routing_frames":0,"workers":{}}),
         );
         if let Some(binding) = &self.residency {
-            report["physical_residency"] = physical_report(binding, report["active_policy"].is_object());
+            let protected = self.protected_bitset.get().and_then(|v| v.as_deref());
+            report["physical_residency"] = physical_report(binding, report["active_policy"].is_object(), protected);
         }
         report
     }
@@ -183,11 +192,76 @@ impl Telemetry {
     }
 }
 
-fn physical_report(binding: &crate::parallax::residency::execution::ExecutionBinding, active: bool) -> Value {
+pub(super) fn encode_expert_bitset(
+    layers: usize,
+    experts_per_layer: usize,
+    active: impl IntoIterator<Item = (usize, usize)>,
+) -> String {
+    let total = layers.saturating_mul(experts_per_layer);
+    let mut bytes = vec![0u8; total.div_ceil(8)];
+    for (layer, expert) in active {
+        if layer < layers && expert < experts_per_layer {
+            let idx = layer * experts_per_layer + expert;
+            bytes[idx / 8] |= 1u8 << (idx % 8);
+        }
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+pub(super) fn profile_protected_bitset(
+    profile: &Profile,
+    layers: usize,
+    experts_per_layer: usize,
+) -> Option<String> {
+    let protected = profile
+        .settings
+        .decayed_miss_lru
+        .as_ref()
+        .map(|c| &c.protected_experts)
+        .or_else(|| {
+            profile
+                .settings
+                .static_core_lru
+                .as_ref()
+                .map(|c| &c.protected_experts)
+        })?;
+    if protected.is_empty() || layers == 0 || experts_per_layer == 0 {
+        return None;
+    }
+    Some(encode_expert_bitset(
+        layers,
+        experts_per_layer,
+        protected.iter().map(|e| (e.layer, e.expert)),
+    ))
+}
+
+fn physical_report(
+    binding: &crate::parallax::residency::execution::ExecutionBinding,
+    active: bool,
+    protected_bitset: Option<&str>,
+) -> Value {
     match binding.report() {
         Ok(report) => {
             let state=report.snapshot;
             let hbm=state.experts.values().filter(|resident| **resident).count();
+            let (layers, experts_per_layer) = state.experts.keys().fold((0usize, 0usize), |(l, e), id| {
+                (l.max(id.layer + 1), e.max(id.expert + 1))
+            });
+            let placement = if layers > 0 && experts_per_layer > 0 {
+                let hbm_bitset = encode_expert_bitset(
+                    layers,
+                    experts_per_layer,
+                    state.experts.iter().filter_map(|(id, resident)| (*resident).then_some((id.layer, id.expert))),
+                );
+                json!({
+                    "layers": layers,
+                    "experts_per_layer": experts_per_layer,
+                    "hbm_bitset": hbm_bitset,
+                    "protected_bitset": protected_bitset,
+                })
+            } else {
+                Value::Null
+            };
             json!({"mode":if active {"active_policy"} else {"configured_initial_placement"},"catalog_id":state.catalog_id,
                 "generation":state.generation,"hbm_experts":hbm,"grace_experts":state.experts.len()-hbm,
                 "hbm_pool_bytes":state.hbm_allocated_bytes,"grace_backing_bytes":state.backing_allocated_bytes,
@@ -203,7 +277,8 @@ fn physical_report(binding: &crate::parallax::residency::execution::ExecutionBin
                 "timed_copy_transactions_including_startup":state.statistics.timed_copies,
                 "rollbacks":state.statistics.rollbacks,"rejected_plans":state.statistics.rejected,
                 "cancelled_transactions":state.statistics.cancellations,"movement_error":report.disabled,
-                "movement_history_capacity":256,"movement_event_total":report.event_count,"movement_events":report.events})
+                "movement_history_capacity":256,"movement_event_total":report.event_count,"movement_events":report.events,
+                "placement":placement})
         },
         Err(error) => json!({"error":error.to_string()}),
     }

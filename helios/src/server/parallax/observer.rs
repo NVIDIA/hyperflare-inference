@@ -237,6 +237,11 @@ impl Observer {
                     error: None,
                     limit_reason: None,
                 };
+                let (layers, experts_per_layer) = capture.profile.model.experts.iter().fold(
+                    (0usize, 0usize),
+                    |(l, e), id| (l.max(id.layer + 1), e.max(id.expert + 1)),
+                );
+                let protected_bitset = super::profile_protected_bitset(&capture.profile, layers, experts_per_layer);
                 let mut live = Continuous::new(&capture, cell_limit);
                 let (evaluation_tx, evaluation_rx) = mpsc::sync_channel::<(Capture, Value, Option<Capture>)>(1);
                 let reports = display.clone();
@@ -451,7 +456,7 @@ impl Observer {
                             totals["actual_ledger"] = ledger.report();
                         }
                         if let Some(policy) = &active { totals["active_policy"] = policy.report(); }
-                        if let Some(binding) = &binding { totals["physical_residency"] = super::physical_report(binding,active.is_some()); }
+                        if let Some(binding) = &binding { totals["physical_residency"] = super::physical_report(binding,active.is_some(),protected_bitset.as_deref()); }
                         let _ = evaluation_tx.try_send((window, totals, None));
                         report_at = now_ns() + 1_000_000_000;
                     }
@@ -466,7 +471,7 @@ impl Observer {
                             totals["actual_ledger"] = ledger.report();
                         }
                         if let Some(policy) = &active { totals["active_policy"] = policy.report(); }
-                        if let Some(binding) = &binding { totals["physical_residency"] = super::physical_report(binding,active.is_some()); }
+                        if let Some(binding) = &binding { totals["physical_residency"] = super::physical_report(binding,active.is_some(),protected_bitset.as_deref()); }
                 let _ = evaluation_tx.send((window, totals, Some(capture)));
                 drop(evaluation_tx);
                 let _ = evaluation.join();
