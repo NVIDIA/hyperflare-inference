@@ -24,6 +24,8 @@ class BatchInputs:
     token_ids: torch.Tensor
     page_tables: torch.Tensor
     sample_enabled: torch.Tensor
+    vision_token_indices: torch.Tensor
+    vision_feature_slot: torch.Tensor
 
     @classmethod
     def allocate(cls, tokens, blocks, device, *, capacity):
@@ -39,6 +41,8 @@ class BatchInputs:
             zeros(tokens, torch.int64),
             zeros((capacity, blocks)) - 1,
             zeros(capacity),
+            torch.full((tokens,), -1, dtype=torch.int32, device=device),
+            torch.full((1,), -1, dtype=torch.int32, device=device),
         )
 
     def buffers(self):
