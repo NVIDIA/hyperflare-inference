@@ -83,6 +83,9 @@ class ReferenceCache:
     Each write stores its own quantized bytes and scales. Subsequent writes
     cannot change preceding records. Reads include just-written rows, with
     decoded latents rounded to BF16 before the canonical expansion projection.
+    Transformers groups even and odd rotary coordinates into separate halves.
+    Importing a native prefix requires de-interleaving the rotary key pairs
+    and moving the index key's rotary coordinates ahead of its unrotated ones.
     This diagnostic cache does not implement native paging or serving state.
     """
 

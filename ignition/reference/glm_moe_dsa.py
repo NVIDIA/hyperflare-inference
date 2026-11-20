@@ -79,11 +79,12 @@ class StreamingExperts(torch.nn.Module):
     calibrated NVFP4 activation quantization. BF16 experts ignore it.
     """
 
-    def __init__(self, canonical, reader, prefix, *, activation):
+    def __init__(self, canonical, reader, prefix, *, activation, fixed_row_batches=False):
         super().__init__()
         if activation not in ("a16", "a4"):
             raise ValueError("expert activation must be a16 or a4")
         self.reader, self.prefix, self.activation = reader, prefix, activation
+        self.fixed_row_batches = fixed_row_batches
         self.act = canonical.act_fn
         self.quantized = f"{prefix}.0.gate_proj.weight_scale" in reader.manifest.tensors
 
@@ -110,7 +111,16 @@ class StreamingExperts(torch.nn.Module):
         output = torch.zeros_like(hidden_states)
         for expert in top_k_index.unique(sorted=True).tolist():
             rows, slots = torch.where(top_k_index == expert)
-            contribution = self.expert(hidden_states[rows], expert) * top_k_weights[rows, slots, None]
+            inputs = hidden_states[rows]
+            if self.fixed_row_batches:
+                # Keep the matrix reduction for an earlier token independent
+                # of how many later tokens route to the same expert.
+                tile_rows = 64
+                padded = torch.nn.functional.pad(inputs, (0, 0, 0, -len(inputs) % tile_rows))
+                values = torch.cat([self.expert(tile, expert) for tile in padded.split(tile_rows)])[:len(inputs)]
+            else:
+                values = self.expert(inputs, expert)
+            contribution = values * top_k_weights[rows, slots, None]
             output.index_add_(0, rows, contribution.to(output.dtype))
         return output
 
@@ -130,7 +140,9 @@ def text_reference(snapshot, token_ids, *, device="cuda:0", dtype=None, expert_a
     an indexer receives the fixture's selection, so each recorded output shows
     one layer's own error without accumulation.
     `cache_precision` selects BF16 storage, FP8 latent storage, or FP8 latent
-    and index storage for paired BF16 arithmetic comparisons. Omitting it
+    and index storage for paired BF16 arithmetic comparisons. These comparisons
+    use fixed-size expert projection batches so that future routing cannot
+    alter the matrix shape used for earlier tokens. Omitting `cache_precision`
     preserves the canonical forward without a storage adapter.
     """
     from transformers.masking_utils import create_causal_mask
@@ -183,8 +195,10 @@ def text_reference(snapshot, token_ids, *, device="cuda:0", dtype=None, expert_a
         prefix = f"model.layers.{index}"
         reader.install(layer, prefix)
         if config.mlp_layer_types[index] == "sparse":
-            layer.mlp.experts = StreamingExperts(layer.mlp.experts, reader, prefix + ".mlp.experts",
-                                                 activation=expert_activation)
+            layer.mlp.experts = StreamingExperts(
+                layer.mlp.experts, reader, prefix + ".mlp.experts",
+                activation=expert_activation, fixed_row_batches=cache_precision is not None,
+            )
         cache = None if cache_precision is None else ReferenceCache(cache_precision)
         if cache_precision == "fp8-latent-index" and layer.self_attn.indexer is not None:
             layer.self_attn.indexer = QuantizedIndexer(layer.self_attn.indexer)

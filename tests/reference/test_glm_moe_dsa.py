@@ -31,7 +31,8 @@ def _canonical(reader, config, prefix, decode):
 
 @torch.no_grad()
 @pytest.mark.parametrize("layer", [3, 78])
-def test_streamed_experts_match_the_transformers_expert_module(layer):
+@pytest.mark.parametrize("fixed_row_batches", [False, True])
+def test_streamed_experts_match_the_transformers_expert_module(layer, fixed_row_batches):
     """Layer 3 stores NVFP4 experts and layer 78 stores BF16 experts."""
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.reference.glm_moe_dsa import CheckpointReader, StreamingExperts
@@ -51,7 +52,7 @@ def test_streamed_experts_match_the_transformers_expert_module(layer):
                             reader.raw(name + ".weight_scale_2"))
 
     canonical = _canonical(reader, config, prefix, decode)
-    streamed = StreamingExperts(canonical, reader, prefix, activation="a16")
+    streamed = StreamingExperts(canonical, reader, prefix, activation="a16", fixed_row_batches=fixed_row_batches)
     generator = torch.Generator().manual_seed(53)
     # BF16-representable inputs: the W4A16 reference rounds activations to BF16.
     hidden = torch.randn((ROWS, config["hidden_size"]), generator=generator).to(torch.bfloat16).float()

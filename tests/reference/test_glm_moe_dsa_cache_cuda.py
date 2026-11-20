@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare deployed GLM cache writers with independent storage arithmetic on fixed operands."""
+"""Check GLM cache byte encodings and the causal prefix in paired Transformers forwards."""
 
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -100,3 +101,24 @@ def test_native_cache_writes_and_query_rounding_match_independent_reference():
     assert torch.equal(query_bytes.view(torch.uint8).cpu(), expected_queries)
     assert torch.equal(query_scales.cpu(), expected_scales)
     assert torch.equal(head_weights.cpu(), expected_scales / 64)
+
+
+@torch.inference_mode()
+def test_index_rounding_cannot_change_the_first_2048_token_states():
+    from ignition import runtime_patches
+    from ignition.reference.glm_moe_dsa import text_reference
+
+    snapshot = os.environ.get("FLARE_GLM53_FULL_SNAPSHOT")
+    fixtures = os.environ.get("FLARE_GLM53_FULL_REFERENCE")
+    if not snapshot or not fixtures:
+        pytest.skip("requires the GLM 5.3 checkpoint and full-model reference fixtures")
+    runtime_patches.apply()
+    tokens = torch.load(Path(fixtures) / "long.pt", mmap=True)["token_ids"].tolist()
+    assert len(tokens) > 2048
+
+    # Both index representations select every causal key through position 2,047.
+    # Later routes can differ, including in layer three, the first routed layer.
+    latent, _ = text_reference(snapshot, tokens, layers=4, cache_precision="fp8-latent")
+    indexed, _ = text_reference(snapshot, tokens, layers=4, cache_precision="fp8-latent-index")
+    assert not torch.equal(latent[2048:], indexed[2048:])
+    torch.testing.assert_close(latent[:2048], indexed[:2048], atol=0, rtol=0)
