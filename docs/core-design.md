@@ -948,9 +948,12 @@ Preparation proceeds in this order:
 6. After compiler workers exit, materialize final KV storage through
    `capture_forwards`' materialization callback. Bind live tensors and native
    handles, validate guards, and refresh cache-maintenance pointers.
-7. Warm every variant in rank order and capture each rank's graphs. Preserve
-   mutations, aliases, forks, and joins. Freeze storage and retain compiled
-   kernel owners through native drain.
+7. Warm compiled variants and capture each rank's graphs in descending order of
+   largest compiler-planned CUDA allocation (breaking ties by total planned bytes,
+   then catalog order, agreed across ranks by cross-rank maximum request size),
+   with uncompiled variants following in catalog order. Preserve mutations,
+   aliases, forks, and joins. Freeze storage and retain compiled kernel owners
+   through native drain.
 8. Validate the catalog and frontend assets, export the runtime core, and
    close the prepared model. `flare run CORE` loads the exported core.
 

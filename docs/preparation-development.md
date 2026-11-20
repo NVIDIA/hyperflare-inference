@@ -216,14 +216,14 @@ pool, compiled kernels, graph executables, and native resources until replay
 drains. CUDA libraries can retain allocations referenced by captured kernel
 arguments without Python tensor owners. Preserve those resources through drain.
 
-After warmup, capture compiled forwards in descending order of their largest
+Warm and capture compiled forwards in descending order of their largest
 compiler-planned allocation, with total planned bytes breaking ties. This lets
-smaller requests reuse backing retained by larger captures. Tensor-parallel ranks
-agree on one order using the maximum request sizes across ranks. Uncompiled
-forwards follow in catalog order. Compiler metadata does not include allocations
-inside opaque operators, and the ordering does not guarantee optimal packing for
-forwards with multiple allocations. Keep temporary destinations explicit so the
-compiler can plan them.
+smaller requests reuse transient and graph backing retained by larger variants.
+Tensor-parallel ranks agree on one order using the maximum request sizes across
+ranks. Uncompiled forwards follow in catalog order. Compiler metadata does not
+include allocations inside opaque operators, and the ordering does not guarantee
+optimal packing for forwards with multiple allocations. Keep temporary
+destinations explicit so the compiler can plan them.
 
 Recipes that retain graph-buffer pools keep their caller-owned scratch until
 their serving forwards expose the required reads, writes, and dependencies.
@@ -328,7 +328,9 @@ waits for their completion. See the [ladder format](../ignition/preparation/ladd
   select a variant key through `compilation_variant` on each rank. Every
   selected variant must compile before collective warmup; ranks must not retrace
   or compile on a binding mismatch.
-  Load, warm, freeze, and save one forward at a time in catalog order. Release
+  Load, warm, freeze, and save one forward at a time in descending order of
+  largest compiler-planned CUDA allocation (breaking ties by total planned bytes,
+  then catalog order, using the maximum request sizes across ranks). Release
   its portable compiler state, generated source, bundled tuning metadata, and
   tuning registration after the cache write;
   retain canonical kernel selections, execution guards, live kernel owners, and
