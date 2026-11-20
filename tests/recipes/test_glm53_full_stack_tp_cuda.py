@@ -54,6 +54,41 @@ VERIFY_ROWS = 8
 CAPACITY = {"short": 32, "long": 1408}
 
 
+def _check_causal_suffix(decoder, place_rows, pool):
+    """One pending token has the same logits with zero or two later verification tokens."""
+    metadata = place_rows(3)
+    pages = [*pool.pages.values(), pool.backing]
+    snapshot = [page.clone() for page in pages]
+    tokens = metadata.token_ids.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _, logits, _, _ = decoder(metadata)
+
+    def replay(inputs):
+        for page, saved in zip(pages, snapshot, strict=True):
+            page.copy_(saved)
+        metadata.token_ids.copy_(inputs)
+        graph.replay()
+        return logits[0].clone()
+
+    expected = replay(tokens)
+    assert bool(torch.isfinite(expected).all())
+    assert expected.numel() == 154880
+    expected_bits = expected.view(torch.uint8)
+    assert torch.equal(replay(tokens).view(torch.uint8), expected_bits)
+    changed = tokens.clone()
+    changed[1:3] = tokens.new_tensor([7856, 1234])
+    assert torch.equal(replay(changed).view(torch.uint8), expected_bits)
+    place_rows(1)
+    assert torch.equal(replay(metadata.token_ids.clone()).view(torch.uint8), expected_bits)
+    place_rows(3)
+    changed[0] = (tokens[0] + 1) % 154880
+    assert not torch.equal(replay(changed), expected)
+    for page, saved in zip(pages, snapshot, strict=True):
+        page.copy_(saved)
+    metadata.token_ids.copy_(tokens)
+
+
 def _rank(rank, world, rendezvous, snapshot, reference, layers, sequences, output):
     from ignition.components.paged_batch import Metadata
     from ignition.components.parallel import TensorParallelShard
@@ -210,6 +245,13 @@ def _rank(rank, world, rendezvous, snapshot, reference, layers, sequences, outpu
                 own=support.row_errors(normalized[index:index + 1], alone[index])["relative_l2"],
                 neighbor=support.row_errors(normalized[index:index + 1], alone[(index + 1) % 3])["relative_l2"])
                 for index in range(3)]
+            if complete:
+                start = rows - 3
+                pool.clear_for_preparation()
+                for first in range(0, start, capacity):
+                    decoders[name](place(name, first, min(first + capacity, start), token_ids))
+                _check_causal_suffix(decoders["verify"],
+                    lambda count: place("verify", start, start + count, token_ids), pool)
         session.freeze()
     dist.barrier(group=group)
     if rank == 0:

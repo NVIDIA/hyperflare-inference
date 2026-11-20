@@ -36,22 +36,24 @@ def index_page_table(block_table):
 
 
 def selected_records(logical, positions, pages):
-    """Compact each row's selected logical positions into physical record indices, preserving order.
+    """Map selected logical positions to physical records in ascending token order.
 
     `pages` holds one index-page table row per query row. A selection is kept
     when it names a position at or before the row's own position on an
-    assigned page. Returns the records padded with -1 and the kept counts.
+    assigned page. Sorting logical positions makes attention partitions
+    independent of top-k enumeration and physical cache-page placement.
+    Returns the records padded with -1 and the kept counts.
     """
     live = (logical >= 0) & (logical <= positions[:, None])
     page = pages.gather(1, (logical.clamp(min=0) // PAGE_RECORDS).long().clamp(max=pages.shape[1] - 1))
     live &= page >= 0
     records = torch.where(live, page * PAGE_RECORDS + logical % PAGE_RECORDS, -1)
-    order = (~live).to(torch.int8).sort(dim=1, stable=True).indices
+    order = logical.masked_fill(~live, torch.iinfo(logical.dtype).max).sort(dim=1).indices
     return Selection(records.gather(1, order).to(torch.int32), live.sum(1, dtype=torch.int32))
 
 
 class PreparedIndexer:
-    """BF16 index projections, FP32 key normalization, FP8 key pages, and top-2048 selection."""
+    """FP8 index queries and keys, FP32 head weights, and top-2048 selection."""
 
     def __init__(self, weights, query_residual, index_key, index_weights, metadata: AttentionMetadata, cache,
                  angles: PreparedRotaryAngles, *, mode, session, name, workspace,
@@ -61,6 +63,8 @@ class PreparedIndexer:
         if (query_residual.shape != (rows, QUERY_RANK) or index_key.shape != (rows, INDEX_WIDTH)
                 or index_weights.shape != (rows, INDEX_HEADS)):
             raise ValueError("GLM 5.3 indexing requires the normalized query rank, index key, and head weights")
+        if index_weights.dtype != torch.float32:
+            raise ValueError("GLM 5.3 index head weights must retain FP32 projection precision")
         if weights["indexer.wq_b"].shape != (INDEX_HEADS * INDEX_WIDTH, QUERY_RANK):
             raise ValueError("GLM 5.3 index query projection geometry mismatch")
         if cache.dtype != torch.uint8 or cache.ndim != 2 or cache.shape[1] != PAGE_RECORDS * INDEX_RECORD_BYTES:
@@ -85,7 +89,7 @@ class PreparedIndexer:
             pages = buffers("indexer.pages", 1 if mode == "prefill" else count, width, dtype=torch.int32)
             self.selectors[count] = PreparedFP8Indexer(
                 query[start:end].view(count, INDEX_HEADS, INDEX_WIDTH),
-                buffers("indexer.weights", count, INDEX_HEADS), cache,
+                buffers("indexer.weights", count, INDEX_HEADS, dtype=torch.float32), cache,
                 pages.expand(count, -1) if mode == "prefill" else pages,
                 buffers("indexer.lengths", count, dtype=torch.int32), None,
                 buffers("indexer.selected", count, TOPK, dtype=torch.int32), mode=mode, session=session,

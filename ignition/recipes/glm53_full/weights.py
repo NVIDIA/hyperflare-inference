@@ -358,11 +358,13 @@ class GlmWeightLoader(DirectWeightLoader):
         inputs = ["q_a_proj", "kv_a_proj_with_mqa"]
         result = {}
         if self.config.selects(layer):
-            inputs += ["indexer.wk", "indexer.weights_proj"]
+            inputs += ["indexer.wk"]
+            result["indexer.weights_proj"] = self.load_linear(f"{prefix}.indexer.weights_proj",
+                rows=self._rows(f"{prefix}.indexer.weights_proj"))
             result["indexer.wq_b"] = self.load_linear(f"{prefix}.indexer.wq_b", rows=self._rows(f"{prefix}.indexer.wq_b"))
             for name in ("indexer.k_norm.weight", "indexer.k_norm.bias"):
                 result[name] = self._tensor(f"{prefix}.{name}")
-        # Projections of the layer input share one GEMM; all are replicated.
+        # The shared GEMM writes BF16. Index head weights require FP32 output.
         result["input_proj"] = self.load_mixed_linear_group(tuple(f"{prefix}.{name}" for name in inputs),
             row_ranges=tuple(self._rows(f"{prefix}.{name}") for name in inputs))
         result["q_b_proj"] = self.load_linear(f"{prefix}.q_b_proj", rows=self._rows(f"{prefix}.q_b_proj"))

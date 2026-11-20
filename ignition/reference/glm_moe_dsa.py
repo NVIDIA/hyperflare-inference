@@ -117,7 +117,7 @@ class StreamingExperts(torch.nn.Module):
 
 @torch.no_grad()
 def text_reference(snapshot, token_ids, *, device="cuda:0", dtype=None, expert_activation="a16", layers=None,
-                   progress=None, layer_hook=None, position_hook=None, teacher=None):
+                   progress=None, layer_hook=None, position_hook=None, teacher=None, cache_precision=None):
     """Run the canonical target decoder and return its hidden states and logits on the CPU.
 
     `layers` stops after that many decoder layers and omits the final norm and
@@ -129,6 +129,9 @@ def text_reference(snapshot, token_ids, *, device="cuda:0", dtype=None, expert_a
     receives the fixture's output of the preceding layer, and a layer without
     an indexer receives the fixture's selection, so each recorded output shows
     one layer's own error without accumulation.
+    `cache_precision` selects BF16 storage, FP8 latent storage, or FP8 latent
+    and index storage for paired BF16 arithmetic comparisons. Omitting it
+    preserves the canonical forward without a storage adapter.
     """
     from transformers.masking_utils import create_causal_mask
     from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
@@ -140,7 +143,12 @@ def text_reference(snapshot, token_ids, *, device="cuda:0", dtype=None, expert_a
         raise ValueError("reference token IDs must be a nonempty integer sequence")
     snapshot, device = Path(snapshot), torch.device(device)
     if dtype is None:
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        dtype = torch.bfloat16 if device.type == "cuda" or cache_precision is not None else torch.float32
+    if cache_precision is not None:
+        from ignition.reference.glm_moe_dsa_cache import PRECISIONS, QuantizedIndexer, ReferenceCache
+
+        if cache_precision not in PRECISIONS or dtype != torch.bfloat16:
+            raise ValueError("paired GLM cache references require BF16 computation and a declared cache precision")
     configuration = json.loads((snapshot / "config.json").read_text())
     if configuration.get("architectures") != ["GlmMoeDsaForCausalLM"]:
         raise ValueError("text reference requires GlmMoeDsaForCausalLM")
@@ -177,15 +185,18 @@ def text_reference(snapshot, token_ids, *, device="cuda:0", dtype=None, expert_a
         if config.mlp_layer_types[index] == "sparse":
             layer.mlp.experts = StreamingExperts(layer.mlp.experts, reader, prefix + ".mlp.experts",
                                                  activation=expert_activation)
+        cache = None if cache_precision is None else ReferenceCache(cache_precision)
+        if cache_precision == "fp8-latent-index" and layer.self_attn.indexer is not None:
+            layer.self_attn.indexer = QuantizedIndexer(layer.self_attn.indexer)
         if layer_hook is not None:
             layer_hook(index, layer)
         hidden, selected = layer.eval()(hidden, attention_mask=mask, position_embeddings=position_embeddings,
-            position_ids=position_ids, prev_topk_indices=selected)
+            position_ids=position_ids, prev_topk_indices=selected, past_key_values=cache)
         if not bool(torch.isfinite(hidden).all()):
             raise ValueError(f"GLM reference layer {index} produced nonfinite hidden states")
         if progress is not None:
             progress(index, hidden.squeeze(0), selected.squeeze(0) if layer.self_attn.indexer is not None else None)
-        del layer
+        del layer, cache
     if layers is not None:
         reader.close()
         return hidden.squeeze(0).float().cpu(), None
@@ -272,6 +283,8 @@ def main():
     parser.add_argument("output", type=Path, help="PyTorch fixture of hidden states, selections and logits")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--expert-activation", choices=("a16", "a4"), default="a16")
+    parser.add_argument("--cache-precision", choices=("bf16", "fp8-latent", "fp8-latent-index"),
+                        help="use BF16 computation with the selected independent cache representation")
     parser.add_argument("--layers", type=int, help="stop after this many decoder layers, without logits")
     parser.add_argument("--record-layers", type=int, nargs="*",
                         help="decoder layers whose output is stored; every executed layer when omitted")
@@ -291,9 +304,9 @@ def main():
         print(f"layer={index} tokens={hidden.shape[0]} elapsed_seconds={time.monotonic() - started:.3f}", flush=True)
 
     hidden, logits = text_reference(args.snapshot, ids, device=args.device, expert_activation=args.expert_activation,
-                                    layers=args.layers, progress=progress)
+                                    layers=args.layers, progress=progress, cache_precision=args.cache_precision)
     result = dict(token_ids=torch.tensor(ids), layers=recorded, selections=selections, hidden=hidden,
-                  expert_activation=args.expert_activation, device=args.device)
+                  expert_activation=args.expert_activation, device=args.device, cache_precision=args.cache_precision)
     if logits is not None:
         top = logits.topk(2, dim=-1)
         result.update(next_tokens=top.indices[:, 0].clone(), margins=(top.values[:, 0] - top.values[:, 1]).clone(),

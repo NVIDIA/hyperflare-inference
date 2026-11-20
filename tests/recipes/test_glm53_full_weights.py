@@ -198,14 +198,14 @@ def test_loaded_rank_holds_its_checkpoint_shards(manifest, config, partitions, r
     for layer in (0, 3):
         prefix = f"model.layers.{layer}"
         loaded = weights.layers[layer]
-        inputs = ["q_a_proj", "kv_a_proj_with_mqa"] + (["indexer.wk", "indexer.weights_proj"] if layer == 0 else [])
+        inputs = ["q_a_proj", "kv_a_proj_with_mqa"] + (["indexer.wk"] if layer == 0 else [])
         assert torch.equal(loaded.attention["input_proj"].cpu(),
                            torch.cat([stored(f"{prefix}.self_attn.{name}.weight") for name in inputs]))
         heads = config.raw["num_attention_heads"] // WORLD
         joint = stored(f"{prefix}.self_attn.kv_b_proj.weight").view(heads, 448, 512)
         assert torch.equal(loaded.attention["key"].cpu(), joint[:, :192])
         assert torch.equal(loaded.attention["value"].cpu(), joint[:, 192:].transpose(1, 2))
-        names = ["q_b_proj", "o_proj"] + (["indexer.wq_b"] if layer == 0 else [])
+        names = ["q_b_proj", "o_proj"] + (["indexer.wq_b", "indexer.weights_proj"] if layer == 0 else [])
         for name in names:
             assert torch.equal(loaded.attention[name].cpu(), stored(f"{prefix}.self_attn.{name}.weight")), name
         names = ["q_a_layernorm.weight", "kv_a_layernorm.weight"] + (

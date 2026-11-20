@@ -116,8 +116,8 @@ class PreparedLayer:
         self.indexer = self.attention_reduce = self.mlp = self.mlp_reduce = None
         if self.selects:
             self.indexer = PreparedIndexer(weights.attention, buffers("indexer.residual", rows, 2048),
-                buffers("indexer.key", rows, 128), buffers("indexer.head_weights", rows, 32), metadata, index_cache,
-                angles, mode=mode, session=session, name=f"{name}.indexer", workspace=workspace, buffers=buffers,
+                buffers("indexer.key", rows, 128), buffers("indexer.head_weights", rows, 32, dtype=torch.float32),
+                metadata, index_cache, angles, mode=mode, session=session, name=f"{name}.indexer", workspace=workspace, buffers=buffers,
                 cache_only=cache_only)
         if cache_only:
             return

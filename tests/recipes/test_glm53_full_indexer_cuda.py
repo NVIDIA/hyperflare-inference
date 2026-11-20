@@ -4,6 +4,7 @@
 """GLM 5.3 prepared top-2048 selection against the Transformers indexer's ranking of every position."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -13,6 +14,8 @@ from ignition.components.rotary import PreparedRotaryAngles
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
+from ignition.reference.glm_moe_dsa_cache import quantize_index
+from ignition.reference.glm_moe_dsa_index import index_score_interval, valid_index_cutoff
 
 from . import glm53_full_support as support
 
@@ -47,7 +50,7 @@ def canonical(manifest):
 
 
 @torch.no_grad()
-def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mode="prefill", rotate=True):
+def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mode="prefill", rotate=True, verify_fp8=False):
     """Selections (as positions) and attention output of one rank; decode replays the trailing rows."""
     from ignition.recipes.glm53_full.attention import PAGE_TOKENS, AttentionMetadata, PreparedAttention, rotary_frequencies
     from ignition.recipes.glm53_full.config import ModelConfig
@@ -76,7 +79,7 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
                 session=session, name=f"attention.{name}", workspace=arena)
             indexer = PreparedIndexer(weights, torch.zeros((capacity, 2048), dtype=torch.bfloat16, device=device),
                 torch.zeros((capacity, 128), dtype=torch.bfloat16, device=device),
-                torch.zeros((capacity, 32), dtype=torch.bfloat16, device=device), metadata, index_cache, angles,
+                torch.zeros((capacity, 32), dtype=torch.float32, device=device), metadata, index_cache, angles,
                 mode=name, session=session, name=f"indexer.{name}", workspace=arena)
             attention.functional(session=session)
             indexer.functional(session=session)
@@ -87,6 +90,10 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
         cache.zero_()
         index_cache.zero_()
 
+        if verify_fp8:
+            reference_keys = torch.empty((rows, 128), dtype=torch.uint8, device=device)
+            reference_scales = torch.empty(rows, dtype=torch.float32, device=device)
+
         def run(name, first, last):
             attention, indexer, angles, metadata = prepared[name]
             positions = torch.arange(first, last, device=device)
@@ -95,7 +102,44 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
             metadata.block_table.copy_(torch.arange(pages, dtype=torch.int32, device=device))
             values = angles(metadata.positions if rotate else torch.zeros_like(metadata.positions))
             projected = attention.project(source[first:last], metadata, values)
-            selection = indexer(projected.query_residual, projected.index_key, projected.index_weights, metadata, values)
+            arguments = (projected.query_residual, projected.index_key, projected.index_weights, metadata, values)
+            if verify_fp8:
+                rotated = {}
+                apply = angles.apply
+
+                def capture(tensor, *args):
+                    result = apply(tensor, *args)
+                    rotated[tensor.ndim] = tensor.clone()
+                    return result
+
+                with patch.object(angles, "apply", capture):
+                    selection = indexer(*arguments)
+                keys, scales = quantize_index(rotated[2], query=False)
+                reference_keys[first:last].copy_(keys)
+                reference_scales[first:last].copy_(scales)
+                actual_keys = index_cache[:, :8192].contiguous().view(-1, 128)
+                actual_scales = index_cache[:, 8192:].contiguous().view(torch.float32).flatten()
+                assert torch.equal(actual_keys[first:last], keys) and torch.equal(actual_scales[first:last], scales)
+                for start in range(0, last - first, 16):
+                    subset = slice(start, min(start + 16, last - first))
+                    scores, allowance = index_score_interval(rotated[3][subset], projected.index_weights[subset],
+                                                             reference_keys[:last], reference_scales[:last])
+                    records = selection.records[subset]
+                    lengths = selection.lengths[subset]
+                    pos = metadata.positions[subset]
+                    valid = valid_index_cutoff(records, lengths, pos, scores, allowance)
+                    assert valid.all(), pos[~valid].tolist()
+                    if first + start <= rows - 1 < first + start + len(pos):
+                        row = records[-1:].clone()
+                        worst, best = scores[-1].argmin(), scores[-1].argmax()
+                        assert (row == best).any() and not (row == worst).any()
+                        row.masked_fill_(row == best, worst)
+                        assert not valid_index_cutoff(row, lengths[-1:], pos[-1:], scores[-1:], allowance[-1:]).item()
+                        future = records[-1:].clone()
+                        future[0, 0] = pos[-1] + 1
+                        assert not valid_index_cutoff(future, lengths[-1:], pos[-1:], scores[-1:], allowance[-1:]).item()
+            else:
+                selection = indexer(*arguments)
             return selection, attention.attend(projected.absorbed, selection, metadata).float()
 
         selection, output = run("prefill", 0, rows)
@@ -120,7 +164,7 @@ def overlap(selection, selected, rank):
 @torch.no_grad()
 def test_selection_matches_transformers_ranking(manifest, canonical):
     source, expected_output, selected, rank = canonical
-    selection, output, decoded = prepared_selection(manifest, source, mode="decode")
+    selection, output, decoded = prepared_selection(manifest, source, mode="decode", verify_fp8=True)
     lengths, expected, inside, worst = overlap(selection, selected, rank)
     rows = source.shape[0]
     assert torch.equal(lengths, expected)
@@ -143,11 +187,7 @@ def test_selection_matches_transformers_ranking(manifest, canonical):
         row = rows - len(decoded) + index
         same = len(set(single.records[0, :2048].tolist()) & set(selection.records[row, :2048].tolist()))
         print(f"decode row {row}: {same} of 2048 records shared with prefill")
-        assert int(single.lengths[0]) == 2048 and same >= 2040
-    # On the 674 rows with more than 2048 candidates, mean overlap was 0.9907, minimum
-    # overlap was 0.9790, and the deepest selected canonical rank was 2272.
-    assert fraction.mean() > 0.985 and fraction.min() > 0.97 and int(excess.max()) < 256, (
-        float(fraction.mean()), float(fraction.min()), int(excess.max()))
+        assert int(single.lengths[0]) == 2048
 
 
 @torch.no_grad()
@@ -174,9 +214,9 @@ def test_wrong_selections_are_rejected(manifest, canonical):
 
 @torch.no_grad()
 def test_every_rank_selects_the_same_records(manifest, canonical):
-    """Index weights are replicated; the selection kernel's output order is not deterministic."""
+    """Replicated index weights and inputs select the same ordered logical positions."""
     source = canonical[0]
     first, _, _ = prepared_selection(manifest, source)
     other, _, _ = prepared_selection(manifest, source, shard=TensorParallelShard(5, 8))
     assert torch.equal(first.lengths, other.lengths)
-    assert torch.equal(first.records.sort(1).values, other.records.sort(1).values)
+    assert torch.equal(first.records, other.records)

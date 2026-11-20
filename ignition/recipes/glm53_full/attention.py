@@ -18,7 +18,7 @@ from b12x.attention import sparse_mla
 from b12x.preparation import PreparedCall
 from flashinfer.triton.norm import rms_norm
 
-from ignition.components.linear import BatchedUnquantizedProjection, prepare_projection
+from ignition.components.linear import BatchedUnquantizedProjection, UnquantizedProjection, prepare_projection
 from ignition.components.rotary import PreparedRotaryAngles
 from ignition.components.sparse_mla import PreparedSparseMLA
 from ignition.preparation.examples import declaration_tensor
@@ -31,9 +31,9 @@ PAGE_RECORDS = 64
 PAGE_TOKENS = 256
 TOPK = 2048
 QUERY_RANK, LATENT, ROTARY, NOPE, VALUE = 2048, 512, 64, 192, 256
-# Fused layer-input projection: query rank, latent, rotary key, then the index key and head weights.
+# BF16 layer-input projection: query rank, latent, rotary key, then the index key.
 INPUT_WIDTH = QUERY_RANK + LATENT + ROTARY
-INDEX_WIDTH = 128 + 32
+INDEX_WIDTH = 128
 
 
 def rotary_frequencies(theta, device):
@@ -144,6 +144,8 @@ class PreparedAttention:
                 or weights["value"].shape != (heads, LATENT, VALUE)
                 or weights["o_proj"].shape != (6144, heads * VALUE)):
             raise ValueError("GLM 5.3 attention cache or head partition geometry mismatch")
+        if selects and weights["indexer.weights_proj"].shape != (32, 6144):
+            raise ValueError("GLM 5.3 index head projection requires a [32, 6144] weight matrix")
         self.weights, self.cache, self.angles = weights, cache, angles
         self.heads, self.selects, self.eps, self.mode, self.rows = heads, selects, eps, mode, rows
 
@@ -162,6 +164,10 @@ class PreparedAttention:
                 session=session, name=f"{name}.input_proj", workspace=workspace)}
         self.absorb = self.expand = self.attention = None
         if not cache_only:
+            if selects:
+                self.projections["indexer.weights_proj"] = UnquantizedProjection(
+                    source, weights["indexer.weights_proj"], zeros(rows, 32, dtype=torch.float32),
+                    session=session, name=f"{name}.indexer.weights_proj")
             self.projections.update({
                 "q_b_proj": prepare_projection(residual, weights["q_b_proj"], query.view(rows, -1),
                     session=session, name=f"{name}.q_b_proj", workspace=workspace),
@@ -225,7 +231,7 @@ class PreparedAttention:
         if not self.selects:
             return Projected(residual, absorbed, None, None)
         return Projected(residual, absorbed, projected[:, INPUT_WIDTH:INPUT_WIDTH + 128],
-                         projected[:, INPUT_WIDTH + 128:])
+                         self.projections["indexer.weights_proj"](source))
 
     def store(self, source, metadata, angles):
         """Project one layer input and store its latent records; return the index key input, or None."""
