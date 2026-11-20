@@ -486,6 +486,7 @@ pub struct ModelRuntime {
     finished: Arc<(Mutex<bool>, Condvar)>,
     metrics: Arc<super::metrics::Metrics>,
     input_store: Option<flare_selene::input::InputStore>,
+    residency: Option<crate::parallax::residency::execution::ExecutionBinding>,
 }
 
 impl ModelRuntime {
@@ -520,6 +521,10 @@ impl ModelRuntime {
         policy: crate::scheduler::PolicyConfig,
         log_to_stderr: bool,
     ) -> std::result::Result<Self, super::StartFailure> {
+        manifest.validate()?;
+        if peers.is_some() && manifest.residency.is_some() {
+            return Err("expert residency requires single-rank serving".into());
+        }
         crate::model::catalog::validate(&config, &manifest)?;
         super::observation::initialize_clock();
         if queue_capacity == 0 || queue_capacity > 1024 || !(2..=4096).contains(&event_capacity) {
@@ -532,6 +537,7 @@ impl ModelRuntime {
             .offload
             .as_ref()
             .and_then(|binding| binding.inputs());
+        let residency = manifest.residency.clone();
         let worker_input_store = input_store.clone();
         let config = Arc::new(config);
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
@@ -757,6 +763,7 @@ impl ModelRuntime {
                 config,
                 event_capacity,
                 input_store,
+                residency,
                 capacity,
                 thread: Mutex::new(Some(thread)),
                 shutdown: Mutex::new(None),
@@ -784,6 +791,10 @@ impl ModelRuntime {
 
     pub(super) fn input_store(&self) -> Option<&flare_selene::input::InputStore> {
         self.input_store.as_ref()
+    }
+
+    pub fn residency(&self) -> Option<&crate::parallax::residency::execution::ExecutionBinding> {
+        self.residency.as_ref()
     }
 
     pub fn healthy(&self) -> bool {

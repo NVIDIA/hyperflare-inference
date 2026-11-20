@@ -241,7 +241,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if membership.is_some() {
         cluster::require_transport()?;
     }
-    let options = args.load_options();
+    let mut options = args.load_options();
+    if let Some(path) = &args.serving.parallax_residency {
+        let config: flare_helios::runtime_core::ResidencyOptions =
+            serde_json::from_slice(&std::fs::read(path)?)?;
+        options.parallax_residency = Some(config);
+    }
     let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
     let routing = cluster::Routing {
         shape: cluster::Shape::from_flags(args.roce_ring, args.roce_chain),

@@ -388,9 +388,13 @@ resume sampling from saved hidden state without replaying prompt tokens. See
 Before CUDA enqueue, callers check `GraphExecutor::can_submit`, obtain its
 `next_fence`, and call `RequestScheduler::commit` with the plan to reserve pages
 and record use of cache ancestors. Commit validates the plan's epochs and
-resources without rerunning scheduling policy. Completion validation checks
-generations, physical slots, monotonic counters and per-step logical bounds before
-mutating request state.
+resources without rerunning scheduling policy. When virtual-memory expert
+residency is attached, residency progress runs only during executor polling,
+before admission: each submitted frame retains a `ReaderLease` through
+confirmed readback completion, and submission cannot advance residency or close
+the submission gate after the scheduler reserves a fence. Completion validation
+checks generations, physical slots, monotonic counters and per-step logical
+bounds before mutating request state.
 Two ordinary decode or complete speculative steps can reference a request
 concurrently; a repeated terminal
 completion does not emit its sampled token twice. A CUDA submission failure

@@ -735,6 +735,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise core serving reserve |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Core default |
+| `--parallax-residency PATH` | Configure virtual-memory Grace/HBM expert residency storage from a JSON configuration bound to authenticated prepared weight views; requires local single-GPU serving | off |
 | `--mtp-adaptive-verification` / `--no-mtp-adaptive-verification` | Adaptive or fixed selection among captured widths | Core default |
 | `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; core defaults apply unless overridden |
 | `--mtp-adaptive-verification-alpha ALPHA` | Positive finite exponent on completed prefix-survival scheduling scores; below 1 favors longer verification prefixes | `1.0` |

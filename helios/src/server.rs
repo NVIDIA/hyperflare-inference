@@ -17,6 +17,7 @@ mod metrics;
 mod models;
 mod observation;
 pub(crate) mod output;
+pub mod parallax;
 mod logprobs;
 mod protocol;
 mod request;
@@ -533,6 +534,8 @@ fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize)
         .route("/v1/responses", post(http::generate).get(http::no_websocket).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/systemone", post(protocol::decisions::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/decisions", post(protocol::decisions::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
+        .route("/v1/parallax/residency", get(parallax_residency))
+        .route("/v1/parallax/residency/plan", post(parallax_residency_plan))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -630,6 +633,18 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
     )
         .into_response()
 }
+
+async fn parallax_residency(State(state): State<Arc<HttpState>>) -> Response {
+    parallax::status_response(state.model.residency())
+}
+
+async fn parallax_residency_plan(
+    State(state): State<Arc<HttpState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    parallax::submit_plan_response(state.model.residency(), &body)
+}
+
 fn readiness_failure(
     message: &'static str,
     disconnected: std::sync::mpsc::RecvError,

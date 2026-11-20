@@ -903,6 +903,10 @@ pub struct ServingOptions {
     #[arg(long, value_name = "N", help_heading = "Speculation options")]
     pub mtp_draft_tokens: Option<usize>,
 
+    /// Configure virtual-memory Grace/HBM expert residency storage from a JSON file.
+    #[arg(long, value_name = "PATH", help_heading = "Advanced serving options")]
+    pub parallax_residency: Option<PathBuf>,
+
     /// Augment learned drafts with shared decoded history; requires prepared history inputs.
     #[arg(
         long,
@@ -1084,6 +1088,9 @@ impl ServingOptions {
         }
         if let Some(n) = self.mtp_draft_tokens {
             options.extend(["--mtp-draft-tokens".into(), n.to_string()]);
+        }
+        if let Some(path) = &self.parallax_residency {
+            options.extend(["--parallax-residency".into(), path.display().to_string()]);
         }
         if self.history_drafts {
             options.push("--history-drafts".into());
@@ -1627,6 +1634,8 @@ mod tests {
             "--max-concurrency",
             "3",
             "--mtp-draft-tokens=0",
+            "--parallax-residency",
+            "residency.json",
             "--embedding-table-storage",
             "ram",
             "--prefix-cache-memory",
@@ -1644,6 +1653,15 @@ mod tests {
         assert_eq!(options.embedding_table_storage, Some(Storage::Ram));
         assert_eq!(options.max_concurrency, Some(3));
         assert_eq!(options.mtp_draft_tokens, Some(0));
+        assert_eq!(
+            args.serving.parallax_residency,
+            Some(PathBuf::from("residency.json"))
+        );
+        assert!(
+            args.rank_options()
+                .windows(2)
+                .any(|pair| pair == ["--parallax-residency", "residency.json"])
+        );
         assert_eq!(
             options.prefix_cache,
             PrefixCacheOffload {

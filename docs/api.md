@@ -276,6 +276,48 @@ grows with queued data; large paused responses can retain more CPU memory.
 Finished responses awaiting delivery count toward the admission limit,
 but occupy no model execution slot or live KV cache.
 
+## Virtual-memory expert residency
+
+When Flare loads a single-GPU payload core with `--parallax-residency PATH`,
+Helios manages configured immutable expert weight allocations in a fixed HBM
+slot pool backed by host-NUMA memory while preserving prepared virtual
+addresses. Both endpoints below require the same API-key authentication as
+generation routes.
+
+`GET /v1/parallax/residency` returns version-one residency state in JSON.
+Without `--parallax-residency`, it returns `{"version":1,"enabled":false,
+"clock":"native_process_monotonic_ns","native_now_ns":...}` without starting
+any background work. When enabled, it additionally reports `catalog_id`,
+`generation`, `hbm_experts`, `grace_experts`, per-expert placement records
+(`layer`, `expert`, `resident`, `group`, `evictable`), `hbm_pool_bytes`,
+`grace_backing_bytes`, `free_slots`, `free_slots_by_group`, `pending`,
+`readers`, `poisoned`, cumulative copy and publication counters (including
+startup placement), `movement_error`, and the bounded 256-entry
+`movement_events` ring with `movement_event_total`.
+
+`POST /v1/parallax/residency/plan` submits one residency exchange plan for the
+executor to stage asynchronously and publish at a quiescent reader boundary.
+The JSON request object accepts exact fields `version` (`1`), `catalog_id`,
+`generation`, `valid_until_ns` (a deadline in Helios's `native_now_ns`
+monotonic clock domain), and optional `promote` and `evict` arrays of up to 64
+`{"layer":N,"expert":M}` identifiers each. Helios returns:
+
+- `202 Accepted` (`{"status":"queued",...}`) when the plan is validated and
+  queued for the executor.
+- `200 OK` (`{"status":"noop",...}`) when a valid plan has empty `promote` and
+  `evict` lists.
+- `400 Bad Request` when residency is disabled, JSON is malformed, `version` or
+  `catalog_id` does not match, `valid_until_ns` has expired, or any expert
+  entry is unknown, duplicated, already in the requested tier, or non-evictable.
+- `409 Conflict` when `generation` is stale, another plan is already queued or
+  in progress, or the target pool group lacks spare HBM slots for staging.
+- `503 Service Unavailable` when residency storage is poisoned or disabled
+  after a backend error.
+
+External controllers poll `GET /v1/parallax/residency` to observe committed
+generations, movement events, and current `native_now_ns`. Helios does not run
+predictors or placement policy loops internally.
+
 ## Health and metrics
 
 `GET /health` returns `{"status":"ok"}` while the model runtime is healthy and

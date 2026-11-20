@@ -3538,6 +3538,7 @@ fn group_runtime(
             finished: Arc::new((Mutex::new(false), Condvar::new())),
             metrics: fixture.metrics.clone(),
             input_store: None,
+            residency: None,
         },
         receiver,
     )
@@ -4054,6 +4055,7 @@ fn http_state_for(
         finished: Arc::new((Mutex::new(true), Condvar::new())),
         metrics: fixture.metrics,
         input_store: None,
+        residency: None,
     });
     Arc::new(HttpState {
         first_response: Arc::new(super::super::latency::FirstResponseSamples::default()),
@@ -6230,4 +6232,53 @@ fn local_copyout_rechecks_headroom_after_each_queued_pin() {
     worker.service_store().unwrap();
     assert_eq!(fake_store(&mut worker).stored.len(), 2);
     assert_eq!(pins(&worker, second), 1);
+}
+
+#[tokio::test]
+async fn parallax_residency_routes_require_bearer_authentication_over_http() {
+    use std::io::{Read, Write};
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, Some("serving-key".into()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state, &[], 65536);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let result = tokio::task::spawn_blocking(move || {
+        for (method, path, body, authed_status) in [
+            ("GET", "/v1/parallax/residency", "", 200u16),
+            ("POST", "/v1/parallax/residency/plan", "{}", 400u16),
+        ] {
+            for (auth, expected) in [
+                ("", 401),
+                ("Authorization: Bearer wrong-key\r\n", 401),
+                ("x-api-key: serving-key\r\n", 401),
+                ("Authorization: Bearer serving-key\r\n", authed_status),
+            ] {
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                write!(
+                    stream,
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                )
+                .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                let (head, body) = response.split_once("\r\n\r\n").unwrap();
+                let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+                assert_eq!(status, expected, "{method} {path}: {body}");
+                let value: serde_json::Value = serde_json::from_str(body).unwrap();
+                if status == 200 {
+                    assert_eq!(value["version"], 1);
+                    assert_eq!(value["enabled"], false);
+                }
+            }
+        }
+        assert!(receiver.try_recv().is_err());
+    })
+    .await;
+    server.abort();
+    result.unwrap();
 }
