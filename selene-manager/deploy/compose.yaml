@@ -13,6 +13,7 @@
 #   SELENE_DATA     host directory on local NVMe for the durable records (default /var/lib/selene)
 services:
   manager:
+    stop_grace_period: 5m
     image: ${MANAGER_IMAGE:-selene:local}
     user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
     command:

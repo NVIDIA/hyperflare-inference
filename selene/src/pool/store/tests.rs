@@ -50,6 +50,7 @@ struct LocalState {
     announced: bool,
     /// What the last local tier offers for a move, coldest first.
     retiring: Vec<Retiring>,
+    ancestors: Vec<Retiring>,
     /// How each offered record's move ended, in order.
     retired: Vec<(PrefixKey, Retirement)>,
     spill: Option<bool>,
@@ -120,6 +121,15 @@ impl crate::store::TierStore for FakeLocal {
     }
     fn set_spill(&mut self, enabled: bool) {
         self.0.lock().unwrap().spill = Some(enabled);
+    }
+    fn retirement_predecessor(&self, key: PrefixKey) -> Option<Retiring> {
+        self.0
+            .lock()
+            .unwrap()
+            .ancestors
+            .iter()
+            .find(|r| r.key == key)
+            .cloned()
     }
     fn take_retiring(&mut self) -> Vec<Retiring> {
         std::mem::take(&mut self.0.lock().unwrap().retiring)
@@ -598,6 +608,7 @@ fn gpu_publications_are_announced_and_their_evictions_reported() {
     let mut rig = rig();
     let key = rig.key(160);
     let checkpoint = PublishedCheckpoint {
+        capture_role: crate::CaptureRole::Endpoint,
         id: CheckpointId::new(42),
         key,
         parent: Some(rig.key(64)),
@@ -721,6 +732,10 @@ fn a_candidate_starting_after_the_resident_prefix_never_stitches_to_a_local_pref
 impl Rig {
     fn retiring(&self, page: u64) -> Retiring {
         Retiring {
+            descendant_row: false,
+            capture_role: crate::CaptureRole::Endpoint,
+            child_paths: 0,
+            ancestor_keys: Vec::new(),
             tier: Tier::Nvme,
             key: self.key(page * PT),
             parent: (page > 1).then(|| self.key((page - 1) * PT)),
@@ -811,6 +826,187 @@ fn a_retiring_record_is_put_and_released_only_when_the_manager_commits_it() {
 }
 
 #[test]
+fn a_page_only_local_root_is_sent_with_its_deeper_row() {
+    let mut rig = rig();
+    rig.ready(true);
+    let mut root = rig.retiring(1);
+    root.tier = Tier::Dram;
+    root.row = false;
+    let mut tip = root.clone();
+    tip.key = rig.key(root.key.consumed_tokens + 1);
+    tip.parent = Some(root.key);
+    tip.ancestor_keys = vec![root.key];
+    tip.row = true;
+    tip.tail_pages = 0;
+    rig.local.0.lock().unwrap().ancestors = vec![root.clone(), tip.clone()];
+    rig.offer(&[tip.clone()]);
+    rig.poll();
+    let started = rig.started();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].1, tip.key);
+    assert_eq!(rig.pool.lock().unwrap().puts[0].1.ancestor_keys, [root.key]);
+    rig.end(started[0].0, PutOutcome::Stored { bytes: 1 });
+    rig.poll();
+    assert_eq!(rig.retired(), [(tip.key, Retirement::Moved)]);
+}
+
+#[test]
+fn losing_the_descendant_row_before_retirement_keeps_the_source() {
+    let mut rig = rig();
+    rig.ready(true);
+    let mut path: Vec<_> = (1..=3).map(|n| rig.retiring(n)).collect();
+    let keys: Vec<_> = path.iter().map(|node| node.key).collect();
+    for (i, node) in path.iter_mut().enumerate() {
+        node.tier = Tier::Dram;
+        node.ancestor_keys = keys[..i].iter().rev().copied().collect();
+        node.child_paths = u32::from(i < 2);
+        node.descendant_row = i < 2;
+    }
+    rig.local.0.lock().unwrap().ancestors = path.clone();
+    rig.offer(&path[2..]);
+    for (i, key) in keys.iter().enumerate() {
+        rig.poll();
+        let (id, offered) = rig.started()[i];
+        assert_eq!(offered, *key);
+        if i == 1 {
+            let pool = rig.pool.lock().unwrap();
+            assert!(pool.puts[i].1.row && pool.puts[i].1.descendant_row);
+        }
+        if i == 2 {
+            let mut local = rig.local.0.lock().unwrap();
+            local.ancestors[1].descendant_row = false;
+            local.ancestors[2].row = false;
+        }
+        rig.end(id, PutOutcome::Stored { bytes: 1 });
+    }
+    rig.poll();
+    assert_eq!(rig.retired(), [(keys[2], Retirement::Failed)]);
+}
+
+#[test]
+fn a_permanent_middle_refusal_retries_only_the_leaf() {
+    for present in [false, true] {
+        let mut rig = rig();
+        rig.ready(true);
+        let mut path: Vec<_> = (1..=3).map(|n| rig.retiring(n)).collect();
+        let keys: Vec<_> = path.iter().map(|r| r.key).collect();
+        for (i, node) in path.iter_mut().enumerate() {
+            node.tier = Tier::Dram;
+            node.ancestor_keys = keys[..i].iter().rev().copied().collect();
+            node.child_paths = u32::from(i < 2);
+        }
+        rig.local.0.lock().unwrap().ancestors = path.clone();
+        let now = Instant::now();
+        rig.store.cascade.now = Some(now);
+        rig.offer(&path[2..]);
+        rig.poll();
+        assert_eq!(rig.started()[0].1, keys[0]);
+        rig.end(rig.started()[0].0, PutOutcome::Stored { bytes: 1 });
+        rig.poll();
+        assert_eq!(rig.started()[1].1, keys[1]);
+        rig.end(rig.started()[1].0, PutOutcome::Refused(PutRefusal::Invalid));
+        rig.poll();
+        assert_eq!(rig.started()[2].1, keys[2]);
+        assert_eq!(
+            rig.pool.lock().unwrap().puts[2].1.ancestor_keys,
+            [keys[1], keys[0]]
+        );
+        let (result, expected) = if present {
+            (PutOutcome::Present, Retirement::MovedLeaf)
+        } else {
+            (PutOutcome::Refused(PutRefusal::Invalid), Retirement::Dropped)
+        };
+        rig.end(rig.started()[2].0, result);
+        rig.poll();
+        assert_eq!(rig.retired(), [(keys[2], expected)]);
+        assert_eq!(rig.store.stats().dropped[6], u64::from(!present));
+    }
+}
+
+#[test]
+fn a_temporary_ancestor_refusal_retries_once_then_offers_the_leaf() {
+    for (reason, index) in [(PutRefusal::Budget, 3), (PutRefusal::Inflight, 4)] {
+        for exhausted in [false, true] {
+            let mut rig = rig();
+            rig.ready(true);
+            let mut path: Vec<_> = (1..=3).map(|n| rig.retiring(n)).collect();
+            let keys: Vec<_> = path.iter().map(|r| r.key).collect();
+            for (i, node) in path.iter_mut().enumerate() {
+                node.tier = Tier::Dram;
+                node.ancestor_keys = keys[..i].iter().rev().copied().collect();
+                node.child_paths = u32::from(i < 2);
+            }
+            rig.local.0.lock().unwrap().ancestors = path.clone();
+            let now = Instant::now();
+            rig.store.cascade.now = Some(now);
+            rig.offer(&path[2..]);
+            rig.poll();
+            assert_eq!(rig.started()[0].1, keys[0]);
+            rig.end(rig.started()[0].0, PutOutcome::Present);
+            rig.poll();
+            assert_eq!(rig.started()[1].1, keys[1]);
+            rig.end(rig.started()[1].0, PutOutcome::Refused(reason));
+            rig.poll();
+            assert!(
+                rig.retired().is_empty(),
+                "the retry must keep the selected leaf"
+            );
+            assert_eq!(rig.started().len(), 2);
+            assert_eq!(rig.store.stats().refusal_drops[index], 0);
+            rig.store.cascade.now = Some(now + Duration::from_millis(50));
+            rig.poll();
+            assert_eq!(rig.started()[2].1, keys[1]);
+            let outcome = if exhausted {
+                PutOutcome::Refused(reason)
+            } else {
+                PutOutcome::Present
+            };
+            rig.end(rig.started()[2].0, outcome);
+            rig.poll();
+            rig.store.cascade.now = Some(now + Duration::from_millis(100));
+            rig.poll();
+            assert_eq!(rig.started()[3].1, keys[2]);
+            assert_eq!(
+                rig.pool.lock().unwrap().puts[3].1.ancestor_keys,
+                [keys[1], keys[0]]
+            );
+            rig.end(rig.started()[3].0, PutOutcome::Present);
+            rig.poll();
+            let how = if exhausted {
+                Retirement::MovedLeaf
+            } else {
+                Retirement::Moved
+            };
+            assert_eq!(rig.retired(), [(keys[2], how)]);
+            assert_eq!(rig.started().len(), 4);
+            assert_eq!(rig.store.stats().refusal_drops[index], u64::from(exhausted));
+            assert_eq!(rig.store.stats().dropped[6], 0);
+        }
+    }
+}
+
+#[test]
+fn a_page_only_retirement_is_put_without_its_row() {
+    let mut rig = rig();
+    rig.ready(true);
+    let mut record = rig.retiring(3);
+    record.row = false;
+    rig.offer(std::slice::from_ref(&record));
+    rig.poll();
+    {
+        let state = rig.pool.lock().unwrap();
+        let [(_, request)] = &state.puts[..] else {
+            panic!("one page-only put expected");
+        };
+        assert!(!request.row);
+        assert_eq!(request.capture_role, crate::CaptureRole::Endpoint);
+    }
+    rig.end(rig.started()[0].0, PutOutcome::Stored { bytes: 1 });
+    rig.poll();
+    assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
+}
+
+#[test]
 fn a_record_the_manager_already_holds_is_released_without_another_copy() {
     let mut rig = rig();
     rig.ready(true);
@@ -878,12 +1074,16 @@ fn a_budget_or_inflight_refusal_waits_for_backoff_despite_progress() {
 #[test]
 fn refusal_discards_count_the_source_tier() {
     for (index, tier) in [Tier::Dram, Tier::Nvme].into_iter().enumerate() {
-        for refusal in [
+        for (reason, refusal) in [
             PutRefusal::Invalid,
+            PutRefusal::Unlinked,
             PutRefusal::Oversize,
             PutRefusal::Budget,
             PutRefusal::Inflight,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut rig = rig();
             let now = Instant::now();
             rig.store.cascade.now = Some(now);
@@ -904,6 +1104,7 @@ fn refusal_discards_count_the_source_tier() {
             }
             assert_eq!(rig.retired(), [(record.key, Retirement::Dropped)]);
             let stats = rig.store.stats();
+            assert_eq!(stats.refusal_drops[reason], 1);
             assert_eq!(stats.dropped[6 + index], 1, "{tier:?} {refusal:?}");
             assert_eq!(stats.dropped.iter().sum::<u64>(), 1);
             rig.poll();
@@ -1118,6 +1319,7 @@ impl Rig {
     fn publication(&self, end: u64) -> PublishedCheckpoint {
         let pages = (end / PT) as usize;
         PublishedCheckpoint {
+            capture_role: crate::CaptureRole::Endpoint,
             id: CheckpointId::new(5),
             key: self.key(end),
             parent: None,

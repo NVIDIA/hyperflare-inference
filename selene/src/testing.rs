@@ -386,6 +386,7 @@ pub fn checkpoint(
     slot: StateSlotId,
 ) -> PublishedCheckpoint {
     PublishedCheckpoint {
+        capture_role: crate::CaptureRole::Endpoint,
         id: ids.next(),
         key: history.key_at(consumed).unwrap(),
         parent: parent.map(|parent| history.key_at(parent).unwrap()),

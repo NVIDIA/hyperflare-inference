@@ -58,6 +58,19 @@ pub struct Participant {
     pub state: Party,
 }
 
+impl Participant {
+    pub(super) fn window_holder(&self) -> Option<ProcKey> {
+        match self.owner {
+            Owner::Proc(proc)
+                if self.memory && matches!(self.state, Party::Pending | Party::Quarantined) =>
+            {
+                Some(proc)
+            }
+            _ => None,
+        }
+    }
+}
+
 pub fn party_state(parties: &[Participant], owner: Owner) -> Party {
     parties
         .iter()
@@ -344,6 +357,13 @@ impl Core {
             .map(|session| (session.instance, session.nonce))
     }
 
+    pub(super) fn process_connected(&self, process: ProcKey) -> bool {
+        self.sessions
+            .values()
+            .any(|s| (s.instance, s.nonce) == process)
+            || self.agents.values().any(|a| a.proc() == process)
+    }
+
     fn proc_exited_flag(&self, key: &ProcKey) -> bool {
         self.procs.get(key).is_none_or(|proc| proc.exited)
     }
@@ -415,14 +435,7 @@ impl Core {
         {
             let state = match p.owner {
                 Owner::Proc(proc) if self.proc_exited_flag(&proc) => Party::Drained,
-                Owner::Proc(proc)
-                    if p.state == Party::Pending
-                        && !self
-                            .sessions
-                            .values()
-                            .any(|s| (s.instance, s.nonce) == proc)
-                        && !self.agents.values().any(|a| a.proc() == proc) =>
-                {
+                Owner::Proc(proc) if p.state == Party::Pending && !self.process_connected(proc) => {
                     Party::Quarantined
                 }
                 Owner::Leg(_) if p.state == Party::Pending => Party::Quarantined,
@@ -563,7 +576,26 @@ impl Core {
         let Some(state) = self.scopes.get(&scope_id) else {
             return refuse(self, v2::ClaimReason::UnknownSource);
         };
-        let Some(entry) = state.index.get(source, endpoint, tier).cloned() else {
+        // The manager's index holds one tier per record. A candidate that named the
+        // arena tier goes stale when write-back releases the arena copy of a record
+        // that is still held on disk, so a claim on the manager's own record is served
+        // from whichever tier holds it. The store reads a chain by key and does not
+        // depend on the tier. Another instance's entry describes that instance's memory
+        // and is never substituted.
+        let entry = state.index.get(source, endpoint, tier).or_else(|| {
+            let other = match tier {
+                Tier::Dram => Tier::Nvme,
+                Tier::Nvme => Tier::Dram,
+                Tier::Gpu => return None,
+            };
+            if source == SourceId::Manager {
+                state.index.get(source, endpoint, other)
+            } else {
+                None
+            }
+        });
+        let entry = entry.cloned();
+        let Some(entry) = entry else {
             return refuse(self, v2::ClaimReason::UnknownSource);
         };
         if m.want_row && !entry.row {

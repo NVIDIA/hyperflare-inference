@@ -102,10 +102,10 @@ cite them by number.
     export pinned, subtracts the resources the pin protects once, and uses the
     reservation arithmetic that admission uses, never a copy of it.
 17. **Put is part of the protocol.** The eviction cascade ends in a write into the
-    manager's store. Refusals follow the pressure policy in section 11: invalid
-    or oversized puts discard the source; budget or in-flight refusals retry once
-    after a backoff, then discard it. Other failures keep the source local and
-    release selection. The model worker never waits for room.
+    manager's store. A DRAM retirement transfers its path root-first. Each
+    predecessor must be confirmed before its child starts. Failed puts release
+    the selection and retain the source path. Claims pin their source through
+    the last transfer window. The model worker continues serving.
 18. **Entries die with their session; its successor announces its own.** When a
     session ends, with or without a successor, the manager removes every entry it
     announced. When a new session opens for the same `instance_id`, the old
@@ -120,9 +120,8 @@ cite them by number.
     `DataChannelRef` and section 7 are fixed here.
 21. **Persisted checksums.** A DRAM or NVMe export serves the checksums
     committed with the record, never hashes of the bytes just read; the manager
-    validates every page and row. When the manager reads a whole record from NVMe
-    into DRAM it checks the record against those checksums and fails the claim
-    `COPY_ERROR` on a mismatch; a window read straight from NVMe into staging is
+    validates every page and row. A restore never reads
+    a whole record from NVMe into DRAM: a window read from NVMe into staging is
     served as it was read, with the persisted checksums, and the requester's check
     is the only one. The manager validates Put metadata against the accepted
     geometry, scope identity, parent, length and its own verification of the
@@ -609,13 +608,14 @@ process picks a new incarnation and becomes `READY` after scanning its NVMe
 records.
 
 - A `ClaimRelease`, `FenceAck` or `ExportEnd` that mentions a vanished claim or
-  export is answered (`UNKNOWN_CLAIM`) or ignored. The restarted manager grants
-  none of the previous run's windows: it reuses the same region files and holds
-  them for recorded previous-run processes, with a 60-second bound for pid-zero
-  holders (section 8.6).
+  export is answered (`UNKNOWN_CLAIM`) or ignored. When the manager reuses
+  region files, it holds them for recorded processes after a crash or a clean
+  stop with unfenced windows. Section 8.6 describes release of the hold,
+  including the 60-second bound for pid-zero holders.
 - Records the dead manager held only in DRAM are lost; NVMe records are
-  recovered. A writer drops its source copy at `Stored`, so a lost record cannot
-  be resent; it is recomputed on demand.
+  recovered if their entire parent chain is on disk. A writer may drop its copy
+  at `Stored`, before arena write-back. Losing an acknowledged row or a required
+  ancestor can make a returning request fetch from a peer or recompute the suffix.
 - Readiness does not wait for previous instances; source hints return as they resync.
 
 ### 8.3 Requester restart
@@ -692,8 +692,8 @@ recreate the files; an unexpected I/O error during the check (an interrupted
 `fallocate` is retried) fails the start and deletes nothing. The lock decides
 ownership, so a live manager's files are never reclaimed and another instance's
 directory is never read. Startup refuses region files owned by another user or
-symbolic links, and removes only its unfinished `generation.tmp` and `holders.tmp`
-metadata writes.
+symbolic links, and removes its unfinished `generation.tmp`, `holders.tmp`
+and `last-shutdown.tmp` metadata writes.
 Other files are left alone. Shutdown retains the regions for reconnecting clients.
 
 **Client.** A client uses the pool only with the regions it registered:
@@ -714,8 +714,10 @@ incarnation would guarantee: that no access under the dead manager can alias a
 window of the new one. Physical fencing (7.1) is kept by the following rule. The
 manager records the pids and start times of visible-pid sessions and
 shared-memory ranks, and the process nonces of pid-zero shared-memory sessions
-and ranks, in a file that survives a crash.
-When it starts on reused regions, each recorded visible process that is still
+and ranks, in a file that survives a crash. At a clean stop it keeps the
+registration of each process with a pending or quarantined shared window.
+This includes a requester whose claim ended before it fenced its window.
+When the manager reuses the regions, each recorded visible process that is still
 the same live process, and every recorded pid-zero process, is a previous-run
 holder. The manager takes the whole of both regions out of service (no window,
 put extent or record can be allocated in them) until every holder is released:
@@ -780,6 +782,8 @@ published. Waiting restores use the bounded claim-slot queue.
 | No progress | 3 s | manager | `FAILED{NO_PROGRESS}` |
 | Concurrent lookups per session | 8 | manager | `LOOKUP_OVERLOADED` |
 | Candidates, nodes, boundaries | 8, 4096, 8192 | both | trimmed (client) or `LOOKUP_INVALID` (manager) |
+| Ancestor keys per put | 4096 | manager | keys after the first 4096 are not considered |
+| Records in a chain before a put starts a new root | 2048 | manager | a put with a row is stored as a root with its complete chain; a page-only put is refused `INVALID` with the detail "page-only put has no held ancestor it can link to" |
 
 - Exports run on the lowest-priority copy stream.
 - A refusal is a normal outcome. The requester claims again 250 ms after a
@@ -803,32 +807,81 @@ writer                          manager
  PutFilled{i, xxh3} ----------->|  verified by the manager
  ...
  PutCommit{metadata} ---------->|
- <------ Stored{bytes}          |  committed, indexed: the writer may drop its copy
+ <------ Stored{bytes}          |  indexed and available to serve. The writer may drop its copy
  or  <-- PutRefused{reason}     |  PRESENT is success; other reasons follow pressure policy
 ```
 
 - `PutCancel` is legal only before `PutCommit`. Unfilled windows stay leased to
   the writer until `FenceAck{put_id}` or process exit.
-- For a record not already indexed, if the published parent is absent or has no
-  stored row, `PutAccept` selects no parent and `first_page = 0`. The writer sends
-  the complete page chain and endpoint row as a root, over shared memory or the data channel.
+- For a record not already indexed, `PutBegin.ancestor_keys` lists candidate
+  ancestors in strictly decreasing consumed-token order: local chain keys,
+  deepest first, followed by the published-parent hint on the local root. The
+  manager considers at most the first 4096 keys and chooses the first ready
+  ancestor whose pages it holds, including a page-only ancestor. `PutAccept`
+  names that parent and its chain-relative end page as `first_page`.
+  The writer sends the remaining pages and the accepted endpoint row, if any.
+  If no ancestor is held, the manager selects no parent and `first_page = 0`, and the writer sends the
+  complete chain as a root. If the chosen ancestor's chain has at least 2048
+  records, the manager also selects a root, so no stored chain exceeds half of
+  the lookup and claim limit of 4096 records. Admission can also select a root
+  under arena pressure.
+  An absent or empty list uses `published_parent` alone and requires that parent
+  to be ready; it never links to an uncommitted parent. Managers that do not
+  implement field 10 ignore the list and use `published_parent` alone.
+- The writer supplies the scheduler's capture role in `PutBegin.capture_role` (field 11).
+  Message and Anchor captures keep their exact recurrent rows. Roots and forks
+  retain available rows regardless of capture role. A newly discovered fork can regain a missing row while a writer still holds it. The writer supplies its
+  local child count in `child_paths` (12) and the next child on the retiring
+  path in `next_child` (13). The manager
+  also counts committed children, counting a known next child only once.
+  The writer sets `descendant_row` (14) when a ready descendant on the
+  unbranched path can offer a row after the same-page rule. Absent means false.
+  These topology hints apply to this put. Only the capture role is persisted.
+- The manager can omit a single-child interior Endpoint row when the writer
+  sets `descendant_row`. Otherwise the same-page rule applies. A covered child
+  alone cannot justify dropping the ancestor that covers it. `PutAccept.record_bytes` is the exact length of the chosen record,
+  including its header. The writer checks that length against the page-only
+  and row-bearing layouts before opening rank transfers. When a child commits,
+  an arena-only Endpoint ancestor can release its former tip row once active claims drain and a committed descendant row covers the unbranched path.
+- An Endpoint tip keeps its row unless a row-bearing ancestor on its path
+  has the same completed-page count. Flare checks when offering the row and
+  the manager checks its chosen parent chain at put time. Two protected
+  boundaries in one page each retain their own row for exact rewinds.
+- An explicit `row=false` put requires a held parent. A missing parent is
+  `INVALID`. Arena pressure that requires a root instead is `BUDGET`. A parent
+  whose chain has at least 2048 records does not count, because the put would
+  then start a new root and a root needs a row: a page-only put there is
+  `INVALID` with the detail "page-only put has no held ancestor it can link to",
+  while a put with a row is stored as a root.
+  A put with zero new pages and no retained row returns `PRESENT` because
+  its parent already covers it.
+- A rowless re-put of a held record returns `PRESENT`. A writer with a newly
+  protected row can upgrade a held page-only record at that exact key. If
+  every holder has released the row, a later capture can supply it. Restore
+  starts at the deepest retained row and prefills the remaining suffix.
+- Under disk pressure, the manager can reclaim a durable interior Endpoint row
+  if its only child has a durable row. Roots, forks and protected roles keep available rows.
+- The manager echoes the accepted capture role in `PutAccept.capture_role` (field 8).
+  The writer puts that value in header flag bits 8 and 9. Zero identifies
+  records from peers without role support and preserves their available
+  rows until a role-aware writer rewrites the record. A legacy writer still
+  commits zero role bits. If the manager already knows the role, it preserves
+  it in the stored header after validating the commit. Record layout, rank
+  geometry and replication flags keep their wire meanings. Older readers can open the same files.
 - `PutGrant` window page numbers count from the accepted record's first page
   (`PutAccept.first_page` is chain-relative), for every writer and rank agent.
-- "Already held means committed": only `Stored` and `PRESENT` confirm a
-  committed destination copy. Discarding a refused source under the pressure
-  policy does not establish a destination copy.
-- **Pressure policy.** `BUDGET` may mean temporary staging or arena pressure,
-  not a full manager. `INVALID` and `OVERSIZE` discard the source; `BUDGET` and
-  `INFLIGHT` retain selection for one retry after a 50 ms backoff, then discard
-  it if refused again with either reason. Pool events do not shorten this
-  backoff. Other refusals, synchronous submission errors and repeated failures
-  retain the source and release selection; their retries wait for a manager or
-  put event, a reconnect or a short backoff. Queue bounds stop
-  selection before pinning. Unavailable or busy managers leave local LRU eviction
-  as the end of the chain; only the manager's own LRU drops its committed data.
-  Manager loss releases waiting selections through the failed-move path. Moves
-  already started keep their move and export pins until the drained terminal
-  event. The model worker never waits for these operations.
+- `Stored` means the manager can serve the indexed record from its arena
+  or from disk. Arena puts can be acknowledged before write-back. `PRESENT`
+  can also mean an empty put is already covered by its parent.
+- **Pressure policy.** A DRAM handoff sends predecessors root-first. An
+  ancestor refused with `INVALID` or `OVERSIZE` triggers a leaf-only put.
+  `BUDGET` and `INFLIGHT` retry once before the same fallback. If the
+  leaf exhausts its retry or the leaf-only put is refused for one of these
+  reasons, the writer drops the leaf. A shared fork stays available to
+  its other children. A manager with a disk root reclaims clean arena duplicates
+  first. Evicting a dirty record writes its undurable predecessors first.
+  A record larger than the arena streams through staging. Full or pinned
+  storage can refuse admission with `BUDGET`.
 - **Validation.** Before indexing, the manager checks the
   `PutCommit` metadata against the accepted geometry, the scope identity, the
   accepted parent and first page, the record length, and the checksums it
@@ -934,7 +987,7 @@ be granted nothing, but their open streams can attest and say goodbye. A new att
 requires a live rank-0 session. Stream loss retains shared-window obligations until the
 process exits. A restarted manager has no record of these obligations: it keeps them in
 memory only. Section 8.6 states how region files it reuses are held for the previous run's
-session processes and pid-zero shared-memory ranks.
+session processes and shared-memory ranks.
 
 **13.4 Windows and checksums.** A multi-process source states, per rank, slice transfer
 checksums (`RankSums`): rank 0's `WindowFilled.rank_sums`/`PutFilled.rank_sums` for itself and

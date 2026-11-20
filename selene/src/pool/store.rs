@@ -117,6 +117,7 @@ struct Planned {
     candidate: PoolCandidate,
 }
 struct Restore {
+    tier: Tier,
     ticket: InboundTicket,
     local: Option<HostHit>,
     id: Option<u64>,
@@ -143,7 +144,7 @@ pub struct PooledStore<S: crate::store::TierStore, P: PoolPort = PoolClient> {
     /// Moves of the last local tier's records to the manager.
     cascade: Cascade,
     /// Restores that were wholly from the pool, which the local tiers did not count.
-    pool_fetched: u64,
+    pool_fetched: [u64; 3],
     /// Restores that failed in the pool part.
     pool_fetch_failed: u64,
     /// Bytes the pool parts copied into the device.
@@ -197,7 +198,7 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
             pool_events: Vec::new(),
             puts: Vec::new(),
             cascade: Cascade::new(layout),
-            pool_fetched: 0,
+            pool_fetched: [0; 3],
             pool_fetch_failed: 0,
             pool_bytes_in: 0,
         }
@@ -300,7 +301,7 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
                     self.rates
                         .observe(restore.level, restore.bytes, restore.started.elapsed());
                 }
-                self.pool_fetched += 1;
+                self.pool_fetched[restore.tier as usize] += 1;
                 self.pool_bytes_in += bytes;
                 events.push(StoreEvent::Fetched {
                     key,
@@ -424,6 +425,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         let bytes = hit.bytes;
         let started = Instant::now();
         self.rates.started(level);
+        let tier = planned.candidate.tier;
         let id = self.pool.fetch(PoolFetch {
             id: 0,
             page_tokens: self.page_tokens,
@@ -437,6 +439,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         self.restores.insert(
             hit.key,
             Restore {
+                tier,
                 ticket,
                 local: planned.local,
                 id: Some(id),
@@ -524,7 +527,16 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
 
     fn stats(&self) -> StoreStats {
         let mut stats = self.inner.stats();
-        stats.fetched += self.pool_fetched;
+        stats.fetched += self.pool_fetched.iter().sum::<u64>();
+        for (count, pool) in stats.restores_by_tier.iter_mut().zip(self.pool_fetched) {
+            *count += pool;
+        }
+        stats.refusal_drops = self.cascade.refusal_drops;
+        stats.retirement_paths = self.cascade.paths;
+        stats.retirement_latency_buckets = self.cascade.latency_buckets;
+        stats.retirement_max_depth = self.cascade.max_depth;
+        stats.retirement_ns = self.cascade.latency_ns;
+        stats.retirement_max_ns = self.cascade.max_latency_ns;
         stats.fetch_failed += self.pool_fetch_failed;
         stats.bytes_in += self.pool_bytes_in;
         for (index, count) in self.cascade.dropped.iter().enumerate() {

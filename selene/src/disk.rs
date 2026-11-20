@@ -366,6 +366,10 @@ impl DiskThread {
         Ok(())
     }
 
+    pub fn is_idle(&self) -> bool {
+        self.outstanding.get() == 0
+    }
+
     pub fn poll(&self, replies: &mut Vec<Reply>) {
         while let Ok(reply) = self.receiver.try_recv() {
             self.outstanding

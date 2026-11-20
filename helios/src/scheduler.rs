@@ -672,6 +672,7 @@ pub struct RequestScheduler {
     track_publications: bool,
     publications: Vec<CheckpointId>,
     offered_publications: BTreeSet<CheckpointId>,
+    pending_reoffers: BTreeSet<CheckpointId>,
     track_evictions: bool,
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
@@ -763,6 +764,7 @@ impl RequestScheduler {
             track_publications: false,
             publications: Vec::new(),
             offered_publications: BTreeSet::new(),
+            pending_reoffers: BTreeSet::new(),
             track_evictions: false,
             evictions: Vec::new(),
             evictions_lost: false,
@@ -1626,7 +1628,12 @@ impl RequestScheduler {
             window_snapshot_ready: false,
             window_restore: false,
             epoch: 0,
-            acceptance: speculation::AcceptanceProfile::new(self.capabilities.completion_token_capacity),
+            acceptance: if self.gpu_confidence() {
+                speculation::AcceptanceProfile::new(self.capabilities.completion_token_capacity)
+            } else {
+                speculation::AcceptanceProfile::seeded(
+                    self.capabilities.completion_token_capacity, &self.forecasts.population)
+            },
             accounting: self.accounting(),
             handle,
             state_slot: StateSlotId((1 + slot * execution_rows) as u32),
@@ -1808,6 +1815,11 @@ impl RequestScheduler {
         }
         let page_tokens = self.capabilities.page_tokens as u64;
         Some(PublishedCheckpoint {
+            capture_role: match checkpoint.retention_rank().role {
+                RetentionRole::Endpoint => flare_selene::CaptureRole::Endpoint,
+                RetentionRole::Message => flare_selene::CaptureRole::Message,
+                RetentionRole::Anchor => flare_selene::CaptureRole::Anchor,
+            },
             id,
             key: checkpoint.prefix(),
             parent,
@@ -1818,6 +1830,23 @@ impl RequestScheduler {
                 as usize,
             slot: self.snapshot_slot(checkpoint.snapshot()),
         })
+    }
+
+    pub(crate) fn reoffer_publication(&mut self, id: CheckpointId) {
+        if !self.publications.contains(&id) {
+            if self.offered_publications.remove(&id) {
+                self.pending_reoffers.insert(id);
+            }
+            self.record_publication(id);
+        }
+    }
+
+    pub(crate) fn submitted_reoffer(&mut self, id: CheckpointId, retry: bool) -> bool {
+        if retry {
+            self.pending_reoffers.contains(&id)
+        } else {
+            self.pending_reoffers.remove(&id)
+        }
     }
 
     fn record_publication(&mut self, id: CheckpointId) {
@@ -2489,6 +2518,9 @@ impl RequestScheduler {
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
+        // One population update per round: this path for host estimates, `observe_packed_forecasts` for GPU confidence.
+        let host_population = proposal_source == speculation::ProposalSource::Mtp && !self.gpu_confidence();
+        let mut population = Vec::new();
         let mut useful_tokens = [0u64; REQUEST_LANES];
         let mut generated = Vec::new();
         let mut boundaries = Vec::new();
@@ -2544,14 +2576,20 @@ impl RequestScheduler {
             {
                 let vector = record.vector.as_ref().unwrap();
                 let offered = vector.offered_drafts as usize;
+                let survival = survival.map(|rows| rows[lane.request.slot as usize].as_slice());
                 request.acceptance.observe(
                     proposal_source,
                     record.generated_tokens as u32,
                     offered,
                     vector.accepted_drafts as usize,
                     vector.emitted_count > vector.accepted_drafts,
-                    survival.map(|rows| rows[lane.request.slot as usize].as_slice()),
+                    survival,
                 );
+                // The population learns from the rounds the request's own profile learns from.
+                if host_population {
+                    population.extend(speculation::observed_prefixes(offered, vector.accepted_drafts as usize,
+                        vector.emitted_count > vector.accepted_drafts, survival));
+                }
             }
             if record.status == 3 {
                 request.error_code = Some(record.error_code);
@@ -2633,6 +2671,9 @@ impl RequestScheduler {
             if request.pending == 0 {
                 request.scheduled_consumed = request.consumed_tokens;
             }
+        }
+        for (depth, value) in population {
+            self.forecasts.observe_population(depth, value as f32);
         }
         for lane in &step.lanes {
             let pending = self.pending_token_ceiling(lane.request) as u64;
@@ -2753,6 +2794,9 @@ impl RequestScheduler {
             request.prefix_snapshot = Some(capture.snapshot);
             self.stats.snapshot_publications += 1;
         } else {
+            if let PublishResult::Existing { id, ready: true } = result {
+                self.reoffer_publication(id);
+            }
             self.release_snapshot(capture.snapshot);
             if let PublishResult::Existing { id, ready: true } = result
                 && matches!(capture.resume, RequestPhase::Snapshot | RequestPhase::Finishing)

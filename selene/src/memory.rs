@@ -67,6 +67,7 @@ pub const IN_FLIGHT_WINDOWS: usize = crate::shared::WINDOW_CREDITS as usize;
 /// copy is complete; a standalone memory store treats every record as durable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecord {
+    pub capture_role: crate::CaptureRole,
     pub pages: Vec<Slot>,
     pub row: Option<Vec<Slot>>,
     pub durable: bool,
@@ -155,6 +156,7 @@ impl Pending {
 
 #[derive(Debug)]
 struct Outbound {
+    refill: bool,
     checkpoint: CheckpointId,
     key: PrefixKey,
     pending: Pending,
@@ -287,6 +289,21 @@ impl Core {
         }
     }
 
+    fn needs_row(&self, checkpoint: &PublishedCheckpoint, parent: Option<PrefixKey>) -> bool {
+        let old = self.index.node(&checkpoint.key);
+        let role = old.map_or(checkpoint.capture_role, |n| {
+            n.location.capture_role.merge(checkpoint.capture_role)
+        });
+        self.flat
+            || !self.index.covered_endpoint(
+                checkpoint.key,
+                parent,
+                role,
+                old.map_or(0, |n| n.children()),
+                |n| n.ready,
+            )
+    }
+
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool> {
         if checkpoint.tail_pages > checkpoint.chain_pages.len() {
             self.stats.store_failed += 1;
@@ -319,7 +336,13 @@ impl Core {
         tail: &[PageId],
         durable: bool,
     ) -> Result<bool> {
-        let result = self.start_record(checkpoint, parent, tail, durable);
+        let result = self.start_record(
+            checkpoint,
+            parent,
+            tail,
+            durable,
+            self.needs_row(checkpoint, parent),
+        );
         match &result {
             Ok(true) => {}
             Ok(false) => self.stats.store_skipped += 1,
@@ -336,6 +359,7 @@ impl Core {
         parent: Option<PrefixKey>,
         tail: &[PageId],
         durable: bool,
+        row: bool,
     ) -> Result<bool> {
         if self.known(&checkpoint.key) {
             return Ok(false);
@@ -352,7 +376,7 @@ impl Core {
             parent,
             checkpoint.bucket,
             tail.len(),
-            true,
+            row,
             durable,
         );
         if let Some(parent) = &parent {
@@ -361,17 +385,23 @@ impl Core {
         let Some(record) = allocated? else {
             return Ok(false);
         };
-        let row = record.row.as_ref().expect("allocated with a row");
+        self.index[&checkpoint.key].location.capture_role = checkpoint.capture_role;
+        self.index
+            .set_published_parent(&checkpoint.key, checkpoint.parent);
         let id = self.next_job();
         let pages = tail
             .iter()
             .zip(&record.pages)
             .map(|(page, slot)| (*page, self.pool.slot_address(*slot)));
-        let row = Some((checkpoint.slot, self.pool.addresses(row)));
+        let row = record
+            .row
+            .as_ref()
+            .map(|slots| (checkpoint.slot, self.pool.addresses(slots)));
         let queued = windows(id, Direction::Out, pages, row);
         self.outbound.insert(
             id,
             Outbound {
+                refill: false,
                 checkpoint: checkpoint.id,
                 key: checkpoint.key,
                 pending: Pending::new(queued),
@@ -393,42 +423,12 @@ impl Core {
         durable: bool,
     ) -> Result<Option<MemoryRecord>> {
         let needed = self.layout.record_slots(tail_pages, row);
-        if !self.fits(needed) {
-            return Ok(None);
-        }
-        if self.free_retention_slots() < needed {
-            self.thin_rows_for(needed);
-        }
-        if self.spill && self.retire_for(self.shortfall(needed)) {
-            return Ok(None);
-        }
-        while self.pool.free_slots() < needed + self.pool.intake_slots() {
-            let announced = &self.announced;
-            let spill = self.spill;
-            match self.index.evict(row, |node| {
-                evictable(node, spill, announced.contains(&node.key))
-            }) {
-                Some(Eviction::Leaves(nodes)) => {
-                    self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
-                    for node in &nodes {
-                        self.thinning.remove(&node.key);
-                        self.clean_slots -= self.clean_slots(node);
-                        self.release(&node.location);
-                    }
-                }
-                Some(Eviction::Compacted(compacted)) => {
-                    self.stats.dropped[0] += u64::from(!self.flat);
-                    let dropped = self.drop_row(&compacted);
-                    debug_assert!(dropped);
-                }
-                None => return Ok(None),
-            }
-        }
-        let Some(mut slots) = self.pool.allocate(needed) else {
+        let Some(mut slots) = self.allocate_slots(needed, row) else {
             return Ok(None);
         };
         let row_slots = slots.split_off(tail_pages);
         let record = MemoryRecord {
+            capture_role: crate::CaptureRole::Endpoint,
             pages: slots,
             row: row.then_some(row_slots),
             durable,
@@ -453,6 +453,78 @@ impl Core {
         Ok(Some(record))
     }
 
+    fn allocate_slots(&mut self, needed: usize, row: bool) -> Option<Vec<Slot>> {
+        if !self.fits(needed) {
+            return None;
+        }
+        if self.free_retention_slots() < needed {
+            self.thin_rows_for(needed);
+        }
+        if self.spill && self.retire_for(self.shortfall(needed)) {
+            return None;
+        }
+        while self.pool.free_slots() < needed + self.pool.intake_slots() {
+            let announced = &self.announced;
+            let spill = self.spill;
+            match self.index.evict(
+                row,
+                |node| {
+                    evictable(node, spill, announced.contains(&node.key))
+                        && (node.children() == 0
+                            || (node.parent.is_some()
+                                && node.ready_children() == 1
+                                && node.location.capture_role == crate::CaptureRole::Endpoint))
+                },
+                |_| false,
+            ) {
+                Some(Eviction::Leaves(nodes)) => {
+                    self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
+                    for node in &nodes {
+                        self.thinning.remove(&node.key);
+                        self.clean_slots -= self.clean_slots(node);
+                        self.release(&node.location);
+                    }
+                }
+                Some(Eviction::Compacted(compacted)) => {
+                    self.stats.dropped[0] += u64::from(!self.flat);
+                    let dropped = self.drop_row(&compacted);
+                    debug_assert!(dropped);
+                }
+                None => return None,
+            }
+        }
+        self.pool.allocate(needed)
+    }
+
+    fn refill_row(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        let key = checkpoint.key;
+        self.pin_record(&key)?;
+        let Some(slots) = self.allocate_slots(self.layout.row_slots(), true) else {
+            self.unpin_record(&key)?;
+            return Ok(StoreOutcome::Retry(StoreReason::Slabs));
+        };
+        self.index.set_ready(&key, false)?;
+        let addresses = self.pool.addresses(&slots);
+        self.index[&key].location.row = Some(slots);
+        let id = self.next_job();
+        let queued = windows(
+            id,
+            Direction::Out,
+            std::iter::empty(),
+            Some((checkpoint.slot, addresses)),
+        );
+        self.outbound.insert(
+            id,
+            Outbound {
+                checkpoint: checkpoint.id,
+                key,
+                refill: true,
+                pending: Pending::new(queued),
+            },
+        );
+        Ok(StoreOutcome::Queued)
+    }
+
     /// Hold bounded cold leaves until they cover the missing slots.
     /// A full tier waits while any such records remain held.
     fn retire_for(&mut self, need_slots: usize) -> bool {
@@ -474,14 +546,8 @@ impl Core {
                 break;
             };
             let held_slots = node.location.slots();
-            let retiring = Retiring {
-                tier: PoolTier::Dram,
-                key,
-                parent: node.parent,
-                bucket: node.bucket,
-                tail_pages: node.tail_pages,
-                row: node.row,
-            };
+            let mut retiring = self.retirement_record(key).unwrap();
+            retiring.ancestor_keys = self.index.ancestor_keys(&key);
             if self.pin_record(&key).is_err() {
                 break;
             }
@@ -490,6 +556,35 @@ impl Core {
             self.retiring.push(retiring);
         }
         !self.held.is_empty()
+    }
+
+    fn retirement_record(&self, key: PrefixKey) -> Option<Retiring> {
+        let node = self.index.node(&key)?;
+        Some(Retiring {
+            tier: PoolTier::Dram,
+            capture_role: node.location.capture_role,
+            child_paths: node.children(),
+            key,
+            parent: node.parent,
+            ancestor_keys: Vec::new(),
+            bucket: node.bucket,
+            tail_pages: node.tail_pages,
+            row: self.offers_row(node),
+            descendant_row: self
+                .index
+                .has_row_below(&key, |n| n.ready && self.offers_row(n)),
+        })
+    }
+
+    fn offers_row(&self, node: &Node<MemoryRecord>) -> bool {
+        node.row
+            && !self.index.covered_endpoint(
+                node.key,
+                node.parent,
+                node.location.capture_role,
+                node.children(),
+                |n| n.ready,
+            )
     }
 
     fn clean_slots(&self, node: &Node<MemoryRecord>) -> usize {
@@ -514,6 +609,9 @@ impl Core {
     }
 
     fn unpin_record(&mut self, key: &PrefixKey) -> Result<()> {
+        if self.held.contains_key(key) && self.index[key].pins() == 1 {
+            return Err(invalid("the retirement still holds this host record"));
+        }
         self.index.unpin(key)?;
         self.clean_slots += self.clean_slots(&self.index[key]);
         Ok(())
@@ -556,7 +654,15 @@ impl Core {
         self.stats.held[0] += u64::from(how == Retirement::Failed);
         self.stats.progress += 1;
         if how != Retirement::Failed {
-            self.finishing.push(*key);
+            let mut cursor = Some(*key);
+            while let Some(k) = cursor {
+                self.finishing.push(k);
+                cursor = self
+                    .index
+                    .node(&k)
+                    .and_then(|node| node.parent)
+                    .filter(|p| how == Retirement::Moved && self.index[p].children() == 1);
+            }
             self.finish_retired();
         }
     }
@@ -565,11 +671,20 @@ impl Core {
     /// them. A record that gained a child meanwhile stays.
     fn finish_retired(&mut self) {
         let mut finishing = std::mem::take(&mut self.finishing);
+        finishing.sort_unstable_by_key(|key| std::cmp::Reverse(key.consumed_tokens));
+        finishing.dedup();
+        let mut waiting = HashSet::new();
         finishing.retain(|key| {
-            if self.index.node(key).is_some_and(|node| node.pinned()) {
+            let Some(node) = self.index.node(key) else {
+                return false;
+            };
+            if node.pinned() || waiting.contains(key) {
+                if let Some(parent) = node.parent {
+                    waiting.insert(parent);
+                }
                 return true;
             }
-            if self.remove_record(key).is_ok() {
+            if node.children() == 0 && self.remove_record(key).is_ok() {
                 self.stats.progress += 1;
             }
             false
@@ -723,7 +838,15 @@ impl Core {
         // many as the headroom needs, so recently used parents keep theirs.
         let mut queued = self.index.thinning_order(&mut self.thinning);
         for key in queued.by_ref() {
-            if !self.index.row_redundant(&key, false) {
+            if !self.index[&key].row
+                || self.index[&key].location.capture_role != crate::CaptureRole::Endpoint
+                || !self.index.row_redundant(&key, false)
+                || self.index[&key].ready_children() != 1
+            {
+                continue;
+            }
+            if !self.index.has_row_below(&key, |n| n.ready && n.row) {
+                self.thinning.insert(key);
                 continue;
             }
             if !self.thin(&key) {
@@ -757,7 +880,7 @@ impl Core {
     }
 
     fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
-        for node in self.index.remove(key)? {
+        for node in self.index.remove(key, |_| false)? {
             self.thinning.remove(&node.key);
             self.clean_slots -= self.clean_slots(&node);
             self.release(&node.location);
@@ -973,22 +1096,45 @@ impl Core {
             checkpoint,
             key,
             pending,
+            refill,
         } = outbound;
-        let result = match pending.error {
-            None => match self.complete_record(&key, true) {
-                Ok(()) => {
-                    self.stats.stored += 1;
+        let result = if refill {
+            let result = match pending.error {
+                None => {
+                    self.index[&key].row = true;
+                    self.stats.row_refills += 1;
                     self.stats.bytes_out += pending.bytes;
                     Ok(pending.bytes)
                 }
-                Err(error) => Err(error),
-            },
-            Some(error) => {
-                self.stats.store_failed += 1;
-                if let Err(removal) = self.complete_record(&key, false) {
-                    Err(invalid(format!("{error}; {removal}")))
-                } else {
+                Some(error) => {
+                    self.pool
+                        .release(self.index[&key].location.row.take().unwrap());
+                    self.stats.store_failed += 1;
                     Err(error)
+                }
+            };
+            self.index
+                .set_ready(&key, true)
+                .expect("refill holds the indexed record");
+            self.unpin_record(&key).expect("refill owns a pin");
+            result
+        } else {
+            match pending.error {
+                None => match self.complete_record(&key, true) {
+                    Ok(()) => {
+                        self.stats.stored += 1;
+                        self.stats.bytes_out += pending.bytes;
+                        Ok(pending.bytes)
+                    }
+                    Err(error) => Err(error),
+                },
+                Some(error) => {
+                    self.stats.store_failed += 1;
+                    if let Err(removal) = self.complete_record(&key, false) {
+                        Err(invalid(format!("{error}; {removal}")))
+                    } else {
+                        Err(error)
+                    }
                 }
             }
         };
@@ -1017,7 +1163,13 @@ impl Core {
             });
             for checkpoint in waiting {
                 let (parent, tail) = self.shape(&checkpoint);
-                let result = match self.start_record(&checkpoint, parent, tail, true) {
+                let result = match self.start_record(
+                    &checkpoint,
+                    parent,
+                    tail,
+                    true,
+                    self.needs_row(&checkpoint, parent),
+                ) {
                     Ok(true) => continue,
                     Ok(false) => {
                         events.push(StoreEvent::Deferred {
@@ -1060,6 +1212,7 @@ impl Core {
                     self.index.touch_ancestors(key);
                 }
                 self.stats.fetched += 1;
+                self.stats.restores_by_tier[crate::Tier::Dram as usize] += 1;
                 self.stats.bytes_in += pending.bytes;
                 self.stats.reused_tokens += tokens;
                 Ok(pending.bytes)
@@ -1075,9 +1228,11 @@ impl Core {
     /// Drop every transfer in progress: unready records leave the index and
     /// pinned chains are released. No event follows.
     fn abandon(&mut self) {
+        self.deferred.clear();
         let outbound = std::mem::take(&mut self.outbound);
-        for (_, outbound) in outbound {
-            let _ = self.complete_record(&outbound.key, false);
+        for (_, mut outbound) in outbound {
+            outbound.pending.error = Some(invalid("host copy abandoned"));
+            self.finish_outbound(outbound, &mut Vec::new());
         }
         let inbound = std::mem::take(&mut self.inbound);
         for (_, inbound) in inbound {
@@ -1085,7 +1240,6 @@ impl Core {
                 let _ = self.unpin_record(node);
             }
         }
-        self.deferred.clear();
     }
 
     fn resident_bytes(&self) -> u64 {
@@ -1094,7 +1248,22 @@ impl Core {
     }
 
     fn stats(&self) -> StoreStats {
+        let mut path = HashSet::new();
+        for tip in self.held.keys() {
+            let mut cursor = Some(*tip);
+            while let Some(key) = cursor {
+                if !path.insert(key) {
+                    break;
+                }
+                cursor = self.index[&key].parent;
+            }
+        }
+        let slots: usize = path
+            .iter()
+            .map(|key| self.index[key].location.slots())
+            .sum();
         StoreStats {
+            retirement_pinned_bytes: slots as u64 * self.pool.page_bytes() as u64,
             outbound_in_flight: self.outbound.len() + self.deferred.len(),
             inbound_in_flight: self.inbound.len(),
             memory_records: self.index.len(),
@@ -1110,8 +1279,8 @@ impl Core {
 }
 
 /// Split a record into transfer windows of at most [`WINDOW_PAGES`] pages,
-/// attaching the row to the last one. A record without pages is one window
-/// holding only the row.
+/// attaching the row to the last one. A row alone needs one window. An empty
+/// link needs none.
 fn windows(
     id: JobId,
     direction: Direction,
@@ -1269,6 +1438,11 @@ impl MemoryStore {
         Ok(accepted)
     }
 
+    /// Index the zero-page link without allocating a row or starting a device copy.
+    pub(crate) fn store_empty(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool> {
+        self.core.start_record(checkpoint, None, &[], false, false)
+    }
+
     /// Allocate slots for a record read in from elsewhere, evicting under the
     /// policy, and index it unready and pinned; `None` when no slots can be
     /// freed. The record is durable: it exists outside this store already.
@@ -1307,6 +1481,12 @@ impl MemoryStore {
     /// before it can spill, so a spill never sees another record's sums.
     pub fn announced_sums(&self, key: &PrefixKey) -> Option<Arc<RecordSums>> {
         self.announce.as_ref()?.sums.get(key).cloned()
+    }
+
+    pub(crate) fn promote_role(&mut self, key: PrefixKey, role: crate::CaptureRole) {
+        if let Some(node) = self.core.index.node_mut(&key) {
+            node.location.capture_role = node.location.capture_role.merge(role);
+        }
     }
 
     /// The slots of a ready record.
@@ -1590,8 +1770,14 @@ impl HostStore for MemoryStore {
             self.core.stats.store_skipped += 1;
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
-        if let Some(node) = self.core.index.node(&checkpoint.key) {
-            if node.ready && node.row {
+        let covered = self
+            .core
+            .index
+            .node(&checkpoint.key)
+            .is_some_and(|node| !self.core.needs_row(checkpoint, node.parent));
+        if let Some(node) = self.core.index.node_mut(&checkpoint.key) {
+            node.location.capture_role = node.location.capture_role.merge(checkpoint.capture_role);
+            if node.ready && (node.row || covered) {
                 self.core.stats.store_skipped += 1;
                 self.core.index.touch_ancestors(&checkpoint.key);
                 return Ok(StoreOutcome::Present);
@@ -1600,18 +1786,15 @@ impl HostStore for MemoryStore {
                 self.core.stats.store_skipped += 1;
                 return Ok(StoreOutcome::Retry(StoreReason::Inflight));
             }
-            // Memory-only rows can be republished as complete roots after compaction.
-            // A node with descendants must retain its page chain until they are evicted.
-            if node.children() != 0 {
-                self.core.stats.store_skipped += 1;
-                return Ok(StoreOutcome::Retry(StoreReason::Slabs));
-            }
-            self.core.remove_record(&checkpoint.key)?;
+            let result = self.core.refill_row(checkpoint)?;
+            self.pump();
+            return Ok(result);
         }
-        let (_, tail) = self.core.shape(checkpoint);
+        let (parent, tail) = self.core.shape(checkpoint);
+        let row = self.core.needs_row(checkpoint, parent);
         if !self
             .core
-            .fits(self.core.layout.record_slots(tail.len(), true))
+            .fits(self.core.layout.record_slots(tail.len(), row))
         {
             self.core.stats.store_skipped += 1;
             self.core.stats.dropped[1] += 1;
@@ -1715,6 +1898,9 @@ impl crate::store::TierStore for MemoryStore {
         self.core.stats.progress += u64::from(self.core.spill != enabled);
         self.core.set_spill(enabled);
     }
+    fn retirement_predecessor(&self, key: PrefixKey) -> Option<Retiring> {
+        self.core.retirement_record(key)
+    }
     fn take_retiring(&mut self) -> Vec<Retiring> {
         std::mem::take(&mut self.core.retiring)
     }
@@ -1781,6 +1967,7 @@ mod tests {
         let chain = (consumed / PT) as u32;
         let tail = chain - parent.map_or(0, |p| (p / PT) as u32);
         PublishedCheckpoint {
+            capture_role: crate::CaptureRole::Endpoint,
             id: checkpoint_id(slot),
             key: history.key_at(consumed).unwrap(),
             parent: parent.map(|p| history.key_at(p).unwrap()),
@@ -1866,13 +2053,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(turn, vec![turn as u8; ROW as usize]);
-            let checkpoint = published(
+            let mut checkpoint = published(
                 &full,
                 u64::from(turn) * PT,
                 (turn > 1).then(|| u64::from(turn - 1) * PT),
                 0,
                 turn,
             );
+            checkpoint.capture_role = crate::CaptureRole::Message;
             assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
             store.poll(&mut events).unwrap();
             assert_eq!(
@@ -1982,38 +2170,132 @@ mod tests {
     }
 
     #[test]
+    fn pressure_keeps_the_last_row_above_a_covered_tip() {
+        let mut core = store_core(32, 8, false);
+        let full = history(192, 1);
+        let parent = published(&full, 128, Some(64), 0, 2);
+        let tip = published(&full, 134, Some(128), 0, 3);
+        for cp in [
+            published(&full, 64, None, 0, 1),
+            parent.clone(),
+            tip.clone(),
+        ] {
+            assert!(core.store(&cp).unwrap());
+            finish(&mut core);
+        }
+        assert!(!core.index[&tip.key].row);
+        core.thin_rows_for(usize::MAX);
+        assert_eq!(core.lookup(&full, 0, u64::MAX).unwrap().key, parent.key);
+        assert!(
+            core.index
+                .candidate(true, |n| n.key == parent.key)
+                .is_none()
+        );
+        let deep = published(&full, 192, Some(134), 0, 4);
+        assert!(core.store(&deep).unwrap());
+        finish(&mut core);
+        core.thin_rows_for(usize::MAX);
+        assert!(!core.index[&parent.key].row);
+        assert_eq!(core.lookup(&full, 0, u64::MAX).unwrap().key, deep.key);
+    }
+
+    #[test]
+    fn same_page_endpoint_replays_from_the_exact_message_boundary() {
+        use crate::CaptureRole::{Anchor, Message};
+        let mut core = store_core(64, 16, false);
+        let full = history(134, 1);
+        let mut branch = history(64, 1);
+        branch.append(&[42; 71], &[]).unwrap();
+        let root = published(&full, 64, None, 0, 1);
+        let mut anchor = published(&full, 128, Some(64), 0, 2);
+        anchor.capture_role = Anchor;
+        let mut message = published(&full, 129, Some(128), 0, 3);
+        message.capture_role = Message;
+        let endpoint = published(&full, 134, Some(129), 0, 4);
+        let sibling = published(&branch, 135, Some(64), 0, 5);
+        for record in [&root, &anchor, &message, &sibling] {
+            assert!(core.store(record).unwrap());
+            finish(&mut core);
+        }
+        core.store(&endpoint).unwrap();
+        finish(&mut core);
+        assert_eq!(core.lookup(&full, 0, 129).unwrap().key, anchor.key);
+        assert_eq!(core.lookup(&full, 0, 130).unwrap().key, message.key);
+        assert!(core.index.node(&endpoint.key).is_none_or(|node| !node.row));
+        let hit = core.lookup(&full, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, message.key);
+        assert_eq!(endpoint.key.consumed_tokens - hit.consumed_tokens, 5);
+        assert_eq!(core.lookup(&branch, 0, u64::MAX).unwrap().key, sibling.key);
+    }
+
+    #[test]
+    fn retirement_offers_a_covered_endpoint_row_only_if_it_becomes_a_fork() {
+        let mut core = store_core(64, 16, false);
+        let full = history(192, 1);
+        let root = published(&full, 128, None, 0, 1);
+        let endpoint = published(&full, 134, Some(128), 0, 2);
+        for record in [&root, &endpoint] {
+            assert!(core.store(record).unwrap());
+            finish(&mut core);
+        }
+        // An existing holder can still have a row from an earlier capture.
+        assert_eq!(core.refill_row(&endpoint).unwrap(), StoreOutcome::Queued);
+        finish(&mut core);
+        assert!(core.index[&endpoint.key].row);
+        assert!(!core.retirement_record(endpoint.key).unwrap().row);
+        let child = published(&full, 192, Some(134), 0, 3);
+        assert!(core.store(&child).unwrap());
+        finish(&mut core);
+        assert!(!core.retirement_record(endpoint.key).unwrap().row);
+        let mut branch = history(134, 1);
+        branch.append(&[42; 58], &[]).unwrap();
+        let sibling = published(&branch, 192, Some(134), 0, 4);
+        assert!(core.store(&sibling).unwrap());
+        finish(&mut core);
+        let offered = core.retirement_record(endpoint.key).unwrap();
+        assert_eq!(offered.child_paths, 2);
+        assert!(offered.row);
+        assert!(core.retirement_record(root.key).unwrap().row);
+    }
+
+    #[test]
     fn row_thinning_uses_warm_headroom_for_each_row_geometry() {
-        for row_slots in [1, 3] {
-            for headroom in [2 * row_slots, 2 * row_slots + 1] {
-                let layout =
-                    Layout::new(&[geometry(PT, &[("kv", PAGE)], row_slots as u64 * PAGE)]).unwrap();
-                assert_eq!(layout.row_slots(), row_slots);
-                let intake = crate::offload::intake_slots(&layout, 1);
-                let warm = 3 * (1 + row_slots) + headroom;
-                let pool = SlabPool::new(PAGE, warm + intake, intake).unwrap();
-                let mut core = Core::new(IDENTITY, pool, layout, false);
-                let full = history(192, 1);
-                let checkpoints = [
-                    published(&full, 64, None, 0, 1),
-                    published(&full, 128, Some(64), 0, 2),
-                    published(&full, 192, Some(128), 0, 3),
-                ];
-                for checkpoint in &checkpoints {
-                    assert!(core.store(checkpoint).unwrap());
-                    finish(&mut core);
+        use crate::CaptureRole::{Anchor, Endpoint, Message};
+        for role in [Endpoint, Message, Anchor] {
+            for row_slots in [1, 3] {
+                for headroom in [2 * row_slots, 2 * row_slots + 1] {
+                    let layout =
+                        Layout::new(&[geometry(PT, &[("kv", PAGE)], row_slots as u64 * PAGE)])
+                            .unwrap();
+                    assert_eq!(layout.row_slots(), row_slots);
+                    let intake = crate::offload::intake_slots(&layout, 1);
+                    let warm = 3 * (1 + row_slots) + headroom;
+                    let pool = SlabPool::new(PAGE, warm + intake, intake).unwrap();
+                    let mut core = Core::new(IDENTITY, pool, layout, false);
+                    let full = history(192, 1);
+                    let mut checkpoints = [
+                        published(&full, 64, None, 0, 1),
+                        published(&full, 128, Some(64), 0, 2),
+                        published(&full, 192, Some(128), 0, 3),
+                    ];
+                    checkpoints[1].capture_role = role;
+                    for checkpoint in &checkpoints {
+                        assert!(core.store(checkpoint).unwrap());
+                        finish(&mut core);
+                    }
+                    let thinned = role == Endpoint && headroom == 2 * row_slots;
+                    assert_eq!(
+                        core.index[&checkpoints[1].key].row, !thinned,
+                        "role={role:?}, row_slots={row_slots}, warm headroom={headroom}, intake={intake}"
+                    );
+                    assert_eq!(
+                        core.pool.free_slots(),
+                        intake + headroom + usize::from(thinned) * row_slots
+                    );
+                    assert!(core.index[&checkpoints[0].key].row);
+                    assert!(core.index[&checkpoints[2].key].row);
+                    assert_clean_slots(&core);
                 }
-                let thinned = headroom == 2 * row_slots;
-                assert_eq!(
-                    core.index[&checkpoints[1].key].row, !thinned,
-                    "row_slots={row_slots}, warm headroom={headroom}, intake={intake}"
-                );
-                assert_eq!(
-                    core.pool.free_slots(),
-                    intake + headroom + usize::from(thinned) * row_slots
-                );
-                assert!(core.index[&checkpoints[0].key].row);
-                assert!(core.index[&checkpoints[2].key].row);
-                assert_clean_slots(&core);
             }
         }
     }
@@ -2067,8 +2349,14 @@ mod tests {
         let side = published(&branch, 256, Some(192), 0, 4);
         assert!(core.store(&side).unwrap());
         finish(&mut core);
-        assert!(!core.index[&older.key].row, "the older redundant row is reclaimed first");
-        assert!(core.index[&resume.key].row, "the recently used parent keeps its row");
+        assert!(
+            !core.index[&older.key].row,
+            "the older redundant row is reclaimed first"
+        );
+        assert!(
+            core.index[&resume.key].row,
+            "the recently used parent keeps its row"
+        );
         assert_eq!(
             core.lookup(&main, 0, u64::MAX).map(|hit| hit.key),
             Some(resume.key)
@@ -2240,23 +2528,39 @@ mod tests {
 
     #[test]
     fn gpu_reuse_cannot_prevent_row_compaction_or_recreate_a_host_copy() {
-        let mut core = store_core(3, 2, false);
+        let mut core = store_core(3, 3, false);
         let full = history(128, 1);
-        let root = published(&full, 64, None, 0, 1);
+        let root = published(&full, 1, None, 0, 99);
+        assert!(core.store(&root).unwrap());
+        finish(&mut core);
+        let interior = published(&full, 64, Some(1), 0, 1);
         let child = published(&full, 128, Some(64), 0, 2);
         let stranger = published(&history(64, 2), 64, None, 2, 3);
-        assert!(core.store(&root).unwrap());
+        assert!(core.store(&interior).unwrap());
         finish(&mut core);
         assert!(core.store(&child).unwrap());
         finish(&mut core);
         core.pin_record(&child.key).unwrap();
-        core.reused(&root.key);
+        core.reused(&interior.key);
         assert!(core.store(&stranger).unwrap());
         finish(&mut core);
-        assert!(!core.index.node(&root.key).unwrap().row);
-        core.reused(&root.key);
-        assert!(core.lookup(&full, 0, 128).is_none());
+        assert!(!core.index.node(&interior.key).unwrap().row);
+        core.reused(&interior.key);
+        assert_eq!(core.lookup(&full, 0, 128).unwrap().key, root.key);
         core.unpin_record(&child.key).unwrap();
+    }
+
+    #[test]
+    fn a_stored_root_keeps_its_published_parent_for_the_pool_put() {
+        let mut core = store_core(32, 4, false);
+        let full = history(1200, 1);
+        // The parent is not indexed, so the record is a root that still names it.
+        let root = published(&full, 400, Some(200), 10, 1);
+        assert!(core.store(&root).unwrap());
+        assert_eq!(
+            core.index.ancestor_keys(&root.key),
+            [full.key_at(200).unwrap()]
+        );
     }
 
     #[test]
@@ -2530,54 +2834,64 @@ mod tests {
 
     #[test]
     fn eviction_releases_the_slabs_of_durable_leaves_and_compacts_rows() {
-        let mut core = store_core(9, 2, false);
+        let mut core = store_core(9, 3, false);
         let full = history(1200, 5);
         let other = history(300, 6);
-        let root = published(&full, 200, None, 0, 1);
-        let child = published(&full, 400, Some(200), 0, 2);
+        let root = published(&full, 1, None, 0, 99);
         assert!(core.store(&root).unwrap());
+        finish(&mut core);
+        let interior = published(&full, 200, Some(1), 0, 1);
+        let child = published(&full, 400, Some(200), 0, 2);
+        assert!(core.store(&interior).unwrap());
         finish(&mut core);
         assert!(core.store(&child).unwrap());
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 3);
 
-        // The child is in flight and the root has that child: no leaf
-        // qualifies, so the root's row is compacted away for the stranger.
+        // The parent keeps its row until the child successfully commits.
         let stranger = published(&other, 250, None, 20, 3);
+        assert!(!core.store(&stranger).unwrap());
+        assert!(core.record(&interior.key).unwrap().row.is_some());
+        assert_eq!(stored(&finish(&mut core)).len(), 1);
+        core.pin_record(&child.key).unwrap();
         assert!(core.store(&stranger).unwrap());
-        let root_node = core.index.node(&root.key).unwrap();
-        assert!(!root_node.row);
-        assert_eq!(root_node.location.row, None);
-        assert_eq!(root_node.location.pages.len(), 3);
+        let interior_node = core.index.node(&interior.key).unwrap();
+        assert!(!interior_node.row);
+        assert_eq!(interior_node.location.row, None);
+        assert_eq!(interior_node.location.pages.len(), 3);
         assert!(core.index.contains(&child.key));
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
 
         // Nothing is evictable for the pages a further record needs: it is skipped.
         let late = published(&other, 64, None, 30, 4);
         assert!(!core.store(&late).unwrap());
-        assert_eq!(core.stats().store_skipped, 1);
+        assert_eq!(core.stats().store_skipped, 2);
         assert!(!core.index.contains(&late.key));
-        assert_eq!(stored(&finish(&mut core)).len(), 2);
+        assert_eq!(stored(&finish(&mut core)).len(), 1);
+        core.unpin_record(&child.key).unwrap();
 
-        // The compacted root no longer matches but still supplies its pages.
-        assert!(core.lookup(&history(250, 5), 0, u64::MAX).is_none());
+        // The compacted interior record no longer matches but still supplies its pages.
+        assert_eq!(
+            core.lookup(&history(250, 5), 0, u64::MAX).unwrap().key,
+            root.key
+        );
         let found = core.lookup(&full, 0, u64::MAX).unwrap();
-        assert_eq!(found.chain.nodes, [root.key, child.key]);
+        assert_eq!(found.chain.nodes, [root.key, interior.key, child.key]);
 
         // With every record ready, the least recently used leaf goes first;
         // the lookup touched the child, so the stranger is older.
         assert!(core.store(&late).unwrap());
         assert!(!core.index.contains(&stranger.key));
         assert!(core.index.contains(&child.key));
-        assert!(core.index.contains(&root.key));
+        assert!(core.index.contains(&interior.key));
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
         finish(&mut core);
 
-        // Removing the child leaves the page-only root childless: both go.
+        // Removing the child leaves the page-only parent childless: both go.
         core.index.touch(&late.key);
         let wide = published(&other, 300, None, 40, 5);
         assert!(core.store(&wide).unwrap());
         assert!(!core.index.contains(&child.key));
-        assert!(!core.index.contains(&root.key));
+        assert!(!core.index.contains(&interior.key));
         assert!(core.index.contains(&late.key));
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 4);
         finish(&mut core);
@@ -2610,21 +2924,26 @@ mod tests {
         let layout = Layout::new(&[geometry(PT, &[("kv", 4096)], 12288)]).unwrap();
         let pool = SlabPool::new(
             layout.page_record_bytes,
-            12 + crate::offload::intake_slots(&layout, 1),
+            15 + crate::offload::intake_slots(&layout, 1),
             crate::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         let mut core = Core::new(IDENTITY, pool, layout, false);
         let full = history(128, 1);
-        let root = full.key_at(64).unwrap();
+        let interior = full.key_at(64).unwrap();
         let child = full.key_at(128).unwrap();
         let fresh = history(64, 2).key_at(64).unwrap();
-        let old = core
-            .allocate(root, None, [1; 16], 1, true, true)
+        let root = full.key_at(1).unwrap();
+        core.allocate(root, None, [1; 16], 0, true, true)
             .unwrap()
             .unwrap();
         core.complete_record(&root, true).unwrap();
-        core.allocate(child, Some(root), [1; 16], 1, true, true)
+        let old = core
+            .allocate(interior, Some(root), [1; 16], 1, true, true)
+            .unwrap()
+            .unwrap();
+        core.complete_record(&interior, true).unwrap();
+        core.allocate(child, Some(interior), [1; 16], 1, true, true)
             .unwrap()
             .unwrap();
         core.complete_record(&child, true).unwrap();
@@ -2632,14 +2951,8 @@ mod tests {
             .unwrap()
             .unwrap();
         core.complete_record(&fresh, true).unwrap();
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
-        let next = history(1, 3).key_at(1).unwrap();
-        let allocated = core
-            .allocate(next, None, [3; 16], 0, true, true)
-            .unwrap()
-            .unwrap();
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 3);
         assert_eq!(old.row.as_ref().unwrap().len(), 3);
-        assert_eq!(allocated.row.as_ref().unwrap().len(), 3);
         let free = core.pool.allocate(core.pool.free_slots()).unwrap();
         assert!(
             old.row
@@ -2649,8 +2962,15 @@ mod tests {
                 .all(|slot| free.contains(slot))
         );
         core.pool.release(free);
+        let next = history(1, 3).key_at(1).unwrap();
+        let allocated = core
+            .allocate(next, None, [3; 16], 0, true, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(allocated.row.as_ref().unwrap().len(), 3);
+        assert!(core.index[&root].row);
         assert_clean_slots(&core);
-        assert!(core.index.node(&root).unwrap().location.row.is_none());
+        assert!(core.index.node(&interior).unwrap().location.row.is_none());
         assert!(core.index.contains(&fresh));
         assert!(core.index.contains(&child));
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
@@ -2808,7 +3128,7 @@ mod tests {
             ))
         );
         // While the chain is pinned, eviction cannot take it.
-        assert!(core.index.evict(true, |_| true).is_none());
+        assert!(core.index.evict(true, |_| true, |_| false).is_none());
         let mut events = Vec::new();
         core.absorb(reply(job, Ok(())));
         core.settle(&mut events);
@@ -2950,19 +3270,19 @@ mod tests {
         let parent = core.index.node(&child.key).unwrap();
         assert!(!parent.pinned());
         assert_eq!(parent.children(), 1);
-        // Allocation compacted the older root before evicting the stranger.
-        assert!(core.record(&root.key).unwrap().row.is_none());
+        // Admission preserves the root row and the parent being extended.
+        assert!(core.record(&root.key).unwrap().row.is_some());
         assert!(core.record(&child.key).unwrap().row.is_some());
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
         assert_eq!(
             stored(&finish(&mut core)),
             [(grandchild.key, Some(3 * PAGE + ROW))]
         );
-        // With only one warm slot free, commit thins the redundant child row.
-        // Its pages remain available and the grandchild retains its endpoint.
+        // Commit frees the former tip's row and retains its pages.
+        assert_eq!(core.record(&child.key).unwrap().pages.len(), 3);
         assert!(core.record(&child.key).unwrap().row.is_none());
         assert!(core.record(&grandchild.key).unwrap().row.is_some());
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
 
         // With nothing else evictable the publication is skipped rather than
         // stored at its parent's expense, and the parent's pin is released.
@@ -2974,7 +3294,7 @@ mod tests {
         assert!(core.index.contains(&grandchild.key));
         assert!(!core.index.node(&grandchild.key).unwrap().pinned());
         assert_eq!(core.index.len(), 3);
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
         assert_clean_slots(&core);
     }
 
@@ -3312,6 +3632,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn recapture_refills_only_the_row_of_an_interior_key() {
+        let mut core = store_core(32, 8, false);
+        let h = history(512, 1);
+        let mut middle = published(&h, 128, Some(64), 0, 2);
+        for cp in [
+            published(&h, 64, None, 0, 1),
+            middle.clone(),
+            published(&h, 192, Some(128), 0, 3),
+        ] {
+            assert!(core.store(&cp).unwrap());
+            finish(&mut core);
+        }
+        core.drop_row(&middle.key);
+        assert!(!core.index[&middle.key].row);
+        let pages = core.index[&middle.key].location.pages.clone();
+        middle.capture_role = crate::CaptureRole::Message;
+        core.index[&middle.key].location.capture_role = middle.capture_role;
+        assert_eq!(core.refill_row(&middle).unwrap(), StoreOutcome::Queued);
+        finish(&mut core);
+        let node = &core.index[&middle.key];
+        assert!(node.ready && node.row);
+        assert_eq!(node.location.pages, pages);
+        assert_eq!(node.children(), 1);
+        assert_eq!(core.stats.row_refills, 1);
+    }
+
+    #[test]
+    fn a_refused_leaf_preserves_its_unconfirmed_ancestors() {
+        let mut core = store_core(32, 8, false);
+        let full = history(192, 1);
+        let parent = published(&full, 128, Some(64), 0, 2);
+        let leaf = published(&full, 192, Some(128), 0, 3);
+        for cp in [
+            published(&full, 64, None, 0, 1),
+            parent.clone(),
+            leaf.clone(),
+        ] {
+            assert!(core.store(&cp).unwrap());
+            finish(&mut core);
+        }
+        announce_all(&mut core);
+        core.set_spill(true);
+        assert!(core.retire_for(1));
+        let tip = core.retiring.pop().unwrap().key;
+        assert_eq!(tip, leaf.key);
+        core.retired(&tip, Retirement::Dropped);
+        assert!(!core.index.contains(&tip));
+        assert_eq!(core.lookup(&full, 0, u64::MAX).unwrap().key, parent.key);
+    }
+
+    #[test]
+    fn a_failed_handoff_and_a_racing_claim_preserve_the_shared_fork() {
+        let mut core = store_core(32, 8, false);
+        let history = history(512, 1);
+        let root = published(&history, 64, None, 0, 1);
+        let fork = published(&history, 128, Some(64), 0, 2);
+        let left = published(&history, 192, Some(128), 0, 3);
+        let right = published(&history, 193, Some(128), 0, 4);
+        for cp in [&root, &fork, &left, &right] {
+            assert!(core.store(cp).unwrap());
+            finish(&mut core);
+            if cp.key == fork.key {
+                core.pin_record(&fork.key).unwrap();
+            }
+        }
+        core.unpin_record(&fork.key).unwrap();
+        core.settle(&mut Vec::new());
+        announce_all(&mut core);
+        core.set_spill(true);
+        assert!(core.retire_for(1));
+        let tip = core.retiring.pop().unwrap().key;
+        core.retired(&tip, Retirement::Failed);
+        assert_eq!(core.index.len(), 4);
+        assert!(core.retire_for(1));
+        let tip = core.retiring.pop().unwrap().key;
+        core.pin_record(&tip).unwrap();
+        core.retired(&tip, Retirement::Moved);
+        assert!(core.index.contains(&tip));
+        core.unpin_record(&tip).unwrap();
+        core.finish_retired();
+        assert!(!core.index.contains(&tip));
+        assert_eq!(core.index.len(), 3);
+        assert!(core.index[&fork.key].row);
+        assert_eq!(core.index[&fork.key].children(), 1);
     }
 
     #[test]

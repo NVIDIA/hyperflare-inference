@@ -400,11 +400,16 @@ fn put_request(history: &TestHistory, pages: usize) -> (PutRequest, PrefixKey) {
     let row = checksum(&data[pages * PAGE..]);
     (
         PutRequest {
+            ancestor_keys: Vec::new(),
             key,
             parent: None,
             bucket: history.bucket_at(key.consumed_tokens).unwrap(),
             chain_pages: pages as u64,
             tail_pages: pages as u64,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             source: PutSource::Host(Box::new(Bytes { data, sums, row, page_bytes: PAGE, row_bytes: ROW })),
         },
@@ -1159,6 +1164,7 @@ fn publication(gpu: &GpuMemory, salt: u32, pages: usize) -> (PublishedCheckpoint
     gpu.rows.lock().unwrap().insert(salt, salted_row(salt));
     let key = history.key_at(pages as u64 * PT).unwrap();
     let checkpoint = PublishedCheckpoint {
+        capture_role: flare_selene::CaptureRole::Endpoint,
         id: CheckpointId::new(u64::from(salt)),
         key,
         parent: None,
@@ -1327,6 +1333,391 @@ fn an_evicted_dram_record_reaches_the_manager_store_and_is_restored_by_another_i
     // Another instance restores it from the manager's store.
     restore_salted(&mut requester, &first_history, 1, 4, &mut store);
     flare_selene::HostStore::close(&mut store).unwrap();
+}
+
+#[test]
+fn a_retired_same_page_tip_restores_from_its_endpoint_parent() {
+    let manager = Manager::start();
+    let mut reader = instance(&manager, 2);
+    reader.ready();
+    let history = history_of((2 * PT + 1) as u32);
+    let geometry = geo();
+    let intake = flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1);
+    let pool = SlabPool::new(PAGE as u64, intake + 4, intake).unwrap();
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    let mut memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
+    for page in 0..2 {
+        gpu.pages
+            .lock()
+            .unwrap()
+            .insert(page, expected_page(page as usize));
+    }
+    let mut parent = None;
+    for (tokens, tail) in [(PT, 1), (2 * PT, 1), (2 * PT + 1, 0)] {
+        gpu.rows
+            .lock()
+            .unwrap()
+            .insert(tokens as u32, vec![tokens as u8; ROW]);
+        let key = history.key_at(tokens).unwrap();
+        store_and_wait(
+            &mut memory,
+            &PublishedCheckpoint {
+                capture_role: flare_selene::CaptureRole::Endpoint,
+                id: CheckpointId::new(tokens),
+                key,
+                parent,
+                bucket: history.bucket_at(tokens).unwrap(),
+                chain_pages: (0..(tokens / PT) as u32).map(PageId).collect(),
+                tail_pages: tail,
+                slot: StateSlotId(tokens as u32),
+            },
+        );
+        parent = Some(key);
+    }
+    assert_eq!(memory.stats().memory_records, 3);
+    let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let mut store =
+        PooledStore::connect(memory, config(&manager, 1), copier, Arc::new(OkRegistrar)).unwrap();
+    wait("Ready", || store.pool().status() == PoolStatus::Ready);
+    drive(&mut store, "the entire path to retire", |store| {
+        store.stats().memory_records == 0
+    });
+    store.close().unwrap();
+    wait_store_index(&reader, &history);
+    let parent_key = history.key_at(2 * PT).unwrap();
+    stored_candidate(&reader, &history, parent_key);
+    restore(&mut reader, &history, 2, &[100, 101]);
+    assert_eq!(
+        reader.gpu.rows.lock().unwrap()[&9],
+        vec![(2 * PT) as u8; ROW]
+    );
+}
+
+fn retire_leaf_over_root_hint(evict_hint: bool) {
+    let manager = Manager::with_memory(128 << 10);
+    let mut reader = instance(&manager, 2);
+    reader.ready();
+    let history = history();
+    let (request, hint) = put_request(&history, 1);
+    reader.client.put(request).unwrap();
+    reader.event("the published ancestor to commit", |event| match event {
+        PoolEvent::Put { outcome, .. } => {
+            assert!(matches!(
+                outcome,
+                flare_selene::pool::PutOutcome::Stored { .. }
+            ));
+            Some(())
+        }
+        _ => None,
+    });
+    wait_store_index(&reader, &history);
+    if evict_hint {
+        let (request, _) = put_request(&salted(99), 8);
+        reader.client.put(request).unwrap();
+        reader.event("the record that evicts the hint", |event| match event {
+            PoolEvent::Put { outcome, .. } => {
+                assert!(matches!(
+                    outcome,
+                    flare_selene::pool::PutOutcome::Stored { .. }
+                ));
+                Some(())
+            }
+            _ => None,
+        });
+        wait("the hint to leave the manager index", || {
+            !offered(&reader, &history)
+        });
+    }
+    let geometry = geo();
+    let layout = Layout::new(&geometry).unwrap();
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    let intake = flare_selene::offload::intake_slots(&layout, 1);
+    let pool = SlabPool::new(PAGE as u64, intake + 8, intake).unwrap();
+    let mut memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
+    for page in 0..4 {
+        gpu.pages
+            .lock()
+            .unwrap()
+            .insert(page, expected_page(page as usize));
+    }
+    let mut parent = Some(hint);
+    for pages in 2..=4 {
+        let row = (pages * PAGE..pages * PAGE + ROW)
+            .map(|byte| (byte * 13 + 5) as u8)
+            .collect();
+        gpu.rows.lock().unwrap().insert(pages as u32, row);
+        let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
+            id: CheckpointId::new(pages as u64),
+            key: history.key_at(pages as u64 * PT).unwrap(),
+            parent,
+            bucket: history.bucket_at(pages as u64 * PT).unwrap(),
+            chain_pages: (0..pages as u32).map(PageId).collect(),
+            tail_pages: 1,
+            slot: StateSlotId(pages as u32),
+        };
+        store_and_wait(&mut memory, &checkpoint);
+        parent = Some(checkpoint.key);
+    }
+    assert_eq!(memory.stats().memory_records, 3);
+    let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let mut store =
+        PooledStore::connect(memory, config(&manager, 1), copier, Arc::new(OkRegistrar)).unwrap();
+    wait("Ready", || store.pool().status() == PoolStatus::Ready);
+    let leaf = parent.unwrap();
+    drive(&mut store, "the retired leaf to commit", |store| {
+        let ticket = reader.client.begin_lookup(&history, 0);
+        wait("the manager lookup", || {
+            !matches!(ticket.state(), LookupState::Pending)
+        });
+        let LookupState::Ready(answer) = ticket.state() else {
+            panic!("no lookup answer");
+        };
+        let Some(candidate) = answer
+            .candidates
+            .iter()
+            .find(|candidate| candidate.plan.key == leaf && candidate.source.instance.is_empty())
+        else {
+            return false;
+        };
+        let nodes = &candidate.plan.nodes;
+        let first = usize::from(!evict_hint);
+        assert_eq!(nodes.len(), first + 3);
+        if !evict_hint {
+            assert_eq!(nodes[0].key, hint);
+        }
+        for (i, node) in nodes[first..].iter().enumerate() {
+            assert_eq!(node.key, history.key_at((2 + i as u64) * PT).unwrap());
+            assert_eq!(node.tail_pages, if evict_hint && i == 0 { 2 } else { 1 });
+        }
+        store.stats().memory_records < 3
+    });
+    store.close().unwrap();
+    restore(&mut reader, &history, 4, &[100, 101, 102, 103]);
+    assert_eq!(
+        reader.gpu.rows.lock().unwrap()[&9],
+        gpu.rows.lock().unwrap()[&4]
+    );
+    reader.client.close().unwrap();
+}
+
+#[test]
+fn a_retired_leaf_links_to_the_published_hint_of_its_local_root() {
+    retire_leaf_over_root_hint(false);
+}
+
+#[test]
+fn a_retired_leaf_with_an_evicted_root_hint_is_stored_as_a_root() {
+    retire_leaf_over_root_hint(true);
+}
+
+/// The candidate the manager's store offers for `key`, once its lookup answers.
+fn stored_candidate(
+    reader: &Instance,
+    history: &TestHistory,
+    key: PrefixKey,
+) -> flare_selene::pool::PoolCandidate {
+    let ticket = reader.client.begin_lookup(history, 0);
+    wait("the manager's lookup", || {
+        !matches!(ticket.state(), LookupState::Pending)
+    });
+    let LookupState::Ready(answer) = ticket.state() else {
+        panic!("no lookup answer");
+    };
+    answer
+        .candidates
+        .iter()
+        .find(|candidate| candidate.plan.key == key && candidate.source.instance.is_empty())
+        .expect("the manager holds the record")
+        .clone()
+}
+
+/// The total size of the record files in `directory`.
+fn record_files_bytes(directory: &std::path::Path) -> u64 {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "ckpt")
+        })
+        .map(|path| std::fs::metadata(path).unwrap().len())
+        .sum()
+}
+
+#[test]
+fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank() {
+    let mut manager = Manager::with_storage(4096, 64 << 20);
+    manager.run();
+    let geometry = vec![
+        geometry(PT, &[("k", 4096), ("v", 4096)], 4096),
+        geometry(PT, &[("k", 4096), ("v", 4096)], 4096),
+    ];
+    let directory = manager
+        .config
+        .root
+        .as_ref()
+        .unwrap()
+        .join(record::directory_name(&[7; 32], &fingerprint(&geometry)));
+    let layout = Layout::new(&geometry).unwrap();
+    let page_bytes = layout.page_record_bytes as usize;
+    let row_bytes = layout.row_record_bytes as usize;
+    let pool_config = |gpu| {
+        let mut config = config(&manager, gpu);
+        config.scope = Scope::new([7; 32], fingerprint(&geometry), &geometry).unwrap();
+        config
+    };
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    let intake = flare_selene::offload::intake_slots(&layout, 1);
+    let pool = SlabPool::new(page_bytes as u64, intake + 64 + layout.row_slots(), intake).unwrap();
+    let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
+    let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let mut store =
+        PooledStore::connect(memory, pool_config(1), copier, Arc::new(OkRegistrar)).unwrap();
+    wait("Ready", || store.pool().status() == PoolStatus::Ready);
+    let (copier, restored) = SimulatedGpu::shared(&geometry).unwrap();
+    let mut reader = Instance {
+        client: PoolClient::start(
+            pool_config(2),
+            None,
+            copier,
+            Arc::new(OkRegistrar),
+            flare_selene::pool::Roots::System,
+            STARTUP_WAIT,
+        )
+        .unwrap(),
+        gpu: restored,
+        events: Vec::new(),
+    };
+    reader.ready();
+    let history = history_of(64 * PT as u32);
+    let page = |index: u32| -> Vec<u8> {
+        (0..page_bytes)
+            .map(|byte| (index * 13 + byte as u32 / PAGE as u32 * 71 + byte as u32 % 251) as u8)
+            .collect()
+    };
+    for index in 0..64 {
+        gpu.pages.lock().unwrap().insert(index, page(index));
+    }
+    let mut parent = None;
+    let mut expected_bytes = 0;
+    let mut stored_page_bytes = 0;
+    let mut stored_row_bytes = 0;
+    let mut metadata_bytes = 0;
+    let mut previous_pages = 0;
+    for turn in 1..=4 {
+        let pages = turn * 16;
+        let tokens = pages as u64 * PT;
+        let key = history.key_at(tokens).unwrap();
+        let row: Vec<u8> = (0..row_bytes)
+            .map(|byte| (turn * 17 + byte / ROW * 91 + byte % 251) as u8)
+            .collect();
+        gpu.rows.lock().unwrap().insert(turn as u32, row);
+        let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
+            id: CheckpointId::new(turn as u64),
+            key,
+            parent,
+            bucket: history.bucket_at(tokens).unwrap(),
+            chain_pages: (0..pages as u32).map(PageId).collect(),
+            tail_pages: pages - previous_pages,
+            slot: StateSlotId(turn as u32),
+        };
+        publish(&mut store, &checkpoint);
+        drive(&mut store, "the turn to leave local memory", |store| {
+            store.stats().memory_records == 0
+        });
+        let candidate = stored_candidate(&reader, &history, key);
+        let header = record::Header::new(
+            &geometry,
+            [7; 32],
+            fingerprint(&geometry),
+            key,
+            parent,
+            checkpoint.bucket,
+            (pages - previous_pages) as u32,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        expected_bytes += header.length_with_row();
+        metadata_bytes += u64::from(header.page_segment);
+        let stored = std::fs::read(directory.join(record::file_name(&key))).unwrap();
+        let stored_header = record::Header::decode(&stored[..4096]).unwrap();
+        stored_page_bytes += stored_header.tail_pages as usize * page_bytes;
+        stored_row_bytes += row_bytes;
+        assert_eq!(record_files_bytes(&directory), expected_bytes);
+        assert_eq!(stored_header.parent, parent);
+        assert_eq!(stored_header.tail_pages, 16);
+        assert_eq!(candidate.plan.nodes.len(), turn);
+        assert_eq!(candidate.plan.nodes.last().unwrap().tail_pages, 16);
+        parent = Some(key);
+        previous_pages = pages;
+    }
+    assert_eq!(stored_page_bytes, 64 * page_bytes);
+    assert_eq!(stored_row_bytes, 4 * row_bytes);
+    let metrics = manager.metrics();
+    for line in [
+        "selene_put_links_total{parent=\"root\"} 1\n".to_string(),
+        "selene_put_links_total{parent=\"linked\"} 3\n".to_string(),
+        format!("selene_put_bytes_total{{part=\"pages\"}} {stored_page_bytes}\n"),
+        format!("selene_put_bytes_total{{part=\"rows\"}} {stored_row_bytes}\n"),
+    ] {
+        assert!(metrics.contains(&line), "missing metric {line}");
+    }
+    // Each file holds its header and checksum table, its tail pages, and its row.
+    assert_eq!(
+        expected_bytes,
+        (stored_page_bytes + stored_row_bytes) as u64 + metadata_bytes
+    );
+    let identity = Identity {
+        model: [7; 32],
+        layout: fingerprint(&geometry),
+    };
+    let request = Request {
+        history: &history,
+        identity: &identity,
+        page_tokens: PT,
+        resident: 0,
+        before: u64::MAX,
+    };
+    let candidate = stored_candidate(&reader, &history, parent.unwrap());
+    let plan = plan::plan(&request, std::slice::from_ref(&candidate.plan)).unwrap();
+    let part = plan.part;
+    reader
+        .client
+        .fetch(PoolFetch {
+            id: 0,
+            page_tokens: PT,
+            part: FetchPart {
+                candidate,
+                part,
+                pages: (100..164).map(PageId).collect(),
+                slot: Some(StateSlotId(9)),
+            },
+        })
+        .unwrap();
+    let result = reader.event("the linked restore", |event| match event {
+        PoolEvent::Fetched { result, .. } => Some(
+            result
+                .as_ref()
+                .map(|bytes| *bytes)
+                .map_err(|error| error.error.to_string()),
+        ),
+        _ => None,
+    });
+    assert_eq!(result, Ok((64 * page_bytes + row_bytes) as u64));
+    for index in 0..64 {
+        assert_eq!(
+            reader.gpu.pages.lock().unwrap()[&(100 + index)],
+            page(index)
+        );
+    }
+    assert_eq!(
+        reader.gpu.rows.lock().unwrap()[&9],
+        gpu.rows.lock().unwrap()[&4]
+    );
+    store.close().unwrap();
+    reader.client.close().unwrap();
 }
 
 /// A directory for the disk tier that takes direct I/O, or `None`.
@@ -1614,6 +2005,7 @@ fn large_recovered_nvme_records_restore_consecutively() {
         }
         gpu.rows.lock().unwrap().insert(salt, salted_row(salt));
         let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(u64::from(salt)),
             key: history.key_at(110_000).unwrap(),
             parent: None,

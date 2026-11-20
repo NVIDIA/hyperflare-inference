@@ -23,7 +23,7 @@
 //! |---|---|---|
 //! | 0 | 8 | magic `FLARECKP` |
 //! | 8 | 4 | format version, `u32` |
-//! | 12 | 4 | flags, `u32` |
+//! | 12 | 4 | flags, `u32`. Bits 8–9 encode the capture role. |
 //! | 16 | 32 | model identity |
 //! | 48 | 16 | layout fingerprint |
 //! | 64 | 8 | key consumed count, `u64` |
@@ -153,7 +153,22 @@ impl PartialEq for Header {
 
 impl Eq for Header {}
 
+impl crate::CaptureRole {
+    pub fn merge(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
 impl Header {
+    pub fn capture_role(&self) -> crate::CaptureRole {
+        crate::CaptureRole::try_from(((self.flags >> 8) & 3) as i32).unwrap()
+    }
+
+    pub fn with_capture_role(mut self, role: crate::CaptureRole) -> Self {
+        self.flags = (self.flags & !(3 << 8)) | ((role as u32) << 8);
+        self
+    }
+
     /// A header for a record under `layout`, with segment offsets derived from
     /// the tail page count and checksums left zero until the writer fills them.
     #[allow(clippy::too_many_arguments)]
@@ -1202,6 +1217,48 @@ mod tests {
                 geometry(128, &[("latent", 73_728), ("index", 16_384)], 1 << 20),
             ],
         ]
+    }
+
+    #[test]
+    fn decoder_accepts_capture_role_flag_bits() {
+        let geometry = &geometries()[0];
+        let original = header(geometry, 128, None);
+        for bits in 1u32..=3 {
+            let mut bytes = original.encode().unwrap();
+            bytes[12..16].copy_from_slice(&(original.flags | bits << 8).to_le_bytes());
+            let decoded = Header::decode(&bytes).unwrap();
+            assert_eq!(decoded.key, original.key);
+            assert_eq!(decoded.layout().unwrap(), original.layout().unwrap());
+            assert_eq!(decoded.encode().unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn an_explicit_rewrite_classifies_a_legacy_record() {
+        use crate::CaptureRole::{Anchor, Endpoint, Legacy, Message};
+        assert_eq!(Legacy.merge(Endpoint), Endpoint);
+        assert_eq!(Legacy.merge(Message), Message);
+        assert_eq!(Message.merge(Endpoint), Message);
+        assert_eq!(Anchor.merge(Message), Anchor);
+        assert_eq!(Message.merge(Legacy), Message);
+        assert_eq!(Legacy.merge(Legacy), Legacy);
+    }
+
+    #[test]
+    fn capture_role_encoding_preserves_the_other_header_flags() {
+        use crate::CaptureRole::{Anchor, Endpoint, Legacy, Message};
+        let mut original = header(&geometries()[0], 128, None);
+        original.flags = 7;
+        for (bits, role) in [Legacy, Endpoint, Message, Anchor].into_iter().enumerate() {
+            let header = original.clone().with_capture_role(role);
+            assert_eq!(header.flags, original.flags | (bits as u32) << 8);
+            assert_eq!(
+                Header::decode(&header.encode().unwrap())
+                    .unwrap()
+                    .capture_role(),
+                role
+            );
+        }
     }
 
     #[test]

@@ -436,6 +436,7 @@ const UNLINK: u8 = 7;
 const CLOSE: u8 = 8;
 const EVENT: u8 = 9;
 const CLOSED: u8 = 10;
+const STORE_EMPTY: u8 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Kind {
@@ -831,6 +832,26 @@ impl DiskTransport for Sharded {
         Some(&self.local)
     }
 
+    fn store_empty(
+        &mut self,
+        id: JobId,
+        header: Header,
+        temporary: PathBuf,
+        path: PathBuf,
+    ) -> Result<()> {
+        self.accept()?;
+        let mut writer = Writer::new(STORE_EMPTY);
+        writer
+            .u64(id.0)
+            .header(&header)?
+            .text(name(&temporary)?)
+            .text(name(&path)?);
+        self.local
+            .store_empty(id, header, temporary, path.clone())?;
+        self.begin(Kind::Stored, id, Some(path), &writer.finish());
+        Ok(())
+    }
+
     fn store(
         &mut self,
         id: JobId,
@@ -1045,10 +1066,15 @@ impl Peer {
     fn dispatch(&mut self, tag: u8, payload: &[u8]) -> Result<Option<(Kind, JobId, Error)>> {
         let mut reader = Reader(payload);
         let id = JobId(reader.u64()?);
-        if tag == STORE {
+        if tag == STORE || tag == STORE_EMPTY {
             let header = self.own(reader.header()?)?;
             let temporary = file(&self.directory, reader.text()?)?;
             let path = file(&self.directory, reader.text()?)?;
+            if tag == STORE_EMPTY {
+                reader.end()?;
+                let result = self.staged.store_empty(id, header, temporary, path);
+                return Ok(result.err().map(|error| (Kind::Stored, id, error)));
+            }
             let slot = StateSlotId(reader.u32()?);
             let count = reader.count(4)?;
             let pages = (0..count)

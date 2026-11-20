@@ -104,11 +104,17 @@ pub struct PutRequest {
     pub key: PrefixKey,
     /// The key of the previous record in the chain, if any.
     pub parent: Option<PrefixKey>,
+    /// Candidate ancestors whose pages the manager can reuse, deepest first.
+    pub ancestor_keys: Vec<PrefixKey>,
     pub bucket: [u8; 16],
     /// Pages of the whole chain up to `key`.
     pub chain_pages: u64,
     /// Pages the record owns, counted from its published parent.
     pub tail_pages: u64,
+    pub capture_role: crate::CaptureRole,
+    pub child_paths: u32,
+    pub descendant_row: bool,
+    pub next_child: Option<PrefixKey>,
     pub row: bool,
     pub source: PutSource,
 }
@@ -125,6 +131,8 @@ pub enum PutRefusal {
     Oversize,
     /// The metadata did not match what was accepted.
     Invalid,
+    /// No held ancestor could supply the missing pages.
+    Unlinked,
     /// The manager has as many puts open as it allows.
     Queue,
     /// A manager device error.

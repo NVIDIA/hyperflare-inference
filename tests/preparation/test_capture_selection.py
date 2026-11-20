@@ -31,6 +31,9 @@ def test_support_forward_is_neither_compiled_nor_captured(monkeypatch):
 
     monkeypatch.setattr(capture, "ForwardCache", Cache)
     monkeypatch.setattr(capture.torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
+
     monkeypatch.setattr(capture.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(capture.torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setattr(capture.torch.cuda, "CUDAGraph", lambda: "graph")
@@ -67,6 +70,9 @@ def test_trial_inputs_are_restored_before_warmup_and_outside_graph_capture(monke
         calls.append(("run", state["value"], state["capturing"]))
 
     monkeypatch.setattr(capture.torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
+
     monkeypatch.setattr(capture.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(capture.torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setattr(capture.torch.cuda, "CUDAGraph", lambda: "graph")
@@ -116,6 +122,9 @@ def test_grouped_capture_compiles_one_representative_and_captures_each_owner(mon
     first, second = (lambda: None), (lambda: None)
     monkeypatch.setattr(capture, "ForwardCache", Cache)
     monkeypatch.setattr(capture.torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
+
     monkeypatch.setattr(capture.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(capture.torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setattr(capture.torch.cuda, "CUDAGraph", lambda: "graph")

@@ -20,8 +20,11 @@
     builds. MSBuild can retain flare-winui.exe after the bridge library changes;
     verify loose and single-file outputs without requiring /t:Rebuild.
 
-[ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
-    Payload cores report rebuild: null even when DeploymentBody.rebuild is present.
+[ ] Report rebuild_weights for payload cores in flare inspect --json.
+    Payload inspection reports the selected deployment's rebuild manifest but
+    leaves each rank's rebuild_weights unset, so the JSON reports null. Remove
+    when payload and logical-resource cores report the same per-rank counts
+    for one rebuild manifest.
 
 [ ] Validate GLM TP4/TP8 A16 expert preparation through export and native replay.
     Verify DirectWeightLoader.load_nvfp4_experts keeps only final scale layouts

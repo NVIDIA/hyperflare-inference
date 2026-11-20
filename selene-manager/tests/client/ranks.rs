@@ -27,7 +27,7 @@ use flare_selene::{
         LookupState, PoolAddress, PoolClient, PoolConfig, PoolEvent, PoolFetch, PoolStatus,
         PutBytes, RankAgent, RankRecords, Tier, rank::memory_links,
     },
-    record::checksum,
+    record::{self, checksum},
     testing::{GpuMemory, SimulatedGpu, TestHistory, geometry},
 };
 
@@ -120,6 +120,64 @@ fn source(manager: &Manager, world: usize) -> Source {
     )
     .unwrap();
     Source { client, _gpu: gpu }
+}
+
+/// Puts the record ending at `tokens` from `writer`, with or without its row, and waits
+/// for the manager's answer.
+fn put_and_wait(
+    writer: &mut Source,
+    history: &TestHistory,
+    world: usize,
+    tokens: u64,
+    parent: Option<PrefixKey>,
+    row: bool,
+    capture_role: flare_selene::CaptureRole,
+    child_paths: u32,
+) -> flare_selene::pool::PutOutcome {
+    let (page, row_bytes) = whole(world);
+    let pages = (tokens / PT) as usize;
+    let data = bytes_of(world, pages);
+    let sums = data[..pages * page]
+        .chunks_exact(page)
+        .map(checksum)
+        .collect();
+    let row_sum = checksum(&data[pages * page..]);
+    let key = history.key_at(tokens).unwrap();
+    writer
+        .client
+        .put(PutRequest {
+            ancestor_keys: Vec::new(),
+            key,
+            parent,
+            bucket: history.bucket_at(tokens).unwrap(),
+            chain_pages: pages as u64,
+            tail_pages: pages as u64 - parent.map_or(0, |p| p.consumed_tokens / PT),
+            row,
+            capture_role,
+            child_paths,
+            descendant_row: child_paths == 1,
+            next_child: None,
+            source: PutSource::Host(Box::new(RecordBytes {
+                data,
+                sums,
+                row: row_sum,
+                page_bytes: page,
+                row_bytes,
+            })),
+        })
+        .unwrap();
+    let mut outcome = None;
+    wait("the manager's answer to the put", || {
+        let mut events = Vec::new();
+        writer.client.poll(&mut events).unwrap();
+        for event in events {
+            if let PoolEvent::Put { outcome: done, .. } = event {
+                outcome = Some(done);
+            }
+        }
+        outcome.is_some()
+    });
+    outcome.unwrap()
 }
 
 /// A multi-process requester: rank 0's client and the agents of ranks `1..world`.
@@ -251,7 +309,7 @@ fn instance_with(
     let gpus: Vec<[u8; 16]> = (0..world).map(|r| [seed + r as u8; 16]).collect();
     let rank0 = PoolClient::start(
         config_at(address_for(manager, reach[0]), world, gpus.clone()),
-        Some(links),
+        (world > 1).then_some(links),
         copier,
         Arc::new(OkRegistrar),
         flare_selene::pool::Roots::System,
@@ -453,49 +511,23 @@ fn rank_agents_restore_manager_records_after_every_window_is_assembled() {
     // Four windows exceed the two credits; the last carries the row.
     let pages = 193;
     let history = history_of(4000);
-    let key = history.key_at(pages as u64 * PT).unwrap();
     let (page, row) = whole(world);
-    let data = bytes_of(world, pages);
-    let sums = data[..pages * page]
-        .chunks_exact(page)
-        .map(checksum)
-        .collect();
-    let row_sum = checksum(&data[pages * page..]);
     let mut writer = source(&manager, world);
     wait("the writer", || writer.client.status() == PoolStatus::Ready);
-    writer
-        .client
-        .put(PutRequest {
-            key,
-            parent: None,
-            bucket: history.bucket_at(key.consumed_tokens).unwrap(),
-            chain_pages: pages as u64,
-            tail_pages: pages as u64,
-            row: true,
-            source: PutSource::Host(Box::new(RecordBytes {
-                data,
-                sums,
-                row: row_sum,
-                page_bytes: page,
-                row_bytes: row,
-            })),
-        })
-        .unwrap();
-    let mut stored = false;
-    wait("the manager to store the record", || {
-        let mut events = Vec::new();
-        writer.client.poll(&mut events).unwrap();
-        for event in events {
-            if let PoolEvent::Put { outcome, .. } = event {
-                assert!(
-                    matches!(outcome, flare_selene::pool::PutOutcome::Stored { .. }),
-                    "{outcome:?}"
-                );
-                stored = true;
-            }
-        }
-        stored
-    });
+    let outcome = put_and_wait(
+        &mut writer,
+        &history,
+        world,
+        pages as u64 * PT,
+        None,
+        true,
+        Default::default(),
+        0,
+    );
+    assert!(
+        matches!(outcome, flare_selene::pool::PutOutcome::Stored { .. }),
+        "{outcome:?}"
+    );
     writer.client.close().unwrap();
     let scratch: Vec<_> = (100..100 + pages as u32).collect();
     for reach in [
@@ -521,6 +553,274 @@ fn rank_agents_restore_manager_records_after_every_window_is_assembled() {
             assert_eq!(result, Ok((pages * page + row) as u64));
             assert_slices(&requester, world, pages, &scratch);
         }
+        requester.close();
+    }
+}
+
+#[test]
+fn rank_agents_restore_an_anchor_below_page_only_tails() {
+    // Without a disk tier every record is served from the arena. On disk the manager
+    // restarts first, so no record is resident and every one streams, whatever the
+    // arena size; a restore does not read records into the arena.
+    for (disk, memory, world) in [
+        (false, 0, 2),
+        (true, 4096, 2),
+        (true, 64 << 20, 2),
+        (true, 64 << 20, 1),
+    ] {
+        let mut manager = network_manager(false);
+        if disk {
+            manager.stop();
+            manager.config.root = Some(manager.base.join("records"));
+            manager.config.memory = memory;
+            manager.config.nvme = 64 << 20;
+            manager.run();
+        }
+        let history = history_of(4000);
+        let (page, row) = whole(world);
+        let mut writer = source(&manager, world);
+        wait("the writer", || writer.client.status() == PoolStatus::Ready);
+        let mut parent = None;
+        // A record is an anchor exactly when it is put with its row. The zero-page
+        // record carries nothing without its row, so it is answered Present and the
+        // chain continues from its parent.
+        for (tokens, anchor) in [
+            (2 * PT, true),
+            (2 * PT + 1, false),
+            (4 * PT, false),
+            (5 * PT, true),
+            (6 * PT, false),
+            (7 * PT, false),
+        ] {
+            let key = history.key_at(tokens).unwrap();
+            let tail_pages = tokens / PT - parent.map_or(0, |p: PrefixKey| p.consumed_tokens / PT);
+            let outcome = put_and_wait(
+                &mut writer,
+                &history,
+                world,
+                tokens,
+                parent,
+                anchor,
+                Default::default(),
+                0,
+            );
+            if tail_pages == 0 && !anchor {
+                assert!(
+                    matches!(outcome, flare_selene::pool::PutOutcome::Present),
+                    "{tokens}: {outcome:?}, expected Present"
+                );
+            } else {
+                let expected =
+                    8192 + tail_pages * page as u64 + if anchor { row as u64 } else { 0 };
+                assert!(
+                    matches!(outcome, flare_selene::pool::PutOutcome::Stored { bytes } if bytes == expected),
+                    "{tokens}: {outcome:?}, expected {expected} bytes"
+                );
+            }
+            if tail_pages > 0 || anchor {
+                parent = Some(key);
+            }
+        }
+        writer.client.close().unwrap();
+        let metrics = manager.metrics();
+        assert!(metrics.contains("selene_put_shapes_total{shape=\"row\"} 2\n"));
+        assert!(metrics.contains("selene_put_shapes_total{shape=\"page_only\"} 3\n"));
+        assert!(metrics.contains("selene_put_shapes_total{shape=\"empty\"} 1\n"));
+        assert!(metrics.contains(&format!(
+            "selene_put_bytes_total{{part=\"rows\"}} {}\n",
+            2 * row
+        )));
+        assert!(metrics.contains(&format!(
+            "selene_put_bytes_total{{part=\"pages\"}} {}\n",
+            7 * page
+        )));
+        if disk {
+            manager.stop();
+            let directory = manager.base.join("records").join(record::directory_name(
+                &[7; 32],
+                &fingerprint(&ranks(world)),
+            ));
+            let checkpoints: std::collections::HashSet<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .filter_map(|entry| {
+                    record::parse_file_name(entry.unwrap().file_name().to_str().unwrap())
+                })
+                .collect();
+            // Streaming already wrote both trailing records. The arena flush stops at
+            // the last anchor, including the page-only predecessor it needs.
+            let pages: &[u64] = if memory == 4096 {
+                &[2, 4, 5, 6, 7]
+            } else {
+                &[2, 4, 5]
+            };
+            let expected = pages.iter()
+                .map(|p| history.key_at(p * PT).unwrap())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(checkpoints, expected);
+            manager.run();
+            // Recovery also drops any streamed page-only suffix.
+            wait("the three records through the last anchor", || {
+                manager
+                    .metrics()
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("selene_records{") && line.contains("tier=\"disk\"")
+                    })
+                    .filter_map(|line| line.rsplit(' ').next().unwrap().parse::<usize>().ok())
+                    .sum::<usize>()
+                    == 3
+            });
+        }
+        let scratch = [100, 101, 102, 103, 104];
+        let reaches: &[&[Reach]] = if world == 1 {
+            &[&[Reach::Local], &[Reach::Network]]
+        } else {
+            &[
+                &[Reach::Local, Reach::Local],
+                &[Reach::Local, Reach::Network],
+                &[Reach::Network, Reach::Network],
+            ]
+        };
+        for reach in reaches {
+            let mut requester = instance_reaching(&manager, world, reach);
+            requester.ready();
+            wait_offered(&requester.rank0, &history);
+            let fetch = fetch_for(&requester.rank0, world, &history, 5, &scratch);
+            assert_eq!(fetch.part.part.end, history.key_at(5 * PT).unwrap());
+            requester.rank0.fetch(fetch).unwrap();
+            let result = requester.event("the anchor restore", |event| match event {
+                PoolEvent::Fetched { result, .. } => Some(
+                    result
+                        .as_ref()
+                        .map(|bytes| *bytes)
+                        .map_err(|failure| failure.error.to_string()),
+                ),
+                _ => None,
+            });
+            assert_eq!(result, Ok((5 * page + row) as u64));
+            assert_slices(&requester, world, 5, &scratch);
+            requester.close();
+        }
+    }
+}
+
+#[test]
+fn rank_writers_send_only_the_pages_of_a_single_child_endpoint() {
+    use flare_selene::CaptureRole::{Anchor, Endpoint};
+    use flare_selene::pool::PutOutcome;
+    let manager = network_manager(false);
+    let world = 2;
+    let history = history_of(4000);
+    let (page, row) = whole(world);
+    let mut writer = source(&manager, world);
+    wait("the writer", || writer.client.status() == PoolStatus::Ready);
+    let root = put_and_wait(&mut writer, &history, world, 2 * PT, None, true, Anchor, 1);
+    assert!(
+        matches!(root, PutOutcome::Stored { bytes } if bytes == (8192 + 2 * page + row) as u64)
+    );
+    let parent = history.key_at(2 * PT);
+    let child = put_and_wait(
+        &mut writer,
+        &history,
+        world,
+        4 * PT,
+        parent,
+        true,
+        Endpoint,
+        1,
+    );
+    assert!(matches!(child, PutOutcome::Stored { bytes } if bytes == (8192 + 2 * page) as u64));
+    writer.client.close().unwrap();
+    let metrics = manager.metrics();
+    assert!(metrics.contains("selene_put_shapes_total{shape=\"row\"} 1\n"));
+    assert!(metrics.contains("selene_put_shapes_total{shape=\"page_only\"} 1\n"));
+    assert!(metrics.contains(&format!("selene_put_bytes_total{{part=\"rows\"}} {row}\n")));
+    assert!(metrics.contains(&format!(
+        "selene_put_bytes_total{{part=\"pages\"}} {}\n",
+        4 * page
+    )));
+}
+
+#[test]
+fn rank_agents_restore_through_a_zero_page_middle_record() {
+    let mut manager = network_manager(false);
+    manager.stop();
+    manager.config.root = Some(manager.base.join("records"));
+    manager.config.nvme = 64 << 20;
+    let world = 2;
+    let geometry = ranks(world);
+    let fingerprint = fingerprint(&geometry);
+    let directory = manager
+        .config
+        .root
+        .as_ref()
+        .unwrap()
+        .join(flare_selene::record::directory_name(&[7; 32], &fingerprint));
+    std::fs::create_dir_all(&directory).unwrap();
+    let history = history_of(4000);
+    let (page, row) = whole(world);
+    let mut parent = None;
+    // Recover a persisted chain so the claim checks zero-page traversal
+    // independently of Put window offsets.
+    for tokens in [2 * PT, 2 * PT + 1, 4 * PT] {
+        let pages = (tokens / PT) as usize;
+        let first = parent.map_or(0, |p: PrefixKey| p.consumed_tokens / PT) as usize;
+        let key = history.key_at(tokens).unwrap();
+        let data = bytes_of(world, pages);
+        let mut header = flare_selene::record::Header::new(
+            &geometry,
+            [7; 32],
+            fingerprint,
+            key,
+            parent,
+            history.bucket_at(tokens).unwrap(),
+            (pages - first) as u32,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        header.row_checksum = checksum(&data[pages * page..]);
+        let mut bytes = vec![0; header.length_with_row() as usize];
+        bytes[..4096].copy_from_slice(&header.encode().unwrap());
+        for (index, chunk) in data[first * page..pages * page]
+            .chunks_exact(page)
+            .enumerate()
+        {
+            bytes[4096 + index * 8..4104 + index * 8]
+                .copy_from_slice(&checksum(chunk).to_le_bytes());
+        }
+        bytes[header.page_segment as usize..header.row_segment as usize]
+            .copy_from_slice(&data[first * page..pages * page]);
+        bytes[header.row_segment as usize..].copy_from_slice(&data[pages * page..]);
+        std::fs::write(directory.join(flare_selene::record::file_name(&key)), bytes).unwrap();
+        parent = Some(key);
+    }
+    manager.run();
+    let scratch = [100, 101, 102, 103];
+    for reach in [
+        [Reach::Local, Reach::Local],
+        [Reach::Local, Reach::Network],
+        [Reach::Network, Reach::Network],
+    ] {
+        let mut requester = instance_reaching(&manager, world, &reach);
+        requester.ready();
+        wait_offered(&requester.rank0, &history);
+        let fetch = fetch_for(&requester.rank0, world, &history, 4, &scratch);
+        assert_eq!(fetch.part.candidate.plan.nodes.len(), 2);
+        requester.rank0.fetch(fetch).unwrap();
+        let result = requester.event(
+            "the restore past the row-only record",
+            |event| match event {
+                PoolEvent::Fetched { result, .. } => Some(
+                    result
+                        .as_ref()
+                        .map(|bytes| *bytes)
+                        .map_err(|failure| failure.error.to_string()),
+                ),
+                _ => None,
+            },
+        );
+        assert_eq!(result, Ok((4 * page + row) as u64));
+        assert_slices(&requester, world, 4, &scratch);
         requester.close();
     }
 }
@@ -1353,11 +1653,16 @@ fn host_put(manager: &Manager, world: usize, reach: &[Reach]) {
     writer
         .rank0
         .put(PutRequest {
+            ancestor_keys: Vec::new(),
             key,
             parent: None,
             bucket: history.bucket_at(key.consumed_tokens).unwrap(),
             chain_pages: pages as u64,
             tail_pages: pages as u64,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             source: PutSource::Host(Box::new(ZeroBytes(RankFiles {
                 world,

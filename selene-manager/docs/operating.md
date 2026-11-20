@@ -31,6 +31,14 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
   gets no shared memory: share a PID namespace, or configure `--listen` and connect
   over TCP to use the data channel. Without shared memory or a data channel, instance startup fails.
 
+The manager retains rows at roots and captured Message or Anchor boundaries.
+A fork keeps its row when a writer still holds it. Existing Legacy-role disk
+records keep all their available rows until rewritten. An Endpoint tip also keeps its row unless an ancestor on its
+path already has a row in the same page. A returning request can rewind
+exactly to either of two captured Message boundaries in one page.
+Arena pressure writes dirty records parent-first. For shutdown timing, crash
+exposure and the write counters, see [Operating the Selene checkpoint manager](../../docs/operating.md).
+
 Record expiry is off by default. `--max-age DURATION|off`
 accepts positive durations in ms, s, m, h, or bare seconds; `off` disables expiry.
 Puts, gets and child publication refresh the required chain in memory only.
@@ -51,8 +59,10 @@ The service is CPU-only and never touches GPU memory. Three budgets are configur
 separately and shared by every scope: `--memory` (the DRAM arena), `--staging` (windows) and
 `--nvme` (durable records).
 
-`--memory` is the arena for the manager's own records served without touching NVMe. Size it for
-the hot working set, not for everything. Allocation uses power-of-two size classes, so a record
+`--memory` is the arena for the manager's own records served without touching NVMe. Only puts
+place records in it; a restore streams a record that is not in the arena and does not add it.
+Size it for the records written recently that are likely to be restored soon, not for everything.
+Allocation uses power-of-two size classes, so a record
 consumes its length rounded up and usable capacity can be materially below the mapping size.
 A record whose rounded extent exceeds the whole arena is not dropped (with `--root` it streams
 to NVMe) but it will never be served from DRAM; without `--root` it can never be admitted and is
@@ -79,6 +89,23 @@ times the page tokens: about 143,000 tokens at 2 GiB and 294,000 at the 4 GiB de
 model with 905,216-byte pages of 64 tokens and a 122 MiB row. Size `--staging` from that
 formula or from the figure in the warning.
 
+A restore from NVMe also reads through staging. A restore reads only the pages and the
+endpoint row it needs, as windows, and never reads a whole record into the arena. A record that
+is in the arena is served from there. A restore window that cannot get a staging block of its
+size class, because earlier windows hold that class, waits until one is released; it is not
+refused. The endpoint row is one window and is never split, and staging blocks are powers of two,
+so staging must be at least the row's size rounded up to a power of two (a page, if larger):
+256 MiB for a 160 MiB row. A restore of a record that is not in the arena, with a window whose
+block, rounded up to a power of two, is larger than the whole staging region, is refused when it
+starts, before any read. The client sees `NO_WINDOWS` and recomputes the prefix. The manager prints a
+warning with the minimum `--staging` when a scope's geometry first arrives and staging is smaller.
+When a restore begins it starts reading the metadata of every record in its chain that is not in
+the arena, in chain order, so a chain near the 2048-record depth at which puts start a new root can
+need up to about 16 MiB of staging at once. A metadata read that finds staging full waits for a
+release, as a window does. A restore is refused at its start, with `NO_WINDOWS`, when the
+block of one record's metadata or one window, rounded up to a power of two, is larger than the whole
+staging region.
+
 `--nvme` bounds record reservations: the rounded arena extent for an in-memory
 record, or the padded file plus the two-window hold for a streamed put. It must exceed the
 largest record an instance can put, or the put is refused `OVERSIZE` and the instance discards
@@ -98,9 +125,9 @@ changed or a file is missing, the wrong size or has no valid generation, the man
 recreates them under a new generation and logs that running instances must restart to use the
 pool: until they do, they run on local tiers only. A file owned by another user stops the
 start, as does an unexpected I/O error while checking them
-(an interrupted call is retried); either stops the manager's start with an error and deletes nothing. After
-a crash the manager keeps the regions out of service for recorded previous-run
-processes ([PROTOCOL.md 8.6](../PROTOCOL.md#86-persistent-shared-regions)).
+(an interrupted call is retried); either stops the manager's start with an error and deletes nothing.
+After a crash or a clean stop with unfenced processes, the manager keeps reused
+regions out of service for recorded holders ([PROTOCOL.md 8.6](../PROTOCOL.md#86-persistent-shared-regions)).
 Visible-pid holders release on reconnect or observed exit, with no time limit.
 A pid-zero holder from a separate PID namespace cannot be watched again after a
 manager restart. It releases when its nonce reconnects or 60 seconds after
@@ -232,19 +259,29 @@ unchanged; changing either means restarting the instances too.
 ## Readiness and restarts
 
 Disk recovery completes before the manager binds any listener, so a manager that
-accepts connections is `READY`. It serves lookups, claims and puts without waiting
-for previous instances to reconnect, with one exception: after a crash, claims are
-refused `REGIONS_HELD` while recorded previous-run processes hold the regions.
+accepts connections is `READY` and serves lookups immediately. Claims receive
+`REGIONS_HELD` while recorded processes from the previous run hold the shared
+regions. A crash can leave holders, as can a clean stop when a writer, peer rank
+or claim requester still has an unfenced window. A requester can still hold its
+window after its claim ends.
 Visible-pid holders release on reconnect or observed exit; pid-zero holders
 release on nonce reconnect or 60 seconds after startup (see [Sizing](#sizing)).
 While the manager drains for shutdown, requests answer `NOT_READY`.
 Sources reconnect and resnapshot independently, so their hints may temporarily miss.
 
 - Records the manager held only in DRAM are lost with it; NVMe records are recovered and start in the
-  disk tier. A put is complete (and the writer may drop its copy) only at `Stored`.
-- `SIGTERM` or `SIGINT` drains: new sessions, lookups, claims and puts are refused, claims in
-  flight run to a terminal state (bounded by their deadlines), then sessions are closed with
-  `SHUTDOWN`.
+  disk tier when their parent chain is complete. At `Stored` the manager can
+  serve the record and the writer may release it. A crash before write-back
+  can lose an acknowledged record or an ancestor it needs. A returning request
+  then uses a surviving copy or recomputes the missing suffix.
+- On `SIGTERM` or `SIGINT` the manager refuses new sessions, lookups, claims and puts.
+  It drains in-flight claims and puts and waits for pending put fences from connected
+  writers and peer ranks, up to the claim deadline plus two seconds (32 seconds by
+  default, capped at four minutes). A reported quarantine ends the wait for that
+  fence. An unannounced disconnect also leaves shared windows quarantined.
+  The manager then closes sessions with `SHUTDOWN` and flushes dirty records using the
+  time left in the 270-second budget measured from the stop signal. Any unfenced
+  holder keeps its registration across restart, even if the drain finishes early.
 
 ## Refusal reasons
 
@@ -254,7 +291,7 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 | Reason | Meaning | Operator action |
 |---|---|---|
 | `NOT_READY` | The manager is draining for shutdown. | None; check `selene_pool_state`. |
-| `REGIONS_HELD` | After a crash, the shared regions are held for processes of the previous run. | Visible-pid holders wait for reconnect or observed exit; pid-zero holders release within 60 s of startup. Check `selene_pool_regions_held`. |
+| `REGIONS_HELD` | A recorded process still holds the shared regions after a crash or a clean stop with unfenced windows. | Visible-pid holders wait for reconnect or observed exit; pid-zero holders release within 60 s of startup. Check `selene_pool_regions_held`. |
 | `CLAIM_LIMIT` | The requester already has its claim slots in flight (default 2). | None; limits do not scale with concurrency. |
 | `SOURCE_LIMIT` / `SOURCE_BUSY` | The source already serves its export slots (default 2). | None. |
 | `UNKNOWN_SOURCE` / `STALE_SOURCE` | The named source or entry is gone, or the source reconnected. | None; the index catches up. |
@@ -265,14 +302,16 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 | `RANKS_DETACHED` / `RANK_LOST` | A rank of a multi-process instance is not attached, or its attachment ended during the transfer. | Look at that rank's process. |
 | `COPY_ERROR` / `CHECKSUM` | A read, write or checksum failed, or the copy was not exact. | Alert on repeats; check the device. |
 | `DEADLINE` / `NO_PROGRESS` | The claim ran past its deadline or stopped making progress (3s). | Look at copy throughput. |
-| put `PRESENT` | Already stored and committed: success, nothing transferred. | None. |
-| put `BUDGET` | Temporary arena, staging or durable-budget pressure: the writer retries once after a 50 ms backoff, then discards the local record on another `BUDGET` or `INFLIGHT` refusal. | Add capacity if sustained. |
-| put `INFLIGHT` | Another put of the same key is in flight: the writer retries once after a 50 ms backoff, then discards the local record on another `BUDGET` or `INFLIGHT` refusal. | None. |
-| put `OVERSIZE` | Can never fit in this configuration; the writer discards the local record. | Raise the budget or add `--root`. |
+| put `PRESENT` | The manager already holds the record or its parent covers the empty put. Nothing is transferred. | None. |
+| put `BUDGET` | Arena, staging or disk pressure. Retry once after 50 ms. On exhaustion, retry an ancestor refusal as a leaf-only put or drop the refused leaf. | Add capacity if sustained. |
+| put `INFLIGHT` | Another put or a protected read holds the key. Same retry and leaf-only fallback as `BUDGET`. | None. |
+| put `OVERSIZE` | The record exceeds capacity. An ancestor refusal triggers a leaf-only put. A refused leaf is dropped. | Raise the budget or add `--root`. |
 | put `QUEUE` | The writer has `max_open_puts` (4) open. | None. |
-| put `INVALID` | Malformed, metadata that does not match the put, or a mode not allowed; the writer discards the local record. | Alert: client and manager disagree. |
+| put `INVALID` | An ancestor refusal triggers a leaf-only put. A refused leaf is dropped. A page-only put with no usable ancestor returns `PUT_UNLINKED`. This includes an ancestor at the 2048-record reroot limit, where a new root would need a row. The manager counts these refusals in `selene_puts_total{outcome="unlinked"}` and logs the cumulative count at powers of two. Other `INVALID` refusals indicate a client or protocol error. | Alert on `INVALID` refusals beyond those counted as `unlinked`. |
 | put `IO` | A device error. | Check the NVMe and the file system. |
 | put `PUT_NOT_READY` | Not ready (see Readiness). | None. |
+
+A leaf-only attempt uses the deepest ancestor the manager still holds. A refusal of that attempt for `BUDGET`, `INFLIGHT`, `OVERSIZE` or `INVALID` drops the leaf in either tier.
 
 ## Quarantine
 
@@ -298,10 +337,13 @@ does not answer within 1 s the previous store text is served.
 | `selene_pool_claims_total{state,reason}`, `selene_pool_claims_refused_total{reason}`, `selene_pool_lookups_total{status}` | Outcomes. Label values are the Rust variant names, such as `reason="CopyError"`. | `CopyError`, `Checksum`, `NoWindows` rising. |
 | `selene_pool_puts_open` | Puts in flight. | |
 | `selene_pool_quarantined_bytes` | Window bytes out of service. | Anything sustained. |
-| `selene_puts_total{outcome}` | `ok`, `error`, `present`, `queue`, `budget`, `inflight`, `oversize` for the store's puts. | Any `error`; `budget` growing faster than `ok`. |
+| `selene_puts_total{outcome}` | `ok`, `error`, `unlinked`, `present`, `queue`, `budget`, `inflight`, `oversize` for the store's puts. `unlinked` counts page-only puts refused `INVALID` because no held ancestor could be linked, which includes a deepest held ancestor whose chain has 2048 records, where only a put with a row can start a new root; the writer drops them and the refusal is normal. `present` includes puts with no new pages and no row. | Any `error`; `budget` growing faster than `ok`. |
+| `selene_put_links_total{parent="linked"\|"root"}` | Accepted puts linked to a held ancestor or stored as complete roots. Includes puts that later fail or are cancelled; excludes refusals, including `PRESENT`. | A rising root fraction can indicate missing ancestors, periodic depth limits, or arena pressure. |
+| `selene_put_shapes_total{shape="row"\|"page_only"\|"empty"}` | Accepted puts that carry a row, accepted puts that carry pages only, including later failures or cancellation, and puts with no new pages and no row, which are answered `PRESENT` and also count under `present`. | A rising `page_only` share shows writers sending pages without rows. |
+| `selene_put_bytes_total{part="pages"\|"rows"}` | Padded page and row payload bytes accepted per put, excluding headers and checksum tables. Counts the accepted shape once, including puts that later fail or are cancelled. | Page bytes per accepted put rising without a similar increase in conversation length. |
 | `selene_gets_total{outcome}` | `ok`, `error` for the store's reads. | Any `error`. |
 | `selene_nvme_errors_total` | NVMe read and write failures. | Any increase. |
-| `selene_nvme_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes. |
+| `selene_nvme_bytes_total`, `selene_nvme_read_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written, bytes read for restores, and disk time for both directions. | Disk time growing faster than the sum of written and read bytes. |
 | `selene_memory_allocated_bytes`, `selene_staging_allocated_bytes` | Arena and staging in use. | Near `--memory` / `--staging`. |
 | `selene_nvme_reserved_bytes`, `selene_nvme_reserved_peak_bytes` | What `--nvme` bounds, as its present value and its high-water mark since start: every record's padded file or rounded arena extent, what each unfinished put will leave on disk, and the staging hold of each unfinished streamed put. Never above `--nvme`. Windows leased for claims and exports are not in it; `selene_staging_allocated_bytes` shows them with the holds, and `--staging` bounds them. | Near `--nvme`: puts are refused `BUDGET` and DRAM eviction stops. |
 | `selene_evictions_total`, `selene_compactions_total` | DRAM evictions and row compactions. | Hot set not staying resident. |
@@ -329,6 +371,12 @@ instance's version answers `Hello` with `VERSION_MISMATCH`. This fails instance 
 after startup it disables the pool until the instance restarts. `--name`, `--socket`,
 `--listen`, `--listen-data` and the TLS files are restart-only.
 
+Upgrade managers before clients. A manager that predates page-only puts ignores `row = false`,
+admits the put with full admission, which can evict, and grants a window for a row. The client
+then cancels the put on the size mismatch and retries the record after its backoff, so a client
+that sends page-only puts to such a manager costs a begin, an accept and a cancel on every
+attempt.
+
 The root holds one directory per model identity and layout fingerprint, named
 `<16 hex>-<32 hex>` from the first 8 bytes of the model identity and the 16-byte layout
 fingerprint. Remove one such
@@ -349,8 +397,8 @@ in that root under its own name.
 
 ### Duplicate puts and stale lookup hints
 
-`Present` means the complete record is already committed. Duplicate put logs
-report cumulative totals at 1, 2, 4, 8, and subsequent doublings;
+`Present` means the requested pages and, when requested, row are already committed.
+Duplicate put logs report cumulative totals at 1, 2, 4, 8, and subsequent doublings;
 every put receives its own reply.
 
 A restore warning ending in `UnknownSource` means that its lookup hint names

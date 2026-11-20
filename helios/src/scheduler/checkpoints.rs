@@ -454,7 +454,11 @@ impl RequestScheduler {
         let key = request.history.key_at(request.checkpoint_anchor() as u64);
         let epoch = request.checkpoints.demand_epoch;
         if let Some(id) = key.and_then(|key| self.cache.ready_by_prefix(&key)) {
+            let promoted = self.cache.checkpoint(id)?.retention_rank().role < RetentionRole::Anchor;
             self.cache.promote(id, RetentionRole::Anchor, epoch)?;
+            if promoted {
+                self.reoffer_publication(id);
+            }
         }
         Ok(())
     }

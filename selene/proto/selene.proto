@@ -974,6 +974,13 @@ enum Reason {
 // BUDGET and "full" are the writer's cue to advance the record to the next
 // configured tier immediately, not to wait (PROTOCOL.md section 11).
 
+enum CaptureRole {
+  LEGACY = 0;
+  ENDPOINT = 1;
+  MESSAGE = 2;
+  ANCHOR = 3;
+}
+
 message PutBegin {
   uint64 put_id = 1;
   PrefixKey key = 2;
@@ -985,6 +992,14 @@ message PutBegin {
   bytes bucket = 7;
   uint64 published_tail_pages = 8;
   CopyMode mode = 9;
+  // Strictly decreasing endpoint lengths; absent uses published_parent only.
+  repeated PrefixKey ancestor_keys = 10;
+  CaptureRole capture_role = 11;
+  // Source tree snapshot. The manager recomputes its own topology on commit.
+  uint32 child_paths = 12;
+  PrefixKey next_child = 13;
+  // A ready descendant on the unbranched path can supply a restore row.
+  bool descendant_row = 14;
 }
 
 message PutAccept {
@@ -998,6 +1013,7 @@ message PutAccept {
   DataChannelRef channel = 6;      // DATA_CHANNEL only.
   // A multi-process writer: the channel of each peer rank that is in channel mode.
   repeated RankChannel rank_channels = 7;
+  CaptureRole capture_role = 8;
 }
 
 // A window to fill, STAGING or ARENA region. At most Limits.window_credits

@@ -313,7 +313,29 @@ use std::net::TcpListener;
         transport
             .truncate(JobId(2), kept_ours.clone(), 4096)
             .unwrap();
-        let mut events = events(&mut transport, 2);
+        let capture = key(134, 0x5a);
+        let header = Header::new(
+            &[geometry(64, &[("kv", 4096)], 4096)],
+            [7; 32],
+            [2; 16],
+            capture,
+            Some(key(128, 0x5a)),
+            [0; 16],
+            0,
+            SystemTime::now(),
+        )
+        .unwrap()
+        .with_capture_role(crate::CaptureRole::Endpoint);
+        let file = record::file_name(&capture);
+        transport
+            .store_empty(
+                JobId(3),
+                header.clone(),
+                zero_directory.join(record::temporary_name(&capture)),
+                zero_directory.join(&file),
+            )
+            .unwrap();
+        let mut events = events(&mut transport, 3);
         events.sort_by_key(|event| Kind::of(event).1);
         assert!(matches!(
             events.as_slice(),
@@ -326,8 +348,21 @@ use std::net::TcpListener;
                     id: JobId(2),
                     result: Ok(())
                 },
+                TransportEvent::Stored {
+                    id: JobId(3),
+                    result: Ok(_),
+                    ..
+                },
             ]
         ));
+        for (directory, fingerprint) in [(&zero_directory, [2; 16]), (&peer_directory, [3; 16])] {
+            let bytes = std::fs::read(directory.join(&file)).unwrap();
+            assert_eq!(bytes.len() as u64, header.length(false));
+            let stored = Header::decode(&bytes).unwrap();
+            assert_eq!(stored.parent, header.parent);
+            assert_eq!(stored.capture_role(), crate::CaptureRole::Endpoint);
+            assert_eq!(stored.fingerprint, fingerprint);
+        }
         assert!(!ours.exists() && !theirs.exists());
         assert_eq!(std::fs::metadata(&kept_ours).unwrap().len(), 4096);
         assert_eq!(std::fs::metadata(&kept_theirs).unwrap().len(), 4096);

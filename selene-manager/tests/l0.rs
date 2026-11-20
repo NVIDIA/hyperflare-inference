@@ -166,6 +166,12 @@ async fn l0_04_invalid_checksum_short_payload_and_offsets() {
     // Nothing the refused puts carried was indexed.
     let mut check = host.client().await;
     assert!(check.records().await.is_empty());
+    let stop = Instant::now();
+    host.stop();
+    assert!(
+        stop.elapsed() < Duration::from_secs(5),
+        "refused puts held the claim drain"
+    );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_05_parent_first_chain_closed_durability() {
@@ -184,9 +190,12 @@ async fn l0_05_parent_first_chain_closed_durability() {
     host.run();
     let mut client = host.client().await;
     client.store(key(128), None).await;
-    wait(|| signal.exists());
     client.store(key(256), Some(key(128))).await;
     let namespace = client.descriptor.name();
+    assert_eq!(host.gauge("nvme_bytes_total"), 0);
+    drop(client);
+    host.request_stop();
+    wait(|| signal.exists());
     assert!(
         !host
             .config
@@ -197,7 +206,6 @@ async fn l0_05_parent_first_chain_closed_durability() {
             .join(record::file_name(&key(256)))
             .exists()
     );
-    assert_eq!(host.gauge("nvme_bytes_total"), 0);
     fs::remove_file(&signal).unwrap();
     wait(|| signal.exists());
     assert!(
@@ -210,7 +218,7 @@ async fn l0_05_parent_first_chain_closed_durability() {
             .exists()
     );
     fs::remove_file(signal).unwrap();
-    host.durable(2);
+    host.stop();
     // The catalog's durable flag is not on the wire: both records being on disk, the
     // parent having been written first, is the chain-durable state.
     for value in [key(128), key(256)] {
@@ -226,6 +234,260 @@ async fn l0_05_parent_first_chain_closed_durability() {
         );
     }
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_writers_restore_a_shared_prefix_and_upgrade_a_pruned_fork() {
+    use flare_selene::CaptureRole::{Anchor, Endpoint, Message};
+    let mut host = Host::with_storage(4 << 20, 16 << 20);
+    host.run();
+    let mut writer = host.client().await;
+    let mut peer = host.client().await;
+    let options = |role| PutOptions {
+        role,
+        ..Default::default()
+    };
+    let PutOutcome::Stored(root) = writer.put(key(64), None, options(Anchor)).await else {
+        panic!("root")
+    };
+    assert_eq!(peer.fetch(&[key(64)], 0, 1).await, [root.clone()]);
+    let PutOutcome::Stored(fork) = writer.put(key(128), Some(key(64)), options(Endpoint)).await
+    else {
+        panic!("fork")
+    };
+    let held = peer.hold(&[key(64), key(128)], 0, 2).await;
+    let PutOutcome::Stored(message) = writer.put(key(192), Some(key(128)), options(Message)).await
+    else {
+        panic!("message")
+    };
+    peer.finish(held).await;
+    assert!(peer.wait_absent(128, Duration::from_secs(5)).await);
+    let upgrade = PutOptions {
+        descendant_row: false,
+        next_child: Some(key(256)),
+        child_paths: 1,
+        ..options(Endpoint)
+    };
+    assert_eq!(
+        peer.put(key(128), Some(key(64)), upgrade).await,
+        PutOutcome::Stored(fork.clone())
+    );
+    assert!(matches!(
+        peer.put(key(256), Some(key(128)), options(Anchor)).await,
+        PutOutcome::Stored(_)
+    ));
+    assert!(matches!(
+        writer
+            .put(key(257), Some(key(192)), options(Endpoint))
+            .await,
+        PutOutcome::Stored(_)
+    ));
+    drop(writer);
+    drop(peer);
+    host.restart();
+    let mut reader = host.client().await;
+    assert_eq!(reader.fetch(&[key(64), key(128)], 0, 2).await[1], fork);
+    assert_eq!(
+        reader.fetch(&[key(64), key(128), key(192)], 0, 3).await[2],
+        message
+    );
+    assert_eq!(reader.fetch(&[key(64)], 0, 1).await, [root]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_role_aware_rewrite_classifies_a_legacy_row_on_disk() {
+    use flare_selene::CaptureRole::Message;
+    let mut host = Host::with_storage(4 << 20, 16 << 20);
+    host.run();
+    let mut writer = host.client().await;
+    let record = key(64);
+    writer.store(record, None).await;
+    drop(writer);
+    host.restart();
+    let mut writer = host.client().await;
+    let options = PutOptions {
+        role: Message,
+        ..Default::default()
+    };
+    assert!(matches!(
+        writer.put(record, None, options).await,
+        PutOutcome::Stored(_)
+    ));
+    assert_eq!(
+        writer.put(record, None, Default::default()).await,
+        PutOutcome::Refused(v2::Reason::Present as u8)
+    );
+    let namespace = writer.descriptor.name();
+    drop(writer);
+    host.stop();
+    let bytes = std::fs::read(
+        host.config
+            .root
+            .as_ref()
+            .unwrap()
+            .join(namespace)
+            .join(record::file_name(&record)),
+    )
+    .unwrap();
+    assert_eq!(
+        flare_selene::shared::record::Header::decode(&bytes[..4096])
+            .unwrap()
+            .capture_role(),
+        Message
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_writer_can_restore_a_missing_row_without_erasing_its_role() {
+    use flare_selene::CaptureRole::{Endpoint, Message};
+    let mut host = Host::with_storage(4 << 20, 16 << 20);
+    host.run();
+    let mut writer = host.client().await;
+    writer.store(key(64), None).await;
+    for (tokens, parent, role) in [(128, 64, Endpoint), (192, 128, Message)] {
+        let options = PutOptions {
+            role,
+            ..Default::default()
+        };
+        assert!(matches!(
+            writer.put(key(tokens), Some(key(parent)), options).await,
+            PutOutcome::Stored(_)
+        ));
+    }
+    assert!(writer.wait_absent(128, Duration::from_secs(5)).await);
+    assert!(matches!(
+        writer
+            .put(key(128), Some(key(64)), Default::default())
+            .await,
+        PutOutcome::Stored(_)
+    ));
+    let namespace = writer.descriptor.name();
+    drop(writer);
+    host.stop();
+    let bytes = fs::read(
+        host.config
+            .root
+            .as_ref()
+            .unwrap()
+            .join(namespace)
+            .join(record::file_name(&key(128))),
+    )
+    .unwrap();
+    assert_eq!(
+        flare_selene::shared::record::Header::decode(&bytes[..4096])
+            .unwrap()
+            .capture_role(),
+        Endpoint
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_page_messages_restore_exactly_and_an_endpoint_put_is_empty() {
+    use flare_selene::CaptureRole::{Anchor, Endpoint, Message};
+    let mut host = Host::with_storage(4 << 20, 16 << 20);
+    host.run();
+    let options = |role| PutOptions {
+        role,
+        ..Default::default()
+    };
+    let mut writer = host.client().await;
+    let root = writer.store(key(64), None).await;
+    let PutOutcome::Stored(anchor) = writer.put(key(128), Some(key(64)), options(Anchor)).await
+    else {
+        panic!("anchor was refused")
+    };
+    drop(writer);
+    host.restart();
+    let mut reader = host.client().await;
+    let mut writer = host.client().await;
+    let claim = reader.hold(&[key(64), key(128)], 0, 2).await;
+    let PutOutcome::Stored(message) = writer.put(key(129), Some(key(128)), options(Message)).await
+    else {
+        panic!("message was refused")
+    };
+    assert_eq!(
+        writer
+            .put(key(134), Some(key(129)), options(Endpoint))
+            .await,
+        PutOutcome::Refused(v2::Reason::Present as u8)
+    );
+    assert!(reader.candidate(134).await.is_none());
+    reader.finish(claim).await;
+    let fork = PutOptions {
+        child_paths: 2,
+        ..options(Endpoint)
+    };
+    let PutOutcome::Stored(fork_row) = writer.put(key(134), Some(key(129)), fork).await else {
+        panic!("fork was refused")
+    };
+    let PutOutcome::Stored(second) = writer.put(key(135), Some(key(129)), options(Message)).await
+    else {
+        panic!("second message was refused")
+    };
+    drop(reader);
+    drop(writer);
+    host.restart();
+    let mut reader = host.client().await;
+    let pg = descriptor().page_bytes() as usize;
+    assert_eq!(
+        reader.fetch(&[key(64), key(128)], 0, 2).await,
+        [root[..pg].to_vec(), anchor.clone()]
+    );
+    for (tokens, expected) in [(129, message), (134, fork_row), (135, second)] {
+        let keys = [key(64), key(128), key(129), key(tokens)];
+        let chain = if tokens == 129 { &keys[..3] } else { &keys[..] };
+        assert_eq!(
+            reader.fetch(chain, 0, 2).await,
+            [root[..pg].to_vec(), anchor[..pg].to_vec(), expected]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recapture_after_the_writer_exits_replaces_a_page_only_message() {
+    use flare_selene::CaptureRole::{Endpoint, Message};
+    let mut host = Host::with_storage(1 << 20, 16 << 20);
+    host.run();
+    let mut first = host.client().await;
+    first.store(key(64), None).await;
+    let interior = PutOptions {
+        role: Endpoint,
+        child_paths: 1,
+        ..Default::default()
+    };
+    assert!(matches!(
+        first.put(key(128), Some(key(64)), interior).await,
+        PutOutcome::Stored(_)
+    ));
+    first.store(key(192), Some(key(128))).await;
+    first.goodbye().await;
+    host.restart();
+    let file = host
+        .config
+        .root
+        .as_ref()
+        .unwrap()
+        .join(descriptor().name())
+        .join(record::file_name(&key(128)));
+    let bytes = fs::read(file).unwrap();
+    let header = flare_selene::shared::record::Header::decode(&bytes[..4096]).unwrap();
+    assert_eq!(header.capture_role(), Endpoint);
+    assert_eq!(bytes.len() as u64, header.length(false));
+    let mut fresh = host.client().await;
+    assert!(fresh.candidate(128).await.is_none());
+    let options = PutOptions {
+        role: Message,
+        child_paths: 1,
+        ..Default::default()
+    };
+    let PutOutcome::Stored(row) = fresh.put(key(128), Some(key(64)), options).await else {
+        panic!("exact recapture must upgrade the page-only key");
+    };
+    assert_eq!(fresh.fetch(&[key(64), key(128)], 0, 2).await[1], row);
+    assert_eq!(
+        fresh.put(key(128), Some(key(64)), options).await,
+        PutOutcome::Refused(v2::Reason::Present as u8)
+    );
+}
+
 #[test]
 fn l0_06_multiprocess_kill_recovery() {
     if let Ok(base) = std::env::var(CHILD) {
@@ -283,6 +545,10 @@ fn l0_06_multiprocess_kill_recovery() {
                     .await;
             } else {
                 client.store(key(128), None).await;
+                if point == "parent_write" {
+                    drop(client);
+                    host.request_stop();
+                }
             }
             loop {
                 std::thread::park();
@@ -395,12 +661,11 @@ async fn l0_07_streaming_and_nvme_oversize() {
     assert_eq!(data[0], bytes[held..]);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_08_refill_and_split_units() {
+async fn l0_08_a_restore_leaves_the_arena_empty_and_splits_units() {
     let mut refill = Host::with_storage(65536, 1024 * 1024);
     refill.run();
     let mut client = refill.client().await;
     client.store(key(128), None).await;
-    refill.durable(1);
     drop(client);
     refill.stop();
     refill.run();
@@ -410,9 +675,11 @@ async fn l0_08_refill_and_split_units() {
         .await
         .expect("the recovered record is offered");
     assert_eq!(candidate.tier, v2::Tier::Nvme as i32);
+    // A restore streams the record from NVMe. It neither takes arena memory nor moves
+    // the record to the DRAM tier.
     client.fetch(&[key(128)], 0, 2).await;
-    refill.wait(|host| host.gauge("memory_allocated_bytes") > 0);
-    wait_tier(&mut client, 128, v2::Tier::Dram).await;
+    assert_eq!(refill.gauge("memory_allocated_bytes"), 0);
+    wait_tier(&mut client, 128, v2::Tier::Nvme).await;
 
     let mut split = Host::with_storage(4096, 32 * 1024 * 1024);
     split.run();
@@ -511,12 +778,17 @@ async fn l0_12_round_robin_and_dead_client_cleanup() {
         client.store(value, previous).await;
         previous = Some(value);
     }
-    host.durable(160);
+    drop(a);
+    drop(client);
+    host.restart();
+    let mut a = host.client().await;
     let keys: Vec<_> = (1..=160).map(|index| key(index * 64)).collect();
-    // Four requesters that stop in the middle of a 160-record restore.
+    // Four requesters that stop in the middle of a 160-record restore. After the
+    // restart every record is on disk only, so the first window waits for the
+    // metadata reads of the whole chain.
     for _ in 0..4 {
         let mut dead = host.client().await;
-        let held = dead.hold(&keys, 0, 160).await;
+        let held = dead.hold_after(&keys, 0, 160, Duration::from_secs(5)).await;
         assert!(!held.windows.is_empty());
         dead.goodbye().await;
     }
@@ -553,9 +825,11 @@ async fn l0_18_restart_recovers_every_committed_record_without_a_descriptor() {
     other.identity = [9; 32];
     let mut second = host.client_with(other.clone()).await.unwrap();
     let second_bytes = second.store(key(64), None).await;
-    host.durable(4);
     let root = host.config.root.clone().unwrap();
     let directory = root.join(client.descriptor.name());
+    drop(client);
+    drop(second);
+    host.stop();
     assert!(!directory.join("descriptor").exists());
     for (key, _) in &expected {
         let bytes = fs::read(directory.join(record::file_name(key))).unwrap();
@@ -577,10 +851,7 @@ async fn l0_18_restart_recovers_every_committed_record_without_a_descriptor() {
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "ckpt"))
         .map(|entry| entry.metadata().unwrap().len())
         .sum();
-    assert_eq!(reported(&host), persisted);
-    drop(client);
-    drop(second);
-    host.stop();
+
     let broken = directory.join(record::file_name(&key(1024)));
     fs::write(&broken, b"broken").unwrap();
     fs::write(directory.join(".interrupted.tmp"), b"partial").unwrap();
@@ -1126,7 +1397,6 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
     geometry.ranks[0].planes = vec![8 * 1024 * 1024];
     let mut resident = host.client_with(geometry.clone()).await.unwrap();
     let stored = resident.store(key(64), None).await;
-    host.durable(1);
     // A second namespace (same geometry) for the put that has to wait.
     let mut other = geometry;
     other.identity = [9; 32];
@@ -1154,12 +1424,15 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_54_get_sources_survive_eviction_pressure() {
-    // Diagnostic: a restore's delivered bytes must be the bytes the manager
-    // verified when it read the record. Hold leases on every arena record,
-    // force a streamed put, release the leases so the read refills the
-    // arena, and apply put pressure while the slow read is in flight. Then
-    // repeat with a record too large for the arena so the header and the
-    // payload windows are read at different times.
+    // Diagnostic: a restore's delivered bytes must be the bytes that were stored;
+    // the requester checks each window against the record's persisted page and
+    // row checksums. A restore streams a record that is not
+    // in the arena, reading its metadata and then each window from disk without
+    // copying the record into the arena. Hold leases on every arena record to
+    // force a streamed put, release them, and complete a put that evicts arena
+    // records while the restore's read is held on the reads thread. Then repeat
+    // with a record too large for the arena so the metadata and the payload
+    // windows are read at different times.
     let base = base("get-pressure");
     let mut config = Config::new(
         base.join("records"),
@@ -1171,24 +1444,38 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
     let (gate, entered, release) = selene_manager::disk::IoGate::new();
     config.faults.read_gate = Some(gate.clone());
     let mut host = Host::open_config(config);
+    // A failed assertion unwinds while the gate still holds the reads thread, and
+    // dropping the manager joins that thread, so the gate is released on every
+    // exit. `release` is declared after `host`, so it drops first.
+    struct Release(std::sync::mpsc::SyncSender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+    let release = Release(release);
     host.run();
     let mut client = host.client().await;
     let first = client.store(key(64), None).await;
     let second = client.store(key(128), Some(key(64))).await;
-    host.durable(2);
     // The second record alone: its parent's page is already held.
     let one = client.hold(&[key(64)], 0, 1).await;
     let two = client.hold(&[key(128)], 1, 1).await;
     assert!(!one.windows.is_empty() && !two.windows.is_empty());
-    // Both arena records are pinned, so this three-page root streams to disk.
-    let streamed = client.store(key(192), None).await;
+    assert_eq!(
+        client.put(key(192), None, PutOptions::default()).await,
+        PutOutcome::Refused(v2::Reason::Budget as u8)
+    );
+    let streamed = client.store(key(512), None).await;
     client.finish(one).await;
     client.finish(two).await;
-    // The arena is now free for the read to verify and refill the record.
     let mut reader = host.client().await;
     let mut pressure = host.client().await;
-    let streamed_key = [key(192)];
-    let fetch = reader.fetch(&streamed_key, 0, 3);
+    let streamed_key = [key(512)];
+    let fetch = reader.fetch(&streamed_key, 0, 8);
+    // Puts write on their own thread, so the pressure put completes while the
+    // restore's read is held. Awaiting its completion is the overlap; the read is
+    // released only afterwards.
     let put = async {
         let entered = tokio::task::spawn_blocking(move || {
             entered
@@ -1198,22 +1485,18 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
         })
         .await
         .unwrap();
-        let put = tokio::spawn(async move {
-            let bytes = pressure.store(key(256), None).await;
-            (pressure, bytes)
-        });
-        host.wait(|host| host.gauge("open_ops") >= 2);
-        release.send(()).unwrap();
-        let (pressure, bytes) = put.await.unwrap();
-        (pressure, bytes, entered)
+        let bytes = tokio::time::timeout(Duration::from_secs(15), pressure.store(key(256), None))
+            .await
+            .expect("the put did not complete while the restore's read was held");
+        release.0.send(()).unwrap();
+        (bytes, entered)
     };
-    let (fetched, (returned, pressed, entered)) = tokio::join!(fetch, put);
-    pressure = returned;
+    let (fetched, (pressed, entered)) = tokio::join!(fetch, put);
     assert_eq!(fetched[0], streamed);
     assert!(!pressed.is_empty());
     assert!(!first.is_empty() && !second.is_empty());
 
-    // 128 pages do not fit the arena: the header is read once and each
+    // 128 pages do not fit the arena: the metadata is read once and each
     // payload window later, while another put adds eviction pressure.
     let large = client.store(key(128 * 64), None).await;
     gate.arm();
@@ -1227,16 +1510,13 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
         })
         .await
         .unwrap();
-        let put = tokio::spawn(async move {
-            let bytes = pressure.store(key(384), None).await;
-            (pressure, bytes)
-        });
-        host.wait(|host| host.gauge("open_ops") >= 2);
-        release.send(()).unwrap();
-        put.await.unwrap()
+        let bytes = tokio::time::timeout(Duration::from_secs(15), pressure.store(key(384), None))
+            .await
+            .expect("the put did not complete while the restore's read was held");
+        release.0.send(()).unwrap();
+        bytes
     };
-    let (fetched, (returned, pressed)) = tokio::join!(fetch, put);
-    drop(returned);
+    let (fetched, pressed) = tokio::join!(fetch, put);
     assert_eq!(fetched[0], large);
     assert!(!pressed.is_empty());
     host.wait(|host| host.gauge("open_ops") == 0);
@@ -1250,7 +1530,6 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
     host.run();
     let mut client = host.client().await;
     let stored = client.store(key(64), None).await;
-    host.durable(1);
     let held = client.hold(&[key(64)], 0, 1).await;
     let window = held.windows[0].window.unwrap();
     assert!(window.page_count > 0 && window.first_page == 0);
@@ -1259,8 +1538,10 @@ async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
     assert_eq!(terminal.state, v2::ClaimState::Failed as i32);
     // Pressure: a 32 KiB root cannot fit beside the leased 16 KiB extent, so
     // eviction must either skip the lease or corrupt the requester's window.
-    let pressed = client.store(key(128), None).await;
-    assert!(!pressed.is_empty());
+    assert_eq!(
+        client.put(key(128), None, PutOptions::default()).await,
+        PutOutcome::Refused(v2::Reason::Budget as u8)
+    );
     let bytes = client.session.shm.as_ref().unwrap().read(&window);
     assert_eq!(bytes, stored[..window.length as usize]);
     host.wait(|host| host.gauge("open_ops") == 0);
@@ -1357,7 +1638,6 @@ async fn l0_60_restore_is_not_refused_when_the_nvme_budget_is_full() {
     let streamed = client.store(key(512 * 64), None).await;
     client.store(key(64 * 64), None).await;
     client.store(key(64 * 64 + 1), None).await;
-    host.durable(3);
     assert!(
         host.gauge("nvme_reserved_bytes") > 3_000_000,
         "the durable budget must be nearly full: {}",
@@ -1365,6 +1645,168 @@ async fn l0_60_restore_is_not_refused_when_the_nvme_budget_is_full() {
     );
     assert_eq!(client.fetch(&[key(512 * 64)], 0, 512).await[0], streamed);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_put_reclaims_its_durable_parents_arena_copy() {
+    let mut host = Host::with_storage(8 << 20, 64 << 20);
+    host.config.staging = 8 << 20;
+    host.run();
+    let mut value = descriptor();
+    value.ranks[0].row_bytes = 5 << 20;
+    let mut client = host.client_with(value.clone()).await.unwrap();
+    let root = client.store(key(64), None).await;
+    // Either record needs an 8 MiB arena extent. Streaming would require two
+    // 8 MiB row windows, which cannot fit the 8 MiB staging region.
+    let child = client.store(key(128), Some(key(64))).await;
+    assert_eq!(
+        client.fetch(&[key(64), key(128)], 0, 2).await,
+        vec![root[..4096].to_vec(), child]
+    );
+    client.store(key(192), Some(key(64))).await;
+    assert_eq!(client.fetch(&[key(64)], 0, 1).await, vec![root]);
+    // The root now has two children. Its disk copy still preserves both
+    // branches when admission reclaims its arena extent.
+    client.store(key(256), Some(key(64))).await;
+    assert!(
+        host.metrics()
+            .contains("selene_puts_total{outcome=\"budget\"} 0\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linked_and_root_restores_share_a_staging_region_that_fits_one_row() {
+    for linked in [false, true] {
+        let mut host = Host::with_storage(16 << 20, 128 << 20);
+        host.config.staging = 32 << 20;
+        host.run();
+        let mut value = descriptor();
+        value.ranks[0].row_bytes = 5 << 20;
+        let mut client = host.client_with(value.clone()).await.unwrap();
+        let mut parent = None;
+        let mut expected = Vec::new();
+        let mut keys = Vec::new();
+        for tokens in if linked {
+            vec![64, 128, 192]
+        } else {
+            vec![192]
+        } {
+            let payload = client.store(key(tokens), parent).await;
+            expected.push(payload);
+            keys.push(key(tokens));
+            parent = Some(key(tokens));
+        }
+        // Recovery starts with no arena copies, so every record streams through
+        // staging, and the endpoint's row is one window of the staging region.
+        client.goodbye().await;
+        host.stop();
+        host.config.staging = 8 << 20;
+        host.run();
+        let mut client = host.client_with(value.clone()).await.unwrap();
+        for record in expected.iter_mut().rev().skip(1) {
+            record.truncate(4096);
+        }
+        assert_eq!(client.fetch(&keys, 0, 3).await, expected, "linked={linked}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_streams_every_record_that_is_not_resident_in_grant_order() {
+    let mut host = Host::with_storage(16 << 20, 128 << 20);
+    host.run();
+    let mut client = host.client().await;
+    let mut expected = Vec::new();
+    let mut keys = Vec::new();
+    let mut parent = None;
+    // The record at 128 tokens has two children, so a chain through it shares a prefix.
+    for tokens in [64, 128, 192, 256] {
+        expected.push(client.store(key(tokens), parent).await);
+        keys.push(key(tokens));
+        parent = Some(key(tokens));
+    }
+    client.store(key(448), Some(key(128))).await;
+    // Recovery starts with no arena copies. Every record streams, the shared prefix and
+    // the endpoint included, and the windows reach the requester in grant order.
+    client.goodbye().await;
+    host.restart();
+    host.durable(5);
+    let mut client = host.client().await;
+    for record in expected.iter_mut().take(3) {
+        record.truncate(4096);
+    }
+    assert_eq!(client.fetch(&keys, 0, 4).await, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_of_a_deep_linked_chain_streams_every_record_in_grant_order() {
+    const RECORDS: u64 = 300;
+    let mut host = Host::with_storage(16 << 20, 128 << 20);
+    host.run();
+    let mut client = host.client().await;
+    let mut expected = Vec::new();
+    let mut keys = Vec::new();
+    let mut parent = None;
+    for tokens in (1..=RECORDS).map(|record| record * 64) {
+        expected.push(client.store(key(tokens), parent).await);
+        keys.push(key(tokens));
+        parent = Some(key(tokens));
+    }
+    // One root and a link at every later put, so the chain is RECORDS records deep.
+    let metrics = host.metrics();
+    for line in [
+        format!(
+            "selene_put_links_total{{parent=\"linked\"}} {}\n",
+            RECORDS - 1
+        ),
+        "selene_put_links_total{parent=\"root\"} 1\n".to_string(),
+    ] {
+        assert!(metrics.contains(&line), "missing metric {line}");
+    }
+    // Recovery starts with no arena copies. Every intermediate record streams its pages
+    // without its row, and the client checks that the windows arrive in grant order.
+    client.goodbye().await;
+    host.restart();
+    host.durable(keys.len());
+    let mut client = host.client().await;
+    for record in expected.iter_mut().take(keys.len() - 1) {
+        record.truncate(4096);
+    }
+    let restored = client.fetch(&keys, 0, RECORDS as u32).await;
+    assert_eq!(restored.len(), expected.len());
+    for (index, (restored, expected)) in restored.iter().zip(&expected).enumerate() {
+        assert!(restored == expected, "record {index} differs");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_put_considers_at_most_the_first_4096_candidate_ancestors() {
+    let mut host = Host::with_storage(64 << 20, 128 << 20);
+    host.run();
+    let mut client = host.client().await;
+    client.store(key(64), None).await;
+    client.goodbye().await;
+    host.restart();
+    host.durable(1);
+    let mut client = host.client().await;
+    let limit = flare_selene::shared::MAX_CHAIN_NODES as u64;
+    let target = key((limit + 8) * 64);
+    // Unheld candidates, deepest first, then the held record.
+    let unheld = (5..5 + limit - 1).rev().map(|pages| key(pages * 64));
+    for (candidates, linked) in [
+        (unheld.clone().chain([key(64)]).collect::<Vec<_>>(), true),
+        (unheld.chain([key(128), key(64)]).collect(), false),
+    ] {
+        assert_eq!(candidates.len() as u64, limit + u64::from(!linked));
+        let (id, start) = client.start_put_linked(target, &candidates).await;
+        let PutStart::Accepted(accept) = start else {
+            panic!("put refused: {start:?}");
+        };
+        assert_eq!(accept.has_parent, linked);
+        assert_eq!(accept.first_page, if linked { 1 } else { 0 });
+        client.abandon_put(id).await;
+        host.wait(|host| host.gauge("open_ops") == 0);
+    }
+}
+
 #[test]
 fn l0_62_socket_directory_modes() {
     // The manager sets a mode only on a directory it created. An existing
@@ -1461,6 +1903,141 @@ async fn l0_63_a_paused_put_keeps_its_window_past_the_deadline() {
         "the stalled put's extent must stay leased"
     );
     assert_eq!(client.session.shm.as_ref().unwrap().read(&window), pattern);
+    host.request_stop();
+    client
+        .session
+        .take(|m| match m {
+            M::Readiness(info) if info.state == v2::ReadinessState::Draining as i32 => Some(()),
+            _ => None,
+        })
+        .await;
+    // A round trip after Draining proves the writer can still send its fence.
+    client.session.barrier().await;
+    let fenced = Instant::now();
+    client.fence_put(id).await;
+    host.stop();
+    assert!(
+        fenced.elapsed() < Duration::from_secs(5),
+        "the writer fenced its last window"
+    );
+}
+
+async fn cancel_with_unfenced_window(writer: &mut Client) -> u64 {
+    let (id, start) = writer.start_put(key(192), None).await;
+    assert!(matches!(start, PutStart::Accepted(_)));
+    writer
+        .session
+        .take(|m| match m {
+            M::PutGrant(grant) if grant.put_id == id => Some(()),
+            _ => None,
+        })
+        .await;
+    writer.cancel_put(id).await;
+    id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_quarantined_writer_stops_promptly_and_holds_the_regions_on_restart() {
+    let mut host = Host::dram_only(32 * 1024);
+    host.run();
+    let mut writer = host.client().await;
+    let id = cancel_with_unfenced_window(&mut writer).await;
+    writer
+        .session
+        .send(c::M::FenceAck(v2::FenceAck {
+            subject: Some(v2::fence_ack::Subject::PutId(id)),
+            outcome: v2::FenceOutcome::Quarantined as i32,
+        }))
+        .await;
+    writer.session.barrier().await;
+    let start = Instant::now();
+    host.stop();
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_secs(5), "stop took {elapsed:?}");
+    host.run();
+    host.wait(|h| h.gauge("pool_ready") == 1);
+    assert_eq!(host.gauge("pool_regions_held"), 1);
+    drop(writer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_released_during_shutdown_keeps_its_unfenced_requesters_hold() {
+    let mut host = Host::dram_only(32 * 1024);
+    host.run();
+    let mut requester = host.client().await;
+    requester.store(key(64), None).await;
+    let claim = requester.hold(&[key(64)], 0, 1).await;
+    assert!(!claim.windows.is_empty());
+    host.request_stop();
+    requester
+        .session
+        .take(|m| match m {
+            M::Readiness(info) if info.state == v2::ReadinessState::Draining as i32 => Some(()),
+            _ => None,
+        })
+        .await;
+    requester
+        .session
+        .send(c::M::ClaimRelease(v2::ClaimRelease { claim_id: claim.id }))
+        .await;
+    let terminal = requester.session.claim_terminal(claim.id).await;
+    assert_eq!(terminal.reason, v2::ClaimReason::Cancelled as i32);
+    assert!(terminal.fence_required);
+    let start = Instant::now();
+    host.stop();
+    assert!(start.elapsed() < Duration::from_secs(5));
+    host.run();
+    host.wait(|h| h.gauge("pool_ready") == 1);
+    assert_eq!(host.gauge("pool_regions_held"), 1);
+    drop(requester);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disconnected_put_releases_its_window_only_if_the_writer_quiesced() {
+    for quiesced in [true, false] {
+        let mut host = Host::dram_only(32 * 1024);
+        host.run();
+        let mut writer = host.client().await;
+        cancel_with_unfenced_window(&mut writer).await;
+        if quiesced {
+            writer.goodbye().await;
+        }
+        writer.session.barrier().await;
+        host.wait(|h| h.gauge("pool_sessions") == 1 && h.gauge("pool_puts_open") == 1);
+        drop(writer);
+        host.wait(|h| h.gauge("pool_sessions") == 0);
+        if quiesced {
+            host.wait(|h| h.gauge("pool_puts_open") == 0 && h.gauge("memory_allocated_bytes") == 0);
+        } else {
+            assert_eq!(host.gauge("pool_puts_open"), 1);
+            assert!(host.gauge("memory_allocated_bytes") > 0);
+        }
+        let stopped = Instant::now();
+        host.stop();
+        assert!(stopped.elapsed() < Duration::from_secs(5));
+        host.run();
+        host.wait(|h| h.gauge("pool_ready") == 1);
+        assert_eq!(host.gauge("pool_regions_held"), u64::from(!quiesced));
+        host.stop();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfenced_writer_holds_the_regions_after_the_shutdown_deadline() {
+    let mut host = Host::dram_only(32 * 1024);
+    host.config.limits.max_claim_deadline_ms = 100;
+    host.run();
+    let mut writer = host.client().await;
+    cancel_with_unfenced_window(&mut writer).await;
+    writer.session.barrier().await;
+    let start = Instant::now();
+    host.stop();
+    assert!(start.elapsed() >= Duration::from_millis(2100));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    host.run();
+    host.wait(|h| h.gauge("pool_ready") == 1);
+    assert_eq!(host.gauge("pool_regions_held"), 1);
+    drop(writer);
 }
 
 /// A startup failure after the store opened must release the instance and root locks and
@@ -1560,7 +2137,11 @@ async fn full_pool_admits_concurrent_large_puts() {
         writer.store(key(root), None).await;
         writer.store(key(leaf), Some(key(root))).await;
     }
-    host.durable(6);
+    drop(writer);
+    // Recovered seed records occupy their file lengths. Three new arena extents use 1536 KiB.
+    host.config.nvme = 1550 * 1024;
+    host.restart();
+    let mut writer = host.client().await;
     let mut a = host.client().await;
     let mut b = host.client().await;
     let mut c = host.client().await;

@@ -133,6 +133,7 @@ mod memory {
             .collect();
         history.append(&tokens, &[]).unwrap();
         let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(1),
             key: history.key_at(consumed).unwrap(),
             parent: None,
@@ -293,6 +294,7 @@ mod memory {
             .collect();
         history.append(&tokens, &[]).unwrap();
         let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(1),
             key: history.key_at(consumed).unwrap(),
             parent: None,
@@ -472,6 +474,7 @@ mod memory {
         other.append(&[11, 12, 13, 14, 15], &[]).unwrap();
         let second_consumed = consumed + 5;
         let second = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(2),
             key: other.key_at(second_consumed).unwrap(),
             parent: None,
@@ -506,6 +509,7 @@ mod memory {
         another.append(&[21, 22, 23], &[]).unwrap();
         let third_consumed = consumed + 3;
         let third = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(3),
             key: another.key_at(third_consumed).unwrap(),
             parent: None,
@@ -689,6 +693,7 @@ mod composite {
             let root_pages: Vec<PageId> = (base..base + 3).map(PageId).collect();
             let child_page = PageId(base + 3);
             let root = PublishedCheckpoint {
+                capture_role: flare_selene::CaptureRole::Endpoint,
                 id: ids.next(),
                 key: history.key_at(root_consumed).unwrap(),
                 parent: None,
@@ -698,6 +703,7 @@ mod composite {
                 slot: StateSlotId(1 + pair * 2),
             };
             let child = PublishedCheckpoint {
+                capture_role: flare_selene::CaptureRole::Endpoint,
                 id: ids.next(),
                 key: history.key_at(child_consumed).unwrap(),
                 parent: Some(root.key),
@@ -784,6 +790,7 @@ mod composite {
             );
         }
         let root = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: ids.next(),
             key: history.key_at(root_consumed).unwrap(),
             parent: None,
@@ -793,6 +800,7 @@ mod composite {
             slot: StateSlotId(5),
         };
         let child = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: ids.next(),
             key: history.key_at(child_consumed).unwrap(),
             parent: Some(root.key),
@@ -802,6 +810,7 @@ mod composite {
             slot: StateSlotId(6),
         };
         let grandchild = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: ids.next(),
             key: history.key_at(grandchild_consumed).unwrap(),
             parent: Some(child.key),
@@ -1024,6 +1033,7 @@ mod composite {
             .iter()
             .enumerate()
             .map(|(index, history)| PublishedCheckpoint {
+                capture_role: flare_selene::CaptureRole::Endpoint,
                 id: ids.next(),
                 key: history.key_at(consumed).unwrap(),
                 parent: None,

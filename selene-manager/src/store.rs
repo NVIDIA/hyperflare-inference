@@ -12,10 +12,10 @@ use crate::{
     proto,
     record::{self, Descriptor, NamespaceId},
 };
-use flare_selene::shared::index::{Eviction, Index as Tree};
+use flare_selene::shared::index::Index as Tree;
 use flare_selene::shared::region::Region;
 use flare_selene::{
-    JobId,
+    CaptureRole, JobId,
     shared::{
         disk::{DiskThread, Job as DiskJob, Span},
         record::Header,
@@ -32,12 +32,20 @@ use std::{
 
 pub const OPEN_GETS: usize = 4;
 pub const MAX_CHAIN: usize = flare_selene::shared::MAX_CHAIN_NODES as usize;
+/// Records in a chain at which a put starts a new root instead of linking. Lookups, claims
+/// and Gets accept a chain of at most `MAX_CHAIN` records and a linked put adds one record,
+/// so the requirement is only that no stored chain exceeds `MAX_CHAIN`. The other half is
+/// headroom that no check depends on. The depth also bounds the metadata blocks a restore
+/// reads before its first window to this many records.
+pub const REROOT_DEPTH: usize = MAX_CHAIN / 2;
 pub use flare_selene::shared::PROGRESS_TIMEOUT as NO_PROGRESS;
 
 /// Whether an operation that has been idle for `idle` has stalled. A put whose client has
 /// delivered everything (`delivered`) waits on this manager's own disk, whose jobs queue behind
 /// each other, so it has stalled only if the disk made no progress either (`disk_idle`, `None`
-/// when no job is outstanding). Otherwise the idle time alone decides.
+/// when no job is outstanding). A get with reads in flight waits the same way on its own
+/// namespace's reads thread, whose idle time is `disk_idle`. Otherwise the idle time alone
+/// decides.
 fn stalled(idle: Duration, delivered: bool, disk_idle: Option<Duration>) -> bool {
     idle >= NO_PROGRESS && !(delivered && disk_idle.is_some_and(|disk| disk < NO_PROGRESS))
 }
@@ -49,16 +57,6 @@ pub const EMBEDDED_STAGING: usize = 16 * 1024 * 1024;
 
 pub use crate::config::Config;
 
-/// Physical charge: the arena allocator size class or the padded disk record.
-pub fn record_charge(header: &Header, in_memory: bool) -> u64 {
-    let length = header.length_with_row();
-    if in_memory {
-        length.max(4096).next_power_of_two()
-    } else {
-        length
-    }
-}
-
 #[derive(Clone)]
 pub struct Location {
     pub header: Header,
@@ -69,6 +67,7 @@ pub struct Location {
     /// The disk job currently transforming these bytes, so a stale completion is ignored.
     pub job: Option<u64>,
     pub retry: Instant,
+    pub admitted: Instant,
     pub bytes: u64,
 }
 
@@ -81,6 +80,14 @@ enum PublishTarget {
 }
 
 impl Location {
+    /// Whether a disk job is writing or truncating this record's file.
+    ///
+    /// Removing the record then would strand the job's completion, so removal
+    /// cascades leave such a record in the tree.
+    pub fn disk_busy(&self) -> bool {
+        self.writing || self.job.is_some()
+    }
+
     pub fn reading(&self) -> bool {
         self.memory
             .as_ref()
@@ -94,6 +101,11 @@ pub struct Namespace {
     pub tree: Tree<Location>,
     pub disk: Option<DiskThread>,
     reads: Option<DiskThread>,
+    /// Reads submitted to `reads` and not yet completed.
+    reads_pending: usize,
+    /// The later of the last read completion and the moment `reads` last went from idle
+    /// to busy. A reads thread that is busy and has not moved for `NO_PROGRESS` is hung.
+    read_progress: Instant,
     pub inflight: HashSet<Key>,
     /// Records that are not durable yet, so durability and scheduling visit only these.
     /// Invariant: when the namespace has a disk, every record that is not durable is in this
@@ -238,6 +250,8 @@ enum RootChoice {
 }
 
 pub struct Put {
+    row: bool,
+    stored_role: CaptureRole,
     namespace: NamespaceId,
     header: Header,
     first_page: u32,
@@ -279,7 +293,6 @@ impl Put {
 
 struct GetRecord {
     header: Header,
-    row: bool,
     memory: Option<Arc<Extent>>,
     file: Option<Arc<File>>,
     meta: Option<Vec<u8>>,
@@ -293,6 +306,9 @@ pub struct Get {
     grants: Vec<PlannedGrant>,
     requested: usize,
     next_grant: usize,
+    /// The first record whose metadata read has not been started. A record's metadata read
+    /// waits for staging, so this advances in record order as staging allows.
+    next_meta_read: usize,
     next_meta: usize,
     window_reads: usize,
     pending_reads: usize,
@@ -322,14 +338,20 @@ impl Open {
         }
     }
 
-    /// A put that owes nothing more to its client and waits on this manager's own disk: it is
-    /// committed, or it has asked for windows, holds none, and both staging slots are still
-    /// draining or chunks are blocked on a full disk queue.
+    /// An operation that waits on this manager's own disk: a put that owes nothing more to its
+    /// client because it is committed, or has asked for windows, holds none, and both staging
+    /// slots are still draining or chunks are blocked on a full disk queue; or a get with reads
+    /// in flight, which waits on its namespace's reads thread.
     fn waits_on_disk(&self) -> bool {
-        matches!(&self.operation, Operation::Put(put) if put.committed
-            || (put.requested > 0
-                && put.windows.granted.is_empty()
-                && (put.hold_slots.iter().all(Option::is_some) || !put.blocked.is_empty())))
+        match &self.operation {
+            Operation::Put(put) => {
+                put.committed
+                    || (put.requested > 0
+                        && put.windows.granted.is_empty()
+                        && (put.hold_slots.iter().all(Option::is_some) || !put.blocked.is_empty()))
+            }
+            Operation::Get(get) => get.pending_reads > 0,
+        }
     }
 
     /// A put whose next window the pool has not yet asked for, with no granted window for the
@@ -359,14 +381,18 @@ enum CatalogKind {
 
 enum ReadKind {
     Meta { length: usize },
-    Fill,
     Window { grant: u32 },
 }
 
 enum Job {
+    Compact {
+        namespace: NamespaceId,
+        key: Key,
+    },
     Write {
         namespace: NamespaceId,
         key: Key,
+        reason: &'static str,
         _memory: Arc<Extent>,
         _temporary: Arc<DiskExtent>,
     },
@@ -383,12 +409,8 @@ enum Job {
         _metadata: Arc<Extent>,
         _temporary: Arc<DiskExtent>,
     },
-    Compact {
-        namespace: NamespaceId,
-        key: Key,
-        bytes: u64,
-    },
     GetRead {
+        namespace: NamespaceId,
         connection: u64,
         transfer: u64,
         record: u32,
@@ -412,7 +434,7 @@ fn finish_record(
         temporary.path.clone(),
         0,
         metadata.bytes(),
-        Some((final_extent.path.clone(), put.header.length(true))),
+        Some((final_extent.path.clone(), put.header.length(put.row))),
     );
     Some((
         task,
@@ -433,9 +455,20 @@ pub struct Metrics {
     pub cancels: u64,
     pub puts_ok: u64,
     pub puts_error: u64,
+    /// Page-only puts that cannot link to a held ancestor, refused `INVALID`.
+    pub puts_unlinked: u64,
+    pub put_links_linked: u64,
+    pub put_links_root: u64,
+    pub put_page_bytes: u64,
+    pub put_row_bytes: u64,
+    pub put_shapes_row: u64,
+    pub put_shapes_page_only: u64,
+    pub put_shapes_empty: u64,
     pub present: u64,
     pub retry_queue: u64,
     pub retry_budget: u64,
+    put_writeback_waits: u64,
+    shutdown_unflushed: Option<(u64, u64)>,
     pub retry_inflight: u64,
     pub oversize: u64,
     pub gets_ok: u64,
@@ -443,7 +476,10 @@ pub struct Metrics {
     pub evictions: u64,
     pub expired: [u64; 2],
     pub compactions: u64,
+    record_actions: HashMap<(CaptureRole, &'static str), (u64, u64)>,
+    /// Durable bytes written; restore reads count in `nvme_read_bytes`.
     pub nvme_bytes: u64,
+    pub nvme_read_bytes: u64,
     pub nvme_seconds: f64,
     pub nvme_errors: u64,
     pub hits: HashMap<(String, &'static str), u64>,
@@ -480,9 +516,14 @@ pub struct PutRequest {
     pub namespace: NamespaceId,
     pub key: Key,
     pub published_parent: Option<Key>,
+    pub ancestor_keys: Vec<Key>,
     pub bucket: [u8; 16],
     pub chain_pages: u32,
     pub published_tail_pages: u32,
+    pub capture_role: CaptureRole,
+    pub child_paths: u32,
+    pub descendant_row: bool,
+    pub next_child: Option<Key>,
     pub row: bool,
 }
 
@@ -494,6 +535,8 @@ pub struct GetRequest {
     pub row: bool,
 }
 
+const WRITEBACK_WORKERS: usize = 4;
+
 pub struct Store {
     config: Config,
     local: Local,
@@ -501,6 +544,7 @@ pub struct Store {
     staging: Arena,
     // Engines drain before the root lock and job buffers are released.
     namespaces: HashMap<NamespaceId, Namespace>,
+    writers: Vec<DiskThread>,
     _lock: Option<disk::RootLock>,
     sessions: HashMap<u64, Session>,
     jobs: HashMap<u64, Job>,
@@ -512,6 +556,8 @@ pub struct Store {
     charged: u64,
     /// The highest `charge_total` seen at an admission or a tick.
     reserved_peak: u64,
+    writeback: HashSet<(NamespaceId, Key)>,
+    pending_former_tips: HashSet<(NamespaceId, Key)>,
     retired_records: Vec<(NamespaceId, Key, Location)>,
     pending_puts: HashMap<u64, VecDeque<PendingPut>>,
     pending_gets: HashMap<u64, VecDeque<PendingGet>>,
@@ -576,16 +622,17 @@ impl Store {
         let staging = usize::try_from(config.staging)
             .map_err(|_| invalid("--staging is too large for this host"))?;
         let name_lock = crate::local::lock_pool(&config.name, &config.socket)?;
+        let mut writers = Vec::new();
         if config.root.is_some() {
-            // Every namespace needs disk threads, and each needs an io_uring ring. Find out now:
-            // a store that cannot write would otherwise run and refuse every put.
-            DiskThread::start("manager-probe").map_err(|error| {
-                invalid(format!(
-                    "the store cannot start its disk threads: {error}. The manager needs \
-                     io_uring: allow io_uring_setup, io_uring_enter and io_uring_register in \
-                     the container's seccomp profile"
-                ))
-            })?;
+            for _ in 0..WRITEBACK_WORKERS {
+                writers.push(Self::disk_thread(&config, "manager-writeback").map_err(|error| {
+                    invalid(format!(
+                        "the store cannot start its disk threads: {error}. The manager needs \
+                         io_uring: allow io_uring_setup, io_uring_enter and io_uring_register in \
+                         the container's seccomp profile"
+                    ))
+                })?);
+            }
         }
         let lock = config
             .root
@@ -609,12 +656,25 @@ impl Store {
         })?;
         let memory = local.arena();
         let staging = local.staging();
+        let marker = local.directory().join("last-shutdown");
+        let shutdown_unflushed = match fs::read_to_string(&marker) {
+            Ok(counts) => {
+                fs::remove_file(&marker)?;
+                counts
+                    .trim()
+                    .split_once(' ')
+                    .and_then(|(records, bytes)| Some((records.parse().ok()?, bytes.parse().ok()?)))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         let mut store = Self {
             _name_lock: name_lock,
             config: config.clone(),
             local,
             memory,
             staging,
+            writers,
             _lock: lock,
             namespaces: HashMap::new(),
             sessions: HashMap::new(),
@@ -622,9 +682,14 @@ impl Store {
             job_counter: 0,
             disk_progress: Instant::now(),
             clock: 0,
-            metrics: Metrics::default(),
+            metrics: Metrics {
+                shutdown_unflushed,
+                ..Metrics::default()
+            },
             charged: 0,
             reserved_peak: 0,
+            writeback: HashSet::new(),
+            pending_former_tips: HashSet::new(),
             retired_records: Vec::new(),
             pending_puts: HashMap::new(),
             pending_gets: HashMap::new(),
@@ -643,25 +708,28 @@ impl Store {
                     .unwrap_or(SystemTime::UNIX_EPOCH);
                 recovered_age.push((modified, id, header.key));
                 let bytes = header.length(row);
-                namespace.tree.insert(
-                    header.key,
-                    header.parent,
-                    header.bucket,
-                    header.tail_pages as usize,
-                    row,
-                    true,
-                    Location {
-                        header,
-                        memory: None,
-                        disk: Some(extent),
-                        durable: false,
-                        writing: false,
-                        job: None,
-                        retry: Instant::now(),
-                        bytes,
-                    },
-                )
-                .map_err(|e| invalid(e.to_string()))?;
+                namespace
+                    .tree
+                    .insert(
+                        header.key,
+                        header.parent,
+                        header.bucket,
+                        header.tail_pages as usize,
+                        row,
+                        true,
+                        Location {
+                            header,
+                            memory: None,
+                            disk: Some(extent),
+                            durable: false,
+                            writing: false,
+                            job: None,
+                            retry: Instant::now(),
+                            admitted: Instant::now(),
+                            bytes,
+                        },
+                    )
+                    .map_err(|e| invalid(e.to_string()))?;
                 store.charged += bytes;
             }
             store.namespaces.insert(id, namespace);
@@ -712,21 +780,25 @@ impl Store {
         &self.metrics
     }
 
+    fn disk_thread(_config: &Config, name: &str) -> Result<DiskThread> {
+        #[cfg(any(test, feature = "test-support"))]
+        let worker = DiskThread::start_with_faults(name, _config.faults.clone());
+        #[cfg(not(any(test, feature = "test-support")))]
+        let worker = DiskThread::start(name);
+        worker.map_err(|e| invalid(e.to_string()))
+    }
+
     fn new_namespace(&self, descriptor: Descriptor) -> Result<Namespace> {
         let directory = self
             .config
             .root
             .as_ref()
             .map(|root| root.join(descriptor.name()));
-        let start = |name| -> Result<_> {
-            #[cfg(any(test, feature = "test-support"))]
-            let worker = DiskThread::start_with_faults(name, self.config.faults.clone());
-            #[cfg(not(any(test, feature = "test-support")))]
-            let worker = DiskThread::start(name);
-            worker.map_err(|e| invalid(e.to_string()))
-        };
         let (disk, reads) = if directory.is_some() {
-            (Some(start("manager-write")?), Some(start("manager-read")?))
+            (
+                Some(Self::disk_thread(&self.config, "manager-write")?),
+                Some(Self::disk_thread(&self.config, "manager-read")?),
+            )
         } else {
             (None, None)
         };
@@ -738,6 +810,8 @@ impl Store {
             descriptor,
             disk,
             reads,
+            reads_pending: 0,
+            read_progress: Instant::now(),
             inflight: HashSet::new(),
             undurable: HashSet::new(),
         })
@@ -802,24 +876,47 @@ impl Store {
             .namespaces
             .get(&id)
             .and_then(|namespace| namespace.tree.node(&key))
-            .is_some_and(|node| node.ready && node.children() == 0 && !node.pinned());
+            .is_some_and(|node| {
+                node.ready && node.children() == 0 && !node.pinned() && !node.location.disk_busy()
+            });
         if !eligible {
             return 0;
         }
-        let removed = self
-            .namespaces
-            .get_mut(&id)
-            .and_then(|namespace| namespace.tree.remove(&key).ok());
+        let removed = self.namespaces.get_mut(&id).and_then(|namespace| {
+            namespace
+                .tree
+                .remove(&key, |node| node.location.disk_busy())
+                .ok()
+        });
         let Some(nodes) = removed else {
             return 0;
         };
         let count = nodes.len() as u64;
         for node in nodes {
+            self.namespaces
+                .get_mut(&id)
+                .unwrap()
+                .undurable
+                .remove(&node.key);
+            self.writeback.remove(&(id, node.key));
             if node.location.memory.is_some() || node.location.disk.is_some() {
                 self.charged = self.charged.saturating_sub(node.location.bytes);
             }
             if let Some(disk) = &node.location.disk {
                 disk.retire();
+            } else if let Some(prior_disk) =
+                self.retired_records.iter().find_map(|(scope, key, prior)| {
+                    (*scope == id && *key == node.key)
+                        .then_some(prior.disk.as_ref())
+                        .flatten()
+                })
+            {
+                // A dirty replacement may still have its predecessor's file at this name.
+                if let Err(error) = fs::remove_file(&prior_disk.path)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    self.metrics.nvme_errors += 1;
+                }
             }
             self.delta(id, CatalogKind::Removed, node.key);
         }
@@ -1165,32 +1262,91 @@ impl Store {
                     || request.key.consumed_tokens / descriptor.page_tokens
                         - parent.consumed_tokens / descriptor.page_tokens
                         != u64::from(request.published_tail_pages)
-            });
+            })
+            || request
+                .ancestor_keys
+                .first()
+                .is_some_and(|ancestor| ancestor.consumed_tokens >= request.key.consumed_tokens)
+            || request
+                .ancestor_keys
+                .windows(2)
+                .any(|keys| keys[0].consumed_tokens <= keys[1].consumed_tokens);
         if invalid_geometry {
             self.metrics.puts_error += 1;
             self.reject_put(&events, proto::Reason::Invalid as u8);
             return;
         }
         let initial_old = self.namespaces[&id].tree.node(&request.key).cloned();
-        if self.namespaces[&id].inflight.contains(&request.key)
-            || initial_old
-                .as_ref()
-                .is_some_and(|node| !node.row && node.pinned())
-        {
+        if self.namespaces[&id].inflight.contains(&request.key) {
             self.metrics.retry_inflight += 1;
             self.reject_put(&events, proto::Reason::Inflight as u8);
             return;
         }
-        if initial_old.as_ref().is_some_and(|node| {
-            node.row && (node.location.memory.is_some() || node.location.disk.is_some())
-        }) {
-            self.namespaces
-                .get_mut(&id)
-                .unwrap()
-                .tree
-                .touch_ancestors(&request.key);
-            self.metrics.present += 1;
-            self.reject_put(&events, proto::Reason::Present as u8);
+        let role = initial_old.as_ref().map_or(request.capture_role, |old| {
+            old.location
+                .header
+                .capture_role()
+                .merge(request.capture_role)
+        });
+        // A legacy peer can only commit a header with zero role bits.
+        let wire_role = if request.capture_role == CaptureRole::Legacy {
+            CaptureRole::Legacy
+        } else {
+            role
+        };
+        let children = initial_old
+            .as_ref()
+            .map_or(0, |node| {
+                let additional = request.next_child.is_some_and(|child| {
+                    self.namespaces[&id]
+                        .tree
+                        .node(&child)
+                        .is_none_or(|n| n.parent != Some(node.key))
+                });
+                node.children().saturating_add(u32::from(additional))
+            })
+            .max(request.child_paths);
+        let needs_row = |parent: Option<Key>| {
+            parent.is_none()
+                || wire_role != CaptureRole::Endpoint
+                || children > 1
+                || ((children == 0 || !request.descendant_row)
+                    && !self.namespaces[&id].tree.covered_endpoint(
+                        request.key,
+                        parent,
+                        role,
+                        children,
+                        |node| node.ready,
+                    ))
+        };
+        if let Some(node) = &initial_old {
+            if node.bucket != request.bucket {
+                self.reject_put(&events, proto::Reason::Invalid as u8);
+                return;
+            }
+            let stored_role = node.location.header.capture_role();
+            let covers_role = stored_role == role;
+            if (node.location.memory.is_some() || node.location.disk.is_some())
+                && (!request.row
+                    || (node.row && covers_role)
+                    || (!node.row && !needs_row(node.parent)))
+            {
+                self.namespaces
+                    .get_mut(&id)
+                    .unwrap()
+                    .tree
+                    .touch_ancestors(&request.key);
+                self.metrics.present += 1;
+                self.reject_put(&events, proto::Reason::Present as u8);
+                return;
+            }
+        }
+        if initial_old
+            .as_ref()
+            .is_some_and(|node| node.pinned() || node.location.disk_busy())
+        {
+            self.metrics.retry_inflight += 1;
+            self.reject_put(&events, proto::Reason::Inflight as u8);
             return;
         }
         let initial_bucket = match &initial_old {
@@ -1203,15 +1359,32 @@ impl Store {
             }
             None => request.bucket,
         };
+        let ancestors = if request.ancestor_keys.is_empty() {
+            request.published_parent.as_slice()
+        } else {
+            request.ancestor_keys.as_slice()
+        };
         let initial_parent = match &initial_old {
             Some(node) => node.parent,
-            None => request.published_parent.filter(|parent| {
-                self.namespaces[&id]
-                    .tree
-                    .node(parent)
-                    .is_some_and(|node| node.row)
-            }),
+            None => ancestors
+                .iter()
+                .filter_map(|ancestor| self.namespaces[&id].tree.node(ancestor))
+                .find(|node| {
+                    node.ready && (node.location.memory.is_some() || node.location.disk.is_some())
+                })
+                .filter(|node| node.chain_depth < REROOT_DEPTH)
+                .map(|node| node.key),
         };
+        // A page-only record can end no restore, so it is stored only linked to a held
+        // ancestor. One that cannot link, because no ancestor is held or the deepest one
+        // ends a chain of `REROOT_DEPTH` records and a new root would need a row, is
+        // refused. That is normal operation, not an error.
+        if initial_parent.is_none() && !request.row {
+            self.metrics.puts_unlinked += 1;
+            self.reject_put_detail(&events, proto::Reason::Invalid as u8, PUT_UNLINKED);
+            return;
+        }
+        let mut row = request.row && needs_row(initial_parent);
         let initial_first =
             initial_parent.map_or(0, |parent| parent.consumed_tokens / descriptor.page_tokens);
         let Some(initial_tail) = request
@@ -1221,6 +1394,29 @@ impl Store {
             self.reject_put(&events, proto::Reason::Invalid as u8);
             return;
         };
+        if initial_tail == 0 && !row {
+            // No pages and no resume row: the held parent already covers it.
+            if let Some(parent) = initial_parent {
+                self.namespaces
+                    .get_mut(&id)
+                    .unwrap()
+                    .tree
+                    .touch_ancestors(&parent);
+            }
+            self.metrics.put_shapes_empty += 1;
+            self.metrics.present += 1;
+            if request.row {
+                let action = self
+                    .metrics
+                    .record_actions
+                    .entry((role, "row_omitted"))
+                    .or_default();
+                action.0 += 1;
+                action.1 += descriptor.row_bytes();
+            }
+            self.reject_put(&events, proto::Reason::Present as u8);
+            return;
+        }
         let child_header = match crate::record::new_header(
             &descriptor,
             request.key,
@@ -1228,7 +1424,7 @@ impl Store {
             initial_bucket,
             initial_tail,
         ) {
-            Ok(header) => header,
+            Ok(header) => header.with_capture_role(wire_role),
             Err(_) => {
                 self.reject_put(&events, proto::Reason::Invalid as u8);
                 return;
@@ -1241,7 +1437,7 @@ impl Store {
             initial_bucket,
             request.chain_pages,
         ) {
-            Ok(header) => header,
+            Ok(header) => header.with_capture_role(wire_role),
             Err(_) => {
                 self.reject_put(&events, proto::Reason::Invalid as u8);
                 return;
@@ -1254,7 +1450,7 @@ impl Store {
         // root there is no disk to stream to, so a record whose own extent
         // cannot fit the arena can never be stored. Whether it fits beside
         // what else must stay resident is a capacity question.
-        if rootless && child_header.length_with_row().max(4096).next_power_of_two() > arena_bytes {
+        if rootless && child_header.length(row).max(4096).next_power_of_two() > arena_bytes {
             self.metrics.oversize += 1;
             self.reject_put(&events, proto::Reason::Oversize as u8);
             return;
@@ -1269,11 +1465,11 @@ impl Store {
         // its mandatory two-window staging hold. Only the record's own charge
         // can make it OVERSIZE; a shortage caused by what else must stay
         // resident is a Budget refusal.
-        let extent = child_header.length_with_row().max(4096).next_power_of_two();
+        let extent = child_header.length(row).max(4096).next_power_of_two();
         let charge = if extent <= arena_bytes {
             extent
         } else {
-            self.put_requirement(&child_header, 0).charge
+            self.put_requirement(&child_header, 0, row).charge
         };
         if !rootless && charge > self.config.nvme {
             self.metrics.oversize += 1;
@@ -1281,15 +1477,15 @@ impl Store {
             return;
         }
         // Pick the shape by asking the arena allocator. A failed allocation
-        // falls back to streaming; a rootless manager instead tries to evict
+        // starts write-back for a rooted manager. A rootless manager tries to evict
         // the parent and store the root. `memory` holds the extent the shape
         // was admitted with.
-        let selected = self.put_requirement(&child_header, arena_bytes);
+        let selected = self.put_requirement(&child_header, arena_bytes, row);
         let mut memory: Option<Arc<Extent>> = None;
         let (header, parent, pins, requirement): (Header, Option<Key>, Vec<Key>, PutRequirement) =
             if !selected.streaming {
                 match self.memory_room_excluding(
-                    child_header.length_with_row() as usize,
+                    child_header.length(row) as usize,
                     !rootless,
                     &selected_pins,
                 ) {
@@ -1299,10 +1495,21 @@ impl Store {
                         (child_header, initial_parent, selected_pins, requirement)
                     }
                     None if rootless => {
+                        if !request.row {
+                            self.metrics.retry_budget += 1;
+                            self.reject_put(&events, proto::Reason::Budget as u8);
+                            return;
+                        }
                         let root_pins: Vec<Key> =
                             replacement.then_some(request.key).into_iter().collect();
-                        match self.rootless_fallback(&root_header, root_pins, arena_bytes) {
+                        match self.rootless_fallback(
+                            &root_header,
+                            root_pins,
+                            arena_bytes,
+                            request.row,
+                        ) {
                             RootChoice::Store(extent) => {
+                                row = request.row;
                                 let requirement = PutRequirement::arena(extent.capacity() as u64);
                                 memory = Some(Arc::new(extent));
                                 let root_pins: Vec<Key> =
@@ -1316,16 +1523,26 @@ impl Store {
                             }
                         }
                     }
+                    None if self
+                        .jobs
+                        .values()
+                        .any(|job| matches!(job, Job::Write { .. })) =>
+                    {
+                        self.metrics.put_writeback_waits += 1;
+                        self.submit_put(connection, transfer, request, events);
+                        return;
+                    }
                     None => {
-                        let requirement = self.put_requirement(&child_header, 0);
-                        (child_header, initial_parent, selected_pins, requirement)
+                        self.metrics.retry_budget += 1;
+                        self.reject_put(&events, proto::Reason::Budget as u8);
+                        return;
                     }
                 }
             } else {
-                let requirement = self.put_requirement(&child_header, 0);
+                let requirement = self.put_requirement(&child_header, 0, row);
                 (child_header, initial_parent, selected_pins, requirement)
             };
-        let length = header.length_with_row();
+        let length = header.length(row);
         // A streamed record reserves two windows in staging. When that hold
         // cannot fit the whole region it can never be admitted: if the record
         // has no arena shape either, refuse it as OVERSIZE. A record that still
@@ -1354,8 +1571,17 @@ impl Store {
             for key in &pins {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
-            self.metrics.retry_budget += 1;
-            self.reject_put(&events, proto::Reason::Budget as u8);
+            if self
+                .jobs
+                .values()
+                .any(|job| matches!(job, Job::Write { .. }))
+            {
+                self.metrics.put_writeback_waits += 1;
+                self.submit_put(connection, transfer, request, events);
+            } else {
+                self.metrics.retry_budget += 1;
+                self.reject_put(&events, proto::Reason::Budget as u8);
+            }
             return;
         }
         let staging_hold = if requirement.streaming {
@@ -1402,9 +1628,11 @@ impl Store {
             .max(self.charge_total().saturating_add(held_now));
         let first =
             parent.map_or(0, |parent| parent.consumed_tokens / descriptor.page_tokens) as u32;
-        let grants = record_grants(&header, first, 0, true, DEFAULT_MAX_WINDOW, 0);
+        let grants = record_grants(&header, first, 0, row, DEFAULT_MAX_WINDOW, 0);
         let pages = vec![None; header.tail_pages as usize];
         let mut put = Put {
+            row,
+            stored_role: role,
             namespace: id,
             header: header.clone(),
             first_page: first,
@@ -1416,7 +1644,7 @@ impl Store {
                 pages,
                 row: None,
                 pages_filled: 0,
-                row_filled: header.row_record_bytes() == 0,
+                row_filled: !row || header.row_record_bytes() == 0,
             },
             memory,
             temporary,
@@ -1440,7 +1668,29 @@ impl Store {
         };
         let namespace = self.namespaces.get_mut(&id).unwrap();
         namespace.inflight.insert(request.key);
+        if parent.is_some() {
+            self.metrics.put_links_linked += 1;
+        } else {
+            self.metrics.put_links_root += 1;
+        }
+        self.metrics.put_page_bytes += u64::from(header.tail_pages) * header.page_record_bytes();
+        self.metrics.put_row_bytes += if row { header.row_record_bytes() } else { 0 };
+        if row {
+            self.metrics.put_shapes_row += 1;
+        } else {
+            self.metrics.put_shapes_page_only += 1;
+            if request.row {
+                let action = self
+                    .metrics
+                    .record_actions
+                    .entry((role, "row_omitted"))
+                    .or_default();
+                action.0 += 1;
+                action.1 += descriptor.row_bytes();
+            }
+        }
         put.outbox.push_back(Ok(PutAnswer::Accept(PutAccept {
+            capture_role: wire_role,
             transfer,
             first_page: first,
             parent,
@@ -1458,7 +1708,7 @@ impl Store {
 
     fn oldest(
         &self,
-        eligible: impl Fn(&flare_selene::shared::index::Node<Location>) -> bool,
+        eligible: impl Fn(NamespaceId, &flare_selene::shared::index::Node<Location>) -> bool,
     ) -> Option<(NamespaceId, Key)> {
         self.namespaces
             .iter()
@@ -1468,9 +1718,9 @@ impl Store {
                     .ordered()
                     .find(|node| {
                         !node.pinned()
-                            && !node.location.writing
+                            && !node.location.disk_busy()
                             && !node.location.reading()
-                            && eligible(node)
+                            && eligible(*id, node)
                     })
                     .map(move |node| (node.accessed(), node.key, *id))
             })
@@ -1478,14 +1728,11 @@ impl Store {
             .map(|(_, key, id)| (id, key))
     }
 
-    fn memory_room(&mut self, bytes: usize, require_durable: bool) -> Option<Extent> {
-        self.memory_room_excluding(bytes, require_durable, &[])
-    }
-
-    /// Attempt the arena allocation, evicting eligible leaves one at a time
+    /// Attempt the arena allocation, reclaiming eligible copies one at a time
     /// until it succeeds. Asking the allocator rather than summing free bytes
     /// handles buddy fragmentation and chains whose parent only becomes a
-    /// leaf after its child is evicted. `excluded` keys must survive.
+    /// leaf after its child is evicted. Excluded records keep their arena copy
+    /// unless a durable disk copy preserves them.
     fn memory_room_excluding(
         &mut self,
         bytes: usize,
@@ -1499,9 +1746,24 @@ impl Store {
             if let Some(extent) = self.memory.allocate(bytes) {
                 return Some(extent);
             }
-            let (id, key) = self.oldest(|node| {
-                Self::memory_evictable(node, require_durable) && !excluded.contains(&node.key)
-            })?;
+            let Some((id, key)) = self.oldest(|_, node| {
+                Self::memory_evictable(node, require_durable)
+                    && (require_durable || !excluded.contains(&node.key))
+            }) else {
+                if require_durable {
+                    let idle = self.writers.iter().filter(|w| w.is_idle()).count();
+                    for _ in 0..idle {
+                        let Some((id, key)) = self.oldest(|id, node| {
+                            node.location.memory.is_some()
+                                && !node.location.durable
+                                && !self.writeback.contains(&(id, node.key))
+                                && self.writable_ancestor(id, node.key, false).is_some()
+                        }) else { break };
+                        self.request_writeback(id, key);
+                    }
+                }
+                return None;
+            };
             if !self.evict_memory(id, key) {
                 return None;
             }
@@ -1516,12 +1778,11 @@ impl Store {
         require_durable: bool,
     ) -> bool {
         node.location.memory.is_some()
-            && (!require_durable || node.location.durable)
-            && (if require_durable {
-                node.children() == 0 || (node.row && node.children() == 1)
+            && if require_durable {
+                node.location.durable
             } else {
                 node.children() == 0
-            })
+            }
     }
 
     /// Try the whole chain when the arena cannot hold the child beside its parent.
@@ -1530,12 +1791,13 @@ impl Store {
         root: &Header,
         root_pins: Vec<Key>,
         arena_bytes: u64,
+        row: bool,
     ) -> RootChoice {
-        let requirement = self.put_requirement(root, arena_bytes);
+        let requirement = self.put_requirement(root, arena_bytes, row);
         if requirement.streaming {
             return RootChoice::Wait;
         }
-        match self.memory_room_excluding(root.length_with_row() as usize, false, &root_pins) {
+        match self.memory_room_excluding(root.length(row) as usize, false, &root_pins) {
             Some(extent) => RootChoice::Store(extent),
             None => RootChoice::Wait,
         }
@@ -1544,12 +1806,12 @@ impl Store {
     /// Returns whether the candidate was actually evicted. A node rejected by
     /// `Tree::remove` (because it gained children) is left untouched.
     fn evict_memory(&mut self, id: NamespaceId, key: Key) -> bool {
-        let (disk, old) = {
-            let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
-            (node.location.disk.is_some(), node.location.bytes)
-        };
-        if disk {
-            let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
+        let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
+        if node.location.disk_busy() {
+            return false;
+        }
+        if node.location.disk.is_some() {
+            let old = node.location.bytes;
             node.location.memory = None;
             node.location.bytes = node.location.header.length(node.row);
             self.charged = self.charged - old + node.location.bytes;
@@ -1566,8 +1828,8 @@ impl Store {
     /// otherwise it streams to disk behind a fixed staging hold of two of its
     /// largest windows. `arena_bytes` is the arena capacity for the shape
     /// decision; admission confirms it by allocating.
-    fn put_requirement(&self, header: &Header, arena_bytes: u64) -> PutRequirement {
-        let length = header.length_with_row();
+    fn put_requirement(&self, header: &Header, arena_bytes: u64, row: bool) -> PutRequirement {
+        let length = header.length(row);
         let extent = length.max(4096).next_power_of_two();
         if extent <= arena_bytes {
             return PutRequirement::arena(extent);
@@ -1576,7 +1838,7 @@ impl Store {
             .parent
             .map_or(0, |parent| parent.consumed_tokens / header.page_tokens)
             as u32;
-        let unit = record_grants(header, first, 0, true, DEFAULT_MAX_WINDOW, 0)
+        let unit = record_grants(header, first, 0, row, DEFAULT_MAX_WINDOW, 0)
             .iter()
             .map(|grant| grant.length.max(4096).next_power_of_two())
             .max()
@@ -1619,74 +1881,81 @@ impl Store {
             return true;
         }
         let mut compact = true;
+        let mut row_children: Option<HashMap<(NamespaceId, Key), u32>> = None;
         while self.charge_total().saturating_add(bytes) > self.config.nvme {
-            let candidate = self.oldest(|node| {
+            let counts = row_children.get_or_insert_with(|| {
+                let mut counts = HashMap::new();
+                for (&id, namespace) in &self.namespaces {
+                    for node in namespace.tree.nodes() {
+                        if node.row
+                            && node.location.durable
+                            && let Some(parent) = node.parent
+                        {
+                            *counts.entry((id, parent)).or_default() += 1;
+                        }
+                    }
+                }
+                counts
+            });
+            let candidate = self.oldest(|id, node| {
                 node.location.durable
-                    && (node.children() == 0 || (compact && node.row && node.children() == 1))
+                    && (node.children() == 0
+                        || (compact
+                            && node.row
+                            && node.parent.is_some()
+                            && node.children() == 1
+                            && node.location.header.capture_role() == CaptureRole::Endpoint
+                            && counts.get(&(id, node.key)).is_some_and(|&n| n > 0)))
             });
             let Some((id, key)) = candidate else {
+                if let Some((id, key)) = self.oldest(|id, node| {
+                    !node.location.durable
+                        && node.children() == 0
+                        && self.writable_ancestor(id, node.key, false).is_some()
+                }) {
+                    self.request_writeback(id, key);
+                }
                 return false;
             };
-            let namespace = self.namespaces.get_mut(&id).unwrap();
-            match namespace.tree.evict(true, |node| node.key == key) {
-                Some(Eviction::Leaves(nodes)) => {
-                    for node in nodes {
-                        self.metrics.evictions += 1;
-                        if let Some(extent) = node.location.disk {
-                            extent.retire();
-                        }
-                        self.charged -= node.location.bytes;
-                        self.delta(id, CatalogKind::Removed, node.key);
-                    }
+            let node = &self.namespaces[&id].tree[&key];
+            let row_parent = node.parent.filter(|_| node.row);
+            if node.children() == 0 {
+                // Cascading removals after this leaf contain only page-only ancestors.
+                let removed = self.evict_accounted(id, key);
+                if removed == 0 {
+                    return false;
                 }
-                Some(Eviction::Compacted(key)) => {
-                    let node = &self.namespaces[&id].tree[&key];
-                    let Some(source) = node.location.disk.clone() else {
-                        return false;
-                    };
-                    let header = node.location.header.clone();
-                    let freed = node.location.bytes.saturating_sub(header.row_segment);
-                    self.job_counter += 1;
-                    let job = self.job_counter;
-                    let task = DiskJob::Truncate {
-                        id: JobId(job),
-                        path: source.path.clone(),
-                        length: header.row_segment,
-                    };
-                    let Some(worker) = &self.namespaces[&id].disk else {
-                        return false;
-                    };
-                    match worker.submit(task) {
-                        Ok(()) => {
-                            self.jobs.insert(
-                                job,
-                                Job::Compact {
-                                    namespace: id,
-                                    key,
-                                    bytes: freed,
-                                },
-                            );
-                            let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
-                            node.location.writing = true;
-                            node.location.job = Some(job);
-                            self.namespaces
-                                .get_mut(&id)
-                                .unwrap()
-                                .tree
-                                .pin(&key)
-                                .unwrap();
-                            self.metrics.compactions += 1;
-                            self.delta(id, CatalogKind::Changed, key);
-                        }
-                        Err(_) => {
-                            self.namespaces.get_mut(&id).unwrap().tree[&key].row = true;
-                            compact = false;
-                        }
-                    }
-                    // Compaction frees bytes asynchronously. Keep looking for
-                    // leaves that can make room for this admission now.
+                self.metrics.evictions += removed;
+            } else {
+                let namespace = self.namespaces.get_mut(&id).unwrap();
+                let node = &namespace.tree[&key];
+                let disk = node
+                    .location
+                    .disk
+                    .as_ref()
+                    .expect("durable record has a file");
+                let job = self.job_counter + 1;
+                let task = DiskJob::Truncate {
+                    id: JobId(job),
+                    path: disk.path.clone(),
+                    length: node.location.header.row_segment,
+                };
+                if namespace.disk.as_ref().unwrap().submit(task).is_err() {
+                    compact = false;
+                    continue;
                 }
-                None => return false,
+                self.job_counter = job;
+                self.jobs.insert(job, Job::Compact { namespace: id, key });
+                namespace.tree.pin(&key).unwrap();
+                namespace.tree.drop_row(&key);
+                let location = &mut namespace.tree[&key].location;
+                location.writing = true;
+                location.job = Some(job);
+                self.metrics.compactions += 1;
+                self.delta(id, CatalogKind::Changed, key);
+            }
+            if let Some(n) = row_parent.and_then(|p| counts.get_mut(&(id, p))) {
+                *n -= 1;
             }
         }
         true
@@ -1713,6 +1982,11 @@ impl Store {
             if put {
                 while self.send_put_grant(connection, transfer) {}
             } else {
+                if let Some(namespace) =
+                    get_ref(&self.sessions, connection, transfer).map(|get| get.namespace)
+                {
+                    self.prepare_get_records(connection, transfer, namespace);
+                }
                 self.send_get_meta(connection, transfer);
                 while self.send_get_grant(connection, transfer) {}
             }
@@ -1905,8 +2179,17 @@ impl Store {
             } else {
                 let record = &get.records[plan.record as usize];
                 if let Some(memory) = &record.memory {
-                    Next::Lease {
-                        memory: memory.clone(),
+                    if get.window_reads > 0 {
+                        // Windows are answered in grant order. A streamed window is
+                        // answered when its read completes, and the namespace's one
+                        // reads thread completes reads in the order they were
+                        // submitted, so a resident window, which needs no read, waits
+                        // until every streamed window granted before it is answered.
+                        Next::Stop
+                    } else {
+                        Next::Lease {
+                            memory: memory.clone(),
+                        }
                     }
                 } else if let Some(file) = &record.file {
                     Next::Read { file: file.clone() }
@@ -1956,11 +2239,13 @@ impl Store {
                 // grow the durable set, so they are bounded by the staging
                 // region alone and never by the NVMe budget.
                 let Some(extent) = self.staging.allocate(length) else {
-                    self.fail_get(
-                        connection,
-                        transfer,
-                        proto::Reason::Budget as u8,
-                        invalid("staging budget"),
+                    // A preceding window can occupy the size class this one
+                    // needs. Retry after release without consuming its credit.
+                    // `begin_get` refuses a Get with a window that staging can
+                    // never hold, so only a shortage that a release ends gets here.
+                    debug_assert!(
+                        self.staging_can_ever_hold(length),
+                        "begin_get admitted a window larger than staging"
                     );
                     return false;
                 };
@@ -1993,9 +2278,11 @@ impl Store {
                 length: extent.bytes().len(),
             },
         };
+        self.note_read_submitted(namespace);
         self.jobs.insert(
             job,
             Job::GetRead {
+                namespace,
                 connection,
                 transfer,
                 record: plan.record,
@@ -2021,8 +2308,27 @@ impl Store {
         }
     }
 
+    /// Count a read for `namespace`'s reads thread. A read that finds the thread idle starts
+    /// its progress clock, so a long-idle thread is not mistaken for a hung one.
+    fn note_read_submitted(&mut self, namespace: NamespaceId) {
+        let namespace = self.namespaces.get_mut(&namespace).unwrap();
+        if namespace.reads_pending == 0 {
+            namespace.read_progress = Instant::now();
+        }
+        namespace.reads_pending += 1;
+    }
+
     fn submit_read(&mut self, namespace: NamespaceId, job: u64, task: DiskJob) {
         use std::sync::mpsc::TrySendError::{Disconnected, Full};
+        // A namespace has one reads thread, which runs its jobs one at a time in the order
+        // they were submitted and reports them in that order. Streamed windows are answered
+        // when their reads complete, so submitting a namespace's reads in grant order is
+        // what keeps a restore's windows in order. A read therefore queues behind any
+        // backlogged read of its namespace instead of taking a free queue slot ahead of it.
+        if self.read_backlog.iter().any(|(id, ..)| *id == namespace) {
+            self.read_backlog.push_back((namespace, job, task));
+            return;
+        }
         let result = match &self.namespaces[&namespace].reads {
             Some(worker) => worker.try_submit(task),
             None => Err(Disconnected(task)),
@@ -2031,7 +2337,15 @@ impl Store {
             Ok(()) => {}
             Err(Full(task)) => self.read_backlog.push_back((namespace, job, task)),
             Err(Disconnected(_)) => {
-                if let Some(Job::GetRead { connection, transfer, .. }) = self.jobs.remove(&job) {
+                if let Some(Job::GetRead {
+                    namespace,
+                    connection,
+                    transfer,
+                    ..
+                }) = self.jobs.remove(&job)
+                {
+                    let namespace = self.namespaces.get_mut(&namespace).unwrap();
+                    namespace.reads_pending = namespace.reads_pending.saturating_sub(1);
                     self.read_failed(connection, transfer);
                 }
             }
@@ -2376,15 +2690,20 @@ impl Store {
             }
             let header = put.header.clone();
             let memory = put.memory.clone();
-            let bytes = record_charge(&header, memory.is_some());
+            let bytes = if let Some(memory) = &memory {
+                memory.capacity() as u64
+            } else {
+                header.length(put.row)
+            };
             let reservation = put.reservation;
             let pins = std::mem::take(&mut put.pins);
-            let record_bytes = header.length_with_row();
+            let record_bytes = header.length(put.row);
             let key = header.key;
             let already_terminal = put.terminal;
             put.terminal = true;
             (
                 header,
+                put.row,
                 memory,
                 bytes,
                 reservation,
@@ -2394,9 +2713,18 @@ impl Store {
                 record_bytes,
             )
         };
-        let (header, memory, bytes, reservation, pins, key, already_terminal, record_bytes) =
+        let (header, row, memory, bytes, reservation, pins, key, already_terminal, record_bytes) =
             prepared;
         let replace = matches!(target, PublishTarget::Replace);
+        if disk.is_some() {
+            let action = self
+                .metrics
+                .record_actions
+                .entry((header.capture_role(), "streamed"))
+                .or_default();
+            action.0 += 1;
+            action.1 += record_bytes;
+        }
         let location = Location {
             header: header.clone(),
             memory,
@@ -2405,6 +2733,7 @@ impl Store {
             writing: false,
             job: None,
             retry: Instant::now(),
+            admitted: Instant::now(),
             bytes,
         };
         let mut rescan = false;
@@ -2414,7 +2743,7 @@ impl Store {
                 let node = namespace.tree.node_mut(&key).unwrap();
                 let old = std::mem::replace(&mut node.location, location);
                 rescan = old.durable;
-                node.row = true;
+                node.row = row;
                 self.retired_records.push((id, key, old));
                 true
             } else {
@@ -2425,7 +2754,7 @@ impl Store {
                         header.parent,
                         header.bucket,
                         header.tail_pages as usize,
-                        true,
+                        row,
                         true,
                         location,
                     )
@@ -2460,6 +2789,21 @@ impl Store {
         self.reused(id, key);
         self.charged = self.charged.saturating_sub(reservation) + bytes;
         self.refresh_durability(id, (!rescan).then_some(key));
+        let mut ancestor = header.parent;
+        while let Some(key) = ancestor {
+            let node = &self.namespaces[&id].tree[&key];
+            if node.children() != 1 {
+                self.pending_former_tips.remove(&(id, key));
+                break;
+            }
+            if node.row {
+                if row {
+                    self.prune_former_tip(id, key);
+                }
+                break;
+            }
+            ancestor = node.parent;
+        }
         self.metrics.puts_ok += 1;
         self.delta(
             id,
@@ -2470,6 +2814,58 @@ impl Store {
             },
             key,
         );
+    }
+
+    /// Whether a block for `length` bytes fits in the whole staging region, which
+    /// hands out power-of-two blocks. A block that does not fit is never available,
+    /// however many windows are released.
+    fn staging_can_ever_hold(&self, length: usize) -> bool {
+        length
+            .max(4096)
+            .checked_next_power_of_two()
+            .is_some_and(|bytes| bytes <= self.staging.capacity())
+    }
+
+    fn prune_former_tip(&mut self, id: NamespaceId, parent: Key) {
+        self.pending_former_tips.remove(&(id, parent));
+        let namespace = self.namespaces.get_mut(&id).unwrap();
+        let Some(node) = namespace.tree.node(&parent) else {
+            return;
+        };
+        if node.parent.is_none()
+            || !node.row
+            || node.location.header.capture_role() != CaptureRole::Endpoint
+            || node.location.disk.is_some()
+            || !namespace.tree.has_row_below(&parent, |n| n.ready && n.row)
+        {
+            return;
+        }
+        let node = &mut namespace.tree[&parent];
+        // A claim keeps the row shape and the extent until its last window drains.
+        if node.pinned()
+            || node.location.reading()
+            || node.location.disk_busy()
+            || namespace.inflight.contains(&parent)
+        {
+            self.pending_former_tips.insert((id, parent));
+            return;
+        }
+        if let Some(extent) = node.location.memory.as_mut().and_then(Arc::get_mut) {
+            extent.truncate(node.location.header.row_segment as usize);
+            let bytes = extent.capacity() as u64;
+            self.charged -= node.location.bytes - bytes;
+            node.location.bytes = bytes;
+        }
+        node.row = false;
+        let action = self
+            .metrics
+            .record_actions
+            .entry((CaptureRole::Endpoint, "former_tip"))
+            .or_default();
+        action.0 += 1;
+        action.1 += node.location.header.row_record_bytes();
+        self.metrics.compactions += 1;
+        self.delta(id, CatalogKind::Changed, parent);
     }
 
     fn begin_get(&mut self, pending: PendingGet) {
@@ -2494,6 +2890,29 @@ impl Store {
                 return;
             }
         };
+        // The metadata and the windows of a record that is not resident are read into
+        // staging. A block larger than staging can never be read, in practice the
+        // endpoint's row window, so the Get is refused before it reads anything. The
+        // reason is BUDGET, which the pool reports to the client as NO_WINDOWS
+        // (`pool/claims.rs`). Every other shortage is temporary: the read waits for a
+        // release, so no refusal can follow once the Get has started.
+        let unservable = records.iter().any(|record| {
+            record.memory.is_none()
+                && !self.staging_can_ever_hold(
+                    usize::try_from(record.header.page_segment).unwrap_or(usize::MAX),
+                )
+        }) || grants.iter().any(|grant| {
+            records[grant.record as usize].memory.is_none()
+                && !self.staging_can_ever_hold(usize::try_from(grant.length).unwrap_or(usize::MAX))
+        });
+        if unservable {
+            self.metrics.gets_error += 1;
+            let _ = events.try_send(Ok(GetAnswer::Refused(Refused {
+                reason: proto::Reason::Budget as u8,
+                detail: "staging budget".into(),
+            })));
+            return;
+        }
         let pages: Vec<Key> = request.keys.clone();
         {
             let namespace = self.namespaces.get_mut(&id).unwrap();
@@ -2525,6 +2944,7 @@ impl Store {
             grants,
             requested: 0,
             next_grant: 0,
+            next_meta_read: 0,
             next_meta: 0,
             window_reads: 0,
             pending_reads: 0,
@@ -2569,9 +2989,18 @@ impl Store {
                 .tree
                 .node(key)
                 .ok_or_else(|| invalid("Get key missing"))?;
-            if (index > 0 && node.parent != Some(request.keys[index - 1]))
-                || (index + 1 == request.keys.len() && !node.row)
-            {
+            if index > 0 {
+                let previous = request.keys[index - 1];
+                let mut parent = node.parent;
+                while parent != Some(previous) {
+                    let skipped = parent
+                        .and_then(|key| namespace.tree.node(&key))
+                        .filter(|node| node.tail_pages == 0)
+                        .ok_or_else(|| invalid("Get chain"))?;
+                    parent = skipped.parent;
+                }
+            }
+            if index + 1 == request.keys.len() && !node.row {
                 return Err(invalid("Get chain"));
             }
             if index == 0 && u64::from(request.skip_pages) > node.tail_pages as u64 {
@@ -2600,7 +3029,6 @@ impl Store {
                     .map(|extent| extent.reader())
                     .transpose()?,
                 header,
-                row: node.row,
                 meta: None,
                 meta_sent: false,
             });
@@ -2625,30 +3053,34 @@ impl Store {
         Ok((records, grants))
     }
 
+    /// Starts the metadata reads of a Get's records, in record order. A record whose
+    /// metadata block does not fit staging now keeps its place: the reads after it wait,
+    /// because the namespace's reads thread runs reads in submission order and a record's
+    /// windows need its metadata, and `pump_grants` resumes here once staging is released.
     fn prepare_get_records(&mut self, connection: u64, transfer: u64, id: NamespaceId) {
-        let records = {
-            let Some((get, _)) = get_mut(&mut self.sessions, connection, transfer) else {
-                return;
-            };
-            get.records.len()
-        };
-        for index in 0..records {
-            let (memory, file, header, length) = {
+        loop {
+            let (index, memory, file, header) = {
                 let Some(get) = get_ref(&self.sessions, connection, transfer) else {
                     return;
                 };
-                let record = &get.records[index];
+                if get.cancelled || get.terminal {
+                    return;
+                }
+                let Some(record) = get.records.get(get.next_meta_read) else {
+                    return;
+                };
                 (
+                    get.next_meta_read,
                     record.memory.clone(),
                     record.file.clone(),
                     record.header.clone(),
-                    record.header.length(record.row),
                 )
             };
             if let Some(memory) = memory {
                 let meta = memory.bytes()[..header.page_segment as usize].to_vec();
                 if let Some((get, _)) = get_mut(&mut self.sessions, connection, transfer) {
                     get.records[index].meta = Some(meta);
+                    get.next_meta_read += 1;
                 }
                 continue;
             }
@@ -2661,28 +3093,23 @@ impl Store {
                 );
                 return;
             };
+            // A record that is not resident is never read whole into the arena. The
+            // namespace's one reads thread runs reads in submission order, so a
+            // whole-record read here would hold back the first window for the time to
+            // read the largest record, row included, and its copy could not overlap the
+            // disk. Only the metadata is read now; the windows follow in grant order.
+            // Metadata is staging traffic too: a full durable budget must not refuse a
+            // restore.
             let meta_length = header.page_segment as usize;
-            let fill = self.memory_room(length as usize, self.config.root.is_some());
-            let (buffer, kind) = if let Some(extent) = fill {
-                (extent, ReadKind::Fill)
-            } else {
-                // Metadata windows are staging traffic too; a full durable
-                // budget must not refuse a restore.
-                let Some(extent) = self.staging.allocate(meta_length) else {
-                    self.fail_get(
-                        connection,
-                        transfer,
-                        proto::Reason::Budget as u8,
-                        invalid("staging budget"),
-                    );
-                    return;
-                };
-                (
-                    extent,
-                    ReadKind::Meta {
-                        length: meta_length,
-                    },
-                )
+            let Some(buffer) = self.staging.allocate(meta_length) else {
+                // Windows of other transfers or of earlier records can occupy the size
+                // class this block needs. `begin_get` refuses a Get with a block that
+                // staging can never hold, so only a shortage that a release ends gets here.
+                debug_assert!(
+                    self.staging_can_ever_hold(meta_length),
+                    "begin_get admitted metadata larger than staging"
+                );
+                return;
             };
             self.job_counter += 1;
             let job = self.job_counter;
@@ -2697,14 +3124,19 @@ impl Store {
             };
             if let Some((get, _)) = get_mut(&mut self.sessions, connection, transfer) {
                 get.pending_reads += 1;
+                get.next_meta_read += 1;
             }
+            self.note_read_submitted(id);
             self.jobs.insert(
                 job,
                 Job::GetRead {
+                    namespace: id,
                     connection,
                     transfer,
                     record: index as u32,
-                    kind,
+                    kind: ReadKind::Meta {
+                        length: meta_length,
+                    },
                     buffer,
                 },
             );
@@ -2740,13 +3172,9 @@ impl Store {
             self.read_failed(connection, transfer);
             return;
         };
-        let state = get_ref(&self.sessions, connection, transfer).map(|get| {
-            (
-                get.namespace,
-                usize::try_from(record).is_ok_and(|index| index < get.records.len()),
-            )
-        });
-        let Some((id, in_range)) = state else {
+        let Some(in_range) = get_ref(&self.sessions, connection, transfer)
+            .map(|get| usize::try_from(record).is_ok_and(|index| index < get.records.len()))
+        else {
             return;
         };
         if !in_range {
@@ -2754,27 +3182,6 @@ impl Store {
             return;
         }
         match kind {
-            ReadKind::Fill => {
-                let (header, row) = {
-                    let Some(get) = get_ref(&self.sessions, connection, transfer) else {
-                        return;
-                    };
-                    let record = &get.records[record as usize];
-                    (record.header.clone(), record.row)
-                };
-                if record::verify_record(extent.bytes(), &header, row).is_err() {
-                    self.read_failed(connection, transfer);
-                    return;
-                }
-                let meta = extent.bytes()[..header.page_segment as usize].to_vec();
-                let extent = Arc::new(extent);
-                self.get_filled(id, &header, extent.clone());
-                if let Some((get, _)) = get_mut(&mut self.sessions, connection, transfer) {
-                    get.records[record as usize].memory = Some(extent);
-                    get.records[record as usize].meta = Some(meta);
-                    get.pending_reads -= 1;
-                }
-            }
             ReadKind::Meta { length } => {
                 let meta = extent.bytes()[..length].to_vec();
                 if let Some((get, _)) = get_mut(&mut self.sessions, connection, transfer) {
@@ -2802,7 +3209,7 @@ impl Store {
                         return;
                     }
                 };
-                if let Some((get, _)) = get_mut(&mut self.sessions, connection, transfer) {
+                if let Some((get, progress)) = get_mut(&mut self.sessions, connection, transfer) {
                     get.outbox.push_back(Ok(GetAnswer::Ready(plan.window(
                         transfer,
                         grant,
@@ -2810,6 +3217,7 @@ impl Store {
                         offset,
                         extent,
                     ))));
+                    *progress = Instant::now();
                 }
             }
         }
@@ -2840,27 +3248,6 @@ impl Store {
             proto::Reason::Io as u8,
             invalid("disk read failed"),
         );
-    }
-
-    fn get_filled(&mut self, id: NamespaceId, header: &Header, extent: Arc<Extent>) {
-        let Some(node) = self
-            .namespaces
-            .get_mut(&id)
-            .unwrap()
-            .tree
-            .node_mut(&header.key)
-        else {
-            return;
-        };
-        if node.location.memory.is_some() || node.location.header != *header {
-            return;
-        }
-        let old = node.location.bytes;
-        let new = extent.capacity() as u64;
-        node.location.memory = Some(extent);
-        node.location.bytes = new;
-        self.charged = self.charged - old + new;
-        self.delta(id, CatalogKind::Changed, header.key);
     }
 
     fn maybe_finish_get(&mut self, connection: u64, transfer: u64) {
@@ -2959,6 +3346,10 @@ impl Store {
 
     fn connection_closed(&mut self, connection: u64) {
         self.local.close(connection);
+        self.close_operations(connection);
+    }
+
+    fn close_operations(&mut self, connection: u64) {
         self.pending_gets.remove(&connection);
         self.pending_puts.remove(&connection);
         self.get_order.retain(|id| *id != connection);
@@ -3072,10 +3463,11 @@ impl Store {
             self.release_pins(namespace, pins);
         }
         self.retired_records.retain(|(id, key, location)| {
-            let replaced = self.namespaces[id]
-                .tree
-                .node(key)
-                .is_none_or(|node| node.location.durable);
+            let replaced = location.disk.is_none()
+                || self.namespaces[id]
+                    .tree
+                    .node(key)
+                    .is_none_or(|node| node.location.durable);
             if !replaced || location.reading() {
                 true
             } else {
@@ -3087,6 +3479,9 @@ impl Store {
 
     fn disk_events(&mut self) {
         let mut completions = Vec::new();
+        for worker in &self.writers {
+            worker.poll(&mut completions);
+        }
         for namespace in self.namespaces.values() {
             for worker in [&namespace.reads, &namespace.disk].into_iter().flatten() {
                 worker.poll(&mut completions);
@@ -3103,18 +3498,40 @@ impl Store {
             let Some(job) = self.jobs.remove(&completion.id.0) else {
                 continue;
             };
-            self.metrics.nvme_bytes += completion.bytes;
+            if matches!(job, Job::GetRead { .. }) {
+                self.metrics.nvme_read_bytes += completion.bytes;
+            } else {
+                self.metrics.nvme_bytes += completion.bytes;
+            }
+            if completion
+                .result
+                .as_ref()
+                .is_err_and(|error| error.no_space())
+                && !matches!(job, Job::GetRead { .. })
+                && let Some((id, key)) =
+                    self.oldest(|_, node| node.location.durable && node.children() == 0)
+            {
+                let removed = self.evict_accounted(id, key);
+                self.metrics.evictions += removed;
+            }
             self.metrics.nvme_seconds += completion.elapsed.as_secs_f64();
             match job {
-                Job::Write { namespace, key, .. } => {
+                Job::Write {
+                    namespace,
+                    key,
+                    reason,
+                    ..
+                } => {
                     let path = self.namespaces[&namespace].path(key);
+                    // Removal keeps a record whose write is in flight (the keep predicate),
+                    // so the record is still in the tree when its completion arrives.
                     let node = self
                         .namespaces
                         .get_mut(&namespace)
                         .unwrap()
                         .tree
                         .node_mut(&key)
-                        .unwrap();
+                        .expect("a record with a disk write in flight is never removed");
                     if node.location.job != Some(completion.id.0) {
                         // The record this write belonged to was replaced. The replacement owns
                         // the key's file now, so the stale completion must not touch either the
@@ -3124,6 +3541,13 @@ impl Store {
                     node.location.job = None;
                     node.location.writing = false;
                     if !failed {
+                        let action = self
+                            .metrics
+                            .record_actions
+                            .entry((node.location.header.capture_role(), reason))
+                            .or_default();
+                        action.0 += 1;
+                        action.1 += completion.bytes;
                         if let Some(path) = path {
                             node.location.disk = Some(Arc::new(DiskExtent::new(path)));
                         }
@@ -3131,6 +3555,12 @@ impl Store {
                     } else {
                         node.location.retry = Instant::now() + Duration::from_millis(100);
                     }
+                    let _ = self
+                        .namespaces
+                        .get_mut(&namespace)
+                        .unwrap()
+                        .tree
+                        .unpin(&key);
                     self.refresh_durability(namespace, Some(key));
                 }
                 Job::Chunk {
@@ -3178,17 +3608,7 @@ impl Store {
                         self.publish_put(connection, transfer, Some(final_extent));
                     }
                 }
-                Job::Compact {
-                    namespace,
-                    key,
-                    bytes,
-                } => {
-                    let _ = self
-                        .namespaces
-                        .get_mut(&namespace)
-                        .unwrap()
-                        .tree
-                        .unpin(&key);
+                Job::Compact { namespace, key } => {
                     let Some(node) = self
                         .namespaces
                         .get_mut(&namespace)
@@ -3203,6 +3623,7 @@ impl Store {
                     node.location.job = None;
                     node.location.writing = false;
                     if !failed {
+                        let bytes = node.location.bytes - node.location.header.row_segment;
                         node.location.bytes -= bytes;
                         self.charged -= bytes;
                         node.location.memory = None;
@@ -3211,15 +3632,25 @@ impl Store {
                         node.row = true;
                         self.delta(namespace, CatalogKind::Changed, key);
                     }
+                    let _ = self
+                        .namespaces
+                        .get_mut(&namespace)
+                        .unwrap()
+                        .tree
+                        .unpin(&key);
                     self.refresh_durability(namespace, Some(key));
                 }
                 Job::GetRead {
+                    namespace,
                     connection,
                     transfer,
                     record,
                     kind,
                     buffer,
                 } => {
+                    let namespace = self.namespaces.get_mut(&namespace).unwrap();
+                    namespace.reads_pending = namespace.reads_pending.saturating_sub(1);
+                    namespace.read_progress = Instant::now();
                     if failed {
                         self.read_failed(connection, transfer);
                     } else {
@@ -3368,68 +3799,92 @@ impl Store {
         }
     }
 
+    fn request_writeback(&mut self, id: NamespaceId, key: Key) {
+        self.writeback.insert((id, key));
+        self.write_ancestor(id, key, "eviction");
+    }
+
+    fn writable_ancestor(
+        &self,
+        id: NamespaceId,
+        target: Key,
+        allow_pending_prune: bool,
+    ) -> Option<Key> {
+        let namespace = &self.namespaces[&id];
+        let mut node = namespace.tree.node(&target)?;
+        while let Some(parent) = node.parent.filter(|p| !namespace.tree[p].location.durable) {
+            node = &namespace.tree[&parent];
+        }
+        let key = node.key;
+        if namespace.inflight.contains(&key)
+            || (!allow_pending_prune && self.pending_former_tips.contains(&(id, key)))
+            || node.location.disk_busy()
+            || node.location.retry > Instant::now()
+        {
+            return None;
+        }
+        Some(key)
+    }
+
+    fn write_ancestor(&mut self, id: NamespaceId, target: Key, reason: &'static str) {
+        let namespace = &self.namespaces[&id];
+        let Some(node) = namespace.tree.node(&target) else {
+            self.writeback.remove(&(id, target));
+            return;
+        };
+        if node.location.durable {
+            if node.location.memory.is_none()
+                || (!node.pinned() && !node.location.reading() && self.evict_memory(id, target))
+            {
+                self.writeback.remove(&(id, target));
+            }
+            return;
+        }
+        let Some(key) = self.writable_ancestor(id, target, reason != "eviction") else {
+            return;
+        };
+        let node = &namespace.tree[&key];
+        let Some(worker) = self.writers.iter().find(|worker| worker.is_idle()) else {
+            return;
+        };
+        let Some(memory) = node.location.memory.clone() else {
+            return;
+        };
+        let job = self.job_counter + 1;
+        let Some(temporary) = namespace.temporary(job) else {
+            return;
+        };
+        let length = node.location.header.length(node.row);
+        let task = DiskJob::write_record(
+            JobId(job),
+            temporary.path.clone(),
+            0,
+            &memory.bytes()[..length as usize],
+            Some((namespace.path(key).unwrap(), length)),
+        );
+        if worker.submit(task).is_ok() {
+            self.job_counter = job;
+            self.jobs.insert(
+                job,
+                Job::Write {
+                    namespace: id,
+                    key,
+                    reason: if key == target { reason } else { "dependency" },
+                    _memory: memory,
+                    _temporary: temporary,
+                },
+            );
+            let tree = &mut self.namespaces.get_mut(&id).unwrap().tree;
+            tree.pin(&key).expect("writeback holds a resident record");
+            let location = &mut tree[&key].location;
+            location.writing = true;
+            location.job = Some(job);
+        }
+    }
+
     fn schedule(&mut self) {
-        let ids: Vec<NamespaceId> = self.namespaces.keys().copied().collect();
-        for id in ids {
-            if self.namespaces[&id].disk.is_none() {
-                continue;
-            }
-            let namespace = &self.namespaces[&id];
-            let mut keys: Vec<Key> = namespace
-                .undurable
-                .iter()
-                .filter_map(|key| namespace.tree.node(key))
-                .filter(|node| {
-                    !node.location.durable
-                        && !node.location.writing
-                        && node.location.memory.is_some()
-                        && node.location.retry <= Instant::now()
-                        && namespace.parent_durable(node.parent)
-                })
-                .map(|node| node.key)
-                .collect();
-            keys.sort_unstable();
-            for key in keys {
-                self.job_counter += 1;
-                let job = self.job_counter;
-                let namespace = &self.namespaces[&id];
-                let node = &namespace.tree[&key];
-                let Some(memory) = node.location.memory.clone() else {
-                    continue;
-                };
-                let Some(temporary) = namespace.temporary(job) else {
-                    continue;
-                };
-                let Some(path) = namespace.path(key) else {
-                    continue;
-                };
-                let task = DiskJob::write_record(
-                    JobId(job),
-                    temporary.path.clone(),
-                    0,
-                    &memory.bytes()[..node.location.header.length(node.row) as usize],
-                    Some((path, node.location.header.length(node.row))),
-                );
-                let Some(worker) = &namespace.disk else {
-                    continue;
-                };
-                if worker.submit(task).is_ok() {
-                    self.jobs.insert(
-                        job,
-                        Job::Write {
-                            namespace: id,
-                            key,
-                            _memory: memory,
-                            _temporary: temporary,
-                        },
-                    );
-                    let location = &mut self.namespaces.get_mut(&id).unwrap().tree[&key].location;
-                    location.writing = true;
-                    location.job = Some(job);
-                } else {
-                    break;
-                }
-            }
+        for (id, key) in self.writeback.iter().copied().collect::<Vec<_>>() {
+            self.write_ancestor(id, key, "eviction");
         }
         let connections: Vec<u64> = self.sessions.keys().copied().collect();
         for connection in connections {
@@ -3467,6 +3922,7 @@ impl Store {
             return;
         }
         if !self.namespaces[&id].parent_durable(parent) {
+            self.write_ancestor(id, parent.unwrap(), "dependency");
             return;
         }
         let Some((put, _)) = put_mut(&mut self.sessions, connection, transfer) else {
@@ -3503,7 +3959,7 @@ impl Store {
         let ids: Vec<_> = self.namespaces.keys().copied().collect();
         for id in ids {
             let keys = self.namespaces.get_mut(&id).unwrap().tree.expired(|node| {
-                !node.pinned() && !node.location.writing && !node.location.reading()
+                !node.pinned() && !node.location.disk_busy() && !node.location.reading()
             });
             for key in keys {
                 let node = &self.namespaces[&id].tree[&key];
@@ -3517,6 +3973,14 @@ impl Store {
     fn timeouts(&mut self) {
         let mut expired = Vec::new();
         let disk_idle = (!self.jobs.is_empty()).then(|| self.disk_progress.elapsed());
+        // A restore waits on its own namespace's reads thread, not on the disk as a whole:
+        // other namespaces' jobs completing say nothing about a thread that is hung.
+        let read_idle: HashMap<NamespaceId, Duration> = self
+            .namespaces
+            .iter()
+            .filter(|(_, namespace)| namespace.reads_pending > 0)
+            .map(|(id, namespace)| (*id, namespace.read_progress.elapsed()))
+            .collect();
         for (connection, session) in &mut self.sessions {
             if session.closed {
                 continue;
@@ -3530,7 +3994,11 @@ impl Store {
                     continue;
                 }
                 let delivered = open.waits_on_disk();
-                if stalled(open.progress.elapsed(), delivered, disk_idle) {
+                let idle = match &open.operation {
+                    Operation::Put(_) => disk_idle,
+                    Operation::Get(get) => read_idle.get(&get.namespace).copied(),
+                };
+                if stalled(open.progress.elapsed(), delivered, idle) {
                     expired.push((*connection, *transfer));
                 }
             }
@@ -3559,6 +4027,108 @@ impl Store {
         }
     }
 
+    pub(crate) fn drain_until(&mut self, deadline: Instant) -> bool {
+        // The pool releases proven-safe holders. A forced stop must preserve the others.
+        for connection in self.sessions.keys().copied().collect::<Vec<_>>() {
+            self.close_operations(connection);
+        }
+        if self.config.root.is_none() {
+            return true;
+        }
+        self.writeback.clear();
+        let mut targets = self.shutdown_targets();
+        let mut complete = false;
+        while Instant::now() < deadline {
+            self.pump();
+            if targets.iter().all(VecDeque::is_empty) && self.jobs.is_empty() {
+                targets = self.shutdown_targets();
+                if targets.iter().all(VecDeque::is_empty)
+                    && self
+                        .sessions
+                        .values()
+                        .all(|s| s.ops.values().all(Open::is_over))
+                {
+                    complete = true;
+                    break;
+                }
+            }
+            for queue in &mut targets {
+                for _ in 0..queue.len() {
+                    if !self.writers.iter().any(DiskThread::is_idle) {
+                        break;
+                    }
+                    let (id, key) = queue.pop_front().unwrap();
+                    if !self.namespaces[&id]
+                        .tree
+                        .node(&key)
+                        .is_some_and(|n| n.row && !n.location.durable)
+                    {
+                        continue;
+                    }
+                    self.write_ancestor(id, key, "shutdown");
+                    if !self.namespaces[&id].tree[&key].location.writing {
+                        queue.push_back((id, key));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.record_shutdown_inventory();
+        complete
+    }
+
+    fn shutdown_targets(&self) -> [VecDeque<(NamespaceId, Key)>; 2] {
+        let mut targets = [VecDeque::new(), VecDeque::new()];
+        for (&id, ns) in &self.namespaces {
+            for key in &ns.undurable {
+                // A page-only record is worth writing only as a dependency of a row.
+                if let Some(node) = ns.tree.node(key).filter(|n| n.row) {
+                    let interior_endpoint = node.location.header.capture_role()
+                        == CaptureRole::Endpoint
+                        && node.parent.is_some()
+                        && node.children() == 1;
+                    targets[usize::from(interior_endpoint)].push_back((id, *key));
+                }
+            }
+        }
+        targets
+    }
+
+    fn record_shutdown_inventory(&mut self) {
+        let mut records = 0;
+        let mut bytes = 0;
+        for ns in self.namespaces.values() {
+            let mut counted = HashSet::new();
+            for key in ns
+                .undurable
+                .iter()
+                .filter(|k| ns.tree.node(k).is_some_and(|n| n.row))
+            {
+                let mut next = Some(*key);
+                while let Some(k) = next {
+                    let node = &ns.tree[&k];
+                    if node.location.durable || !counted.insert(k) {
+                        break;
+                    }
+                    if node.location.disk.is_none() {
+                        records += 1;
+                        bytes += node.location.bytes;
+                    }
+                    next = node.parent;
+                }
+            }
+        }
+        self.metrics.shutdown_unflushed = Some((records, bytes));
+        if records > 0 {
+            eprintln!("selene: shutdown left {records} dirty records ({bytes} bytes)");
+        }
+        // The NVMe device may be the reason the flush timed out.
+        let path = self.local.directory().join("last-shutdown");
+        if let Err(e) = crate::local::write_atomically(&path, format!("{records} {bytes}\n").as_bytes()) {
+            eprintln!("selene: could not save shutdown inventory: {e}");
+        }
+    }
+
     pub fn pump(&mut self) {
         self.pump_reads();
         self.pump_chunks();
@@ -3567,6 +4137,9 @@ impl Store {
         self.pump_grants();
         self.cleanup_turn();
         self.settle_terminal_puts();
+        for (id, key) in self.pending_former_tips.iter().copied().collect::<Vec<_>>() {
+            self.prune_former_tip(id, key);
+        }
         self.schedule();
         self.tick();
         self.maybe_finish_gets();
@@ -3603,6 +4176,31 @@ impl Store {
 
     pub fn metrics_text(&self) -> String {
         let mut text = String::new();
+        if self.config.root.is_some() {
+            let mut arena_only = 0u64;
+            let mut oldest = Duration::ZERO;
+            for ns in self.namespaces.values() {
+                for node in ns
+                    .tree
+                    .nodes()
+                    .filter(|n| n.location.memory.is_some() && n.location.disk.is_none())
+                {
+                    arena_only += node.location.bytes;
+                    oldest = oldest.max(node.location.admitted.elapsed());
+                }
+            }
+            text.push_str(&format!(
+                "selene_arena_only_bytes {arena_only}\nselene_oldest_dirty_seconds {}\n",
+                oldest.as_secs_f64()
+            ));
+            if let Some((records, bytes)) = self.metrics.shutdown_unflushed {
+                text.push_str(&format!("selene_shutdown_unflushed_records {records}\nselene_shutdown_unflushed_bytes {bytes}\n"));
+            }
+        }
+        for ((role, reason), (records, bytes)) in &self.metrics.record_actions {
+            let role = role.as_str_name().to_ascii_lowercase();
+            text.push_str(&format!("selene_policy_records_total{{role=\"{role}\",reason=\"{reason}\"}} {records}\nselene_policy_bytes_total{{role=\"{role}\",reason=\"{reason}\"}} {bytes}\n"));
+        }
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
             text.push_str(&format!(
                 "selene_expired_total{{tier=\"{tier}\"}} {}\n",
@@ -3612,9 +4210,14 @@ impl Store {
         for (name, value) in [
             ("unknown_frames_total", self.metrics.dropped),
             ("cancels_total", self.metrics.cancels),
+            (
+                "put_writeback_waits_total",
+                self.metrics.put_writeback_waits,
+            ),
             ("evictions_total", self.metrics.evictions),
             ("compactions_total", self.metrics.compactions),
             ("nvme_bytes_total", self.metrics.nvme_bytes),
+            ("nvme_read_bytes_total", self.metrics.nvme_read_bytes),
             ("nvme_errors_total", self.metrics.nvme_errors),
             ("connections", self.sessions.len() as u64),
             (
@@ -3670,9 +4273,35 @@ impl Store {
             "selene_nvme_seconds_total {}\n",
             self.metrics.nvme_seconds
         ));
+        for (part, count) in [
+            ("pages", self.metrics.put_page_bytes),
+            ("rows", self.metrics.put_row_bytes),
+        ] {
+            text.push_str(&format!(
+                "selene_put_bytes_total{{part=\"{part}\"}} {count}\n"
+            ));
+        }
+        for (parent, count) in [
+            ("linked", self.metrics.put_links_linked),
+            ("root", self.metrics.put_links_root),
+        ] {
+            text.push_str(&format!(
+                "selene_put_links_total{{parent=\"{parent}\"}} {count}\n"
+            ));
+        }
+        for (shape, count) in [
+            ("row", self.metrics.put_shapes_row),
+            ("page_only", self.metrics.put_shapes_page_only),
+            ("empty", self.metrics.put_shapes_empty),
+        ] {
+            text.push_str(&format!(
+                "selene_put_shapes_total{{shape=\"{shape}\"}} {count}\n"
+            ));
+        }
         for (outcome, count) in [
             ("ok", self.metrics.puts_ok),
             ("error", self.metrics.puts_error),
+            ("unlinked", self.metrics.puts_unlinked),
             ("present", self.metrics.present),
             ("queue", self.metrics.retry_queue),
             ("budget", self.metrics.retry_budget),
@@ -3729,6 +4358,7 @@ impl Store {
 pub type Reply<T> = tokio::sync::oneshot::Sender<T>;
 
 pub struct PutAccept {
+    pub capture_role: CaptureRole,
     pub transfer: u64,
     pub first_page: u32,
     pub parent: Option<Key>,
@@ -3749,6 +4379,12 @@ pub struct WindowGrant {
     pub page_count: u32,
     pub row: bool,
 }
+
+/// The detail of the `INVALID` refusal of a page-only put that cannot link to a held ancestor,
+/// which the pool counts and logs in aggregate because it is routine. No ancestor is held, or
+/// the deepest one ends a chain of `REROOT_DEPTH` records, so the put would start a new root,
+/// and a root needs a row.
+pub use flare_selene::shared::PUT_UNLINKED;
 
 pub struct Refused {
     pub reason: u8,
@@ -3801,9 +4437,14 @@ pub enum StoreCommand {
         descriptor: Descriptor,
         key: Key,
         published_parent: Option<Key>,
+        ancestor_keys: Vec<Key>,
         bucket: [u8; 16],
         chain_pages: u32,
         published_tail_pages: u32,
+        capture_role: CaptureRole,
+        child_paths: u32,
+        descendant_row: bool,
+        next_child: Option<Key>,
         row: bool,
         events: tokio::sync::mpsc::Sender<Result<PutAnswer>>,
         reply: Reply<Result<()>>,
@@ -3847,7 +4488,9 @@ pub enum StoreCommand {
         connection: u64,
     },
     Tick,
-    Shutdown,
+    Shutdown {
+        deadline: Instant,
+    },
 }
 
 fn region_wire(region: Region) -> i32 {
@@ -3928,9 +4571,14 @@ impl Store {
                 descriptor,
                 key,
                 published_parent,
+                ancestor_keys,
                 bucket,
                 chain_pages,
                 published_tail_pages,
+                capture_role,
+                child_paths,
+                descendant_row,
+                next_child,
                 row,
                 events,
                 reply,
@@ -3963,9 +4611,14 @@ impl Store {
                         namespace,
                         key,
                         published_parent,
+                        ancestor_keys,
                         bucket,
                         chain_pages,
                         published_tail_pages,
+                        capture_role,
+                        child_paths,
+                        descendant_row,
+                        next_child,
                         row,
                     },
                     events,
@@ -4066,7 +4719,7 @@ impl Store {
                 let _ = reply.send(self.metrics_text());
             }
             StoreCommand::Tick => {}
-            StoreCommand::Shutdown => {}
+            StoreCommand::Shutdown { .. } => {}
         }
     }
 }
@@ -4084,7 +4737,7 @@ fn validate_commit(put: &mut Put, descriptor: &Descriptor) -> Result<()> {
         || header.tail_pages != planned.tail_pages
         || header.page_segment != planned.page_segment
         || header.row_segment != planned.row_segment
-        || header.flags != 0
+        || header.flags != planned.flags
         || !row_ok
         || !descriptor.matches(&header)
     {
@@ -4100,7 +4753,13 @@ fn validate_commit(put: &mut Put, descriptor: &Descriptor) -> Result<()> {
             return Err(invalid("commit checksum table"));
         }
     }
-    put.header = header;
+    if header.capture_role() == put.stored_role {
+        put.header = header;
+    } else {
+        put.header = header.with_capture_role(put.stored_role);
+        put.commit_bytes[..4096]
+            .copy_from_slice(&put.header.encode().map_err(|e| invalid(e.to_string()))?);
+    }
     Ok(())
 }
 
@@ -4304,18 +4963,31 @@ mod tests {
                     connection: 1,
                     transfer: index + 1,
                     request: PutRequest {
+                        ancestor_keys: Vec::new(),
                         namespace: id,
                         key: key(pages + index as u32),
                         published_parent: parent,
                         bucket: [0; 16],
                         chain_pages: pages + index as u32,
                         published_tail_pages: pages + index as u32 - first,
+                        capture_role: CaptureRole::Legacy,
+                        child_paths: 0,
+                        descendant_row: false,
+                        next_child: None,
                         row: true,
                     },
                     events: events.clone(),
                 });
                 store.flush_outboxes();
-                let answer = answers.try_recv().unwrap().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let answer = loop {
+                    if let Ok(answer) = answers.try_recv() {
+                        break answer.unwrap();
+                    }
+                    assert!(Instant::now() < deadline, "{label}: admission timed out");
+                    store.pump();
+                    std::thread::yield_now();
+                };
                 match answer {
                     PutAnswer::Accept(_) => {
                         assert!(refusal.is_none(), "{label}: accepted");
@@ -4428,7 +5100,7 @@ mod tests {
         };
         let one_page = crate::record::new_header(&value, key(64), None, [0; 16], 1).unwrap();
         // The arena shape charges its 16 KiB extent.
-        let arena = store.put_requirement(&one_page, 16 * 1024);
+        let arena = store.put_requirement(&one_page, 16 * 1024, true);
         assert!(!arena.streaming);
         assert_eq!(arena.charge, 16 * 1024);
         assert_eq!(arena.reservation, 16 * 1024);
@@ -4437,7 +5109,7 @@ mod tests {
         // 128 pages and a 4 KiB row: 524 KiB of disk record plus a fixed
         // hold of two 512 KiB windows.
         let many = crate::record::new_header(&value, key(128 * 64), None, [0; 16], 128).unwrap();
-        let stream = store.put_requirement(&many, 0);
+        let stream = store.put_requirement(&many, 0, true);
         assert!(stream.streaming);
         assert_eq!(stream.reservation, 524 * 1024);
         assert_eq!(stream.allocation, 2 * 512 * 1024);
@@ -4445,6 +5117,16 @@ mod tests {
         assert_eq!(stream.charge, (524 + 2 * 512) * 1024);
         drop(store);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    /// Physical charge: the arena allocator size class or the padded disk record.
+    fn record_charge(header: &Header, in_memory: bool) -> u64 {
+        let length = header.length_with_row();
+        if in_memory {
+            length.max(4096).next_power_of_two()
+        } else {
+            length
+        }
     }
 
     fn insert_memory_node(
@@ -4479,10 +5161,566 @@ mod tests {
                     writing: false,
                     job: None,
                     retry: Instant::now(),
+                    admitted: Instant::now(),
                     bytes,
                 },
             )
             .unwrap();
+    }
+
+    /// A Get of records that are all on disk: the metadata reads it submits, then, once the
+    /// metadata has arrived and credit is given, its window reads.
+    #[test]
+    fn a_get_streams_records_that_are_not_resident_and_reads_the_first_window_first() {
+        let (mut store, base, directory) = store_with_root("get-streams", 64 << 20);
+        // A 4 MiB row is larger than a window can share with a page, so the endpoint's row
+        // is a window of its own.
+        let mut value = descriptor();
+        value.ranks[0].row_bytes = 4 << 20;
+        store
+            .hello(1, std::process::id(), None, value.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace;
+        let path = base.join("chain.ckpt");
+        fs::write(&path, vec![0; 16 << 20]).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+        let count = 4;
+        let records: Vec<_> = (1..=count)
+            .map(|pages| GetRecord {
+                header: crate::record::new_header(
+                    &value,
+                    page_key(pages),
+                    (pages > 1).then(|| page_key(pages - 1)),
+                    [0; 16],
+                    1,
+                )
+                .unwrap(),
+                memory: None,
+                file: Some(file.clone()),
+                meta: None,
+                meta_sent: false,
+            })
+            .collect();
+        let grants: Vec<_> = records
+            .iter()
+            .enumerate()
+            .flat_map(|(index, record)| {
+                record_grants(
+                    &record.header,
+                    index as u32,
+                    0,
+                    index + 1 == records.len(),
+                    DEFAULT_MAX_WINDOW,
+                    index as u32,
+                )
+            })
+            .collect();
+        // One page window per record, then the endpoint's row.
+        assert_eq!(grants.len(), count as usize + 1);
+        let row_bytes = records[0].header.row_record_bytes();
+        assert_eq!(
+            grants.last().map(|grant| (grant.row, grant.length)),
+            Some((true, row_bytes))
+        );
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        store.sessions.get_mut(&1).unwrap().ops.insert(
+            1,
+            Open {
+                operation: Operation::Get(Box::new(Get {
+                    namespace: id,
+                    pins: VecDeque::new(),
+                    records,
+                    grants: grants.clone(),
+                    requested: 0,
+                    next_grant: 0,
+                    next_meta_read: 0,
+                    next_meta: 0,
+                    window_reads: 0,
+                    pending_reads: 0,
+                    cancelled: false,
+                    terminal: false,
+                    finished: false,
+                    events,
+                    outbox: VecDeque::new(),
+                })),
+                progress: Instant::now(),
+            },
+        );
+        let arena_used = store.memory.used();
+
+        store.prepare_get_records(1, 1, id);
+        // Only metadata is read up front, one read per record and no more than the page
+        // segment, which leaves the arena untouched and the endpoint's row unread.
+        let mut jobs: Vec<_> = store.jobs.keys().copied().collect();
+        jobs.sort_unstable();
+        assert_eq!(jobs.len(), count as usize);
+        // The reads thread fills each metadata buffer from the zero-filled file. A header
+        // written before that read lands would be overwritten, so wait for every read.
+        let mut completed = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while completed < jobs.len() {
+            assert!(
+                Instant::now() < deadline,
+                "{completed} of {} metadata reads completed",
+                jobs.len()
+            );
+            let mut replies = Vec::new();
+            store.namespaces[&id]
+                .reads
+                .as_ref()
+                .unwrap()
+                .poll(&mut replies);
+            assert!(replies.iter().all(|reply| reply.result.is_ok()));
+            completed += replies.len();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for (record, job) in jobs.into_iter().enumerate() {
+            let Some(Job::GetRead {
+                record: read,
+                kind: ReadKind::Meta { length },
+                mut buffer,
+                ..
+            }) = store.jobs.remove(&job)
+            else {
+                panic!("job {job} is not a metadata read");
+            };
+            assert_eq!(read as usize, record);
+            let header = get_in(&mut store).records[record].header.clone();
+            assert_eq!(length as u64, header.page_segment);
+            buffer.bytes_mut()[..4096].copy_from_slice(&header.encode().unwrap());
+            store.get_read_done(1, 1, read, ReadKind::Meta { length }, Some(buffer));
+        }
+        assert_eq!(store.memory.used(), arena_used);
+
+        // With credit for every window, windows are read in grant order and the row after
+        // every page window.
+        get_in(&mut store).requested = grants.len();
+        store.pump_grants();
+        let mut reads: Vec<_> = store
+            .jobs
+            .iter()
+            .map(|(job, read)| {
+                let Job::GetRead { kind, buffer, .. } = read else {
+                    panic!("job {job} is not a Get read");
+                };
+                let ReadKind::Window { grant } = kind else {
+                    panic!("job {job} is not a window read");
+                };
+                (*job, *grant, buffer.bytes().len() as u64)
+            })
+            .collect();
+        reads.sort_unstable();
+        assert_eq!(
+            reads.iter().map(|read| read.1).collect::<Vec<_>>(),
+            (0..grants.len() as u32).collect::<Vec<_>>(),
+            "windows are submitted in grant order"
+        );
+        for (job, grant, bytes) in &reads {
+            assert_eq!(*bytes, grants[*grant as usize].length, "job {job}");
+        }
+        let (row_job, _, row_length) = reads[grants.len() - 1];
+        let (first_job, ..) = reads[0];
+        assert!(first_job < row_job);
+        assert_eq!(row_length, row_bytes);
+        // No record gained an arena copy.
+        assert_eq!(store.memory.used(), arena_used);
+        assert!(
+            get_in(&mut store)
+                .records
+                .iter()
+                .all(|record| record.memory.is_none())
+        );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// Makes a resident record disk-only: its arena copy is dropped and its file, which
+    /// holds the record's header followed by zeros, is the only copy.
+    fn move_to_disk(store: &mut Store, id: NamespaceId, key: Key, path: PathBuf) {
+        let node = store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .node_mut(&key)
+            .unwrap();
+        let header = node.location.header.clone();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The length is set, not written, so a record of many pages is a sparse file.
+        let mut file = File::create(&path).unwrap();
+        io::Write::write_all(&mut file, &header.encode().unwrap()).unwrap();
+        file.set_len(header.length_with_row()).unwrap();
+        node.location.memory = None;
+        node.location.disk = Some(Arc::new(DiskExtent::new(path)));
+        node.location.durable = true;
+    }
+
+    #[test]
+    fn a_get_whose_row_window_cannot_fit_in_staging_is_refused_before_any_read() {
+        let name = format!(
+            "selene-unit-{}-staging-row-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let mut config = Config::new(
+            base.join("records"),
+            base.join("manager.sock"),
+            1 << 20,
+            64 << 20,
+        );
+        config.name = name.clone();
+        // The endpoint's row is a 16 MiB window of its own, which is larger than staging.
+        config.staging = 8 << 20;
+        let mut store = Store::open(config).unwrap();
+        let directory = store.shm_directory();
+        let mut value = descriptor();
+        value.ranks[0].row_bytes = 16 << 20;
+        store
+            .hello(1, std::process::id(), None, value.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace;
+        let extent = store.memory.allocate(4096).unwrap();
+        insert_memory_node(&mut store, id, &value, page_key(1), None, 1, extent);
+        move_to_disk(
+            &mut store,
+            id,
+            page_key(1),
+            base.join("records").join("row.ckpt"),
+        );
+        let (events, mut receiver) = tokio::sync::mpsc::channel(8);
+        store.submit_get(
+            1,
+            1,
+            GetRequest {
+                namespace: id,
+                keys: vec![page_key(1)],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch();
+        store.flush_outboxes();
+        match receiver.try_recv() {
+            Ok(Ok(GetAnswer::Refused(refused))) => {
+                assert_eq!(refused.reason, proto::Reason::Budget as u8);
+            }
+            Ok(Ok(GetAnswer::Leased { .. })) => panic!("the Get started"),
+            _ => panic!("expected the Get to be refused"),
+        }
+        assert!(receiver.try_recv().is_err());
+        assert!(store.jobs.is_empty(), "the refused Get submitted a read");
+        assert!(!store.sessions[&1].ops.contains_key(&1));
+        assert!(!store.namespaces[&id].tree[&page_key(1)].pinned());
+        drop(store);
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// The metadata block of a record that is not resident is read into staging before any
+    /// window, so a block larger than staging is refused when the Get starts even though every
+    /// window of the record fits. The block holds a 4096-byte header and 8 bytes of checksum
+    /// per page, so a record of a million pages is needed to exceed the smallest staging.
+    #[test]
+    fn a_get_whose_metadata_block_cannot_fit_in_staging_is_refused_before_any_read() {
+        let name = format!(
+            "selene-unit-{}-staging-metadata-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let mut config = Config::new(
+            base.join("records"),
+            base.join("manager.sock"),
+            1 << 20,
+            64 << 20,
+        );
+        config.name = name.clone();
+        config.staging = 8 << 20;
+        let mut store = Store::open(config).unwrap();
+        let directory = store.shm_directory();
+        let value = descriptor();
+        store
+            .hello(1, std::process::id(), None, value.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace;
+        let pages = (8u64 << 20) / 8 + 1;
+        let record = page_key(pages);
+        let extent = store.memory.allocate(4096).unwrap();
+        insert_memory_node(&mut store, id, &value, record, None, pages as u32, extent);
+        move_to_disk(
+            &mut store,
+            id,
+            record,
+            base.join("records").join("metadata.ckpt"),
+        );
+        let header = store.namespaces[&id].tree[&record].location.header.clone();
+        let staging = store.staging.capacity() as u64;
+        assert!(header.page_segment > staging);
+        for grant in record_grants(&header, 0, 0, true, DEFAULT_MAX_WINDOW, 0) {
+            assert!(grant.length <= staging, "a window must fit for this test");
+        }
+        let (events, mut receiver) = tokio::sync::mpsc::channel(8);
+        store.submit_get(
+            1,
+            1,
+            GetRequest {
+                namespace: id,
+                keys: vec![record],
+                skip_pages: 0,
+                expected_pages: pages as u32,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch();
+        store.flush_outboxes();
+        match receiver.try_recv() {
+            Ok(Ok(GetAnswer::Refused(refused))) => {
+                assert_eq!(refused.reason, proto::Reason::Budget as u8);
+            }
+            Ok(Ok(GetAnswer::Leased { .. })) => panic!("the Get started"),
+            _ => panic!("expected the Get to be refused"),
+        }
+        assert!(receiver.try_recv().is_err());
+        assert!(store.jobs.is_empty(), "the refused Get submitted a read");
+        assert!(!store.sessions[&1].ops.contains_key(&1));
+        assert!(!store.namespaces[&id].tree[&record].pinned());
+        drop(store);
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Staging that other transfers hold is a temporary shortage. The Get has been told it is
+    /// leased, so it waits for the release instead of being refused.
+    #[test]
+    fn a_get_whose_metadata_read_finds_staging_full_waits_for_a_release() {
+        let name = format!(
+            "selene-unit-{}-staging-meta-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let mut config = Config::new(
+            base.join("records"),
+            base.join("manager.sock"),
+            1 << 20,
+            64 << 20,
+        );
+        config.name = name.clone();
+        config.staging = 8 << 20;
+        let mut store = Store::open(config).unwrap();
+        let directory = store.shm_directory();
+        let value = descriptor();
+        store
+            .hello(1, std::process::id(), None, value.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace;
+        let extent = store.memory.allocate(4096).unwrap();
+        insert_memory_node(&mut store, id, &value, page_key(1), None, 1, extent);
+        move_to_disk(
+            &mut store,
+            id,
+            page_key(1),
+            base.join("records").join("record.ckpt"),
+        );
+        let held = store.staging.allocate(store.staging.capacity()).unwrap();
+        let (events, mut receiver) = tokio::sync::mpsc::channel(8);
+        store.submit_get(
+            1,
+            1,
+            GetRequest {
+                namespace: id,
+                keys: vec![page_key(1)],
+                skip_pages: 0,
+                expected_pages: 1,
+                row: true,
+            },
+            events,
+        );
+        let mut answers = Vec::new();
+        for _ in 0..5 {
+            store.pump();
+            while let Ok(answer) = receiver.try_recv() {
+                answers.push(answer);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(answers.as_slice(), [Ok(GetAnswer::Leased { .. })]),
+            "a Get that only waits for staging was refused or answered early"
+        );
+        assert!(store.jobs.is_empty());
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut metadata = false;
+        while !metadata {
+            assert!(Instant::now() < deadline, "the metadata never arrived");
+            store.pump();
+            while let Ok(answer) = receiver.try_recv() {
+                match answer {
+                    Ok(GetAnswer::Meta { record, .. }) => {
+                        assert_eq!(record, 0);
+                        metadata = true;
+                    }
+                    Ok(GetAnswer::Refused(refused)) => {
+                        panic!("the Get was refused: {}", refused.detail)
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(store);
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Windows are answered in grant order. A resident window granted after a streamed one
+    /// must not be answered while the streamed window's read is still in flight.
+    #[test]
+    fn a_resident_window_after_a_streamed_one_waits_for_it() {
+        let name = format!(
+            "selene-unit-{}-resident-after-streamed-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let mut config = Config::new(
+            base.join("records"),
+            base.join("manager.sock"),
+            1 << 20,
+            64 << 20,
+        );
+        config.name = name.clone();
+        config.staging = 8 << 20;
+        let (gate, entered, release) = crate::disk::IoGate::new();
+        config.faults.read_gate = Some(gate.clone());
+        let mut store = Store::open(config).unwrap();
+        // Dropping the store joins the reads thread, so a failed assertion must release the
+        // gate first or the test would hang instead of failing. `release` is declared after
+        // `store`, so it drops first.
+        struct Release(std::sync::mpsc::SyncSender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
+        let release = Release(release);
+        let directory = store.shm_directory();
+        let value = descriptor();
+        store
+            .hello(1, std::process::id(), None, value.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace;
+        // A parent recovered from disk and a child still in the arena.
+        let extent = store.memory.allocate(4096).unwrap();
+        insert_memory_node(&mut store, id, &value, page_key(1), None, 1, extent);
+        move_to_disk(
+            &mut store,
+            id,
+            page_key(1),
+            base.join("records").join("parent.ckpt"),
+        );
+        let header =
+            crate::record::new_header(&value, page_key(2), Some(page_key(1)), [0; 16], 1).unwrap();
+        let mut extent = store
+            .memory
+            .allocate(header.length_with_row() as usize)
+            .unwrap();
+        extent.bytes_mut()[..4096].copy_from_slice(&header.encode().unwrap());
+        insert_memory_node(
+            &mut store,
+            id,
+            &value,
+            page_key(2),
+            Some(page_key(1)),
+            1,
+            extent,
+        );
+        let (events, mut receiver) = tokio::sync::mpsc::channel(32);
+        store.submit_get(
+            1,
+            1,
+            GetRequest {
+                namespace: id,
+                keys: vec![page_key(1), page_key(2)],
+                skip_pages: 0,
+                expected_pages: 2,
+                row: true,
+            },
+            events,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // The gate holds the parent's metadata read; releasing it lets the metadata arrive.
+        store.pump();
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the metadata read never reached the disk thread");
+        release.0.send(()).unwrap();
+        loop {
+            while let Ok(answer) = receiver.try_recv() {
+                if let Ok(GetAnswer::Refused(refused)) = answer {
+                    panic!("the Get was refused: {}", refused.detail);
+                }
+            }
+            if get_in(&mut store)
+                .records
+                .iter()
+                .all(|record| record.meta_sent)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the metadata never arrived");
+            store.pump();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let grants = get_in(&mut store).grants.clone();
+        assert!(grants.len() >= 2);
+        assert_eq!(
+            grants[0].record, 0,
+            "the first window is the streamed parent's"
+        );
+        assert!(
+            grants[1..].iter().all(|grant| grant.record == 1),
+            "the later windows are the resident child's"
+        );
+        // Hold the parent's window read on the disk thread and give credit for every window.
+        gate.arm();
+        get_in(&mut store).requested = grants.len();
+        store.pump();
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the window read never reached the disk thread");
+        for _ in 0..5 {
+            store.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(get_in(&mut store).window_reads, 1);
+        assert_eq!(
+            get_in(&mut store).next_grant,
+            1,
+            "a resident window was answered ahead of the streamed window before it"
+        );
+        release.0.send(()).unwrap();
+        let mut ready = Vec::new();
+        while ready.len() < grants.len() {
+            assert!(Instant::now() < deadline, "answered windows {ready:?}");
+            store.pump();
+            while let Ok(answer) = receiver.try_recv() {
+                if let Ok(GetAnswer::Ready(window)) = answer {
+                    ready.push(window.index);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(ready, (0..grants.len() as u32).collect::<Vec<_>>());
+        drop(store);
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -4501,6 +5739,7 @@ mod tests {
             grants: Vec::new(),
             requested: 0,
             next_grant: 0,
+            next_meta_read: 0,
             next_meta: 0,
             window_reads: 0,
             pending_reads: 2,
@@ -4531,6 +5770,206 @@ mod tests {
         store.cleanup_turn();
         store.flush_outboxes();
         assert!(!store.sessions.contains_key(&1));
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn reads_behind_a_backlogged_read_are_submitted_in_order() {
+        use std::time::{Duration, Instant};
+        let name = format!(
+            "selene-unit-{}-read-order-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let mut config = Config::new(
+            base.join("records"),
+            base.join("manager.sock"),
+            1 << 20,
+            64 << 20,
+        );
+        config.name = name.clone();
+        config.staging = 8 << 20;
+        let (gate, entered, release) = crate::disk::IoGate::new();
+        config.faults.read_gate = Some(gate);
+        let mut store = Store::open(config).unwrap();
+        let directory = store.shm_directory();
+        let id = store.register_namespace(descriptor()).unwrap();
+        // The disk thread answers jobs in the order it receives them. A span that is not
+        // block aligned fails at once without touching the file, so a reply only records
+        // when its job ran.
+        let file = Arc::new(File::open("/dev/null").unwrap());
+        let read = |job: u64| DiskJob::ReadRecord {
+            id: JobId(job),
+            file: file.clone(),
+            span: Span {
+                address: 1,
+                offset: 0,
+                length: 1,
+            },
+        };
+        let mut order = Vec::new();
+        let mut collect = |store: &Store, count: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while order.len() < count {
+                assert!(
+                    Instant::now() < deadline,
+                    "disk replies stopped at {order:?}"
+                );
+                let mut replies = Vec::new();
+                store.namespaces[&id]
+                    .reads
+                    .as_ref()
+                    .unwrap()
+                    .poll(&mut replies);
+                order.extend(replies.iter().map(|reply| reply.id.0));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        // The gate holds the first job on the thread, so the next QUEUE_DEPTH jobs fill its
+        // queue and the one after them waits in the backlog.
+        store.submit_read(id, 0, read(0));
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the read never reached the disk thread");
+        let queued = flare_selene::shared::disk::QUEUE_DEPTH as u64;
+        for job in 1..=queued + 1 {
+            store.submit_read(id, job, read(job));
+        }
+        assert_eq!(store.read_backlog.len(), 1);
+        // Every job but the backlogged one finishes, which leaves the queue empty.
+        release.send(()).unwrap();
+        collect(&store, queued as usize + 1);
+        assert_eq!(store.read_backlog.len(), 1);
+        // With room in the queue a later read must still wait behind the backlogged one,
+        // or it would run first.
+        store.submit_read(id, queued + 2, read(queued + 2));
+        store.pump_reads();
+        collect(&store, queued as usize + 3);
+        assert_eq!(order, (0..queued + 3).collect::<Vec<_>>());
+        assert!(store.read_backlog.is_empty());
+        drop(store);
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A store holding a Get on connection 1, transfer 1, whose two streamed windows were
+    /// planned and whose reads are both in flight.
+    fn get_with_two_windows(label: &str) -> (Store, PathBuf) {
+        let (mut store, directory) = store(label);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store.namespaces.get_mut(&id).unwrap().reads_pending = 2;
+        store
+            .hello(1, std::process::id(), None, value.clone())
+            .unwrap();
+        let record = GetRecord {
+            header: crate::record::new_header(&value, page_key(1), None, [0; 16], 1).unwrap(),
+            memory: None,
+            file: None,
+            meta: None,
+            meta_sent: false,
+        };
+        let window = |page_first| PlannedGrant {
+            record: 0,
+            record_offset: page_first * 4096,
+            length: 4096,
+            pages: 1,
+            row: false,
+            page_first,
+        };
+        let (events, _receiver) = tokio::sync::mpsc::channel(4);
+        let get = Get {
+            namespace: id,
+            pins: VecDeque::new(),
+            records: vec![record],
+            grants: vec![window(0), window(1)],
+            requested: 0,
+            next_grant: 2,
+            // Its one record's reads are already in flight.
+            next_meta_read: 1,
+            next_meta: 0,
+            window_reads: 2,
+            pending_reads: 2,
+            cancelled: false,
+            terminal: false,
+            finished: false,
+            events,
+            outbox: VecDeque::new(),
+        };
+        store.sessions.get_mut(&1).unwrap().ops.insert(
+            1,
+            Open {
+                operation: Operation::Get(Box::new(get)),
+                progress: Instant::now(),
+            },
+        );
+        (store, directory)
+    }
+
+    fn get_in(store: &mut Store) -> &mut Get {
+        let open = store.sessions.get_mut(&1).unwrap().ops.get_mut(&1).unwrap();
+        let Operation::Get(get) = &mut open.operation else {
+            panic!("expected Get");
+        };
+        get
+    }
+
+    fn window_read_done(store: &mut Store, grant: u32) {
+        let extent = store.staging.allocate(4096).unwrap();
+        store.get_read_done(1, 1, 0, ReadKind::Window { grant }, Some(extent));
+    }
+
+    #[test]
+    fn a_get_waiting_on_its_reads_is_not_a_client_stall() {
+        let (mut store, directory) = get_with_two_windows("get-waits-on-disk");
+        assert!(store.sessions[&1].ops[&1].waits_on_disk());
+        get_in(&mut store).pending_reads = 0;
+        assert!(!store.sessions[&1].ops[&1].waits_on_disk());
+        get_in(&mut store).pending_reads = 2;
+        // Its namespace's reads thread moved just now, so a Get that has heard nothing
+        // for longer than the limit is not expired.
+        let open = store.sessions.get_mut(&1).unwrap().ops.get_mut(&1).unwrap();
+        open.progress = Instant::now() - NO_PROGRESS * 2;
+        store.timeouts();
+        assert!(!get_in(&mut store).terminal);
+        // Releasing a window is progress for the Get itself.
+        let open = store.sessions.get_mut(&1).unwrap().ops.get_mut(&1).unwrap();
+        open.progress = Instant::now() - NO_PROGRESS * 2;
+        window_read_done(&mut store, 1);
+        assert!(store.sessions[&1].ops[&1].progress.elapsed() < NO_PROGRESS);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_get_whose_namespace_reads_made_no_progress_expires_while_the_disk_moves() {
+        let (mut store, directory) = get_with_two_windows("hung-reads");
+        let id = get_in(&mut store).namespace;
+        // Reads for this namespace were submitted long ago and none has completed.
+        store.namespaces.get_mut(&id).unwrap().read_progress = Instant::now() - NO_PROGRESS * 2;
+        // Other jobs keep completing, so the disk as a whole is moving.
+        let buffer = store.staging.allocate(4096).unwrap();
+        store.jobs.insert(
+            u64::MAX,
+            Job::GetRead {
+                namespace: id,
+                connection: 1,
+                transfer: 1,
+                record: 0,
+                kind: ReadKind::Meta { length: 0 },
+                buffer,
+            },
+        );
+        store.disk_progress = Instant::now();
+        let open = store.sessions.get_mut(&1).unwrap().ops.get_mut(&1).unwrap();
+        open.progress = Instant::now() - NO_PROGRESS * 2;
+        store.timeouts();
+        assert!(
+            get_in(&mut store).terminal,
+            "a Get behind a hung reads thread was not expired"
+        );
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }
@@ -4581,6 +6020,7 @@ mod tests {
                     writing: false,
                     job: None,
                     retry: Instant::now(),
+                    admitted: Instant::now(),
                     bytes: 0,
                 },
             )
@@ -4607,6 +6047,7 @@ mod tests {
                 writing: false,
                 job: None,
                 retry: Instant::now(),
+                admitted: Instant::now(),
                 bytes: 0,
             };
             let tree = &mut store.namespaces.get_mut(&id).unwrap().tree;
@@ -4737,6 +6178,7 @@ mod tests {
         let (events, mut receiver) = tokio::sync::mpsc::channel(4);
         let (reply, _answer) = tokio::sync::oneshot::channel();
         store.handle(StoreCommand::PutBegin {
+            ancestor_keys: Vec::new(),
             connection: 1,
             transfer: 1,
             namespace: id,
@@ -4746,6 +6188,10 @@ mod tests {
             bucket: [0; 16],
             chain_pages: 2,
             published_tail_pages: 1,
+            capture_role: CaptureRole::Legacy,
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             events,
             reply,
@@ -4784,6 +6230,7 @@ mod tests {
         let (events, mut receiver) = tokio::sync::mpsc::channel(4);
         let (reply, _answer) = tokio::sync::oneshot::channel();
         store.handle(StoreCommand::PutBegin {
+            ancestor_keys: Vec::new(),
             connection: 1,
             transfer: 1,
             namespace: id,
@@ -4793,6 +6240,10 @@ mod tests {
             bucket: [0; 16],
             chain_pages: 2,
             published_tail_pages: 1,
+            capture_role: CaptureRole::Legacy,
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             events,
             reply,
@@ -4808,6 +6259,520 @@ mod tests {
         }
         drop(store);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    /// The record holding `pages` pages of a chain, as the tests below name it.
+    fn page_key(pages: u64) -> Key {
+        Key {
+            consumed_tokens: pages * 64,
+            digest: [pages as u8; 16],
+        }
+    }
+
+    /// Records at the given page counts, each linked to the one before and resident.
+    fn insert_chain(store: &mut Store, id: NamespaceId, value: &Descriptor, pages: &[u64]) {
+        let mut parent = None;
+        let mut first = 0;
+        for &end in pages {
+            let tail = (end - first) as u32;
+            let header =
+                crate::record::new_header(value, page_key(end), parent, [0; 16], tail).unwrap();
+            let extent = store
+                .memory
+                .allocate(header.length_with_row() as usize)
+                .unwrap();
+            insert_memory_node(store, id, value, page_key(end), parent, tail, extent);
+            parent = Some(page_key(end));
+            first = end;
+        }
+    }
+
+    /// A store with a connected session holding a chain of resident records, of
+    /// which those ending at `page_only` have lost their rows.
+    fn held_chain(
+        label: &str,
+        memory: usize,
+        pages: &[u64],
+        page_only: &[u64],
+    ) -> (Store, PathBuf, NamespaceId) {
+        let (mut store, directory) = dram_store(label, memory);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store.hello(1, 0, None, value.clone()).unwrap();
+        insert_chain(&mut store, id, &value, pages);
+        for &end in page_only {
+            store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .drop_row(&page_key(end));
+        }
+        (store, directory, id)
+    }
+
+    /// A put of `key` whose published parent is `parent`, answered by the first reply.
+    fn first_put_answer(
+        store: &mut Store,
+        id: NamespaceId,
+        key: Key,
+        parent: Option<Key>,
+        ancestor_keys: Vec<Key>,
+        row: bool,
+    ) -> PutAnswer {
+        let chain_pages = key.consumed_tokens / 64;
+        let (events, mut answers) = tokio::sync::mpsc::channel(16);
+        store.begin_put(PendingPut {
+            connection: 1,
+            transfer: 1,
+            request: PutRequest {
+                namespace: id,
+                key,
+                published_parent: parent,
+                ancestor_keys,
+                bucket: [0; 16],
+                chain_pages: chain_pages as u32,
+                published_tail_pages: (chain_pages
+                    - parent.map_or(0, |parent| parent.consumed_tokens / 64))
+                    as u32,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
+                row,
+            },
+            events,
+        });
+        store.flush_outboxes();
+        answers.try_recv().unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_page_only_put_without_a_held_ancestor_is_unlinked_and_not_an_error() {
+        for parent_held in [false, true] {
+            let (mut store, directory, id) = held_chain(
+                "page-only-root",
+                16 << 10,
+                if parent_held { &[1] } else { &[] },
+                &[],
+            );
+            let parent = page_key(1);
+            let answer = first_put_answer(
+                &mut store,
+                id,
+                page_key(2),
+                parent_held.then_some(parent),
+                Vec::new(),
+                false,
+            );
+            // Only a root could hold it when no ancestor is held, and a root without a
+            // row ends no restore. With a held parent the arena is the limit.
+            let reason = if parent_held {
+                proto::Reason::Budget
+            } else {
+                proto::Reason::Invalid
+            };
+            assert!(
+                matches!(answer, PutAnswer::Refused(refusal) if refusal.reason == reason as u8)
+            );
+            assert!(store.sessions[&1].ops.is_empty());
+            assert_eq!(store.metrics.puts_error, 0);
+            assert_eq!(store.metrics.puts_unlinked, u64::from(!parent_held));
+            assert!(store.metrics_text().contains(&format!(
+                "selene_puts_total{{outcome=\"unlinked\"}} {}\n",
+                u8::from(!parent_held)
+            )));
+            if parent_held {
+                assert!(
+                    store.namespaces[&id].tree[&parent]
+                        .location
+                        .memory
+                        .is_some()
+                );
+            }
+            drop(store);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    /// A held ancestor in a chain of `REROOT_DEPTH` records does not count as one to link
+    /// to: the put would start a new root, and a root needs a row.
+    #[test]
+    fn a_page_only_put_below_a_chain_at_the_reroot_depth_is_unlinked() {
+        for (depth, row, linked) in [
+            (REROOT_DEPTH - 1, false, true),
+            (REROOT_DEPTH, false, false),
+            (REROOT_DEPTH, true, true),
+        ] {
+            let (mut store, directory, id) = held_chain("page-only-reroot", 64 << 20, &[1], &[]);
+            store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .node_mut(&page_key(1))
+                .unwrap()
+                .chain_depth = depth;
+            let answer = first_put_answer(
+                &mut store,
+                id,
+                page_key(2),
+                Some(page_key(1)),
+                Vec::new(),
+                row,
+            );
+            match answer {
+                PutAnswer::Accept(accept) => {
+                    assert!(linked, "depth {depth}, row {row}");
+                    // A put that cannot link starts a root, with every page of the chain.
+                    let expected = if depth == REROOT_DEPTH {
+                        (None, 0)
+                    } else {
+                        (Some(page_key(1)), 1)
+                    };
+                    assert_eq!((accept.parent, accept.first_page), expected);
+                    assert_eq!(store.metrics.puts_unlinked, 0);
+                }
+                PutAnswer::Refused(refusal) => {
+                    assert!(!linked, "depth {depth}, row {row}");
+                    assert_eq!(refusal.reason, proto::Reason::Invalid as u8);
+                    assert_eq!(refusal.detail, PUT_UNLINKED);
+                    assert_eq!(store.metrics.puts_unlinked, 1);
+                    assert_eq!(store.metrics.puts_error, 0);
+                }
+                _ => panic!("unexpected answer"),
+            }
+            drop(store);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn puts_keep_the_row_they_send_and_pages_already_held_are_present() {
+        // The chain holds a row-bearing record of one page and a page-only record of two.
+        let empty = Key {
+            consumed_tokens: 130,
+            digest: [130; 16],
+        };
+        // (key, its parent in the chain, row, counted shape)
+        for (key, parent, row, shape) in [
+            (page_key(3), page_key(2), true, Some("row")),
+            (page_key(3), page_key(2), false, Some("page_only")),
+            (empty, page_key(2), false, Some("empty")),
+            (empty, page_key(2), true, Some("row")),
+            // A held page-only record is rewritten only to gain its row.
+            (page_key(2), page_key(1), true, Some("row")),
+            (page_key(2), page_key(1), false, None),
+        ] {
+            let (mut store, directory, id) = held_chain("row-kept-put", 64 << 20, &[1, 2], &[2]);
+            let accepted = matches!(shape, Some("row" | "page_only"));
+            match first_put_answer(&mut store, id, key, Some(parent), Vec::new(), row) {
+                PutAnswer::Accept(accept) => {
+                    assert!(accepted, "{key:?}, row={row}");
+                    let put = put_ref(&store.sessions, 1, 1).unwrap();
+                    assert_eq!(accept.record_bytes, put.header.length(row));
+                    assert_eq!(put.grants.iter().any(|grant| grant.row), row);
+                    assert_eq!(
+                        store.metrics.put_row_bytes,
+                        if row {
+                            put.header.row_record_bytes()
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(store.metrics.present, 0);
+                }
+                PutAnswer::Refused(refused) => {
+                    assert!(!accepted, "{key:?}, row={row}");
+                    assert_eq!(refused.reason, proto::Reason::Present as u8);
+                    assert_eq!(store.metrics.put_page_bytes, 0);
+                    assert_eq!(store.metrics.present, 1);
+                }
+                _ => panic!("unexpected answer"),
+            }
+            let metrics = store.metrics_text();
+            for name in ["row", "page_only", "empty"] {
+                let count = u8::from(shape == Some(name));
+                assert!(
+                    metrics.contains(&format!(
+                        "selene_put_shapes_total{{shape=\"{name}\"}} {count}\n"
+                    )),
+                    "{key:?}, row={row}, shape {name}"
+                );
+            }
+            drop(store);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn put_rows_follow_capture_role_and_topology() {
+        for (parent, tokens, role, children, expected_row) in [
+            (None, 64, CaptureRole::Endpoint, 1, true),
+            (Some(128), 192, CaptureRole::Endpoint, 1, false),
+            (Some(128), 192, CaptureRole::Endpoint, 0, true),
+            (Some(128), 192, CaptureRole::Endpoint, 2, true),
+            (Some(128), 192, CaptureRole::Message, 1, true),
+            (Some(128), 192, CaptureRole::Anchor, 1, true),
+            (Some(128), 192, CaptureRole::Legacy, 1, true),
+        ] {
+            let (mut store, directory) = dram_store("anchor-put", 64 << 20);
+            let value = descriptor();
+            let id = store.register_namespace(value.clone()).unwrap();
+            store.hello(1, 0, None, value.clone()).unwrap();
+            let key = |tokens| Key {
+                consumed_tokens: tokens,
+                digest: [tokens as u8; 16],
+            };
+            for (tokens, parent) in [(64, None), (128, Some(key(64)))] {
+                let header =
+                    crate::record::new_header(&value, key(tokens), parent, [0; 16], 1).unwrap();
+                let extent = store
+                    .memory
+                    .allocate(header.length_with_row() as usize)
+                    .unwrap();
+                insert_memory_node(&mut store, id, &value, key(tokens), parent, 1, extent);
+            }
+            store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .drop_row(&key(128));
+            let (events, mut answers) = tokio::sync::mpsc::channel(16);
+            // Use a distinct digest for a root at the same token count.
+            let endpoint = Key {
+                consumed_tokens: tokens,
+                digest: [99; 16],
+            };
+            store.begin_put(PendingPut {
+                connection: 1,
+                transfer: 1,
+                request: PutRequest {
+                    namespace: id,
+                    key: endpoint,
+                    published_parent: parent.map(key),
+                    ancestor_keys: Vec::new(),
+                    bucket: [0; 16],
+                    chain_pages: (tokens / 64) as u32,
+                    published_tail_pages: (tokens / 64 - parent.unwrap_or(0) / 64) as u32,
+                    capture_role: role,
+                    child_paths: children,
+                    descendant_row: children == 1,
+                    next_child: None,
+                    row: true,
+                },
+                events,
+            });
+            store.flush_outboxes();
+            let PutAnswer::Accept(accept) = answers.try_recv().unwrap().unwrap() else {
+                panic!("expected accept");
+            };
+            assert_eq!(accept.capture_role, role);
+            let put = put_ref(&store.sessions, 1, 1).unwrap();
+            assert_eq!(accept.record_bytes, put.header.length(expected_row));
+            assert_eq!(put.grants.iter().any(|grant| grant.row), expected_row);
+            assert_eq!(
+                store.metrics.put_row_bytes,
+                if expected_row {
+                    put.header.row_record_bytes()
+                } else {
+                    0
+                }
+            );
+            let shape = if expected_row { "row" } else { "page_only" };
+            assert!(
+                store
+                    .metrics_text()
+                    .contains(&format!("selene_put_shapes_total{{shape=\"{shape}\"}} 1\n"))
+            );
+            drop(store);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn a_held_page_only_record_is_rewritten_only_to_become_an_anchor() {
+        for (role, children, rewritten) in [
+            (CaptureRole::Endpoint, 1, false),
+            (CaptureRole::Message, 1, true),
+            (CaptureRole::Endpoint, 2, true),
+        ] {
+            let (mut store, directory) = dram_store("page-only-reput", 64 << 20);
+            let value = descriptor();
+            let id = store.register_namespace(value.clone()).unwrap();
+            store.hello(1, 0, None, value.clone()).unwrap();
+            let key = |tokens| Key {
+                consumed_tokens: tokens,
+                digest: [tokens as u8; 16],
+            };
+            for (tokens, parent) in [(64, None), (128, Some(key(64)))] {
+                let header =
+                    crate::record::new_header(&value, key(tokens), parent, [0; 16], 1).unwrap();
+                let extent = store
+                    .memory
+                    .allocate(header.length_with_row() as usize)
+                    .unwrap();
+                insert_memory_node(&mut store, id, &value, key(tokens), parent, 1, extent);
+            }
+            store
+                .namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .drop_row(&key(128));
+            let loc = &mut store.namespaces.get_mut(&id).unwrap().tree[&key(128)].location;
+            loc.header = loc.header.clone().with_capture_role(CaptureRole::Endpoint);
+            let (events, mut answers) = tokio::sync::mpsc::channel(16);
+            store.begin_put(PendingPut {
+                connection: 1,
+                transfer: 1,
+                request: PutRequest {
+                    namespace: id,
+                    key: key(128),
+                    published_parent: Some(key(64)),
+                    ancestor_keys: Vec::new(),
+                    bucket: [0; 16],
+                    chain_pages: 2,
+                    published_tail_pages: 1,
+                    capture_role: role,
+                    child_paths: children,
+                    descendant_row: children == 1,
+                    next_child: None,
+                    row: true,
+                },
+                events,
+            });
+            store.flush_outboxes();
+            match answers.try_recv().unwrap().unwrap() {
+                PutAnswer::Accept(accept) => {
+                    assert!(rewritten, "role {role:?}: a page-only record was rewritten");
+                    assert_eq!(accept.capture_role, role);
+                    let put = put_ref(&store.sessions, 1, 1).unwrap();
+                    assert!(put.grants.iter().any(|grant| grant.row));
+                }
+                PutAnswer::Refused(refused) => {
+                    assert!(!rewritten, "role {role:?}: the anchor row was refused");
+                    assert_eq!(refused.reason, proto::Reason::Present as u8);
+                    assert_eq!(store.metrics.put_page_bytes, 0);
+                }
+                _ => panic!("unexpected answer"),
+            }
+            drop(store);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn put_selects_the_deepest_held_ancestor_including_page_only_records() {
+        for (candidates, published, unready, expected) in [
+            (vec![5, 3, 1], None, None, Some(3)),
+            (vec![5, 4, 3, 1], None, None, Some(4)),
+            (vec![5, 1], None, None, Some(1)),
+            (vec![5], None, None, None),
+            (vec![], Some(3), None, Some(3)),
+            (vec![5, 4, 3, 1], None, Some(4), Some(3)),
+            (vec![], Some(4), Some(4), None),
+        ] {
+            let (mut store, directory, id) = held_chain("ancestor-put", 64 << 20, &[1, 3, 4], &[3]);
+            if let Some(unready) = unready {
+                store
+                    .namespaces
+                    .get_mut(&id)
+                    .unwrap()
+                    .tree
+                    .set_ready(&page_key(unready), false)
+                    .unwrap();
+            }
+            let pages = candidates.first().copied().unwrap_or(5).max(5) + 1;
+            let answer = first_put_answer(
+                &mut store,
+                id,
+                page_key(pages),
+                published.map(page_key),
+                candidates.into_iter().map(page_key).collect(),
+                true,
+            );
+            let PutAnswer::Accept(accept) = answer else {
+                panic!("expected an accept");
+            };
+            assert_eq!(accept.parent, expected.map(page_key));
+            assert_eq!(accept.first_page, expected.unwrap_or(0) as u32);
+            let header = crate::record::new_header(
+                &descriptor(),
+                page_key(pages),
+                expected.map(page_key),
+                [0; 16],
+                pages as u32 - accept.first_page,
+            )
+            .unwrap();
+            assert_eq!(accept.record_bytes, header.length_with_row());
+            let metrics = store.metrics_text();
+            for line in [
+                format!(
+                    "selene_put_links_total{{parent=\"linked\"}} {}\n",
+                    u8::from(expected.is_some())
+                ),
+                format!(
+                    "selene_put_links_total{{parent=\"root\"}} {}\n",
+                    u8::from(expected.is_none())
+                ),
+                format!(
+                    "selene_put_bytes_total{{part=\"pages\"}} {}\n",
+                    u64::from(header.tail_pages) * header.page_record_bytes()
+                ),
+                format!(
+                    "selene_put_bytes_total{{part=\"rows\"}} {}\n",
+                    header.row_record_bytes()
+                ),
+            ] {
+                assert!(metrics.contains(&line), "missing metric {line}");
+            }
+            if let Some(parent) = accept.parent {
+                assert!(store.namespaces[&id].tree[&parent].pinned());
+            }
+            drop(store);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn an_ancestor_list_must_be_strictly_decreasing_and_end_before_the_record() {
+        // The record ends at page 6, and pages 1, 3 and 4 are held.
+        for (candidates, accepted) in [
+            (vec![5, 4, 3], true),
+            (vec![4, 1], true),
+            (vec![6], false),
+            (vec![7, 3], false),
+            (vec![4, 4], false),
+            (vec![3, 4], false),
+            (vec![5, 3, 3], false),
+            (vec![5, 1, 3], false),
+        ] {
+            let (mut store, directory, id) =
+                held_chain("ancestor-order", 64 << 20, &[1, 3, 4], &[]);
+            let errors = store.metrics.puts_error;
+            let answer = first_put_answer(
+                &mut store,
+                id,
+                page_key(6),
+                None,
+                candidates.iter().copied().map(page_key).collect(),
+                true,
+            );
+            match answer {
+                PutAnswer::Accept(_) => assert!(accepted, "{candidates:?} was accepted"),
+                PutAnswer::Refused(refused) => {
+                    assert!(!accepted, "{candidates:?} was refused");
+                    assert_eq!(refused.reason, proto::Reason::Invalid as u8);
+                    assert_eq!(store.metrics.puts_error, errors + 1);
+                    assert!(!store.namespaces[&id].inflight.contains(&page_key(6)));
+                }
+                _ => panic!("unexpected answer for {candidates:?}"),
+            }
+            drop(store);
+            let _ = fs::remove_dir_all(directory);
+        }
     }
 
     #[test]
@@ -4847,6 +6812,7 @@ mod tests {
                     writing: false,
                     job: None,
                     retry: Instant::now(),
+                    admitted: Instant::now(),
                     bytes,
                 },
             )
@@ -4884,6 +6850,8 @@ mod tests {
         };
         for (key, above, tail) in [(parent, None, 1), (child, Some(parent), 1)] {
             let header = crate::record::new_header(&value, key, above, [0; 16], tail).unwrap();
+            let bytes = header.length_with_row();
+            store.charged += bytes;
             let location = Location {
                 header,
                 memory: None,
@@ -4892,7 +6860,8 @@ mod tests {
                 writing: false,
                 job: None,
                 retry: Instant::now(),
-                bytes: 0,
+                admitted: Instant::now(),
+                bytes,
             };
             let tree = &mut store.namespaces.get_mut(&id).unwrap().tree;
             tree.insert(key, above, [0; 16], tail as usize, true, true, location)
@@ -4907,12 +6876,17 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: id,
                 key: parent,
                 published_parent: None,
                 bucket: [0; 16],
                 chain_pages: 1,
                 published_tail_pages: 1,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
@@ -4930,6 +6904,9 @@ mod tests {
             "a child cannot stay durable under a replaced parent"
         );
         assert!(namespace.undurable.contains(&child));
+        store.config.nvme = store.charge_total();
+        assert!(!store.make_room_evict(1));
+        assert!(store.namespaces[&id].tree[&parent].location.writing);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !store.namespaces[&id].tree[&child].location.durable {
             assert!(Instant::now() < deadline, "the rewrite never completed");
@@ -4938,8 +6915,61 @@ mod tests {
         }
         assert!(store.namespaces[&id].tree[&parent].location.durable);
         assert!(store.namespaces[&id].undurable.is_empty());
+        assert!(store.make_room_evict(1));
         drop(store);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_get_skips_only_zero_page_ancestors() {
+        let (mut store, directory) = store("get-zero-pages");
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = |tokens| Key {
+            consumed_tokens: tokens,
+            digest: [7; 16],
+        };
+        insert_node(&mut store, id, &value, key(64), None, 1);
+        insert_node(&mut store, id, &value, key(65), Some(key(64)), 0);
+        insert_node(&mut store, id, &value, key(66), Some(key(65)), 0);
+        insert_node(&mut store, id, &value, key(128), Some(key(66)), 1);
+        insert_node(&mut store, id, &value, key(192), Some(key(128)), 1);
+        let (records, grants) = store
+            .plan_get(
+                id,
+                &GetRequest {
+                    namespace: id,
+                    keys: vec![key(64), key(128)],
+                    skip_pages: 1,
+                    expected_pages: 1,
+                    row: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(
+            (grants[0].page_first, grants[0].pages, grants[0].row),
+            (1, 1, true)
+        );
+        for keys in [vec![key(64), key(192)], vec![key(128), key(64)]] {
+            let error = store
+                .plan_get(
+                    id,
+                    &GetRequest {
+                        namespace: id,
+                        keys,
+                        skip_pages: 0,
+                        expected_pages: 2,
+                        row: true,
+                    },
+                )
+                .err()
+                .expect("a missing page or unrelated key must be refused");
+            assert_eq!(error.to_string(), "Get chain");
+        }
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -4968,6 +6998,73 @@ mod tests {
         );
         drop(store);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn idle_arena_records_are_lost_on_an_unclean_stop() {
+        let (mut store, root, shm) = store_with_root("idle-arena", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [4; 16],
+        };
+        let extent = store.memory.allocate(16 << 10).unwrap();
+        insert_memory_node(&mut store, id, &value, key, None, 1, extent);
+        store.refresh_durability(id, Some(key));
+        store.pump();
+        assert!(
+            store.jobs.is_empty(),
+            "idle pump wrote an arena-only checkpoint"
+        );
+        let config = store.config.clone();
+        assert!(!store.drain_until(Instant::now()));
+        assert!(
+            store
+                .metrics_text()
+                .contains("selene_shutdown_unflushed_records 1\n")
+        );
+        assert!(store.namespaces[&id].tree[&key].location.memory.is_some());
+        drop(store);
+        let store = Store::open(config.clone()).unwrap();
+        assert!(store.namespaces.values().all(|ns| !ns.tree.contains(&key)));
+        assert!(
+            store
+                .metrics_text()
+                .contains("selene_shutdown_unflushed_bytes 16384\n")
+        );
+        drop(store); // This instance exits without recording a shutdown.
+        let store = Store::open(config).unwrap();
+        assert!(!store.metrics_text().contains("selene_shutdown_unflushed_"));
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(shm);
+    }
+
+    #[test]
+    fn drain_returns_with_a_dirty_record_when_disk_work_outlasts_its_deadline() {
+        let (store, base, shm) = store_with_root("drain-deadline", 1 << 20);
+        let mut config = store.config.clone();
+        drop(store);
+        config.faults.delay_ms = 500;
+        let mut store = Store::open(config).unwrap();
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let key = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let extent = store.memory.allocate(16 << 10).unwrap();
+        insert_memory_node(&mut store, id, &value, key, None, 1, extent);
+        store.refresh_durability(id, Some(key));
+        let started = Instant::now();
+        assert!(!store.drain_until(started + Duration::from_millis(30)));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert!(store.namespaces[&id].tree[&key].location.memory.is_some());
+        assert!(store.drain_until(Instant::now() + Duration::from_secs(5)));
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(shm);
     }
 
     #[test]
@@ -5007,12 +7104,14 @@ mod tests {
                     writing: false,
                     job: None,
                     retry: Instant::now(),
+                    admitted: Instant::now(),
                     bytes,
                 },
             )
             .unwrap();
-        // A publish refreshes durability right after it inserts, which is how scheduling finds it.
+        // Pressure starts the write before a replacement acquires the same key.
         store.refresh_durability(id, Some(key));
+        store.request_writeback(id, key);
         store.pump();
         let job = store.namespaces[&id]
             .tree
@@ -5041,6 +7140,7 @@ mod tests {
         );
         assert_eq!(location.job, Some(replacement));
         assert!(location.writing, "a stale completion cleared the new write");
+        assert!(store.namespaces[&id].tree[&key].pinned());
         drop(store);
         let _ = fs::remove_dir_all(directory);
         // `_root` is the instance's shared-memory directory.
@@ -5077,6 +7177,7 @@ mod tests {
         let put = |store: &mut Store, transfer: u64| {
             let (reply, answer) = tokio::sync::oneshot::channel();
             store.handle(StoreCommand::PutBegin {
+                ancestor_keys: Vec::new(),
                 connection: 1,
                 transfer,
                 namespace: id,
@@ -5086,6 +7187,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 1,
                 published_tail_pages: 1,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
                 events: put_events.clone(),
                 reply,
@@ -5106,6 +7211,7 @@ mod tests {
                     grants: Vec::new(),
                     requested: 0,
                     next_grant: 0,
+                    next_meta_read: 0,
                     next_meta: 0,
                     window_reads: 0,
                     pending_reads: 1,
@@ -5217,6 +7323,7 @@ mod tests {
                         writing: false,
                         job: None,
                         retry: Instant::now(),
+                        admitted: Instant::now(),
                         bytes,
                     },
                 )
@@ -5268,6 +7375,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: id,
                 key: Key {
                     consumed_tokens: 384,
@@ -5277,6 +7385,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 6,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
@@ -5309,6 +7421,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
@@ -5318,6 +7431,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
@@ -5366,12 +7483,17 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace,
                 key,
                 published_parent: None,
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
@@ -5447,6 +7569,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
@@ -5456,6 +7579,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             put_events,
@@ -5513,6 +7640,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
@@ -5522,6 +7650,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             put_events,
@@ -5550,12 +7682,17 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: id,
                 key,
                 published_parent: None,
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
@@ -5638,6 +7775,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: id,
                 key: Key {
                     consumed_tokens: 128,
@@ -5647,6 +7785,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
@@ -5703,6 +7845,7 @@ mod tests {
                 1,
                 200 + index,
                 PutRequest {
+                    ancestor_keys: Vec::new(),
                     namespace: id,
                     key: Key {
                         consumed_tokens: 128 + index * 64,
@@ -5712,6 +7855,10 @@ mod tests {
                     bucket: [0; 16],
                     chain_pages: (128 + index * 64) as u32 / 64,
                     published_tail_pages: (128 + index * 64) as u32 / 64,
+                    capture_role: CaptureRole::Legacy,
+                    child_paths: 0,
+                    descendant_row: false,
+                    next_child: None,
                     row: true,
                 },
                 put_events.clone(),
@@ -5755,6 +7902,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
@@ -5764,6 +7912,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
@@ -5798,8 +7950,8 @@ mod tests {
     }
 
     #[test]
-    fn impossible_read_fill_preserves_warm_records() {
-        let (mut store, base, directory) = store_with_root("oversize-read-fill", 96 * 1024);
+    fn an_impossible_allocation_preserves_warm_records() {
+        let (mut store, base, directory) = store_with_root("oversize-allocation", 96 * 1024);
         let descriptor = descriptor();
         store
             .hello(1, std::process::id(), None, descriptor.clone())
@@ -5822,7 +7974,7 @@ mod tests {
         node.location.durable = true;
         let used = store.memory.used();
 
-        assert!(store.memory_room(80 * 1024, true).is_none());
+        assert!(store.memory_room_excluding(80 * 1024, true, &[]).is_none());
         assert_eq!(store.memory.used(), used);
         assert!(store.namespaces[&id].tree[&key].location.memory.is_some());
 
@@ -5832,54 +7984,232 @@ mod tests {
     }
 
     #[test]
-    fn a_compacted_records_disk_charge_survives_promotion_and_eviction() {
-        let (mut store, base, directory) = store_with_root("compacted-read-fill", 64 * 1024);
-        let descriptor = descriptor();
+    fn disk_pressure_compacts_only_an_endpoint_with_a_durable_row_child() {
+        use CaptureRole::{Anchor, Endpoint, Message};
+        let (mut store, base, directory) = store_with_root("durable-rows", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        insert_chain(&mut store, id, &value, &[1, 2, 3, 4, 5]);
+        for (pages, role) in [
+            (1, Endpoint),
+            (2, Message),
+            (3, Anchor),
+            (4, Endpoint),
+            (5, Endpoint),
+        ] {
+            let key = page_key(pages);
+            let ns = store.namespaces.get_mut(&id).unwrap();
+            let path = ns.path(key).unwrap();
+            let loc = &mut ns.tree[&key].location;
+            loc.header = loc.header.clone().with_capture_role(role);
+            fs::File::create(&path)
+                .unwrap()
+                .set_len(loc.header.length(true))
+                .unwrap();
+            loc.disk = Some(Arc::new(DiskExtent::new(path)));
+            loc.durable = pages != 5;
+        }
+        let tip = page_key(5);
         store
-            .hello(1, std::process::id(), None, descriptor.clone())
-            .unwrap();
-        let id = store.sessions[&1].namespace;
-        let key = Key {
-            consumed_tokens: 64,
-            digest: [1; 16],
-        };
-        let extent = store.memory.allocate(16 * 1024).unwrap();
-        insert_memory_node(&mut store, id, &descriptor, key, None, 1, extent);
-        let node = store
             .namespaces
             .get_mut(&id)
             .unwrap()
             .tree
-            .node_mut(&key)
+            .pin(&tip)
             .unwrap();
-        let header = node.location.header.clone();
-        node.row = false;
-        node.location.disk = Some(Arc::new(DiskExtent::new(base.join("compacted.ckpt"))));
-        node.location.durable = true;
-        node.location.memory = None;
-        node.location.bytes = header.length(false);
-        store.charged = node.location.bytes;
-
-        let extent = Arc::new(
-            store
-                .memory
-                .allocate(header.length(false) as usize)
-                .unwrap(),
-        );
-        let charge = extent.capacity() as u64;
-        store.get_filled(id, &header, extent);
-        assert!(store.namespaces[&id].tree[&key].location.memory.is_some());
-        assert_eq!(store.charge_total(), charge);
-        assert!(store.evict_memory(id, key));
-        assert_eq!(store.charge_total(), header.length(false));
-
+        store.config.nvme = store.charge_total();
+        assert!(!store.make_room_evict(1));
+        assert!(store.jobs.is_empty());
+        store.namespaces.get_mut(&id).unwrap().tree[&tip]
+            .location
+            .durable = true;
+        assert!(!store.make_room_evict(1));
+        assert_eq!(store.metrics.compactions, 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !store.jobs.is_empty() {
+            assert!(Instant::now() < deadline);
+            store.disk_events();
+            std::thread::yield_now();
+        }
+        assert!(store.make_room_evict(1));
+        for pages in 1..=5 {
+            let node = &store.namespaces[&id].tree[&page_key(pages)];
+            let row = pages != 4;
+            assert_eq!(node.row, row);
+            assert_eq!(
+                fs::metadata(&node.location.disk.as_ref().unwrap().path)
+                    .unwrap()
+                    .len(),
+                node.location.header.length(row)
+            );
+        }
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn fragmented_arena_holes_fall_back_to_streaming() {
+    fn disk_pressure_keeps_the_only_row_above_a_page_only_child() {
+        let (mut store, base, directory) = store_with_root("anchor-compaction", 64 * 1024);
+        let descriptor = descriptor();
+        store
+            .hello(1, std::process::id(), None, descriptor.clone())
+            .unwrap();
+        let id = store.sessions[&1].namespace;
+        let root = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let tail = Key {
+            consumed_tokens: 128,
+            digest: [2; 16],
+        };
+        for (key, parent) in [(root, None), (tail, Some(root))] {
+            let extent = store.memory.allocate(16 * 1024).unwrap();
+            insert_memory_node(&mut store, id, &descriptor, key, parent, 1, extent);
+            let node = &mut store.namespaces.get_mut(&id).unwrap().tree[&key];
+            node.location.durable = true;
+        }
+        let tree = &mut store.namespaces.get_mut(&id).unwrap().tree;
+        tree[&tail].row = false;
+        tree.pin(&tail).unwrap();
+        store.config.nvme = 0;
+
+        // The pinned page-only tail resumes from the root's row, so the root
+        // must not be compacted to make room.
+        assert!(!store.make_room_evict(1));
+        assert!(store.namespaces[&id].tree[&root].row);
+        assert_eq!(store.metrics.compactions, 0);
+
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// Durable, resident records of one namespace linked as `links` says, each of one page,
+    /// whose keys are named by `(pages, digest)`.
+    fn durable_records(
+        store: &mut Store,
+        id: NamespaceId,
+        value: &Descriptor,
+        links: &[((u64, u8), Option<(u64, u8)>)],
+        page_only: Option<(u64, u8)>,
+    ) {
+        let key = |(pages, digest): (u64, u8)| Key {
+            consumed_tokens: pages * 64,
+            digest: [digest; 16],
+        };
+        for &(record, parent) in links {
+            let header = crate::record::new_header(value, key(record), parent.map(key), [0; 16], 1)
+                .unwrap()
+                .with_capture_role(CaptureRole::Endpoint);
+            let extent = store
+                .memory
+                .allocate(header.length_with_row() as usize)
+                .unwrap();
+            insert_memory_node(store, id, value, key(record), parent.map(key), 1, extent);
+            let namespace = store.namespaces.get_mut(&id).unwrap();
+            let path = namespace.path(key(record)).unwrap();
+            let row = Some(record) != page_only;
+            File::create(&path)
+                .unwrap()
+                .set_len(header.length(row))
+                .unwrap();
+            if !row {
+                namespace.tree.drop_row(&key(record));
+            }
+            let location = &mut namespace.tree[&key(record)].location;
+            location.header = header;
+            location.disk = Some(Arc::new(DiskExtent::new(path)));
+            location.durable = true;
+        }
+    }
+
+    #[test]
+    fn evicting_a_leaf_with_a_row_updates_the_row_counts_that_guard_compaction() {
+        let (mut store, base, directory) = store_with_root("row-counts-leaf", 64 * 1024);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let (root, fork, with_row, page_only) = ((1, 1), (2, 2), (3, 3), (3, 4));
+        durable_records(
+            &mut store,
+            id,
+            &value,
+            &[
+                (root, None),
+                (fork, Some(root)),
+                (with_row, Some(fork)),
+                (page_only, Some(fork)),
+            ],
+            Some(page_only),
+        );
+        let key = |(pages, digest): (u64, u8)| Key {
+            consumed_tokens: pages * 64,
+            digest: [digest; 16],
+        };
+        let charge = store.namespaces[&id].tree[&key(fork)].location.bytes;
+        // Room is made by evicting the two leaves, oldest first. Once the leaf with the
+        // row is gone, the fork's only remaining child has no row, so it keeps its row.
+        store.config.nvme = 2 * charge;
+        assert!(store.make_room_evict(0));
+        let tree = &store.namespaces[&id].tree;
+        assert!(tree.node(&key(with_row)).is_none() && tree.node(&key(page_only)).is_none());
+        assert!(
+            tree[&key(fork)].row,
+            "the parent of a page-only child lost its row"
+        );
+        assert_eq!(store.metrics.compactions, 0);
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn compacting_a_record_updates_the_row_counts_that_guard_its_parents_compaction() {
+        let (mut store, base, directory) = store_with_root("row-counts-compact", 64 * 1024);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let (root, top, middle, leaf) = ((1, 1), (2, 2), (3, 3), (4, 4));
+        durable_records(
+            &mut store,
+            id,
+            &value,
+            &[
+                (root, None),
+                (top, Some(root)),
+                (middle, Some(top)),
+                (leaf, Some(middle)),
+            ],
+            None,
+        );
+        let key = |(pages, digest): (u64, u8)| Key {
+            consumed_tokens: pages * 64,
+            digest: [digest; 16],
+        };
+        let tree = &mut store.namespaces.get_mut(&id).unwrap().tree;
+        // The middle record is the oldest, so it is compacted first; the top record is
+        // next in age, and the leaf is newest.
+        tree.access_at(&key(middle), 1);
+        tree.access_at(&key(top), 2);
+        tree.access_at(&key(leaf), 3);
+        let charge = tree[&key(top)].location.bytes;
+        store.config.nvme = 3 * charge;
+        assert!(store.make_room_evict(0));
+        finish_jobs(&mut store);
+        // After the middle record lost its row, the top record's only child has none, so
+        // the top record keeps its row and the leaf is evicted instead.
+        let tree = &store.namespaces[&id].tree;
+        assert!(!tree[&key(middle)].row);
+        assert!(tree[&key(top)].row, "the top record was compacted as well");
+        assert!(tree.node(&key(leaf)).is_none());
+        assert_eq!(store.metrics.compactions, 1);
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn fragmented_arena_writes_a_dirty_record_before_admission() {
         // 64 KiB arena with 16 KiB live at 0 and 32 KiB; the freed buddies
         // leave 32 KiB free as two separated 16 KiB holes.
         let (mut store, base, directory) = store_with_root("fragmented", 64 * 1024);
@@ -5923,13 +8253,13 @@ mod tests {
             1,
             third,
         );
-        // A 32 KiB record cannot use the holes. With no evictable leaf (the
-        // occupants are not durable) the Put streams instead of refusing.
+        // The allocation needs a contiguous extent, so admission waits for write-back.
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: id,
                 key: Key {
                     consumed_tokens: 192,
@@ -5942,18 +8272,30 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 3,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
         );
         store.dispatch_trace();
-        let open = &store.sessions[&1].ops[&1];
-        let Operation::Put(put) = &open.operation else {
-            panic!("expected Put");
-        };
-        assert!(put.streaming);
-        assert!(put.memory.is_none());
-        assert_eq!(put.staging_hold.as_ref().unwrap().capacity(), 2 * 16 * 1024);
+        assert!(!store.writeback.is_empty());
+        assert!(
+            store
+                .metrics_text()
+                .contains("selene_put_writeback_waits_total 1\n")
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !store.sessions[&1].ops.contains_key(&1) {
+            assert!(Instant::now() < deadline);
+            store.pump();
+            std::thread::yield_now();
+        }
+        let put = put_ref(&store.sessions, 1, 1).unwrap();
+        assert!(put.memory.is_some());
+        assert!(!put.streaming);
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);
@@ -5973,6 +8315,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
@@ -5982,6 +8325,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             put_events,
@@ -6055,6 +8402,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
                     consumed_tokens: 128,
@@ -6064,6 +8412,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 2,
                 published_tail_pages: 2,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events.clone(),
@@ -6076,6 +8428,7 @@ mod tests {
             1,
             2,
             PutRequest {
+                ancestor_keys: Vec::new(),
                 namespace: id,
                 key: Key {
                     consumed_tokens: 192,
@@ -6085,6 +8438,10 @@ mod tests {
                 bucket: [0; 16],
                 chain_pages: 3,
                 published_tail_pages: 3,
+                capture_role: CaptureRole::Legacy,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
                 row: true,
             },
             events,
@@ -6138,16 +8495,344 @@ mod tests {
         store.namespaces.get_mut(&id).unwrap().tree[&key]
             .location
             .writing = true;
-        assert_eq!(store.oldest(|_| true), Some(entries[2]));
+        assert_eq!(store.oldest(|_, _| true), Some(entries[2]));
         let (id, key) = entries[2];
         store.reused(id, key);
-        assert_eq!(store.oldest(|_| true), Some(entries[3]));
+        assert_eq!(store.oldest(|_, _| true), Some(entries[3]));
         assert_eq!(
-            store.oldest(|node| node.key.consumed_tokens == 128),
+            store.oldest(|_, node| node.key.consumed_tokens == 128),
             Some(entries[4])
         );
         drop(store);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A page-only parent whose write-back is in flight, with one resident child.
+    /// The write is submitted but its completion is not polled until the next pump.
+    fn page_only_parent_writing(label: &str) -> (Store, PathBuf, PathBuf, NamespaceId) {
+        let (mut store, base, directory) = store_with_root(label, 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        insert_chain(&mut store, id, &value, &[1, 2]);
+        let namespace = store.namespaces.get_mut(&id).unwrap();
+        namespace.tree.drop_row(&page_key(1));
+        store.refresh_durability(id, Some(page_key(1)));
+        store.request_writeback(id, page_key(1));
+        assert!(
+            store.namespaces[&id].tree[&page_key(1)].location.writing,
+            "the parent's write-back was not submitted"
+        );
+        (store, base, directory, id)
+    }
+
+    fn finish_jobs(store: &mut Store) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !store.jobs.is_empty() {
+            assert!(Instant::now() < deadline, "the disk jobs never completed");
+            store.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn expiring_a_child_keeps_a_page_only_parent_whose_write_is_in_flight() {
+        let (mut store, base, directory, id) = page_only_parent_writing("expire-writing-parent");
+        store.config.max_age = Duration::from_secs(7200);
+        let namespace = store.namespaces.get_mut(&id).unwrap();
+        namespace.tree.max_age = store.config.max_age;
+        namespace.tree.node_mut(&page_key(2)).unwrap().last_used = SystemTime::UNIX_EPOCH;
+        // Exercise the disk-job guard independently of the write-back pin.
+        namespace.tree.unpin(&page_key(1)).unwrap();
+        store.tick();
+        let tree = &store.namespaces[&id].tree;
+        assert!(
+            tree.node(&page_key(2)).is_none(),
+            "the child did not expire"
+        );
+        assert!(
+            tree.node(&page_key(1)).is_some(),
+            "expiry removed a parent whose write is in flight"
+        );
+        assert_eq!(store.evict_accounted(id, page_key(1)), 0);
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .pin(&page_key(1))
+            .unwrap();
+        finish_jobs(&mut store);
+        let location = &store.namespaces[&id].tree[&page_key(1)].location;
+        assert!(location.disk.is_some() && !location.writing);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn mark_endpoint(store: &mut Store, id: NamespaceId, key: Key) {
+        let loc = &mut store.namespaces.get_mut(&id).unwrap().tree[&key].location;
+        loc.header = loc.header.clone().with_capture_role(CaptureRole::Endpoint);
+    }
+
+    #[test]
+    fn a_finishing_stream_can_write_its_pinned_former_tip() {
+        let (mut store, base, shm) = store_with_root("stream-prune", 64 << 10);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store.hello(1, std::process::id(), None, value.clone()).unwrap();
+        insert_chain(&mut store, id, &value, &[1, 2]);
+        store.refresh_durability(id, None);
+        store.write_ancestor(id, page_key(1), "dependency");
+        finish_jobs(&mut store);
+        let parent = page_key(2);
+        mark_endpoint(&mut store, id, parent);
+        assert!(matches!(
+            first_put_answer(&mut store, id, page_key(32), Some(parent), vec![parent], true),
+            PutAnswer::Accept(_)
+        ));
+        assert!(put_ref(&store.sessions, 1, 1).unwrap().streaming);
+        let sibling = store.memory.allocate(16 << 10).unwrap();
+        insert_memory_node(&mut store, id, &value, page_key(3), Some(parent), 1, sibling);
+        store.prune_former_tip(id, parent);
+        assert!(store.pending_former_tips.contains(&(id, parent)));
+        store.schedule_finish(1, 1, id);
+        finish_jobs(&mut store);
+        let node = &store.namespaces[&id].tree[&parent];
+        assert!(node.location.durable && node.row && node.pinned());
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(shm).unwrap();
+    }
+
+    #[test]
+    fn a_page_only_child_preserves_its_parents_last_row() {
+        let (mut store, dir, id) = held_chain("last-parent", 1 << 20, &[1, 2, 3], &[3]);
+        mark_endpoint(&mut store, id, page_key(2));
+        store.prune_former_tip(id, page_key(2));
+        assert!(store.namespaces[&id].tree[&page_key(2)].row);
+        assert!(matches!(
+            first_put_answer(&mut store, id, page_key(4), Some(page_key(3)), vec![], true),
+            PutAnswer::Accept(_)
+        ));
+        store.publish_put(1, 1, None);
+        assert!(store.namespaces[&id].tree[&page_key(4)].row);
+        assert!(!store.namespaces[&id].tree[&page_key(2)].row);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn evicting_a_sibling_preserves_the_forks_row() {
+        let (mut store, dir, id) = held_chain("fork-evict", 1 << 20, &[1, 2, 3], &[]);
+        let parent = page_key(2);
+        mark_endpoint(&mut store, id, parent);
+        let sibling = Key {
+            digest: [99; 16],
+            ..page_key(3)
+        };
+        let extent = store.memory.allocate(16 << 10).unwrap();
+        insert_memory_node(
+            &mut store,
+            id,
+            &descriptor(),
+            sibling,
+            Some(parent),
+            1,
+            extent,
+        );
+        assert_eq!(store.evict_accounted(id, sibling), 1);
+        assert!(store.namespaces[&id].tree[&parent].row);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_disk_flush_stops_at_the_signal_deadline() {
+        let (mut store, base, shm) = store_with_root("flush-budget", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        insert_chain(&mut store, id, &value, &[1]);
+        store.refresh_durability(id, None);
+        let path = store.namespaces[&id].path(page_key(1)).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let owner = std::thread::spawn(move || {
+            crate::control::run_store_owner(
+                store,
+                rx,
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                Arc::new(std::sync::Mutex::new(None)),
+            )
+        });
+        let (reply, seen) = std::sync::mpsc::channel();
+        tx.blocking_send(StoreCommand::Metrics { reply }).unwrap();
+        seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        tx.blocking_send(StoreCommand::Shutdown { deadline })
+            .unwrap();
+        owner.join().unwrap();
+        assert!(
+            !path.exists(),
+            "the flush started a write after the shared deadline"
+        );
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(shm).unwrap();
+    }
+
+    #[test]
+    fn drain_skips_page_only_leaves_and_writes_rows_first() {
+        let (store, base, shm) = store_with_root("drain-priority", 1 << 20);
+        let mut config = store.config.clone();
+        drop(store);
+        config.faults.delay_ms = 100;
+        let mut store = Store::open(config).unwrap();
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        insert_chain(&mut store, id, &value, &[1, 2, 3]);
+        mark_endpoint(&mut store, id, page_key(2));
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .drop_row(&page_key(3));
+        for n in 10..14 {
+            let key = Key {
+                digest: [n; 16],
+                ..page_key(1)
+            };
+            let extent = store.memory.allocate(16 << 10).unwrap();
+            insert_memory_node(&mut store, id, &value, key, None, 1, extent);
+        }
+        store.refresh_durability(id, None);
+        assert!(!store.drain_until(Instant::now() + Duration::from_millis(30)));
+        assert_eq!(
+            store
+                .jobs
+                .values()
+                .filter(|j| matches!(j, Job::Write { key, .. } if key.consumed_tokens == 64))
+                .count(),
+            4
+        );
+        assert!(store.drain_until(Instant::now() + Duration::from_secs(5)));
+        let ns = &store.namespaces[&id];
+        assert!(ns.tree[&page_key(2)].location.durable);
+        assert!(ns.tree[&page_key(3)].location.disk.is_none());
+        assert!(
+            store
+                .metrics_text()
+                .contains("selene_shutdown_unflushed_records 0\n")
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(shm).unwrap();
+    }
+
+    #[test]
+    fn arena_pressure_starts_bounded_independent_writes() {
+        let (mut store, base, shm) = store_with_root("arena-parallel", 128 << 10);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        for n in 1..=8 {
+            let key = Key {
+                digest: [n; 16],
+                ..page_key(1)
+            };
+            let extent = store.memory.allocate(16 << 10).unwrap();
+            insert_memory_node(&mut store, id, &value, key, None, 1, extent);
+        }
+        store.refresh_durability(id, None);
+        assert!(store.memory_room_excluding(16 << 10, true, &[]).is_none());
+        assert_eq!(
+            store
+                .jobs
+                .values()
+                .filter(|j| matches!(j, Job::Write { .. }))
+                .count(),
+            4
+        );
+        // Readers can hold the first four extents after their writes finish.
+        let writing: Vec<_> = store.namespaces[&id].tree.nodes()
+            .filter(|n| n.location.writing).map(|n| n.key).collect();
+        for key in writing {
+            store.namespaces.get_mut(&id).unwrap().tree.pin(&key).unwrap();
+        }
+        finish_jobs(&mut store);
+        assert!(store.memory_room_excluding(16 << 10, true, &[]).is_none());
+        assert_eq!(store.jobs.len(), 4);
+        finish_jobs(&mut store);
+        assert!(store.memory_room_excluding(16 << 10, true, &[]).is_some());
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(shm).unwrap();
+    }
+
+    #[test]
+    fn independent_dirty_roots_flush_before_a_serial_writers_deadline() {
+        let (store, base, shm) = store_with_root("parallel-drain", 1 << 20);
+        let mut config = store.config.clone();
+        drop(store);
+        config.faults.delay_ms = 100;
+        let mut store = Store::open(config).unwrap();
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        for n in 1..=16 {
+            let key = Key {
+                digest: [n; 16],
+                ..page_key(1)
+            };
+            let extent = store.memory.allocate(16 << 10).unwrap();
+            insert_memory_node(&mut store, id, &value, key, None, 1, extent);
+        }
+        store.refresh_durability(id, None);
+        assert!(store.drain_until(Instant::now() + Duration::from_millis(1250)));
+        assert!(
+            store.namespaces[&id]
+                .tree
+                .nodes()
+                .all(|n| n.location.durable)
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(shm).unwrap();
+    }
+
+    #[test]
+    fn rootless_metrics_omit_dirty_inventory() {
+        let (store, dir) = store("dirty-gauges");
+        let text = store.metrics_text();
+        assert!(
+            !text.contains("selene_arena_only_bytes")
+                && !text.contains("selene_oldest_dirty_seconds")
+        );
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writeback_waits_for_a_put_replacing_its_dirty_ancestor() {
+        let (mut store, base, directory) = store_with_root("replace-dirty", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        store.hello(1, 0, None, value.clone()).unwrap();
+        insert_chain(&mut store, id, &value, &[1, 2]);
+        let parent = page_key(1);
+        store.namespaces.get_mut(&id).unwrap().tree.drop_row(&parent);
+        assert!(matches!(
+            first_put_answer(&mut store, id, parent, None, Vec::new(), true),
+            PutAnswer::Accept(_)
+        ));
+
+        store.request_writeback(id, page_key(2));
+        assert!(store.jobs.is_empty());
+        store.cancel(1, 1);
+        store.pump();
+        assert!(store.namespaces[&id].tree[&parent].location.disk_busy());
+        finish_jobs(&mut store);
+        assert!(store.namespaces[&id].tree[&page_key(2)].location.durable);
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
