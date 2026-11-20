@@ -24,8 +24,10 @@ TOKEN_FIELDS = ("bos_token", "eos_token", "unk_token", "sep_token", "pad_token",
 def annotated_template_asset(source: bytes, patch_path: Path):
     """Insert message marks into exact checkpoint bytes, without bundling that source."""
     patch = json.loads(patch_path.read_text())
-    if hashlib.sha256(source).hexdigest() != patch["source_sha256"]:
-        raise ValueError(f"checkpoint chat template does not match {patch_path}")
+    digest = hashlib.sha256(source).hexdigest()
+    if digest != patch["source_sha256"]:
+        raise ValueError(f"checkpoint chat template does not match {patch_path}: its SHA-256 is {digest},"
+                         f" and the patch applies to {patch['source_sha256']}")
     parts, previous = [], 0
     for offset in patch["insertions"]:
         if type(offset) is not int or not previous <= offset <= len(source):
@@ -42,9 +44,19 @@ def downloaded_template_asset(patch_path: Path, *, cache_dir=None):
     """Fetch a canonical template at its pinned HF revision, then annotate it."""
     from huggingface_hub import hf_hub_download
 
+    from ignition.errors import FetchError
+
     source = json.loads(patch_path.read_text())["source"]
-    path = hf_hub_download(source["repository"], source["filename"],
-                           revision=source["revision"], cache_dir=cache_dir)
+    try:
+        path = hf_hub_download(source["repository"], source["filename"],
+                               revision=source["revision"], cache_dir=cache_dir)
+    except Exception as error:  # noqa: BLE001 - Network, authorization, and disk failures share one exit code.
+        raise FetchError(
+            f"cannot read {source['filename']} of {source['repository']} at revision {source['revision']}: {error}."
+            f" This chat template is not part of the checkpoint snapshot, so preparation needs it in the hub cache."
+            f" On a host without network access, run `hf download {source['repository']} {source['filename']}"
+            f" --revision {source['revision']} --cache-dir <hub cache>` on a connected host and copy the"
+            f" downloaded cache entries to the hub cache of this host.") from error
     return annotated_template_asset(Path(path).read_bytes(), patch_path)
 
 

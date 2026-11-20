@@ -5,6 +5,7 @@
 """Qualified checkpoint, serving range, and memory costs of the GLM 5.3 recipe."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -38,6 +39,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     from ignition.preparation.rank_group import prepare_group
 
     from .bootstrap import PreparationConfig, prepare_rank
+    from .frontend import chat_template_asset
 
     speculation = plan.speculation
     drafting = {} if speculation is None else {
@@ -60,8 +62,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         # 4.9 GB per rank at TP4, which GB10 holds beside its weights, but 9.7 GB at TP2, which it does not.
         expand_expert_scales=plan.world_size >= 4,
         mtp=speculation is not None, **drafting)
-    # A refusal is reported here, before any rank starts, so that its guidance reaches the command line at every
-    # rank count; a rank that fails during preparation prints a traceback.
+    # A refusal or a failed template download is reported here, before any rank starts, so that its guidance
+    # reaches the command line at every rank count; a rank that fails during preparation prints a traceback.
     if speculation is not None and any(gpu.capability == (10, 3) for gpu in plan.gpus):
         from ignition.preparation.quantization import quantized_layers
 
@@ -69,6 +71,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
 
         require_draft_experts_supported(
             quantized_layers(json.loads((Path(snapshot) / "config.json").read_text())), sm103=True)
+    config = replace(config, chat_template=chat_template_asset(Path(snapshot).resolve(), cache_dir=plan.hub_cache))
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,

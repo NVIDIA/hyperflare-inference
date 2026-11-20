@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render GLM request cases with the checkpoint's canonical Transformers template."""
+"""Render GLM requests with the selected template and checkpoint tokenizer."""
 
 import argparse
 import base64
@@ -14,11 +14,13 @@ from pathlib import Path
 from transformers import AutoProcessor, AutoTokenizer
 from PIL import Image
 
-from ignition.preparation.frontend import annotated_template_asset
+from ignition.recipes.glm53.frontend import chat_template_asset
 
 
 def generate(snapshot):
     tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
+    source = chat_template_asset(snapshot)["text"]
+    tokenizer.chat_template = source.replace("{%- mark -%}", "")
     tool = {"type": "function", "function": {"name": "lookup", "parameters": {
         "type": "object", "properties": {"city": {"type": "string"}, "count": {"type": "integer"}}}}}
     system = {"role": "system", "content": "Answer accurately. α 世界"}
@@ -31,15 +33,12 @@ def generate(snapshot):
         effective = {"add_generation_prompt": not continuation, **options}
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, **effective)
         ids = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=False, **effective)
-        source = annotated_template_asset(tokenizer.get_chat_template().encode(),
-            Path(__file__).resolve().parents[2] / "ignition/recipes/glm53/assets/chat_template.patch.json")["text"]
-        assert source.replace("{%- mark -%}", "") == tokenizer.get_chat_template()
         marker = "\0message-position\0"
         while marker in rendered:
             marker += "_"
-        annotated = source.replace("{%- mark -%}", "{{- message_position() -}}")
+        annotated = source.replace("{%- mark -%}", "{{- message_position -}}")
         marked = tokenizer.apply_chat_template(messages, chat_template=annotated, tokenize=False,
-            message_position=lambda: marker, **effective)
+            message_position=marker, **effective)
         chunks = marked.split(marker)
         assert "".join(chunks) == rendered
         positions, position = [], 0
@@ -79,6 +78,12 @@ def generate(snapshot):
                {"role": "tool", "tool_call_id": "b", "content": "London: cloudy"},
                {"role": "tool", "tool_call_id": "a", "content": "Paris: clear"}]
     add("parallel_tool_results", history, {"tools": [tool]}, wire_strings=True)
+    case_history = copy.deepcopy(history)
+    case_history[2]["tool_calls"][0]["id"] = "a"
+    case_history[2]["tool_calls"][1]["id"] = "A"
+    case_history[3]["tool_call_id"], case_history[4]["tool_call_id"] = "A", "a"
+    add("case_sensitive_tool_ids", case_history, {"tools": [tool]}, wire_strings=True)
+    add("duplicate_tool_results", [*history, history[3]], {"tools": [tool]}, wire_strings=True)
     for clear in (False, True):
         add(f"retained_reasoning_{clear}", [*history, {"role": "user", "content": "Compare."}],
             {"tools": [tool], "clear_thinking": clear})
@@ -89,6 +94,7 @@ def generate(snapshot):
     add("empty_assistant_continuation", [system, user, {"role": "assistant", "content": "", "reasoning_content": ""}],
         {"continue_final_message": True})
     processor = AutoProcessor.from_pretrained(snapshot, local_files_only=True)
+    processor.chat_template = tokenizer.chat_template
     image_cases = []
     for count in (1, 2):
         images = [Image.new("RGB", (112 + 28 * i, 84), (31 * i, 100, 210)) for i in range(count)]

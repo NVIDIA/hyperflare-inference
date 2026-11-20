@@ -86,6 +86,134 @@ def test_gemma_fetches_pinned_canonical_template(hidden, filename, repository, r
         chat_template_asset(4096, cache_dir=tmp_path)
 
 
+HUB = Path.home() / ".cache/huggingface/hub"
+ZAI = dict(repository="zai-org/GLM-5.3-Flash", filename="chat_template.jinja",
+           revision="46a050bec13002ad29ee795c16e61cf4fa3c4a9c")
+
+
+@pytest.fixture
+def calibrated_template(tmp_path):
+    """The chat_template.jinja bytes of the calibrated checkpoint's pinned revision, in a snapshot directory."""
+    bundled = (HUB / "models--local-inference-lab--GLM-5.3-Flash-NVFP4" / "snapshots"
+               / "378ca54585c46542bad1f3cb3ed0d73ae51cdb62" / "chat_template.jinja")
+    if not bundled.is_file():
+        pytest.skip("the calibrated GLM checkpoint's chat template is not in the hub cache")
+    (tmp_path / "chat_template.jinja").write_bytes(bundled.read_bytes())
+    return tmp_path
+
+
+def stub_download(monkeypatch, result):
+    calls = []
+
+    def download(repo, name, **kwargs):
+        calls.append((repo, name, kwargs))
+        if isinstance(result, Exception):
+            raise result
+        return result
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(hf_hub_download=download))
+    return calls
+
+
+def test_glm_nvidia_template_is_annotated_in_place(monkeypatch, tmp_path):
+    from ignition.recipes.glm53 import frontend
+
+    calls = stub_download(monkeypatch, fixture("glm53", "chat_template.zai.source.jinja"))
+    (tmp_path / "chat_template.jinja").write_bytes(fixture("glm53", "chat_template.source.jinja").read_bytes())
+    asset = frontend.chat_template_asset(tmp_path, cache_dir=tmp_path)
+    assert asset["text"].encode() == fixture("glm53", "chat_template.jinja").read_bytes()
+    assert not calls
+    (tmp_path / "chat_template.jinja").write_bytes((tmp_path / "chat_template.jinja").read_bytes() + b" ")
+    with pytest.raises(ValueError, match="does not match") as error:
+        frontend.chat_template_asset(tmp_path, cache_dir=tmp_path)
+    assert hashlib.sha256((tmp_path / "chat_template.jinja").read_bytes()).hexdigest() in str(error.value)
+    assert not calls
+
+
+def test_glm_calibrated_template_is_replaced_by_the_canonical_source(monkeypatch, calibrated_template):
+    """The real bytes of the calibrated checkpoint's template select the pinned canonical download."""
+    from ignition.recipes.glm53 import frontend
+
+    bundled = (calibrated_template / "chat_template.jinja").read_bytes()
+    assert hashlib.sha256(bundled).hexdigest() == frontend.CALIBRATED_TEMPLATE_SHA256
+    calls = stub_download(monkeypatch, fixture("glm53", "chat_template.zai.source.jinja"))
+    asset = frontend.chat_template_asset(calibrated_template, cache_dir=calibrated_template)
+    assert calls == [(ZAI["repository"], ZAI["filename"],
+                      dict(revision=ZAI["revision"], cache_dir=calibrated_template))]
+    assert asset["text"].encode() == fixture("glm53", "chat_template.zai.jinja").read_bytes()
+    assert asset["text"].replace("{%- mark -%}", "").encode() != bundled
+    # A single changed byte of the bundled template is neither replaced nor annotated.
+    calls.clear()
+    (calibrated_template / "chat_template.jinja").write_bytes(bundled + b" ")
+    with pytest.raises(ValueError, match="does not match") as error:
+        frontend.chat_template_asset(calibrated_template, cache_dir=calibrated_template)
+    assert hashlib.sha256(bundled + b" ").hexdigest() in str(error.value)
+    assert not calls
+
+
+def test_glm_download_failure_says_how_to_seed_the_hub_cache(monkeypatch, calibrated_template):
+    from ignition.errors import FetchError
+    from ignition.recipes.glm53 import frontend
+
+    stub_download(monkeypatch, OSError("offline"))
+    with pytest.raises(FetchError, match=r"offline.*hf download zai-org/GLM-5.3-Flash chat_template.jinja"
+                                         r" --revision 46a050bec13002ad29ee795c16e61cf4fa3c4a9c --cache-dir"):
+        frontend.chat_template_asset(calibrated_template, cache_dir=calibrated_template)
+
+
+def render(template, messages, **options):
+    """Render with Transformers, the reference implementation of GLM's chat template."""
+    from transformers.utils.chat_template_utils import render_jinja_template
+
+    return render_jinja_template([messages], chat_template=template, add_generation_prompt=True, **options)[0][0]
+
+
+def test_calibrated_and_canonical_templates_differ_only_on_null_content(calibrated_template):
+    """Why the canonical template is required: the bundled copy writes the text "None" for null content.
+
+    Tool-result matching is implemented differently (the bundled template scans every result for each call, the
+    canonical one sorts) but renders the same prompts, so a prompt differs only through null content.
+    """
+    bundled = (calibrated_template / "chat_template.jinja").read_text()
+    canonical = fixture("glm53", "chat_template.zai.source.jinja").read_text()
+    assert hashlib.sha256(canonical.encode()).hexdigest() == json.loads(
+        (ROOT / "ignition/recipes/glm53/assets/chat_template.zai.patch.json").read_text())["source_sha256"]
+    tool = {"type": "function", "function": {"name": "lookup", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}}}}}
+
+    def call(identifier):
+        return {"id": identifier, "type": "function", "function": {"name": "lookup", "arguments": {"city": "Paris"}}}
+
+    def conversation(content, calls, results):
+        return [{"role": "user", "content": "Weather?"},
+                {"role": "assistant", "content": content, "tool_calls": [call(i) for i in calls]},
+                *({"role": "tool", "tool_call_id": i, "content": f"result {i}"} for i in results)]
+
+    # The only rendered difference: an assistant message without text.
+    null_bundled = render(bundled, conversation(None, ["a"], ["a"]), tools=[tool])
+    null_canonical = render(canonical, conversation(None, ["a"], ["a"]), tools=[tool])
+    assert "<think></think>None<tool_call>" in null_bundled
+    assert "<think></think><tool_call>" in null_canonical
+    assert null_bundled.replace("</think>None<tool_call>", "</think><tool_call>") == null_canonical
+    # Null content in any role renders as text in the bundled copy only.
+    for role in ("system", "user"):
+        messages = [{"role": role, "content": None}, {"role": "user", "content": "Weather?"}]
+        assert "None" in render(bundled, messages) and "None" not in render(canonical, messages)
+    # Tool results as one message of output entries, in call order and reordered.
+    for results in (["a", "b"], ["b", "a"]):
+        messages = [*conversation("", ["a", "b"], [])[:2], {"role": "tool", "content": [
+            {"tool_call_id": i, "output": f"result {i}"} for i in results]}]
+        assert render(bundled, messages, tools=[tool]) == render(canonical, messages, tools=[tool]), results
+        assert render(canonical, messages, tools=[tool]).index("result a") < render(
+            canonical, messages, tools=[tool]).index("result b")
+    # Tool results in call order, reordered, matched by identifiers that differ in case, duplicated or unknown.
+    for calls, results in ((["a", "b"], ["a", "b"]), (["a", "b"], ["b", "a"]), (["a", "A"], ["A", "a"]),
+                           (["a", "b", "c"], ["c", "a", "b"]), (["a", "b"], ["a", "a"]), (["a"], ["zzz"]),
+                           (["a", "b"], ["b"])):
+        messages = conversation("", calls, results)
+        assert render(bundled, messages, tools=[tool]) == render(canonical, messages, tools=[tool]), (calls, results)
+        assert "result" in render(canonical, messages, tools=[tool])
+
+
 def test_step_assets_preserve_checkpoint_and_validate_generation_span(tmp_path):
     from ignition.recipes.step5.frontend import runtime_assets, inference_template
 

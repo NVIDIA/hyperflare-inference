@@ -27,6 +27,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
+from .frontend import chat_template_asset
 from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_core_pb2 as contract_proto
@@ -42,7 +43,7 @@ from ignition.preparation.collectives import (
 )
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
-from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
+from ignition.preparation.frontend import prepare_frontend
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.scratch import ScratchArena
@@ -99,6 +100,9 @@ class PreparationConfig:
     compile_decoder: bool = True
     retain_graphs: bool = False
     kernel_cache: Path | None = None
+    # The annotated chat template, resolved once before the ranks start so that a failed download surfaces
+    # from the process that reports preparation errors; None makes a rank resolve it from the snapshot.
+    chat_template: dict | None = None
     mtp: bool = False
     # SM103 uses checkpoint-scaled A4; SM120/121 retain A16 with A4 prefill launches.
     expert_activation: str = "auto"
@@ -272,6 +276,11 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                f"reserved={torch.cuda.memory_reserved(device) >> 20} MiB, rss={rss >> 20} MiB")
 
     snapshot = Path(snapshot).resolve()
+    # Only a rank that exports a server section needs the template: rank zero, or every rank when all
+    # ranks share one host. Ranks on other hosts export weight-only bundles.
+    template = None
+    if rank == 0 or config.hosts is None:
+        template = config.chat_template or chat_template_asset(snapshot)
     shard = TensorParallelShard(rank, len(config.devices))
     if (shard.world_size > 1) != (group is not None):
         raise ValueError("a GLM rank group exists exactly when more than one rank prepares")
@@ -658,8 +667,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         memory.update(scoring.memory_report())
     assets = {role: {"path": str(snapshot / filename)}
         for role, filename in (("tokenizer", "tokenizer.json"),)}
-    assets["chat_template"] = annotated_template_asset(
-        (snapshot / "chat_template.jinja").read_bytes(), Path(__file__).with_name("assets") / "chat_template.patch.json")
+    if template is not None:
+        assets["chat_template"] = template
     generation = json.loads((snapshot / "generation_config.json").read_text())
     from .mla import MLAState
     cache_regions = []

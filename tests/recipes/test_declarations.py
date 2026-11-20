@@ -249,12 +249,38 @@ def test_qwen_adapter_passes_speculation_overrides(monkeypatch, tmp_path):
     assert 1 + config.request_capacity + plan.snapshots == plan.live_rows + plan.cache_states
 
 
+GLM_TEMPLATE = {"text": "annotated template", "sha256": "0" * 64}
+
+
+@pytest.fixture
+def glm_template(monkeypatch):
+    """Replace the GLM chat-template resolution that preparation performs before any rank starts."""
+    calls = []
+    monkeypatch.setattr("ignition.recipes.glm53.frontend.chat_template_asset",
+                        lambda snapshot, *, cache_dir=None: calls.append((snapshot, cache_dir)) or GLM_TEMPLATE)
+    return calls
+
+
+def test_glm_template_failure_stops_preparation_before_a_rank_group_starts(monkeypatch, tmp_path):
+    from ignition.errors import FetchError
+
+    def offline(snapshot, *, cache_dir=None):
+        raise FetchError("offline")
+
+    monkeypatch.setattr("ignition.recipes.glm53.frontend.chat_template_asset", offline)
+    monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
+                        lambda *args, **options: pytest.fail("a rank group started"))
+    for ranks in (1, 4):
+        with pytest.raises(FetchError, match="offline"):
+            GLM.recipe.prepare(tmp_path, fitted(GLM, ranks), compile_forwards=True, kernel_cache=None, progress=None)
+
+
 @pytest.mark.parametrize("declaration,speculating,refused", [
     ({"group_size": 32, "quant_algo": "MXFP8"}, True, True),
     ({"group_size": 32, "quant_algo": "MXFP8"}, False, False),
     ({"group_size": 16, "quant_algo": "W4A16_NVFP4"}, True, False)])
-def test_glm_sm103_refusal_of_mxfp8_draft_experts_precedes_any_rank(monkeypatch, tmp_path, declaration,
-                                                                  speculating, refused):
+def test_glm_sm103_refusal_of_mxfp8_draft_experts_precedes_any_rank(monkeypatch, tmp_path, glm_template,
+                                                                  declaration, speculating, refused):
     (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {
         "quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
         "quantized_layers": {"model.language_model.layers.45.mlp.experts": declaration}}}))
@@ -271,7 +297,7 @@ def test_glm_sm103_refusal_of_mxfp8_draft_experts_precedes_any_rank(monkeypatch,
         assert GLM.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None) == "group"
 
 
-def test_tensor_parallel_adapters_prepare_a_rank_group(monkeypatch, tmp_path):
+def test_tensor_parallel_adapters_prepare_a_rank_group(monkeypatch, tmp_path, glm_template):
     seen = []
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
                         lambda snapshot, config, prepare, *, progress, core_storage=None, ranks=None, checkpoint=None:
@@ -296,6 +322,8 @@ def test_tensor_parallel_adapters_prepare_a_rank_group(monkeypatch, tmp_path):
     assert GLM.recipe.prepare(tmp_path, plan, compile_forwards=False, kernel_cache=tmp_path, progress=None) == "group"
     config, prepare, _, _ = seen.pop()
     assert prepare is glm.prepare_rank and config.devices == (0, 1, 2, 3)
+    # The template is resolved once, in the calling process, and carried to every rank.
+    assert glm_template == [(tmp_path.resolve(), plan.hub_cache)] and config.chat_template is GLM_TEMPLATE
     # Like Qwen, GLM pages fill the memory measured after graph capture, at least the plan's minimum.
     assert (config.max_active, config.pages, config.minimum_pages, config.context) == (
         2, None, plan.minimum_pages, plan.context)
@@ -379,7 +407,7 @@ def test_recipes_declare_whether_they_overlap_branches():
 
 
 @pytest.mark.parametrize("alias", ["qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash"])
-def test_adapters_carry_stream_overlap_into_the_preparation_config(monkeypatch, tmp_path, alias):
+def test_adapters_carry_stream_overlap_into_the_preparation_config(monkeypatch, tmp_path, alias, glm_template):
     seen = []
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
                         lambda snapshot, config, prepare, **options: seen.append(config) or "group")

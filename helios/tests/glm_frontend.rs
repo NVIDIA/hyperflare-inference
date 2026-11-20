@@ -43,9 +43,15 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
             tokenizer: asset("tokenizer.json"),
             tokens: support::tokens(&asset("tokenizer_config.json")).unwrap(),
             chat_template: Some({
-                let path=template_fixtures::path("glm53", "chat_template");
+                // The NVIDIA checkpoint's bundled template is annotated in place. The calibrated
+                // checkpoint's template is replaced by the canonical source, and the reference
+                // fixtures generated from the same snapshot fail if the choice is wrong.
+                let patch: serde_json::Value=serde_json::from_str(include_str!("../../ignition/recipes/glm53/assets/chat_template.patch.json")).unwrap();
+                let digest=format!("{:x}",Sha256::digest(fs::read(snapshot.join("chat_template.jinja")).unwrap()));
+                let name=if digest==patch["source_sha256"].as_str().unwrap() {"chat_template"} else {"chat_template.zai"};
+                let path=template_fixtures::path("glm53", name);
                 let contents=fs::read_to_string(&path).unwrap();
-                assert_eq!(contents.replace("{%- mark -%}",""),fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap());
+                assert_eq!(contents.replace("{%- mark -%}",""),fs::read_to_string(template_fixtures::path("glm53", &format!("{name}.source"))).unwrap());
                 Asset {range:None,sha256:format!("{:x}",Sha256::digest(contents.as_bytes())),path}
             }),
         },

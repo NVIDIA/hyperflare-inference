@@ -1,0 +1,17 @@
+{
+  "source": {
+    "repository": "zai-org/GLM-5.3-Flash",
+    "revision": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "2614a3c896d53e265f564c23701173c0049f985dacfbae79fc4bcd9f5ba083f4",
+  "result_sha256": "0b7a669ad2225549584e777ff234c5efec0d7c3fac6753b851ded4f491c4a53a",
+  "insertions": [
+    5251,
+    10210,
+    10309,
+    10412,
+    10592,
+    10733
+  ]
+}
