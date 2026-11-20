@@ -117,6 +117,7 @@ class PreparationConfig:
     compile_decoder: bool = True
     retain_graphs: bool = False
     kernel_cache: Path | None = None
+    steering_sidecar: Path | None = None
     dspark: bool = True
     draft_head_quantization: str | None = None
     markov_head_quantization: str | None = None
@@ -135,6 +136,11 @@ class PreparationConfig:
     mtp_only: bool = False
 
     def __post_init__(self):
+        if self.steering_sidecar is not None:
+            path = Path(self.steering_sidecar).expanduser().resolve()
+            if not path.is_file():
+                raise ValueError(f"steering sidecar is not a file: {path}")
+            object.__setattr__(self, "steering_sidecar", path)
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -346,7 +352,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                                    steering_sidecar=config.steering_sidecar)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -375,9 +382,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             storage=core_storage, maximum_pages=total_memory // bytes_per_page,
             maximum_rows=total_memory // layout.row_bytes,
             backed_slots=min(state_rows + 1, 1 + execution_rows + slots), dspark=config.dspark)
-        requests = DeviceRequestState.allocate(device, vocab_size=129280, capacity=slots)
+        steering = weights.steering is not None
+        requests = DeviceRequestState.allocate(
+            device, vocab_size=129280, capacity=slots, steering=steering)
         inputs = BatchInputs.allocate(config.prefill_chunk_size, blocks, device, capacity=slots)
-        admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
+        admission = AdmissionBuffers.allocate(
+            device, vocab_size=129280, capacity=slots, steering=steering)
         commands = StateCommands.allocate(device, capacity=slots)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
@@ -398,10 +408,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         identity = hashlib.sha256(json.dumps({"config": json.loads((metadata_path / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
+        from .steering import steered_identity
+
+        preparation_identity = steered_identity(
+            identity, None if weights.steering is None else weights.steering.sha256
+        )
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
-            device=device, checkpoint=identity,
+            device=device, checkpoint=preparation_identity,
             workload_schema="deepseek41-text", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
         session.__enter__()
@@ -605,12 +620,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     assets = {role: {"path": str(path)}
         for role, path in (("tokenizer", metadata_path / "tokenizer.json"),)}
     buffers["request_pending_token"] = requests.pending_token
-    server_config = {"identity": identity, "model_id": snapshot.name,
+    sampling_defaults = RECIPE.sampling_defaults.as_dict()
+    if weights.steering is not None:
+        sampling_defaults["steering_scale"] = 0.0
+        sampling_defaults.setdefault("ranges", {})["steering_scale"] = {
+            "min": 0.0, "max": 1.0}
+    server_config = {"identity": preparation_identity, "model_id": snapshot.name,
         "max_sequence_tokens": config.context, "prefill_chunk_size": config.prefill_chunk_size,
         "pages": pages, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": PAGE_TOKENS,
         "frontend": prepare_frontend(metadata_path, eos_token_ids=[1], prompt_encoder=PromptEncoder.DEEPSEEK_V41,
             image_profile="deepseek_row_major" if vision_state is not None else None),
-        "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
+        "sampling_defaults": sampling_defaults, "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency,
             page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None, rows=None,
             embedding_tables=range(len(tables.sources)))}
@@ -622,6 +642,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
         "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,
+        "steering_sidecar_sha256": (None if weights.steering is None else
+                                    weights.steering.sha256.hex()),
         "target_logits_dtype": "float32",
         "draft_logits_dtype": "bfloat16" if config.dspark else None,
         "offloaded_bytes": sum(tables.partition(ordinal, shard.rank).rows * 264
@@ -655,7 +677,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward = forward.forward
         if hasattr(forward, "completion") and hasattr(forward.completion, "scratch_tensors"):
             disposable.append(forward.completion.scratch_tensors)
-    model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    model = PreparedModel(rebuild_weights=declare_weights(
+        weights, components=('embedding', 'norm', 'head', 'vision', 'draft', 'steering')),
+        device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges(disposable), *completion.zero_ranges()),

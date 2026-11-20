@@ -583,12 +583,56 @@ fn options(body: &Value, protocol: Protocol) -> Result<Options> {
         }
     }
     if present(body, "chat_template_kwargs") {
-        options.template.extend(
-            body["chat_template_kwargs"]
-                .as_object()
-                .ok_or("chat_template_kwargs must be an object")?
-                .clone(),
-        );
+        let mut template = body["chat_template_kwargs"]
+            .as_object()
+            .ok_or("chat_template_kwargs must be an object")?
+            .clone();
+        if let Some(value) = template.remove("steering_scale").filter(|value| !value.is_null()) {
+            let nested = value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or("steering_scale must be a finite number")?;
+            let exact_int = |v: &Value| {
+                v.as_i64()
+                    .map(i128::from)
+                    .or_else(|| v.as_u64().map(i128::from))
+            };
+            let int_equals_float = |k: i128, f: f64| {
+                f.is_finite()
+                    && f.fract() == 0.0
+                    && f >= (i128::MIN as f64)
+                    && f < -(i128::MIN as f64)
+                    && (f as i128) == k
+                    && (k as f64) == f
+            };
+            let conflict = match body.get("steering_scale").filter(|v| !v.is_null()) {
+                Some(top) => match (exact_int(top), exact_int(&value)) {
+                    (Some(a), Some(b)) => a != b,
+                    (Some(k), None) => !int_equals_float(k, nested),
+                    (None, Some(k)) => !options
+                        .sampling
+                        .steering_scale
+                        .is_some_and(|top_level| int_equals_float(k, top_level)),
+                    (None, None) => options
+                        .sampling
+                        .steering_scale
+                        .is_some_and(|top_level| top_level != nested),
+                },
+                None => false,
+            };
+            if conflict {
+                return Err("top-level and chat_template_kwargs steering_scale must match".into());
+            }
+            options.sampling.steering_scale = Some(nested);
+        }
+        options.template.extend(template);
+    }
+    if options.sampling.steering_scale.is_some()
+        && !matches!(protocol, Protocol::Chat | Protocol::Completions)
+    {
+        return Err(unsupported(
+            "steering_scale requires Chat Completions or raw Completions",
+        ));
     }
     Ok(options)
 }
@@ -937,6 +981,44 @@ mod tests {
                 serde_json::json!({"tool_calls":[{"function":{"arguments":invalid}}]});
             assert!(normalize_tool_arguments(&mut message).is_err());
         }
+    }
+    #[test]
+    fn steering_scale_accepts_openai_and_template_extension_fields() {
+        let chat = |extra: Value| {
+            let mut body = json!({"messages":[{"role":"user","content":"x"}]});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            decode(Protocol::Chat, body, false)
+        };
+        let top = chat(json!({"steering_scale":0.75})).unwrap();
+        assert_eq!(top.request.options.sampling.steering_scale, Some(0.75));
+        let nested = chat(json!({"chat_template_kwargs":{"steering_scale":0.5}})).unwrap();
+        assert_eq!(nested.request.options.sampling.steering_scale, Some(0.5));
+        assert!(!nested.request.options.template.contains_key("steering_scale"));
+        let completion = decode(
+            Protocol::Completions,
+            json!({"prompt":"x","steering_scale":1.0}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(completion.request.options.sampling.steering_scale, Some(1.0));
+        assert!(chat(json!({"steering_scale":"1"})).is_err());
+        assert!(chat(json!({"chat_template_kwargs":{"steering_scale":"1"}})).is_err());
+        assert!(chat(json!({
+            "steering_scale":1.0,
+            "chat_template_kwargs":{"steering_scale":0.0}
+        })).is_err());
+        assert!(chat(json!({
+            "steering_scale":9007199254740992u64,
+            "chat_template_kwargs":{"steering_scale":9007199254740993u64}
+        })).is_err());
+        assert!(chat(json!({
+            "steering_scale":9007199254740993u64,
+            "chat_template_kwargs":{"steering_scale":9007199254740992.0}
+        })).is_err());
+        assert!(chat(json!({
+            "steering_scale":9007199254740992.0,
+            "chat_template_kwargs":{"steering_scale":9007199254740993u64}
+        })).is_err());
     }
 }
 #[cfg(test)]

@@ -11,18 +11,26 @@ import torch
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.expert_overlap import ConcurrentSharedExpert
-from ignition.components.ring_commit import PreparedRingCommit
 from ignition.components.linear import UnquantizedProjection
-from ignition.components.mhc import MHCWeights, MHCScratch, PreparedMHC, PreparedMHCPost
+from ignition.components.mhc import MHCScratch, MHCWeights, PreparedMHC, PreparedMHCPost
 from ignition.components.mlp import MLPScratch, PreparedMLP
-from ignition.components.moe import RouterScratch, PreparedRouter, PreparedRoutedExperts
-from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.components.moe import PreparedRoutedExperts, PreparedRouter, RouterScratch
 from ignition.components.parallel import TensorParallelShard
+from ignition.components.ring_commit import PreparedRingCommit
+from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.preparation.tuning import register_finalizer
 
-from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
+from .attention import (
+    AttentionIndices,
+    AttentionScratch,
+    PreparedAttention,
+    PreparedGlobalKV,
+    Rotary,
+    normalize,
+)
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+from .steering import steer_attention, steer_shared_expert
 
 
 @dataclass(frozen=True)
@@ -129,10 +137,11 @@ class PreparedLayer:
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
-                 window_metadata=None, examples=None):
+                 window_metadata=None, examples=None, steering=None):
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
         self.metadata = metadata
+        self.steering = steering
         self.image_mask = (torch.zeros(metadata.token_ids.shape, dtype=torch.bool, device=metadata.token_ids.device)
                            if mode == "prefill" and weights.experts.vision_correction is not None else None)
         self.boundary = boundary
@@ -205,12 +214,15 @@ class PreparedLayer:
         if self.concurrent_shared is not None:
             self.shared = None
 
-    def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
-        incoming, next_mix, records, selection, _ = self._run(incoming, pre_mix, metadata, indices,
-            selection, boundary=boundary, window_cache=window_cache)
+    def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None,
+                 window_cache=None, token_scale=None):
+        incoming, next_mix, records, selection, _ = self._run(
+            incoming, pre_mix, metadata, indices, selection, boundary=boundary,
+            window_cache=window_cache, token_scale=token_scale)
         return incoming, next_mix, records, selection
 
-    def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None):
+    def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None,
+             window_cache=None, token_scale=None):
         if self.engram is not None:
             incoming = (self.engram(incoming[0], metadata),)
         if boundary is None:
@@ -222,6 +234,11 @@ class PreparedLayer:
         attended, records, selection, observations = self.attention._run(normalized, metadata, selection,
             indices=indices, window_cache=window_cache)
         attention_output = self.attention_reduce(attended)
+        steering = self.steering
+        if steering is not None:
+            if token_scale is None:
+                raise ValueError("steering-enabled decoder layer requires per-token scale")
+            attention_output = steer_attention(attention_output, steering, token_scale)
         next_mix = torch.zeros_like(attn_mix)
         residual, post, comb, normalized = self.ffn_hc(attention_output, residual, post, comb,
             pre_mix=attn_mix, pre_out=next_mix)
@@ -233,6 +250,8 @@ class PreparedLayer:
                               selected_logits=route.selected_logits, image_mask=image_mask)
         shared = (self.shared(normalized) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(pending, routed))
+        if steering is not None:
+            shared = steer_shared_expert(shared, steering, token_scale)
         output = self.mlp_reduce(routed + shared)
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
@@ -313,7 +332,8 @@ class PreparedDecoder:
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
-                examples=examples))
+                examples=examples,
+                steering=None if weights.steering is None else weights.steering.layers.get(index)))
             carry = defer
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
@@ -352,6 +372,9 @@ class PreparedDecoder:
 
     def __call__(self, metadata):
         source_metadata = metadata
+        token_scale = metadata.steering_scale
+        if self.weights.steering is not None and token_scale is None:
+            raise ValueError("steering-enabled decoder requires per-token scale metadata")
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)
                   if self.vision is not None else metadata.token_ids)
@@ -373,6 +396,8 @@ class PreparedDecoder:
             if layer.boundary is not None:
                 suffix, state, attn_mix = layer.boundary(incoming, pre_mix, metadata, indices,
                                                         layer.attention.selectors[0])
+                if token_scale is not None:
+                    token_scale = suffix.gather(token_scale)
                 metadata = suffix.metadata
                 indices = self.suffix_window_metadata(metadata, replay_start=suffix.replay_start)
                 boundary = state, attn_mix
@@ -384,8 +409,10 @@ class PreparedDecoder:
                     feedback = torch.where(suffix.live[:, None], feedback, 0)
                 column = self.aux_layers.index(index)
                 auxiliary[:, column * 5120:(column + 1) * 5120].copy_(feedback)
-            incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
-                boundary=boundary, window_cache=None if staging is None else staging[index])
+            incoming, pre_mix, record, selection = layer(
+                incoming, pre_mix, metadata, indices, selection, boundary=boundary,
+                window_cache=None if staging is None else staging[index],
+                token_scale=token_scale)
             records.append(record)
         residual, = incoming
         samples = metadata.sample_indices

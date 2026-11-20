@@ -247,6 +247,7 @@ def _markov_step(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    PARAMETERS: tl.constexpr = 6,
 ):
     block, row = tl.program_id(0), tl.program_id(1)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -277,10 +278,10 @@ def _markov_step(
         tl.load(Base + row * base_row_stride + STEP * base_step_stride + token, inside, other=0.0).to(tl.float32) + bias
     )
     safe = tl.minimum(tl.maximum(tl.load(Slots + row).to(tl.int64), 0), CAPACITY - 1)
-    temperature = tl.load(Params + safe * 6)
-    repetition = tl.load(Params + safe * 6 + 3)
-    presence = tl.load(Params + safe * 6 + 4)
-    frequency = tl.load(Params + safe * 6 + 5)
+    temperature = tl.load(Params + safe * PARAMETERS)
+    repetition = tl.load(Params + safe * PARAMETERS + 3)
+    presence = tl.load(Params + safe * PARAMETERS + 4)
+    frequency = tl.load(Params + safe * PARAMETERS + 5)
     neutral = (
         (repetition == 1.0) & (presence.to(tl.int32, bitcast=True) == 0) & (frequency.to(tl.int32, bitcast=True) == 0)
     )
@@ -472,6 +473,7 @@ class PreparedMarkovProposals:
             BLOCK=block,
             CHUNK=64,
             FP8=self.head_scale is not None,
+            PARAMETERS=self.state.parameters.shape[1],
             num_warps=4,
             enable_fp_fusion=False,
         )

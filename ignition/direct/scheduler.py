@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import struct
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -80,8 +81,11 @@ class Layout:
     record_fields: int = 24
     confidence_widths: dict = field(default_factory=dict)
     completion_cursors: dict = field(default_factory=dict)
+    parameter_width: int = field(init=False, default=6)
 
     def __post_init__(self):
+        from ..preparation import runtime_core_pb2 as _wire
+
         if not 1 <= self.max_active <= self.capacity or self.pages <= 0 or self.page_tokens <= 0:
             raise ValueError("direct execution requires positive pages and slots within request capacity")
         if type(self.record_fields) is not int or self.record_fields <= 16:
@@ -90,6 +94,16 @@ class Layout:
         if (self.max_width > self.completion_token_capacity
                 or any(key[0] == "speculative" and key[2] > self.completion_token_capacity for key in self.graphs)):
             raise ValueError("verification width exceeds completion token capacity")
+        widths = {
+            int(np.prod(self.buffer_specs[binding["buffer"]][1][1:]))
+            for inputs in self.bindings.values()
+            for binding in inputs
+            if binding["source"] == _wire.SAMPLING_PARAMETERS and binding["buffer"] in self.buffer_specs
+        }
+        if widths:
+            if len(widths) != 1 or next(iter(widths)) not in (6, 7):
+                raise ValueError("SamplingParameters bindings must agree on width 6 or 7")
+            object.__setattr__(self, "parameter_width", next(iter(widths)))
         object.__setattr__(self, "graphs", MappingProxyType(dict(self.graphs)))
 
     @classmethod
@@ -186,23 +200,35 @@ class SamplingParameters:
     presence_penalty: float = 0.
     frequency_penalty: float = 0.
     top_k: int = -1
+    steering_scale: float = 0.
 
     def __post_init__(self):
         values = (self.temperature, self.top_p, self.min_p, self.repetition_penalty,
-                  self.presence_penalty, self.frequency_penalty)
+                  self.presence_penalty, self.frequency_penalty, self.steering_scale)
         if any(not math.isfinite(value) for value in values):
             raise AdmissionError("sampling parameters must be finite")
         if self.temperature <= 0:
             raise AdmissionError("temperature must be positive; greedy decoding is not supported")
-        if not 0 < self.top_p <= 1 or not 0 <= self.min_p <= 1 or self.repetition_penalty <= 0:
-            raise AdmissionError("require 0 < top_p <= 1, 0 <= min_p <= 1 and repetition_penalty > 0")
+        if (not 0 < self.top_p <= 1 or not 0 <= self.min_p <= 1
+                or self.repetition_penalty <= 0 or not 0 <= self.steering_scale <= 1):
+            raise AdmissionError("require 0 < top_p <= 1, 0 <= min_p <= 1, repetition_penalty > 0 and 0 <= steering_scale <= 1")
         if type(self.seed) is not int or not 0 <= self.seed < 1 << 64 or type(self.top_k) is not int:
             raise AdmissionError("seed must be a uint64 and top_k an integer")
+        scale = 0.0 if self.steering_scale == 0.0 else struct.unpack("<f", struct.pack("<f", self.steering_scale))[0]
+        object.__setattr__(self, "steering_scale", scale)
 
-    def values(self):
-        """The six FP32 admission parameters, in Helios's order."""
-        return (self.temperature, self.top_p, self.min_p, self.repetition_penalty,
-                self.presence_penalty, self.frequency_penalty)
+    def steering_bits(self) -> int:
+        return struct.unpack("<I", struct.pack("<f", self.steering_scale))[0]
+
+    def values(self, width: int = 6):
+        """The six or seven FP32 admission parameters, in Helios's order."""
+        if width not in (6, 7):
+            raise AdmissionError("sampling parameter width must be 6 or 7")
+        if width == 6 and self.steering_scale != 0.0:
+            raise AdmissionError("nonzero steering_scale requires a 7-column SamplingParameters model")
+        ordered = (self.temperature, self.top_p, self.min_p, self.repetition_penalty,
+                   self.presence_penalty, self.frequency_penalty, self.steering_scale)
+        return ordered[:width]
 
 
 class Acceptance:
@@ -251,7 +277,7 @@ class Acceptance:
 
 @dataclass
 class Checkpoint:
-    """An immutable snapshot row holding the state after consuming exactly `key`, and its complete pages."""
+    """An immutable snapshot row holding the state after consuming `key`'s tokens, and its complete pages."""
 
     key: tuple
     snapshot: int
@@ -261,7 +287,7 @@ class Checkpoint:
 
     @property
     def consumed(self):
-        return len(self.key)
+        return len(self.key[0]) if (self.key and isinstance(self.key[0], tuple)) else len(self.key)
 
 
 class Request:
@@ -371,8 +397,14 @@ class Scheduler:
 
     # Admission and retirement.
 
+    @staticmethod
+    def _cache_key(tokens, sampling: SamplingParameters):
+        prompt_key = tuple(tokens)
+        return prompt_key if sampling.steering_scale == 0.0 else (prompt_key, sampling.steering_bits())
+
     def validate(self, request):
         prompt, layout = request.prompt, self.layout
+        request.sampling.values(layout.parameter_width)
         if not prompt or any(type(t) is not int or not 0 <= t < layout.vocabulary for t in prompt):
             raise AdmissionError("the prompt must be a nonempty list of vocabulary token IDs")
         if type(request.max_new_tokens) is not int or not 1 <= request.max_new_tokens < 1 << 31:
@@ -436,7 +468,7 @@ class Scheduler:
             slot = next((index for index, occupant in enumerate(self.slots) if occupant is None), None)
             if slot is None:
                 return
-            hit = self.cache.get(tuple(request.prompt)) if self.prefix_cache else None
+            hit = self.cache.get(self._cache_key(request.prompt, request.sampling)) if self.prefix_cache else None
             shared = hit.pages if hit is not None else ()
             needed = self._pages_needed(request, len(shared))
             if hit is not None:
@@ -711,8 +743,8 @@ class Scheduler:
         """Reserve a snapshot row for the request's prompt endpoint unless that prompt is cached or in capture."""
         if not self.prefix_cache:
             return False
-        key = tuple(request.prompt)
-        if key in self.cache or any(r.capture is not None and r.prompt == request.prompt for r in self.active):
+        key = self._cache_key(request.prompt, request.sampling)
+        if key in self.cache or any(r.capture is not None and self._cache_key(r.prompt, r.sampling) == key for r in self.active):
             return False
         if not self.free_snapshots and not self._evict(snapshots=1):
             return False
@@ -724,7 +756,7 @@ class Scheduler:
         pages = tuple(request.pages[:request.consumed // self.layout.page_tokens])
         self.page_pool.retain(pages)
         self.clock += 1
-        key = tuple(request.prompt[:request.consumed])
+        key = self._cache_key(request.prompt[:request.consumed], request.sampling)
         self.cache[key] = Checkpoint(key, request.capture, pages, used=self.clock)
         request.capture = None
         self.stats["checkpoints"] += 1

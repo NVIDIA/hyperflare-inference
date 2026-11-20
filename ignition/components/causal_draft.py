@@ -139,8 +139,14 @@ class PreparedCausalDraftRound:
             self.draft_generation.copy_(torch.where(matches.any(1), self.requests.generation, self.draft_generation))
         self.draft.finish(draft_state, before, states, active)
         candidates[:, 1:].copy_(drafts)
-        metadata = Metadata.allocate(b * w, b, self.blocks, slots.device, samples=b * w)
-        metadata.set(before, limits, states, self.inputs.page_tables[safe], candidates, self.inputs.live_rows)
+        metadata = Metadata.allocate(
+            b * w, b, self.blocks, slots.device, samples=b * w,
+            steering=self.requests.parameters.shape[1] == 7,
+        )
+        metadata.set(
+            before, limits, states, self.inputs.page_tables[safe], candidates, self.inputs.live_rows,
+            parameters=self.requests.parameters, row_slot_ids=self.inputs.row_slot_ids[:b],
+        )
         hidden, logits, auxiliary, records = self.decoder(metadata)
         p = target.run(scratch["target"], logits.view(b, w, -1), candidates=drafts)
         target_valid = scratch["target"]["valid"]

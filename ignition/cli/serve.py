@@ -198,6 +198,7 @@ def _export_hosts(args):
                          stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                         steering_sidecar=args.steering_sidecar,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only,
@@ -280,9 +281,10 @@ def _prepare(args):
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
-                         stream_overlap=stream_overlap(args, model),
+                      stream_overlap=stream_overlap(args, model),
                       roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                      steering_sidecar=args.steering_sidecar,
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                       language_model_only=args.language_model_only,
@@ -304,6 +306,7 @@ def _prepare(args):
                      f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
                      f" · mixed prefill {'on' if plan.mixed_prefill else 'off'}"
+                     f"{(' · steering ' + plan.steering_sidecar.name) if plan.steering_sidecar is not None else ''}"
                      f" · expert scales {plan.expert_scale_compression or 'native'}"
                      f"{(' · online MXFP8 ' + plan.online_mxfp8_scope) if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
@@ -464,7 +467,8 @@ def debug_serve(args) -> int:
                          context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
                          stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
-                         cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                         cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill,
+                         prompt_logprobs=args.prompt_logprobs, steering_sidecar=args.steering_sidecar,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)

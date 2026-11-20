@@ -35,9 +35,17 @@ pub struct PrefixHistory {
 
 impl PrefixHistory {
     pub fn new(identity: [u8; 32]) -> Self {
+        Self::with_steering_scale(identity, 0.)
+    }
+
+    pub fn with_steering_scale(identity: [u8; 32], steering_scale: f32) -> Self {
         let mut hash = Blake2b::<U16>::new();
         hash.update(b"flare-prefix-root-v1\0");
         hash.update(identity);
+        if steering_scale != 0. {
+            hash.update(b"flare-steering-scale-v1\0");
+            hash.update(steering_scale.to_bits().to_le_bytes());
+        }
         Self {
             identity,
             boundaries: vec![PrefixKey {

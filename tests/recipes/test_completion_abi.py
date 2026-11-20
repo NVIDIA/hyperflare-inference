@@ -107,8 +107,59 @@ def _kernel_cases(fields, device="cpu"):
         a.admission_eos_count, a.admission_grammar_enabled, errors, state.generation, state.seed, state.rng_counter,
         state.parameters, state.top_k, state.max_new_tokens, state.eos_token_ids, state.eos_count, state.grammar_enabled,
         state.generated_tokens, state.pending_token, state.status, state.error_code, state.consumed_tokens,
-        records, frame, sequence, 4, state.consumed_tokens.stride(0), fields)
+        records, frame, sequence, 4, state.consumed_tokens.stride(0), fields, 4, state.parameters.shape[1])
     _admission_finish[(4,)](*finish_args)
+    check(2, [8, 91, 65, 0, -1, 1, 0, 0])
+
+    from ignition.components.sampling import (
+        DeviceRequestState as SharedRequestState,
+    )
+    from ignition.components.sampling import (
+        RequestAdmission as SharedAdmission,
+    )
+    from ignition.components.sampling import (
+        _admission_validate,
+    )
+    steered_state = SharedRequestState.allocate(device, vocab_size=32, capacity=4, steering=True)
+    steered_state.consumed_tokens.copy_(state.consumed_tokens)
+    steered_admission = AdmissionBuffers.allocate(device, vocab_size=32, capacity=4, steering=True)
+    steered_admission.stage(0, 1, SharedAdmission(9, 21, temperature=1., eos_token_ids=(), steering_scale=0.), [3, 4])
+    steered_admission.stage(1, 2, SharedAdmission(9, 23, temperature=.8, eos_token_ids=(), steering_scale=.75), [3, 4])
+    steered_admission.admission_count.fill_(2)
+    steered_errors = torch.zeros(4, dtype=torch.int32, device=device)
+    sa = steered_admission
+    # Out-of-range steering_scale on row 1 (slot 2) fails _admission_validate before generation is written.
+    sa.admission_parameters[1, 6] = 1.5
+    _admission_validate[(4, 1)](
+        sa.admission_count, sa.admission_slots, sa.admission_generations, sa.admission_parameters,
+        sa.admission_top_k, sa.admission_max_new_tokens, sa.admission_eos_token_ids, sa.admission_eos_count,
+        sa.admission_histogram, sa.admission_grammar_enabled, steered_state.generation, steered_errors,
+        32, 4, 32, 4, 7)
+    assert steered_errors.tolist() == [0, 1, 0, 0]
+    sa.admission_parameters[1, 6] = .75
+    steered_errors.zero_()
+    _admission_validate[(4, 1)](
+        sa.admission_count, sa.admission_slots, sa.admission_generations, sa.admission_parameters,
+        sa.admission_top_k, sa.admission_max_new_tokens, sa.admission_eos_token_ids, sa.admission_eos_count,
+        sa.admission_histogram, sa.admission_grammar_enabled, steered_state.generation, steered_errors,
+        32, 4, 32, 4, 7)
+    assert steered_errors.tolist() == [0, 0, 0, 0]
+    steered_records = torch.zeros_like(records)
+    steered_frame = torch.zeros(1, dtype=torch.int64, device=device)
+    steered_sequence = torch.tensor([91], dtype=torch.int64, device=device)
+    _admission_finish[(4,)](
+        sa.admission_count, sa.admission_slots, sa.admission_generations, sa.admission_seed_bits,
+        sa.admission_parameters, sa.admission_top_k, sa.admission_max_new_tokens, sa.admission_eos_token_ids,
+        sa.admission_eos_count, sa.admission_grammar_enabled, steered_errors, steered_state.generation,
+        steered_state.seed, steered_state.rng_counter, steered_state.parameters, steered_state.top_k,
+        steered_state.max_new_tokens, steered_state.eos_token_ids, steered_state.eos_count,
+        steered_state.grammar_enabled, steered_state.generated_tokens, steered_state.pending_token,
+        steered_state.status, steered_state.error_code, steered_state.consumed_tokens,
+        steered_records, steered_frame, steered_sequence, 4, steered_state.consumed_tokens.stride(0), fields, 4, 7)
+    assert steered_state.parameters[2, 0].item() == pytest.approx(.8)
+    assert steered_state.parameters[2, 6].item() == pytest.approx(.75)
+    assert steered_state.parameters[1, 6].item() == 0.0
+    assert steered_records[0, 2, :8].tolist() == [9, 91, 65, 0, -1, 1, 0, 0]
     check(2, [8, 91, 65, 0, -1, 1, 0, 0])
     errors[0] = 2
     _admission_finish[(4,)](*finish_args)

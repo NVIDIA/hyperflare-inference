@@ -1403,6 +1403,7 @@ impl<'a> Worker<'a> {
             });
             let checkpoint_accounting = parked.as_ref().map(|parked| parked.checkpoint_accounting.clone());
             let spec = incoming.spec();
+            let steering_scale = incoming.prompt.sampling.steering_scale;
             self.scheduler
                 .advance_to(super::observation::monotonic_ns())?;
             let admission = if let Some(store) =
@@ -1413,6 +1414,7 @@ impl<'a> Worker<'a> {
                     store.as_mut(),
                     incoming.pool_lookup.as_ref(),
                     spec,
+                    steering_scale,
                     incoming.pool_plan.as_ref(),
                     checkpoint_accounting,
                     self.prefill_rate,
@@ -1426,7 +1428,12 @@ impl<'a> Worker<'a> {
                     handle
                 })
             } else {
-                admit_with_checkpoint_accounting(&mut self.scheduler, spec, checkpoint_accounting)
+                admit_with_checkpoint_accounting(
+                    &mut self.scheduler,
+                    spec,
+                    steering_scale,
+                    checkpoint_accounting,
+                )
             };
             let handle = match admission {
                 Ok(handle) => handle,
@@ -2685,7 +2692,10 @@ fn begin_pool_lookup(
     }
     let plan = match incoming.pool_plan.as_ref() {
         Some(plan) => scheduler.refresh_admission_plan(plan),
-        None => scheduler.plan_admission(&incoming.spec()),
+        None => scheduler.plan_admission_with_steering(
+            &incoming.spec(),
+            incoming.prompt.sampling.steering_scale,
+        ),
     };
     let Ok(plan) = plan else {
         return;
@@ -2703,9 +2713,10 @@ fn begin_pool_lookup(
 fn admit_with_checkpoint_accounting(
     scheduler: &mut RequestScheduler,
     spec: RequestSpec,
+    steering_scale: f32,
     accounting: Option<crate::scheduler::CheckpointAccounting>,
 ) -> Result<RequestHandle> {
-    let plan = scheduler.plan_admission(&spec)?;
+    let plan = scheduler.plan_admission_with_steering(&spec, steering_scale)?;
     Ok(scheduler.admit_planned_with_checkpoint_accounting(spec, plan, None, accounting)?.handle)
 }
 
@@ -2716,6 +2727,7 @@ fn admit_with_host_store(
     store: &mut dyn flare_selene::HostStore,
     pool_lookup: Option<&flare_selene::pool::LookupTicket>,
     spec: RequestSpec,
+    steering_scale: f32,
     queued_plan: Option<&crate::scheduler::AdmissionPlan>,
     accounting: Option<crate::scheduler::CheckpointAccounting>,
     prefill_rate: f64,
@@ -2724,7 +2736,7 @@ fn admit_with_host_store(
 ) -> Result<(RequestHandle, Option<crate::offload::LookupOutcome>)> {
     let plan = match queued_plan {
         Some(plan) => scheduler.refresh_admission_plan(plan)?,
-        None => scheduler.plan_admission(&spec)?,
+        None => scheduler.plan_admission_with_steering(&spec, steering_scale)?,
     };
     let reused = (plan.resident_tokens() != 0)
         .then(|| plan.history().key_at(plan.resident_tokens()))
@@ -2772,7 +2784,7 @@ fn admit_with_host_store(
                     return Err(Error::Admission(AdmissionError::Capacity(failure)));
                 }
                 restore_wait.retry_at = None;
-                let handle = admit_with_checkpoint_accounting(scheduler, spec, accounting.clone())?;
+                let handle = admit_with_checkpoint_accounting(scheduler, spec, steering_scale, accounting.clone())?;
                 scheduler.record_host_lookup();
                 return Ok((handle, Some(LookupOutcome::CapacityRejected)));
             }
@@ -2788,7 +2800,7 @@ fn admit_with_host_store(
             // No event follows a rejected fetch; this request is the ticket's only
             // waiter, so retire it and admit the request again without the store.
             scheduler.finish_inbound(key, false)?;
-            return admit_with_checkpoint_accounting(scheduler, spec, Some(admitted_accounting))
+            return admit_with_checkpoint_accounting(scheduler, spec, steering_scale, Some(admitted_accounting))
                 .map(|handle| (handle, Some(LookupOutcome::EnqueueRejected)));
         }
         Ok((admitted.handle, Some(LookupOutcome::Admitted)))

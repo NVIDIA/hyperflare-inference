@@ -262,9 +262,14 @@ pub struct LiveRequest {
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
     admission_order: u64,
+    steering_scale: f32,
 }
 
 impl LiveRequest {
+    pub fn steering_scale(&self) -> f32 {
+        self.steering_scale
+    }
+
     pub fn checkpoint_accounting(&self) -> CheckpointAccounting {
         self.checkpoints.clone()
     }
@@ -594,6 +599,7 @@ struct Slot {
 pub struct AdmissionPlan {
     history: PrefixHistory,
     lookup: Lookup,
+    steering_scale: f32,
 }
 
 impl AdmissionPlan {
@@ -1407,6 +1413,14 @@ impl RequestScheduler {
     /// Validates the request, builds its prefix history, and looks up the GPU
     /// cache without reserving anything.
     pub fn plan_admission(&mut self, spec: &RequestSpec) -> Result<AdmissionPlan> {
+        self.plan_admission_with_steering(spec, 0.)
+    }
+
+    pub fn plan_admission_with_steering(
+        &mut self,
+        spec: &RequestSpec,
+        steering_scale: f32,
+    ) -> Result<AdmissionPlan> {
         if spec.prompt.is_empty()
             || spec.message_boundaries.first() == Some(&0)
             || spec.message_boundaries.last().is_some_and(|n| *n > spec.prompt.len())
@@ -1424,7 +1438,8 @@ impl RequestScheduler {
             ));
         }
         self.free_slot()?;
-        let mut history = PrefixHistory::new(self.identity);
+        let steering_scale = if steering_scale == 0. { 0. } else { steering_scale };
+        let mut history = PrefixHistory::with_steering_scale(self.identity, steering_scale);
         history.append(&spec.prompt, &spec.conditioning)?;
         if spec.prompt_logprobs && self.scored_prefill_catalog.is_empty() {
             return Err(crate::Error::admission(crate::AdmissionError::Invalid,
@@ -1433,7 +1448,11 @@ impl RequestScheduler {
         let lookup = if spec.prompt_logprobs {
             Lookup { checkpoint: None, consumed_tokens: 0, pages: Vec::new(), snapshot: None }
         } else { self.cache.lookup(&history)? };
-        Ok(AdmissionPlan { history, lookup })
+        Ok(AdmissionPlan {
+            history,
+            lookup,
+            steering_scale,
+        })
     }
 
     /// Recheck GPU residency while retaining a queued request's validated history.
@@ -1442,6 +1461,7 @@ impl RequestScheduler {
         Ok(AdmissionPlan {
             history: plan.history.clone(),
             lookup: self.cache.lookup(&plan.history)?,
+            steering_scale: plan.steering_scale,
         })
     }
 
@@ -1485,7 +1505,11 @@ impl RequestScheduler {
         inbound: Option<InboundRequest>,
         accounting: Option<CheckpointAccounting>,
     ) -> Result<Admitted> {
-        let AdmissionPlan { history, lookup } = plan;
+        let AdmissionPlan {
+            history,
+            lookup,
+            steering_scale,
+        } = plan;
         // Lookups count once per admitted request, not per attempt of a waiting one.
         let (hit, reused) = (lookup.checkpoint.is_some(), lookup.consumed_tokens);
         let page_tokens = self.capabilities.page_tokens as u64;
@@ -1670,6 +1694,7 @@ impl RequestScheduler {
             growable_output: spec.growable_output,
             preempted: false,
             admission_order: self.admissions,
+            steering_scale,
         });
         self.admissions += 1;
         if let Some(inbound) = &inbound {

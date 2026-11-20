@@ -123,6 +123,8 @@ pub struct SamplingParameters {
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
     pub top_k: i32,
+    #[cfg_attr(feature = "server", serde(default))]
+    pub steering_scale: f32,
 }
 
 impl Default for SamplingParameters {
@@ -136,6 +138,7 @@ impl Default for SamplingParameters {
             presence_penalty: 0.,
             frequency_penalty: 0.,
             top_k: 20,
+            steering_scale: 0.,
         }
     }
 }
@@ -180,6 +183,7 @@ pub struct SamplingRanges {
     pub repetition_penalty: Option<SamplingRange<f32>>,
     pub presence_penalty: Option<SamplingRange<f32>>,
     pub frequency_penalty: Option<SamplingRange<f32>>,
+    pub steering_scale: Option<SamplingRange<f32>>,
 }
 
 impl SamplingRanges {
@@ -205,7 +209,8 @@ impl SamplingRanges {
             min_p,
             repetition_penalty,
             presence_penalty,
-            frequency_penalty
+            frequency_penalty,
+            steering_scale
         );
         min.validate()?;
         max.validate()?;
@@ -214,7 +219,23 @@ impl SamplingRanges {
 }
 
 impl SamplingParameters {
-    pub(crate) fn values(&self) -> [f32; 6] {
+    pub(crate) fn canonical_steering_scale(&self) -> f32 {
+        if self.steering_scale == 0. {
+            0.
+        } else {
+            self.steering_scale
+        }
+    }
+
+    pub(crate) fn in_steering_bounds(&self, defaults: &Self, ranges: &SamplingRanges) -> bool {
+        let scale = self.canonical_steering_scale();
+        match ranges.steering_scale {
+            Some(range) => range.min <= scale && scale <= range.max,
+            None => scale == defaults.canonical_steering_scale(),
+        }
+    }
+
+    pub(crate) fn values(&self) -> [f32; 7] {
         [
             self.temperature,
             self.top_p,
@@ -222,6 +243,7 @@ impl SamplingParameters {
             self.repetition_penalty,
             self.presence_penalty,
             self.frequency_penalty,
+            self.canonical_steering_scale(),
         ]
     }
     pub fn validate(&self) -> Result<()> {
@@ -240,6 +262,7 @@ impl SamplingParameters {
         if self.values().iter().any(|value| !value.is_finite())
             || !(0. < self.top_p && self.top_p <= 1.)
             || !(0. ..=1.).contains(&self.min_p)
+            || !(0. ..=1.).contains(&self.steering_scale)
             || self.repetition_penalty <= 0.
             || [self.temperature, self.top_p, self.repetition_penalty]
                 .iter()

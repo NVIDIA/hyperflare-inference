@@ -38,6 +38,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         prefill_chunk_size=plan.prefill_chunk, minimum_pages=plan.minimum_pages,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=HEADROOM_BYTES + plan.reserve_bytes, kernel_cache=kernel_cache,
+        steering_sidecar=plan.steering_sidecar,
         dspark=speculation is not None,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression,
         mla_compute_mode=plan.mla_compute_mode, **drafting)

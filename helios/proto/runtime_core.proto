@@ -447,6 +447,8 @@ message DefaultSamplingParameters {
   optional float frequency_penalty = 8;
   // Absent parameter ranges fix those parameters at their declared defaults.
   SamplingRanges ranges = 9;
+  // Default per-request activation steering scale; 0 when steering is prepared.
+  optional float steering_scale = 10;
 }
 message SamplingFloatRange {
   optional float min = 1;
@@ -464,6 +466,8 @@ message SamplingRanges {
   SamplingFloatRange repetition_penalty = 5;
   SamplingFloatRange presence_penalty = 6;
   SamplingFloatRange frequency_penalty = 7;
+  // Declared [0, 1] interval when the core binds seven-column SamplingParameters.
+  SamplingFloatRange steering_scale = 8;
 }
 message FrontendSettings {
   TokenizerSettings tokenizer = 1;

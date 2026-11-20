@@ -10,7 +10,7 @@ use super::*;
 use crate::{
     cache::Fence,
     execution::{CompletionRecord, GraphKind},
-    scheduler::{RequestScheduler, RequestSpec, SchedulerLimits},
+    scheduler::{RequestHandle, RequestScheduler, RequestSpec, SchedulerLimits},
 };
 
 #[test]
@@ -54,6 +54,135 @@ pub(super) fn config() -> ModelConfig {
         history_drafts: true,
         speculative_proposal_source: Default::default(),
     }
+}
+#[test]
+fn contract_bindings_and_ranges_govern_six_and_seven_column_sampling_rows() {
+    let stock = config();
+    let stock_manifest = manifest(&stock);
+    let width = |manifest: &crate::execution::ExecutionManifest| {
+        manifest
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "admission_parameters")
+            .unwrap()
+            .shape[1]
+    };
+    assert_eq!(width(&stock_manifest), 6);
+    Inputs::new(&stock, &stock_manifest).unwrap();
+
+    let mut steered = stock.clone();
+    steered.sampling_ranges.steering_scale = Some(SamplingRange { min: 0., max: 1. });
+    let steered_manifest = manifest(&steered);
+    assert_eq!(width(&steered_manifest), 7);
+    Inputs::new(&steered, &steered_manifest).unwrap();
+    assert!(Inputs::new(&steered, &stock_manifest).is_err());
+    assert!(Inputs::new(&stock, &steered_manifest).is_err());
+
+    let mut mismatched = steered_manifest.clone();
+    mismatched
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == "admission_parameters")
+        .unwrap()
+        .shape[1] = 8;
+    assert!(Inputs::new(&steered, &mismatched).is_err());
+
+    let handle = RequestHandle { slot: 0, generation: 1 };
+    let admission = Admission {
+        handle,
+        sampling: SamplingParameters { steering_scale: 1., ..Default::default() },
+        max_new_tokens: 1,
+        prompt: vec![7],
+        data: PromptData {
+            positions: vec![[0; 3]],
+            vision_token_indices: vec![-1],
+            ..Default::default()
+        },
+        grammar_mask: None,
+        ignore_eos: false,
+        prompt_logprobs: false,
+    };
+    assert!(admission.validate(&stock).is_err());
+    admission.validate(&steered).unwrap();
+
+    // Mixed 6-column and 7-column SamplingParameters bindings across graphs must be rejected.
+    let mut mixed_config = steered.clone();
+    mixed_config.contract.graphs[1]
+        .inputs
+        .push(crate::model::testing::binding(
+            "legacy_parameters",
+            ValueSource::SamplingParameters,
+            InputIndexing::SubmissionRow,
+            0,
+            0,
+        ));
+    let mut mixed_manifest = manifest(&mixed_config);
+    mixed_manifest
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == "legacy_parameters")
+        .unwrap()
+        .shape[1] = 6;
+    assert!(Inputs::new(&mixed_config, &mixed_manifest).is_err());
+
+    // Packing a 7-column steered admission writes exact FP32 steering_scale bytes at column 6.
+    let mut scheduler = RequestScheduler::new(
+        steered.identity,
+        steered.limits,
+        scheduler_capabilities(&steered),
+    )
+    .unwrap();
+    scheduler
+        .measured_graph_durations(&steered_manifest.graphs)
+        .unwrap();
+    let steered_spec = RequestSpec {
+        message_boundaries: vec![],
+        prompt: vec![7; 4],
+        conditioning: vec![],
+        max_new_tokens: 2,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: false,
+    };
+    let steered_plan = scheduler
+        .plan_admission_with_steering(&steered_spec, 0.75)
+        .unwrap();
+    let req_handle = scheduler
+        .admit_planned(steered_spec, steered_plan, None)
+        .unwrap()
+        .handle;
+    let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
+    admissions[req_handle.slot as usize] = Some(Admission {
+        handle: req_handle,
+        sampling: SamplingParameters {
+            steering_scale: 0.5,
+            ..Default::default()
+        },
+        max_new_tokens: 2,
+        prompt: vec![7; 4],
+        data: PromptData {
+            positions: (0..4).map(|p| [p; 3]).collect(),
+            vision_token_indices: vec![-1; 4],
+            ..Default::default()
+        },
+        grammar_mask: None,
+        ignore_eos: false,
+        prompt_logprobs: false,
+    });
+    let mut inputs = Inputs::new(&steered, &steered_manifest).unwrap();
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(1)).unwrap();
+    assert!(crate::model::pack_inputs(&mut inputs, &steered, &scheduler, &step, &admissions).is_err());
+    admissions[req_handle.slot as usize].as_mut().unwrap().sampling.steering_scale = 0.75;
+    crate::model::pack_inputs(&mut inputs, &steered, &scheduler, &step, &admissions).unwrap();
+    let params_upload = inputs
+        .uploads()
+        .into_iter()
+        .find(|u| u.buffer == "admission_parameters")
+        .unwrap();
+    assert_eq!(params_upload.bytes.len(), 7 * 4);
+    assert_eq!(&params_upload.bytes[24..28], &0.75f32.to_le_bytes());
 }
 
 #[test]

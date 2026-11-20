@@ -104,6 +104,8 @@ pub struct Sampling {
     pub presence_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steering_scale: Option<f64>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constraint {

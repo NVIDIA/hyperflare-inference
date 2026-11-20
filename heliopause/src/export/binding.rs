@@ -669,7 +669,7 @@ fn validate_sampling(value: &serde_json::Value) -> super::Result<()> {
     let values = value
         .as_object()
         .ok_or_else(|| super::invalid("sampling defaults must be an object"))?;
-    let names = [
+    let required = [
         "temperature",
         "top_p",
         "min_p",
@@ -677,6 +677,7 @@ fn validate_sampling(value: &serde_json::Value) -> super::Result<()> {
         "presence_penalty",
         "frequency_penalty",
     ];
+    let floats = [required.as_slice(), &["steering_scale"]].concat();
     let valid = |name: &str, value: &serde_json::Value| -> bool {
         if name == "top_k" {
             return value
@@ -694,19 +695,26 @@ fn validate_sampling(value: &serde_json::Value) -> super::Result<()> {
             && (!matches!(name, "temperature" | "top_p" | "repetition_penalty")
                 || v >= f32::MIN_POSITIVE as f64)
             && (name != "top_p" || v <= 1.)
-            && (name != "min_p" || (0. ..=1.).contains(&v))
+            && (!matches!(name, "min_p" | "steering_scale") || (0. ..=1.).contains(&v))
     };
-    for name in names.into_iter().chain(["top_k", "seed"]) {
+    for name in required.into_iter().chain(["top_k", "seed"]) {
         if !values.get(name).is_some_and(|v| valid(name, v)) {
             return Err(super::invalid("invalid recipe sampling defaults"));
         }
+    }
+    if values
+        .get("steering_scale")
+        .is_some_and(|value| !valid("steering_scale", value))
+    {
+        return Err(super::invalid("invalid recipe steering default"));
     }
     if let Some(ranges) = values.get("ranges") {
         let ranges = ranges
             .as_object()
             .ok_or_else(|| super::invalid("invalid sampling ranges"))?;
         for (name, bounds) in ranges {
-            if name == "seed" || !names.contains(&name.as_str()) && name != "top_k" {
+            let known_float = floats.iter().any(|candidate| *candidate == name.as_str());
+            if name == "seed" || (!known_float && name != "top_k") {
                 return Err(super::invalid(format!("invalid sampling range for {name}")));
             }
             let min = bounds
@@ -717,8 +725,9 @@ fn validate_sampling(value: &serde_json::Value) -> super::Result<()> {
                 .get("max")
                 .filter(|v| valid(name, v))
                 .and_then(|v| v.as_f64());
-            if !min.zip(max).is_some_and(|(min, max)| {
-                min <= values[name].as_f64().unwrap() && values[name].as_f64().unwrap() <= max
+            let default = values.get(name).and_then(serde_json::Value::as_f64);
+            if !min.zip(max).zip(default).is_some_and(|((min, max), default)| {
+                min <= default && default <= max
             }) {
                 return Err(super::invalid(format!("invalid sampling range for {name}")));
             }
@@ -761,6 +770,21 @@ pub(crate) fn serving_metadata(
         ));
     }
     validate_sampling(&sampling)?;
+    let steering = sampling.get("steering_scale");
+    let steering_range = sampling
+        .get("ranges")
+        .and_then(|ranges| ranges.get("steering_scale"));
+    if steering.is_some() != steering_range.is_some()
+        || steering.is_some_and(|value| value.as_f64() != Some(0.))
+        || steering_range.is_some_and(|range| {
+            range.get("min").and_then(serde_json::Value::as_f64) != Some(0.)
+                || range.get("max").and_then(serde_json::Value::as_f64) != Some(1.)
+        })
+    {
+        return Err(super::invalid(
+            "steering metadata requires a zero default and a 0..1 range",
+        ));
+    }
     let sampling: wire::DefaultSamplingParameters =
         message("DefaultSamplingParameters", &sampling)?;
     helios_core::runtime_core::validate_sampling_defaults(&sampling)?;

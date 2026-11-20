@@ -56,7 +56,11 @@ class _Frontend:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise AdmissionError("messages must be a nonempty list")
-        options = dict(body.get("chat_template_kwargs") or {})
+        raw_kwargs = body.get("chat_template_kwargs")
+        if raw_kwargs is not None and not isinstance(raw_kwargs, dict):
+            raise AdmissionError("chat_template_kwargs must be an object")
+        options = dict(raw_kwargs or {})
+        options.pop("steering_scale", None)
         for name in ("tools", "reasoning_effort"):
             if body.get(name) is not None:
                 options[name] = body[name]
@@ -78,20 +82,33 @@ class _Frontend:
 
 
 def _sampling(body, defaults):
+    def finite_f64(name, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise AdmissionError(f"{name} must be a number")
+        try:
+            as_float = float(value)
+        except OverflowError as error:
+            raise AdmissionError(f"{name} must be finite") from error
+        if not math.isfinite(as_float):
+            raise AdmissionError(f"{name} must be finite")
+        return as_float
+
+    def canonical_json_number(name, value):
+        as_float = finite_f64(name, value)
+        if isinstance(value, int) and -(1 << 63) <= value < (1 << 64):
+            return value
+        return as_float
+
     def clamp(name, value, default):
         bounds = defaults.get("ranges", {}).get(name, {"min": default, "max": default})
         return min(max(value, bounds["min"]), bounds["max"])
 
-    def number(name):
+    def number(name, value=None):
         default = float(defaults.get(name, SamplingParameters.__dataclass_fields__[name].default))
-        value = body.get(name)
-        if value is None:
+        raw = body.get(name) if value is None else value
+        if raw is None:
             return default
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise AdmissionError(f"{name} must be a number")
-        if isinstance(value, float) and not math.isfinite(value):
-            raise AdmissionError(f"{name} must be finite")
-        return float(clamp(name, value, default))
+        return float(clamp(name, finite_f64(name, raw), default))
 
     def integer(name, default):
         value = body.get(name)
@@ -101,11 +118,24 @@ def _sampling(body, defaults):
             raise AdmissionError(f"{name} must be an integer")
         return value if name == "seed" else clamp(name, value, default)
 
+    raw_kwargs = body.get("chat_template_kwargs")
+    if raw_kwargs is not None and not isinstance(raw_kwargs, dict):
+        raise AdmissionError("chat_template_kwargs must be an object")
+    nested_scale = None if not raw_kwargs else raw_kwargs.get("steering_scale")
+    top_scale = body.get("steering_scale")
+    chosen_scale = top_scale
+    if nested_scale is not None:
+        nested_canonical = canonical_json_number("steering_scale", nested_scale)
+        if top_scale is not None:
+            if canonical_json_number("steering_scale", top_scale) != nested_canonical:
+                raise AdmissionError("top-level and chat_template_kwargs steering_scale must match")
+        chosen_scale = nested_scale
     return SamplingParameters(
         seed=integer("seed", int(defaults.get("seed", 0))), temperature=number("temperature"),
         top_p=number("top_p"), min_p=number("min_p"), repetition_penalty=number("repetition_penalty"),
         presence_penalty=number("presence_penalty"), frequency_penalty=number("frequency_penalty"),
-        top_k=integer("top_k", int(defaults.get("top_k", -1))))
+        top_k=integer("top_k", int(defaults.get("top_k", -1))),
+        steering_scale=number("steering_scale", chosen_scale))
 
 
 class DirectServer:

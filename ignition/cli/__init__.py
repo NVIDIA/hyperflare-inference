@@ -192,6 +192,8 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
+    advanced.add_argument("--steering-sidecar", type=Path, metavar="PATH",
+                          help="prepare DeepSeek V4.1 with per-request activation steering constants")
     advanced.add_argument("--force-moe-decode-a16", action=argparse.BooleanOptionalAction, default=None,
                           help="use W4A16 target routed experts for decode and verification, with calibrated A4 prefill;"
                                " requires Qwen3.8 Flash NVFP4 on SM120/121 and separate prefill graphs")

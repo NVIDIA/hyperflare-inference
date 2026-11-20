@@ -527,6 +527,15 @@ pub(super) fn sampling_parameters(
             defaults.frequency_penalty,
             ranges.frequency_penalty,
         )?,
+        steering_scale: {
+            let scale = sampling_number(
+                object,
+                "steering_scale",
+                defaults.steering_scale,
+                ranges.steering_scale,
+            )?;
+            if scale == 0. { 0. } else { scale }
+        },
         top_k: object
             .get("top_k")
             .filter(|value| !value.is_null())
@@ -857,21 +866,22 @@ mod tests {
             presence_penalty: Some(SamplingRange { min: -2., max: 2. }),
             frequency_penalty: Some(SamplingRange { min: -1., max: 1. }),
             top_k: Some(SamplingRange { min: 1, max: 100 }),
+            steering_scale: Some(SamplingRange { min: 0., max: 1. }),
         };
         for (value, top_k, expected, expected_k) in [
             (
                 -1e100,
                 serde_json::json!(i64::MIN),
-                [0.5, 0.5, 0., 0.5, -2., -1.],
+                [0.5, 0.5, 0., 0.5, -2., -1., 0.],
                 1,
             ),
             (
                 1e100,
                 serde_json::json!(u64::MAX),
-                [1.5, 1., 0.5, 2., 2., 1.],
+                [1.5, 1., 0.5, 2., 2., 1., 0.],
                 100,
             ),
-            (0.5, serde_json::json!(50), [0.5; 6], 50),
+            (0.5, serde_json::json!(50), [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.], 50),
         ] {
             let body = serde_json::json!({"seed":u64::MAX,"temperature":value,"top_p":value,
                 "min_p":value,"repetition_penalty":value,"presence_penalty":value,"frequency_penalty":value,"top_k":top_k});
@@ -879,6 +889,34 @@ mod tests {
             assert_eq!(result.values(), expected);
             assert_eq!(result.top_k, expected_k);
             assert_eq!(result.seed, u64::MAX);
+        }
+    }
+
+    #[test]
+    fn steering_scale_clamps_to_the_prepared_interval_and_canonicalizes_negative_zero() {
+        let defaults = SamplingParameters::default();
+        let unsteered_ranges = SamplingRanges::default();
+        let unsteered_body = serde_json::json!({"steering_scale": 0.8});
+        let clamped = sampling_parameters(
+            unsteered_body.as_object().unwrap(),
+            &defaults,
+            &unsteered_ranges,
+        )
+        .unwrap();
+        assert_eq!(clamped.steering_scale.to_bits(), 0.0f32.to_bits());
+
+        let ranges = SamplingRanges {
+            steering_scale: Some(SamplingRange { min: 0., max: 1. }),
+            ..Default::default()
+        };
+        for (requested, expected) in [(-10., 0.), (-0., 0.), (0.5, 0.5), (10., 1.)] {
+            let body = serde_json::json!({"steering_scale":requested});
+            let sampling =
+                sampling_parameters(body.as_object().unwrap(), &defaults, &ranges).unwrap();
+            assert_eq!(sampling.steering_scale, expected);
+            if expected == 0. {
+                assert_eq!(sampling.steering_scale.to_bits(), 0.0f32.to_bits());
+            }
         }
     }
 
