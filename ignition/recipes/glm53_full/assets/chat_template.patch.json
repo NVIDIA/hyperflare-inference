@@ -1,0 +1,17 @@
+{
+  "source": {
+    "repository": "local-inference-lab/GLM-5.3-NVFP4",
+    "revision": "cca10d1586255195d3279785fc85577bfc1e9227",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "69bb3ab52067898e2466b855407636de559568947f367945842aabcb7fcc1705",
+  "result_sha256": "aa19a952b27d3edfd51e1a18cda71d2e5dcb31d3beadd3729a4d3e71ead40a02",
+  "insertions": [
+    5015,
+    9564,
+    9687,
+    9982,
+    10227,
+    10368
+  ]
+}

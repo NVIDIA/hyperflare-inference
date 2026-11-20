@@ -2,7 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render GLM requests with the selected template and checkpoint tokenizer."""
+"""Render GLM requests with the selected template and checkpoint tokenizer.
+
+`--recipe` names the recipe whose annotated template asset places the message
+marks. The text-only `glm53_full` recipe has no image cases.
+`--equivalent-template` names another template file, such as the model
+author's revision of a republished checkpoint's template, that must render
+every case to the same text.
+"""
 
 import argparse
 import base64
@@ -14,13 +21,21 @@ from pathlib import Path
 from transformers import AutoProcessor, AutoTokenizer
 from PIL import Image
 
+from ignition.preparation.frontend import annotated_template_asset
 from ignition.recipes.glm53.frontend import chat_template_asset
 
 
-def generate(snapshot):
+def generate(snapshot, recipe="glm53", equivalent_template=None):
     tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
-    source = chat_template_asset(snapshot)["text"]
-    tokenizer.chat_template = source.replace("{%- mark -%}", "")
+    if recipe == "glm53":
+        source = chat_template_asset(snapshot)["text"]
+        tokenizer.chat_template = source.replace("{%- mark -%}", "")
+    else:
+        source = annotated_template_asset(
+            tokenizer.get_chat_template().encode(),
+            Path(__file__).resolve().parents[2] / f"ignition/recipes/{recipe}/assets/chat_template.patch.json",
+        )["text"]
+        assert source.replace("{%- mark -%}", "") == tokenizer.get_chat_template()
     tool = {"type": "function", "function": {"name": "lookup", "parameters": {
         "type": "object", "properties": {"city": {"type": "string"}, "count": {"type": "integer"}}}}}
     system = {"role": "system", "content": "Answer accurately. α 世界"}
@@ -32,10 +47,14 @@ def generate(snapshot):
         continuation = options.get("continue_final_message", False)
         effective = {"add_generation_prompt": not continuation, **options}
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, **effective)
+        if equivalent_template is not None:
+            assert tokenizer.apply_chat_template(messages, chat_template=equivalent_template, tokenize=False,
+                                                 **effective) == rendered, name
         ids = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=False, **effective)
         marker = "\0message-position\0"
         while marker in rendered:
             marker += "_"
+        # A string variable, not a callable: Transformers passes template arguments as JSON-like values.
         annotated = source.replace("{%- mark -%}", "{{- message_position -}}")
         marked = tokenizer.apply_chat_template(messages, chat_template=annotated, tokenize=False,
             message_position=marker, **effective)
@@ -56,7 +75,7 @@ def generate(snapshot):
             suffix_starts[index] = min(suffix_starts[index + 1], offsets[index][0])
         boundaries = sorted({index for position in positions for index in range(1, len(offsets))
             if prefix_ends[index] <= position <= suffix_starts[index]})
-        body = {"model": "glm53", "messages": copy.deepcopy(messages), "chat_template_kwargs": options}
+        body = {"model": recipe, "messages": copy.deepcopy(messages), "chat_template_kwargs": options}
         if wire_strings:
             for message in body["messages"]:
                 for call in message.get("tool_calls", []):
@@ -93,9 +112,11 @@ def generate(snapshot):
         {"continue_final_message": "reasoning_content"})
     add("empty_assistant_continuation", [system, user, {"role": "assistant", "content": "", "reasoning_content": ""}],
         {"continue_final_message": True})
+    image_cases = []
+    if recipe == "glm53_full":
+        return {"cases": cases, "image_cases": image_cases}
     processor = AutoProcessor.from_pretrained(snapshot, local_files_only=True)
     processor.chat_template = tokenizer.chat_template
-    image_cases = []
     for count in (1, 2):
         images = [Image.new("RGB", (112 + 28 * i, 84), (31 * i, 100, 210)) for i in range(count)]
         content = [{"type": "text", "text": "Describe the images."}]
@@ -119,5 +140,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--recipe", choices=("glm53", "glm53_full"), default="glm53")
+    parser.add_argument("--equivalent-template", type=Path)
     args = parser.parse_args()
-    args.output.write_text(json.dumps(generate(args.snapshot), ensure_ascii=False))
+    equivalent = None if args.equivalent_template is None else args.equivalent_template.read_text()
+    args.output.write_text(json.dumps(generate(args.snapshot, args.recipe, equivalent), ensure_ascii=False))
