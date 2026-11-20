@@ -15,6 +15,7 @@ pub(super) enum PlanOrigin {
     #[default]
     Ordinary,
     Discovery,
+    DiscoveryStart,
     RefreshStart(cost::Key),
     AcceptanceStart,
 }
@@ -50,6 +51,7 @@ impl RefreshState {
 
     pub fn validate(&self, origin: PlanOrigin) -> Result<()> {
         match origin {
+            PlanOrigin::DiscoveryStart if !self.ready() => Err("optional discovery requires full credit and no active episode".into()),
             PlanOrigin::RefreshStart(_) if !self.ready() => Err("refresh requires full credit and no active episode".into()),
             PlanOrigin::AcceptanceStart if !self.acceptance_ready() => Err("acceptance learning requires full credit and no active episode".into()),
             _ => Ok(()),

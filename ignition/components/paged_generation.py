@@ -5,7 +5,7 @@
 """Collective text execution and request completion."""
 
 from ignition.components.collectives import PreparedAllReduce
-from ignition.components.sampling import PreparedSampling
+from ignition.components.sampling import PreparedCompletion, PreparedSampling
 from ignition.components.state import save_hidden
 
 
@@ -94,3 +94,24 @@ class PreparedGeneration:
             return {"target.hidden": hidden, "target.logits": logits,
                     **{"target." + name: getattr(metadata, name) for name in
                        ("live_counts", "starts", "lengths", "query_start_loc", "token_ids", "positions")}}
+
+
+class PreparedPrefill:
+    """Consume prompt rows without publishing continuation or sampling outputs."""
+
+    def __init__(self, decoder, batch, records, frame, sequence, *, validation):
+        self.decoder, self.batch = decoder, batch
+        self.validation = validation
+        b, rows = batch.inputs, batch.rows
+        self.completion = PreparedCompletion(batch.requests, b.row_slot_ids[:rows],
+            b.row_generations[:rows], b.live_rows, records, frame, sequence)
+        self.completion.prepare()
+        decoder.release_outputs()
+        self.batch.functional()
+
+    def __call__(self):
+        validation, present = self.batch.validate()
+        metadata = self.batch.begin(self.validation(validation), present=present)
+        self.decoder(metadata, terminal=False)
+        self.batch.finish(metadata)
+        self.completion()

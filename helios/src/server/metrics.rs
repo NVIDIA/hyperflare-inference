@@ -401,7 +401,7 @@ impl Metrics {
             GraphKind::Init => 0,
             GraphKind::Restore => 1,
             GraphKind::Resume => 2,
-            GraphKind::Prefill | GraphKind::ScoredPrefill => 3,
+            GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => 3,
             GraphKind::Decode => 4,
             GraphKind::Vision => 5,
             GraphKind::Snapshot => 6,
@@ -410,7 +410,7 @@ impl Metrics {
         };
         self.launches[index].fetch_add(1, Ordering::Relaxed);
         let sampling_index = match kind {
-            GraphKind::Prefill | GraphKind::ScoredPrefill => 0,
+            GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => 0,
             GraphKind::Decode => 1,
             GraphKind::Resume => 2,
             GraphKind::Speculative => 3,

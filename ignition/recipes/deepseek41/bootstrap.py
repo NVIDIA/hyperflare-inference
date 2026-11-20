@@ -50,7 +50,7 @@ from .decoder import PreparedDecoder, Scratch, DraftScratch
 from ignition.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
 from .engram import Tables
-from ignition.components.paged_generation import PreparedGeneration
+from ignition.components.paged_generation import PreparedGeneration, PreparedPrefill
 from ignition.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
 from ignition.components.paged_resume import PreparedResume
@@ -85,7 +85,7 @@ def _can_race_contextual_plans(config, signatures, device):
 
     if not mla_norm_mxfp8.is_supported(device):
         raise ValueError("--joint-tuning requires fused MXFP8 query normalization on the selected device")
-    if not any(signature.kind in ("prefill", "scored_prefill", "decode", "speculative")
+    if not any(signature.kind in ("prefill", "terminal_prefill", "scored_prefill", "decode", "speculative")
                for signature in signatures.values()):
         raise ValueError("--joint-tuning requires prepared text graphs")
     return True
@@ -256,6 +256,11 @@ class PreparationConfig(BasePreparationConfig):
     @property
     def completion_token_capacity(self):
         return max(self.speculative_widths) if self.dspark else 1
+
+
+def deferred_prefill_enabled(config: PreparationConfig, sliding_window: int) -> bool:
+    """Return whether preparation emits separate intermediate and terminal prefill graphs."""
+    return getattr(config, "sm103", None) is not None and config.prefill_chunk_size > sliding_window
 
 
 def _prepare_speculation_catalog(config, speculation, *, add, buffers,
@@ -945,6 +950,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
              + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
              + (len(config.batch_capacities) if False in modes else 0))
     count += len(PATCH_CAPACITIES) if vision_state is not None else 0
+    deferred_prefill = deferred_prefill_enabled(config, weights.config.text["sliding_window"])
+    if deferred_prefill:
+        count += len(modes) * len(config.prefill_capacities)
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)
     with phase(progress, "Construct graph catalog", total=count) as stage:
@@ -990,6 +998,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
                         context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT)
                     fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
+                    if kind == "prefill" and deferred_prefill:
+                        add("terminal_" + name, forward, "terminal_prefill", rows, capacity, fields, enabled=enabled)
+                        forward = PreparedPrefill(decoder, batch, completion, frame, sequence,
+                            validation=forward.validation)
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
         confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
             forward_inputs=forward_inputs,
@@ -1069,7 +1081,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=core_storage,
-            compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"))
+            compile_kinds=("terminal_prefill", "prefill", "scored_prefill", "decode", "resume", "speculative", "vision"))
     finally:
         if feature_pool is not None:
             feature_pool.materialize()
