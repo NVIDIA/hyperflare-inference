@@ -11,7 +11,7 @@ import torch
 
 from ignition.progress import graph_catalog, phase
 
-from .aot import ForwardCache
+from .aot import ForwardCache, allocation_order
 from .collectives import warmup_wait
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
@@ -20,19 +20,7 @@ from .runtime_core import capture_graph, instantiate_graph, record_export_graph
 
 def _capture_order(names, compiled, coordinator):
     sizes = {name: forward.capture_allocation_sizes for name, forward in compiled.items()}
-    ranks = [(names, sizes)]
-    if coordinator is not None:
-        ranks = [None] * len(coordinator.ranks)
-        torch.distributed.all_gather_object(ranks, (names, sizes), group=coordinator.group)
-        if any(selected != names or requests.keys() != sizes.keys() for selected, requests in ranks):
-            raise ValueError("tensor-parallel capture requires matching forward catalogs")
-
-    def priority(name):
-        requests = [rank_sizes[name] for _, rank_sizes in ranks if name in rank_sizes]
-        return (bool(requests), max((max(sizes, default=0) for sizes in requests), default=0),
-                max((sum(sizes) for sizes in requests), default=0))
-
-    return tuple(sorted(names, key=priority, reverse=True))
+    return allocation_order(names, sizes, coordinator)
 
 
 @_defer_full_collection()

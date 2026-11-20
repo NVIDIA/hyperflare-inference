@@ -428,6 +428,7 @@ class StorageBackend(SerializableCallable):
                 fake_mode=detect_fake_mode(examples), options={'config_patches': dict(_OPTIONS if options is None else options)},
                 aot=True, donate_graph_module=True)
         self._serialized_artifact = None
+        self._cuda_allocation_sizes = None
         self._tuning_frozen = False
         self._bound = None
 
@@ -459,12 +460,21 @@ class StorageBackend(SerializableCallable):
             artifact = (fn.artifact.serialize() if fn._serialized_artifact is None
                         else zlib.decompress(fn._serialized_artifact))
         calls = _serialized_invocations(fn.invocations)
-        return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen))
+        sizes = getattr(fn, "_cuda_allocation_sizes", None)
+        if sizes is None:
+            graph = getattr(fn.artifact, "_flare_graph", None)
+            if graph is None:
+                entry, _, _ = pickle.loads(artifact)
+                graph = entry.compiled_fw.result
+            sizes = tuple(int(size) for device, size in getattr(graph, "_flare_pool_sizes", ())
+                          if device == "cuda")
+            fn._cuda_allocation_sizes = sizes
+        return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen, sizes))
 
     @classmethod
     def deserialize_compile_artifacts(cls, data):
         fn = cls.__new__(cls)
-        artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen = pickle.loads(data)
+        artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen, fn._cuda_allocation_sizes = pickle.loads(data)
         devices = {item[4] for item in fn.signature if isinstance(item, tuple) and item[4].type == "cuda"}
         if len(devices) != 1:
             raise ValueError("compiled forwards require exactly one CUDA device")
@@ -550,6 +560,9 @@ class BoundForward:
     @property
     def capture_allocation_sizes(self):
         """CUDA allocation requests from the compiled forward's memory plan."""
+        sizes = getattr(self.backend, "_cuda_allocation_sizes", None)
+        if sizes is not None:
+            return sizes
         return tuple(int(size) for device, size in self.backend.artifact._flare_graph._flare_pool_sizes
                      if device == "cuda")
 
@@ -613,6 +626,26 @@ def _completed(pending):
             if future is None or future.done():
                 return pending.pop(index)
         wait([item[-2].pending for item in pending], return_when=FIRST_COMPLETED)
+
+
+def allocation_order(names, sizes, coordinator=None):
+    """Order compiled forwards by largest allocation request, agreed across ranks."""
+    names = tuple(names)
+    ranks = [(names, sizes)]
+    if coordinator is not None:
+        import torch.distributed as dist
+
+        ranks = [None] * len(coordinator.ranks)
+        dist.all_gather_object(ranks, (names, sizes), group=coordinator.group)
+        if any(selected != names or requests.keys() != sizes.keys() for selected, requests in ranks):
+            raise ValueError("tensor-parallel capture requires matching forward catalogs")
+
+    def priority(name):
+        requests = [rank_sizes[name] for _, rank_sizes in ranks if name in rank_sizes]
+        return (bool(requests), max((max(allocations, default=0) for allocations in requests), default=0),
+                max((sum(allocations) for allocations in requests), default=0))
+
+    return tuple(sorted(names, key=priority, reverse=True))
 
 
 # Command-line, planning, display, and diagnostic direct-execution sources do not change compiled forwards.
@@ -848,7 +881,7 @@ class ForwardCache:
                                        materialize=materialize, warmup=warmup, before_run=before_run)
         selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
                                         source_identity=self.root.name)
-        compiled, paths, pending = {}, {}, []
+        compiled, loaded, paths, pending = {}, {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
             def finish():
@@ -857,19 +890,9 @@ class ForwardCache:
                     with _guard_code_cache(self.root / 'guards'):
                         if bound.pending is not None:
                             bound.pending.result()
-                        if materialize is None:
-                            if not bound.cache_hit:
-                                bound = self._load(bound.owner, path, required=True,
-                                                   before_run=None if before_run is None else lambda: before_run(name))
-                                bound.cache_hit = False
-                            compiled[name] = self._warm(bound, path, name=name, progress=None,
-                                                       selections=selections, warmup=warmup,
-                                                       before_run=None if before_run is None else lambda name=name: before_run(name))
-                            compiled[name].prepare_capture()
-                            selections.release(compiled[name])
-                            release_unused(generation=0)
-                        else:
-                            paths[name] = path
+                        elif materialize is None and bound.cache_hit:
+                            loaded[name] = bound
+                        paths[name] = path
                 except Exception as error:
                     raise RuntimeError(f"failed to prepare compiled forward {name}") from error
                 stage.update(advance=1)
@@ -887,21 +910,44 @@ class ForwardCache:
         release_unused()
         if materialize is not None:
             materialize()
-            with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
-                for name, forward in functions.items():
+        if len(functions) > 1:
+            sizes = {
+                name: (loaded[name].capture_allocation_sizes if name in loaded
+                       else self._allocation_sizes(paths[name]))
+                for name in functions
+            }
+            ordered_names = allocation_order(functions, sizes)
+        else:
+            ordered_names = tuple(functions)
+        with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
+            for name in ordered_names:
+                forward = functions[name]
+                try:
                     with _guard_code_cache(self.root / 'guards'):
-                        try:
-                            bound = self._load(forward, paths[name], required=True,
-                                               before_run=None if before_run is None else lambda name=name: before_run(name))
-                        except BindingMismatch:
-                            bound = BoundForward(aot_forward(forward, options=self.options), forward, False)
+                        if name in loaded:
+                            bound = loaded.pop(name)
+                        else:
+                            try:
+                                bound = self._load(forward, paths[name], required=True,
+                                                   before_run=None if before_run is None else lambda name=name: before_run(name))
+                            except BindingMismatch:
+                                if materialize is None:
+                                    raise
+                                bound = BoundForward(aot_forward(forward, options=self.options), forward, False)
+                            else:
+                                if materialize is None:
+                                    bound.cache_hit = False
                         compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
                                                    selections=selections, warmup=warmup,
                                                    before_run=None if before_run is None else lambda name=name: before_run(name))
                         compiled[name].prepare_capture()
                         selections.release(compiled[name])
                         release_unused(generation=0)
-                    stage.update(advance=1)
+                except Exception as error:
+                    if materialize is None:
+                        raise RuntimeError(f"failed to prepare compiled forward {name}") from error
+                    raise
+                stage.update(advance=1)
         release_unused()
         return compiled
 
@@ -1091,8 +1137,15 @@ class ForwardCache:
         selections = InductorSelections(self.device, coordinator=coordinator,
                                         lock_gpu_clocks=self.lock_gpu_clocks, source_identity=self.root.name)
         published, released = [], 0
+        sizes = {
+            name: (selected[name].capture_allocation_sizes if name in selected
+                   else self._allocation_sizes(paths[name, getattr(forward, "compilation_variant", "shared")][0]))
+            for name, forward in functions.items()
+        }
+        ordered_names = allocation_order(functions, sizes, coordinator)
         with phase(progress, "Load and warm compiled forwards", total=len(functions)) as stage:
-            for name, forward in functions.items():
+            for name in ordered_names:
+                forward = functions[name]
                 failure = None
                 try:
                     if name not in selected:
@@ -1136,6 +1189,13 @@ class ForwardCache:
         if coordinator.spans_hosts:
             _share_artifacts(selections._gather(published), group, ranks)
         return selected
+
+    def _allocation_sizes(self, path):
+        with Path(path).open('rb') as file:
+            compiled = pickle.load(file)
+        _, payload = compiled['compiled_fn']
+        _, _, _, _, _, sizes = pickle.loads(payload)
+        return sizes
 
     def _load(self, forward, path, *, required=False, before_run=None):
         with bind_device(self.device, freeze_tuning=self.options.get(
