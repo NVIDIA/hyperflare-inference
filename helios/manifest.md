@@ -210,6 +210,34 @@ Natural finishing performs one count load and branch in addition to candidate
 selection and normalization. Equal readback bytes do not imply equal total work
 or efficiency.
 
+An optional `parallax_routes_v1` output has contiguous dtype int64 and shape
+`[2,L,4+E]`, with `1 <= L <= 256`, `1 <= E <= 4096`, and `L*(4+E) <= 1048576`.
+It is output-only, never an input or tuning status buffer. Unknown
+`parallax_routes_*` versions are rejected. The selected tracing catalog excludes
+mixed graphs and requires a single rank. The package field
+`ExecutionGraph.routing_trace` identifies traced variants; absent or false means
+counter-free execution. Native startup defaults to counter-free graphs and omits
+this output from the execution manifest, preventing routing readback. Explicit
+`--parallax-routing` requires traced counterparts for every target graph in the
+selected ordinary or MTP mode. Catalogs with only ordinary traced graphs still
+require MTP disabled when tracing. Paired variants must agree on geometry and
+input bindings. Decode, prefill, scored-prefill, and complete speculative graphs
+reset the selected frame and write one row per canonical layer:
+`[submission_sequence, valid_tokens, top_k, invalid_route_count, expert_counts...]`.
+Dense layers write zero token, top-K, and count fields. Counts exclude padded
+rows and sum to `valid_tokens * top_k`; expert columns are canonical IDs.
+Speculative counts cover all executed target verification rows, including
+rejected candidates; they are not accepted-output-token counts. Draft experts
+are excluded from this target catalog. The v1 decoder accepts at most 262144
+valid tokens per row and rejects stale sequences, invalid IDs, or inconsistent
+totals as invalid telemetry without changing model outputs. The native executor
+retains two readbacks and waits for each frame's existing transfer fence before
+decoding or reuse. Instrumented executions add `8*L*(4+E)` readback bytes per
+target graph and twice that persistent output storage; discrete devices also
+retain two pinned readback buffers. Counters add captured GPU work and native
+decoding and HTTP collection add CPU work; overhead requires measurement. Host
+dispatch is a conservative demand lower bound, not a GPU layer timestamp.
+
 An optional `readiness_timestamps` output has dtype int64 and contiguous shape
 `[2,3*N]`, with `1 <= N <= 64`. Each frame holds one triple per embedding table:
 GPU timestamps before its external readiness wait, after readiness, and after a

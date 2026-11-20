@@ -4,6 +4,7 @@
 
 """Complete GLM text forwards with invocation-local tensors and sharded vocabulary weights."""
 
+from copy import copy
 from dataclasses import dataclass
 
 import torch
@@ -101,6 +102,7 @@ class PreparedDecoder:
         if metadata.sample_indices.shape != scratch.hidden.shape[:1]:
             raise ValueError("GLM sample indices and hidden-output capacities differ")
         self.weights, self.scratch, self.state, self.metadata = weights, scratch, state, metadata
+        self.routing_trace = None
         self.tokens, self.blocks, self.sample_rows = (scratch.embedding.shape[0],
             scratch.mla.index.page_table.shape[1], scratch.hidden.shape[0])
         self.mode = mode
@@ -139,6 +141,26 @@ class PreparedDecoder:
         self.scratch = self.metadata = self.feedback = self.kda_records = None
         return self
 
+    def with_routing_trace(self, trace):
+        """Share prepared storage across serial plain and traced graph variants.
+
+        Only wrappers carrying instrumentation differ. Operators, metadata and
+        continuation state retain their original owners and tuning bindings.
+        Never mutate a plain layer: it must capture without counter operations.
+        """
+        if trace is None or self.routing_trace is not None:
+            raise ValueError("routing instrumentation requires an untraced decoder")
+        traced = copy(self)
+        traced.routing_trace = trace
+        traced.layers = []
+        for index, (layer, weights) in enumerate(zip(self.layers, self.weights.layers, strict=True)):
+            if isinstance(weights.mlp, MoEWeights):
+                layer = copy(layer)
+                layer.mlp = copy(layer.mlp)
+                layer.mlp.routing_counter = trace.functional_counter(index, self.tokens, layer.module.mlp.gate.top_k)
+            traced.layers.append(layer)
+        return traced
+
     def rebind_pages(self):
         """Rebind every sparse-attention layer to the continuation pool's current page pools."""
         for layer in self.layers:
@@ -146,6 +168,8 @@ class PreparedDecoder:
                 layer.attention.rebind_pages()
 
     def __call__(self, metadata, *, records=None):
+        if self.routing_trace is not None:
+            self.routing_trace.begin()
         language = self.weights.tree.model.language_model
         embedded = self.embedding(token_ids=metadata.token_ids, num_rows=metadata.recurrent.num_tokens)
         if self.vision is not None:
@@ -154,7 +178,8 @@ class PreparedDecoder:
         for index, layer in enumerate(self.layers):
             layer_records = None if records is None or index not in records.layers else records.layer(index)
             attention_metadata = metadata.indexed if layer.module.block_type == "indexed_attention" else metadata.recurrent
-            value, carry = layer(value, attention_metadata, carry, records=layer_records)
+            value, carry = layer(value, attention_metadata, carry, records=layer_records,
+                                 valid_tokens=metadata.recurrent.num_tokens)
         auxiliary = None
         if not self.full_feedback and self.scoring is None:
             selected = value[metadata.sample_indices]

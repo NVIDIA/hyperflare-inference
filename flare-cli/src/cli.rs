@@ -903,6 +903,10 @@ pub struct ServingOptions {
     #[arg(long, value_name = "N", help_heading = "Speculation options")]
     pub mtp_draft_tokens: Option<usize>,
 
+    /// Enable prepared Parallax routing telemetry for the selected execution mode.
+    #[arg(long, help_heading = "Advanced serving options")]
+    pub parallax_routing: bool,
+
     /// Augment learned drafts with shared decoded history; requires prepared history inputs.
     #[arg(
         long,
@@ -1082,6 +1086,9 @@ impl ServingOptions {
         if let Some(n) = self.max_concurrency {
             options.extend(["--max-concurrency".into(), n.to_string()]);
         }
+        if self.parallax_routing {
+            options.push("--parallax-routing".into());
+        }
         if let Some(n) = self.mtp_draft_tokens {
             options.extend(["--mtp-draft-tokens".into(), n.to_string()]);
         }
@@ -1186,6 +1193,7 @@ impl ServingOptions {
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
+            parallax_routing: self.parallax_routing,
             history_drafts: if self.history_drafts {
                 Some(true)
             } else if self.no_history_drafts {
@@ -1626,6 +1634,7 @@ mod tests {
             "--max-concurrency",
             "3",
             "--mtp-draft-tokens=0",
+            "--parallax-routing",
             "--embedding-table-storage",
             "ram",
             "--prefix-cache-memory",
@@ -1643,6 +1652,8 @@ mod tests {
         assert_eq!(options.embedding_table_storage, Some(Storage::Ram));
         assert_eq!(options.max_concurrency, Some(3));
         assert_eq!(options.mtp_draft_tokens, Some(0));
+        assert!(options.parallax_routing);
+        assert!(args.rank_options().contains(&"--parallax-routing".to_string()));
         assert_eq!(
             options.prefix_cache,
             PrefixCacheOffload {

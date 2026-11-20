@@ -6,6 +6,7 @@
 
 import torch
 from dataclasses import dataclass
+from copy import copy
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.sampling import PreparedSampling
@@ -55,6 +56,11 @@ class PreparedGeneration:
         self.batch.functional()
         self.decoder.functional(session=session)
         self.compilation_variant = "sample"
+
+    def with_routing_trace(self, trace):
+        traced = copy(self)
+        traced.decoder = self.decoder.with_routing_trace(trace)
+        return traced
 
     def rebind_pages(self, pages):
         self.decoder.rebind_pages()

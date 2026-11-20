@@ -198,6 +198,7 @@ def _export_hosts(args):
                          stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                         parallax_routing=args.parallax_routing,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only,
@@ -283,6 +284,7 @@ def _prepare(args):
                          stream_overlap=stream_overlap(args, model),
                       roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                      parallax_routing=args.parallax_routing,
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                       language_model_only=args.language_model_only,
@@ -302,6 +304,7 @@ def _prepare(args):
         ladder_name = f" · ladder {plan.collective_ladder['name']}" if plan.collective_ladder is not None else ""
         stage.update(f"GPU{'s' if plan.world_size > 1 else ''} {indices}{restricted}"
                      f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
+                     f"{' · Parallax routing on' if plan.parallax_routing else ''}"
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
                      f" · mixed prefill {'on' if plan.mixed_prefill else 'off'}"
                      f" · expert scales {plan.expert_scale_compression or 'native'}"
@@ -465,6 +468,7 @@ def debug_serve(args) -> int:
                          stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
+                         parallax_routing=args.parallax_routing,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)

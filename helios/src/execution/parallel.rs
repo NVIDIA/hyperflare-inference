@@ -322,6 +322,7 @@ impl TensorParallelExecutor {
                             return Err(invalid("rank completion size differs from its ABI"));
                         }
                         let completion = FrameCompletion {
+                            routing: None,
                             logprobs: None, prompt_logprobs: None, proposal_confidence, speculative_survival,
                             fence, graph_index: graph, timing,
                             records: super::transport::decode_records(reader.0, fence,

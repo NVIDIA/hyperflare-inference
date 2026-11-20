@@ -126,7 +126,7 @@ class PreparedGlmLayer:
         self.scratch = self.output = None
         return self
 
-    def __call__(self, source, metadata, carry=None, *, records=None):
+    def __call__(self, source, metadata, carry=None, *, records=None, valid_tokens=None):
         if self.has_carry:
             if carry is None:
                 raise ValueError("GLM post/pre layer requires runtime residual and mixing carry")
@@ -141,7 +141,14 @@ class PreparedGlmLayer:
         attention = self.attention_reduce(attended)
         mlp_residual, mlp_post, mlp_comb, mlp_input = self.mlp_hc(
             attention, attention_residual, attention_post, attention_comb)
-        mlp = self.mlp_reduce(self.mlp(mlp_input))
+        if isinstance(self.mlp, PreparedGlmMoe) and self.mlp.routing_counter is not None:
+            if valid_tokens is None:
+                valid_tokens = getattr(metadata, "num_tokens", None)
+            if valid_tokens is None:
+                raise ValueError("traced GLM MoE layer requires valid_tokens")
+            mlp = self.mlp_reduce(self.mlp(mlp_input, valid_tokens=valid_tokens))
+        else:
+            mlp = self.mlp_reduce(self.mlp(mlp_input))
         if self.post is None:
             return mlp, (mlp_residual, mlp_post, mlp_comb)
         return self.post(mlp, mlp_residual, mlp_post, mlp_comb), None

@@ -182,6 +182,7 @@ class Plan:
     stream_overlap: bool = True
     mixed_prefill: bool = False
     prompt_logprobs: bool = False
+    parallax_routing: bool = False
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
     roce_ring: bool = False
@@ -207,6 +208,10 @@ class Plan:
     benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
+        if type(self.parallax_routing) is not bool:
+            raise UsageError("parallax routing capture must be a boolean")
+        if self.parallax_routing and (self.recipe.name != "glm53" or self.world_size != 1 or self.mixed_prefill):
+            raise UsageError("--parallax-routing requires GLM-Flash on one GPU without mixed prefill")
         if self.context_parallel_size is not None:
             if (type(self.context_parallel_size) is not int or not 1 <= self.context_parallel_size <= self.world_size
                     or self.world_size % self.context_parallel_size):
@@ -387,6 +392,7 @@ class Plan:
             "stream_overlap": self.stream_overlap,
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
+            "parallax_routing": self.parallax_routing,
             "expert_scale_compression": self.expert_scale_compression,
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
@@ -433,7 +439,7 @@ class Plan:
 def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concurrency: int, reserve_bytes: int,
         speculation: Speculation | None, prefill_chunk: int | None = None,
         context_parallel: bool = True, context_parallel_size: int | None = None, stream_overlap: bool = True, cache_states: int | None = None,
-        mixed_prefill: bool = False, prompt_logprobs: bool = False,
+        mixed_prefill: bool = False, prompt_logprobs: bool = False, parallax_routing: bool = False,
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
@@ -509,6 +515,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 context_parallel_size=context_parallel_size,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
+                parallax_routing=parallax_routing,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 mla_compute_mode=mla_compute_mode,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
@@ -567,6 +574,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          prefill_chunk: int | None = None, context_parallel: bool = True, context_parallel_size: int | None = None,
          stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
+         parallax_routing: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
          language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
@@ -637,7 +645,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    speculation=speculation, prefill_chunk=chunk, context_parallel=context_parallel,
                    context_parallel_size=context_parallel_size,
                    stream_overlap=stream_overlap, cache_states=cache_states,
-                   mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
+                   mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, parallax_routing=parallax_routing,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,

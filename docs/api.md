@@ -276,6 +276,36 @@ grows with queued data; large paused responses can retain more CPU memory.
 Finished responses awaiting delivery count toward the admission limit,
 but occupy no model execution slot or live KV cache.
 
+## Experimental routing observations
+
+`GET /v1/parallax/routing?after=N` returns version-one aggregate routing records
+with routing sequence greater than `N` (default zero). It uses normal API
+authentication. Collection requires both a package prepared with
+`--parallax-routing` and explicit `flare run --parallax-routing` activation.
+Normal serving returns `enabled: false`; reading the endpoint does not activate
+counters. This endpoint neither changes routing nor moves experts.
+
+The response includes `version`, `session`, `model_id`, `enabled`, `geometry`
+(`[layers, experts]`), `clock`, `native_now_ns`, `demand_timing`, `demand_scope`,
+`capacity`, `latest_sequence`, `dropped_total`, `invalid_total`, and `frames`.
+Each frame has `sequence`, `graph`, `phase`, `batch_size`, `concurrency`, and a
+`sample` containing `submission`, `gpu_ns`, `demand_lower_bound_ns`,
+`available_ns`, and `layers`. Layer records contain canonical `layer`, valid
+`tokens`, `top_k`, and expert-indexed `counts`. No prompt content, token IDs, or
+per-request identifiers are exposed. Phase `verify` reports target expert work
+from a complete speculative round, including candidates rejected after
+verification. Counts exclude padded target rows and draft-layer experts; they do
+not count only accepted output tokens.
+
+The native process uses its own monotonic clock. Demand is conservatively bounded
+by host dispatch before launch; availability follows the readback fence. An
+external consumer must additionally account for HTTP receipt and queueing delay.
+The ring retains at most 32 records. Producer contention drops observations rather
+than waiting; invalid telemetry increments `invalid_total`. Retention eviction is
+visible as a sequence gap. Consumers must detect gaps, changed counters, and
+changed sessions and start separate evaluation windows. This is an experimental
+observation feed, not a lossless tracing service.
+
 ## Health and metrics
 
 `GET /health` returns `{"status":"ok"}` while the model runtime is healthy and

@@ -52,6 +52,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
+pub mod parallax;
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -533,6 +534,7 @@ fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize)
         .route("/v1/responses", post(http::generate).get(http::no_websocket).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/systemone", post(protocol::decisions::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/decisions", post(protocol::decisions::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
+        .route("/v1/parallax/routing", get(parallax_routing))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -629,6 +631,21 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
         text,
     )
         .into_response()
+}
+
+async fn parallax_routing(State(state): State<Arc<HttpState>>, uri: Uri) -> Response {
+    let after = match parallax::parse_after(uri.query()) {
+        Ok(value) => value,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    Json(
+        state
+            .model
+            .metrics()
+            .parallax
+            .snapshot(after, &state.model.config().model_id),
+    )
+    .into_response()
 }
 fn readiness_failure(
     message: &'static str,

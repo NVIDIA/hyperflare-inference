@@ -273,7 +273,7 @@ impl ExecutionManifest {
             }
         }
         for name in producers.keys().chain(statuses.iter()) {
-            if host_inputs.contains(name) || matches!(*name, "completion_records" | "completion_logprobs" | "prompt_logprobs" | "proposal_confidence" | "completion_speculative_survival" | "readiness_timestamps") {
+            if host_inputs.contains(name) || matches!(*name, "completion_records" | "completion_logprobs" | "prompt_logprobs" | "proposal_confidence" | "completion_speculative_survival" | "readiness_timestamps" | "parallax_routes_v1") {
                 return Err("tuning storage cannot overlap request transport storage".into());
             }
         }
@@ -555,6 +555,15 @@ impl ExecutionManifest {
                 return Err("readiness timestamps require two contiguous int64 frames of three timestamps per interval".into());
             }
         }
+        for buffer in self.buffers.iter().filter(|buffer| buffer.name.starts_with("parallax_routes_")) {
+            if buffer.name != crate::parallax::BUFFER {
+                return Err("unsupported Parallax routing schema".into());
+            }
+            crate::parallax::validate_buffer(buffer)?;
+            if self.graphs.iter().any(|g| g.kind == GraphKind::Mixed) {
+                return Err("Parallax routing v1 does not support mixed graphs".into());
+            }
+        }
         self.validate_tuning()?;
         let mut names = HashSet::new();
         let mut host_spans = HashMap::<&str, (usize, usize)>::new();
@@ -629,7 +638,7 @@ impl ExecutionManifest {
             for binding in &graph.input_bindings {
                 if !bound.insert(binding.buffer_name.as_str())
                     || ["completion_records", "completion_logprobs", "prompt_logprobs", "readiness_timestamps",
-                        "completion_speculative_survival"].contains(&binding.buffer_name.as_str())
+                        "parallax_routes_v1", "completion_speculative_survival"].contains(&binding.buffer_name.as_str())
                 {
                     return Err(Error::execution(
                         ExecutionError::Manifest,

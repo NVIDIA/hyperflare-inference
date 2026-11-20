@@ -240,6 +240,7 @@ pub struct PromptLogprobs {
 
 #[derive(Debug)]
 pub struct FrameCompletion {
+    pub routing: Option<crate::parallax::RoutingReadout>,
     pub fence: Fence,
     pub graph_index: usize,
     pub timing: ExecutionTiming,
@@ -308,6 +309,7 @@ impl ExecutionTiming {
 }
 
 struct Pending {
+    routing_dispatch_ns: u64,
     logprobs: u64,
     logprob_width: usize,
     logprob_token_ids: Vec<Vec<u32>>,
@@ -320,6 +322,7 @@ struct Pending {
 }
 
 struct Frame {
+    routing: Option<Readback>,
     input: PinnedHost,
     output: PinnedHost,
     confidence: Option<Readback>,
@@ -528,6 +531,9 @@ impl GraphExecutor {
                     .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
                     .transpose()?,
                 readiness: manifest.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps")
+                    .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
+                    .transpose()?,
+                routing: manifest.buffers.iter().find(|buffer| buffer.name == crate::parallax::BUFFER)
                     .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
                     .transpose()?,
                 produced: model.event_with_timing(true)?,
@@ -840,6 +846,7 @@ impl GraphExecutor {
             bytes / 4
         } else { 0 };
         frame.pending = Some(Pending {
+            routing_dispatch_ns: if frame.routing.is_some() { crate::parallax::now_ns() } else { 0 },
             logprobs,
             logprob_width,
             logprob_token_ids,
@@ -911,6 +918,13 @@ impl GraphExecutor {
                 if crate::engram::consumes(graph.kind) {
                     if let Some(readback) = &frame.readiness {
                         let buffer = self.manifest.buffer("readiness_timestamps")?;
+                        readback.enqueue_copy(&resources.copy, buffer.address + index * buffer.nbytes / 2,
+                                              buffer.nbytes / 2)?;
+                    }
+                }
+                if crate::parallax::consumes(graph.kind) {
+                    if let Some(readback) = &frame.routing {
+                        let buffer = self.manifest.buffer(crate::parallax::BUFFER)?;
                         readback.enqueue_copy(&resources.copy, buffer.address + index * buffer.nbytes / 2,
                                               buffer.nbytes / 2)?;
                     }
@@ -1061,7 +1075,22 @@ impl GraphExecutor {
                 return Err(error);
             }
         }
+        let routing = if crate::parallax::consumes(self.manifest.graphs[pending.graph_index].kind) {
+            frame.routing.as_ref().map(|readback| {
+                let buffer = self.manifest.buffer(crate::parallax::BUFFER).expect("validated routing output");
+                // SAFETY: transferred covers this retained frame; decoding finishes before reuse.
+                let result = crate::parallax::decode(unsafe { readback.bytes() }, buffer.shape[1],
+                    buffer.shape[2] - crate::parallax::HEADER, pending.fence.0,
+                    pending.routing_dispatch_ns, crate::parallax::now_ns());
+                // Telemetry content errors are counted independently, never model failures.
+                result.map_or(crate::parallax::RoutingReadout::Invalid, |mut sample| {
+                    sample.gpu_ns = Some(elapsed_ns);
+                    crate::parallax::RoutingReadout::Valid(sample)
+                })
+            })
+        } else { None };
         Ok(Some(FrameCompletion {
+            routing,
             fence: pending.fence,
             graph_index: pending.graph_index,
             timing: ExecutionTiming {

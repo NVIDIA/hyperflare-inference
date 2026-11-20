@@ -1041,3 +1041,23 @@ def test_every_recipe_inherits_base_config_and_forwards_shared_plan_fields(monke
     assert captured["lock_gpu_clocks"] is True
     assert captured["max_active"] == plan.concurrency
     assert captured["prefill_chunk_size"] == 8192
+
+
+def test_parallax_routing_plan_requires_single_gpu_glm_without_mixed_prefill():
+    from ignition.recipes import resolve
+
+    glm = resolve("glm-5.3-flash")
+    qwen = resolve("qwen3.8-flash")
+    single = (gpu(0, 256),)
+    plan = planning.fit(glm.recipe, glm.checkpoint, single, concurrency=1, reserve_bytes=0,
+                        speculation=None, parallax_routing=True)
+    assert plan.parallax_routing is True
+    assert plan.to_dict()["parallax_routing"] is True
+    with pytest.raises(UsageError, match="--parallax-routing"):
+        planning.fit(glm.recipe, glm.checkpoint, (gpu(0, 256), gpu(1, 256)),
+                     concurrency=1, reserve_bytes=0, speculation=None, parallax_routing=True)
+    with pytest.raises(UsageError, match="--parallax-routing"):
+        planning.fit(qwen.recipe, qwen.checkpoint, single, concurrency=1, reserve_bytes=0,
+                     speculation=None, parallax_routing=True)
+    with pytest.raises(UsageError, match="--parallax-routing"):
+        replace(plan, mixed_prefill=True)

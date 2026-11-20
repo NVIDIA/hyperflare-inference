@@ -60,7 +60,7 @@ from .pool import ContinuationPool, continuation_layout
 from .resume import PreparedResume
 from .stack import DecoderScratch, PreparedDecoder
 from .state import DecoderMetadata
-from .weights import ModelWeights
+from .weights import ModelWeights, MoEWeights
 from .vision import PreparedVision, VisionMetadata, VisionScratch
 from .vision_state import FEATURES, PATCH_CAPACITIES, PreparedVisionGeneration, VisionInputs
 from ignition.components.vision_state import PrefillVisionInputs, VisionState
@@ -88,6 +88,7 @@ def races_context_transport(config, world_size, device):
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
     prompt_logprobs: bool = False
+    parallax_routing: bool = False
     devices: tuple[int, ...] = (0, 1)
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
@@ -118,6 +119,10 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("GLM verification storage supports at most seven draft tokens")
+        if type(self.parallax_routing) is not bool:
+            raise TypeError("parallax_routing must be a boolean")
+        if self.parallax_routing and len(self.devices) != 1:
+            raise ValueError("Parallax routing capture v1 requires one GPU")
         if self.expert_activation not in ("auto", "a4", "a16"):
             raise ValueError("GLM expert activation must be auto, a4, or a16")
         from ignition.planning import host_shape_error
@@ -393,6 +398,18 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity, sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
+        routing_trace = None
+        if config.parallax_routing:
+            from ignition.components.routing_trace import BUFFER, RoutingTrace
+
+            expert_counts = {layer.mlp.router.shape[0] for layer in weights.layers
+                             if isinstance(layer.mlp, MoEWeights)}
+            if len(expert_counts) != 1:
+                raise ValueError("routing trace v1 requires one routed expert count across layers")
+            experts, = expert_counts
+            route_output = torch.zeros((2, len(weights.layers), 4 + experts), dtype=torch.int64, device=device)
+            buffers[BUFFER] = route_output
+            routing_trace = RoutingTrace(route_output, frame, sequence)
         vision_state = vision_inputs = vision_prefill = vision_storage = None
         vision_owners = []
         if weights.vision is not None:
@@ -459,14 +476,19 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                    + (len(config.batch_capacities) if False in graph_modes else 0)
                        + (len(config.speculative_shapes) if config.mtp else 0))
     graph_count += len(PATCH_CAPACITIES) if vision_state is not None else 0
+    if config.parallax_routing:
+        graph_count += (len(graph_modes) * prefill_graph_count(config.prefill_capacities, scoring)
+                        + (len(config.batch_capacities) if False in graph_modes else 0)
+                        + (len(config.speculative_shapes) if config.mtp else 0))
     memory(f"after model state (continuation {pool.backing.nbytes >> 20} MiB, {state_rows} rows)")
     with phase(progress, "Construct graph catalog", total=graph_count) as stage:
-        def add(name, function, kind, rows, tokens, fields, *, enabled=None):
+        def add(name, function, kind, rows, tokens, fields, *, enabled=None, traced=False):
             if kind == "scored_prefill":
                 function = PreparedScoredPrefill(function, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = function
-            signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled)
+            signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields),
+                speculation_enabled=enabled, routing_trace=traced)
             stage.update(advance=1)
 
         if vision_state is not None:
@@ -519,6 +541,9 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     if mode == "decode":
                         fields = tuple(field for field in fields if field not in ("token_ids", "query_lengths"))
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
+                    if routing_trace is not None:
+                        add(name + "-parallax", forward.with_routing_trace(routing_trace),
+                            kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled, traced=True)
         if speculation is not None:
             from .speculative import PreparedRound
 
@@ -527,6 +552,9 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 operation = PreparedRound(speculation, batch, width, name)
                 operation.prepare()
                 add(name, operation, "speculative", batch, width, forward_inputs, enabled=True)
+                if routing_trace is not None:
+                    add(name + "-parallax", operation.with_routing_trace(routing_trace),
+                        "speculative", batch, width, forward_inputs, enabled=True, traced=True)
 
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in graph_modes:
@@ -667,6 +695,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     memory = {"rank": rank, "world_size": shard.world_size, "device": config.devices[rank],
         "weights_bytes": weights.allocated_bytes, "continuation_bytes": pool.backing.nbytes,
         "state_rows": state_rows, "pages": pages, "page_bytes": kv_bytes // pages, "kv_bytes": kv_bytes,
+        "parallax_routing_bytes": 0 if routing_trace is None else routing_trace.output.nbytes,
         "completion_output_bytes": completion.nbytes, "operator_scratch_bytes": arena.nbytes, "graphs": len(graphs), "prefill_capacities": config.prefill_capacities,
         "free_device_bytes": free, "total_device_bytes": total, "headroom_bytes": config.headroom_bytes, "page_tokens": config.page_tokens,
         "allocated_bytes": torch.cuda.memory_allocated(device), "reserved_bytes": torch.cuda.memory_reserved(device),

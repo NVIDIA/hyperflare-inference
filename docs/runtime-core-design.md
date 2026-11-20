@@ -635,6 +635,16 @@ Helios rejects graph operation identifiers 10, 11, and 13 and the graph kinds
 `proposal`, `verification`, and `packed_speculative`. Designed, not
 implemented: loading and serving cores that recorded those operations.
 
+`ExecutionGraph.routing_trace` (bool field 16) marks target graph variants
+(decode, prefill, scored prefill, and complete speculative rounds) that populate
+the optional `parallax_routes_v1` output buffer. Omission or `false` identifies
+counter-free execution, preserving compatibility with existing cores. Native
+startup selects counter-free graphs by default and omits `parallax_routes_v1`
+from the execution manifest so no routing readback runs. Passing
+`--parallax-routing` selects traced variants and requires complete paired
+coverage with matching geometry and input bindings for the selected execution
+mode; partial or mismatched catalogs fail admission before graph loading.
+
 Unselected graph templates and executables are never reconstructed. Functions
 used only by omitted graphs are dropped, as are unused modules without globals.
 Modules with globals retain their persistent contents. Weights, MTP weights,
