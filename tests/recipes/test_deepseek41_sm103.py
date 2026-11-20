@@ -29,15 +29,12 @@ def model():
 
 
 @pytest.fixture
-def options(tmp_path):
-    # These CPU tests validate admission and accounting, not library loading.
-    library = tmp_path / "library.so"
-    library.touch()
+def options():
     target = ExpertPlacement(384, tuple(range(160, 384)), tuple(range(256)))
     draft = ExpertPlacement(128, (), tuple(range(128)))
     placements = tuple((f"layers.{i}.ffn", target) for i in range(40))
     placements += tuple((f"mtp.{i}.ffn", draft) for i in range(3))
-    return SM103Config(placements, library, library)
+    return SM103Config(placements)
 
 
 def test_physical_accounting_includes_duplicate_host_and_hbm_copies(model, options):
@@ -65,7 +62,7 @@ def test_incomplete_or_mismatched_model_coverage_fails_before_allocation(model, 
 def test_tp1_requires_explicit_local_sm103_configuration(options, tmp_path):
     with pytest.raises(ValueError, match="distinct GPUs"):
         PreparationConfig(devices=(0,))
-    with pytest.raises(ValueError, match="explicit libraries"):
+    with pytest.raises(ValueError, match="explicit placement"):
         PreparationConfig(devices=(0,), sm103=options)
     with pytest.raises(ValueError, match="distinct GPUs"):
         PreparationConfig(devices=(0, 1, 2, 3), sm103=options, kernel_cache=tmp_path)
@@ -110,10 +107,9 @@ def snapshot(tmp_path, configuration):
 
 
 @pytest.mark.parametrize("staging", [None, PrefillExpertStaging(1024, 8)])
-def test_configuration_roundtrip_resolves_libraries_and_preserves_row_order(options, tmp_path, staging):
+def test_configuration_roundtrip_preserves_row_order(options, tmp_path, staging):
     options = replace(options, prefill_staging=staging)
     value = options.to_dict()
-    value["flashmla_library"] = value["deepselect_library"] = "library.so"
     path = tmp_path / "sm103.json"
     path.write_text(json.dumps(value))
     assert SM103Config.load(path) == options
@@ -207,8 +203,8 @@ def test_invalid_json_configuration_is_rejected(options, tmp_path, change):
 @pytest.mark.parametrize("staging", [False, True])
 def test_planning_counts_native_experts_and_physical_cache_layout(options, snapshot, drafting, staging):
     from ignition.recipes.deepseek41.config import ModelConfig
-    from ignition.recipes.deepseek41.pool import continuation_layout, page_bytes
     from ignition.recipes.deepseek41.recipe import RECIPE
+    from ignition.recipes.deepseek41.sm103 import _reference_cache_costs
 
     if not drafting:
         options = replace(options, placements=options.placements[:40])
@@ -223,8 +219,10 @@ def test_planning_counts_native_experts_and_physical_cache_layout(options, snaps
     assert checkpoint.expansion_bytes == 0
     assert not checkpoint.scale_compressed_device_bytes
     costs = recipe.ranks[1] if drafting else recipe.plain_ranks[1]
-    assert costs.state_row_bytes == continuation_layout(model, dspark=drafting, alignment=512).row_bytes
-    assert costs.page_bytes == page_bytes(model, alignment=512)
+    width = RECIPE.max_draft_tokens + 1 if drafting else 1
+    expected_row, expected_page = _reference_cache_costs(model, verification_width=width, dspark=drafting)
+    assert costs.state_row_bytes == expected_row
+    assert costs.page_bytes == expected_page
     assert costs.graph_bytes == (8 << 30) + (3 * 224 * 18_800_640 if staging else 0)
     assert 1 not in RECIPE.ranks  # Explicit placement must not change ordinary TP admission.
 
@@ -304,8 +302,12 @@ def test_reference_execution_configuration_and_planning_costs(options, snapshot,
     staged_path.write_text(json.dumps(staged_reference.to_dict()))
     assert SM103Config.load(staged_path) == staged_reference
     assert staged_reference.to_dict()["prefill_staging"] == {"min_rows": 1024, "min_cold_experts": 8}
-    with pytest.raises(ValueError, match="hybrid library paths"):
-        SM103Config(options.placements, options.flashmla_library, options.deepselect_library, execution="reference")
+    with pytest.raises(ValueError, match="must be 'reference'"):
+        SM103Config(options.placements, execution="hybrid")
+    hybrid_path = tmp_path / "sm103-hybrid.json"
+    hybrid_path.write_text(json.dumps({**reference.to_dict(), "flashmla_library": "libflashmla.so"}))
+    with pytest.raises(ValueError, match="do not match reference execution"):
+        SM103Config.load(hybrid_path)
     with pytest.raises(ValueError, match="128-aligned"):
         SM103Config(options.placements, execution="reference", context=300)
 

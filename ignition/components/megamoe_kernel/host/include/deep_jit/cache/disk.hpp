@@ -10,7 +10,6 @@
 #include <vector>
 
 #include <deep_jit/utils/exception.hpp>
-#include <deep_jit/utils/env.hpp>
 #include <deep_jit/utils/filesystem.hpp>
 #include <deep_jit/utils/uuid.hpp>
 
@@ -82,30 +81,6 @@ struct DiskCache {
     explicit DiskCache(std::vector<std::filesystem::path> paths)
         : paths(std::move(paths)) {
         DJ_HOST_ASSERT(not this->paths.empty());
-    }
-
-    static DiskCache from_env(const Env& env) {
-        // Parse PATH_1:PATH_2:PATH_3 into a writable cache root followed by
-        // zero or more read-only lookup roots.
-        std::vector<std::filesystem::path> paths;
-        if (const auto env_opt = env.get<std::string>("JIT_CACHE_DIR")) {
-            size_t begin = 0;
-            while (true) {
-                const auto end = env_opt->find(':', begin);
-                const auto item = env_opt->substr(begin, end - begin);
-                DJ_HOST_ASSERT(not item.empty(), "disk cache path list contains an empty path: {}", env_opt.value());
-                paths.emplace_back(item);
-                if (end == std::string_view::npos)
-                    break;
-                begin = end + 1;
-            }
-        } else {
-            const auto home = get_env<std::string>("HOME");
-            DJ_HOST_ASSERT(not home.empty(), "HOME environment variable must not be empty");
-            paths.emplace_back(std::filesystem::path(home) / ".dj");
-        }
-
-        return DiskCache(paths);
     }
 
     [[nodiscard]] DiskCacheEntry entry(const std::string& tag, const std::string& digest) const {

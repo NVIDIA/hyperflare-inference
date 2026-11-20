@@ -56,8 +56,8 @@ public:
     Toolkit toolkit;
     CompilerInfo compiler_info;
 
-    explicit CUDA(const Env& env)
-        : toolkit(find_cuda_toolkit(env)),
+    CUDA()
+        : toolkit(find_cuda_toolkit()),
           compiler_info(get_compiler_info()) {}
 
     [[nodiscard]] CompilerInfo get_compiler_info() const {
@@ -76,7 +76,6 @@ public:
 
     void compile(const std::string& source,
                  std::filesystem::path dir,
-                 const Env& env,
                  const Config& config,
                  const CompilerOptions& options) const {
         // Release GIL to let other Python threads run
@@ -86,8 +85,7 @@ public:
         dir = std::filesystem::absolute(dir).lexically_normal();
         const auto source_path = dir / "kernel.cu";
         const auto cubin_path = dir / "kernel.cubin";
-        const bool debug = env.get<bool>("JIT_DEBUG", false);
-        const bool print_compiler_command = debug or env.get<bool>("JIT_PRINT_COMPILER_COMMAND", false);
+        constexpr bool print_compiler_command = false;
 
         // Write source code
         write_file_sync(source_path, source);
@@ -167,11 +165,11 @@ public:
         write_file_sync(dir / "meta.json", metadata.dump());
     }
 
-    [[nodiscard]] static std::shared_ptr<Kernel> load(const std::filesystem::path& dir, const Env& env) {
-        return Kernel::load(dir, env);
+    [[nodiscard]] static std::shared_ptr<Kernel> load(const std::filesystem::path& dir) {
+        return Kernel::load(dir);
     }
 
-    static Toolkit find_cuda_toolkit(const Env& env) {
+    static Toolkit find_cuda_toolkit() {
         std::filesystem::path home_path;
 
         // Find CUDA home
@@ -200,13 +198,8 @@ public:
         DJ_HOST_ASSERT(not home_path.empty() and std::filesystem::exists(home_path));
         home_path = std::filesystem::absolute(home_path).lexically_normal();
 
-        // Find NVCC
-        std::filesystem::path nvcc;
-        if (const auto path = env.get<std::string>("JIT_NVCC_COMPILER"); path and not path->empty()) {
-            nvcc = std::filesystem::absolute(*path).lexically_normal();
-        } else {
-            nvcc = home_path / "bin/nvcc";
-        }
+        // Find NVCC inside the resolved CUDA toolkit
+        std::filesystem::path nvcc = home_path / "bin/nvcc";
         DJ_HOST_ASSERT(is_executable(nvcc), "NVCC compiler is not executable: {}", nvcc.string());
 
         // Try to find `cuobjdump`

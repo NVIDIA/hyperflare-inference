@@ -492,11 +492,18 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
             and speculation.graph_budget is None and recipe.speculation is not None):
         speculation = replace(speculation, graph_budget=recipe.speculation.graph_budget)
     if speculation is not None and speculation.graph_budget is not None:
-        from ignition.components.capacity import packed_speculative_shapes
+        from ignition.components.capacity import (
+            packed_speculative_depth_shapes,
+            packed_speculative_shapes,
+        )
 
         try:
-            packed_speculative_shapes(concurrency, speculation.draft_tokens + 1,
-                                      speculation.token_capacity, speculation.graph_budget)
+            if recipe.packed_speculative_depths:
+                packed_speculative_depth_shapes(concurrency, speculation.widths,
+                                                speculation.token_capacity, speculation.graph_budget)
+            else:
+                packed_speculative_shapes(concurrency, speculation.draft_tokens + 1,
+                                          speculation.token_capacity, speculation.graph_budget)
         except ValueError as error:
             raise UsageError(f"--speculative-graph-budget: {error}") from error
     costs = recipe.costs(len(gpus), speculation, checkpoint)

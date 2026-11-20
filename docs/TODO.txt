@@ -116,9 +116,9 @@
     shape-dependent compiler overhead before extrapolating component gains.
 
 [ ] Extend decayed-miss LRU native qualification on terminal-prefill cores from
-    TP1 DeepSeek V4.1 `"execution": "reference"` (docs/parallax.md) to `"hybrid"`
-    and GLM-5.3-Flash cores, and evaluate exact tensor-level state equivalence
-    under concurrent positive-temperature sampling.
+    TP1 DeepSeek V4.1 `"execution": "reference"` (docs/parallax.md) to GLM-5.3-Flash
+    cores, and evaluate exact tensor-level state equivalence under concurrent
+    positive-temperature sampling.
 
 [ ] Compare Inkling 2 effort-zero generation with the canonical target using
     the static NVFP4 checkpoint. Native TP4 emits analysis in content_text and

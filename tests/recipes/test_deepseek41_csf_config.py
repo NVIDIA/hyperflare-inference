@@ -3,13 +3,9 @@
 
 """Lossless scale storage preserves the recipe's native arithmetic admission."""
 
-import json
-from types import SimpleNamespace
-
 import pytest
 
 from ignition.recipes.deepseek41.config import ModelConfig
-from ignition.recipes.deepseek41.weights import ModelWeights
 
 
 @pytest.fixture
@@ -52,19 +48,3 @@ def test_invalid_csf_contract_is_rejected(configuration, field, value):
     configuration["quantization_config"][field] = value
     with pytest.raises(ValueError):
         ModelConfig.from_dict(configuration)
-
-
-@pytest.mark.parametrize("draft", [False, True])
-def test_incomplete_expert_layout_inventory_fails_before_weight_loading(configuration, tmp_path, draft):
-    (tmp_path / "config.json").write_text(json.dumps(configuration))
-    layouts = {f"layers.{i}.ffn": None for i in range(40)} if draft else {}
-    with pytest.raises(ValueError, match="every enabled target and draft layer"):
-        ModelWeights.load(SimpleNamespace(metadata_path=tmp_path), "cpu", shard=None,
-                          dspark=draft, megamoe_layouts=layouts)
-
-
-def test_empty_layout_values_cannot_select_the_ordinary_expert_path(configuration, tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps(configuration))
-    with pytest.raises(TypeError, match="concrete MegaMoeLayerLayout"):
-        ModelWeights.load(SimpleNamespace(metadata_path=tmp_path), "cpu", shard=None,
-                          megamoe_layouts={f"layers.{i}.ffn": None for i in range(40)})

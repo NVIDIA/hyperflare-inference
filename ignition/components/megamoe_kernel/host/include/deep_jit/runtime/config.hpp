@@ -12,18 +12,18 @@ namespace deep_jit {
 
 struct Config {
     std::filesystem::path python_library_root;
-    std::string env_prefix;
+    std::vector<std::filesystem::path> cache_dirs;
     std::string extra_signature;
     std::vector<std::filesystem::path> include_dirs;
     std::vector<std::string> include_prefixes;
 
     explicit Config(std::filesystem::path python_library_root,
-                    std::string env_prefix,
+                    std::vector<std::filesystem::path> cache_dirs,
                     std::string extra_signature = {},
                     std::vector<std::filesystem::path> include_dirs = {},
                     std::vector<std::string> include_prefixes = {})
         : python_library_root(std::move(python_library_root)),
-          env_prefix(std::move(env_prefix)),
+          cache_dirs(std::move(cache_dirs)),
           extra_signature(std::move(extra_signature)),
           include_dirs(std::move(include_dirs)),
           include_prefixes(std::move(include_prefixes)) {
@@ -33,9 +33,13 @@ struct Config {
                        "Python library root must be absolute: {}", this->python_library_root.string());
         this->python_library_root = this->python_library_root.lexically_normal();
 
-        // Check environment prefix
-        DJ_HOST_ASSERT(not this->env_prefix.empty(), "environment variable prefix must not be empty");
-        DJ_HOST_ASSERT(this->env_prefix != "DJ", "DJ is reserved for global environment variables");
+        // Check explicit disk cache roots
+        DJ_HOST_ASSERT(not this->cache_dirs.empty(), "JIT cache directory list must not be empty");
+        for (auto& cache_dir: this->cache_dirs) {
+            DJ_HOST_ASSERT(not cache_dir.empty(), "JIT cache directory must not be empty");
+            DJ_HOST_ASSERT(cache_dir.is_absolute(), "JIT cache directory must be absolute: {}", cache_dir.string());
+            cache_dir = cache_dir.lexically_normal();
+        }
 
         // Check includes
         for (auto& include_dir: this->include_dirs) {

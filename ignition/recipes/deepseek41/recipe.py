@@ -69,6 +69,7 @@ RECIPE = Recipe(
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True,
                             draft_prefix_selection="gpu", graph_budget=64),
+    packed_speculative_depths=True,
     max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,

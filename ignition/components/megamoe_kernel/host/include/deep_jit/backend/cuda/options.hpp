@@ -11,7 +11,6 @@
 
 #include <deep_jit/backend/cuda/device.hpp>
 #include <deep_jit/runtime/config.hpp>
-#include <deep_jit/utils/env.hpp>
 #include <deep_jit/utils/exception.hpp>
 #include <deep_jit/utils/filesystem.hpp>
 #include <deep_jit/utils/hash.hpp>
@@ -36,22 +35,20 @@ struct CompilerOptions {
     std::vector<std::string> extra_nvcc_flags;
     std::optional<std::string> post_hook;
 
-    static CompilerOptions default_options(const Env& env, Device& device) {
-        const bool debug = env.get<bool>("JIT_DEBUG", false);
-        const bool dump_asm = debug or env.get<bool>("JIT_DUMP_ASM", false);
+    static CompilerOptions default_options(Device& device) {
         return {
             .optimize_level = "3",
             .fast_math = false,
-            .ptxas_verbose = debug or env.get<bool>("JIT_PTXAS_VERBOSE", false),
+            .ptxas_verbose = false,
             .ptxas_register_usage_level = 10,
-            .check_no_spills = env.get<bool>("JIT_CHECK_NO_SPILLS", false),
-            .check_no_local_memory = env.get<bool>("JIT_CHECK_NO_LOCAL_MEMORY", false),
-            .with_line_info = debug or env.get<bool>("JIT_WITH_LINEINFO", false),
-            .dump_ptx = dump_asm or env.get<bool>("JIT_DUMP_PTX", false),
-            .dump_sass = dump_asm or env.get<bool>("JIT_DUMP_SASS", false),
+            .check_no_spills = false,
+            .check_no_local_memory = false,
+            .with_line_info = false,
+            .dump_ptx = false,
+            .dump_sass = false,
             .arch = device.get_arch(),
             .nvcc_flags = std::vector<std::string> {
-                std::format("-std=c++{}", env.get<int>("JIT_CPP_STANDARD", 20)),
+                "-std=c++20",
                 "--compiler-options=-fPIC",
                 "--compiler-options=-fconcepts",
                 "--expt-relaxed-constexpr",
@@ -196,7 +193,7 @@ struct LaunchOptions {
     // Others
     std::optional<bool> nonportable_cluster_size_allowed;
 
-    static LaunchOptions default_options(const Env&) {
+    static LaunchOptions default_options() {
         return {
             .stream = std::nullopt,
             .num_smem_bytes = 0,

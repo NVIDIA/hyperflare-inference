@@ -11,12 +11,13 @@ namespace deep_gemm {
 
 inline deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>> jit(nullptr);
 
-inline void init_jit(const std::string& library_root_path) {
+inline void init_jit(const std::string& library_root_path, const std::string& cache_dir_path) {
     const auto library_root = std::filesystem::absolute(library_root_path);
     const auto include_dir = library_root / "include";
+    const auto cache_dir = std::filesystem::absolute(cache_dir_path);
     const auto config = deep_jit::Config(
         library_root,
-        "DG",
+        {cache_dir},
         "cutlass-" + std::to_string(CUTLASS_VERSION),
         {include_dir},
         {"deep_gemm/"});

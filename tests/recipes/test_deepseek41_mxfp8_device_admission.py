@@ -49,7 +49,7 @@ def test_attention_selects_architecture_compatible_mxfp8_preparation(monkeypatch
     scratch = AttentionScratch.allocate(1, 4, "cpu")
     config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-20, "candidate_source_layer_id": 0},
                              source=lambda layer: None)
-    pool = SimpleNamespace(config=config, window_record_planes=(528,),
+    pool = SimpleNamespace(config=config,
                            window=lambda *args, **kwargs: torch.zeros((2, 128 * 528), dtype=torch.uint8))
     weights = {"qkv_a": SimpleNamespace(weight=PackedMXFP8()),
                "q_b": SimpleNamespace(weight=PackedMXFP8()),

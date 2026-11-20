@@ -139,7 +139,7 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     for tokens in getattr(config, "prefill_capacities", prefill_capacities(config.prefill_chunk_size)):
         for enabled in ((True, False) if recipe == "deepseek41" else (None,)):
             add("prefill", 1, tokens, enabled=enabled)
-            if recipe == "deepseek41" and config.prefill_chunk_size > pool.config.text["sliding_window"]:
+            if recipe == "deepseek41" and bootstrap.deferred_prefill_enabled(config, pool.config.text["sliding_window"]):
                 add("terminal_prefill", 1, tokens, enabled=enabled)
     from ignition.components.prompt_logprobs import scored_prefill_capacities
     for tokens in scored_prefill_capacities(config.prefill_chunk_size):
@@ -320,3 +320,58 @@ def test_deepseek_short_chunk_catalog_retains_complete_prefill_semantics():
     flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
     assert contract["version"] == 3
     assert not any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])
+
+
+@pytest.mark.parametrize("devices", [(0, 1, 2), (0, 1, 2, 3), (0, 1, 2, 3, 4, 5)])
+def test_deepseek_non_sm103_tp_layouts_retain_contract_v3_without_terminal_prefill(devices):
+    import flare_heliopause
+    from ignition.recipes.deepseek41 import bootstrap
+
+    config, contract, manifest = _recipe_metadata(
+        "deepseek41", config_options={"devices": devices, "prefill_chunk_size": 4096}
+    )
+    assert config.sm103 is None
+    assert not bootstrap.deferred_prefill_enabled(config, 128)
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    assert contract["version"] == 3
+    assert not any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])
+
+
+def test_deepseek_sm103_enables_terminal_prefill_only_above_sliding_window(tmp_path):
+    import flare_heliopause
+    from ignition.components.expert_placement import ExpertPlacement
+    from ignition.recipes.deepseek41 import bootstrap
+    from ignition.recipes.deepseek41.sm103 import SM103Config
+
+    sm103 = SM103Config(
+        placements=(("layers.0.ffn", ExpertPlacement(4, (0, 1), (2, 3))),),
+    )
+    long_config, long_contract, long_manifest = _recipe_metadata(
+        "deepseek41",
+        config_options={
+            "devices": (0,),
+            "expert_scale_compression": None,
+            "kernel_cache": tmp_path,
+            "prefill_chunk_size": 4096,
+            "sm103": sm103,
+        },
+    )
+    assert bootstrap.deferred_prefill_enabled(long_config, 128)
+    flare_heliopause.validate_prepared_contract(long_manifest, json.dumps(long_contract))
+    assert long_contract["version"] == 4
+    assert any(graph["kind"] == "terminal_prefill" for graph in long_manifest["graphs"])
+
+    short_config, short_contract, short_manifest = _recipe_metadata(
+        "deepseek41",
+        config_options={
+            "devices": (0,),
+            "expert_scale_compression": None,
+            "kernel_cache": tmp_path,
+            "prefill_chunk_size": 128,
+            "sm103": sm103,
+        },
+    )
+    assert not bootstrap.deferred_prefill_enabled(short_config, 128)
+    flare_heliopause.validate_prepared_contract(short_manifest, json.dumps(short_contract))
+    assert short_contract["version"] == 3
+    assert not any(graph["kind"] == "terminal_prefill" for graph in short_manifest["graphs"])

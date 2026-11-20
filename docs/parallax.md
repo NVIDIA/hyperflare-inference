@@ -328,8 +328,8 @@ execution mode. Packages exported with only ordinary traced variants still requi
 graphs. Mixed tracing fails admission.
 
 DeepSeek V4.1 TP1 capture wiring has checkpoint component coverage and exported
-native serving coverage on GB300 across both `"hybrid"` and `"reference"` SM103
-executions (`decoder.py` and `reference_experts.py`). Its ordinary,
+native serving coverage on GB300 through `"reference"` SM103 execution
+(`reference_experts.py`). Its ordinary,
 terminal-prefill, scored-prefill, and packed MTP variants count canonical
 target IDs before physical expert mapping. Verification counts include rejected
 target candidates; draft experts are not part of this feed. Each layer records
@@ -814,7 +814,7 @@ CUDA_VISIBLE_DEVICES=GPU_UUID FLARE_RUN_CUDA_TESTS=1 cargo test --release \
 host-to-HBM copies ahead of a MegaMoE consumer. It adapts DerpSeek's temporary
 prompt staging and previous cold-demand gate so all decisions and copies run
 inside captured CUDA graphs. It is a preparation component, not a native
-residency policy. DeepSeek SM103 preparation (`"hybrid"` and `"reference"`)
+residency policy. DeepSeek SM103 `"reference"` preparation
 inserts it into eligible target prefill layers through the `prefill_staging`
 setting described in [model preparation](model-preparation.md#deepseek-v41-flash).
 Eligibility follows prepared row counts: when `yoco_keep_tokens < min_rows`,

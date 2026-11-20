@@ -68,10 +68,9 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 
 def _forward_factories(mla_compute_mode, *, vision,
-                       draft_vocabulary_runtime=None, examples=None, expert_stagers=None, stage_min_rows=1024):
+                       draft_vocabulary_runtime=None, examples=None):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
-    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples,
-                    expert_stagers=expert_stagers, stage_min_rows=stage_min_rows),
+    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode, examples=examples))
 
@@ -184,10 +183,10 @@ class PreparationConfig:
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
         if self.sm103 is not None and (not isinstance(self.sm103, SM103Config)
                 or self.hosts is not None or self.kernel_cache is None):
-            raise ValueError("SM103 preparation requires explicit libraries, placement and kernel cache on one local GPU")
+            raise ValueError("SM103 preparation requires explicit placement and kernel cache on one local GPU")
         if self.sm103 is not None and self.expert_scale_compression is not None:
             raise ValueError("SM103 MegaMoE requires expanded native expert scales; CSF checkpoint loading remains lossless")
-        if self.sm103 is not None and self.sm103.execution == "reference":
+        if self.sm103 is not None:
             if self.prompt_logprobs:
                 raise ValueError("reference SM103 preparation does not support --prompt-logprobs")
             if self.joint_tuning:
@@ -272,6 +271,11 @@ class PreparationConfig:
     @property
     def completion_token_capacity(self):
         return max(self.speculative_widths) if self.dspark else 1
+
+
+def deferred_prefill_enabled(config: PreparationConfig, sliding_window: int) -> bool:
+    """Gate deferred intermediate/terminal prefill graphs to validated SM103 preparations."""
+    return config.sm103 is not None and config.prefill_chunk_size > sliding_window
 
 
 def _prepare_speculation_catalog(config, speculation, *, add, buffers,
@@ -876,7 +880,7 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
 @torch.no_grad()
 @with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None):
-    if config.sm103 is not None and config.sm103.execution == "reference":
+    if config.sm103 is not None:
         return _prepare_reference_rank(snapshot, config, rank=rank, group=group,
                                        progress=progress, core_storage=core_storage)
     if core_storage is None:
@@ -888,20 +892,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
-    megamoe_layouts = fused_attention = None
     with core_storage.transient():
-        if config.sm103 is not None:
-            from .config import ModelConfig
-
-            megamoe_layouts, fused_attention = config.sm103.prepare(ModelConfig.load(metadata_path), config,
-                device=device, storage=core_storage)
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                     confidence=config.draft_tokens > 0,
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
-                                    megamoe_layouts=megamoe_layouts, fused_attention=fused_attention)
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -914,8 +911,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     tables = Tables.prepare(manifest, weights.config, tokens=max(config.prefill_chunk_size, config.decode_tokens),
         device=device, sequence=sequence, frame=frame, host_allocator=core_storage.host_allocate, progress=progress, shard=shard)
     with phase(progress, "Allocate model state and collectives"):
-        alignment = 512 if fused_attention is not None else 256
-        layout = continuation_layout(weights.config, dspark=config.dspark, alignment=alignment)
+        layout = continuation_layout(weights.config, dspark=config.dspark)
         snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
         if snapshots < 1:
             raise ValueError("snapshot budget must hold a complete DeepSeek continuation")
@@ -925,13 +921,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         pages = (config.prefill_chunk_size + PAGE_TOKENS - 1) // PAGE_TOKENS + 2 * slots
         if config.kv_pages is not None:
             pages = config.kv_pages
-        bytes_per_page = page_bytes(weights.config, alignment=alignment)
+        bytes_per_page = page_bytes(weights.config)
         total_memory = virtual_device_memory(device, group, tuning_replica=config.tuning_replica)
         pool = ContinuationPool.allocate(weights.config, state_rows + 1, pages, device,
             storage=core_storage, maximum_pages=total_memory // bytes_per_page,
             maximum_rows=total_memory // layout.row_bytes,
-            backed_slots=min(state_rows + 1, 1 + execution_rows + slots), dspark=config.dspark,
-            window_record_planes=(512, 16) if fused_attention is not None else (528,))
+            backed_slots=min(state_rows + 1, 1 + execution_rows + slots), dspark=config.dspark)
         requests = DeviceRequestState.allocate(device, vocab_size=129280, capacity=slots)
         inputs = BatchInputs.allocate(config.prefill_chunk_size, blocks, device, capacity=slots)
         admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
@@ -954,8 +949,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         tables = replace(tables, readiness_runtime=collective)
         identity = hashlib.sha256(json.dumps({"config": json.loads((metadata_path / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
-            "contract": "deepseek41.graph-inputs.v1",
-            "sm103": None if config.sm103 is None else config.sm103.to_dict()}, sort_keys=True).encode()).hexdigest()
+            "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
@@ -989,50 +983,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 token_base=129280, sentinel_names=("image_start", "image_start", "image_newline", "image_end"),
                 feature_type=1, image_slots=config.image_concurrency, arena=feature_arena)
             vision_storage = {}
-        expert_stagers = {}
-        staging = None if config.sm103 is None else config.sm103.prefill_staging
-        if staging is not None:
-            from ignition.components.megamoe_staging import PreparedExpertStage
-
-            streams = ([torch.cuda.Stream(device=device) for _ in range(2)] if config.stream_overlap
-                       else [None, None])
-            for index, layer in enumerate(weights.layers):
-                expert = layer.experts.experts
-                if expert.host_tier is not None and expert.host_tier.rows >= staging.min_cold_experts:
-                    expert_stagers[index] = PreparedExpertStage(expert.host_tier, streams[len(expert_stagers) % 2],
-                        expert.expert_map, expert.host_experts, session=session, workspace=arena, name=f"prefill-stage-{index}",
-                        min_cold=staging.min_cold_experts)
-            if not expert_stagers:
-                raise ValueError("prefill staging requires eligible target host experts")
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples,
-            expert_stagers=expert_stagers, stage_min_rows=1024 if staging is None else staging.min_rows)
+            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
         routing_trace = None
-        from ignition.components.expert_row_storage import megamoe_row_storage
-        from ignition.components.megamoe_tiers import MegaMoeLayerWeights
-
-        expert_rows, row_buffers = megamoe_row_storage(
-            (index, layer.experts.experts, f"weights.layers[{index}].experts.experts")
-            for index, layer in enumerate(weights.layers)
-            if isinstance(layer.experts.experts, MegaMoeLayerWeights)
-            and layer.experts.experts.host_tier is not None)
-        buffers.update(row_buffers)
-        if config.parallax_routing:
-            from ignition.components.routing_trace import BUFFER, RoutingTrace
-
-            expert_counts = {layer.experts.router.shape[0] for layer in weights.layers}
-            if len(expert_counts) != 1:
-                raise ValueError("routing trace v1 requires one routed expert count across target layers")
-            experts, = expert_counts
-            route_output = torch.zeros((2, len(weights.layers), 4 + experts), dtype=torch.int64, device=device)
-            buffers[BUFFER] = route_output
-            routing_trace = RoutingTrace(route_output, frame, sequence)
+        expert_rows = ()
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
         forwards, signatures, metadata, scratch = {}, {}, {}, {}
@@ -1064,7 +1024,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         count += (len(modes) * prefill_graph_count(config.prefill_capacities, scoring)
                   + len(config.speculative_shapes) + len(config.packed_speculative_depth_shapes)
                   + (len(config.batch_capacities) if False in modes else 0))
-    deferred_prefill = config.prefill_chunk_size > weights.config.text["sliding_window"]
+    deferred_prefill = deferred_prefill_enabled(config, weights.config.text["sliding_window"])
     if deferred_prefill:
         count += len(modes) * len(config.prefill_capacities) * (2 if routing_trace is not None else 1)
     catalog_bytes = {}
@@ -1227,23 +1187,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency,
             page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None, rows=None,
             embedding_tables=range(len(tables.sources)))}
-    tier_bytes = (dict(hbm=0, host=0) if config.sm103 is None else
-                  config.sm103.expert_bytes(weights.config, dspark=config.dspark))
-    workspace_bytes = (0 if megamoe_layouts is None else sum(
-        workspace.buffer.nbytes for workspace in {id(layout.workspace): layout.workspace
-                                                 for layout in megamoe_layouts.values()}.values()))
-    expert_host_bytes = (0 if megamoe_layouts is None else sum(region.extent
-        for layer in (*weights.layers, *(() if weights.draft is None else weights.draft.layers))
-        if layer.experts.experts.host_tier is not None
-        for region in layer.experts.experts.host_tier.regions))
     memory = {"rank": rank, "world_size": shard.world_size, "device": config.devices[rank],
         "catalog_operand_bytes": catalog_bytes,
-        "weights_bytes": weights.allocated_bytes, "mapped_host_bytes": expert_host_bytes,
-        "expert_tier_bytes": None if config.sm103 is None else tier_bytes,
-        "expert_staging_scratch_estimate": 0 if config.sm103 is None else config.sm103.staging_bytes(weights.config),
-        "megamoe_workspace_bytes": workspace_bytes,
+        "weights_bytes": weights.allocated_bytes, "mapped_host_bytes": 0,
+        "expert_tier_bytes": None,
+        "expert_staging_scratch_estimate": 0,
+        "megamoe_workspace_bytes": 0,
         "expert_scale_compression": config.expert_scale_compression,
-        "sm103": None if config.sm103 is None else config.sm103.to_dict(),
+        "sm103": None,
         "mla_compute_mode": config.mla_compute_mode,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,

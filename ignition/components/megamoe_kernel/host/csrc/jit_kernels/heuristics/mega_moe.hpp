@@ -11,7 +11,6 @@
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/common/types.cuh>
-#include <deep_jit/utils/env.hpp>
 
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
@@ -235,17 +234,6 @@ static MegaMoEConfig get_mega_moe_config(
         num_bytes_per_pull
     };
 
-    // Print configs for the first time
-    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
-        const auto key = std::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
-        static std::unordered_set<std::string> printed;
-        if (printed.count(key) == 0) {
-            std::cout << key << ": " << config << std::endl;
-            printed.insert(key);
-        }
-    }
     return config;
 }
 

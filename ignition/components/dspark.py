@@ -12,7 +12,6 @@ from ignition.components.speculation import SpeculativeRngState
 
 from .collectives import PreparedAllGather
 from .compressed_mla import PreparedCompressedCacheWriter
-from .mega_attention_cache import MegaCacheLayout, PreparedMegaCacheWriter
 from .embedding import PreparedEmbedding
 from .linear import QuantizedProjection, UnquantizedProjection
 from .markov_sampling import PreparedRowScaledFP8MarkovProjection, RowScaledFP8MarkovWeight
@@ -145,19 +144,9 @@ class PreparedContext:
             norm = PreparedRMSNorm(kv[:, index * 512:(index + 1) * 512], layer.attention["kv_norm"],
                 normalized, eps=weights.config.text["rms_norm_eps"], session=session,
                 name=f"{name}.{index}.norm").functional()
-            layout = layer.attention.get("fused_layout")
-            cache = pool.window(index, draft=True)
-            if layout is None:
-                writer = PreparedCompressedCacheWriter(normalized, cache, slots,
-                    page_size=128, kind="swa", session=session, name=f"{name}.{index}.write", cache_format=cache_format)
-                writer.functional(session=session)
-            else:
-                if pool.window_record_planes != (512, 16):
-                    raise ValueError("fused draft context requires separated window payload and scale planes")
-                cache = MegaCacheLayout(128, 528).view(cache)
-                writer = PreparedMegaCacheWriter(normalized, slots, layout.cos_sin[0], cache, slots,
-                    ratio=1, kernel_cache=layout.kernel_cache, session=session, name=f"{name}.{index}.write")
-            self.stages.append((norm, writer, layout, cache))
+            writer = PreparedCompressedCacheWriter(normalized, pool.window(index, draft=True), slots,
+                page_size=128, kind="swa", session=session, name=f"{name}.{index}.write", cache_format=cache_format)
+            self.stages.append((norm, writer.functional(session=session)))
 
     def functional(self):
         return self
@@ -180,13 +169,10 @@ class PreparedContext:
             live = (positions >= 0) & (offset < count) & (offset >= (count - 128).clamp_min(0))
             slots = torch.where(live, m.state_rows[m.requests] * 128 + positions % 128, -1)
         kv = self.context_projection(self.norm(self.project(auxiliary)))
-        for index, (norm, writer, layout, cache) in enumerate(self.stages):
+        for index, (norm, writer) in enumerate(self.stages):
             normalized = norm(kv[:, index * 512:(index + 1) * 512])
-            if layout is None:
-                self.rotary.apply(normalized, positions.clamp_min(0), compressed=False)
-                writer(normalized, slots)
-            else:
-                writer(normalized, positions.clamp_min(0), layout.cos_sin[0], cache, slots)
+            self.rotary.apply(normalized, positions.clamp_min(0), compressed=False)
+            writer(normalized, slots)
 
 
 class PreparedMarkovEmbedding:

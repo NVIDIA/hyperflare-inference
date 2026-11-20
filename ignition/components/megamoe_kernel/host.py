@@ -36,5 +36,5 @@ def prepare(kernel_cache: Path):
         extra_cflags=["-O3", "-std=c++20", "-DDJ_DISABLE_GIL=1", "-fvisibility=hidden", "-fno-gnu-unique"],
         extra_ldflags=[f"-L{cuda / 'lib64'}", "-lcudart", "-lcublasLt"],
         build_directory=str(build), verbose=False)
-    module.initialize(str(headers))
+    module.initialize(str(headers), str(Path(kernel_cache) / "deepgemm"))
     return module

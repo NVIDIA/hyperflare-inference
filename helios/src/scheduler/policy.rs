@@ -1246,10 +1246,13 @@ impl RequestScheduler {
         };
         let measured_mask = candidates[..ordinary_count].iter()
             .filter(|c| c.rate.duration_ns != 0).fold(0, |mask, c| mask | c.mask);
-        // Discovering a first usable operation must remain possible. Trying an
-        // alternative shape need not suspend unrelated measured service when
-        // every selected request already has a measured way to make progress.
-        let optional_discovery = |c: &Candidate| c.duration_ns == 0
+        // Discovering a first usable operation must remain possible. On
+        // terminal-prefill catalogs, trying an alternative shape need not
+        // suspend unrelated measured service when every selected request
+        // already has a measured way to make progress. Non-terminal cores keep
+        // unrestricted discovery unchanged.
+        let optional_discovery = |c: &Candidate| self.terminal_prefill_min_tokens != 0
+            && c.duration_ns == 0
             && c.mask & measured_mask == c.mask && measured_mask & !c.mask != 0;
         let ordinary = *candidates[..ordinary_count].iter()
             .filter(|c| !optional_discovery(c)).max_by(|a, b| compare(a, b))?;

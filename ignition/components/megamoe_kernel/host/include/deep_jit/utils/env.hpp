@@ -53,34 +53,4 @@ inline T get_env(const std::string& name, const T& default_value = T()) {
     }
 }
 
-class Env {
-public:
-    std::string prefix;
-
-    explicit Env(std::string prefix) : prefix(std::move(prefix)) {
-        DJ_HOST_ASSERT(not this->prefix.empty(), "environment variable prefix must not be empty");
-        DJ_HOST_ASSERT(this->prefix != "DJ", "DJ is reserved for global environment variables");
-    }
-
-    template <typename T>
-    std::optional<T> get(const std::string_view suffix) const {
-        if (const auto value = get_with_prefix<T>(prefix, suffix))
-            return value;
-        return get_with_prefix<T>("DJ", suffix);
-    }
-
-    template <typename T>
-    T get(const std::string_view suffix, const T& default_value) const {
-        return get<T>(suffix).value_or(default_value);
-    }
-
-    template <typename T>
-    static std::optional<T> get_with_prefix(const std::string_view prefix, const std::string_view suffix) {
-        const auto name = std::string(prefix) + "_" + std::string(suffix);
-        if (std::getenv(name.c_str()) == nullptr)
-            return std::nullopt;
-        return get_env<T>(name);
-    }
-};
-
 }  // namespace deep_jit

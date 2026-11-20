@@ -142,20 +142,6 @@ def test_decoder_boundary_refreshes_suffix_after_packing(start):
     assert len(observed) == 7
 
 
-def test_decoder_suffix_reads_previous_ring_through_a_full_window():
-    source = Metadata.allocate(8192, 1, 256, "cpu")
-    suffix = PreparedDecoderSuffix(source)
-    windows = PreparedWindowIndices(suffix.metadata, mode="prefill", tokens=128, page_size=256, width=128)
-    for rows in (1, 120, 127, 128, 129, 8192):
-        set_metadata(source, [8192], [rows])
-        packed = suffix.begin(source)
-        packet = windows(packed.metadata, replay_start=packed.replay_start)
-        live_indices = packet.window_indices[packed.live]
-        old = live_indices[(live_indices >= 0) & (live_indices < 128)].unique()
-        expected = torch.arange(1, 128, dtype=torch.int32) if rows <= 128 else old.new_empty(0)
-        assert torch.equal(old, expected)
-
-
 def test_shared_window_buffers_survive_layer_consumption_and_capacity_switches():
     groups = []
     for tokens in (8, 24, 128):
@@ -198,7 +184,7 @@ def test_attention_rejects_incompatible_shared_window_indices(mismatch):
         arguments["visible"] = (torch.zeros(24), torch.zeros(24))
     helper = DeepSeek41Indices(**arguments)
     config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-6, "candidate_source_layer_id": 0}, source=lambda layer: None)
-    pool = SimpleNamespace(config=config, window_record_planes=(528,), window=lambda *args, **kwargs: torch.zeros((1, 128 * 528), dtype=torch.uint8))
+    pool = SimpleNamespace(config=config, window=lambda *args, **kwargs: torch.zeros((1, 128 * 528), dtype=torch.uint8))
     with pytest.raises(ValueError, match="shared window indices must match"):
         PreparedAttention(0, {}, torch.zeros((24, 1)), None, metadata, pool, None,
             mode="verify", world=1, session=None, name="attention", workspace=None, window_metadata=helper)
@@ -208,7 +194,7 @@ def test_standalone_attention_refreshes_its_own_window_metadata(monkeypatch):
     from ignition.recipes.deepseek41 import attention
     metadata = Metadata.allocate(24, 8, 1, "cpu", max_query_tokens=6)
     config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-6, "candidate_source_layer_id": 0}, source=lambda layer: None)
-    pool = SimpleNamespace(config=config, window_record_planes=(528,), window=lambda *args, **kwargs: torch.zeros((10, 128 * 528), dtype=torch.uint8))
+    pool = SimpleNamespace(config=config, window=lambda *args, **kwargs: torch.zeros((10, 128 * 528), dtype=torch.uint8))
     scratch = SimpleNamespace(projected=torch.zeros((24, 1792)),
         query_low=torch.zeros((24, 1280)), query=torch.zeros((24, 16, 512)),
         window_values=torch.zeros((24, 512)), attended=torch.zeros((24, 16, 512)),

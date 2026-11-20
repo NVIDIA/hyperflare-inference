@@ -11,7 +11,6 @@
 #include <torch/all.h>
 
 #include <deep_jit/backend/cuda/driver.hpp>
-#include <deep_jit/utils/env.hpp>
 
 #include "../heuristics/sm90.hpp"
 #include "../../utils/math.hpp"
@@ -143,12 +142,6 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
     const cuuint32_t smem_dims[2] = {static_cast<cuuint32_t>(smem_inner_dim), static_cast<cuuint32_t>(smem_outer_dim)};
     const cuuint64_t gmem_strides[1] = {static_cast<cuuint64_t>(gmem_outer_stride * elem_size), };
     const cuuint32_t elem_strides[2] = {1, 1};
-    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
-        printf("Making TMA desc: global memory: %d %d, shared memory: %d %d, outer stride: %d, swizzle: %d (base: %d), elem size: %d, pointer: %llu\n",
-               gmem_inner_dim, gmem_outer_dim, smem_inner_dim, smem_outer_dim,
-               gmem_outer_stride, swizzle_mode, swizzle_base, elem_size,
-               reinterpret_cast<unsigned long long>(t.data_ptr()));
-    }
     DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
         &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32, fp4_unpacked_smem),
         2, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
@@ -187,11 +180,6 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
     const cuuint32_t smem_dims[3] = {static_cast<cuuint32_t>(smem_dim_0), static_cast<cuuint32_t>(smem_dim_1), static_cast<cuuint32_t>(smem_dim_2)};
     const cuuint64_t gmem_strides[2] = {static_cast<cuuint64_t>(gmem_stride_0 * elem_size), static_cast<cuuint64_t>(gmem_stride_1 * elem_size)};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
-    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
-        printf("Making 3D TMA desc: global memory: %d %d %d, shared memory: %d %d %d, outer stride: %d %d, swizzle: %d, elem size: %d\n",
-               gmem_dim_0, gmem_dim_1, gmem_dim_2, smem_dim_0, smem_dim_1, smem_dim_2,
-               gmem_stride_0, gmem_stride_1, swizzle_mode, elem_size);
-    }
     DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
         &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32, fp4_unpacked_smem),
         3, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,

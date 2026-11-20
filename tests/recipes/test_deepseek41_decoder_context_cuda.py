@@ -29,9 +29,8 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned CUDA device")
 
 
-@pytest.mark.parametrize("separated", [False, True])
 @torch.no_grad()
-def test_compacted_prefill_feedback_transitions_to_accepted_verification_under_native_replay(tmp_path, separated):
+def test_compacted_prefill_feedback_transitions_to_accepted_verification_under_native_replay():
     checkpoint = RECIPE.checkpoints[0]
     snapshot = Path.home() / ".cache/huggingface/hub" / (
         "models--" + checkpoint.repository.replace("/", "--")) / "snapshots" / checkpoint.revision
@@ -56,20 +55,7 @@ def test_compacted_prefill_feedback_transitions_to_accepted_verification_under_n
         assert torch.equal(packed.scale_rows[0].view(torch.uint8),
                            torch.cat([weight.scale_rows[0].view(torch.uint8) for weight in separate]))
     weights = SimpleNamespace(config=config, draft=draft)
-    if separated:
-        from ignition.components.fused_mla import FusedMLAPreparation
-        from ignition.components.rotary import CompressedRotary
-
-        library = os.environ.get("FLARE_FLASHMLA_LIBRARY")
-        if not library or torch.cuda.get_device_capability() != (10, 3):
-            pytest.skip("separated draft context requires SM103 and the pinned FlashMLA library")
-        rotary = CompressedRotary(config, device)
-        layout = FusedMLAPreparation.create((rotary.frequencies[False], rotary.frequencies[True]), 8192,
-                                           kernel_cache=tmp_path, library=library)
-        for layer in draft.layers:
-            layer.attention["fused_layout"] = layout
-    pool = ContinuationPool.allocate(config, 4, 2, device, dspark=True,
-                                     window_record_planes=(512, 16) if separated else (528,))
+    pool = ContinuationPool.allocate(config, 4, 2, device, dspark=True)
     metadata = Metadata.allocate(4096, 1, 1, device)
     packing = PreparedDecoderSuffix(metadata).functional()
     hidden = config.text["hidden_size"]

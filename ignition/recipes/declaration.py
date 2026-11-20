@@ -260,6 +260,8 @@ class Recipe:
     draft_head_quantizations: tuple[str, ...] = ()
     draft_body_quantizations: tuple[str, ...] = ()
     markov_head_quantizations: tuple[str, ...] = ()
+    # True when the recipe's packed speculative catalog budgets complete rounds across every draft depth.
+    packed_speculative_depths: bool = False
 
     def mixed_shapes(self, concurrency, chunk, speculation):
         from ignition.components.capacity import mixed_shapes, serving_modes

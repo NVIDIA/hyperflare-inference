@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 // Keep the preparation binding's runtime separate from the installed library.
 #define deep_gemm flare_megamoe_host
@@ -9,7 +10,9 @@
 #include "csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #undef deep_gemm
 
-void initialize(const std::string& root) { flare_megamoe_host::init_jit(root); }
+void initialize(const std::string& root, const std::string& cache_dir) {
+    flare_megamoe_host::init_jit(root, cache_dir);
+}
 void launch(torch::Tensor y, std::vector<std::optional<torch::Tensor>> acts,
             std::vector<torch::Tensor> weights, std::vector<torch::Tensor> shared,
             torch::Tensor control, torch::Tensor buffer, int capacity,
@@ -39,6 +42,7 @@ void launch(torch::Tensor y, std::vector<std::optional<torch::Tensor>> acts,
     TORCH_CHECK(control.device() == y.device() && buffer.device() == y.device());
     for (const auto& t : acts) if (t.has_value()) TORCH_CHECK(t->device() == y.device());
     for (const auto& t : shared) TORCH_CHECK(t.device() == y.device());
+    const c10::cuda::CUDAGuard device_guard(y.device());
     torch::Tensor absent;
     const auto act = [&](size_t i) { return acts[i].value_or(absent); };
     flare_megamoe_host::sm100_fp8_fp4_mega_moe(y,

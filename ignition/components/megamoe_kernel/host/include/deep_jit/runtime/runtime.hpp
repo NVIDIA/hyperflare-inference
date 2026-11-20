@@ -8,7 +8,6 @@
 #include <deep_jit/cache/disk.hpp>
 #include <deep_jit/cache/memory.hpp>
 #include <deep_jit/runtime/config.hpp>
-#include <deep_jit/utils/env.hpp>
 #include <deep_jit/utils/gil.hpp>
 #include <deep_jit/utils/hash.hpp>
 #include <deep_jit/utils/lazy.hpp>
@@ -25,7 +24,6 @@ public:
     using LaunchOptions = Backend::LaunchOptions;
 
     Config config;
-    Env env;
     Device device;
     CompilerOptions default_compiler_options;
     LaunchOptions default_launch_options;
@@ -37,11 +35,10 @@ public:
 
     explicit Runtime(Config config)
         : config(std::move(config)),
-          env(this->config.env_prefix),
-          default_compiler_options(CompilerOptions::default_options(env, device)),
-          default_launch_options(LaunchOptions::default_options(env)),
-          disk_cache(DiskCache::from_env(env)),
-          backend(env),
+          default_compiler_options(CompilerOptions::default_options(device)),
+          default_launch_options(LaunchOptions::default_options()),
+          disk_cache(this->config.cache_dirs),
+          backend(),
           parser(this->config.include_dirs, this->config.include_prefixes) {
         // Hash contains 5 parts:
         //   - Extra signature (base, unchanged)
@@ -57,7 +54,7 @@ public:
         const auto options = default_compiler_options.override_with(override_options);
         const auto key = cache_key(source, options);
         return mem_cache.get_or_create(key, [&] {
-            return Backend::load(compile(name, source, key, options), env);
+            return Backend::load(compile(name, source, key, options));
         });
     }
 
@@ -82,7 +79,7 @@ public:
             return entry.path;
 
         // Compile
-        backend.compile(source, entry.path, env, config, options);
+        backend.compile(source, entry.path, config, options);
 
         // Publish
         [[maybe_unused]] GilScopedRelease gil_release;

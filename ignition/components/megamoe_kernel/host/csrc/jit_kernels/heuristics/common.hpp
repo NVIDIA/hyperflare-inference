@@ -6,7 +6,6 @@
 #include <unordered_set>
 
 #include <deep_gemm/common/types.cuh>
-#include <deep_jit/utils/env.hpp>
 
 #include "config.hpp"
 #include "runtime.hpp"
@@ -40,18 +39,6 @@ static GemmConfig get_best_config(const GemmDesc& desc) {
         .launch_config = launch_config
     };
 
-    // Print configs for the first time
-    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
-        std::stringstream ss;
-        ss << desc;
-        const auto key = ss.str();
-
-        static std::unordered_set<std::string> printed;
-        if (printed.count(key) == 0) {
-            std::cout << desc << ": " << gemm_config << ", " << layout_info << std::endl;
-            printed.insert(key);
-        }
-    }
     return gemm_config;
 }
 

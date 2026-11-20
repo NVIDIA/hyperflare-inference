@@ -13,7 +13,6 @@
 #include <deep_jit/backend/cuda/driver.hpp>
 #include <deep_jit/backend/cuda/options.hpp>
 #include <deep_jit/backend/cuda/stable_torch_utils.h>
-#include <deep_jit/utils/env.hpp>
 #include <deep_jit/utils/exception.hpp>
 #include <deep_jit/utils/gil.hpp>
 #include <deep_jit/utils/no_ref_ptr.hpp>
@@ -45,7 +44,7 @@ public:
     Kernel(Kernel&&) = delete;
     Kernel& operator=(Kernel&&) = delete;
 
-    static std::shared_ptr<Kernel> load(const std::filesystem::path& dir, const Env& env) {
+    static std::shared_ptr<Kernel> load(const std::filesystem::path& dir) {
         // Release GIL to let other Python threads run
         [[maybe_unused]] GilScopedRelease gil_release;
 
@@ -53,13 +52,6 @@ public:
         const auto cubin_path = dir / "kernel.cubin";
         if (not std::filesystem::is_regular_file(cubin_path))
             DJ_PANIC("missing CUDA CUBIN: {}", cubin_path.string());
-
-        // Record start time
-        const bool debug = env.get<bool>("JIT_DEBUG", false);
-        const bool print_load_time = debug or env.get<bool>("JIT_PRINT_LOAD_TIME", false);
-        if (debug)
-            std::fputs(std::format("Loading CUBIN: {}\n", cubin_path.string()).c_str(), stdout);
-        const auto start_time = std::chrono::steady_clock::now();
 
         // Load kernel
         CUlibrary library_handle{};
@@ -80,11 +72,6 @@ public:
             throw;
         }
 
-        // Print and return
-        if (print_load_time) {
-            const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - start_time;
-            std::fputs(std::format("Load time ({}): {:.2f} ms\n", dir.string(), elapsed.count()).c_str(), stdout);
-        }
         return std::make_shared<Kernel>(library_handle, kernel_handle);
     }
 

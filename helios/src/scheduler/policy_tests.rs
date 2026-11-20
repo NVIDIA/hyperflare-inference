@@ -1171,6 +1171,25 @@ fn cold_engine(active: usize, speculative: bool) -> RequestScheduler {
     s
 }
 
+fn cold_terminal_engine(active: usize, speculative: bool) -> RequestScheduler {
+    let mut s = engine(active, speculative);
+    let capacities = s.prefill_catalog.clone();
+    s.terminal_prefill_graphs(129, &capacities).unwrap();
+    let mut graphs = super::tests::duration_graphs(active);
+    let terminal: Vec<_> = graphs.iter()
+        .filter(|g| g.kind == GraphKind::Prefill)
+        .cloned()
+        .map(|mut g| {
+            g.kind = GraphKind::TerminalPrefill;
+            g.name = format!("terminal-{}", g.token_capacity);
+            g
+        })
+        .collect();
+    graphs.extend(terminal);
+    s.graph_durations(&graphs).unwrap();
+    s
+}
+
 fn measured_step(s: &mut RequestScheduler, duration_ns: u64, accepted: usize) -> ScheduledPlan {
     let plan = s.plan().expect("runnable request must make progress");
     let fence = Fence(s.submitted.0 + 1);
@@ -2571,9 +2590,29 @@ fn initial_unknown_graph_completions_neither_earn_nor_spend_refresh_credit() {
 }
 
 #[test]
+fn non_terminal_core_preserves_unrestricted_discovery_behavior() {
+    for credit_ns in [0.0, refresh::CREDIT_CAP_NS] {
+        let mut s = cold_engine(2, false);
+        let decoder = add(&mut s, 1, 64, 4096);
+        ready(&mut s, &[decoder]);
+        set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+        let prompt = add(&mut s, 2, 2048, 1);
+        initialize(&mut s, prompt);
+        s.refresh.credit_ns = 0.0;
+        let first = measured_step(&mut s, 200 * MS, 0);
+        assert_eq!((first.kind, first.token_capacity, first.origin),
+                   (GraphKind::Prefill, 512, PlanOrigin::Discovery));
+        s.refresh.credit_ns = credit_ns;
+        let next = s.plan().unwrap();
+        assert_eq!((next.kind, next.token_capacity, next.origin),
+                   (GraphKind::Prefill, 256, PlanOrigin::Discovery));
+    }
+}
+
+#[test]
 fn optional_prefill_discovery_does_not_displace_competing_measured_service() {
     for competing in [false, true] {
-        let mut s = cold_engine(2, false);
+        let mut s = cold_terminal_engine(2, false);
         let decoder = competing.then(|| add(&mut s, 1, 64, 4096));
         if let Some(handle) = decoder { ready(&mut s, &[handle]); }
         set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
@@ -2596,7 +2635,7 @@ fn optional_prefill_discovery_does_not_displace_competing_measured_service() {
 
 #[test]
 fn optional_discovery_spends_measured_time_and_requires_fresh_funding() {
-    let mut s = cold_engine(2, false);
+    let mut s = cold_terminal_engine(2, false);
     let decoder = add(&mut s, 1, 64, 4096);
     ready(&mut s, &[decoder]);
     set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
@@ -2635,7 +2674,7 @@ fn optional_discovery_spends_measured_time_and_requires_fresh_funding() {
 
 #[test]
 fn discovery_debt_does_not_block_a_requests_untimed_prerequisites() {
-    let mut s = cold_engine(2, false);
+    let mut s = cold_terminal_engine(2, false);
     let decoder = add(&mut s, 1, 64, 4096);
     ready(&mut s, &[decoder]);
     set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);

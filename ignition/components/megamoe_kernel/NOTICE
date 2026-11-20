@@ -15,7 +15,8 @@ are unchanged by that choice; FP32 addition order can affect final BF16 rounding
 
 inputs.py adapts vLLM v0.32.0's
 vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe.py (Apache-2.0,
-Copyright contributors to the vLLM project). The Triton kernel is unchanged.
+Copyright contributors to the vLLM project; full license text in LICENSE.vllm).
+The Triton kernel is unchanged.
 The Python wrapper imports Triton directly and fixes the declared activation
 format to dynamic MXFP8, removing its dependency on vLLM's QuantKey classes.
 It validates the tensor geometry, formats and devices before launching.
@@ -23,16 +24,11 @@ It validates the tensor geometry, formats and devices before launching.
 The host/csrc preparation launcher and heuristics derive from
 vllm-project/DeepGEMM commit 1e1842a833699298f7afc02eefb2ed168fff6938.
 The MegaMoE launcher passes the selected accumulation order as a kernel template
-argument. The heuristics are unchanged. The host/include/deep_jit headers are
-unchanged from that revision's DeepJIT submodule and retain its license in
-LICENSE.DeepJIT. Flare's host_bindings.cpp
+argument. The heuristics omit environment-selected debug printing. The
+host/include/deep_jit headers derive from that revision's DeepJIT submodule and
+retain its license in LICENSE.DeepJIT; Flare replaces environment-variable
+compiler/cache toggles with an explicit cache directory and fixed compilation
+options. Flare's host_bindings.cpp
 passes logical expert count independently of physical HBM tensor extents.
 The binding has a separate preparation runtime and uses the carried CUDA
 headers; it does not add a native serving dependency.
-
-host/csrc/jit_kernels/impls/sm100_mqa_logits.hpp and sm100_sparse_mqa_logits.hpp
-are also unchanged from that DeepGEMM revision. mqa_bindings.cpp supplies
-caller-owned logits, metadata and scheduler storage to their full-cache and
-candidate-restricted paged MXFP4 indexer launchers. It preserves the reference
-kernels and separated cache planes while exposing allocation lifetimes to
-preparation.

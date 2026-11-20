@@ -7,7 +7,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cublasLt.h>
 
-#include <deep_jit/utils/env.hpp>
 #include <deep_jit/utils/lazy.hpp>
 
 #include "../utils/exception.hpp"
@@ -31,14 +30,8 @@ public:
     bool use_temp_cublaslt_workspace;
 
     explicit Runtime() {
-        // Whether to use PyTorch cuBLASLt
-        // By default, we don't use it,
-        // as `at::cuda::getCurrentCUDABlasLtHandle` has large CPU overhead with some PyTorch versions
-        use_pytorch_managed_cublaslt_handle = deep_jit::get_env<int>("DG_USE_PYTORCH_CUBLASLT_HANDLE", 0) > 0;
-        // Whether to create workspace tensor on each call instead of holding one.
-        // Enabled by compute-sanitizer tests, which trigger `cudaErrorCudartUnloading`
-        // when the workspace tensor is destructed after CUDA driver shutdown.
-        use_temp_cublaslt_workspace = deep_jit::get_env<int>("DG_USE_TEMP_CUBLASLT_WORKSPACE", 0) > 0;
+        use_pytorch_managed_cublaslt_handle = false;
+        use_temp_cublaslt_workspace = false;
 
         if (not use_pytorch_managed_cublaslt_handle)
             DG_CUBLASLT_CHECK(cublasLtCreate(&cublaslt_handle));

@@ -109,281 +109,58 @@ scale in HBM. DeepInfer's native loader expects native scale tensors and rejects
 the `mxfp4_csf` configuration; the integration must provide a real loading and
 storage adaptation rather than relabeling the compressed checkpoint as native.
 
-The experimental parameter loader materializes the complete text, draft and
-vision parameter tree while leaving routed experts and Engram tables as storage
-declarations. On SM103, all 1,219 ordinary parameter entries and their source
-scales match the checkpoint exactly, and tied parameters share storage. This
-qualifies parameter loading, not complete forward execution or serving.
+### DeepSeek V4.1 `"reference"` preparation boundaries
 
-The experimental model assembly constructs the original target, DFlash and
-vision modules with explicit execution settings, Flare-owned expert planes and
-native Engram delivery. Its SM103 construction check loads all 40 target layers,
-three draft layers and the 32-block vision encoder, placing half of each layer's
-routed experts in HBM and half in Grace. Target expert operations are prepared
-at 1, 8, 192 and 8192 rows and draft operations at 1 and 7 rows. Parameter
-construction is consuming: reference projection fusion transfers storage
-ownership, so a failed assembly requires a fresh parameter tree.
+The `"execution": "reference"` path in `ignition/recipes/deepseek41/` binds the
+DeepInfer target, DFlash draft, and vision modules into Flare's preparation and
+export contracts with the following architectural invariants:
 
-On one GB300, the complete target transformer compiles and executes through
-Helios's native graph executor with full checkpoint Engram tables in host RAM.
-Synthetic prompts at prefill capacities 1, 192 and 8192, followed by four sampled
-outputs per request, preserve finite hidden outputs, FP32 vocabulary logits and
-complete request/cache state exactly against direct execution using the same
-delivered table rows. Chunk sequences are 1; 129, 128, 3; and 8192, 129, 3 actual
-tokens. They exercise padded rows, compression and page boundaries, continued
-prefill and the transition into decode. Intermediate chunks consume tokens
-without sampling; prompt histogram entries are counted once at admission.
-
-The compiled graphs include the reference BF16 vocabulary projection,
-target-layer feature storage, DFlash main-cache writes, Engram history commit
-and shared FlashInfer sampling. Request RNG counters advance once per output;
-the completion cursor reports draft context through the consumed target token.
-Replay allocates no GPU storage and leaves the unassigned continuation row
-unchanged. A queued decode after the output limit preserves request and cache
-state. These ordinary-generation checks do not establish
-long-context accuracy, cross-capacity numerical equivalence or fresh-process
-core loading.
-
-With seven proposed tokens on the same GB300 and split expert placement,
-complete native speculative rounds preserve proposal IDs, draft and target
-logits, filtered probabilities, request counters and model/cache bytes exactly
-against direct execution until a twelve-output limit and a queued finished
-round. The shared sampler's FP32 survival estimates satisfy its existing
-relative bound of 1e-6 against direct execution and an independent FP64
-calculation; token decisions and cache state retain exact comparisons. An
-actual-model rollback check compares every accepted input count from zero
-through eight with target-only execution of that prefix at the same physical
-row capacity. These checks cover one request and synthetic prompt tokens;
-they do not qualify concurrent speculative serving or fresh-process core loading.
-
-The complete 32-layer reference vision encoder, spatial downsample and projector
-compile and replay on GB300 with checkpoint weights. Normalized synthetic image
-inputs with 24-by-24 and 25-by-31 patch grids match direct outputs exactly across
-three changing inputs per shape, without GPU allocation during replay. Compiler
-declarations retain TileKernels rotary/SwiGLU, FlashAttention and the reference
-ATen projections; unbiased BF16 projections select DeepGEMM from the operand's
-CUDA device. Native feature publication also passes at patch capacities 576,
-1152 and 9216, including partial spatial groups, append offsets, stale request
-generations and invalid rotary positions. Published features match the original
-encoder, spatial merge and projector exactly; rejected writes preserve existing
-features. Replay allocates no GPU storage. Native image preprocessing matches
-DeepInfer's processor and GPU normalization exactly for tiny, landscape,
-extreme-aspect-ratio and multiple-image inputs. The comparison covers token
-types, feature indices, atomic spans, patch geometry, positions and BF16 pixels.
-
-With the complete checkpoint and half of each expert layer in HBM, a native
-vision graph publishes features from a synthetic 24-by-24 patch image for
-chunked text execution. Prefill chunks of 129 and 3 tokens, four ordinary sampled
-outputs and subsequent seven-token speculative rounds through a twelve-output
-limit preserve outputs and complete state against direct execution. The image
-span ends at the first chunk boundary; Engram history retains image sentinels
-and excludes them from subsequent text n-grams. Learned image-marker and feature
-injection matches the original reference merge operation exactly. These checks
-cover one request and one image; they do not establish image understanding,
-concurrent image serving or fresh-process core loading.
-
-The reference cached-prefix sampler uses the original BF16 vocabulary projection
-and shared request validation/completion. Native replay at one and four rows
-with synthetic saved hidden states produces the expected greedy tokens without
-consuming input, changing cache bytes or touching inactive requests. Complete
-continuation snapshots and forks preserve all reference cache regions and partial
-pages at endpoints 1, 127, 128, 129, 255 and 256. Both checks allocate no GPU
-storage during replay. Full-model generation after native prefix restoration
-remains unqualified.
-
-The target-feature storage binding preserves strided destinations and adjacent
-feature planes during compiled replay at 1, 8, 129 and 8192 rows, for one- and
-four-way residual inputs. These synthetic component checks compare three
-changing inputs against the original native operation with no replay allocation.
-
-Reference gather, BF16 projection and mHC operators expose native launches through
-Torch operation declarations. On SM103, complete-forward compilation and captured
-replay preserve exact output bytes for synthetic 5120-wide inputs at 1, 8 and 129
-rows, including shifted and unshifted hyperconnections. Checks cover
-FP8 normalization output, residual mixing, changing inputs and replay allocation
-stability. Component checks qualify the operator bindings; complete-model
-prefill checks at 8,192 rows verify numerical repeatability across direct and
-captured execution (`tests/components/test_reference_model_cuda.py`).
-
-Compiled reference attention transforms preserve cache bytes and BF16 outputs
-at capacities 1, 8, 129 and 8192 for the 528-byte sliding-window, 288-byte
-compressed-attention and 68-byte index-cache formats. Checks cover normalization,
-rotary or Hadamard transforms, quantization and masked stores through the original
-fused operator. CUDA memory checking reports zero invalid accesses for these
-bindings and the mHC component cases; it does not establish numerical
-repeatability or whole-model correctness.
-
-The experimental reference expert binding supplies DeepInfer's normalization
-producer with views into Flare's prepared MegaMoE workspace. DeepGEMM's router
-writes canonical selections through a physical-row mapping and preserves the
-separate image routing bias. The expert consumer rejects encoded tensors that
-do not alias its prepared storage. Shared-first host accumulation matches the
-reference's FP32 reduction order; the existing host binding retains routed-first
-accumulation by default. These are preparation-time arithmetic choices, not
-runtime residency policies. This binding does not establish complete-model or
-native-serving qualification.
-Canonical expert identities remain separate from physical storage rows. On
-SM103, the binding matches the reference with all-HBM storage, disjoint HBM/Grace
-tiers and HBM copies of Grace-backed experts at capacities 1, 8, 129 and 8192.
-These tests use eight checkpoint experts and the shared expert, changing text
-and image routing masks. Duplicate physical copies do not add router choices.
-
-The experimental reference Engram binding publishes graph-produced hashes to
-Helios's mapped request mailboxes. Its projection consumes delivered FP8 row
-planes after their external CUDA readiness event and losslessly packs E8M0
-scale bytes for DeepGEMM. The reference hash and gate kernels remain intact;
-Torch operation declarations expose their outputs and mutations to preparation.
-No BF16 lookup materialization or activation recasting is required. Inactive
-tokens publish negative row IDs and contribute no Engram residual update.
-
-On SM103, native execution of both checkpoint Engram projections and gates
-matches the reference exactly at graph capacities 1, 192 and 8192 with shared
-8192-token delivery buffers. Tests use checkpoint table samples and a synthetic
-hash space, changing histories, image bypass and fully inactive batches. The
-full checkpoint's hash geometry is checked separately against the PyTorch hash
-reference. These checks do not qualify full-table delivery, fresh-process core
-export or complete-model serving.
-
-The reference Engram history binding reads raw tokens from native continuation
-rows and constructs compressed-vocabulary n-grams inside captured computation.
-Image positions terminate lookback, including across chunk boundaries. Commit
-appends only the consumed input prefix; rejected drafts and inactive requests
-leave history unchanged. On SM103, compiled graph replay matches DeepInfer's
-native n-gram builder at request widths 1, 6 and 8 with four packed requests and
-at single-request prefill capacities 129 and 8192. Checks cover image boundaries,
-full/partial/zero acceptance and restored history, with exact state agreement,
-no replay allocations and zero CUDA memory errors. Complete speculative serving
-and native continuation transfer remain separate qualification requirements.
-
-The experimental reference cache binding exposes shared compressed pages and
-per-request sliding-window and compressor rings through Flare's continuation
-storage. Target and draft layers retain separate windows; shared cache consumers
-alias their source pages. Every history ring and partial page belongs to the
-complete continuation row, including state omitted by the reference engine's
-disk-cache format. Ring lengths follow the prepared verification capacity.
-Attention and draft index construction consume the actual cache ring geometry.
-Speculative transactions snapshot cache rows before draft execution and restore
-rejected writes after verification. Main-cache records contain values and scales
-together; index caches store them in separate page sections. Rollback addresses
-both index sections independently. On SM103, compiled transactions using the
-reference cache-store operation preserve every backing byte against accepted-prefix
-stores at widths one and eight, for every accepted count, across compression and
-page boundaries and inactive requests. This component check does not establish
-complete speculative generation or native prefix restoration.
-Sliding-window cache records occupy 528 bytes. FlashMLA's tensor map requires
-the stride between request slots to contain whole records, so continuation-row
-padding preserves both that divisibility and the state allocator's alignment.
-
-All 40 target and three draft attention modules construct from checkpoint
-parameters on SM103 with explicit attention and indexer preparation settings.
-The first target layer's complete reference attention compiles and replays with exact output
-and cache agreement at 129- and 8192-token prefill capacities and one- and
-eight-token decode capacities, without GPU allocations during replay. The
-reference attention chain from target layers 2 through 39 also compiles and
-preserves exact active outputs and complete cache state for short decode sequences at widths
-one and eight and prefill capacities of 129 and 8192. Prefill checks continue
-across odd chunk boundaries, shorten chunks and replay fully inactive graphs.
-These checks use checkpoint attention weights and synthetic activations, with
-compressed-cache sharing, index projection and candidate-block selection at a
-prepared context capacity of 32768 tokens. They do not establish complete
-decoder execution, long-context model accuracy or native core export.
-CUDA memory checking reports zero errors for direct and compiled attention
-and metadata checks, including fully inactive graphs that preserve all cache storage.
-
-Sparse-indexer compiler bindings retain DeepGEMM scoring and scheduling,
-DeepSelect selection, and the reference candidate-index transformations.
-Pointer alignment is checked inside the native scoring calls. Scheduling
-outputs match the declared compiler shape, dtype and stride for contiguous
-and paged FP4 metadata at 1, 8 and 129 rows, with 4, 128 and 4096 candidate
-blocks. These allocation checks do not establish long-context selection quality.
-
-The experimental metadata bindings consume Flare's validated packed requests
-inside captured computation. They supply reference token positions, page tables,
-C1/C2 compression destinations and sliding-window indices. Padded tokens receive
-invalid state-write destinations. Decode output matches DeepInfer's native C++
-input builder at verification widths 1, 6 and 8 across page and ring boundaries.
-Prefill follows Flare's single-request graph contract. It uses fixed-capacity
-cache gathers, zeroes unused output rows and excludes them from attention.
-At capacities 129 and 8192, metadata and gathered cache values match the native
-builder, while compressed outputs and state match the reference kernel with
-NaNs in padded input rows. Engram history and image routing masks remain explicit
-inputs; these bindings do not commit request history.
-
-On SM103, captured reference compression matches an uninterrupted reference
-prefill across a 129-token chunk followed by 8192 tokens, including restoration
-at the odd chunk boundary. Verification widths 1, 6 and 8 preserve exact outputs
-and ring state after full, partial and zero draft acceptance. Decode indexing
-and five- and seven-token draft metadata match the reference index formulas.
-Compressor kernels skip inactive rows before accessing state, using an explicit
-negative state index; verification bounds come from prepared input geometry.
-Captured tests preserve active outputs and all inactive state with interleaved
-padded rows, empty prefill requests and fully inactive batches. CUDA memory
-checking reports zero errors on those cases.
-
-Exported full-model serving is qualified on one GB300 across both the
-complete-chunk core
-`63bf1d05b2011d9a4ffeda37a4f3fb9f98144733b6eb0ddd08439a477ecde79a` (`207`
-compiled forwards, `237` graphs, `--speculative-graph-budget 64`) and the CED +
-Encoder-staged cores
-`13e47a848e903037c8e30b0c8082544d9d4f3b79844429349e9b462fdab9c736` and
-`d11fbfb8f184555bc26b10ce172773b2b1e92a85406d5e0722c671f8dee23b80` (`TP1`,
-262,144-token context, concurrency 16, 8,192-token prefill chunks, adaptive
-draft depths through seven, 128-token packed verification capacity,
-`--speculative-graph-budget 80`, image concurrency one, `--parallax-routing`,
-`"prefill_staging": {"min_rows": 1024, "min_cold_experts": 8}`, 11,680 active
-target HBM experts plus 40 spare exchange rows and 3,680 Grace experts). The
-CED + staged core compiles 283 forwards and exports 313 graphs (`35,409` total
-CUDA graph kernel nodes, fewer than the 237-graph core's `37,300` nodes after
-vectorizing `ReferenceCacheTransaction` ring snapshots/commits across the
-contiguous ring slice) using a `9.13 GiB` shared CUDA graph pool; fresh-process
-`flare run` verifies all 50 shards, loads without Python, allocates
-`18,029,568` logical KV tokens and `1,568` snapshot slots (`15.01 GiB` cache
-budget; `18,010,752` KV tokens with Parallax enabled), and passes
-`tests/server/test_deepseek41_sm103.py`, 2,080-token continuations, single- and
-multi-image (up to three images) generation, mid-stream cancellation, ordinary
-decode (`--mtp-draft-tokens 0`), adaptive speculative execution at runtime
-limits 3, 5, and 7, and exact 36-request seeded parity across Parallax
-disabled, observed, static, `decayed_miss_lru`, and EWMA `predictor_rank` modes
-including 12,800-token prefix restoration across physical residency generations
-104 to 159. Because `dspark_target_layer_ids` (`[37, 38, 39]`) lies entirely in
-the consumer half (`layers 20..39`), `"reference"` enables CED consumer
-compaction (`yoco_prefill_truncation="compact"`, `keep_tokens = 144` >=
-`window_tokens = 135`, `terminal_prefill_min_tokens = 144`), skips consumer
-`layers 20..39` and LM-head projection on intermediate `prefill` chunks
-(`terminal=False`), raises the sparse-indexer scoring workspace limit to
-`256 MiB` (`512` query rows), and stages cold Context Encoder experts
-(`layers 0..19`) two layers ahead on two auxiliary streams. Vision encoder
-varlen attention zero-initializes its output buffer before `_flash_attn_fwd` in
-core `d11fbfb8...` so non-128-aligned live patch counts cannot propagate `NaN`
-values left in the shared graph pool.
-
-Under the equal 11,680-expert HBM budget on core `13e47a84...`, sixteen
-completed 2,048-token responses per cell with distinct request seeds deliver
-`243.1`, `414.2`, `667.0`, `993.1`, and `1,478.9 tokens/s` at concurrencies 1,
-2, 4, 8, and 16 with `decayed_miss_lru` active movement at adaptive `MTP-3`
-(mean verification graph durations `8.91`, `10.21`, `11.79`, `14.45`, and
-`18.02 ms`), compared with `166.3`, `528.7`, and `730.9 tokens/s` under static
-placement at concurrencies 1, 8, and 16. Across runtime draft depths 0, 3, 5,
-and 7 (`alpha = 1.0`) with active movement, concurrency-one decode delivers
-`146.6`, `243.1`, `246.9`, and `241.3 tokens/s` (`249.6 tokens/s` at `MTP-5`
-with `--mtp-adaptive-verification-alpha 0.5`), and concurrency-sixteen decode
-delivers `1,016.7`, `1,478.9`, `1,496.1`, and `1,479.0 tokens/s`. Median
-uncached prefill throughput (`N = 10` timed samples per length) at 8,192,
-32,768, and 131,072 tokens reaches `58.6K`, `72.4K`, and `79.3K tokens/s`
-(`139.7`, `452.7`, and `1,653.0 ms` TTFT) with active `decayed_miss_lru`
-(`41.2K`, `52.1K`, and `55.8K tokens/s` / `198.6`, `629.5`, and `2,351.0 ms`
-static), surpassing both the `"hybrid"` equal-residency core
-`9078905c99a9473fe553c8ede38dc7e1ef8fd71271d0ec425aed2cacd7f93b50` (`150.1`,
-`575.1`, and `2,399.7 ms` active) and local lossless DerpSeek exact 1.9 (`175.2`,
-`512.5`, and `2,024.0 ms`). Prompt-heavy mixed waves (`agentic-c8` and held-out
-`public-holdout/agentic-c8`) rise from `493.6` and `354.7 tokens/s` (complete-chunk
-core `63bf1d05...`) to `574.6` (`+16.4%`) and `463.6 tokens/s` (`+30.7%`).
-Unseeded multi-stream decode benchmarks that omit `seed` share
-`defaults.seed = 0`; because the reference kernels are batch-invariant across
-lanes, identical unseeded prompts follow identical token trajectories when using
-fixed widths (`2,590.5–3,012.1 tokens/s` sustained `C16` under adaptive MTP), so
-multi-stream MoE comparisons require distinct per-request seeds. Multi-GPU TP2+
-composition and prompt log-probabilities remain unimplemented on `"reference"`.
+- **Parameter loading and consuming fusion (`reference_parameters.py`,
+  `reference_model.py`).** Ordinary text, draft, and vision parameters
+  materialize once with tied storage preserved while routed experts and Engram
+  tables stay as explicit storage declarations. Reference projection fusion
+  transfers storage ownership, so a failed assembly requires a fresh parameter
+  tree.
+- **Expert residency and accumulation order (`reference_experts.py`,
+  `megamoe_kernel/`).** Canonical expert identities remain separate from
+  physical HBM and Grace row indices; duplicate physical copies never expand
+  router choices. Normalization producers write into prepared MegaMoE workspace
+  views, and expert consumers reject encoded tensors that do not alias prepared
+  storage. Shared-first FP32 accumulation matches DeepInfer's reduction order;
+  routed-first remains the default for the standalone host binding.
+- **Cache storage and speculative rollback (`reference_cache.py`,
+  `reference_metadata.py`).** Shared compressed pages (`288`-byte records),
+  index pages (`68`-byte records with separated payload and scale sections),
+  and per-request sliding-window (`528`-byte records) and compressor rings live
+  in Flare's continuation storage with alignment preserving both allocator
+  granularity and FlashMLA's tensor-map row stride (`lcm(256, 528)`). Padded
+  tokens receive invalid write destinations and leave cache state unchanged.
+  Speculative transactions snapshot and restore both main-cache and separated
+  index-cache regions independently across accepted prefix lengths.
+- **Engram delivery and history (`reference_engram.py`).** Captured graphs
+  publish token hashes to Helios's mapped request mailboxes and consume
+  delivered FP8 rows after external CUDA readiness events, with negative row
+  IDs bypassing inactive tokens. Compressed-vocabulary n-gram history lives in
+  continuation rows, terminates lookback at image sentinels, and commits only
+  accepted prefixes.
+- **Vision and multimodal prefill (`reference_vision.py`).** The 32-block
+  vision encoder, spatial downsample, and projector bind into Flare's vision
+  graph family (`PATCH_CAPACITIES`) and image feature arena. Varlen attention
+  zero-initializes its output buffer before `_flash_attn_fwd` so non-128-aligned
+  patch counts cannot propagate `NaN` values from the shared CUDA graph pool.
+- **Context-Encoder-Decoder (CED) prefill and Encoder staging (`bootstrap.py`,
+  `megamoe_staging.py`).** Because `dspark_target_layer_ids` (`[37, 38, 39]`)
+  lies entirely inside the consumer half (`layers 20..39`), CED prefill
+  compacts the consumer suffix to `yoco_keep_tokens = 144` (`>= 135` window
+  tokens) and omits consumer layers on intermediate chunks (`terminal=False`),
+  while staging cold Context Encoder experts (`layers 0..19`) two layers ahead
+  on auxiliary streams.
+- **Scope and open work.** Present single-GPU GB300 (`SM103`, `TP1`) serving
+  workflows and commands live in [model preparation](model-preparation.md) and
+  [Parallax](parallax.md). Multi-GPU (`TP2+`) composition, prompt
+  log-probabilities, pinned external preparation packaging for DeepInfer, and
+  remaining long-context and concurrency qualification items are tracked in
+  [TODO.txt](TODO.txt).
 
 Carry forward measured techniques from
 [DerpSeek](https://github.com/chronarion/derpseek) where they fit the reference
