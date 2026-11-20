@@ -676,21 +676,19 @@
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `ignition/components/linear.py`; SM103 execution is unqualified.
 
-[ ] Establish a bound that distinguishes GLM 5.3 verification rows from
-    incorrect ordinary-decode results. Holding b12x W4A16 route packing
-    fixed made the layer 3 prefill expert replay repeatable at TP8.
-    Changing another row's expert routes changed the watched row's local
-    expert output. On a 2047-token prefix, unchanged runs also differed
-    in layer 0's index order and by 0.94 relative L2 in the final hidden
-    state. The layer-level results do not supply a width-independent
-    full-stack tolerance.
+[ ] Establish equal GLM 5.3 target distributions across decode capacities
+    before qualifying lossless speculation. On twelve TP8 checkpoint rows,
+    ordinary capacity one and verification capacity eight differ by up to
+    0.07361 in total variation at temperature one and top-p 0.95. Their
+    first differences occur in the layer-zero BF16 query projection.
+    Close when the executed target and proposal laws satisfy mtp-design.md.
 
-[ ] Qualify exact GLM 5.3 index selection against FP32 Transformers apart
-    from equal-score ties. At layer 6 on a 2722-token prompt the prepared
-    FP8 indexer matched two of 674 nontrivial sets. Each other row omitted
-    a position with a strictly higher FP32 score than a retained position.
-    Recomputing the head projection with FP32 output also matched two sets.
-    Close when the selected positions meet the reference criterion.
+[ ] Pin FlashInfer to a revision containing logical-position tie breaking
+    in FP8 sparse selection and column-based split-K in the packed W4A16
+    expert kernel. The lockfile selects 598c8547, which has neither repair.
+    Close when a locked install passes the checkpoint cutoff and target-row
+    regressions and serves freshly exported plain and draft-enabled GLM 5.3
+    cores. See model-preparation.md, section GLM 5.3.
 
 [ ] Exercise Kimi K3 and K3.1 MLA key absorption and value expansion with
     core-backed storage at eight decode rows. Their shared weight loader
@@ -700,17 +698,9 @@
     views. Close when an export and replay on each recipe's supported rank
     count validate these operands.
 
-[ ] Qualify the first and recursive GLM 5.3 draft steps against independent
-    layer 78 execution. With 2305 tokens of teacher-forced context, first-step
-    attention differed from an FP32 Transformers layer using the draft
-    weights by 0.0184 relative L2. Twice the BF16 reference error was 0.0166.
-    Close when both steps meet their intermediate and logit bounds and the
-    same checks reject a shifted position and incorrect preceding state.
-
-[ ] Run the GLM 5.3 checks that have not run: concurrency above eight and a
-    component test of the draft round in tests/recipes. Close when each has
-    run or is removed from the qualification statement in
-    docs/model-preparation.md.
+[ ] Qualify GLM 5.3 serving above eight concurrent requests. The TP8
+    qualification in model-preparation.md covers eight. Close when a core
+    exported with a higher capacity passes the concurrent serving check.
 
 [ ] Reproduce the scheduler's numerical work allowance for an advisory
     Messages block hint. On a GLM 5.3 TP8 core with measured prefill costs,

@@ -751,24 +751,46 @@ through 2, and no recurrent layers, residual mixing, or vision tower. The
 logical context is 1,048,576 tokens; the default 4096-token prefill chunk
 controls graph execution size independently of that context.
 
-Attention is sparse. An indexer on 21 layers scores every earlier position
-and keeps the 2048 highest-scoring positions for each token; each following
-layer without an indexer attends to the positions kept by the nearest indexer
-layer below it. The indexer quantizes queries and keys to FP8 and computes
-head weights from a BF16 projection. On 674 positions with more than 2048
-candidates in a 2722-token prompt, the layer 6 selection retained 99.07% of
-the FP32 Transformers selection on average and 97.90% in the worst row.
-Only two sets matched exactly. Each other set omitted a strictly higher-scoring
-position. Changing only the selection changed the prepared attention output by
-0.247% in relative L2 norm across those positions. Each cached token holds a
-656-byte latent attention record per layer
+In 21 target layers, each token scores the index keys of its own request
+through its current position and keeps the highest-scoring 2048, or all
+visible positions if fewer. Subsequent layers reuse those positions until
+the next indexer. The indexer quantizes queries and keys to FP8. Its
+head-weight projection uses BF16 checkpoint weights and writes FP32 values.
+The indexer normalizes those values in FP32. Attention reads the selected
+records in ascending logical token order, independent of physical page
+placement. Selection is qualified on eight SM120 GPUs with the FlashInfer
+selector that breaks equal scores by increasing logical position at every
+top-k reduction (commit `661af16ee061af9d21056bbe3ca7db1f5f4bd2aa`).
+The 21 target indexers and the draft indexer passed independent FP8 score
+and cutoff checks on 60,081 prefill and decode rows per 2,722-token prompt.
+Four cutoff exchanges on the long checkpoint fixture fell within their
+individual FP32 accumulation bounds. A second prompt tokenized from the
+speculative decoding and runtime core design documents had exact sets
+throughout. At layer 6, quantizing the index keys and queries changed the
+attention update by 0.236% and 0.273% relative L2 over the 674 rows with
+more than 2048 visible tokens. The matched FP8 reference reproduced every
+selected position on those rows.
+
+Each cached token holds a 656-byte latent attention record per layer
 (512 FP8 latent values, four FP32 scales, and 64 BF16 rotary values) and a
 132-byte index key per indexer layer. Pages hold 256 tokens.
 
-Weights keep the checkpoint's precision: NVFP4 for the routed experts of
-layers 3 through 77, and BF16 for attention, shared experts, dense MLPs,
-embeddings, and the vocabulary head. The NVFP4 experts execute with BF16
-activations.
+To measure the cache tradeoff on another prompt, run
+`python -m ignition.reference.glm_moe_dsa` on the same snapshot, device,
+and JSON array of token IDs under the `token_ids` key. Use a separate
+output file for each `--cache-precision` setting. `bf16` keeps the latent
+cache in BF16, `fp8-latent` rounds the four latent groups at each write,
+and `fp8-latent-index` also quantizes index keys and queries. Keep
+`--expert-activation a16` for all three runs and set `--logit-rows` to
+the prompt length to retain every vocabulary row. These Transformers
+forwards use the same 64-row expert projections in every cache mode.
+With variable projection sizes, changing later tokens' expert assignments
+can change the reduction used for an earlier token. The fixed size keeps
+that effect out of the cache comparison.
+
+The checkpoint supplies NVFP4 weights for the routed experts in layers 3
+through 77 and BF16 weights for attention, shared experts, dense MLPs,
+embeddings, and the vocabulary head. Routed experts use BF16 activations.
 Eight ranks each hold eight of the 64 attention heads, an eighth of each
 expert's intermediate columns, and an eighth of the vocabulary head; the
 embeddings, normalization, low-rank attention inputs, routers, and indexer
@@ -799,16 +821,72 @@ top-p 0.95 to 1.0, so requests cannot select greedy output; top-k is fixed
 off. Prompt log probabilities and images are not prepared. Requests with
 image content are rejected.
 
-Implemented and qualified on eight RTX PRO 6000 Blackwell Max-Q GPUs (SM120,
-96 GB each) at the default capacities: export with compiled forwards with
-and without learned drafts, and serving through `flare run`. A core prepared
-with separate index selections per draft step used 62.96 GiB of fixed data
-on each GPU and had capacity for 613,632 cached tokens and 2268 snapshots.
-On three sampled continuations from that core, ordinary decode re-scored 279 tokens emitted with drafts.
-The mean absolute difference in their pre-sampling log probabilities was
-0.039. This comparison measures scores for tokens already drawn.
-Equivalence of the sampled distributions and agreement of the draft layer
-with an independent implementation are unqualified.
+Serving is qualified on eight RTX PRO 6000 Blackwell Max-Q GPUs (SM120,
+96 GB each) with the two FlashInfer kernel repairs identified in this
+section. Signed exports with and without learned drafts served through
+`flare run` at the default capacities. Each passed five GLM service tests
+and 93 shared protocol tests, and each reproduced the FP32 most-likely token
+on 16 growing prefixes from each of the 24-token `short.pt` and 2,722-token
+`long.pt` fixtures in `FLARE_GLM53_FULL_REFERENCE`. The draft-enabled
+core offered 1050 first-step and 810 second-step learned proposals during
+these checks. Independent arithmetic checks qualify the prepared first and
+recursive draft steps on fixed checkpoint inputs at prefix lengths 2048,
+2049, 2305, and 2561.
+[Draft arithmetic regression](../tests/recipes/test_glm53_full_draft_arithmetic_cuda.py).
+The checks cover cache writes, rotary arithmetic, attention, expert stages,
+normalization, all vocabulary logits, and actual proposal probabilities.
+Wrong preceding state, position, and selection each fail these checks.
+At a 2305-token prefix, changing the Transformers latent cache and index
+operands to matched FP8 changed first-step attention by 1.518% relative
+L2. Flare's attention differed from the BF16 reference by 2.155% and from
+the matched FP8 reference by 1.519%. Cache precision accounts for part of
+the difference. The arithmetic checks also account for query quantization,
+split partials stored in BF16, and the reduction on each stage's inputs.
+
+Target distribution qualification depends on physical decode capacity.
+With the packed expert kernel that assigns reduction boundaries by output
+column (FlashInfer commit `e3c7023a94a59e8951bb87c872a68e350bc33b19`),
+the prepared target produced bitwise-identical watched logits at capacity
+eight when future tokens, an unrelated request, an inactive row, or the
+watched row's slot changed at the start of four three-token intervals.
+The short fixture covers positions 21–23 and the long fixture covers
+254–256, 2,046–2,048, and 2,719–2,721. Ordinary and verification logits
+agreed at all twelve positions when both used capacity eight.
+Ordinary capacity one and verification capacity
+eight differed by up to 0.07225 in total variation before filtering and
+0.07361 with top-p 0.95 at temperature one. Before filtering, Flare's
+distance from BF16 was within the paired Transformers FP8-to-BF16 distance
+on seven of twelve ordinary rows and six of twelve verification rows.
+For every tested token the two widths first differed in one to three
+BF16 outputs of the layer-zero query projection on identical inputs. The
+widths subsequently routed those tokens to different experts. The target
+sampling distributions at these capacities are measurably different.
+
+Across all 2,722 positions of the long prefill fixture, median unfiltered
+total variation was 0.08266 for the independent matched FP8 reference
+versus BF16, 0.08391 for Flare versus BF16, and 0.08740 for Flare versus
+matched FP8. Flare's distance from BF16 was within the quantization
+distance on 1,333 positions. Individual distributions can differ sharply.
+Among the 1,516 positions with a CPU FP32 top-two logit margin of at least
+one, Flare disagreed with the FP32 most-likely token on 29 and the matched
+FP8 reference on 32. Reversing the last 674 input tokens left all 78 layer
+outputs and every vocabulary score bitwise identical through position 2,047
+in both the prepared prefill and the matched FP8 reference.
+
+The repository lockfile selects FlashInfer `598c8547be335bcd833254177ac18ccb2bf4dabc`.
+Reproducing the sparse cutoff and target causal checks requires the FlashInfer
+revision with both the logical-position tie rule and the column-based expert
+reduction described above.
+
+The signed plain core declared 59.662 GiB of fixed device allocations on
+seven ranks and 59.727 GiB on rank five. The draft-enabled core declared
+62.217 GiB on each rank. The resource baselines at the same capacities were
+the signed plain entry `gb202-tp8-202611201311` and draft-enabled entry
+`gb202-tp8-202611201338`. The increases were 18 MiB on seven plain ranks,
+84 MiB on plain rank five, and 12 MiB on each draft rank. These are
+complete export measurements. Both pairs of cores
+have identical cache geometry within each mode. End-to-end comparison with
+a separately running draft inference engine is unqualified.
 
 With the checkpoint's `index_share_for_mtp_iteration` setting enabled,
 the first proposal in a round selects sparse attention records for each

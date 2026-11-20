@@ -54,15 +54,18 @@ VERIFY_ROWS = 8
 CAPACITY = {"short": 32, "long": 1408}
 
 
-def _check_causal_suffix(decoder, place_rows, pool):
+def _check_causal_suffix(decoder, place_rows, pool, runtime, session):
     """One pending token has the same logits with zero or two later verification tokens."""
     metadata = place_rows(3)
     pages = [*pool.pages.values(), pool.backing]
     snapshot = [page.clone() for page in pages]
     tokens = metadata.token_ids.clone()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    stream = torch.cuda.Stream(device=tokens.device)
+    stream.wait_stream(torch.cuda.current_stream(tokens.device))
+    with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(graph, stream=stream):
         _, logits, _, _ = decoder(metadata)
+    torch.cuda.current_stream(tokens.device).wait_stream(stream)
 
     def replay(inputs):
         for page, saved in zip(pages, snapshot, strict=True):
@@ -251,7 +254,7 @@ def _rank(rank, world, rendezvous, snapshot, reference, layers, sequences, outpu
                 for first in range(0, start, capacity):
                     decoders[name](place(name, first, min(first + capacity, start), token_ids))
                 _check_causal_suffix(decoders["verify"],
-                    lambda count: place("verify", start, start + count, token_ids), pool)
+                    lambda count: place("verify", start, start + count, token_ids), pool, runtime, session)
         session.freeze()
     dist.barrier(group=group)
     if rank == 0:
