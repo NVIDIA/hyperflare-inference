@@ -1338,8 +1338,8 @@ keys it does not use, except in `[prefix_cache]`, where it accepts only `memory`
 `[models.<alias>]` overrides `[defaults]`; flags override both.
 Both sections accept `speculative_token_capacity`, overridden during preparation
 by `--speculative-token-capacity`. Omitting it uses the recipe declaration when
-supplied: Muse Spark declares 32 target rows and every other speculative recipe
-except Gemma 4 declares 128.
+supplied: Muse Spark declares 32 target rows, Inkling 2 Mini declares 64, and
+every other speculative recipe except Gemma 4 declares 128.
 Gemma 4 derives the larger of padded concurrency and draft count plus one,
 giving six rows at its defaults.
 Both sections also accept positive integer `speculative_graph_budget`, overridden

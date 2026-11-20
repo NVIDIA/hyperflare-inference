@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare Inkling 2 text, vision and complete DSpark generation graphs on four GPUs, on one host or across four hosts."""
+"""Prepare Inkling 2 text, vision and complete DSpark generation graphs."""
 
 import contextlib
 import hashlib
@@ -36,7 +36,7 @@ from ignition.preparation.tuning import RecordedPreparationSession, with_autotun
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
-from .config import WORLD_SIZE, ModelConfig
+from .config import ModelConfig
 from .contract import prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch
 from .weights import ModelWeights
@@ -65,13 +65,15 @@ class PreparationConfig(BasePreparationConfig):
     speculative_graph_budget: int = 64
     benchmark_selection: object | None = None
 
+    world_size = 4
+
     def __post_init__(self):
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
-        if (not isinstance(self.devices, tuple) or len(self.devices) != WORLD_SIZE
-                or len(set(placements)) != WORLD_SIZE
-                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != WORLD_SIZE)
+        if (not isinstance(self.devices, tuple) or len(self.devices) != self.world_size
+                or len(set(placements)) != len(self.devices)
+                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
                 or any(type(d) is not int or d < 0 for d in self.devices)):
-            raise ValueError("Inkling 2 preparation requires four distinct GPUs")
+            raise ValueError(f"Inkling 2 preparation requires {self.world_size} distinct GPUs")
         validate_host_topology(self.roce_ring, self.roce_chain, self.hosts)
         request_capacity(self.max_active)
         if not 1 <= self.max_active <= 32:
@@ -117,6 +119,10 @@ class PreparationConfig(BasePreparationConfig):
         return max((b * w for b, w, _ in self.speculative_round_shapes), default=request_capacity(self.max_active))
 
 
+class MiniPreparationConfig(PreparationConfig):
+    world_size = 1
+
+
 def _logit_gather_bytes(rows, width):
     """Per-rank bytes of an FP32 `[rows, width]` vocabulary-shard gather."""
     return rows * width * 4
@@ -131,6 +137,8 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, hi
     log-probability channels are None without drafting.
     """
     slots, world = request_capacity(config.max_active), len(config.devices)
+    if world == 1:
+        return None, None, None, None
     tokens = max(config.prefill_chunk_size, config.decode_tokens)
     vocabulary_rows = max(config.decode_samples, slots)
     if coordinator.spans_hosts:
@@ -181,7 +189,7 @@ class InklingResume(PreparedResume):
 @with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     from .frontend import prepare as prepare_frontend, runtime_assets
-    from .recipe import RECIPE
+    from .recipe import RECIPE, MINI_RECIPE
 
     snapshot = Path(snapshot).resolve()
     world = len(config.devices)
@@ -195,8 +203,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         headers = [entry.header_sha256 for entry in manifest.shards]
         model = ModelConfig.load(snapshot)
         model.validate_shard(shard)
+        recipe = MINI_RECIPE if model.text.loop is not None else RECIPE
+        decoder_type = PreparedDecoder
+        if model.text.loop is not None:
+            from .mini_decoder import PreparedLoopDecoder
+            decoder_type = PreparedLoopDecoder
     # Continuation rows and pages hold the prepared layers only.
-    text = model.text if config.decoder_layers is None else model.text.prefix(config.decoder_layers)
+    text = (model.text if config.decoder_layers is None else model.text.prefix(config.decoder_layers)).cache_config
     if not text.global_layers:
         raise ValueError("a decoder-layer prefix must include a global-attention layer, whose K/V use pages")
     with phase(progress, "Load weights"):
@@ -237,7 +250,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         width = max((w for _, w, _ in config.speculative_round_shapes), default=1)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + width), device=device)
-        coordinator = CollectivePreparation(group)
+        coordinator = CollectivePreparation(group) if group is not None else None
         runtime, vocabulary_runtime, sampling_runtime, logprob_runtime = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
             hidden=text.hidden, local_vocabulary=weights.head.shape[0],
@@ -286,7 +299,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     speculation = None
     if config.drafting:
         from .dspark import SpeculativePreparation
-        speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, decoder=PreparedDecoder,
+        speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, decoder=decoder_type,
             completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
             collectives=collectives, draft_tokens=config.draft_tokens, sampling_runtime=sampling_runtime,
             logprob_runtime=logprob_runtime)
@@ -306,7 +319,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                     name = f"{mode}{capacity}" + (suffix if mode == "prefill" else "")
                     m = Metadata.allocate(capacity, rows, blocks, device)
                     storage = prefill_storage if mode == "prefill" else decode_storage
-                    decoder = PreparedDecoder(mode_weights, None, storage.rows(capacity, rows), m, pool,
+                    decoder = decoder_type(mode_weights, None, storage.rows(capacity, rows), m, pool,
                         mode=mode, session=session, workspace=arena, name=name, **collectives)
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and vision_state else None)
@@ -345,9 +358,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             from .vision_state import PreparedVisionGeneration
             raw = json.loads((snapshot / "config.json").read_text())
             with torch.device("meta"):
-                module = Inkling2VisionModel(Inkling2VisionConfig.from_dict(raw["vision_config"]))
+                module = Inkling2VisionModel(Inkling2VisionConfig.from_dict(
+                    raw["vision_config"], **(dict(text_hidden_size=model.text.hidden) if model.text.loop is not None else {})))
             name = f"vision{capacity}"
-            encoder = PreparedVision(module, VisionScratch.allocate(capacity, device),
+            encoder = PreparedVision(module, VisionScratch.allocate(capacity, device, hidden=model.text.hidden),
                 VisionMetadata.allocate(capacity, 1, device), weights.vision,
                 session=session, name=name, projection_workspace=arena, attention_workspace=arena)
             encoder.functional(session=session)
@@ -370,10 +384,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
     release_unused()
-    server_config = dict(identity=identity, model_id=RECIPE.served_model_name, max_sequence_tokens=config.context,
+    server_config = dict(identity=identity, model_id=recipe.served_model_name, max_sequence_tokens=config.context,
         prefill_chunk_size=config.prefill_chunk_size, pages=pages, state_rows=state_rows, snapshots=snapshots,
         page_tokens=PAGE_TOKENS, frontend=prepare_frontend(snapshot, vision=config.vision), assets=runtime_assets(snapshot),
-        sampling_defaults=RECIPE.sampling_defaults.as_dict(),
+        sampling_defaults=recipe.sampling_defaults.as_dict(),
         model_contract=prepare_contract(signatures, buffers, pool, vocabulary=vocabulary,
             image_slots=config.image_concurrency, vision=config.vision, drafting=config.drafting))
     if config.drafting:

@@ -35,8 +35,9 @@ def recipes() -> tuple[Recipe, ...]:
     from .minimax_m3.recipe import RECIPE as minimax_m3
     from .muse_spark.recipe import RECIPE as muse_spark
     from .inkling2.recipe import RECIPE as inkling2
+    from .inkling2.recipe import MINI_RECIPE as inkling2_mini
 
-    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, mimo_v2, kimi3, kimi31, step5, nemotron_h, minimax_m3, gemma4, muse_spark, inkling2
+    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, mimo_v2, kimi3, kimi31, step5, nemotron_h, minimax_m3, gemma4, muse_spark, inkling2_mini, inkling2
 
 
 def snapshot_directory(hub_cache: Path, checkpoint: Checkpoint) -> Path:
@@ -152,12 +153,14 @@ def _unsupported(reason: str) -> UsageError:
 
 def _supporting(config_path: Path, source: str) -> tuple[Recipe, Checkpoint]:
     try:
-        architectures = json.loads(config_path.read_text())["architectures"]
+        config = json.loads(config_path.read_text())
+        architectures = config["architectures"]
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise _unsupported(f"{source} has no readable config.json architecture") from error
     for recipe in recipes():
         for checkpoint in recipe.checkpoints:
-            if isinstance(architectures, list) and checkpoint.architecture in architectures:
+            if (isinstance(architectures, list) and checkpoint.architecture in architectures
+                    and (not checkpoint.model_type or checkpoint.model_type == config.get("model_type"))):
                 return recipe, checkpoint
     raise _unsupported(f"no recipe supports architecture {architectures!r} in {source}")
 

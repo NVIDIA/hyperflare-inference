@@ -40,9 +40,11 @@ class Columns:
     streams: tuple[tuple[tuple[str, int], ...], ...]
 
     @classmethod
-    def of(cls, local, heads, kv_heads, dim, width):
+    def of(cls, local, heads, kv_heads, dim, width, separate_inputs=False):
         query = (("query", heads * dim), ("gate", heads * dim))
         relative = (("relative", heads * RELATIVE_RANK), ("sink", heads))
+        if local and separate_inputs:
+            return cls(((*query, *relative), (("key", kv_heads * dim),), (("value", kv_heads * dim),)))
         if local:
             return cls(((*query, ("key", kv_heads * dim), ("value", kv_heads * dim), *relative),))
         return cls(((*query, *relative), (("key", kv_heads * dim), ("key_lags", kv_heads * width)),
@@ -105,11 +107,11 @@ def fuse_projections(placed, columns: Columns, *, local):
     return tuple(fused)
 
 
-def attention_weights(placed, *, local, heads, kv_heads, dim, width):
+def attention_weights(placed, *, local, heads, kv_heads, dim, width, separate_inputs=False):
     """Serving attention tensors from one rank's placed checkpoint roles (`weights.checkpoint_layout`)."""
     from ignition.preparation.persistent import persistent_copy
 
-    columns = Columns.of(local, heads, kv_heads, dim, width)
+    columns = Columns.of(local, heads, kv_heads, dim, width, separate_inputs)
     projection = placed["relative_projection"]
     if local:
         key, value = placed["key_convolution"], placed["value_convolution"]
@@ -183,7 +185,8 @@ class PreparedAttention(torch.nn.Module):
         self.local = text.local(layer)
         self.heads, self.kv_heads, self.dim = weights.query_clip_scale.shape[0], cache.key.shape[2], text.head_dim
         self.window, self.ring = text.window, text.window + PAGE_TOKENS
-        self.columns = Columns.of(self.local, self.heads, self.kv_heads, self.dim, text.convolution_width)
+        self.columns = Columns.of(self.local, self.heads, self.kv_heads, self.dim, text.convolution_width,
+                                  separate_inputs=len(weights.projections) == 3)
         self.weights = weights
         self.key_convolution = PreparedCausalConvolution(weights.key_convolution, cache.key_history,
             dynamic_heads=0 if self.local else self.kv_heads)

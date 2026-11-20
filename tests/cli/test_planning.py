@@ -329,6 +329,7 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     if expected is None:
         expected = ((4, 4096, 6) if model.recipe.name == "gemma4" else
                     (4, 4096, 32) if model.recipe.name == "muse_spark" else
+                    (8, 8192, 64) if model.recipe.name == "inkling2_mini" else
                     (8, 4096, 128) if model.recipe.name == "inkling2" else (32, 4096, 128))
     args = _parser().parse_args(["export", model.checkpoint.alias, *flags])
     selected = preparation.speculation(args, model, configuration)
@@ -832,7 +833,7 @@ def test_collective_tuning_plan_recipe_default_and_override(mode):
 def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_path, recipe, mode):
     from importlib import import_module
 
-    bootstrap_name = "kimi3" if recipe.name == "kimi31" else recipe.name
+    bootstrap_name = {"kimi31": "kimi3", "inkling2_mini": "inkling2"}.get(recipe.name, recipe.name)
     bootstrap = import_module(f"ignition.recipes.{bootstrap_name}.bootstrap")
     assert recipe.collective_tuning == "static"
     assert bootstrap.PreparationConfig.__dataclass_fields__["collective_tuning"].default == "static"
@@ -1006,7 +1007,7 @@ def test_every_recipe_inherits_base_config_and_forwards_shared_plan_fields(monke
     from importlib import import_module
     from ignition.preparation.bootstrap import BasePreparationConfig
 
-    bootstrap_name = "kimi3" if recipe.name == "kimi31" else recipe.name
+    bootstrap_name = {"kimi31": "kimi3", "inkling2_mini": "inkling2"}.get(recipe.name, recipe.name)
     bootstrap = import_module(f"ignition.recipes.{bootstrap_name}.bootstrap")
     assert issubclass(bootstrap.PreparationConfig, BasePreparationConfig)
 

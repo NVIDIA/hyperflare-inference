@@ -1536,6 +1536,159 @@ preparation after the multi-host changes or at 32 concurrent requests,
 effort-zero tests on Sparks, `--roce-ring`, `--roce-chain`, and a numerical
 comparison of BF16 cross-host reductions against single-host FP32 output.
 
+## Inkling 2 Mini
+
+The `inkling-2-mini` alias selects
+[`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7)
+at revision `ed40e7da625f594fc9c4990f5f66be24873c22d7`.
+The public checkpoint declares `Inkling2LoopForConditionalGeneration` and
+`model_type: inkling2_loop`. Preparation also accepts local directories with
+that model type and either `Inkling2LoopForConditionalGeneration` or
+`Inkling2ForConditionalGeneration`; `inkling-2-mini-local` names
+`/data/models/Inkling-2-Mini` with the latter architecture.
+Mini reads its per-layer NVFP4/MXFP8 formats from `hf_quant_config.json`.
+The recipe requires one SM120 or SM121 GPU and prepares text,
+vision, and the bundled DSpark drafter. `--language-model-only` omits vision;
+`--no-mtp` omits drafting.
+
+Mini stores 24 target layers. Layers 6 through 17 execute three times, for 48
+layer visits. Each visit owns separate KV and short-convolution histories in
+the continuation contract. Every repeated core pass starts from the prelude's
+residual state and blends messages from the previous pass through the stored
+low-rank controllers. Prefix restore therefore restores all three passes'
+histories. The Rust runtime uses the existing continuation and paged-KV storage
+contracts.
+
+The vision encoder retains its BF16 weights and projects merged patches to
+Mini's 2304-channel text width. DSpark retains the three-layer BF16 sidecar,
+mixes target taps at unfolded visits 5, 23, 41, and the final normalized output,
+and proposes up to seven tokens. Draft KV and recurrent context are part of
+the shared continuation contract. Mixed exports include both speculative and
+plain graphs, selected at load with `--mtp-draft-tokens 7` or
+`--mtp-draft-tokens 0`.
+
+Expert layers 0 through 19 retain NVFP4 weights and four-or-six activation
+quantization with complete per-token maxima. Layers 20 through 23 retain
+MXFP8 weights and nearest E4M3 activations with upward-rounded UE8M0 block
+scales. Both formats apply route weights before intermediate BF16 rounding
+and quantization. Attention, dense projections, and routing use prepared
+FlashInfer/b12x operations; the expert arithmetic is prepared Triton code.
+All kernels are captured before export and replay without Python in Helios.
+
+Export the pinned release and serve it on a Spark:
+
+```sh
+.venv/bin/ignition export inkling-2-mini --gpus 0 \
+  --max-concurrency 4 --prefill-chunk-size 8192 --autotune-effort off \
+  --speculative-graph-budget 6 --compile-workers 2
+flare-cli/target/release/flare run CACHE_ENTRY --gpus 0 \
+  --memory-limit 36G --prefix-cache-memory 2G --embedding-table-storage ram \
+  --mtp-draft-tokens 7 --no-mtp-adaptive-verification
+```
+
+`CACHE_ENTRY` is the path printed by export. The recipe declares a
+1,048,576-token logical context; available shared cache memory also bounds
+admission. Mini's sampling defaults are temperature 1, top-p 1, no top-k
+filter, and neutral penalties. TMLv0 prompt encoding defaults to reasoning
+effort 0.9.
+
+On one GB10 SM121 GPU, a 64-graph native core with concurrency 4, 8192-token
+prefill chunks, a six-graph packed verification budget, and autotuning disabled
+passes all six service tests with drafting disabled and with seven fixed drafts.
+The tests cover text, streamed reasoning, tools, request isolation, prefix restore
+and branching above 8192 tokens, four ordered images across a prefill boundary,
+image-prefix reuse, and four concurrent image requests. Fixed-depth drafting
+accepts proposed tokens; plain decoding reports zero draft rounds. Adaptive
+selection passes the five text, tool, image, and cache tests and accepts drafts
+over the suite. Its per-request draft-count assertion is omitted because the
+scheduler can choose plain decoding for an individual request.
+The lookup test scales its output allowance with prefill capacity so reasoning
+can inspect the record list before natural EOS. The image-prefix test first
+captures a long system-message anchor to calibrate prefill and snapshot costs,
+then requires retention of the image prompt's endpoint. Sequential and concurrent
+image requests both allow 2048 output tokens and require natural EOS.
+
+Snapshot and branch-restore tests preserve every visit's state bytes exactly at
+consumed endpoints 127, 128, 129, 1025, 4122, 8191, 8192, and 8193, with stable CUDA
+allocator counters. DSpark checks cover compiled checkpoint save/restore,
+accepted-context updates, recurrent proposal distributions, and combined target
+and draft snapshot transfers. The scheduler's timing probes can change decode
+capacity within a request, so seeded complete generations can differ across
+requests. At identical token-ID prefixes, compiled native Flare and vLLM select
+the same highest-probability token for 15 short prefixes and 14 prefixes between
+8259 and 8515 tokens. The maximum top-token log-probability differences are
+0.0615 and 0.303, respectively; the long prefixes include reasoning transitions.
+
+NVFP4 and MXFP8 expert checks cover 1, 4, 8, 32, 128, 4096, and 8192 tokens.
+The six-shape synthetic benchmark through 8192 rows differs from independent
+vLLM expert fixtures by at most 3.93e-7 relative L2. Changed-input CUDA graph
+replay and compiled-forward save/restore pass for both formats.
+
+On GB10, Mini vision passes native replay for uncompiled, traced, and AOT
+forwards at patch capacities 64 and 256, including padded inputs, publication
+of image features, and invalid-upload rejection. Independent vLLM features
+for five image sizes from 1×1 to 640×320 differ by at most 0.0326 relative L2.
+On the same images, vLLM differs from canonical Transformers eager attention
+by at most 0.0352; Flare differs by at most 0.0312. Tests retain the vision
+suite's canonical-backend spread bounds and exact replay checks.
+
+Run checkpoint and service qualification separately:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 \
+FLARE_INKLING2_MINI_SNAPSHOT=/data/models/Inkling-2-Mini \
+FLARE_INKLING2_MINI_REFERENCE=/tmp/mini-experts-reference.safetensors \
+  .venv/bin/python -m pytest tests/recipes/test_inkling2_mini.py -q
+FLARE_INKLING2_MINI_TEST_URL=http://127.0.0.1:8000 \
+FLARE_INKLING2_MINI_TEST_DRAFTS=7 \
+  .venv/bin/python -m pytest tests/server/test_inkling2_mini.py -q
+```
+
+Generate the expert reference file in the vLLM environment containing the
+Inkling 2 implementation:
+
+```sh
+python qualify/inkling2_mini_reference.py --checkpoint /data/models/Inkling-2-Mini \
+  --output /tmp/mini-experts-reference.safetensors
+```
+
+The service test requires
+an exported core running through `flare run` with prefix-cache retention enabled.
+For the draft-acceptance check, serve with `--mtp-draft-tokens 7
+--no-mtp-adaptive-verification`, or set the test variable to `0` and serve
+with `--mtp-draft-tokens 0`. Omit the draft-count test variable when checking
+adaptive selection.
+`qualify/inkling2_mini_logits.py` collects next-token probabilities for the same
+JSON list of token-ID prefixes on either server, independently of chat rendering.
+Generate independent vision features with `qualify/inkling2_mini_vision_reference.py`
+in the vLLM environment. Set `FLARE_INKLING2_MINI_VISION_REFERENCE` to its
+output and run `tests/recipes/test_inkling2_vision.py`. Native replay tests
+require the Heliopause `qualification` Cargo feature. The draft and cache
+checks are in `tests/components/test_inkling2_dspark_cuda.py` and
+`tests/recipes/test_inkling2_mini.py` with the Mini snapshot variable above.
+
+For expert-kernel iteration, run the component benchmark without preparing a
+model catalog or exporting a core:
+
+```sh
+.venv/bin/python scripts/benchmark_inkling2_mini_experts.py \
+  --snapshot /data/models/Inkling-2-Mini --layers 0 20 \
+  --rows 1 4 8 32 128 8192 --seeds 0 1 2 --output /tmp/mini-experts.jsonl
+```
+
+The benchmark loads one layer at a time, uses seeded Gaussian BF16 activations,
+and selects routes through checkpoint router weights outside timing. CUDA event
+samples cover route packing, activation quantization, the two expert projections,
+route-weighted SiTU, and the expert sum. Each sample starts with a cold L2 cache.
+Repeated replay must preserve outputs and CUDA allocator counters. Add
+`--reference PATH` to compare each selected layer and shape with fixtures from
+`qualify/inkling2_mini_reference.py`; its `--rows` must include every benchmark
+shape. Add `--compile` to compile only the expert operation with Inductor.
+The default captures direct Triton launches and PyTorch reductions. Neither mode
+measures attention, drafting, complete decoder rounds, or service throughput.
+`--autotune-effort` selects b12x tuning during model preparation; Mini's custom
+expert Triton configurations require separate measurement and numerical checks.
+
 ## Muse Spark Open
 
 The `muse-spark-open-nvfp4` alias selects

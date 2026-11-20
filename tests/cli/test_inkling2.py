@@ -1,16 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inkling preparation preserves the declared TP4 and DSpark capacities."""
+"""Inkling checkpoint resolution and declared preparation capacities."""
 
 from dataclasses import replace
+import json
 
 import pytest
 
 from ignition.cli import _parser, preparation
-from ignition.recipes import ResolvedModel
-from ignition.recipes.inkling2.recipe import RECIPE
+from ignition.recipes import ResolvedModel, resolve
+from ignition.recipes.inkling2.recipe import RECIPE, MINI_RECIPE
 from tests.cli.test_planning import derive, gpu
+
+
+@pytest.mark.parametrize("architecture", ["Inkling2ForConditionalGeneration", "Inkling2LoopForConditionalGeneration"])
+def test_mini_directory_resolves_loop_architectures(tmp_path, architecture):
+    (tmp_path / "config.json").write_text(json.dumps({
+        "architectures": [architecture], "model_type": "inkling2_loop"}))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": MINI_RECIPE.checkpoints[0].stored_bytes}}))
+    model = resolve(str(tmp_path))
+    assert model.recipe is MINI_RECIPE
+    assert model.recipe.tensor_parallel == (1,)
+    assert model.recipe.speculation.draft_tokens == 7
+    assert model.recipe.max_images == 4
+    assert (model.recipe.max_concurrency, model.recipe.prefill_chunk,
+            model.recipe.speculation.token_capacity) == (8, 8192, 64)
+
+
+def test_small_directory_retains_its_recipe(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({
+        "architectures": ["Inkling2ForConditionalGeneration"], "model_type": "inkling2"}))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": RECIPE.checkpoints[0].stored_bytes}}))
+    assert resolve(str(tmp_path)).recipe is RECIPE
 
 
 def test_inkling_defaults_cover_tp4_seven_drafts_and_vision():

@@ -95,6 +95,8 @@ class Checkpoint:
     plain_ranks: Mapping[int, "RankCosts"] | None = None
     # API model name advertised for this checkpoint; empty uses the recipe's `served_model_name`.
     served_model_name: str = ""
+    # Disambiguates checkpoints that retain an architecture name across model variants.
+    model_type: str = ""
 
 
 @dataclass(frozen=True)
