@@ -324,3 +324,21 @@ def test_reference_execution_configuration_and_planning_costs(options, snapshot,
                          reserve_bytes=0, speculation=recipe.speculation, prefill_chunk=8192)
     assert plan.live_rows == 1 + request_capacity(16)
     assert plan.context == 262144
+
+
+def test_reference_sm103_admits_quantized_draft_and_markov_heads(options, tmp_path):
+    reference = SM103Config(options.placements, host_lane_clusters=4, execution="reference", context=262144)
+    for draft_q in (None, "nvfp4", "mxfp8"):
+        for markov_q in (None, "fp8"):
+            cfg = PreparationConfig(
+                devices=(0,), sm103=reference, kernel_cache=tmp_path,
+                draft_head_quantization=draft_q, markov_head_quantization=markov_q,
+            )
+            assert cfg.draft_head_quantization == draft_q
+            assert cfg.markov_head_quantization == markov_q
+    with pytest.raises(ValueError, match="Markov head quantization"):
+        PreparationConfig(devices=(0,), sm103=reference, kernel_cache=tmp_path,
+                          markov_head_quantization="nvfp4")
+    with pytest.raises(ValueError, match="vocabulary-parallel"):
+        PreparationConfig(devices=(0,), sm103=reference, kernel_cache=tmp_path,
+                          vocabulary_parallel_sampling=True)

@@ -56,9 +56,11 @@ class ReferenceGeneration:
         self.sampling.functional(session=session)
         batch.functional()
 
-    def with_routing_trace(self, trace):
+    def with_routing_trace(self, trace, *, stream=None, routes_buffer=None, valid_buffer=None):
         traced = copy(self)
-        traced.model = self.model.with_routing_trace(trace)
+        traced.model = self.model.with_routing_trace(trace, stream=stream,
+                                                     routes_buffer=routes_buffer,
+                                                     valid_buffer=valid_buffer)
         return traced
 
     def __call__(self):
@@ -133,9 +135,11 @@ class ReferencePrefill:
         self.completion.prepare()
         batch.functional()
 
-    def with_routing_trace(self, trace):
+    def with_routing_trace(self, trace, *, stream=None, routes_buffer=None, valid_buffer=None):
         traced = copy(self)
-        traced.model = self.model.with_routing_trace(trace)
+        traced.model = self.model.with_routing_trace(trace, stream=stream,
+                                                     routes_buffer=routes_buffer,
+                                                     valid_buffer=valid_buffer)
         return traced
 
     def __call__(self):

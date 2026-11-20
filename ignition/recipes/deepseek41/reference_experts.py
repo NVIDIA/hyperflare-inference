@@ -144,11 +144,12 @@ class ReferenceExperts(nn.Module):
             raise ValueError(f"reference experts have no prepared operation for {rows} rows")
         return self.operations[rows]
 
-    def with_routing_trace(self, trace, layer):
+    def with_routing_trace(self, trace, layer, *, stream=None, routes_buffer=None, valid_buffer=None):
         """Return a read-only traced view recording canonical expert IDs."""
         if trace is None:
             raise ValueError("routing instrumentation requires a prepared trace")
-        return TracedReferenceExperts(self, trace, layer)
+        return TracedReferenceExperts(self, trace, layer, stream=stream,
+                                      routes_buffer=routes_buffer, valid_buffer=valid_buffer)
 
     def fused_norm_cast_kwargs(self, num_tokens):
         x, sf, _, _, shared_sf, block_m = self._operation(num_tokens).encoded_inputs()
@@ -174,11 +175,18 @@ class ReferenceExperts(nn.Module):
 class TracedReferenceExperts(nn.Module):
     """Record canonical expert demand beside an immutable ReferenceExperts binding."""
 
-    def __init__(self, base, trace, layer):
+    def __init__(self, base, trace, layer, *, stream=None, routes_buffer=None, valid_buffer=None):
         super().__init__()
-        top_k = next(iter(base.operations.values())).workspace.geometry.top_k
+        first_op = next(iter(base.operations.values()))
+        top_k = first_op.workspace.geometry.top_k
+        ids_dtype = first_op.encoded_inputs()[2].dtype
         self.__dict__["base"] = base
-        self.counters = {rows: trace.functional_counter(layer, rows, top_k) for rows in base.operations}
+        self.counters = {rows: trace.functional_counter(layer, rows, top_k, dtype=ids_dtype)
+                         for rows in base.operations}
+        self._async_trace = stream is not None
+        self.stream_handle = 0 if stream is None else stream.cuda_stream
+        self._routes_buffer = routes_buffer
+        self._valid_buffer = valid_buffer
 
     def fused_norm_cast_kwargs(self, num_tokens):
         return self.base.fused_norm_cast_kwargs(num_tokens)
@@ -191,14 +199,31 @@ class TracedReferenceExperts(nn.Module):
         image_mask = getattr(input_metadata, "images_seq_mask", None)
         if image_mask is not None and base.image_bias is None:
             raise ValueError("image routing requires the checkpoint image bias")
-        routes = torch.empty_like(ids)
+        if self._async_trace and self._routes_buffer is not None:
+            routes = self._routes_buffer[:rows]
+        else:
+            routes = torch.empty_like(ids)
         _traced_gate(hidden_states_bf16, base.weight, base.bias, base.image_bias,
                      input_metadata.valid_token_mask, image_mask, base.placement, base.counts,
                      ids, probabilities, routes, base.scaling)
-        valid_tokens = getattr(input_metadata, "valid_token_count", None)
-        if valid_tokens is None:
-            valid_tokens = input_metadata.valid_token_mask.sum(dtype=torch.int32).reshape(1)
-        self.counters[rows](routes, valid_tokens)
+        stream_handle = self.stream_handle if self._async_trace else None
+        if self._async_trace:
+            valid_tokens = getattr(input_metadata, "_trace_valid_buffer", None)
+            if valid_tokens is None:
+                source = getattr(input_metadata, "valid_token_count", None)
+                if source is None:
+                    source = input_metadata.valid_token_mask.sum(dtype=torch.int32).reshape(1)
+                if self._valid_buffer is not None:
+                    self._valid_buffer.copy_(source)
+                    valid_tokens = self._valid_buffer
+                else:
+                    valid_tokens = source
+                    stream_handle = None
+        else:
+            valid_tokens = getattr(input_metadata, "valid_token_count", None)
+            if valid_tokens is None:
+                valid_tokens = input_metadata.valid_token_mask.sum(dtype=torch.int32).reshape(1)
+        self.counters[rows](routes, valid_tokens, stream_handle=stream_handle)
         return op.encoded(hidden_states_bf16, hidden_states, staged=expert_stage)
 
 

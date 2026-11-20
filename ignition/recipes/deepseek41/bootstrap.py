@@ -192,10 +192,12 @@ class PreparationConfig:
                 raise ValueError("reference SM103 preparation does not support --prompt-logprobs")
             if self.joint_tuning:
                 raise ValueError("reference SM103 preparation does not support --joint-tuning")
-            if (self.draft_head_quantization is not None
-                    or self.markov_head_quantization is not None
-                    or self.vocabulary_parallel_sampling):
-                raise ValueError("reference SM103 preparation uses checkpoint head formats on one GPU")
+            if self.vocabulary_parallel_sampling:
+                raise ValueError("reference SM103 preparation does not support vocabulary-parallel sampling on one GPU")
+            if self.draft_head_quantization not in (None, "nvfp4", "mxfp8"):
+                raise ValueError("reference SM103 draft head quantization must be None, 'nvfp4', or 'mxfp8'")
+            if self.markov_head_quantization not in (None, "fp8"):
+                raise ValueError("reference SM103 Markov head quantization must be None or 'fp8'")
         worlds = (1,) if self.sm103 is not None else (3, 4, 6)
         if (not isinstance(self.devices, tuple) or len(self.devices) not in worlds
                 or len(set(placements)) != len(self.devices)
@@ -357,6 +359,24 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
     return collective, prefill, vocabulary, result, draft_vocabulary
 
 
+def _bind_reference_draft_heads(model, config):
+    if model.draft is None or (config.draft_head_quantization is None and config.markov_head_quantization is None):
+        return
+    if model.draft_head is not None or model.markov_head is not None:
+        return
+    from ignition.components.markov_sampling import fp8_markov_head
+    from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
+
+    draft_head = None
+    if config.draft_head_quantization == "nvfp4":
+        draft_head = nvfp4_draft_head(model.lm_head.weight)
+    elif config.draft_head_quantization == "mxfp8":
+        draft_head = mxfp8_draft_head(model.lm_head.weight)
+    markov_head = (fp8_markov_head(model.draft.markov_w2.weight)
+                   if config.markov_head_quantization == "fp8" else None)
+    model.bind_draft_heads(draft_head=draft_head, markov_head=markov_head)
+
+
 def _prepare_reference_rank(snapshot, config, *, rank, group, progress=None, core_storage=None):
     import gc
     from deepinfer.model_executor.execution_settings import ExecutionSettings
@@ -456,6 +476,7 @@ def _prepare_reference_rank(snapshot, config, *, rank, group, progress=None, cor
                 context=config.context, request_capacity=config.request_capacity,
                 prefill_tokens=config.prefill_chunk_size, verification_tokens=verification_samples,
                 yoco_keep_tokens=yoco_keep_tokens)
+            _bind_reference_draft_heads(model, config)
             del parameters
             gc.collect()
             release_unused()
@@ -492,6 +513,17 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
 
     transient = contextlib.ExitStack()
     transient.enter_context(core_storage.transient())
+    _bind_reference_draft_heads(model, config)
+    target_small_rows = sorted({
+        *(r for r in config.batch_capacities if r <= 8),
+        *(b for b, _ in config.speculative_shapes if b <= 8),
+        *(t for _, _, t in config.packed_speculative_depth_shapes if t <= 8),
+    })
+    draft_small_rows = sorted({
+        b * (w - 1) for b, w, _ in config.packed_speculative_depth_shapes if 1 <= b * (w - 1) <= 8
+    })
+    model.bind_low_latency_fp8_projections(
+        target_rows=target_small_rows, draft_rows=draft_small_rows, session=session)
     with phase(progress, "Allocate reference model state"):
         verification_width = max(config.speculative_widths) if dspark_loaded else 1
         geometry = ReferenceCacheLayout.from_config(model.cfg, verification_width=verification_width,
@@ -548,7 +580,7 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             for index in range(len(model.model.layers))
             if experts.weights[f"layers.{index}.ffn"].host_tier is not None)
         buffers.update(row_buffers)
-        routing_trace = None
+        routing_trace = trace_stream = trace_routes = trace_valid = None
         if config.parallax_routing:
             from ignition.components.routing_trace import BUFFER, RoutingTrace
 
@@ -561,6 +593,17 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
                                        dtype=torch.int64, device=device)
             buffers[BUFFER] = route_output
             routing_trace = RoutingTrace(route_output, frame, sequence)
+            if config.stream_overlap:
+                trace_stream = torch.cuda.Stream(device=device)
+                first_ops = experts.modules["layers.0.ffn"].operations
+                first_op = next(iter(first_ops.values()))
+                max_trace_tokens = max(first_ops)
+                top_k = first_op.workspace.geometry.top_k
+                ids_dtype = first_op.encoded_inputs()[2].dtype
+                trace_routes = torch.zeros((len(model.model.layers), max_trace_tokens, top_k),
+                                           dtype=ids_dtype, device=device)
+                trace_valid = torch.zeros((len(model.model.layers), 1),
+                                          dtype=torch.int32, device=device)
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
 
@@ -607,7 +650,9 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             nonlocal catalog_previous
             variants = [(name, forward, False)]
             if routing_trace is not None and kind in ("decode", "prefill", "terminal_prefill", "speculative"):
-                variants.append((name + "-parallax", forward.with_routing_trace(routing_trace), True))
+                variants.append((name + "-parallax", forward.with_routing_trace(
+                    routing_trace, stream=trace_stream, routes_buffer=trace_routes,
+                    valid_buffer=trace_valid), True))
             for graph_name, operation, traced in variants:
                 forwards[graph_name] = operation
                 signatures[graph_name] = GraphSignature(kind, rows, tokens, tuple(fields),
@@ -665,7 +710,7 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
                     mode="decode", shard=shard, pool=pool, verification_width=1)
                 forward = ReferenceSpeculation(model, batch_op, history, completion, frame, sequence,
                     rng=rng, proposal_generation=proposal_generation, proposal_offset=proposal_offset,
-                    session=session)
+                    session=session, workspace=arena)
                 add(name, forward, "speculative", batch, 1, forward_inputs, enabled=True)
             for batch, logical_width, packed_tokens in sorted(config.packed_speculative_depth_shapes,
                     key=lambda shape: (shape[2], shape[0], shape[1]), reverse=True):
@@ -676,7 +721,7 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
                 forward = ReferenceSpeculation(model, batch_op, history, completion, frame, sequence,
                     rng=rng, proposal_generation=proposal_generation, proposal_offset=proposal_offset,
                     session=session, prefix_limits=prefix_limits, confidence_output=confidence.device_view,
-                    target_token_capacity=packed_tokens, transaction=shared_transaction)
+                    target_token_capacity=packed_tokens, transaction=shared_transaction, workspace=arena)
                 add(name, forward, "speculative", batch, logical_width, packed_inputs,
                     enabled=True, packed_tokens=packed_tokens, draft_tokens=depth)
 
@@ -778,11 +823,11 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
         "expert_scale_compression": None,
         "sm103": config.sm103.to_dict(),
         "mla_compute_mode": config.mla_compute_mode,
-        "draft_head_quantization": None,
-        "markov_head_quantization": None,
+        "draft_head_quantization": config.draft_head_quantization,
+        "markov_head_quantization": config.markov_head_quantization,
         "vocabulary_parallel_sampling": False,
         "target_logits_dtype": "float32",
-        "draft_logits_dtype": "float32" if config.dspark else None,
+        "draft_logits_dtype": ("bfloat16" if config.draft_head_quantization is not None else "float32") if config.dspark else None,
         "offloaded_bytes": offloaded_bytes,
         "continuation_bytes": pool.backing.nbytes, "state_rows": state_rows,
         "preparation_state_rows": int(pool.memory_capacity[0].item()),
@@ -809,6 +854,8 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
     disposable = [delivery.buffers()]
     if vision_state is not None:
         disposable.append(vision_state.arena)
+    if trace_routes is not None:
+        disposable.extend((trace_routes, trace_valid))
     prepared = PreparedModel(rebuild_weights=declare_reference_weights(model), expert_rows=expert_rows,
         device=config.devices[0], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
@@ -818,7 +865,8 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
         core_data=delivery,
         resources=(model, experts, delivery, history, pool, requests, inputs, admission, commands,
             forwards, compiled, stream, graph_pool, session, rng, proposal_generation, proposal_offset,
-            confidence, vision_state, vision_inputs, vision_prefill, feature_pool),
+            confidence, vision_state, vision_inputs, vision_prefill, feature_pool,
+            trace_stream, trace_routes, trace_valid),
         close_resources=())
     if confidence is not None:
         prepared.proposal_confidence = confidence.host_view

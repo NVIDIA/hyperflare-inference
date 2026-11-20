@@ -50,6 +50,7 @@ class ReferenceDeclaredWeights:
 
     layers: tuple
     draft_experts: tuple
+    draft_heads: tuple
     model: object
     scales: tuple
 
@@ -64,20 +65,27 @@ def declare_reference_weights(model):
             if isinstance(extra, torch.Tensor) and extra.data_ptr() not in seen_scales:
                 seen_scales.add(extra.data_ptr())
                 scales.append(extra)
+    derived_heads = tuple(h for h in (getattr(model, "draft_head", None), getattr(model, "markov_head", None))
+                          if h is not None)
     roots = ReferenceDeclaredWeights(
         layers=tuple(model.experts.weights[f"layers.{i}.ffn"] for i in range(target_count)),
         draft_experts=tuple(model.experts.weights[f"mtp.{i}.ffn"] for i in range(draft_count)),
+        draft_heads=derived_heads,
         model=model,
         scales=tuple(scales),
     )
-    components = ("draft_experts", "model", "scales") if draft_count else ("model", "scales")
+    components = ["model", "scales"]
+    if draft_count:
+        components.insert(0, "draft_experts")
+    if derived_heads:
+        components.insert(0, "draft_heads")
     aliases = ()
     if draft_count:
         aliases = (
             ("weights.model.draft.embed_tokens.weight", "weights.model.model.embed_tokens.weight"),
             ("weights.model.draft.lm_head.weight", "weights.model.lm_head.weight"),
         )
-    return declare_weights(roots, components=components, layers=("layers",), aliases=aliases)
+    return declare_weights(roots, components=tuple(components), layers=("layers",), aliases=aliases)
 
 
 @dataclass(frozen=True)
@@ -193,6 +201,8 @@ class ReferenceModel(nn.Module):
         self.yoco_keep_tokens = yoco_keep_tokens
         self.expert_stagers = {}
         self.stage_min_rows = 1024
+        self.draft_head = None
+        self.markov_head = None
         cfg = AttrDict(parameters.config.gpt, runtime_max_model_len=context,
             max_num_seqs=request_capacity, max_num_batched_tokens=max(prefill_tokens, verification_tokens),
             max_num_decoding_tokens=verification_tokens, max_num_prefilling_tokens=prefill_tokens,
@@ -232,6 +242,21 @@ class ReferenceModel(nn.Module):
 
         return DeepseekVLForCausalLM._special_image_token_mask(self, input_ids)
 
+    def bind_draft_heads(self, *, draft_head=None, markov_head=None):
+        """Attach quantized draft vocabulary or Markov heads derived from checkpoint weights."""
+        if (draft_head is not None or markov_head is not None) and self.draft is None:
+            raise ValueError("derived draft heads require an enabled draft model")
+        if markov_head is not None and not self.draft.enable_markov:
+            raise ValueError("derived Markov head requires an enabled Markov head")
+        self.draft_head = draft_head
+        self.markov_head = markov_head
+        for obj in (draft_head, markov_head):
+            if obj is None:
+                continue
+            for value in vars(obj).values():
+                if isinstance(value, torch.Tensor):
+                    record_numeric_tensor(value)
+
     def bind_prefill_staging(self, expert_stagers, *, min_rows=1024):
         """Attach prepared double-buffered cold-expert stagers for prompt execution."""
         if type(min_rows) is not int or min_rows < 1:
@@ -239,11 +264,41 @@ class ReferenceModel(nn.Module):
         self.expert_stagers = dict(expert_stagers)
         self.stage_min_rows = min_rows
 
-    def with_routing_trace(self, trace):
+    def bind_low_latency_fp8_projections(self, *, target_rows, draft_rows=(), session):
+        """Wrap eligible FP8 attention projections with SM103 low-latency GEMMs for M <= 8."""
+        from deepinfer.model_executor.layers.linear import ReplicatedLinear
+        from ignition.components.sm103_projection import (
+            LOW_LATENCY_FP8_MAX_ROWS, LowLatencyFP8Linear, is_sm103,
+        )
+
+        if not is_sm103(self.lm_head.weight.device):
+            return
+        small_target = tuple(sorted({r for r in target_rows if 1 <= r <= LOW_LATENCY_FP8_MAX_ROWS}))
+        small_draft = tuple(sorted({r for r in draft_rows if 1 <= r <= LOW_LATENCY_FP8_MAX_ROWS}))
+
+        def wrap_attention(attn, rows, prefix):
+            if not rows:
+                return
+            for attr in ("q_a_kv_swa_proj", "q_a_kv_proj", "kv_swa_proj", "q_b_proj", "out_proj"):
+                mod = getattr(attn, attr, None)
+                if (isinstance(mod, ReplicatedLinear)
+                        and mod.weight.dtype == torch.float8_e4m3fn
+                        and mod.bias is None and not mod.use_fp32_output
+                        and mod.input_size % 128 == 0 and mod.output_size % 128 == 0):
+                    setattr(attn, attr, LowLatencyFP8Linear(mod, rows, session=session, name=f"{prefix}.{attr}"))
+
+        for index, layer in enumerate(self.model.layers):
+            wrap_attention(layer.self_attn, small_target, f"layers.{index}.attn")
+        if self.draft is not None and small_draft:
+            for index, layer in enumerate(self.draft.layers):
+                wrap_attention(layer.self_attn, small_draft, f"mtp.{index}.attn")
+
+    def with_routing_trace(self, trace, *, stream=None, routes_buffer=None, valid_buffer=None):
         """Return a traced target-model callable without mutating untraced modules."""
         if trace is None:
             raise ValueError("routing instrumentation requires a prepared trace")
-        return TracedReferenceModel(self, trace)
+        return TracedReferenceModel(self, trace, stream=stream,
+                                    routes_buffer=routes_buffer, valid_buffer=valid_buffer)
 
     def forward(self, caches, metadata, hidden_states=None, *, speculation_enabled=True, terminal=True):
         from deepinfer.model_executor.models.deepseek_vl import DeepseekVLForCausalLM
@@ -259,19 +314,27 @@ class ReferenceModel(nn.Module):
 class TracedReferenceModel:
     """Execute one reference target forward while recording canonical expert routes."""
 
-    def __init__(self, base, trace):
+    def __init__(self, base, trace, *, stream=None, routes_buffer=None, valid_buffer=None):
         self.base, self.trace = base, trace
         self.cfg, self.model, self.lm_head, self.draft = base.cfg, copy(base.model), base.lm_head, base.draft
         self.vision_language_tuner = base.vision_language_tuner
         self.yoco_keep_tokens = base.yoco_keep_tokens
         self.expert_stagers = base.expert_stagers
         self.stage_min_rows = base.stage_min_rows
+        self.draft_head = base.draft_head
+        self.markov_head = base.markov_head
+        self._async_trace = stream is not None
+        self.stream_handle = 0 if stream is None else stream.cuda_stream
+        self._valid_buffer = None if valid_buffer is None else valid_buffer[0]
         traced_layers = copy(base.model.layers)
         traced_layers._modules = base.model.layers._modules.copy()
         for index, layer in enumerate(base.model.layers):
             traced_layer = copy(layer)
             traced_layer._modules = layer._modules.copy()
-            traced_layer._modules["mlp"] = layer.mlp.with_routing_trace(trace, index)
+            layer_buf = None if routes_buffer is None else routes_buffer[index]
+            layer_valid = None if valid_buffer is None else valid_buffer[index]
+            traced_layer._modules["mlp"] = layer.mlp.with_routing_trace(
+                trace, index, stream=stream, routes_buffer=layer_buf, valid_buffer=layer_valid)
             traced_layers._modules[str(index)] = traced_layer
         self.model._modules = base.model._modules.copy()
         self.model._modules["layers"] = traced_layers
@@ -282,10 +345,21 @@ class TracedReferenceModel:
     def __call__(self, caches, metadata, hidden_states=None, *, speculation_enabled=True, terminal=True):
         from deepinfer.model_executor.models.deepseek_vl import DeepseekVLForCausalLM
 
-        self.trace.begin()
+        if self._async_trace and self._valid_buffer is not None:
+            valid_tokens = getattr(metadata, "valid_token_count", None)
+            if valid_tokens is None:
+                valid_tokens = metadata.valid_token_mask.sum(dtype=torch.int32).reshape(1)
+            self._valid_buffer.copy_(valid_tokens)
+            metadata = copy(metadata)
+            metadata._trace_valid_buffer = self._valid_buffer
+        self.trace.begin(stream_handle=self.stream_handle if self._async_trace else None)
         if hidden_states is None and metadata.is_prompt:
             hidden_states = DeepseekVLForCausalLM.get_input_embeddings(self, metadata)
         dflash = self.draft if speculation_enabled and terminal else None
-        return self.model(caches, metadata, hidden_states=hidden_states, dflash=dflash,
-                          terminal=terminal, expert_stagers=self.expert_stagers,
-                          stage_min_rows=self.stage_min_rows)
+        output = self.model(caches, metadata, hidden_states=hidden_states, dflash=dflash,
+                            terminal=terminal, expert_stagers=self.expert_stagers,
+                            stage_min_rows=self.stage_min_rows)
+        if self._async_trace:
+            anchor = output.hidden_states if hasattr(output, "hidden_states") and output.hidden_states is not None else metadata.input_ids
+            self.trace.join(anchor, stream_handle=self.stream_handle)
+        return output

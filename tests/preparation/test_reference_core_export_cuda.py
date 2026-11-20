@@ -303,6 +303,8 @@ def test_miniature_reference_core_export_and_fresh_process_flare_run(tmp_path):
         retain_graphs=True,
         kernel_cache=kernel_cache,
         dspark=True,
+        draft_head_quantization="nvfp4",
+        markov_head_quantization="fp8",
         speculative_widths=(1, 2, 3, 4),
         speculative_token_capacity=8,
         speculative_graph_budget=16,

@@ -33,7 +33,10 @@ class ReferenceSpeculation:
     def __init__(self, model, batch, history, completion, frame, sequence, *,
                  rng, proposal_generation, proposal_offset, session,
                  prefix_limits=None, confidence_output=None, target_token_capacity=None,
-                 transaction=None):
+                 transaction=None, workspace=None):
+        from ignition.components.markov_sampling import PreparedMarkovProposals
+        from ignition.components.vocabulary import PreparedVocabularyProjection
+
         width, rows = batch.verification_width, batch.rows
         if (batch.shard.world_size != 1 or batch.mode != "decode" or width < 1
                 or (width > 1 and (model.draft is None or width > model.draft.max_MTP_value + 1))
@@ -87,12 +90,45 @@ class ReferenceSpeculation:
         logits = torch.zeros((rows, width, vocab), device=device)
         drafts = torch.zeros((rows, width - 1), device=device, dtype=torch.int64)
         candidates = torch.zeros((rows, width), device=device, dtype=torch.int64)
-        self.proposals = tuple(PreparedSpeculativeDistributions(logits[:, :1].contiguous(),
-            *args, drafts, prefix_offset=index) for index in range(width - 1))
+        depth = width - 1
+        draft_head = getattr(model, "draft_head", None)
+        markov_head = getattr(model, "markov_head", None)
+        if depth and draft_head is not None:
+            draft_source = torch.empty((rows * depth, model.cfg.hidden_size), dtype=torch.bfloat16, device=device)
+            draft_out = torch.empty((rows * depth, vocab), dtype=torch.bfloat16, device=device)
+            self.draft_head_proj = PreparedVocabularyProjection(
+                draft_source, draft_head, draft_out, draft_out, runtime=None, session=session,
+                coordinator=None, name=f"reference.draft_head.{rows}x{depth}.t{self.target_tokens}",
+                workspace=workspace, gather=False).functional(session=session)
+        else:
+            self.draft_head_proj = None
+        use_fused_markov = (depth > 0 and model.draft is not None and model.draft.enable_markov
+                            and model.draft.markov_rank % 64 == 0)
+        if depth and markov_head is not None and not use_fused_markov:
+            raise ValueError("FP8 Markov head requires an enabled 64-aligned Markov head")
+        probabilities = torch.zeros((rows, depth, vocab), device=device)
+        if use_fused_markov:
+            base_dtype = torch.bfloat16 if draft_head is not None else torch.float32
+            base_example = torch.zeros((rows, depth, vocab), dtype=base_dtype, device=device)
+            pending_example = torch.zeros((rows,), dtype=torch.int64, device=device)
+            valid_example = torch.zeros((rows, depth), dtype=torch.bool, device=device)
+            seed_example = torch.zeros((rows,), dtype=torch.int64, device=device)
+            offset_example = torch.zeros((rows,), dtype=torch.int64, device=device)
+            resolved_markov = model.draft.markov_w2.weight if markov_head is None else markov_head
+            self.markov_proposals = PreparedMarkovProposals(
+                base_example, model.draft.markov_w1.weight, resolved_markov, pending_example,
+                drafts, probabilities, valid_example, state, b.row_slot_ids[:rows],
+                b.row_generations[:rows], b.live_rows, seed_example, offset_example, workspace=None)
+            self.markov_proposals.prepare()
+            self.markov_proposals.functional(session=session)
+            self.proposals = ()
+        else:
+            self.markov_proposals = None
+            self.proposals = tuple(PreparedSpeculativeDistributions(logits[:, :1].contiguous(),
+                *args, drafts, prefix_offset=index) for index in range(depth))
         self.target = PreparedSpeculativeDistributions(logits, *args, drafts)
         for operation in (*self.proposals, self.target):
             operation.prepare()
-        probabilities = torch.zeros((rows, width - 1, vocab), device=device)
         self.verification = PreparedStochasticVerification(probabilities, drafts,
             self.target.probabilities, *args, rng=rng, target_valid=self.target.valid,
             token_limits=b.query_lengths[:rows])
@@ -105,9 +141,11 @@ class ReferenceSpeculation:
             operation.functional(session=session)
         batch.functional()
 
-    def with_routing_trace(self, trace):
+    def with_routing_trace(self, trace, *, stream=None, routes_buffer=None, valid_buffer=None):
         traced = copy(self)
-        traced.model = self.model.with_routing_trace(trace)
+        traced.model = self.model.with_routing_trace(trace, stream=stream,
+                                                     routes_buffer=routes_buffer,
+                                                     valid_buffer=valid_buffer)
         return traced
 
     @staticmethod
@@ -153,36 +191,52 @@ class ReferenceSpeculation:
                 depth, self.model.draft.window_size, swa_block_size=self.pool.geometry.window_tokens)
             draft_hidden = self.model.draft.forward_drafts(
                 torch.where(active, pending, 0), draft_metadata, self.caches, block_size=depth)
-            base_logits = get_logits(self.model.draft.post_norm(draft_hidden),
-                self.model.lm_head.weight, self.model.cfg.vocab_size).view(self.rows, depth, -1)
+            normed_draft = self.model.draft.post_norm(draft_hidden)
+            if self.draft_head_proj is not None:
+                base_logits = self.draft_head_proj(normed_draft).view(self.rows, depth, -1)
+            else:
+                base_logits = get_logits(normed_draft, self.model.lm_head.weight,
+                                         self.model.cfg.vocab_size).view(self.rows, depth, -1)
             probabilities = torch.empty((self.rows, depth, state.vocab_size), dtype=torch.float32, device=pending.device)
             valid = torch.empty((self.rows, depth), dtype=torch.bool, device=pending.device)
             confidences = []
             seed = state.seed.view(torch.int64)[safe] ^ DRAFT_RNG_DOMAIN
             prior = torch.where(active, pending, 0)
-            sampled = torch.empty(self.rows, dtype=torch.int32, device=pending.device)
-            row_valid = torch.empty(self.rows, dtype=torch.bool, device=pending.device)
-            for index, sampler in enumerate(self.proposals):
-                scores = base_logits[:, index].clone()
-                markov = None
-                if self.model.draft.enable_markov:
-                    markov = self.model.draft.markov_w1(prior)
-                    scores = self.model.draft.markov_w2(markov, out_acc=scores)
+            if self.markov_proposals is not None:
+                self.markov_proposals.run(base_logits, prior, drafts, probabilities, valid, seed, offset)
+                valid = valid & active[:, None] & (first.starts > 0)[:, None]
                 if self.allocator is not None:
-                    confidences.append(self.model.draft.confidence_head(
-                        draft_hidden.view(self.rows, depth, -1)[:, index],
-                        markov, step_i=index))
-                scratch = self._scratch(sampler, scores.device)
-                sampler.run(scratch, scores[:, None].contiguous(), candidates=drafts)
-                for row in range(self.rows):
-                    token, ok = sample_probabilities(scratch["probabilities"][row],
-                        seed[row:row + 1], offset[row:row + 1] + 4 * index, return_valid=True)
-                    sampled[row:row + 1].copy_(token)
-                    row_valid[row:row + 1].copy_(ok)
-                prior = sampled.long()
-                drafts[:, index].copy_(prior)
-                probabilities[:, index].copy_(scratch["probabilities"][:, 0])
-                valid[:, index].copy_(scratch["valid"][:, 0] & row_valid & active & (first.starts > 0))
+                    priors = torch.cat((prior[:, None], drafts[:, :-1]), dim=1) if depth > 1 else prior[:, None]
+                    markov_embs = self.model.draft.markov_w1(priors.reshape(-1)).view(self.rows, depth, -1)
+                    draft_hidden_3d = draft_hidden.view(self.rows, depth, -1)
+                    for index in range(depth):
+                        confidences.append(self.model.draft.confidence_head(
+                            draft_hidden_3d[:, index].contiguous(),
+                            markov_embs[:, index].contiguous(), step_i=index))
+            else:
+                sampled = torch.empty(self.rows, dtype=torch.int32, device=pending.device)
+                row_valid = torch.empty(self.rows, dtype=torch.bool, device=pending.device)
+                for index, sampler in enumerate(self.proposals):
+                    scores = base_logits[:, index].float().clone()
+                    markov = None
+                    if self.model.draft.enable_markov:
+                        markov = self.model.draft.markov_w1(prior)
+                        scores = self.model.draft.markov_w2(markov, out_acc=scores)
+                    if self.allocator is not None:
+                        confidences.append(self.model.draft.confidence_head(
+                            draft_hidden.view(self.rows, depth, -1)[:, index],
+                            markov, step_i=index))
+                    scratch = self._scratch(sampler, scores.device)
+                    sampler.run(scratch, scores[:, None].contiguous(), candidates=drafts)
+                    for row in range(self.rows):
+                        token, ok = sample_probabilities(scratch["probabilities"][row],
+                            seed[row:row + 1], offset[row:row + 1] + 4 * index, return_valid=True)
+                        sampled[row:row + 1].copy_(token)
+                        row_valid[row:row + 1].copy_(ok)
+                    prior = sampled.long()
+                    drafts[:, index].copy_(prior)
+                    probabilities[:, index].copy_(scratch["probabilities"][:, 0])
+                    valid[:, index].copy_(scratch["valid"][:, 0] & row_valid & active & (first.starts > 0))
             candidates[:, 1:].copy_(drafts)
             if self.allocator is not None:
                 finished = ((slots >= 0) & (slots < state.capacity)
