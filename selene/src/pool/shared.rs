@@ -104,6 +104,8 @@ pub struct PutRequest {
     pub key: PrefixKey,
     /// The key of the previous record in the chain, if any.
     pub parent: Option<PrefixKey>,
+    /// Candidate ancestors whose pages the manager can reuse, deepest first.
+    pub ancestor_keys: Vec<PrefixKey>,
     pub bucket: [u8; 16],
     /// Pages of the whole chain up to `key`.
     pub chain_pages: u64,

@@ -361,6 +361,8 @@ impl Core {
         let Some(record) = allocated? else {
             return Ok(false);
         };
+        self.index
+            .set_published_parent(&checkpoint.key, checkpoint.parent);
         let row = record.row.as_ref().expect("allocated with a row");
         let id = self.next_job();
         let pages = tail
@@ -405,9 +407,11 @@ impl Core {
         while self.pool.free_slots() < needed + self.pool.intake_slots() {
             let announced = &self.announced;
             let spill = self.spill;
-            match self.index.evict(row, |node| {
-                evictable(node, spill, announced.contains(&node.key))
-            }) {
+            match self.index.evict(
+                row,
+                |node| evictable(node, spill, announced.contains(&node.key)),
+                |_| false,
+            ) {
                 Some(Eviction::Leaves(nodes)) => {
                     self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
                     for node in &nodes {
@@ -478,6 +482,7 @@ impl Core {
                 tier: PoolTier::Dram,
                 key,
                 parent: node.parent,
+                ancestor_keys: self.index.ancestor_keys(&key),
                 bucket: node.bucket,
                 tail_pages: node.tail_pages,
                 row: node.row,
@@ -757,7 +762,7 @@ impl Core {
     }
 
     fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
-        for node in self.index.remove(key)? {
+        for node in self.index.remove(key, |_| false)? {
             self.thinning.remove(&node.key);
             self.clean_slots -= self.clean_slots(&node);
             self.release(&node.location);
@@ -2260,6 +2265,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_root_keeps_its_published_parent_for_the_pool_put() {
+        let mut core = store_core(32, 4, false);
+        let full = history(1200, 1);
+        // The parent is not indexed, so the record is a root that still names it.
+        let root = published(&full, 400, Some(200), 10, 1);
+        assert!(core.store(&root).unwrap());
+        assert_eq!(
+            core.index.ancestor_keys(&root.key),
+            [full.key_at(200).unwrap()]
+        );
+    }
+
+    #[test]
     fn store_dedupes_shapes_and_defers_children_of_records_in_flight() {
         let mut core = store_core(32, 4, false);
         let full = history(1200, 1);
@@ -2808,7 +2826,7 @@ mod tests {
             ))
         );
         // While the chain is pinned, eviction cannot take it.
-        assert!(core.index.evict(true, |_| true).is_none());
+        assert!(core.index.evict(true, |_| true, |_| false).is_none());
         let mut events = Vec::new();
         core.absorb(reply(job, Ok(())));
         core.settle(&mut events);

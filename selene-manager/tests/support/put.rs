@@ -84,6 +84,7 @@ pub async fn put(
     let chain_pages = key.consumed_tokens / descriptor.page_tokens;
     session
         .send(c::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: id,
             key: Some(key_to(key)),
             chain_pages,

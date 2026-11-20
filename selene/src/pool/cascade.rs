@@ -186,21 +186,18 @@ impl Cascade {
         entry: Move,
     ) {
         let record = &entry.record;
-        if !record.row {
-            // Without its row the record can end no restore.
-            return self.failed(inner, record);
-        }
-        let pin = match inner.pin_export(record.tier, record.key, 0, true) {
+        let pin = match inner.pin_export(record.tier, record.key, 0, record.row) {
             Ok(pin) => pin,
             Err(_) => return self.failed(inner, record),
         };
         let request = PutRequest {
             key: record.key,
             parent: record.parent,
+            ancestor_keys: record.ancestor_keys.clone(),
             bucket: record.bucket,
             chain_pages: pin.chain().total_pages,
             tail_pages: record.tail_pages as u64,
-            row: true,
+            row: record.row,
             source: PutSource::Host(Box::new(PinBytes {
                 pin,
                 page_bytes: self.page_bytes,

@@ -329,6 +329,7 @@ async fn d6_a_put_whose_writer_dies_mid_window_fails_and_the_same_record_stores_
     // Begin a put, take its grant, send half of the first window and die.
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: 1,
             key: Some(pool::pkey(2048)),
             chain_pages: 32,

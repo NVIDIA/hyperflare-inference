@@ -21,7 +21,7 @@ use crate::{
     data::channel,
     proto::{self, v2, v2::server_message::M},
     record::{Descriptor, NamespaceId},
-    store::{GetAnswer, PutAnswer, Reply, StoreCommand},
+    store::{GetAnswer, PUT_UNLINKED, PutAnswer, Reply, StoreCommand},
 };
 use flare_selene::shared::Tier;
 use flare_selene::shared::record::{HEADER_BYTES, Header};
@@ -248,18 +248,25 @@ impl Core {
     // ------------------------------------------------------------------ put
 
     fn put_refusal_log(&mut self, put_id: u64, reason: v2::Reason, detail: &str) -> Option<String> {
-        if reason == v2::Reason::Present {
-            self.present_puts = self.present_puts.saturating_add(1);
-            return self.present_puts.is_power_of_two().then(|| {
-                format!(
-                    "selene: {} duplicate puts refused (Present) so far",
-                    self.present_puts
-                )
-            });
-        }
-        Some(format!(
-            "selene: put {put_id} refused ({reason:?}): {detail}"
-        ))
+        // Duplicates and unlinked page-only puts are routine, so each is logged as a
+        // cumulative count at 1, 2, 4, 8 and so on.
+        let (count, what) = match reason {
+            v2::Reason::Present => (&mut self.present_puts, "duplicate puts refused (Present)"),
+            v2::Reason::Invalid if detail == PUT_UNLINKED => (
+                &mut self.unlinked_puts,
+                "page-only puts refused (no held ancestor to link to)",
+            ),
+            _ => {
+                return Some(format!(
+                    "selene: put {put_id} refused ({reason:?}): {detail}"
+                ));
+            }
+        };
+        *count = count.saturating_add(1);
+        let count = *count;
+        count
+            .is_power_of_two()
+            .then(|| format!("selene: {count} {what} so far"))
     }
 
     fn put_refusal(&mut self, sid: u64, put_id: u64, reason: v2::Reason, detail: &str) {
@@ -357,6 +364,16 @@ impl Core {
         } else {
             None
         };
+        let Ok(ancestor_keys) = m
+            .ancestor_keys
+            .iter()
+            .take(flare_selene::shared::MAX_CHAIN_NODES as usize)
+            .map(|key| key_from(Some(key)))
+            .collect::<Checked<Vec<_>>>()
+        else {
+            self.put_refusal(sid, put_id, v2::Reason::Invalid, "bad ancestor key");
+            return Ok(());
+        };
         let Ok(bucket) = <[u8; 16]>::try_from(m.bucket.as_slice()) else {
             self.put_refusal(sid, put_id, v2::Reason::Invalid, "bucket must be 16 bytes");
             return Ok(());
@@ -387,6 +404,7 @@ impl Core {
             descriptor,
             key: record_key,
             published_parent: parent,
+            ancestor_keys,
             bucket,
             chain_pages,
             published_tail_pages: tail_pages,
@@ -605,8 +623,13 @@ impl Core {
                     length: grant.length,
                     record: grant.record,
                     // Grant pages count from the accepted record's first page, as the
-                    // writer's coverage and the rank agents read them.
-                    first_page: grant.page_first as u32 - rec.accepted.expect("put accepted").1,
+                    // writer's coverage and the rank agents read them. A row-only
+                    // grant has no first page, and the subtraction would underflow.
+                    first_page: if grant.page_count == 0 {
+                        0
+                    } else {
+                        grant.page_first as u32 - rec.accepted.expect("put accepted").1
+                    },
                     page_count: grant.page_count,
                     row: grant.row,
                 };
@@ -1329,6 +1352,34 @@ mod tests {
             );
         }
         assert_eq!(core.present_puts, 4096);
+    }
+
+    #[test]
+    fn unlinked_put_logs_are_aggregated_at_doubling_totals() {
+        let (mut core, _handle, _events) = Core::new(
+            Default::default(),
+            Default::default(),
+            crate::arena::Arena::new(4096).unwrap(),
+            None,
+        );
+        let mut logged = Vec::new();
+        for id in 1..=64 {
+            if let Some(message) = core.put_refusal_log(id, v2::Reason::Invalid, PUT_UNLINKED) {
+                assert!(message.contains(&format!("{id} page-only puts")));
+                logged.push(id);
+            }
+        }
+        assert_eq!(logged, [1, 2, 4, 8, 16, 32, 64]);
+        assert_eq!(core.unlinked_puts, 64);
+        // Any other INVALID refusal is a disagreement and is logged every time.
+        for id in 65..68 {
+            assert!(
+                core.put_refusal_log(id, v2::Reason::Invalid, "bad key")
+                    .is_some_and(|message| message.contains("bad key"))
+            );
+        }
+        assert_eq!(core.unlinked_puts, 64);
+        assert_eq!(core.present_puts, 0);
     }
 
     #[test]

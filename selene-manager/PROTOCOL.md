@@ -120,9 +120,8 @@ cite them by number.
     `DataChannelRef` and section 7 are fixed here.
 21. **Persisted checksums.** A DRAM or NVMe export serves the checksums
     committed with the record, never hashes of the bytes just read; the manager
-    validates every page and row. When the manager reads a whole record from NVMe
-    into DRAM it checks the record against those checksums and fails the claim
-    `COPY_ERROR` on a mismatch; a window read straight from NVMe into staging is
+    validates every page and row. A restore never reads
+    a whole record from NVMe into DRAM: a window read from NVMe into staging is
     served as it was read, with the persisted checksums, and the requester's check
     is the only one. The manager validates Put metadata against the accepted
     geometry, scope identity, parent, length and its own verification of the
@@ -780,6 +779,8 @@ published. Waiting restores use the bounded claim-slot queue.
 | No progress | 3 s | manager | `FAILED{NO_PROGRESS}` |
 | Concurrent lookups per session | 8 | manager | `LOOKUP_OVERLOADED` |
 | Candidates, nodes, boundaries | 8, 4096, 8192 | both | trimmed (client) or `LOOKUP_INVALID` (manager) |
+| Ancestor keys per put | 4096 | manager | keys after the first 4096 are not considered |
+| Records in a chain before a put starts a new root | 2048 | manager | a put with a row is stored as a root with its complete chain; a page-only put is refused `INVALID` with the detail "page-only put has no held ancestor it can link to" |
 
 - Exports run on the lowest-priority copy stream.
 - A refusal is a normal outcome. The requester claims again 250 ms after a
@@ -809,9 +810,34 @@ writer                          manager
 
 - `PutCancel` is legal only before `PutCommit`. Unfilled windows stay leased to
   the writer until `FenceAck{put_id}` or process exit.
-- For a record not already indexed, if the published parent is absent or has no
-  stored row, `PutAccept` selects no parent and `first_page = 0`. The writer sends
-  the complete page chain and endpoint row as a root, over shared memory or the data channel.
+- For a record not already indexed, `PutBegin.ancestor_keys` lists candidate
+  ancestors in strictly decreasing consumed-token order: local chain keys,
+  deepest first, followed by the published-parent hint on the local root. The
+  manager considers at most the first 4096 keys and chooses the first ready
+  ancestor whose pages it holds, including a page-only ancestor. `PutAccept`
+  names that parent and its chain-relative end page as `first_page`. The writer
+  sends the remaining pages and, if `PutBegin.row` is set, the endpoint row.
+  If no ancestor is held, the manager selects no parent and `first_page = 0`,
+  and the writer sends the complete chain as a root. If the chosen ancestor's
+  chain has at least 2048 records, the manager also selects a root, so no stored
+  chain exceeds half of the lookup and claim limit of 4096 records. Admission
+  can also select a root under arena pressure. An absent or empty list uses
+  `published_parent` alone and requires that parent to be ready; it never links
+  to an uncommitted parent. Managers that do not implement field 10 ignore the
+  list and use `published_parent` alone.
+- A put with `row = false` retains only pages and cannot be a restore endpoint,
+  so it needs a held ancestor to link to. Without one the manager answers
+  `INVALID`; arena pressure that would require a root instead is `BUDGET`. The chosen
+  ancestor does not count when its chain has at least 2048 records, because the put would
+  then start a new root, and a root needs a row. At that depth a page-only put is answered
+  `INVALID` with the detail "page-only put has no held ancestor it can link to", and a put with
+  a row is stored as a root. A
+  put with a row for a held page-only record upgrades it; without a row it is
+  answered `PRESENT`. A put that carries no pages and no row, because the chosen
+  ancestor already covers its endpoint, is also answered `PRESENT`. Lookups
+  select the deepest retained row and prefill the suffix.
+- Under disk pressure the manager drops a record's row only when its single
+  child carries a row, so every chain keeps a row to restore from.
 - `PutGrant` window page numbers count from the accepted record's first page
   (`PutAccept.first_page` is chain-relative), for every writer and rank agent.
 - "Already held means committed": only `Stored` and `PRESENT` confirm a

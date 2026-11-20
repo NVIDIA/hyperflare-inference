@@ -212,6 +212,7 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
     }
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: 6,
             key: Some(pool::pkey(4096)),
             chain_pages: 64,
@@ -225,6 +226,7 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
         .await;
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: 7,
             key: Some(pool::pkey(5120)),
             chain_pages: 80,
@@ -250,6 +252,61 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
 }
 
 // ---------------------------------------------------------------- recovered records (NVMe)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn puts_reroot_at_half_the_chain_limit_and_restore_through_the_next_tail() {
+    let bound = selene_manager::store::REROOT_DEPTH as u64;
+    let mut host = Host::with_storage(64 << 20, 128 << 20);
+    let descriptor = descriptor();
+    let directory = host.config.root.as_ref().unwrap().join(descriptor.name());
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut parent = None;
+    for depth in 1..bound {
+        let record = key(depth * 64);
+        let (_, bytes, _) = content_for(&descriptor, record, parent, (depth - 1) as u32);
+        std::fs::write(
+            directory.join(selene_manager::record::file_name(&record)),
+            bytes,
+        )
+        .unwrap();
+        parent = Some(record);
+    }
+    host.run();
+    let mut writer = host.client().await;
+    let at_bound = key(bound * 64);
+    let root = key((bound + 1) * 64);
+    let child = key((bound + 2) * 64);
+    writer.store(at_bound, parent).await;
+    writer.store(root, Some(at_bound)).await;
+    writer.store(child, Some(root)).await;
+    host.durable(bound as usize + 2);
+    for (record, expected_parent) in [(at_bound, parent), (root, None), (child, Some(root))] {
+        let bytes =
+            std::fs::read(directory.join(selene_manager::record::file_name(&record))).unwrap();
+        let header = flare_selene::shared::record::Header::decode(&bytes[..4096]).unwrap();
+        assert_eq!(header.parent, expected_parent);
+    }
+    let (_, root_bytes, _) = content_for(&descriptor, root, None, 0);
+    let root_header = flare_selene::shared::record::Header::decode(&root_bytes[..4096]).unwrap();
+    let (_, child_bytes, _) = content_for(&descriptor, child, Some(root), (bound + 1) as u32);
+    let child_header = flare_selene::shared::record::Header::decode(&child_bytes[..4096]).unwrap();
+    let mut reader = host.client().await;
+    assert_eq!(
+        reader.fetch(&[root], 0, (bound + 1) as u32).await,
+        vec![root_bytes[root_header.page_segment as usize..].to_vec()]
+    );
+    assert_eq!(
+        reader.fetch(&[root, child], 0, (bound + 2) as u32).await,
+        vec![
+            root_bytes[root_header.page_segment as usize..root_header.row_segment as usize]
+                .to_vec(),
+            child_bytes[child_header.page_segment as usize..].to_vec(),
+        ]
+    );
+    let metrics = host.metrics();
+    assert!(metrics.contains("selene_put_links_total{parent=\"root\"} 1\n"));
+    assert!(metrics.contains("selene_put_links_total{parent=\"linked\"} 2\n"));
+}
 
 fn rooted(label: &str) -> (std::path::PathBuf, selene_manager::store::Config) {
     let base = std::env::temp_dir().join(format!("selene-{label}-{}", std::process::id()));
@@ -421,9 +478,9 @@ async fn a8_damage_at_rest_never_reaches_a_restore() {
         byte[0] ^= 0xff;
         handle.write_all_at(&byte, at).unwrap();
     }
-    // The store reads whole records back with their checksums: damage found on the way
-    // fails the claim before any window carries it. A copy of it that did get out would
-    // carry the persisted checksums, so the requester's own check would catch it too.
+    // A restore reads its windows straight from the file and serves them with the
+    // checksums persisted with the record, so damaged bytes reach the requester
+    // with checksums they do not match, and the requester's own check fails the copy.
     reader.claim(reader.claim_for(1, &candidate, 0, true)).await;
     let granted = reader.claim_granted(1).await;
     assert_eq!(granted.total_pages, 16);
@@ -471,6 +528,7 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
     let mut writer = open(&mut pool, "writer").await;
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: 1,
             key: Some(pool::pkey(1024)),
             chain_pages: 16,

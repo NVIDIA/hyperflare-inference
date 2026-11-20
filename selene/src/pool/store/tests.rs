@@ -721,6 +721,7 @@ fn a_candidate_starting_after_the_resident_prefix_never_stitches_to_a_local_pref
 impl Rig {
     fn retiring(&self, page: u64) -> Retiring {
         Retiring {
+            ancestor_keys: Vec::new(),
             tier: Tier::Nvme,
             key: self.key(page * PT),
             parent: (page > 1).then(|| self.key((page - 1) * PT)),
@@ -806,6 +807,26 @@ fn a_retiring_record_is_put_and_released_only_when_the_manager_commits_it() {
     assert!(rig.retired().is_empty());
     let (id, _) = rig.started()[0];
     rig.end(id, PutOutcome::Stored { bytes: 1 });
+    rig.poll();
+    assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
+}
+
+#[test]
+fn a_page_only_retirement_is_put_without_its_row() {
+    let mut rig = rig();
+    rig.ready(true);
+    let mut record = rig.retiring(3);
+    record.row = false;
+    rig.offer(std::slice::from_ref(&record));
+    rig.poll();
+    {
+        let state = rig.pool.lock().unwrap();
+        let [(_, request)] = &state.puts[..] else {
+            panic!("one page-only put expected");
+        };
+        assert!(!request.row);
+    }
+    rig.end(rig.started()[0].0, PutOutcome::Stored { bytes: 1 });
     rig.poll();
     assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
 }

@@ -253,7 +253,12 @@ pages, in the same way a GPU checkpoint's pages combine with a child computed
 later from a different request. A checkpoint published while its parent key
 is absent from the host index is stored as a root record holding its complete
 page chain, so a skipped or evicted ancestor never makes its descendants
-unrestorable.
+unrestorable. A put to the manager's store instead lists the record's local
+ancestors, deepest first, and the manager links it to the deepest one it holds
+ready; the writer sends only the pages after that ancestor. The manager stores
+a root with the complete chain only when it holds none of them, when the
+chosen ancestor's chain is already half the lookup limit long, or when the
+arena is under pressure.
 
 GPU eviction ranks eligible checkpoints by logical-request demand epoch,
 retention role, consumed-token count, and identity, as specified in
@@ -269,6 +274,8 @@ when every leaf is pinned, it compacts the least recently used unpinned
 single-child ancestor by
 dropping its row and keeping its pages. A compacted host node stays in the tree
 as page-only, no longer matches lookups, and continues to supply chain pages.
+The manager's store compacts a record under disk pressure only when its single
+child keeps its own row, so every chain retains a row to restore from.
 A node is evictable only when its store's policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
@@ -1219,7 +1226,9 @@ checks; deployments must secure the cluster fabric, since these links carry
 session secrets and transfer tokens in plaintext.
 Records reach the manager's store only when they cascade off the end of a
 local chain under pressure, and an instance's own records leave the manager's
-index when its session ends. Restarting with wiped local disks therefore
+index when its session ends. A compacted page-only record cascades without a
+row and is stored only linked to an ancestor the manager holds; the manager
+refuses it as `INVALID` otherwise, and the instance drops the copy. Restarting with wiped local disks therefore
 restores nothing unless records had already cascaded to the manager. This holds
 on a single host too.
 

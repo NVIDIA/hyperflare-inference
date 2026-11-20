@@ -51,8 +51,10 @@ The service is CPU-only and never touches GPU memory. Three budgets are configur
 separately and shared by every scope: `--memory` (the DRAM arena), `--staging` (windows) and
 `--nvme` (durable records).
 
-`--memory` is the arena for the manager's own records served without touching NVMe. Size it for
-the hot working set, not for everything. Allocation uses power-of-two size classes, so a record
+`--memory` is the arena for the manager's own records served without touching NVMe. Only puts
+place records in it; a restore streams a record that is not in the arena and does not add it.
+Size it for the records written recently that are likely to be restored soon, not for everything.
+Allocation uses power-of-two size classes, so a record
 consumes its length rounded up and usable capacity can be materially below the mapping size.
 A record whose rounded extent exceeds the whole arena is not dropped (with `--root` it streams
 to NVMe) but it will never be served from DRAM; without `--root` it can never be admitted and is
@@ -78,6 +80,23 @@ One export holds (`--staging` minus the row bytes) divided by the page bytes, ro
 times the page tokens: about 143,000 tokens at 2 GiB and 294,000 at the 4 GiB default for a
 model with 905,216-byte pages of 64 tokens and a 122 MiB row. Size `--staging` from that
 formula or from the figure in the warning.
+
+A restore from NVMe also reads through staging. A restore reads only the pages and the
+endpoint row it needs, as windows, and never reads a whole record into the arena. A record that
+is in the arena is served from there. A restore window that cannot get a staging block of its
+size class, because earlier windows hold that class, waits until one is released; it is not
+refused. The endpoint row is one window and is never split, and staging blocks are powers of two,
+so staging must be at least the row's size rounded up to a power of two (a page, if larger):
+256 MiB for a 160 MiB row. A restore of a record that is not in the arena, with a window whose
+block, rounded up to a power of two, is larger than the whole staging region, is refused when it
+starts, before any read. The client sees `NO_WINDOWS` and recomputes the prefix. The manager prints a
+warning with the minimum `--staging` when a scope's geometry first arrives and staging is smaller.
+When a restore begins it starts reading the metadata of every record in its chain that is not in
+the arena, in chain order, so a chain near the 2048-record depth at which puts start a new root can
+need up to about 16 MiB of staging at once. A metadata read that finds staging full waits for a
+release, as a window does. A restore is refused at its start, with `NO_WINDOWS`, when the
+block of one record's metadata or one window, rounded up to a power of two, is larger than the whole
+staging region.
 
 `--nvme` bounds record reservations: the rounded arena extent for an in-memory
 record, or the padded file plus the two-window hold for a streamed put. It must exceed the
@@ -270,7 +289,7 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 | put `INFLIGHT` | Another put of the same key is in flight: the writer retries once after a 50 ms backoff, then discards the local record on another `BUDGET` or `INFLIGHT` refusal. | None. |
 | put `OVERSIZE` | Can never fit in this configuration; the writer discards the local record. | Raise the budget or add `--root`. |
 | put `QUEUE` | The writer has `max_open_puts` (4) open. | None. |
-| put `INVALID` | Malformed, metadata that does not match the put, or a mode not allowed; the writer discards the local record. | Alert: client and manager disagree. |
+| put `INVALID` | The refusal of a page-only put that has no held ancestor to link to is routine: the writer discards the local record, and it is counted as `selene_puts_total{outcome="unlinked"}` and logged as a cumulative total at 1, 2, 4, 8 and so on. A held ancestor whose chain already has 2048 records does not count, because a put there starts a new root instead of linking, which keeps stored chains at half of the 4096 records that a lookup, claim or restore accepts; a put with a row starts a new root there, and a page-only put cannot, because a root needs a row. The detail sent with the refusal is "page-only put has no held ancestor it can link to" (`PUT_UNLINKED` in the code). Any other `INVALID` (malformed, metadata that does not match the put, a mode not allowed) means the client and manager disagree. | Alert on `INVALID` refusals beyond those counted as `unlinked`. |
 | put `IO` | A device error. | Check the NVMe and the file system. |
 | put `PUT_NOT_READY` | Not ready (see Readiness). | None. |
 
@@ -298,10 +317,13 @@ does not answer within 1 s the previous store text is served.
 | `selene_pool_claims_total{state,reason}`, `selene_pool_claims_refused_total{reason}`, `selene_pool_lookups_total{status}` | Outcomes. Label values are the Rust variant names, such as `reason="CopyError"`. | `CopyError`, `Checksum`, `NoWindows` rising. |
 | `selene_pool_puts_open` | Puts in flight. | |
 | `selene_pool_quarantined_bytes` | Window bytes out of service. | Anything sustained. |
-| `selene_puts_total{outcome}` | `ok`, `error`, `present`, `queue`, `budget`, `inflight`, `oversize` for the store's puts. | Any `error`; `budget` growing faster than `ok`. |
+| `selene_puts_total{outcome}` | `ok`, `error`, `unlinked`, `present`, `queue`, `budget`, `inflight`, `oversize` for the store's puts. `unlinked` counts page-only puts refused `INVALID` because no held ancestor could be linked, which includes a deepest held ancestor whose chain has 2048 records, where only a put with a row can start a new root; the writer drops them and the refusal is normal. `present` includes puts with no new pages and no row. | Any `error`; `budget` growing faster than `ok`. |
+| `selene_put_links_total{parent="linked"\|"root"}` | Accepted puts linked to a held ancestor or stored as complete roots. Includes puts that later fail or are cancelled; excludes refusals, including `PRESENT`. | A rising root fraction can indicate missing ancestors, periodic depth limits, or arena pressure. |
+| `selene_put_shapes_total{shape="row"\|"page_only"\|"empty"}` | Accepted puts that carry a row, accepted puts that carry pages only, including later failures or cancellation, and puts with no new pages and no row, which are answered `PRESENT` and also count under `present`. | A rising `page_only` share shows writers sending pages without rows. |
+| `selene_put_bytes_total{part="pages"\|"rows"}` | Padded page and row payload bytes accepted per put, excluding headers and checksum tables. Counts the accepted shape once, including puts that later fail or are cancelled. | Page bytes per accepted put rising without a similar increase in conversation length. |
 | `selene_gets_total{outcome}` | `ok`, `error` for the store's reads. | Any `error`. |
 | `selene_nvme_errors_total` | NVMe read and write failures. | Any increase. |
-| `selene_nvme_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes. |
+| `selene_nvme_bytes_total`, `selene_nvme_read_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written, bytes read for restores, and disk time for both directions. | Disk time growing faster than the sum of written and read bytes. |
 | `selene_memory_allocated_bytes`, `selene_staging_allocated_bytes` | Arena and staging in use. | Near `--memory` / `--staging`. |
 | `selene_nvme_reserved_bytes`, `selene_nvme_reserved_peak_bytes` | What `--nvme` bounds, as its present value and its high-water mark since start: every record's padded file or rounded arena extent, what each unfinished put will leave on disk, and the staging hold of each unfinished streamed put. Never above `--nvme`. Windows leased for claims and exports are not in it; `selene_staging_allocated_bytes` shows them with the holds, and `--staging` bounds them. | Near `--nvme`: puts are refused `BUDGET` and DRAM eviction stops. |
 | `selene_evictions_total`, `selene_compactions_total` | DRAM evictions and row compactions. | Hot set not staying resident. |
@@ -329,6 +351,12 @@ instance's version answers `Hello` with `VERSION_MISMATCH`. This fails instance 
 after startup it disables the pool until the instance restarts. `--name`, `--socket`,
 `--listen`, `--listen-data` and the TLS files are restart-only.
 
+Upgrade managers before clients. A manager that predates page-only puts ignores `row = false`,
+admits the put with full admission, which can evict, and grants a window for a row. The client
+then cancels the put on the size mismatch and retries the record after its backoff, so a client
+that sends page-only puts to such a manager costs a begin, an accept and a cancel on every
+attempt.
+
 The root holds one directory per model identity and layout fingerprint, named
 `<16 hex>-<32 hex>` from the first 8 bytes of the model identity and the 16-byte layout
 fingerprint. Remove one such
@@ -349,8 +377,8 @@ in that root under its own name.
 
 ### Duplicate puts and stale lookup hints
 
-`Present` means the complete record is already committed. Duplicate put logs
-report cumulative totals at 1, 2, 4, 8, and subsequent doublings;
+`Present` means the requested pages and, when requested, row are already committed.
+Duplicate put logs report cumulative totals at 1, 2, 4, 8, and subsequent doublings;
 every put receives its own reply.
 
 A restore warning ending in `UnknownSource` means that its lookup hint names

@@ -2050,7 +2050,7 @@ impl DiskStore {
             if !prior_readable {
                 self.evicted.push(key);
                 if self.index.node(&key).unwrap().children() == 0 {
-                    for removed in self.index.remove(&key)? {
+                    for removed in self.index.remove(&key, |_| false)? {
                         self.unlink(removed)?;
                     }
                 }
@@ -2130,7 +2130,7 @@ impl DiskStore {
                 return Ok(false);
             }
             // At the truncate cap, whole-record eviction can precede further row reclaim.
-            match self.index.evict(true, |_| true) {
+            match self.index.evict(true, |_| true, |_| false) {
                 Some(Eviction::Leaves(nodes)) => {
                     self.stats.dropped[3] += nodes.len() as u64;
                     for node in nodes {
@@ -2207,6 +2207,7 @@ impl DiskStore {
                 tier: PoolTier::Nvme,
                 key,
                 parent: node.parent,
+                ancestor_keys: self.index.ancestor_keys(&key),
                 bucket: node.bucket,
                 tail_pages: node.tail_pages,
                 row: node.row,
@@ -2246,7 +2247,7 @@ impl DiskStore {
             if self.index.node(key).is_some_and(|node| node.pinned()) {
                 return true;
             }
-            if let Ok(removed) = self.index.remove(key) {
+            if let Ok(removed) = self.index.remove(key, |_| false) {
                 for node in removed {
                     if let Err(error) = self.unlink(node) {
                         result = Err(error);
@@ -2291,7 +2292,7 @@ impl DiskStore {
     }
 
     pub(crate) fn expire(&mut self, key: PrefixKey) -> Result<()> {
-        for node in self.index.remove(&key)? {
+        for node in self.index.remove(&key, |_| false)? {
             if node.location.bytes == 0 {
                 self.evicted.push(node.key);
             }
@@ -2348,7 +2349,7 @@ impl DiskStore {
         let bytes = std::mem::take(&mut node.location.bytes);
         self.used = self.used.saturating_sub(bytes);
         if node.children() == 0 {
-            for removed in self.index.remove(key)? {
+            for removed in self.index.remove(key, |_| false)? {
                 self.unlink(removed)?;
             }
         } else {
@@ -2565,6 +2566,8 @@ impl HostStore for DiskStore {
         };
         let id = self.next_job();
         let detect = self.announce.is_none() && self.geometry.len() > 1;
+        self.index
+            .set_published_parent(&checkpoint.key, checkpoint.parent);
         if let Err(error) = self
             .transport
             .store(id, header, temporary, path, checkpoint, detect)
@@ -3052,7 +3055,8 @@ mod tests {
                     match removal {
                         "expire" => store.expire(header.key).unwrap(),
                         "evict" => {
-                            let Some(Eviction::Leaves(nodes)) = store.index.evict(false, |_| true)
+                            let Some(Eviction::Leaves(nodes)) =
+                                store.index.evict(false, |_| true, |_| false)
                             else {
                                 panic!("the chain must have an evictable leaf");
                             };
@@ -3594,7 +3598,7 @@ mod tests {
             store_with(vec![scanned(&directory(), header.clone(), 0, true)], bytes);
         let budget = super::super::input::DiskBudget::new(bytes, bytes);
         store.share_budget(budget.clone());
-        let nodes = store.index.remove(&header.key).unwrap();
+        let nodes = store.index.remove(&header.key, |_| false).unwrap();
         for node in nodes {
             store.unlink(node).unwrap();
         }
@@ -3617,7 +3621,7 @@ mod tests {
             store_with(vec![scanned(&directory(), header.clone(), 0, true)], bytes);
         let budget = super::super::input::DiskBudget::new(bytes, bytes);
         store.share_budget(budget.clone());
-        let nodes = store.index.remove(&header.key).unwrap();
+        let nodes = store.index.remove(&header.key, |_| false).unwrap();
         for node in nodes {
             store.unlink(node).unwrap();
         }
@@ -3731,6 +3735,28 @@ mod tests {
         assert_eq!(node.location.bytes, bytes);
         assert!(store.index().node(&child.key).is_none());
         assert_eq!(store.index().node(&root.key).unwrap().children(), 0);
+    }
+
+    #[test]
+    fn a_stored_root_keeps_its_published_parent_for_the_pool_put() {
+        let (mut store, _log) = store_with(Vec::new(), 1 << 30);
+        let full = history(2000);
+        let mut ids = Ids::new();
+        // The parent is not indexed, so the record is a root that still names it.
+        let root = checkpoint(
+            &mut ids,
+            &full,
+            1300,
+            Some(700),
+            pages(0..20),
+            20,
+            StateSlotId(1),
+        );
+        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_eq!(
+            store.index().ancestor_keys(&root.key),
+            [full.key_at(700).unwrap()]
+        );
     }
 
     #[test]

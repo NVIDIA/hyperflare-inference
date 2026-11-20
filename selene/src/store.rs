@@ -203,6 +203,7 @@ pub struct Retiring {
     pub tier: PoolTier,
     pub key: PrefixKey,
     pub parent: Option<PrefixKey>,
+    pub ancestor_keys: Vec<PrefixKey>,
     pub bucket: [u8; 16],
     /// Pages the record owns, counted from its parent.
     pub tail_pages: usize,

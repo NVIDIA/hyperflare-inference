@@ -471,6 +471,12 @@ impl CompositeStore {
             return;
         }
         self.stats.held[0] += u64::from(!reserved_file);
+        let hint = self
+            .memory
+            .index()
+            .node(&key)
+            .and_then(|node| node.published_parent);
+        self.disk.index_mut().set_published_parent(&key, hint);
         if let Some(parent) = parent
             && self
                 .memory
@@ -2573,6 +2579,43 @@ mod tests {
         short.tail_pages = 15;
         assert!(store.store(&short).is_err());
         assert_eq!(store.stats().store_failed, 3);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_spilled_root_keeps_its_published_parent_for_the_pool_put() {
+        let Some(directory) = test_directory("composite", "published-parent") else {
+            return;
+        };
+        let mut store = composite(&directory, 48, 4, 1 << 30);
+        let full = history(2000);
+        let mut ids = Ids::new();
+        // The parent is indexed in neither tier, so the record is a root; the pool put still
+        // names that parent as a candidate ancestor, so the hint must reach the disk index.
+        let root = checkpoint(
+            &mut ids,
+            &full,
+            1990,
+            Some(1500),
+            pages(0..31),
+            31,
+            StateSlotId(1),
+        );
+        let parent = full.key_at(1500).unwrap();
+        let (_, bytes) = copy_landed(&mut store, &root, None, 1);
+        store
+            .memory
+            .index_mut()
+            .set_published_parent(&root.key, root.parent);
+        assert_eq!(store.memory.index().ancestor_keys(&root.key), [parent]);
+        let mut events = Vec::new();
+        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        assert!(store.disk.index().contains(&root.key));
+        assert_eq!(store.disk.index().ancestor_keys(&root.key), [parent]);
+        store.spill(root.key);
+        poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(&directory).unwrap();

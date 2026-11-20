@@ -1682,6 +1682,7 @@ pub(super) fn host_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
         .collect();
     let row = checksum(&data[3 * PAGE as usize..]);
     crate::pool::PutRequest {
+        ancestor_keys: Vec::new(),
         key: key(192, 2),
         parent,
         bucket: [4; 16],

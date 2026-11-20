@@ -162,6 +162,8 @@ struct Run {
     records: Vec<Vec<u8>>,
     expected: u64,
     received: u64,
+    /// The index the next ready window must carry: windows are answered in grant order.
+    next_window: u32,
     cancelled: bool,
     abandoned: bool,
     damaged: bool,
@@ -179,6 +181,7 @@ impl Run {
             records: Vec::new(),
             expected: 0,
             received: 0,
+            next_window: 0,
             cancelled: false,
             abandoned: false,
             damaged: false,
@@ -347,6 +350,7 @@ impl Client {
         let page_tokens = self.descriptor.page_tokens;
         let chain_pages = key.consumed_tokens / page_tokens;
         v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: id,
             key: Some(key_to(key)),
             chain_pages,
@@ -379,6 +383,16 @@ impl Client {
             _ => None,
         })
         .await
+    }
+
+    /// Starts a put whose candidate ancestors, deepest first, are `ancestors`.
+    pub async fn start_put_linked(&mut self, key: Key, ancestors: &[Key]) -> (u64, PutStart) {
+        self.next_put += 1;
+        let id = self.next_put;
+        let mut begin = self.begin(id, key, None);
+        begin.ancestor_keys = ancestors.iter().copied().map(key_to).collect();
+        self.session.send(c::M::PutBegin(begin)).await;
+        (id, self.first_answer(id).await)
     }
 
     pub async fn start_put(&mut self, key: Key, parent: Option<Key>) -> (u64, PutStart) {
@@ -590,6 +604,11 @@ impl Client {
             return;
         }
         let window = ready.window.unwrap();
+        assert_eq!(
+            window.index, run.next_window,
+            "windows arrive in grant order"
+        );
+        run.next_window += 1;
         let bytes = self.session.shm.as_ref().unwrap().read(&window);
         let page = self.descriptor.page_bytes() as usize;
         let mut sound = ready.page_xxh3.len() == window.page_count as usize;

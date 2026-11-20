@@ -180,6 +180,11 @@ impl Engine {
             row: request.row,
             has_published_parent: request.parent.is_some(),
             published_parent: request.parent.map(codec::key_to),
+            ancestor_keys: request
+                .ancestor_keys
+                .into_iter()
+                .map(codec::key_to)
+                .collect(),
             bucket: request.bucket.to_vec(),
             published_tail_pages: request.tail_pages,
             mode: if self.dial.is_some() {

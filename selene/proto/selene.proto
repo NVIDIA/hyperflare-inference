@@ -985,6 +985,8 @@ message PutBegin {
   bytes bucket = 7;
   uint64 published_tail_pages = 8;
   CopyMode mode = 9;
+  // Strictly decreasing endpoint lengths; absent uses published_parent only.
+  repeated PrefixKey ancestor_keys = 10;
 }
 
 message PutAccept {
