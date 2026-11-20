@@ -58,18 +58,17 @@ def fixture(name):
     return torch.load(Path(os.environ["FLARE_GLM53_FULL_REFERENCE"]) / f"{name}.pt")
 
 
-def next_token(card, token_ids):
-    """Most likely next token after `token_ids`, the 20 most likely tokens, and the prompt's cached tokens.
-
-    The recipe's declared temperature range excludes greedy sampling, so the most likely token is read from
-    the returned alternatives rather than from the sampled token.
-    """
-    result = request("/v1/completions", {"model": card["id"], "prompt": token_ids, "max_tokens": 1,
-                                         "logprobs": 20, "return_tokens_as_token_ids": True})
+def next_token_scores(card, token_ids, *, score_token=None):
+    """Request natural alternatives or the specified reference token's full-vocabulary log probability."""
+    body = {"model": card["id"], "prompt": token_ids, "max_tokens": 1,
+            "logprobs": 20, "return_tokens_as_token_ids": True}
+    if score_token is not None:
+        body.update(logprobs=0, logprob_token_ids=[score_token])
+    result = request("/v1/completions", body)
     choice = result["choices"][0]
     alternatives = {int(token.removeprefix("token_id:")): value
                     for token, value in choice["logprobs"]["top_logprobs"][0].items()}
-    return max(alternatives, key=alternatives.get), alternatives, result["usage"]["prompt_tokens_details"]["cached_tokens"]
+    return alternatives, result["usage"]["prompt_tokens_details"]["cached_tokens"]
 
 
 def test_card_declares_the_recipe(card):
@@ -89,17 +88,18 @@ def test_greedy_tokens_follow_the_reference(card):
     logprobs = reference["logits"].float().log_softmax(-1)
     changed, decisive, differences, cached = [], 0, [], []
     for row in sampled:
-        token, alternatives, reused = next_token(card, token_ids[:row + 1])
+        prefix = token_ids[:row + 1]
+        alternatives, reused = next_token_scores(card, prefix)
+        token = max(alternatives, key=alternatives.get)
         cached.append((row + 1, reused))
         if margins[row] >= 1.0:
             decisive += 1
             if token != expected[row]:
                 changed.append((row, margins[row]))
         if row in final:
-            served = alternatives.get(expected[row])
+            scores, _ = next_token_scores(card, prefix, score_token=expected[row])
             exact = float(logprobs[row - (rows - 64), expected[row]])
-            # A reference token outside the 20 served alternatives counts as the worst served alternative.
-            differences.append(abs((min(alternatives.values()) if served is None else served) - exact))
+            differences.append(abs(scores[expected[row]] - exact))
     assert len(changed) <= math.ceil(2 * CHANGED_DECISIVE_TOKENS * decisive), (changed, decisive)
     assert sum(differences) / len(differences) < 2 * LOGPROB_FLOOR, differences
     # Each prompt extends the previous one. The checkpoint policy chooses how much of it is reused, so the
@@ -110,8 +110,8 @@ def test_greedy_tokens_follow_the_reference(card):
 
 def test_short_sequence_predicts_the_reference_token(card):
     reference = fixture("short")
-    token, _, _ = next_token(card, reference["token_ids"].tolist())
-    assert token == int(reference["next_tokens"][-1])
+    scores, _ = next_token_scores(card, reference["token_ids"].tolist())
+    assert max(scores, key=scores.get) == int(reference["next_tokens"][-1])
 
 
 def chat(card, messages, **fields):
