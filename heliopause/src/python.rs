@@ -602,6 +602,7 @@ fn flare_heliopause(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeServer>()?;
     module.add_function(wrap_pyfunction!(current_context, module)?)?;
     module.add_function(wrap_pyfunction!(memory_inventory, module)?)?;
+    module.add_function(wrap_pyfunction!(roce_gid_index, module)?)?;
     module.add_function(wrap_pyfunction!(serve_tensor_parallel_rank, module)?)?;
     #[cfg(target_os = "linux")]
     module.add_function(wrap_pyfunction!(bind_parent_lifetime, module)?)?;
@@ -623,6 +624,20 @@ fn memory_inventory(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> 
     result.set_item("total_bytes", inventory.total)?;
     result.set_item("mappings", inventory.mappings)?;
     Ok(result)
+}
+
+/// This host's RoCE GID index by the rule native serving uses: 3 when every active device has a
+/// RoCEv2 IPv4 GID there, otherwise the lowest index at which one does.
+#[pyfunction]
+fn roce_gid_index() -> PyResult<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::execution::roce_fabric::discover()
+            .map(|fabric| fabric.gid_index)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(PyRuntimeError::new_err("RoCE preparation requires Linux"))
 }
 
 #[cfg(test)]

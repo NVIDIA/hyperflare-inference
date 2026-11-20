@@ -437,6 +437,7 @@ def test_roce_setup_preserves_routing_and_core_transport_owner(monkeypatch, ring
             self.ring, self.options = ring, options
 
     monkeypatch.setitem(sys.modules, "b12x.comm", SimpleNamespace(roce=SimpleNamespace(AllReduce=Runtime)))
+    monkeypatch.setitem(sys.modules, "flare_heliopause", SimpleNamespace(roce_gid_index=lambda: 5))
     storage = SimpleNamespace(transports=[])
     runtime = create_roce_runtime(object(), "cuda:0", max_tokens=32, pipe_tokens=4096,
                                   hidden_size=4096, gather_bytes=4096, ring=ring, core_storage=storage)
@@ -444,6 +445,7 @@ def test_roce_setup_preserves_routing_and_core_transport_owner(monkeypatch, ring
     assert runtime.options["max_size"] == 2 << 20
     assert runtime.options["pipe_bytes"] == 4096 * 4096 * 2
     assert callable(runtime.options["region_allocator"])
+    assert runtime.options["gid_index"] == 5
 
 
 def test_differing_tuning_races_report_bounded_counts_and_release_job(monkeypatch):
