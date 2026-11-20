@@ -172,6 +172,7 @@ pub(super) struct Active {
     state: Committed,
     storage: BTreeMap<Expert, (u64, usize)>,
     constraints: BTreeMap<Expert, PlacementConstraint>,
+    window_misses: BTreeSet<Expert>,
     next_ns: u64,
     proposed: u64,
     no_movement: u64,
@@ -251,6 +252,7 @@ impl Active {
             binding,
             storage,
             constraints,
+            window_misses: BTreeSet::new(),
             next_ns: 0,
             proposed: 0,
             no_movement: 0,
@@ -291,6 +293,8 @@ impl Active {
             .map_err(|e| e.to_string())?;
         self.state.ingest(&events)?;
         let misses = self.state.observe(record, executed, &self.algorithm)?;
+        self.window_misses
+            .extend(misses.into_iter().map(|(expert, _)| expert));
         if now < self.next_ns {
             return Ok(());
         }
@@ -309,6 +313,8 @@ impl Active {
             return Ok(());
         }
         self.next_ns = now.saturating_add(self.config.interval_ns);
+        let accumulated: Vec<_> = self.window_misses.iter().map(|&e| (e, 1u64)).collect();
+        self.window_misses.clear();
         let resident = snapshot
             .experts
             .iter()
@@ -317,7 +323,7 @@ impl Active {
         let candidates = self
             .state
             .policy
-            .propose(&misses, &resident, &BTreeSet::new(), &self.algorithm)
+            .propose(&accumulated, &resident, &BTreeSet::new(), &self.algorithm)
             .into_iter()
             .map(|(expert, index)| (expert, self.state.policy.slots[index].expert))
             .collect::<Vec<_>>();
@@ -720,5 +726,162 @@ mod tests {
             .is_none()
         );
         assert_eq!(snapshot.experts[&e(3)], false); // Proposals never publish mappings.
+    }
+
+    #[test]
+    fn misses_during_interval_wait_are_retained_for_next_decision() {
+        use crate::parallax::residency::{
+            Backend, Binding, Capabilities, Controller, Location, Region,
+            execution::ExecutionBinding,
+        };
+        use crate::server::parallax::calibration::{Calibration, CopyCost};
+
+        struct StubBackend {
+            regions: Vec<Region>,
+            initial: Vec<Location>,
+        }
+        unsafe impl Backend for StubBackend {
+            fn regions(&self) -> &[Region] {
+                &self.regions
+            }
+            fn initial_location(&self, region: usize) -> Location {
+                self.initial[region]
+            }
+            fn has_backing(&self, region: usize) -> bool {
+                region != 0
+            }
+            fn slots(&self) -> usize {
+                4
+            }
+            fn slot_bytes(&self) -> usize {
+                64
+            }
+            fn backing_bytes(&self) -> usize {
+                self.regions.len() * 64
+            }
+            fn transfer_bytes(&self, _: usize) -> usize {
+                64
+            }
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    stable_addresses: true,
+                    asynchronous_staging: true,
+                    publication_requires_quiescence: true,
+                    cold_moe_execution_qualified: false,
+                }
+            }
+            fn address(&self, region: usize) -> u64 {
+                4096 + self.regions[region].offset as u64
+            }
+            fn stage(&mut self, _: &[(usize, usize)]) -> Result<(), Error> {
+                Ok(())
+            }
+            fn ready(&mut self) -> Result<bool, Error> {
+                Ok(true)
+            }
+            fn discard(&mut self) -> Result<(), Error> {
+                Ok(())
+            }
+            unsafe fn publish(&mut self, _: &[Binding]) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let regions = (0..4)
+            .map(|i| Region {
+                expert: e(i),
+                part: 0,
+                offset: i * 64,
+                bytes: 64,
+            })
+            .collect();
+        let initial = vec![
+            Location::Hbm(0),
+            Location::Hbm(1),
+            Location::Hbm(2),
+            Location::Backing,
+        ];
+        let controller =
+            Controller::new("window-misses".to_string(), StubBackend { regions, initial }).unwrap();
+        let binding = ExecutionBinding::new(controller);
+        let mut gate = unsafe { binding.claim() }.unwrap();
+
+        let mut profile = super::super::prediction_tests::profile("window-misses");
+        profile.model.identity = "window-misses".into();
+        profile.model.experts = (0..4).map(e).collect();
+        profile.hardware.bandwidth_bytes_per_ns = 10.;
+        profile.hardware.transfer_latency_ns = 5;
+        profile.hardware.transfer_calibration = Some(Calibration {
+            version: 1,
+            memory_path: "synthetic".into(),
+            gpu_uuid: "synthetic".into(),
+            elapsed_ns: 0,
+            host_to_device: Some(CopyCost {
+                bandwidth_bytes_per_ns: 10.,
+                latency_ns: 5,
+            }),
+            device_to_host: Some(CopyCost {
+                bandwidth_bytes_per_ns: 10.,
+                latency_ns: 5,
+            }),
+            samples: vec![],
+            failure: None,
+        });
+        profile.settings.initial_resident = Some(vec![e(0), e(1), e(2)]);
+        profile.settings.decayed_miss_lru = Some(DecayedMissLruConfig {
+            version: 1,
+            protected_experts: vec![e(0)],
+            window: 32,
+            min_misses: 1.0,
+            min_age_observations: 1,
+            max_promotions_per_layer: 1,
+            max_promotions_per_observation: 1,
+        });
+        let config = Config {
+            policy: Policy::DecayedMissLru,
+            interval_ns: 100_000_000,
+            valid_for_ns: 200_000_000,
+            publication_ns: 10_000_000,
+        };
+        let mut active = Active::new(&config, &profile, binding.clone()).unwrap();
+        let resident: BTreeSet<_> = [e(0), e(1), e(2)].into();
+
+        let make_record = |sequence: u64, available_ns: u64, counts: Vec<u32>| Record {
+            sequence,
+            graph: 0,
+            phase: "decode",
+            batch_size: 1,
+            concurrency: 1,
+            sample: RoutingSample {
+                submission: sequence,
+                residency_generation: Some(0),
+                gpu_ns: Some(100),
+                demand_lower_bound_ns: available_ns - 10_000_000,
+                available_ns,
+                layers: vec![LayerDemand {
+                    layer: 0,
+                    tokens: 1,
+                    top_k: 1,
+                    counts,
+                }],
+            },
+        };
+        // Frame 1 at t=100ms triggers decision with no misses -> advances next_ns to 200ms.
+        active.observe(&make_record(1, 100_000_000, vec![1, 1, 0, 0]), &resident, &profile, 100_000_000);
+        assert_eq!(active.proposed, 0);
+
+        // Frame 2 at t=150ms (inside interval wait) misses cold expert 3.
+        active.observe(&make_record(2, 150_000_000, vec![1, 0, 0, 4]), &resident, &profile, 150_000_000);
+        assert_eq!(active.proposed, 0);
+
+        // Frame 3 at t=210ms crosses next_ns with ZERO misses of its own;
+        // expert 3 from Frame 2 must still be proposed and committed!
+        active.observe(&make_record(3, 210_000_000, vec![1, 1, 0, 0]), &resident, &profile, 210_000_000);
+        assert_eq!(active.proposed, 1);
+        unsafe { gate.tick(215_000_000) }.unwrap();
+        let snap = binding.snapshot().unwrap();
+        assert_eq!(snap.generation, 1);
+        assert!(snap.experts[&e(3)]);
+        assert!(!snap.experts[&e(2)]);
     }
 }
