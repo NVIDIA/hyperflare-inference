@@ -20,7 +20,15 @@ from types import MethodType, SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from qualify.server import Run, comparable_message, digest, metric_delta, resource_totals, write_json
+from qualify.server import (
+    Run,
+    comparable_message,
+    digest,
+    metric_delta,
+    require_fixture_transformers,
+    resource_totals,
+    write_json,
+)
 
 
 SEEDS = (13, 29, 47, 71)
@@ -104,9 +112,7 @@ def prepare_fixture(args):
     torch.set_num_threads(1)
     golden_path = ROOT / "tests/frontend/qwen38_images.json"
     golden = json.loads(golden_path.read_text())
-    origin = json.loads(importlib.metadata.distribution("transformers").read_text("direct_url.json"))
-    if origin.get("vcs_info", {}).get("commit_id") != golden["transformers_commit"]:
-        raise ValueError("Transformers source differs from the canonical fixture pin")
+    require_fixture_transformers(golden)
     versions = {name: importlib.metadata.version(name) for name in golden["versions"]}
     if versions != golden["versions"] or torch.version.git_version != golden["torch_commit"]:
         raise ValueError("canonical processor dependencies differ from the pinned fixture")

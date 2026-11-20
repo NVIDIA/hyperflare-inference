@@ -34,7 +34,7 @@ from ignition.preparation.qwen38 import (
     FRONTEND_SHA256,
     MODEL_ID,
     REVISION,
-    TRANSFORMERS_REVISION,
+    TRANSFORMERS_VERSION,
 )
 
 from .provenance import digest, write_json
@@ -221,8 +221,8 @@ def prepare(args):
     import tokenizers
     from transformers import AutoTokenizer
 
-    origin = json.loads(importlib.metadata.distribution("transformers").read_text("direct_url.json") or "{}")
-    if origin.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_REVISION or tokenizers.__version__ != "0.23.2":
+    installed = importlib.metadata.version("transformers")
+    if installed != TRANSFORMERS_VERSION or tokenizers.__version__ != "0.23.2":
         raise ValueError("corpus generation requires the pinned Transformers/tokenizers versions")
     assets = {**FRONTEND_SHA256, "config.json": CONFIG_SHA256}
     for name, expected in assets.items():
