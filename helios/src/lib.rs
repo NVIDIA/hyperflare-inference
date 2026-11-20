@@ -19,6 +19,7 @@ pub mod offload;
 mod os;
 #[cfg(feature = "server")]
 pub mod output;
+pub mod parallax;
 #[cfg(feature = "runtime-core")]
 pub mod core;
 mod replay;
