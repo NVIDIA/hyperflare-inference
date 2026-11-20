@@ -823,8 +823,14 @@ class LowLatencyFP8Linear(nn.Module):
                     x_sf.fill_(0x7F7F7F7F)
                     out = torch.empty((rows, n), dtype=torch.bfloat16, device=device)
                     sf_scratch = torch.empty((128 * (k // 128),), dtype=torch.int32, device=device)
+
+                    def produce():
+                        x_fp8.zero_()
+                        x_sf.fill_(0x7F7F7F7F)
+
                     return PreparedCall(
                         run=lambda: state.run(x_fp8, x_sf, base.weight, self.weight_sf_f8, out, sf_scratch),
+                        produce=produce,
                         output=out,
                         owners=(base.weight, self.weight_sf_f8),
                     )
