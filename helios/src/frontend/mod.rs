@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use serde_json::{Map, Value as Json};
 use sha2::{Digest, Sha256};
-use tokenizers::Tokenizer;
+use tokenizers::{PostProcessor, Tokenizer};
 
 use crate::{Error, Failure, FrontendError, Result};
 
@@ -322,13 +322,291 @@ fn json_names(value: &Json, token: &str) -> bool {
     }
 }
 
-fn encode_text(tokenizer: &Tokenizer, text: &str, add_special_tokens: bool) -> Result<tokenizers::Encoding> {
-    tokenizer.encode(text, add_special_tokens).map_err(|error| {
-        Error::frontend(FrontendError::Tokenizer(Failure::boxed(
-            error.to_string(),
-            error,
-        )))
-    })
+const PARALLEL_ENCODE_MIN_BYTES: usize = 32 * 1024;
+const PARALLEL_ENCODE_MIN_CHUNK_BYTES: usize = 16 * 1024;
+const PARALLEL_ENCODE_MAX_THREADS: usize = 16;
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn normalizer_is_noop(normalizer: Option<&tokenizers::NormalizerWrapper>) -> bool {
+    match normalizer {
+        None => true,
+        Some(tokenizers::NormalizerWrapper::Sequence(seq)) => seq.as_ref().is_empty(),
+        _ => false,
+    }
+}
+
+fn pre_tokenizer_is_chunk_safe(pre: Option<&tokenizers::PreTokenizerWrapper>) -> bool {
+    use tokenizers::PreTokenizerWrapper as P;
+    match pre {
+        None => false,
+        Some(P::ByteLevel(bl)) => !bl.add_prefix_space,
+        Some(P::Split(_))
+        | Some(P::Whitespace(_))
+        | Some(P::WhitespaceSplit(_))
+        | Some(P::Delimiter(_))
+        | Some(P::Punctuation(_))
+        | Some(P::Digits(_))
+        | Some(P::UnicodeScripts(_))
+        | Some(P::BertPreTokenizer(_)) => true,
+        Some(P::Metaspace(m)) => {
+            m.prepend_scheme == tokenizers::pre_tokenizers::metaspace::PrependScheme::Never
+        }
+        Some(P::Sequence(seq)) => seq
+            .as_ref()
+            .iter()
+            .all(|child| pre_tokenizer_is_chunk_safe(Some(child))),
+        Some(P::FixedLength(_)) => false,
+    }
+}
+
+fn verify_split_boundary(
+    tokenizer: &Tokenizer,
+    text: &str,
+    cut: usize,
+    prev_cut: usize,
+    straddle_half: usize,
+) -> bool {
+    if cut <= prev_cut || cut >= text.len() || !text.is_char_boundary(cut) {
+        return false;
+    }
+    let win_start = floor_char_boundary(text, cut.saturating_sub(straddle_half).max(prev_cut));
+    let win_end = ceil_char_boundary(text, cut.saturating_add(straddle_half).min(text.len()));
+    if win_start >= cut || win_end <= cut {
+        return false;
+    }
+    let (Ok(full), Ok(left), Ok(right)) = (
+        tokenizer.encode(&text[win_start..win_end], false),
+        tokenizer.encode(&text[win_start..cut], false),
+        tokenizer.encode(&text[cut..win_end], false),
+    ) else {
+        return false;
+    };
+    let (l_ids, r_ids, f_ids) = (left.get_ids(), right.get_ids(), full.get_ids());
+    if l_ids.len() < 2 || r_ids.len() < 2 || l_ids.len() + r_ids.len() != f_ids.len() {
+        return false;
+    }
+    if !l_ids.iter().chain(r_ids.iter()).eq(f_ids.iter()) {
+        return false;
+    }
+    let rel_cut = cut - win_start;
+    left.get_offsets()
+        .iter()
+        .copied()
+        .chain(
+            right
+                .get_offsets()
+                .iter()
+                .map(|&(start, end)| (rel_cut + start, rel_cut + end)),
+        )
+        .eq(full.get_offsets().iter().copied())
+}
+
+fn find_parallel_chunks(
+    tokenizer: &Tokenizer,
+    text: &str,
+    add_special_tokens: bool,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if text.len() < PARALLEL_ENCODE_MIN_BYTES {
+        return None;
+    }
+    if !normalizer_is_noop(tokenizer.get_normalizer())
+        || !pre_tokenizer_is_chunk_safe(tokenizer.get_pre_tokenizer())
+    {
+        return None;
+    }
+    if add_special_tokens
+        && tokenizer
+            .get_post_processor()
+            .is_some_and(|p| p.added_tokens(false) > 0)
+    {
+        return None;
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(PARALLEL_ENCODE_MAX_THREADS)
+        .min(text.len() / PARALLEL_ENCODE_MIN_CHUNK_BYTES);
+    if threads < 2 {
+        return None;
+    }
+    let max_added_len = tokenizer
+        .get_added_vocabulary()
+        .get_vocab()
+        .keys()
+        .map(String::len)
+        .max()
+        .unwrap_or(0);
+    let straddle_half = max_added_len.max(256);
+    let bytes = text.as_bytes();
+    let mut cuts = Vec::with_capacity(threads - 1);
+    let mut prev_cut = 0usize;
+    for i in 1..threads {
+        let target = (text.len() * i) / threads;
+        let lo = target.max(prev_cut + 4096);
+        let hi = (target + 8192).min(text.len().saturating_sub(4096));
+        if lo >= hi {
+            continue;
+        }
+        // Prefer splitting right after a newline run; fall back to before an ASCII space
+        // for single-line payloads (e.g. minified JSON).
+        let mut candidate = None;
+        for pos in lo..hi {
+            if bytes[pos - 1] == b'\n'
+                && bytes[pos] != b'\n'
+                && bytes[pos] != b'\r'
+                && text.is_char_boundary(pos)
+            {
+                candidate = Some(pos);
+                break;
+            }
+        }
+        if candidate.is_none() {
+            for pos in lo..hi {
+                if bytes[pos - 1] != b' ' && bytes[pos] == b' ' && text.is_char_boundary(pos) {
+                    candidate = Some(pos);
+                    break;
+                }
+            }
+        }
+        if let Some(cut) = candidate
+            && verify_split_boundary(tokenizer, text, cut, prev_cut, straddle_half)
+        {
+            cuts.push(cut);
+            prev_cut = cut;
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut ranges = Vec::with_capacity(cuts.len() + 1);
+    let mut start = 0;
+    for cut in cuts {
+        ranges.push(start..cut);
+        start = cut;
+    }
+    ranges.push(start..text.len());
+    Some(ranges)
+}
+
+fn map_tokenizer_error(error: tokenizers::Error) -> Error {
+    Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+        error.to_string(),
+        error,
+    )))
+}
+
+fn encode_ids(tokenizer: &Tokenizer, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+    let Some(ranges) = find_parallel_chunks(tokenizer, text, add_special_tokens) else {
+        return tokenizer
+            .encode_fast(text, add_special_tokens)
+            .map(|encoding| encoding.get_ids().to_vec())
+            .map_err(map_tokenizer_error);
+    };
+    let parts = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len() - 1);
+        for range in &ranges[1..] {
+            let slice = &text[range.clone()];
+            handles.push(scope.spawn(move || {
+                tokenizer
+                    .encode_fast(slice, false)
+                    .map(|encoding| encoding.get_ids().to_vec())
+                    .map_err(map_tokenizer_error)
+            }));
+        }
+        let mut results = Vec::with_capacity(ranges.len());
+        results.push(
+            tokenizer
+                .encode_fast(&text[ranges[0].clone()], false)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(map_tokenizer_error),
+        );
+        for handle in handles {
+            results.push(handle.join().unwrap());
+        }
+        results
+    });
+    let mut total = 0usize;
+    let mut decoded = Vec::with_capacity(parts.len());
+    for part in parts {
+        let ids = part?;
+        total += ids.len();
+        decoded.push(ids);
+    }
+    let mut out = Vec::with_capacity(total);
+    for ids in decoded {
+        out.extend_from_slice(&ids);
+    }
+    Ok(out)
+}
+
+fn encode_with_offsets(
+    tokenizer: &Tokenizer,
+    text: &str,
+    add_special_tokens: bool,
+) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
+    let Some(ranges) = find_parallel_chunks(tokenizer, text, add_special_tokens) else {
+        let encoding = tokenizer
+            .encode(text, add_special_tokens)
+            .map_err(map_tokenizer_error)?;
+        return Ok((encoding.get_ids().to_vec(), encoding.get_offsets().to_vec()));
+    };
+    let parts = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(ranges.len() - 1);
+        for range in &ranges[1..] {
+            let start = range.start;
+            let slice = &text[range.clone()];
+            handles.push(scope.spawn(move || {
+                tokenizer
+                    .encode(slice, false)
+                    .map(|encoding| (start, encoding))
+                    .map_err(map_tokenizer_error)
+            }));
+        }
+        let mut results = Vec::with_capacity(ranges.len());
+        results.push(
+            tokenizer
+                .encode(&text[ranges[0].clone()], false)
+                .map(|encoding| (ranges[0].start, encoding))
+                .map_err(map_tokenizer_error),
+        );
+        for handle in handles {
+            results.push(handle.join().unwrap());
+        }
+        results
+    });
+    let mut total = 0usize;
+    let mut decoded = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (start, encoding) = part?;
+        total += encoding.get_ids().len();
+        decoded.push((start, encoding));
+    }
+    let mut ids = Vec::with_capacity(total);
+    let mut offsets = Vec::with_capacity(total);
+    for (start, encoding) in decoded {
+        ids.extend_from_slice(encoding.get_ids());
+        offsets.extend(
+            encoding
+                .get_offsets()
+                .iter()
+                .map(|&(a, b)| (start + a, start + b)),
+        );
+    }
+    Ok((ids, offsets))
 }
 
 pub struct Frontend {
@@ -655,12 +933,12 @@ impl Frontend {
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
-        encode_text(&self.tokenizer, text, add_special_tokens).map(|encoding| encoding.get_ids().to_vec())
+        encode_ids(&self.tokenizer, text, add_special_tokens)
     }
 
     /// Encodes `text` without the added vocabulary, so a spelled control stays ordinary text.
     pub fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>> {
-        encode_text(&self.ordinary_tokenizer, text, false).map(|encoding| encoding.get_ids().to_vec())
+        encode_ids(&self.ordinary_tokenizer, text, false)
     }
 
     pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
@@ -874,16 +1152,17 @@ impl Frontend {
             } else {
                 &self.ordinary_tokenizer
             };
-            let encoding = encode_text(tokenizer, &segment.text, false)?;
+            let (seg_ids, seg_offsets) = encode_with_offsets(tokenizer, &segment.text, false)?;
             let first = token_ids.len();
             if segmented {
-                token_ids.extend_from_slice(encoding.get_ids());
-                offsets.extend_from_slice(encoding.get_offsets());
+                token_ids.extend_from_slice(&seg_ids);
+                offsets.extend_from_slice(&seg_offsets);
             } else {
                 self.push_segment(
                     &segment.text,
                     &ordinary,
-                    &encoding,
+                    &seg_ids,
+                    &seg_offsets,
                     image_sources.len(),
                     &mut token_ids,
                     &mut offsets,
@@ -919,7 +1198,8 @@ impl Frontend {
         &self,
         text: &str,
         ordinary: &[std::ops::Range<usize>],
-        encoding: &tokenizers::Encoding,
+        ids: &[u32],
+        offsets: &[(usize, usize)],
         images: usize,
         ids_out: &mut Vec<u32>,
         offsets_out: &mut Vec<(usize, usize)>,
@@ -928,7 +1208,6 @@ impl Frontend {
             .tokenizer
             .get_added_vocabulary()
             .get_added_tokens_decoder();
-        let (ids, offsets) = (encoding.get_ids(), encoding.get_offsets());
         // An added token with lstrip or rstrip also covers adjacent whitespace, which may be
         // request text. Only the token's own bytes decide whether the request spelled it.
         let spelled = |at: usize| {
@@ -987,13 +1266,13 @@ impl Frontend {
         ids: &mut Vec<u32>,
         offsets: &mut Vec<(usize, usize)>,
     ) -> Result<()> {
-        let encoding = encode_text(&self.ordinary_tokenizer, &text[range.clone()], false)?;
-        ids.extend_from_slice(encoding.get_ids());
+        let (part_ids, part_offsets) =
+            encode_with_offsets(&self.ordinary_tokenizer, &text[range.clone()], false)?;
+        ids.extend_from_slice(&part_ids);
         offsets.extend(
-            encoding
-                .get_offsets()
-                .iter()
-                .map(|&(a, b)| (range.start + a, range.start + b)),
+            part_offsets
+                .into_iter()
+                .map(|(a, b)| (range.start + a, range.start + b)),
         );
         Ok(())
     }
@@ -1434,5 +1713,89 @@ mod tests {
             .unwrap();
         assert_eq!(rendered.text, "{\"text\": \"x\"}");
         assert!(rendered.marks.is_empty());
+    }
+
+    #[test]
+    fn parallel_encode_matches_sequential_ids_and_offsets_exactly() {
+        use tokenizers::models::bpe::{BPE, Vocab};
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        use tokenizers::pre_tokenizers::sequence::Sequence;
+        use tokenizers::pre_tokenizers::split::Split;
+        use tokenizers::{AddedToken, SplitDelimiterBehavior};
+
+        let mut vocab = Vocab::default();
+        let mut next_id = 0u32;
+        for ch in ByteLevel::alphabet() {
+            let key = ch.to_string();
+            if !vocab.contains_key(&key) {
+                vocab.insert(key, next_id);
+                next_id += 1;
+            }
+        }
+        for tok in ["Ġthe", "Ġquick", "Ġbrown", "Ġfox", "ĊĊ", "123", "json"] {
+            if !vocab.contains_key(tok) {
+                vocab.insert(tok.to_string(), next_id);
+                next_id += 1;
+            }
+        }
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(bpe);
+        let pre = Sequence::new(vec![
+            Split::new(
+                r"\s*[\r\n]+|\s+(?!\S)|\s+",
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+                .unwrap()
+                .into(),
+            ByteLevel::new(false, false, false).into(),
+        ]);
+        tokenizer.with_pre_tokenizer(Some(pre));
+
+        // 1. Multi-paragraph text exceeding PARALLEL_ENCODE_MIN_BYTES (32 KiB) with Unicode & CRLF.
+        let para = "The quick brown fox jumps over 123 lazy dogs! café 😀\n\nSecond line with\r\nCRLF and punctuation...\n";
+        let multi_para = para.repeat(900); // ~85 KiB
+        assert!(multi_para.len() > PARALLEL_ENCODE_MIN_BYTES * 2);
+        let chunks = find_parallel_chunks(&tokenizer, &multi_para, false).unwrap();
+        assert!(chunks.len() >= 2);
+        let seq = tokenizer.encode(multi_para.as_str(), false).unwrap();
+        let par_ids = encode_ids(&tokenizer, &multi_para, false).unwrap();
+        let (par_off_ids, par_offsets) = encode_with_offsets(&tokenizer, &multi_para, false).unwrap();
+        assert_eq!(par_ids, seq.get_ids());
+        assert_eq!(par_off_ids, seq.get_ids());
+        assert_eq!(par_offsets, seq.get_offsets());
+
+        // 2. Single-line minified text (no newlines — exercises ASCII space fallback).
+        let single_line = "the quick brown fox 123 json payload item ".repeat(2200);
+        assert!(single_line.len() > PARALLEL_ENCODE_MIN_BYTES * 2);
+        assert!(find_parallel_chunks(&tokenizer, &single_line, false).is_some());
+        let seq = tokenizer.encode(single_line.as_str(), false).unwrap();
+        let (par_off_ids, par_offsets) =
+            encode_with_offsets(&tokenizer, &single_line, false).unwrap();
+        assert_eq!(par_off_ids, seq.get_ids());
+        assert_eq!(par_offsets, seq.get_offsets());
+
+        // 3. Added vocabulary token near split boundaries must remain bit-identical.
+        let mut with_added = tokenizer.clone();
+        let _ = with_added.add_special_tokens([AddedToken::from("<|special|>", true)]);
+        let with_ctrl = format!("{}\n<|special|>\n{}", para.repeat(450), para.repeat(450));
+        let seq = with_added.encode(with_ctrl.as_str(), false).unwrap();
+        let (par_off_ids, par_offsets) =
+            encode_with_offsets(&with_added, &with_ctrl, false).unwrap();
+        assert_eq!(par_off_ids, seq.get_ids());
+        assert_eq!(par_offsets, seq.get_offsets());
+
+        // 4. add_prefix_space=true must disable chunk splitting and stay exact.
+        let mut prefixed = tokenizer.clone();
+        prefixed.with_pre_tokenizer(Some(ByteLevel::new(true, false, false)));
+        assert!(find_parallel_chunks(&prefixed, &multi_para, false).is_none());
+        let seq = prefixed.encode(multi_para.as_str(), false).unwrap();
+        let (par_off_ids, par_offsets) =
+            encode_with_offsets(&prefixed, &multi_para, false).unwrap();
+        assert_eq!(par_off_ids, seq.get_ids());
+        assert_eq!(par_offsets, seq.get_offsets());
     }
 }
