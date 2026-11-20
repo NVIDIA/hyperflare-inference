@@ -129,9 +129,12 @@ the checkpoint identifier or any alias, including repository IDs with slashes.
 Unknown names return a JSON 404.
 See [the API reference](../docs/api.md) for discovery fields and generation routes.
 HTTP admission reserves at most `queue_capacity + max_active` requests before
-reading JSON bodies. Admitted requests await a bounded CPU preparation worker;
-each of the `frontend_workers` permits, two by default, prepares one request at
-a time.
+reading JSON bodies. Admitted requests await one of `frontend_workers` CPU
+preparation permits (two by default), so at most `frontend_workers` requests
+prepare concurrently. `frontend_workers` also caps the shared thread budget
+(`min(frontend_workers, available_parallelism(), 16)`) for parallel long-prompt
+tokenization, bounding the helper threads any preparing request can borrow
+alongside its own worker thread.
 `ignition` cores set the queue to four times the concurrency limit, one worker per
 concurrent request, and a body limit of the recipe's per-image byte allowance
 times its image limit plus 32 bytes per context token.
