@@ -712,13 +712,13 @@
     run or is removed from the qualification statement in
     docs/model-preparation.md.
 
-[ ] Validate the shared Messages block-cache hint on the GLM 5.3 core
-    (tests/server/test_protocols.py). The frontend emits the hinted cut.
-    A changed suffix reused zero tokens in the served test, and the
-    scheduler counted a work-budget rejection after prefill costs became
-    available. Measure the selected cuts, snapshot and prefill cost
-    estimates, and remaining budget for that request. Close when an
-    admitted hinted checkpoint is restored and its continuation verified.
+[ ] Reproduce the scheduler's numerical work allowance for an advisory
+    Messages block hint. On a GLM 5.3 TP8 core with measured prefill costs,
+    a 1132-token prompt restored its 1120-token hinted prefix after a suffix
+    change at extra-work fraction 1. Fraction 0 recorded a work-budget skip
+    and restored zero tokens. Aggregate metrics omit the request's reserved
+    work and per-cut costs. Close when those inputs independently predict the
+    admission threshold for the same prompt.
 
 [ ] Add `glm53_full` to the sampling-defaults table in docs/api.md and to the
     speculative catalog description in docs/cli-design.md. Close when both

@@ -55,6 +55,13 @@ def message_input_tokens(usage):
     return usage.input_tokens + (usage.cache_read_input_tokens or 0) + (usage.cache_creation_input_tokens or 0)
 
 
+def service_metrics(http):
+    response = http.get("/metrics")
+    response.raise_for_status()
+    samples = (line.rsplit(" ", 1) for line in response.text.splitlines() if line and not line.startswith("#"))
+    return {key: float(value) for key, value in samples}
+
+
 def test_model_discovery_and_lookup(clients):
     o, _, http = clients
     listed = http.get("/v1/models")
@@ -201,7 +208,7 @@ def test_raw_completion_batch_and_zero_tokens(clients):
 
 @pytest.mark.parametrize("hinted", [False, True])
 def test_messages_block_hint_reuses_history_after_suffix_changes(clients, hinted):
-    _, anthropic, _ = clients
+    _, anthropic, http = clients
     history = {"type": "text", "text": f"History {time.time_ns()}. "
                + "An earlier action read a file and checked its output.\n" * 100}
     if hinted:
@@ -211,18 +218,36 @@ def test_messages_block_hint_reuses_history_after_suffix_changes(clients, hinted
     anthropic.messages.create(
         messages=[{"role": "user", "content": "Warm the shared message preamble."}], **kwargs,
     )
+    before = service_metrics(http)
     first = anthropic.messages.create(
         messages=[{"role": "user", "content": blocks}], **kwargs,
     )
+    captured = service_metrics(http)
     blocks[1] = {"type": "text", "text": "Second action: run the tests. Reply OK."}
     history.pop("cache_control", None)
     second = anthropic.messages.create(
         messages=[{"role": "user", "content": blocks}], **kwargs,
     )
-    reused = (second.usage.cache_read_input_tokens or 0) - (first.usage.cache_read_input_tokens or 0)
-    if hinted:
-        assert reused > 500
+    restored = service_metrics(http)
+    cached = second.usage.cache_read_input_tokens or 0
+    assert cached == sum(restored[key] - captured[key] for key in (
+        "flare_cache_reused_tokens_total", "flare_host_cache_reused_tokens_total",
+    ))
+    reused = cached - (first.usage.cache_read_input_tokens or 0)
+    if not hinted:
+        assert reused == 0
+    elif reused > 500:
+        assert captured["flare_snapshot_publications_total"] > before["flare_snapshot_publications_total"]
     else:
+        # The changed suffix rules out restoring the first request's end. A skip can
+        # explain zero additional reuse only when the request published no interior cut.
+        message = 'flare_checkpoint_captures_total{role="message"}'
+        assert captured[message] == before[message]
+        assert any(captured[key] > before[key] for key in (
+            'flare_checkpoint_skips_total{reason="unknown_cost"}',
+            'flare_checkpoint_skips_total{reason="work_budget"}',
+            'flare_checkpoint_skips_total{reason="storage"}',
+        ))
         assert reused == 0
 
 
@@ -689,14 +714,10 @@ def test_mixed_endpoint_concurrency(clients):
 
 def test_batch_validation_and_disconnect_release_admission(clients):
     _, _, http = clients
-    def metrics():
-        response = http.get("/metrics")
-        response.raise_for_status()
-        return {key: float(value) for line in response.text.splitlines() if line and not line.startswith("#") for key, value in [line.rsplit(" ", 1)]}
-    before = metrics()
+    before = service_metrics(http)
     invalid = http.post("/v1/completions", json={"prompt": [[1], [4294967295]], "max_tokens": 8})
     assert invalid.status_code == 400
-    assert metrics()["flare_requests_admitted_total"] == before["flare_requests_admitted_total"]
+    assert service_metrics(http)["flare_requests_admitted_total"] == before["flare_requests_admitted_total"]
     with http.stream("POST", "/v1/completions", json={"prompt": ["Count the positive integers:"], "n": 4, "max_tokens": 4096, "ignore_eos": True, "stream": True, "temperature": 1}) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -705,7 +726,7 @@ def test_batch_validation_and_disconnect_release_admission(clients):
                 break
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        after = metrics()
+        after = service_metrics(http)
         if after["flare_active_requests"] == 0 and after["flare_http_inflight_requests"] == 0:
             break
         time.sleep(0.02)
