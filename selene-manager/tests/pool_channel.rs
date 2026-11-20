@@ -10,7 +10,7 @@
 mod support;
 
 use selene_manager::{Key, proto::v2};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::{
     channel::{self, Ended, Security},
     content_for, descriptor, key,
@@ -432,19 +432,34 @@ async fn d7_a_corrupt_put_and_a_cancelled_put_over_the_channel() {
         PutResult::Refused(_) => {}
         other => panic!("{other:?}"),
     }
-    // Both ended; the record stores cleanly.
-    match channel::put_record(
-        &mut writer,
-        &Security::Plain,
-        3,
-        key(1024),
-        None,
-        Damage::default(),
-    )
-    .await
-    {
-        PutResult::Stored(bytes) => assert!(bytes > 0),
-        other => panic!("{other:?}"),
+    // Both ended; the record stores cleanly. A store pump admits a queued Begin before it
+    // releases the keys of cancelled puts, so a Begin queued with the cancel is refused
+    // Inflight; the writer retries with a new put id, since put ids must increase.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for id in 3.. {
+        match channel::put_record(
+            &mut writer,
+            &Security::Plain,
+            id,
+            key(1024),
+            None,
+            Damage::default(),
+        )
+        .await
+        {
+            PutResult::Stored(bytes) => {
+                assert!(bytes > 0);
+                break;
+            }
+            PutResult::Refused(refused) if refused.reason == v2::Reason::Inflight as i32 => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the cancelled put did not settle"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
 
