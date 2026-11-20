@@ -42,13 +42,42 @@ def _gb10(count):
     return tuple(planning.Gpu(i, "GB10", f"GPU-{i}", 121 << 30, 115 << 30, (12, 1)) for i in range(count))
 
 
-def test_four_gb10_hosts_fit_the_declared_configuration():
+@pytest.mark.parametrize("concurrency, chunk", [(8, 4096), (32, 8192)])
+def test_four_gb10_hosts_fit_the_declared_and_the_largest_configuration(concurrency, chunk):
     plan = planning.plan(recipe.RECIPE, recipe.RECIPE.checkpoints[0], _gb10(4), selected=(0, 1, 2, 3),
-                         concurrency=8, reserve_bytes=4 << 30, speculation=recipe.RECIPE.speculation,
-                         prefill_chunk=4096)
+                         concurrency=concurrency, reserve_bytes=4 << 30, speculation=recipe.RECIPE.speculation,
+                         prefill_chunk=chunk)
     assert plan.fits and plan.world_size == 4
-    assert (plan.concurrency, plan.prefill_chunk) == (8, 4096)
+    assert (plan.concurrency, plan.prefill_chunk, plan.speculative_token_capacity) == (concurrency, chunk, 128)
     assert plan.guaranteed_tokens >= planning.MINIMUM_REQUEST_TOKENS
+
+
+def test_request_capacity_is_bounded_by_thirty_two():
+    from ignition.errors import UsageError
+
+    assert bootstrap.PreparationConfig(max_active=32, prefill_chunk_size=8192).max_active == 32
+    with pytest.raises(ValueError, match=r"\[1, 32\]"):
+        bootstrap.PreparationConfig(max_active=33)
+    with pytest.raises(UsageError, match="must be 1 through 32"):
+        planning.plan(recipe.RECIPE, recipe.RECIPE.checkpoints[0], _gb10(4), selected=(0, 1, 2, 3),
+                      concurrency=33, reserve_bytes=4 << 30, speculation=recipe.RECIPE.speculation)
+
+
+def test_thirty_two_requests_size_rounds_scratch_rows_and_prefill_graphs():
+    default_eight = bootstrap.PreparationConfig(max_active=8)
+    legacy_eight = bootstrap.PreparationConfig(max_active=8, speculative_token_capacity=64)
+    # At concurrency 8, 8 * 8 = 64 <= 128, so the 128-token default preserves the exact 8-request graph catalog.
+    assert default_eight.speculative_round_shapes == legacy_eight.speculative_round_shapes
+    assert (default_eight.decode_tokens, default_eight.decode_samples) == (64, 64)
+
+    config = bootstrap.PreparationConfig(max_active=32, prefill_chunk_size=8192)
+    shapes = config.speculative_round_shapes
+    assert {batch for batch, _, _ in shapes} == {1, 2, 4, 8, 16, 32}
+    assert all(packed <= 128 for _, _, packed in shapes) and (32, 8, 128) in shapes and (32, 1, 32) in shapes
+    # Packed verification bounds target rows; every request still samples each of its eight positions.
+    assert (config.decode_tokens, config.decode_samples) == (128, 256)
+    assert config.image_concurrency == 4
+    assert bootstrap.prefill_capacities(8192)[-1] == 8192
 
 
 @pytest.mark.parametrize("remote", [False, True])
@@ -73,6 +102,18 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
     assert config.max_active == 8 and config.drafting and config.vision and config.draft_tokens == 7
     assert kwargs["ranks"] is ranks and kwargs["checkpoint"] is plan.checkpoint
     assert kwargs["core_storage"] is storage
+
+
+def test_remote_capacities_follow_thirty_two_requests_and_8192_token_chunks(monkeypatch):
+    config = bootstrap.PreparationConfig(devices=(0,) * 4, hosts=HOSTS, max_active=32, prefill_chunk_size=8192)
+    calls = []
+    monkeypatch.setattr(bootstrap, "create_roce_runtime", lambda group, device, **kwargs: calls.append(kwargs))
+    bootstrap._collective_runtimes(config, None, None, coordinator=SimpleNamespace(spans_hosts=True),
+                                   core_storage=None, **GEOMETRY)
+    (call,) = calls
+    # The drafter reduces an eight-position block of each of 32 requests in one shot.
+    assert call["max_tokens"] == 32 * DRAFT_BLOCK == 256 and call["pipe_tokens"] == 8192
+    assert call["gather_bytes"] == 256 * LOCAL_VOCABULARY * 4
 
 
 @pytest.mark.parametrize("drafting", [False, True])

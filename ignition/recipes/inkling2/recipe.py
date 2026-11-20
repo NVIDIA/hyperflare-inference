@@ -57,8 +57,8 @@ RECIPE = Recipe(name="inkling2", served_model_name="Inkling-2-Small-NVFP4", prep
     checkpoints=(Checkpoint(alias="inkling-2-small-nvfp4", repository="/data/models/Inkling-2-Small-NVFP4",
         revision="local", architecture="Inkling2ForConditionalGeneration", stored_bytes=344_366_116_864,
         device_bytes=344_366_116_864, expansion_bytes=5_673_717_760, draft_bytes=2_684_203_392),),
-    context=1048576, page_tokens=128, concurrency=8, max_concurrency=8, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=64, packed_verification=True, graph_budget=64),
+    context=1048576, page_tokens=128, concurrency=8, max_concurrency=32, prefill_chunk=4096,
+    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64),
     max_draft_tokens=7, max_images=4, image_bytes=32 << 20, verification_rows=0, language_model_only=True,
     ranks=MappingProxyType({4: RankCosts(31_293_440, 655_360, 5 << 30)}),
     plain_ranks=MappingProxyType({4: RankCosts(26_935_296, 524_288, 5 << 30)}))

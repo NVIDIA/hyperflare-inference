@@ -16,11 +16,12 @@ from tests.cli.test_planning import derive, gpu
 def test_inkling_defaults_cover_tp4_seven_drafts_and_vision():
     assert RECIPE.tensor_parallel == (4,)
     assert (RECIPE.context, RECIPE.concurrency, RECIPE.prefill_chunk) == (1048576, 8, 4096)
+    assert RECIPE.max_concurrency == 32
     assert (RECIPE.max_images, RECIPE.image_bytes) == (4, 32 << 20)
     model = ResolvedModel(RECIPE, RECIPE.checkpoints[0])
     args = _parser().parse_args(["export", model.checkpoint.alias])
     speculation = preparation.speculation(args, model)
-    assert (speculation.draft_tokens, speculation.token_capacity, speculation.graph_budget) == (7, 64, 64)
+    assert (speculation.draft_tokens, speculation.token_capacity, speculation.graph_budget) == (7, 128, 64)
     assert speculation.packed_verification
     assert speculation.widths == tuple(range(1, 9))
 
@@ -52,5 +53,5 @@ def test_inkling_adapter_preserves_uncompiled_untuned_qualification(monkeypatch,
     assert config.max_active == 8
     assert config.drafting and config.vision
     assert config.speculative_widths == tuple(range(1, 9))
-    assert config.speculative_token_capacity == 64
+    assert config.speculative_token_capacity == 128
     assert config.speculative_graph_budget == 64
