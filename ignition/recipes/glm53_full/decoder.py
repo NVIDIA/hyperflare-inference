@@ -151,10 +151,10 @@ class PreparedLayer:
         if self.indexer is not None:
             self.indexer.store(key, metadata, angles)
 
-    def attention_part(self, hidden, metadata, angles, selection):
+    def attention_part(self, hidden, metadata, angles, selection, *, reuse_selection=False):
         """This rank's part of the attention update, and the selection the layer attended to."""
         projected = self.attention.project(self._normalized(hidden, "input_layernorm"), metadata, angles)
-        if self.indexer is not None:
+        if self.indexer is not None and not reuse_selection:
             selection = self.indexer(projected.query_residual, projected.index_key, projected.index_weights,
                                      metadata, angles)
         elif selection is None:
@@ -165,8 +165,8 @@ class PreparedLayer:
         """This rank's part of the MLP update."""
         return self.mlp(self._normalized(hidden, "post_attention_layernorm"))
 
-    def __call__(self, hidden, metadata, angles, selection: Selection | None):
-        part, selection = self.attention_part(hidden, metadata, angles, selection)
+    def __call__(self, hidden, metadata, angles, selection: Selection | None, *, reuse_selection=False):
+        part, selection = self.attention_part(hidden, metadata, angles, selection, reuse_selection=reuse_selection)
         hidden = torch.add(hidden, self.attention_reduce(part))
         return torch.add(hidden, self.mlp_reduce(self.mlp_part(hidden))), selection
 

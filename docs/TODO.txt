@@ -700,11 +700,12 @@
     views. Close when an export and replay on each recipe's supported rank
     count validate these operands.
 
-[ ] Validate the GLM 5.3 draft layer (decoder layer 78) against an external
-    forward. Transformers 5.23 does not execute it; the recipe follows the
-    GLM 5.3 Flash draft layout. Served rounds emit about three tokens per
-    round, which no reference confirms. Close when a reference forward of
-    layer 78 exists and tests/recipes compares the prepared layer with it.
+[ ] Qualify the first and recursive GLM 5.3 draft steps against independent
+    layer 78 execution. With 2305 tokens of teacher-forced context, first-step
+    attention differed from an FP32 Transformers layer using the draft
+    weights by 0.0184 relative L2. Twice the BF16 reference error was 0.0166.
+    Close when both steps meet their intermediate and logit bounds and the
+    same checks reject a shifted position and incorrect preceding state.
 
 [ ] Run the GLM 5.3 checks that have not run: concurrency above eight and a
     component test of the draft round in tests/recipes. Close when each has
@@ -725,8 +726,5 @@
 
 [ ] Include the GLM 5.3 draft layer's replicated tensors, about 0.18 GB per
     rank, in the checkpoint's declared expansion bytes
-    (`ignition/recipes/glm53_full/recipe.py`), and implement or reject the
-    checkpoint's `index_share_for_mtp_iteration` option, which would reuse one
-    indexer selection across draft steps. Close when the planner's estimate
-    with drafts equals loaded bytes within the graph allowance and the option
-    is decided.
+    (`ignition/recipes/glm53_full/recipe.py`). Close when the declared
+    expansion accounts for the replicated tensors in the loaded draft weights.

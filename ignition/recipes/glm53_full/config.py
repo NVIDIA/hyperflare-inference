@@ -43,6 +43,8 @@ class ModelConfig:
         for key, expected in _REQUIRED.items():
             if raw.get(key) != expected or type(raw.get(key)) is not type(expected):
                 raise ValueError(f"GLM 5.3 {key} requires {expected!r}, got {raw.get(key)!r}")
+        if type(raw.get("index_share_for_mtp_iteration", False)) is not bool:
+            raise ValueError("GLM 5.3 index_share_for_mtp_iteration must be boolean")
         rope = raw.get("rope_parameters")
         if (not isinstance(rope, dict) or rope.get("rope_type") != "default"
                 or type(rope.get("rope_theta")) not in (int, float) or rope["rope_theta"] <= 0):

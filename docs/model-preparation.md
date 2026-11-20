@@ -801,19 +801,23 @@ image content are rejected.
 
 Implemented and qualified on eight RTX PRO 6000 Blackwell Max-Q GPUs (SM120,
 96 GB each) at the default capacities: export with compiled forwards with
-and without learned drafts, and serving through `flare run`. Loading the
-core with learned drafts places 62.96 GiB of fixed data on each GPU and
-leaves a cache of 613,632 tokens and 2268 snapshot slots. On three sampled
-continuations, ordinary decode re-scored 279 tokens emitted with drafts.
+and without learned drafts, and serving through `flare run`. A core prepared
+with separate index selections per draft step used 62.96 GiB of fixed data
+on each GPU and had capacity for 613,632 cached tokens and 2268 snapshots.
+On three sampled continuations from that core, ordinary decode re-scored 279 tokens emitted with drafts.
 The mean absolute difference in their pre-sampling log probabilities was
 0.039. This comparison measures scores for tokens already drawn.
 Equivalence of the sampled distributions and agreement of the draft layer
 with an independent implementation are unqualified.
 
-The checkpoint requests index reuse between recursive drafts through
-`index_share_for_mtp_iteration`. The recipe runs the indexer at each
-draft step. Other rank counts, concurrency above eight, multi-host serving,
-and SM103 and SM121 hardware are unqualified.
+With the checkpoint's `index_share_for_mtp_iteration` setting enabled,
+the first proposal in a round selects sparse attention records for each
+request. Recursive proposals reuse the same physical records. A request
+that stops proposing contributes no further draft records. The target's
+accepted context rebuilds the committed draft keys before another round.
+Index sharing takes effect when the draft graphs are exported. Other rank
+counts, concurrency above eight, multi-host serving, and SM103 and SM121
+hardware are unqualified.
 
 ## DeepSeek V4.1 Flash
 

@@ -23,9 +23,9 @@ Draft records are written from two sources:
   context of the next forward overwrites its record before any row reads it as
   context of an accepted position.
 
-Status: implemented. No Transformers class runs this layer, so its numerical
-behavior has no external reference; the measured acceptance rate of its
-proposals is the available evidence.
+When the checkpoint requests index sharing, the first proposal selects the
+records for each request. Recursive proposals read those records while writing
+their own latent records. Accepted context rebuilds the committed index keys.
 """
 
 import torch
@@ -39,7 +39,7 @@ from ignition.components.rotary import PreparedRotaryAngles
 from ignition.components.state import gather_rows
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
-from .attention import PAGE_TOKENS, AttentionMetadata, ExampleBuffers, rotary_frequencies
+from .attention import PAGE_TOKENS, AttentionMetadata, ExampleBuffers, Selection, rotary_frequencies
 from .decoder import HIDDEN, VOCABULARY, PreparedLayer
 
 
@@ -76,8 +76,8 @@ class PreparedDraftLayer:
         self.angles.functional()
         self.layer.functional(session=session)
 
-    def __call__(self, embedded, previous, positions, requests, page_table):
-        """Return the draft layer's output for rows whose `positions` are draft positions, or None when cache-only."""
+    def __call__(self, embedded, previous, positions, requests, page_table, selection=None):
+        """Store draft records and, for proposal rows, return hidden states and the attended records."""
         placement = draft_placement(positions, requests, page_table)
         embedded = embedded.masked_fill((positions == 0)[:, None], 0)
         joined = torch.empty((embedded.shape[0], 2 * HIDDEN), dtype=torch.bfloat16, device=embedded.device)
@@ -88,8 +88,7 @@ class PreparedDraftLayer:
         if self.cache_only:
             self.layer.store(residual, placement, angles)
             return None
-        hidden, _ = self.layer(residual, placement, angles, None)
-        return hidden
+        return self.layer(residual, placement, angles, selection, reuse_selection=selection is not None)
 
 
 class PreparedContext:
@@ -129,8 +128,9 @@ class PreparedProposals:
     """One draft step for every request of a speculative round.
 
     Step `i` runs the draft row at position `before - 1 + i`, where `before`
-    is the request's consumed token count, and returns vocabulary logits and
-    the draft's normalized output, which the next step joins with its token.
+    is the request's consumed token count. Each step returns vocabulary logits
+    and the normalized output that the following step joins with its token.
+    A shared index selection lives only within this round.
     """
 
     def __init__(self, weights, pool, inputs, batch, depth, *, runtime, vocabulary_runtime, coordinator, session,
@@ -139,6 +139,7 @@ class PreparedProposals:
         buffers = ExampleBuffers(device) if buffers is None else buffers
         self.pool, self.inputs, self.batch, self.depth = pool, inputs, batch, depth
         self.weights, self.eps = weights, weights.config.norm_eps
+        self.share_indices = weights.config.raw.get("index_share_for_mtp_iteration", False)
         self.logit_shape, self.logit_dtype = (batch, VOCABULARY), torch.bfloat16
         self.layer = self.embedding = self.head = None
         if depth == 0:
@@ -161,20 +162,24 @@ class PreparedProposals:
         self.logits = None
 
     def begin(self, states):
-        """The target's last normalized hidden state of every request."""
+        """Start each round with the saved target hidden state and no preceding draft selection."""
         previous = torch.empty((self.batch, HIDDEN), dtype=torch.bfloat16, device=states.device)
-        return gather_rows(self.pool.last_hidden, states, previous)
+        return gather_rows(self.pool.last_hidden, states, previous), None
 
-    def step(self, previous, index, tokens, before, states, active, proposing):
+    def step(self, state, index, tokens, before, states, active, proposing):
+        previous, selection = state
         slots = self.inputs.row_slot_ids[:self.batch].long().clamp(0, self.inputs.page_tables.shape[0] - 1)
         requests = torch.arange(self.batch, device=tokens.device)
         positions = torch.where(proposing, before - 1 + index, -1)
         count = torch.full((1,), self.batch, dtype=torch.int32, device=tokens.device)
         embedded = self.embedding(token_ids=torch.where(proposing, tokens, 0), num_rows=count)
-        hidden = self.layer(embedded, previous, positions, requests, self.inputs.page_tables[slots])
+        if selection is not None:
+            selection = Selection(torch.where(proposing[:, None], selection.records, -1),
+                                  torch.where(proposing, selection.lengths, 0))
+        hidden, selection = self.layer(embedded, previous, positions, requests, self.inputs.page_tables[slots], selection)
         normalized = torch.empty_like(hidden)
         rms_norm(hidden, self.weights.draft.head_norm, normalized, self.eps, round_before_weight=True)
-        return self.head(normalized), normalized
+        return self.head(normalized), (normalized, selection if self.share_indices else None)
 
     def finish(self, previous, before, states, active):
         """Proposals keep no state between rounds: accepted context rewrites the records they stored."""
