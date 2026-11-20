@@ -244,6 +244,23 @@ def test_mxfp8_draft_experts_preserve_tp_partitions(manifest):
             assert torch.equal(scales.cpu().view(torch.uint8), expected_scales.view(torch.uint8))
 
 
+@cuda
+def test_nvfp4_draft_head_bytes_match_the_declared_expansion():
+    from ignition.components.vocabulary import nvfp4_draft_head
+    from ignition.preparation.persistent import allocated_tensor_bytes
+    from ignition.recipes import resolve
+
+    device = torch.device("cuda:0")
+    shard = torch.randn(154880 // 4, 4096, device=device).bfloat16()
+    before = allocated_tensor_bytes(device)
+    head = nvfp4_draft_head(shard)
+    torch.cuda.synchronize(device)
+    # Four shards, each within the allocator's 512-byte rounding of the declared bytes.
+    declared = resolve("glm-5.3-flash-nvfp4").checkpoint.expansion_bytes
+    measured = 4 * (allocated_tensor_bytes(device) - before)
+    assert abs(measured - declared) <= 4 * 512, (measured, declared, type(head))
+
+
 def assert_projection(manifest, packed, name, *, rows=None, columns=None, output_rows=None):
     """Compare a loaded projection with its checkpoint slice: BF16 tensors exactly, MXFP8 values and scales."""
     if not isinstance(packed, torch.Tensor):

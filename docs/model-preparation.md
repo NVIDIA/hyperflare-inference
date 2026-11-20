@@ -528,17 +528,68 @@ use the same prepared model graphs; the flag selects table storage only.
 
 ## GLM 5.3 Flash
 
-The `glm-5.3-flash` recipe uses `nvidia/GLM-5.3-Flash-FP4-Local` and supports
-one, two, or four GPUs, including TP1 on DGX Station. Its logical context is
-1,048,576 tokens; the default 4096-token prefill chunk controls graph execution
-size independently of that context.
+The GLM recipe supports one, two, or four GPUs, including TP1 on DGX Station.
+Its logical context is 1,048,576 tokens; the default 4096-token prefill chunk
+controls graph execution size independently of that context. The
+`glm-5.3-flash` alias selects `nvidia/GLM-5.3-Flash-FP4-Local`.
 
-Projection formats follow the checkpoint's ModelOpt declarations. The target
-decoder uses MXFP8 for KDA Q/K/V, dense MLPs, and the vocabulary head;
+`glm-5.3-flash-nvfp4` selects
+`local-inference-lab/GLM-5.3-Flash-NVFP4@378ca54585c46542bad1f3cb3ed0d73ae51cdb62`.
+It retains BF16 text and vision projections, calibrated NVFP4 target experts,
+and MXFP8 draft experts. Target sampling retains the BF16 vocabulary head. The
+draft layer proposes with an NVFP4 copy of that head, quantized at load;
+verification uses the BF16 head.
+
+This checkpoint is qualified on four SM120 GPUs at TP4 only: it exports with
+every warmup and capture and serves, and its first-token log probabilities on
+token-ID prompts differ from vLLM's by no more than two vLLM runs differ from
+each other. GIF and JPEG image answers are less reliable than vLLM's. TP1, TP2,
+SM103 and SM121 are not qualified; `docs/TODO.txt` lists the open checks. Its
+MXFP8 draft experts require SM120 or
+SM121. On SM103, preparation refuses them before any rank starts unless
+speculation is disabled with `--no-mtp`. Its indexed weights total
+198,042,331,512 bytes; split evenly across two GPUs they occupy 99,021,165,756
+bytes (92.2 GiB) each, before replicated tensors and runtime allocations.
+
+Routed-expert activation precision differs between the two checkpoints. On SM120
+and SM121 the calibrated checkpoint's target experts, declared plain NVFP4, run
+NVFP4 activations (A4) at every batch size, and its MXFP8 draft experts run
+MXFP8 activations (A8). The NVIDIA checkpoint's target experts, declared with
+compressed block scales, run 16-bit activations (A16) for decode with A4 launches
+for prefill, and its draft experts run A16. A comparison between the two
+checkpoints, or against another runtime, accounts for this difference. The
+chat template's default reasoning effort is max, so a runtime that defaults to
+another effort renders different prompts unless the request names the effort.
+
+The NVIDIA alias annotates matching bundled template bytes locally. The
+calibrated checkpoint's pinned bundled digest selects the canonical inference
+template from `zai-org/GLM-5.3-Flash@46a050bec13002ad29ee795c16e61cf4fa3c4a9c`,
+downloaded through the configured hub cache once, before any rank starts, so a
+failed download is reported from the command line at every rank count. The
+model author's template defines the prompts, and the canonical copy differs
+from the checkpoint's bundled copy in one rendered way: a message with null
+content, such as an assistant message that only calls tools, renders no text,
+where the bundled copy writes the word `None` into the history. Tool results
+render identically (the bundled copy matches them by scanning, the canonical
+one by sorting). Unknown bundled bytes
+are rejected with their digest. The template is not part of the checkpoint
+snapshot, so downloading the checkpoint does not fetch it. An offline host needs
+that revision in its hub cache before export. On a connected host, run
+
+```sh
+hf download zai-org/GLM-5.3-Flash chat_template.jinja \
+    --revision 46a050bec13002ad29ee795c16e61cf4fa3c4a9c --cache-dir <hub cache>
+```
+
+and copy the resulting cache entries to the offline host's hub cache.
+
+Projection formats follow each checkpoint's ModelOpt declarations. The NVIDIA
+checkpoint uses MXFP8 for KDA Q/K/V, dense MLPs, and the vocabulary head;
 block-FP8 with FP32 scales for MLA projections and shared experts; and BF16 for
 recurrent gates, indexer projections, and MLA key/value absorption. Compatible
 projections are fused within each precision group. Normalization retains BF16
-or FP32 checkpoint weights. Learned drafts use the target MXFP8 vocabulary head.
+or FP32 checkpoint weights. On the NVIDIA checkpoint, learned drafts use the
+target MXFP8 vocabulary head.
 
 Image preparation includes the checkpoint's replicated vision tower and native
 image processor. The tower merges four patches into each image feature, with

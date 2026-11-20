@@ -393,6 +393,57 @@
     atomic-reduction paths: component bounds on matched operands and measured
     repeatability. See core-design.md.
 
+[ ] Qualify glm-5.3-flash-nvfp4 at TP1 and TP2 and on SM103 and SM121; only TP4 on
+    SM120 has been qualified. Run the CUDA-gated tests (FLARE_RUN_CUDA_TESTS=1) in
+    tests/recipes/test_glm53_weights.py, test_glm53_mla_cuda.py,
+    test_glm53_nvidia_weights.py, test_glm53_moe_overlap.py and
+    test_glm53_vision.py, and tests/components/test_weight_formats_cuda.py, then
+    export, serve, run image requests and compare first-token log probabilities
+    with a reference. At TP1 and TP2 the loader allocates 453 MB and 226 MB of
+    compressed-scale scratch (allocate_expert_scale_scratch) that this checkpoint,
+    which stores plain scales, never reads; skip it when no layer is declared with
+    compressed scales. Close when each configuration exports with every warmup and
+    capture and passes those checks.
+
+[ ] Explain why GIF and JPEG colour answers of glm-5.3-flash-nvfp4 at TP4 are less
+    reliable than vLLM's: 14 and 10 correct of 20 at default sampling, against 19
+    and 20 (PNG and WebP answers match vLLM's). The vision tower matches the
+    Transformers reference in tests/recipes/test_glm53_vision.py. One candidate is
+    the tower's RMS-norm epsilon, 1e-5 here and 1e-6 in vLLM. Close when an
+    isolated comparison of the epsilon, or another identified cause, restores
+    vLLM's accuracy on these images.
+
+[ ] Repair the CUDA test cases that fail on upstream main and with this series:
+    test_glm_mla_checkpoint_native_replay[4-decode-1-True] fails
+    runs_concurrently (the TP4 one-row decode graph shows no overlap of the query
+    chain and the indexer; cause unknown);
+    test_cp_prefill_query_reuse_matches_separate_values_across_slices[2] calls
+    PreparedGlmMLA.attend_gathered_context with its old signature; the two
+    test_native_mxfp8_dense_graph cases raise KernelResolutionFrozenError; and
+    six test_actual_dense_and_attention_shards cases with NVIDIA's snapshot read
+    .weight of grouped projections, which have none. Close when they pass.
+
+[ ] Resolve the CUDA illegal memory access of the GLM MLA replay tests with
+    cuBLAS 13.4.1.3, which uv.lock pins. After test_autotuned_shared_routed_graph
+    [2-True-False-False-1] and the replay cases [1-decode-2-True],
+    [1-decode-1-False], [1-decode-2-False], [1-prefill-65-True] and
+    [2-decode-1-True] in one process, [2-decode-2-True] raises
+    CUBLAS_STATUS_INTERNAL_ERROR in cublasGemmStridedBatchedEx, called by torch.bmm
+    in _bmm_out (ignition/components/linear.py), and the CUDA error then persists
+    in the process. Upstream main fails the same sequence with NVIDIA's snapshot
+    and the locked cuBLAS, and passes it with cuBLAS 13.6.1.10. Close when the
+    locked cuBLAS passes this sequence, or the operand layout that triggers the
+    error is found.
+
+[ ] Explain the one TP4 preparation failure of glm-5.3-flash-nvfp4 at warmup 44
+    with cuBLAS 13.4.1.3, which the lock file pins. Six later preparation runs
+    with 13.4.1.3 passed every warmup, one of them at default tuning, and no
+    operand layout of the failing batched matrix multiplication was found
+    unusual. The failing call, torch.bmm in _bmm_out, is the call that fails in
+    the MLA replay sequence above with 13.4.1.3; whether it is the same defect
+    is not established. Close when the cause of both failures is found, or when
+    the locked cuBLAS no longer fails either.
+
 [ ] Run the host offload isolation measurements for the memory tier and the
     composite store with qualify/host_cache_isolation.py. Every threshold in
     prefix-cache-offload.md section 4 must hold before derived host-store

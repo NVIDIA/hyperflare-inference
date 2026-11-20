@@ -95,7 +95,16 @@ RECIPE = Recipe(
         # Language model, draft layer, output head, and replicated vision tower.
         device_bytes=177_421_592_008,
         # Decoder layer 45, the MTP module.
-        draft_bytes=4_301_658_112),),
+        draft_bytes=4_301_658_112), Checkpoint(
+        alias="glm-5.3-flash-nvfp4", repository="local-inference-lab/GLM-5.3-Flash-NVFP4",
+        revision="378ca54585c46542bad1f3cb3ed0d73ae51cdb62", architecture="Glm5NextForConditionalGeneration",
+        stored_bytes=198_042_331_512, device_bytes=198_042_331_512,
+        draft_bytes=7_843_920_512,
+        # The draft layer proposes with an NVFP4 copy of the BF16 vocabulary head, made at load: for the
+        # 154,880 x 4096 head, 4-bit values, one E4M3 scale per 16 values with each TP4 shard's rows padded
+        # to 128 for the swizzle, and an FP32 gain per shard, summed over four shards. Weights estimates add
+        # it without speculation too, which overstates them by 89 MB per rank at TP4 with --no-mtp.
+        expansion_bytes=356_909_072),),
     context=1048576, page_tokens=256, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
     # Shared experts, KDA gate projections, and decode query chains run on an auxiliary stream.

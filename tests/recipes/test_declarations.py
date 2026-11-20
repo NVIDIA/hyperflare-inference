@@ -170,13 +170,15 @@ def test_weights_exclude_the_draft_model_unless_drafts_are_learned(model):
     assert recipe.live_rows(4, None) == 1 + 4
 
 
-def test_glm_stored_bytes_match_the_cached_checkpoint():
-    if not GLM.cached(HUB):
+@pytest.mark.parametrize("alias", ["glm-5.3-flash", "glm-5.3-flash-nvfp4"])
+def test_glm_stored_bytes_match_the_cached_checkpoint(alias):
+    model = resolve(alias)
+    if not model.cached(HUB):
         pytest.skip("the pinned GLM revision is not in the hub cache")
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 
-    tensors = inspect_indexed_checkpoint(GLM.snapshot(HUB)).tensors.values()
-    checkpoint = GLM.checkpoint
+    tensors = inspect_indexed_checkpoint(model.snapshot(HUB)).tensors.values()
+    checkpoint = model.checkpoint
     assert checkpoint.stored_bytes == sum(tensor.nbytes for tensor in tensors)
     assert checkpoint.device_bytes == sum(tensor.nbytes for tensor in tensors)
     assert checkpoint.mapped_host_bytes == 0

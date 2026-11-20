@@ -21,7 +21,7 @@ HUB = Path.home() / ".cache/huggingface/hub"
 def test_declarations_import_without_model_dependencies():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; from ignition.recipes import aliases; from ignition import planning;"
-         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'qwen3.8-27b-qad', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'mimo-v2.6-flash-rl', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'kimi-k3.1-pro', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4', 'inkling-2-small-nvfp4');"
+         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'qwen3.8-27b-qad', 'glm-5.3-flash', 'glm-5.3-flash-nvfp4', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'mimo-v2.6-flash-rl', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'kimi-k3.1-pro', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4', 'inkling-2-small-nvfp4');"
          " assert not {'torch', 'transformers', 'flare_heliopause'} & set(sys.modules)"],
         cwd=ROOT, check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -36,6 +36,18 @@ def test_alias_and_repository_resolve_to_the_declared_checkpoint(tmp_path):
     assert alias.snapshot(tmp_path) == (
         tmp_path / "models--nvidia--Qwen3.8-Flash-Next-FP4-Local" / "snapshots"
         / "b9ce18a6887e18c089fdea8509a33e63429a3300")
+
+
+def test_glm_calibrated_checkpoint_coexists_with_nvidia_default(tmp_path):
+    calibrated = resolve("glm-5.3-flash-nvfp4")
+    repository = "local-inference-lab/GLM-5.3-Flash-NVFP4"
+    revision = "378ca54585c46542bad1f3cb3ed0d73ae51cdb62"
+    assert resolve(f"{repository}@{revision}").checkpoint is calibrated.checkpoint
+    assert calibrated.snapshot(tmp_path) == (
+        tmp_path / "models--local-inference-lab--GLM-5.3-Flash-NVFP4" / "snapshots" / revision)
+    default = resolve("glm-5.3-flash")
+    assert default.recipe is calibrated.recipe
+    assert default.checkpoint.repository == "nvidia/GLM-5.3-Flash-FP4-Local"
 
 
 def write_checkpoint(directory, architecture, total_size):
