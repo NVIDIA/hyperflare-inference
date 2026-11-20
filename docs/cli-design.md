@@ -1947,3 +1947,23 @@ lease and then runs the normal core inspection path, so
 `--json`, `--unverified`, `--publisher-keys`, `--trust-store`, `--rank`,
 `--tensor-parallel`, and the section flags behave as they do for `flare inspect`. It has no separate
 verification path.
+
+## Parallax shadow viewer
+
+`flare parallax` renders external Parallax shadow evaluation artifacts with
+Flare's terminal UI toolkit without opening a GPU context or modifying Helios
+serving behavior.
+
+- `flare parallax --report PATH` loads a saved JSON comparison file
+  (`comparison.json`, `live-comparison.json`, or `leaderboard.json`) or a
+  capture directory containing one, and displays comparison metrics, predictor
+  latency, and any saved `responses.json` entries.
+- `flare parallax --watch PATH` polls an external session or capture directory
+  for `capture/live-comparison.json`, `capture/leaderboard.json`, and
+  `capture/comparison.json` (plus `responses.json` and `demo.json`) until the
+  session completes or the operator exits.
+- `--plain` prints the JSON report (for `--report`) or plain-text status updates
+  (for `--watch`) instead of entering the interactive terminal UI.
+
+See [External Parallax tooling](parallax-demo.md) for offline trace replay,
+live collection, and measurement boundaries.

@@ -30,6 +30,8 @@ mod inspect;
 mod launch;
 #[cfg(unix)]
 mod orbit;
+#[cfg(unix)]
+mod parallax;
 mod trust;
 #[cfg(windows)]
 use flare::windows;
@@ -70,6 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .apply(&mut parsed, &matches, &home)
         .map_err(|error| error.to_string())?;
     let mut args = match parsed.command {
+        #[cfg(unix)]
+        cli::Command::Parallax(args) => return parallax::run(args).map_err(|e| e.to_string().into()),
         cli::Command::Run(args) => *args,
         cli::Command::Download(args) => return hub::run_download(args),
         cli::Command::Inspect(args) => return inspect::run(args),

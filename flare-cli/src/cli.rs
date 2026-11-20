@@ -41,6 +41,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Inspect or watch external Parallax shadow comparison reports.
+    #[cfg(unix)]
+    Parallax(ParallaxArgs),
     /// Serve a local core or download a prepared core from Hugging Face.
     Run(Box<Run>),
     /// Download a prepared core from the hardware's Hugging Face revision.
@@ -2363,4 +2366,58 @@ mod cache_cli_tests {
             "download cache selection requires --downloads"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn parallax_subcommand_parses_report_and_watch_modes() {
+        let report = Cli::try_parse_from(["flare", "parallax", "--report", "/tmp/comparison.json", "--plain"])
+            .unwrap()
+            .command;
+        match report {
+            Command::Parallax(ParallaxArgs {
+                report: Some(path),
+                watch: None,
+                plain: true,
+            }) => assert_eq!(path, PathBuf::from("/tmp/comparison.json")),
+            other => panic!("unexpected parallax report command: {other:?}"),
+        }
+        let watch = Cli::try_parse_from(["flare", "parallax", "--watch", "/tmp/session"])
+            .unwrap()
+            .command;
+        match watch {
+            Command::Parallax(ParallaxArgs {
+                report: None,
+                watch: Some(path),
+                plain: false,
+            }) => assert_eq!(path, PathBuf::from("/tmp/session")),
+            other => panic!("unexpected parallax watch command: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["flare", "parallax"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "flare",
+                "parallax",
+                "--report",
+                "/tmp/a.json",
+                "--watch",
+                "/tmp/dir",
+            ])
+            .is_err()
+        );
+    }
+}
+
+/// Terminal viewer for external Parallax shadow evaluation artifacts.
+#[cfg(unix)]
+#[derive(Debug, Args)]
+pub struct ParallaxArgs {
+    /// Saved Parallax comparison JSON file or capture directory to display without a GPU.
+    #[arg(long, value_name = "PATH", required_unless_present = "watch", conflicts_with = "watch")]
+    pub report: Option<PathBuf>,
+    /// Live Parallax session or capture directory to poll until completion or exit.
+    #[arg(long, value_name = "PATH")]
+    pub watch: Option<PathBuf>,
+    /// Print JSON (for --report) or status lines (for --watch) without an interactive TUI.
+    #[arg(long)]
+    pub plain: bool,
 }
