@@ -80,6 +80,7 @@ class Layout:
     record_fields: int = 24
     confidence_widths: dict = field(default_factory=dict)
     completion_cursors: dict = field(default_factory=dict)
+    terminal_prefill_min_tokens: int = 0
 
     def __post_init__(self):
         if not 1 <= self.max_active <= self.capacity or self.pages <= 0 or self.page_tokens <= 0:
@@ -91,6 +92,12 @@ class Layout:
                 or any(key[0] == "speculative" and key[2] > self.completion_token_capacity for key in self.graphs)):
             raise ValueError("verification width exceeds completion token capacity")
         object.__setattr__(self, "graphs", MappingProxyType(dict(self.graphs)))
+        terminal = self.capacities("terminal_prefill")
+        if ((self.terminal_prefill_min_tokens > 0) != bool(terminal)
+                or self.terminal_prefill_min_tokens < 0
+                or (terminal and (terminal != self.capacities("prefill")
+                    or self.terminal_prefill_min_tokens > self.prefill_chunk))):
+            raise ValueError("terminal prefill requires matching capacities and a positive minimum within the chunk")
 
     @classmethod
     def of(cls, model):
@@ -100,7 +107,7 @@ class Layout:
                           for signature in model.signatures.values())
         graphs = {}
         for name, signature in model.signatures.items():
-            if (signature.kind in ("init", "restore", "snapshot", "prefill", "decode", "resume", "speculative")
+            if (signature.kind in ("init", "restore", "snapshot", "prefill", "terminal_prefill", "decode", "resume", "speculative")
                     and signature.speculation_enabled in (None, speculative)):
                 key = (signature.kind, signature.batch_capacity, signature.token_capacity)
                 if signature.kind == "speculative":
@@ -122,6 +129,8 @@ class Layout:
                    state_rows_per_request=max(g["state_rows_per_request"] for g in config["model_contract"]["graphs"] if g["graph"] in graphs.values()),
                    draft_pages=max((v["page_offset"] for v in config["model_contract"]["cache"]["page_tables"]), default=0),
                    record_fields=buffers["completion_records"].shape[-1],
+                   terminal_prefill_min_tokens=max((g.get("terminal_prefill_min_tokens", 0)
+                       for g in config["model_contract"]["graphs"]), default=0),
                    confidence_widths={name: signature.confidence_width for name, signature in model.signatures.items()
                                       if signature.confidence_width},
                    completion_cursors={g["graph"]: None if g["draft_cursor"] is None else g["draft_cursor"]["lag_tokens"]
@@ -158,7 +167,7 @@ class Layout:
 
     def capacities(self, kind, *, width=None):
         """Prepared capacities of one graph kind: token capacities for prefill, batch capacities otherwise."""
-        if kind == "prefill":
+        if kind in ("prefill", "terminal_prefill"):
             return sorted({key[2] for key in self.graphs if key[0] == kind})
         return sorted({key[1] for key in self.graphs
                        if len(key) == 3 and key[0] == kind and (width is None or key[2] == width)})
@@ -169,9 +178,9 @@ class Layout:
 
     def graph(self, kind, size, width=1):
         """Name and capacities of the smallest prepared graph holding `size` rows, or prefill tokens."""
-        for capacity in self.capacities(kind, width=None if kind == "prefill" else width):
+        for capacity in self.capacities(kind, width=None if kind in ("prefill", "terminal_prefill") else width):
             if capacity >= size:
-                key = (kind, 1, capacity) if kind == "prefill" else (kind, capacity, width)
+                key = (kind, 1, capacity) if kind in ("prefill", "terminal_prefill") else (kind, capacity, width)
                 return self.graphs[key], key[1], key[2]
         raise AdmissionError(f"no prepared {kind} graph holds {size}" + (f" at width {width}" if width > 1 else ""))
 
@@ -548,7 +557,14 @@ class Scheduler:
         if prefilling:
             request = min(prefilling, key=lambda r: r.ident)
             tokens = min(len(request.prompt) - request.consumed, self.layout.prefill_chunk)
-            return self._step("prefill", tokens, [Lane(request, request.consumed, tokens)])
+            kind = "prefill"
+            if self.layout.terminal_prefill_min_tokens:
+                remaining = len(request.prompt) - request.consumed
+                if remaining <= self.layout.prefill_chunk:
+                    kind = "terminal_prefill"
+                else:
+                    tokens = min(tokens, remaining - self.layout.terminal_prefill_min_tokens)
+            return self._step(kind, tokens, [Lane(request, request.consumed, tokens)])
         return None
 
     def _round_tokens(self, request, width):
@@ -621,6 +637,11 @@ class Scheduler:
                     or (step.kind not in ("speculative",) and status == RUNNING and consumed != lane.start + lane.tokens)):
                 raise CompletionError(f"{step.graph} progress disagrees for request {request.ident}:"
                                       f" {record[:8].tolist()}")
+            if layout.terminal_prefill_min_tokens and step.kind in ("prefill", "terminal_prefill"):
+                if (consumed != lane.start + lane.tokens
+                        or (step.kind == "prefill" and (emitted or status != RUNNING))
+                        or (consumed < len(request.prompt) and emitted)):
+                    raise CompletionError("prefill cannot publish output or incomplete continuation state")
             if int(record[8]) != emitted:
                 raise CompletionError(f"{step.graph} token vector disagrees for request {request.ident}")
             tokens = [int(token) for token in record[16:16 + emitted]]
@@ -631,9 +652,9 @@ class Scheduler:
                 accepted = min(int(record[10]), offered)
                 request.acceptance.observe(offered, accepted, int(record[8]) > int(record[10]))
                 request.rounds += 1
-            if emitted or (step.kind == "prefill" and consumed > request.consumed):
+            if emitted or (step.kind in ("prefill", "terminal_prefill") and consumed > request.consumed):
                 # Helios's `credit`: committed prompt and output tokens are this step's useful service.
-                useful[request.slot] = (consumed - request.consumed if step.kind == "prefill" else 0) + emitted
+                useful[request.slot] = (consumed - request.consumed if step.kind in ("prefill", "terminal_prefill") else 0) + emitted
                 request.accounting.last_progress_ns = self.now_ns
             if emitted:
                 request.accounting.pending_publication_fence = step.sequence
@@ -641,7 +662,7 @@ class Scheduler:
             request.consumed = consumed
             request.generated.extend(tokens)
             finished = status == FINISHED or len(request.generated) >= request.max_new_tokens
-            if step.kind == "prefill" and consumed == len(request.prompt) and self._capture(request):
+            if step.kind in ("prefill", "terminal_prefill") and consumed == len(request.prompt) and self._capture(request):
                 request.finished_early = finished
                 continue
             if finished:

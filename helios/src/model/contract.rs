@@ -67,7 +67,7 @@ contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xt
 contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5, ContentHeaders = 6 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9, PaddedGrid = 10 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9, ClassToken = 10 });
-contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
+contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12, TerminalPrefill = 14 });
 
 impl TryFrom<GraphKind> for GraphOperation {
     type Error = crate::Error;
@@ -78,6 +78,7 @@ impl TryFrom<GraphKind> for GraphOperation {
             GraphKind::Restore => Self::Restore,
             GraphKind::Snapshot => Self::Snapshot,
             GraphKind::Prefill => Self::Prefill,
+            GraphKind::TerminalPrefill => Self::TerminalPrefill,
             GraphKind::ScoredPrefill => Self::ScoredPrefill,
             GraphKind::Decode => Self::Decode,
             GraphKind::Resume => Self::Resume,
@@ -233,6 +234,8 @@ pub struct GraphContract {
     pub embedding_tables: Vec<u32>,
     pub pending_token: Option<StateView>,
     pub tuned_bindings: Vec<TunedBinding>,
+    #[cfg_attr(any(feature = "frontend", feature = "runtime-core"), serde(default))]
+    pub terminal_prefill_min_tokens: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -361,7 +364,7 @@ impl PreparedContract {
     }
 
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
-        if !(1..=3).contains(&self.version) {
+        if !(1..=4).contains(&self.version) {
             return Err("unsupported prepared model contract version; re-export the model core".into());
         }
         if self.vocabulary == 0
@@ -373,6 +376,31 @@ impl PreparedContract {
             return Err("invalid prepared model contract vocabulary or geometry".into());
         }
         self.vision.validate()?;
+        let minimum = self.graphs.iter().find(|g| g.kind == GraphOperation::TerminalPrefill)
+            .map(|g| g.terminal_prefill_min_tokens);
+        for graph in &self.graphs {
+            if graph.kind == GraphOperation::TerminalPrefill {
+                if minimum == Some(0) || Some(graph.terminal_prefill_min_tokens) != minimum {
+                    return Err("terminal prefill graphs require one positive reconstruction minimum".into());
+                }
+            } else if graph.terminal_prefill_min_tokens != 0 {
+                return Err("terminal minimum belongs only to terminal prefill graphs".into());
+            }
+        }
+        if let Some(minimum) = minimum {
+            if self.version < 4 { return Err("terminal prefill requires prepared model contract 4".into()); }
+            let capacities = |kind| {
+                let mut values: Vec<_> = manifest.graphs.iter().filter(|g| g.kind == kind)
+                    .map(|g| g.token_capacity).collect();
+                values.sort_unstable();
+                values
+            };
+            let ordinary = capacities(GraphKind::Prefill);
+            if ordinary.is_empty() || ordinary != capacities(GraphKind::TerminalPrefill)
+                || minimum > *ordinary.last().unwrap() {
+                return Err("terminal and ordinary prefill catalogs must cover the same capacities".into());
+            }
+        }
         self.frontend.validate()?;
         if self.vision.enabled() != self.frontend.image_layout.is_some()
             || self.frontend.image_layout.is_some() != self.frontend.image_preparation.is_some()
@@ -541,10 +569,15 @@ impl PreparedContract {
                 }
             }
             if let Some(pending) = &graph.pending_token {
+                let prefill_producer = if minimum.is_some() {
+                    GraphOperation::TerminalPrefill
+                } else {
+                    GraphOperation::Prefill
+                };
                 for operation in [
                     GraphOperation::Init,
                     GraphOperation::Restore,
-                    GraphOperation::Prefill,
+                    prefill_producer,
                     GraphOperation::ScoredPrefill,
                     GraphOperation::Resume,
                     GraphOperation::Decode,
@@ -556,7 +589,8 @@ impl PreparedContract {
                         .iter()
                         .filter(|producer| producer.kind == operation)
                         .peekable();
-                    let required = matches!(operation, GraphOperation::Init | GraphOperation::Restore | GraphOperation::Prefill);
+                    let required = matches!(operation, GraphOperation::Init | GraphOperation::Restore)
+                        || operation == prefill_producer;
                     if (required && producers.peek().is_none()) || producers.any(|producer| {
                             !producer.state.iter().any(|s| {
                                 s.access != StateAccessKind::Read && s.view.contains(pending)
@@ -712,11 +746,49 @@ mod tests {
             contract.graphs[0].state[0].view.buffer = "missing_state".into();
             assert!(contract.validate(&manifest).is_err());
         }
-        for version in [0, 4, u32::MAX] {
+        for version in [0, 5, u32::MAX] {
             let mut contract = config.contract.clone();
             contract.version = version;
             assert!(contract.validate(&manifest).is_err());
         }
+    }
+
+    #[test]
+    fn terminal_prefill_validates_version_minimum_and_matching_catalog() {
+        let config = crate::model::tests::config();
+        let mut manifest = crate::model::testing::manifest(&config);
+        let mut contract = config.contract.clone();
+        contract.version = 4;
+        let prefill: Vec<_> = manifest.graphs.iter().filter(|g| g.kind == GraphKind::Prefill).cloned().collect();
+        for mut descriptor in prefill {
+            let mut graph = contract.graph(&descriptor.name).unwrap().clone();
+            descriptor.name = format!("terminal_{}", descriptor.name);
+            descriptor.kind = GraphKind::TerminalPrefill;
+            graph.graph = descriptor.name.clone();
+            graph.kind = GraphOperation::TerminalPrefill;
+            graph.terminal_prefill_min_tokens = 129;
+            contract.graphs.push(graph);
+            manifest.graphs.push(descriptor);
+        }
+        contract.validate(&manifest).unwrap();
+        let pending = contract.graphs.iter().find_map(|g| g.pending_token.clone()).unwrap();
+        let mut missing_producer = contract.clone();
+        missing_producer.graphs.last_mut().unwrap().state
+            .retain(|state| !state.view.contains(&pending));
+        assert!(missing_producer.validate(&manifest).unwrap_err().to_string()
+            .contains("device pending-token input lacks an admission or sampling producer"));
+        for graph in contract.graphs.iter_mut().filter(|g| g.kind == GraphOperation::Prefill) {
+            graph.state.retain(|state| !state.view.contains(&pending));
+        }
+        contract.validate(&manifest).unwrap();
+        let mut invalid = contract.clone();
+        invalid.version = 3;
+        assert!(invalid.validate(&manifest).is_err());
+        let mut invalid = contract.clone();
+        invalid.graphs.last_mut().unwrap().terminal_prefill_min_tokens = 0;
+        assert!(invalid.validate(&manifest).is_err());
+        manifest.graphs.pop();
+        assert!(contract.validate(&manifest).is_err());
     }
 
     #[test]
