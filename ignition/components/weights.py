@@ -1328,6 +1328,53 @@ class DirectWeightLoader:
             w13=w13, w2=w2, w13_block_scales=s13, w2_block_scales=s2,
             w13_global_scales=g13, w2_global_scales=g2), scale_scratch=scale_scratch, allocate=persistent_empty)
 
+    def load_mxfp8_experts(self, prefixes, *, hidden_size, intermediate_size,
+                           intermediate_range=None, swiglu_limit=None):
+        """Prepare E4M3 experts with their checkpoint E8M0 block scales."""
+        import torch
+        from b12x.moe import fused_moe as moe
+        from .sm103 import is_sm103
+
+        self._require_open()
+        if is_sm103(self.device):
+            raise ValueError("MXFP8 experts require SM120/121")
+        prefixes = tuple(prefixes)
+        first, last = _aligned_range(intermediate_range, intermediate_size, 32)
+        local, count = last - first, len(prefixes)
+        # No provenance is recorded: _record_fp4_expert_owner_provenance maps unchanged FP4 owners, and
+        # b12x swizzles the scale grids copied here, so these experts stay unprovenanced rather than
+        # claim a byte mapping that the retained owners do not have.
+        plan = moe.plan_weights(source=moe.PackedSource(format="mxfp8_e8m0_k32", w13_layout="w13"),
+            activation=moe.ActivationSpec(mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16,
+                                          swiglu_limit=swiglu_limit),
+            geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden_size, intermediate_size=local))
+        w13 = persistent_empty((count, 2 * local, hidden_size), dtype=torch.float8_e4m3fn, device=self.device)
+        w2 = persistent_empty((count, hidden_size, local), dtype=torch.float8_e4m3fn, device=self.device)
+        s13 = torch.empty((count, 2 * local, hidden_size // 32), dtype=torch.uint8, device=self.device)
+        s2 = torch.empty((count, hidden_size, local // 32), dtype=torch.uint8, device=self.device)
+        for index, prefix in enumerate(prefixes):
+            for projection, values, scales in (
+                ("up_proj", w13[index, :local], s13[index, :local]),
+                ("gate_proj", w13[index, local:], s13[index, local:]),
+                ("down_proj", w2[index], s2[index]),
+            ):
+                source = self._sources[f"{prefix}.{projection}.weight"]
+                scale = self._sources[f"{prefix}.{projection}.weight_scale"]
+                rows, columns = ((hidden_size, intermediate_size) if projection == "down_proj"
+                                 else (intermediate_size, hidden_size))
+                if source.dtype != torch.float8_e4m3fn or source.shape != (rows, columns):
+                    raise ValueError(f"{prefix}.{projection}: MXFP8 weight geometry or dtype mismatch")
+                if scale.dtype not in (torch.uint8, torch.float8_e8m0fnu) or scale.shape != (rows, columns // 32):
+                    raise ValueError(f"{prefix}.{projection}: MXFP8 block scale geometry or dtype mismatch")
+                self._copy(values, source[:, first:last] if projection == "down_proj" else source[first:last])
+                scale = scale.view(torch.uint8)
+                self._copy(scales, scale[:, first // 32:last // 32] if projection == "down_proj" else scale[first:last])
+        self._session.flush()
+        ones = persistent_copy(torch.ones(count, dtype=torch.float32, device=self.device))
+        return moe.prepare_weights(plan=plan, weights=moe.PackedWeights(
+            w13=w13, w2=w2, w13_block_scales=s13, w2_block_scales=s2,
+            w13_global_scales=ones, w2_global_scales=ones), allocate=persistent_empty)
+
     def load_fp4_experts(self, prefixes, *, hidden_size, intermediate_size, format, activation_mode,
                          intermediate_range=None, scale_vectors=None, swiglu_limit=None,
                          swiglu_clamp_after_silu=False,

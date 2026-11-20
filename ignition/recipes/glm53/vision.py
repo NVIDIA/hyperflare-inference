@@ -13,7 +13,7 @@ from transformers.models.glm5_next.modeling_glm5_next import (
     apply_rotary_pos_emb_vision,
 )
 
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.linear import prepare_projection, UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
 from ignition.preparation.persistent import persistent_copy
 
@@ -80,10 +80,10 @@ class VisionWeights:
     @classmethod
     def load(cls, module, loader):
         parameters, projections = {}, {}
-        declarations = loader.quantization
         for path, _ in module.named_parameters():
             prefix = "model.visual." + path.removesuffix(".weight")
-            if path.endswith(".weight") and prefix in declarations:
+            parent, _, attribute = path.rpartition(".")
+            if attribute == "weight" and isinstance(module.get_submodule(parent), torch.nn.Linear):
                 projections[path.removesuffix(".weight")] = loader.load_linear(prefix)
             else:
                 parameters[path] = loader.load_tensor("model.visual." + path)
@@ -111,10 +111,12 @@ class _Attention(torch.nn.Module):
         super().__init__()
         self.scratch = scratch
         self.q_norm, self.k_norm = module.q_norm, module.k_norm
-        self.qkv = QuantizedProjection(scratch.hidden, weights["qkv"], scratch.qkv,
-            session=session, name=f"{name}.qkv", bias=module.qkv.bias, workspace=projection_workspace)
-        self.proj = QuantizedProjection(scratch.attention, weights["proj"], scratch.projected,
-            session=session, name=f"{name}.proj", bias=module.proj.bias, workspace=projection_workspace)
+        self.qkv = prepare_projection(scratch.hidden, weights["qkv"], scratch.qkv,
+            session=session, name=f"{name}.qkv", bias=module.qkv.bias, workspace=projection_workspace,
+            activation_mode="quantized")
+        self.proj = prepare_projection(scratch.attention, weights["proj"], scratch.projected,
+            session=session, name=f"{name}.proj", bias=module.proj.bias, workspace=projection_workspace,
+            activation_mode="quantized")
         self.attention = shared.attention if shared is not None else PreparedVarlenAttention(
             scratch.query, scratch.key, scratch.value, metadata.cu_seqlens,
             scratch.attention.view_as(scratch.query), session=session, workspace=attention_workspace, name=name)
@@ -178,7 +180,7 @@ class PreparedVision:
                                        ("up_proj", scratch.hidden, scratch.up),
                                        ("down_proj", scratch.gate, scratch.projected)):
                 original = getattr(block.mlp, key)
-                setattr(block.mlp, key, _Linear(QuantizedProjection(source,
+                setattr(block.mlp, key, _Linear(prepare_projection(source,
                     weights.projections[f"{prefix}.mlp.{key}"], output,
                     session=session, name=f"{name}.{prefix}.mlp.{key}",
                     activation_mode="auto", bias=original.bias, workspace=projection_workspace)))
@@ -189,7 +191,7 @@ class PreparedVision:
                                    ("up_proj", scratch.output, scratch.merger_up),
                                    ("down_proj", scratch.merger_gate, scratch.output)):
             original = getattr(module.merger, key)
-            setattr(module.merger, key, _Linear(QuantizedProjection(source,
+            setattr(module.merger, key, _Linear(prepare_projection(source,
                 weights.projections[f"merger.{key}"], output,
                 session=session, name=f"{name}.merger.{key}",
                 activation_mode="auto", bias=original.bias, workspace=projection_workspace)))

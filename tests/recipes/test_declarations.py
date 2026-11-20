@@ -4,7 +4,9 @@
 
 """Declared recipe costs against the layouts and checkpoints they describe."""
 
+import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -245,6 +247,28 @@ def test_qwen_adapter_passes_speculation_overrides(monkeypatch, tmp_path):
     assert layout.snapshot_capacity(config.snapshot_budget_bytes) == plan.snapshots
     # Without speculation the pool holds a null row, one live row per slot, and the snapshot rows.
     assert 1 + config.request_capacity + plan.snapshots == plan.live_rows + plan.cache_states
+
+
+@pytest.mark.parametrize("declaration,speculating,refused", [
+    ({"group_size": 32, "quant_algo": "MXFP8"}, True, True),
+    ({"group_size": 32, "quant_algo": "MXFP8"}, False, False),
+    ({"group_size": 16, "quant_algo": "W4A16_NVFP4"}, True, False)])
+def test_glm_sm103_refusal_of_mxfp8_draft_experts_precedes_any_rank(monkeypatch, tmp_path, declaration,
+                                                                  speculating, refused):
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {
+        "quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {"model.language_model.layers.45.mlp.experts": declaration}}}))
+    started = []
+    monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
+                        lambda *args, **options: started.append(args) or "group")
+    plan = fitted(GLM, 4, speculation=GLM.recipe.speculation if speculating else None)
+    plan = replace(plan, gpus=tuple(replace(gpu, capability=(10, 3)) for gpu in plan.gpus))
+    if refused:
+        with pytest.raises(ValueError, match="draft layer stores MXFP8 experts.*--no-mtp"):
+            GLM.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
+        assert not started
+    else:
+        assert GLM.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None) == "group"
 
 
 def test_tensor_parallel_adapters_prepare_a_rank_group(monkeypatch, tmp_path):

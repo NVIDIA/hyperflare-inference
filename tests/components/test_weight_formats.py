@@ -165,6 +165,7 @@ def test_modelopt_conflicting_block_declarations_are_rejected(entry):
     ("NVFP4", 16, "csf", ("nvfp4_csf", "a4")),
     ("W4A16_NVFP4", 16, None, ("nvfp4", "a16")),
     ("MXFP4", 32, None, ("mxfp4", "a8")),
+    ("MXFP8", 32, None, ("mxfp8", "a8")),
 ])
 def test_expert_storage_and_activation_contract(algo, group, encoding, expected):
     entry = {"quant_algo": algo, "group_size": group}
@@ -314,3 +315,13 @@ def test_nvfp4_group_rejects_calibration_mismatch_before_payload(tmp_path, diffe
         loader._sources[f"up.{difference}"] *= 2
     with pytest.raises(ValueError, match="identical weight and activation calibration"):
         loader.load_linear_group(("gate", "up"))
+
+
+def test_mxfp8_experts_refuse_sm103(monkeypatch):
+    from ignition.components import sm103
+
+    loader = DirectWeightLoader(SimpleNamespace(), "cpu")
+    loader._session = object()
+    monkeypatch.setattr(sm103, "is_sm103", lambda device: True)
+    with pytest.raises(ValueError, match="MXFP8 experts require SM120/121"):
+        loader.load_mxfp8_experts(("expert",), hidden_size=256, intermediate_size=256)

@@ -87,6 +87,10 @@ class ModelWeights:
         with GlmWeightLoader(manifest, device, shard=shard,
                              progress=progress if shard.rank == 0 else None,
                              expert_activation=expert_activation) as loader:
+            if mtp:
+                from ignition.components.sm103 import is_sm103
+
+                require_draft_experts_supported(loader.quantization, sm103=is_sm103(device))
             names = [f"{TEXT_PREFIX}.embed_tokens.weight", f"{TEXT_PREFIX}.norm.weight"]
             for name in names:
                 path, attribute = name.rsplit(".", 1)
@@ -241,15 +245,17 @@ class GlmWeightLoader(DirectWeightLoader):
         prefixes = tuple(f"{prefix}.{i}" for i in ids)
         from ignition.preparation.quantization import expert_format
 
+        extent = self.shard.partition(2048, alignment=128)
         fmt, mode = expert_format(self.quantization, prefix)
+        if fmt == "mxfp8":
+            return self.load_mxfp8_experts(prefixes, hidden_size=4096, intermediate_size=2048,
+                intermediate_range=extent, swiglu_limit=10.0)
         if fmt != "nvfp4_csf":
             return self.load_fp4_experts(prefixes, hidden_size=4096, intermediate_size=2048,
-                format=fmt, activation_mode=mode,
-                intermediate_range=self.shard.partition(2048, alignment=128), swiglu_limit=10.0,
+                format=fmt, activation_mode=mode, intermediate_range=extent, swiglu_limit=10.0,
                 scale_vectors=_expert_scales(self._sources, prefixes) if mode == "a4" else None)
         return self.load_nvfp4_experts(
-            prefixes, hidden_size=4096, intermediate_size=2048,
-            intermediate_range=self.shard.partition(2048, alignment=128),
+            prefixes, hidden_size=4096, intermediate_size=2048, intermediate_range=extent,
             scale_vectors=_expert_scales(self._sources, prefixes), scale_scratch=scale_scratch,
             swiglu_limit=10.0, activation_mode=self.expert_activation,
         )
@@ -278,6 +284,15 @@ class GlmWeightLoader(DirectWeightLoader):
                 for name in (
             "input_layernorm.weight", "post_attention_layernorm.weight",
             "hc_attn_base", "hc_attn_fn", "hc_attn_scale", "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale")}
+
+
+def require_draft_experts_supported(quantization, *, sm103):
+    """Refuse an unsupported draft layer before the target layers load."""
+    from ignition.preparation.quantization import expert_format
+
+    if sm103 and expert_format(quantization, f"{TEXT_PREFIX}.layers.45.mlp.experts")[0] == "mxfp8":
+        raise ValueError("the draft layer stores MXFP8 experts, which need SM120 or SM121;"
+                         " prepare with --no-mtp on this GPU")
 
 
 def _expert_scales(sources, prefixes):

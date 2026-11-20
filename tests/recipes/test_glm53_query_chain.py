@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 
 from ignition.preparation.scratch import ScratchArena
-from ignition.recipes.glm53.mla import QueryChain
+from ignition.recipes.glm53.mla import QueryChain, _output_width
 
 
 def test_query_workspace_normalizes_zero_and_nonzero_rank_requirements(monkeypatch):
@@ -42,3 +42,8 @@ def test_query_workspace_normalizes_zero_and_nonzero_rank_requirements(monkeypat
         assert chain.workspace.eq(17).all()
         shapes.append((chain.workspace.shape, chain.workspace.stride(), chain.workspace.storage_offset()))
     assert shapes[0] == shapes[1]
+
+
+def test_projection_output_width_reads_bf16_tensors_and_quantized_declarations():
+    assert _output_width(torch.empty(16384, 1536, dtype=torch.bfloat16, device="meta")) == 16384
+    assert _output_width(SimpleNamespace(out_features=8192)) == 8192

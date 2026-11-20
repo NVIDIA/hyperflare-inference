@@ -12,7 +12,8 @@ import weakref
 import pytest
 import torch
 
-from ignition.components import linear
+from ignition.components import block_fp8, linear
+from ignition.components import weights as linear_weights
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.fixtures import bf16_gemv, blockscaled_gemm
 from ignition.preparation.fixtures.projection import input_factory
@@ -213,3 +214,13 @@ def test_native_dense_activations_only_override_auto(monkeypatch, native, reques
                                             name="projection", activation_mode=requested)
     assert modes == [expected]
     assert projection.activation_mode == expected
+
+
+@pytest.mark.parametrize("weight", [
+    linear_weights.GroupedLinearWeights(parts=(torch.empty(2, 2),), widths=(2,)),
+    block_fp8.BlockFP8Weight(values=torch.empty(2, 2), scales=torch.empty(1, 1)),
+], ids=["grouped", "block_fp8"])
+def test_prepare_projection_refuses_a_bias_it_would_drop(weight):
+    with pytest.raises(ValueError, match="bias is not supported"):
+        linear.prepare_projection(None, weight, None, session=None, name="projection", workspace=None,
+                                  bias=torch.zeros(2))

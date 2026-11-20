@@ -23,20 +23,23 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import benchmark_resource, declare, register_context_plan, register_finalizer
 
 
-def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None):
+def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None,
+                       bias=None):
     """Bind a projection without changing its checkpoint weight representation."""
     from .block_fp8 import BlockFP8Projection, BlockFP8Weight
     from .weights import GroupedLinearWeights
 
+    if bias is not None and isinstance(weight, (GroupedLinearWeights, BlockFP8Weight)):
+        raise ValueError(f"{name}: bias is not supported for grouped or block-FP8 projections")
     if isinstance(weight, GroupedLinearWeights):
         return PreparedProjectionGroup(source, weight, output, session=session, name=name, workspace=workspace,
                                        activation_mode=activation_mode, staging=staging)
     if isinstance(weight, torch.Tensor):
-        return UnquantizedProjection(source, weight, output, session=session, name=name)
+        return UnquantizedProjection(source, weight, output, session=session, name=name, bias=bias)
     if isinstance(weight, BlockFP8Weight):
         return BlockFP8Projection(source, weight, output, session=session, name=name)
     return QuantizedProjection(source, weight, output, session=session, name=name,
-                               workspace=workspace, activation_mode=activation_mode)
+                               workspace=workspace, activation_mode=activation_mode, bias=bias)
 
 
 class PreparedProjectionGroup:

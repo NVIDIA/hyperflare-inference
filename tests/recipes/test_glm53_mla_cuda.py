@@ -100,6 +100,22 @@ def assert_selection(actual, expected, indexer, scratch):
         assert torch.all(logits[row][changed] == cutoff)
 
 
+def assert_bf16_query_projection(actual, weights):
+    """Check the graph's query and absorbed query against float32 products of its own inputs."""
+    rows = actual["query_residual"].shape[0]
+    expected = actual["query_residual"].float() @ weights["q_b_proj"].float().T
+    observed = actual["query"].reshape(rows, -1).float()
+    assert expected.count_nonzero(), "the query projection input is all zeros"
+    assert torch.linalg.vector_norm(observed - expected) / torch.linalg.vector_norm(expected) < .01
+    # Per head, the key half of kv_b_proj maps the 256 query channels to the 512-wide latent space.
+    heads = actual["query"].shape[1]
+    absorb = weights["kv_b_proj"].view(heads, 512, 512)[:, :256].float()
+    absorbed = actual["absorbed_query"]
+    expected = torch.einsum("rhd,hdc->rhc", actual["query"][:absorbed.shape[0]].float(), absorb)
+    assert expected.count_nonzero(), "the query absorption input is all zeros"
+    assert torch.linalg.vector_norm(absorbed.float() - expected) / torch.linalg.vector_norm(expected) < .01
+
+
 @pytest.fixture(scope="module", params=[1, 2, 4])
 def model_weights(request):
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
@@ -245,8 +261,15 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
                         metadata.requests, metadata.block_table, scratch.index.physical, scratch.index.selected_lengths,
                         **attention.indexer.expand_options, plan=attention.indexer.expand_plan)
                 torch.testing.assert_close(scratch.index.physical, actual_physical, rtol=0, atol=0)
+                if isinstance(weights["q_b_proj"], torch.Tensor) and isinstance(weights["kv_b_proj"], torch.Tensor):
+                    assert_bf16_query_projection(actual, weights)
                 for key, value in actual.items():
                     assert torch.isfinite(value).all(), key
+                    # forward() never writes scratch.attended: the graph's attention output goes straight to
+                    # value expansion, so the copy above holds zeros. The expanded stage depends on that output
+                    # and is compared with the eager recomputation of attention, value expansion and output.
+                    if key == "attended":
+                        continue
                     if not torch.equal(value, expected[key]):
                         difference = (value.float() - expected[key].float()).abs()
                         mismatches.append(f"step {step}, {key}: {difference.count_nonzero().item()} elements differ; "

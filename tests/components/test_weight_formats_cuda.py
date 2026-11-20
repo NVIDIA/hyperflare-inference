@@ -108,6 +108,12 @@ def test_mxfp8_conversion_padding_and_nonfinite_weights():
 
 
 def packed(rows, columns, fmt, generator):
+    if fmt == "mxfp8":
+        from ignition.reference.qwen38_quant import decode_mxfp8
+
+        w = (torch.randn((rows, columns), generator=generator) * 8).to(torch.float8_e4m3fn)
+        s = torch.randint(121, 125, (rows, columns // 32), dtype=torch.uint8, generator=generator)
+        return {"weight": w, "weight_scale": s}, decode_mxfp8(w, s)
     group = 32 if fmt == "mxfp4" else 16
     w = torch.randint(0, 256, (rows, columns // 2), dtype=torch.uint8, generator=generator)
     if fmt == "mxfp4":
@@ -200,9 +206,11 @@ def test_ordinary_fp4_linear_graph(tmp_path, rows, fmt, native):
             torch.testing.assert_close(out.float().cpu(), expected, rtol=.025, atol=.015)
 
 
-@pytest.mark.parametrize("fmt,mode", [("nvfp4", "a16"), ("nvfp4", "a4"), ("mxfp4", "a8")])
+@pytest.mark.parametrize("fmt,mode", [("nvfp4", "a16"), ("nvfp4", "a4"), ("mxfp4", "a8"), ("mxfp8", "a8")])
 @pytest.mark.parametrize("compression", [None, "csf"])
 def test_ordinary_fp4_experts_graph(tmp_path, monkeypatch, fmt, mode, compression):
+    if fmt == "mxfp8" and compression is not None:
+        pytest.skip("MXFP8 experts keep their uncompressed scales")
     from torch.multiprocessing.reductions import StorageWeakRef
     from b12x.moe import fused_moe
     from b12x.preparation import PreparationSession
@@ -234,6 +242,18 @@ def test_ordinary_fp4_experts_graph(tmp_path, monkeypatch, fmt, mode, compressio
     prepare_weights = fused_moe.prepare_weights
 
     def inspect_scales(*, plan, weights, scale_scratch=None, allocate=None):
+        if fmt == "mxfp8":
+            for expert in range(2):
+                for projection, values, scales in (
+                    ("up_proj", weights.w13[expert, :128], weights.w13_block_scales[expert, :128]),
+                    ("gate_proj", weights.w13[expert, 128:], weights.w13_block_scales[expert, 128:]),
+                    ("down_proj", weights.w2[expert], weights.w2_block_scales[expert]),
+                ):
+                    extent = (slice(None), slice(128, 256)) if projection == "down_proj" else (slice(128, 256), slice(None))
+                    scale_extent = (slice(None), slice(4, 8)) if projection == "down_proj" else extent
+                    name = f"experts.{expert}.{projection}"
+                    assert torch.equal(values.cpu().view(torch.uint8), tensors[name + ".weight"][extent].view(torch.uint8))
+                    assert torch.equal(scales.cpu(), tensors[name + ".weight_scale"][scale_extent])
         if compression is not None:
             native_scales.extend(StorageWeakRef(t.untyped_storage())
                                  for t in (weights.w13_block_scales, weights.w2_block_scales))
@@ -241,10 +261,14 @@ def test_ordinary_fp4_experts_graph(tmp_path, monkeypatch, fmt, mode, compressio
 
     monkeypatch.setattr(fused_moe, "prepare_weights", inspect_scales)
     with DirectWeightLoader(manifest, "cuda:0") as loader:
-        experts = loader.load_fp4_experts(("experts.0", "experts.1"), hidden_size=256, intermediate_size=256,
-            intermediate_range=(128, 256), format=fmt, activation_mode=mode,
-            scale_vectors=scale_vectors if mode == "a4" else None,
-            scale_compression=compression, scale_scratch=buffers)
+        if fmt == "mxfp8":
+            experts = loader.load_mxfp8_experts(("experts.0", "experts.1"), hidden_size=256, intermediate_size=256,
+                                              intermediate_range=(128, 256))
+        else:
+            experts = loader.load_fp4_experts(("experts.0", "experts.1"), hidden_size=256, intermediate_size=256,
+                intermediate_range=(128, 256), format=fmt, activation_mode=mode,
+                scale_vectors=scale_vectors if mode == "a4" else None,
+                scale_compression=compression, scale_scratch=buffers)
         assert loader._session.torch_copy_bytes == 0
     assert experts.plan.scale_compression == compression
     assert all(reference.expired() for reference in native_scales)
@@ -291,6 +315,70 @@ def test_ordinary_fp4_experts_graph(tmp_path, monkeypatch, fmt, mode, compressio
             expected = torch.cat(expected)
             relative = torch.linalg.vector_norm(out.float().cpu() - expected) / torch.linalg.vector_norm(expected)
             assert relative < .035, float(relative)
+
+
+@pytest.mark.parametrize("tokens", [1, 7, 33])
+@torch.no_grad()
+def test_mxfp8_experts_match_a_reference_at_glm_geometry_with_swiglu_limit(tmp_path, tokens):
+    """GLM's draft layer: hidden 4096, one TP4 shard of the 2048-wide experts, top-2 routing, limit 10."""
+    from b12x.moe import fused_moe
+    from b12x.preparation import PreparationSession
+    from ignition.components.moe import PreparedRoutedExperts
+    from ignition.reference.qwen38_quant import decode_mxfp8, quantize_mxfp8_activation
+
+    hidden, intermediate, first, last, limit, count = 4096, 2048, 1536, 2048, 10., 4
+    gen = torch.Generator().manual_seed(4096)
+    tensors, decoded = {}, []
+    for expert in range(count):
+        projections = {}
+        for projection, shape in (("gate_proj", (intermediate, hidden)), ("up_proj", (intermediate, hidden)),
+                                  ("down_proj", (hidden, intermediate))):
+            weight = (torch.randn(shape, generator=gen) * 8).to(torch.float8_e4m3fn)
+            scale = torch.randint(119, 122, (shape[0], shape[1] // 32), dtype=torch.uint8, generator=gen)
+            tensors[f"experts.{expert}.{projection}.weight"] = weight
+            tensors[f"experts.{expert}.{projection}.weight_scale"] = scale
+            projections[projection] = decode_mxfp8(weight, scale)
+        decoded.append(projections)
+    manifest = checkpoint(tmp_path, tensors, {})
+    with DirectWeightLoader(manifest, "cuda:0") as loader:
+        experts = loader.load_mxfp8_experts(tuple(f"experts.{i}" for i in range(count)), hidden_size=hidden,
+            intermediate_size=intermediate, intermediate_range=(first, last), swiglu_limit=limit)
+        assert loader._session.torch_copy_bytes == 0
+    assert experts.plan.activation.mode == "a8" and experts.plan.activation.swiglu_limit == limit
+    cpu = torch.randn(tokens, hidden, generator=gen).bfloat16()
+    ids = (torch.arange(tokens * 2, dtype=torch.int32).reshape(tokens, 2) + tokens) % count
+    routes = torch.softmax(torch.randn(tokens, 2, generator=gen), -1)
+    x, out = cpu.cuda(), torch.empty_like(cpu, device="cuda")
+
+    def reference(clamp):
+        result = torch.zeros(tokens, hidden)
+        reached = 0
+        for row in range(tokens):
+            source = quantize_mxfp8_activation(cpu[row:row + 1].float())
+            for choice in range(2):
+                weights = decoded[int(ids[row, choice])]
+                gate, up = source @ weights["gate_proj"][first:last].T, source @ weights["up_proj"][first:last].T
+                reached += int(((gate > limit) | (up.abs() > limit)).sum())
+                if clamp:
+                    gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+                activation = quantize_mxfp8_activation((torch.nn.functional.silu(gate) * up).bfloat16().float())
+                result[row] += (activation @ weights["down_proj"][:, first:last].T)[0] * routes[row, choice]
+        return result, reached
+
+    expected, reached = reference(True)
+    unclamped, _ = reference(False)
+    assert reached, "no activation reaches the limit, so the test would not notice its absence"
+    assert torch.linalg.vector_norm(unclamped - expected) / torch.linalg.vector_norm(expected) > .1
+    with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
+        operation = PreparedRoutedExperts(x, experts, ids.cuda(), routes.cuda(), out, session=session, name="moe")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            operation()
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+    relative = torch.linalg.vector_norm(out.float().cpu() - expected) / torch.linalg.vector_norm(expected)
+    assert relative < .035, float(relative)
 
 
 @pytest.mark.parametrize("local", [96, 192, 384])

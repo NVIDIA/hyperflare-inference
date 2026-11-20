@@ -99,9 +99,14 @@ def _reference(manifest, weights, device):
         parent, _, attribute = path.rpartition(".")
         setattr(module.get_submodule(parent), attribute, torch.nn.Parameter(value, requires_grad=False))
     declarations = json.loads((manifest.snapshot / "config.json").read_text())["quantization_config"]["quantized_layers"]
-    with CheckpointTensors(manifest, byte_budget=1 << 30) as reader:
+    vision_bytes = sum(tensor.nbytes for name, tensor in manifest.tensors.items() if name.startswith("model.visual."))
+    with CheckpointTensors(manifest, byte_budget=vision_bytes) as reader:
         for path in weights.projections:
             prefix = f"model.visual.{path}"
+            if prefix not in declarations:
+                module.get_submodule(path).weight = torch.nn.Parameter(
+                    reader.read(prefix + ".weight").to(device), requires_grad=False)
+                continue
             if declarations[prefix]["quant_algo"] == "MXFP8":
                 decoded = decode_mxfp8(reader.read(prefix + ".weight"), reader.read(prefix + ".weight_scale"))
                 scale, quantized = 1., True

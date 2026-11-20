@@ -4,6 +4,8 @@
 
 """Qualified checkpoint, serving range, and memory costs of the GLM 5.3 recipe."""
 
+import json
+from pathlib import Path
 from types import MappingProxyType
 
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
@@ -58,6 +60,15 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         # 4.9 GB per rank at TP4, which GB10 holds beside its weights, but 9.7 GB at TP2, which it does not.
         expand_expert_scales=plan.world_size >= 4,
         mtp=speculation is not None, **drafting)
+    # A refusal is reported here, before any rank starts, so that its guidance reaches the command line at every
+    # rank count; a rank that fails during preparation prints a traceback.
+    if speculation is not None and any(gpu.capability == (10, 3) for gpu in plan.gpus):
+        from ignition.preparation.quantization import quantized_layers
+
+        from .weights import require_draft_experts_supported
+
+        require_draft_experts_supported(
+            quantized_layers(json.loads((Path(snapshot) / "config.json").read_text())), sm103=True)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
