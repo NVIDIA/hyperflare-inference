@@ -450,7 +450,7 @@ def _prepare_reference_rank(snapshot, config, *, rank, group, progress=None, cor
                                     if config.packed_verification else config.decode_tokens)
             execution = ExecutionSettings(draft_tokens=config.draft_tokens, batch_invariant=False,
                 yoco_prefill_truncation="compact" if yoco_keep_tokens is not None else "off",
-                index_memory_limit=256 << 20,
+                index_memory_limit=max(256 << 20, config.context * 1024),
                 sampler_topk=0, confidence_temperature=1.)
             model = ReferenceModel(parameters, experts, delivery, execution=execution,
                 context=config.context, request_capacity=config.request_capacity,
