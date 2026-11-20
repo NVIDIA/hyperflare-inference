@@ -101,6 +101,8 @@ struct Move {
     /// Shapes offered on this pass, checked before releasing a locally promoted row.
     offered: Vec<Retiring>,
     started: Instant,
+    /// Candidates sent for the active put of a local root.
+    root_candidates: Option<Vec<crate::PrefixKey>>,
 }
 
 pub(crate) struct Cascade {
@@ -122,6 +124,11 @@ pub(crate) struct Cascade {
     pub(crate) latency_ns: u64,
     pub(crate) max_latency_ns: u64,
     pub(crate) latency_buckets: [u64; 8],
+    /// Root puts the manager stored, by [`crate::RootReason`], with their pages.
+    pub(crate) root_records: [u64; crate::RootReason::COUNT],
+    pub(crate) root_pages: [u64; crate::RootReason::COUNT],
+    pub(crate) deeper_link_records: u64,
+    pub(crate) deeper_link_pages: u64,
 }
 
 impl Cascade {
@@ -133,6 +140,10 @@ impl Cascade {
             latency_ns: 0,
             max_latency_ns: 0,
             latency_buckets: [0; 8],
+            root_records: [0; crate::RootReason::COUNT],
+            root_pages: [0; crate::RootReason::COUNT],
+            deeper_link_records: 0,
+            deeper_link_pages: 0,
             pending: VecDeque::new(),
             moving: HashMap::new(),
             retry_after: now,
@@ -178,24 +189,24 @@ impl Cascade {
             if up && self.pending.len() + self.moving.len() < PENDING_MAX + MOVES_MAX {
                 let mut path = VecDeque::new();
                 if record.tier == Tier::Dram && record.parent.is_some() {
-                    path.extend(record.ancestor_keys.iter().rev().copied());
-                    // The local root may name a predecessor held only by the manager.
-                    if path
-                        .front()
-                        .is_some_and(|key| inner.retirement_predecessor(*key).is_none())
+                    // Each parent consumes fewer tokens, bounding the walk by the local chain depth.
+                    let mut parent = record.parent;
+                    while let Some(local) =
+                        parent.and_then(|key| inner.retirement_predecessor(key, false))
                     {
-                        path.pop_front();
+                        path.push_front(local.key);
+                        parent = local.parent;
                     }
                     // A page-only local root cannot start a manager chain. The first
                     // row-bearing descendant can send those pages from its pinned chain.
                     if path
                         .front()
-                        .and_then(|key| inner.retirement_predecessor(*key))
+                        .and_then(|key| inner.retirement_predecessor(*key, false))
                         .is_some_and(|r| r.parent.is_none() && !r.row)
                     {
                         while path
                             .front()
-                            .and_then(|key| inner.retirement_predecessor(*key))
+                            .and_then(|key| inner.retirement_predecessor(*key, false))
                             .is_some_and(|r| !r.row)
                         {
                             path.pop_front();
@@ -210,6 +221,7 @@ impl Cascade {
                     record,
                     failures: 0,
                     leaf_only: false,
+                    root_candidates: None,
                 });
             } else {
                 inner.retired(record.key, record.tier, Retirement::Failed);
@@ -236,35 +248,28 @@ impl Cascade {
     ) {
         let key = entry.path.front().copied().unwrap_or(entry.record.key);
         let current = (entry.record.tier == Tier::Dram)
-            .then(|| inner.retirement_predecessor(key))
+            .then(|| inner.retirement_predecessor(key, key != entry.record.key))
             .flatten();
-        let record = match current.as_ref() {
+        let mut record = match current {
             Some(record) => record,
-            None if key == entry.record.key => &entry.record,
+            None if key == entry.record.key => entry.record.clone(),
             None => return self.failed(inner, &entry.record),
         };
         let pin = match inner.pin_export(record.tier, record.key, 0, record.row) {
             Ok(pin) => pin,
             Err(_) => return self.failed(inner, &entry.record),
         };
-        if record.tier == Tier::Dram {
-            entry.offered.push(record.clone());
-        }
-        // The selected path already carries the ancestry, including the local root's hint.
-        let ancestors = &entry.record.ancestor_keys;
-        let first = if key == entry.record.key {
-            0
+        // The path holds local records. The keys after the local chain are the root's offered candidates.
+        let ancestors = if key == entry.record.key {
+            entry.record.ancestor_keys.clone()
         } else {
-            entry.path.len()
+            std::mem::take(&mut record.ancestor_keys)
         };
+        entry.root_candidates = record.parent.is_none().then(|| ancestors.clone());
         let request = PutRequest {
             key: record.key,
             parent: record.parent,
-            ancestor_keys: ancestors[first..]
-                .iter()
-                .take(crate::shared::MAX_CHAIN_NODES as usize)
-                .copied()
-                .collect(),
+            ancestor_keys: ancestors,
             bucket: record.bucket,
             chain_pages: pin.chain().total_pages,
             tail_pages: record.tail_pages as u64,
@@ -283,6 +288,9 @@ impl Cascade {
                 row_bytes: self.row_bytes,
             })),
         };
+        if record.tier == Tier::Dram {
+            entry.offered.push(record);
+        }
         match pool.put(request) {
             Ok(id) => {
                 self.moving.insert(id, entry);
@@ -311,6 +319,20 @@ impl Cascade {
         let Some(mut entry) = self.moving.remove(&id) else {
             return false;
         };
+        if let (Some(candidates), PutOutcome::Stored { pages, linked, .. }) =
+            (entry.root_candidates.take(), outcome)
+        {
+            if let Some(parent) = linked {
+                if candidates.iter().skip(1).any(|key| key == parent) {
+                    self.deeper_link_records += 1;
+                    self.deeper_link_pages += pages;
+                }
+            } else {
+                let reason = crate::RootReason::from_nearest(candidates.first().copied()) as usize;
+                self.root_records[reason] += 1;
+                self.root_pages[reason] += pages;
+            }
+        }
         let record = &entry.record;
         match outcome {
             PutOutcome::Stored { .. } | PutOutcome::Present => {
@@ -321,7 +343,7 @@ impl Cascade {
                     if record.tier == Tier::Dram {
                         if entry.offered.iter().any(|old| {
                             inner
-                                .retirement_predecessor(old.key)
+                                .retirement_predecessor(old.key, false)
                                 .is_some_and(|current| {
                                     current.row
                                         && (!old.row

@@ -163,6 +163,7 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
         id: CheckpointId::new(1),
         key,
         parent: None,
+        ancestors: Vec::new(),
         bucket: key.digest,
         chain_pages: vec![PageId(1), PageId(2)],
         tail_pages: 2,

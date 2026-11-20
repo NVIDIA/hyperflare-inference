@@ -47,6 +47,41 @@ fn publish(
 }
 
 #[test]
+fn publication_keeps_the_nearest_256_offered_ancestors() {
+    let mut scheduler = scheduler(1, 8, 260);
+    scheduler.enable_publications();
+    let history = history(5);
+    let mut parent = None;
+    for end in 1..=260 {
+        let tail: Vec<_> = ((end - 1) as u32 / 64..end as u32 / 64).collect();
+        let id = publish(&mut scheduler, &history, parent, end, &tail, 0);
+        scheduler.record_publication(id);
+        parent = Some(id);
+    }
+    let publication = scheduler.publication(parent.unwrap()).unwrap();
+    let nearest: Vec<_> = (4..260).rev().map(|n| history.key_at(n).unwrap()).collect();
+    assert_eq!(publication.ancestors, nearest);
+    assert_eq!(publication.parent, nearest.first().copied());
+}
+
+#[test]
+fn offered_ancestors_skip_keys_at_or_above_the_child() {
+    let mut scheduler = scheduler(1, 8, 4);
+    scheduler.enable_publications();
+    let history = history(1);
+    let root = publish(&mut scheduler, &history, None, 10, &[], 0);
+    let middle = publish(&mut scheduler, &history, Some(root), 20, &[], 0);
+    let tip = publish(&mut scheduler, &history, Some(middle), 30, &[], 0);
+    for id in [root, middle, tip] {
+        scheduler.record_publication(id);
+    }
+    assert_eq!(
+        scheduler.offered_ancestors(Some(tip), 20).unwrap(),
+        [history.key_at(10).unwrap()]
+    );
+}
+
+#[test]
 fn cached_rows_beyond_eight_per_request_yield_backing_to_admission() {
     let mut s = scheduler(1, 64, 64);
     let aliases: Vec<_> = (0..64).map(|i| 63 - i..64 - i).collect();

@@ -477,12 +477,15 @@ impl CompositeStore {
             return;
         }
         self.stats.held[0] += u64::from(!reserved_file);
-        let hint = self
-            .memory
-            .index()
-            .node(&key)
-            .and_then(|node| node.published_parent);
-        self.disk.index_mut().set_published_parent(&key, hint);
+        if parent.is_none() {
+            let hint = self
+                .memory
+                .index()
+                .node(&key)
+                .map(|node| node.published_ancestors.clone())
+                .unwrap_or_default();
+            self.disk.index_mut().set_published_ancestors(&key, hint);
+        }
         if let Some(parent) = parent
             && self
                 .memory
@@ -1455,6 +1458,22 @@ impl HostStore for CompositeStore {
             per_rank_records: std::array::from_fn(|i| {
                 disk.per_rank_records[i] + memory.per_rank_records[i]
             }),
+            root_records: std::array::from_fn(|tier| {
+                std::array::from_fn(|reason| {
+                    memory.root_records[tier][reason] + disk.root_records[tier][reason]
+                })
+            }),
+            root_pages: std::array::from_fn(|tier| {
+                std::array::from_fn(|reason| {
+                    memory.root_pages[tier][reason] + disk.root_pages[tier][reason]
+                })
+            }),
+            deeper_link_records: std::array::from_fn(|i| {
+                memory.deeper_link_records[i] + disk.deeper_link_records[i]
+            }),
+            deeper_link_pages: std::array::from_fn(|i| {
+                memory.deeper_link_pages[i] + disk.deeper_link_pages[i]
+            }),
             abandoned_stores: disk.abandoned_stores,
             rows_thinned: std::array::from_fn(|i| disk.rows_thinned[i] + memory.rows_thinned[i]),
             expired: std::array::from_fn(|i| disk.expired[i] + memory.expired[i]),
@@ -2272,6 +2291,43 @@ mod tests {
     }
 
     #[test]
+    fn a_covered_endpoint_is_stored_under_the_ancestor_that_covers_it() {
+        let Some(directory) = test_directory("composite", "covered-list") else {
+            return;
+        };
+        let mut store = composite(&directory, 18, 0, 1 << 30);
+        let full = history(3 * PAGE_TOKENS);
+        let mut ids = Ids::new();
+        // The Message at 128 tokens is on disk with its row. The prompt-end Endpoint at
+        // 130 was never stored. The terminal Endpoint at 133 shares their page.
+        let mut message = checkpoint(&mut ids, &full, 128, None, pages(0..2), 2, StateSlotId(1));
+        message.capture_role = crate::CaptureRole::Message;
+        written(&mut store, &message, None, 1);
+        let mut endpoint = checkpoint(
+            &mut ids,
+            &full,
+            133,
+            Some(130),
+            pages(0..2),
+            0,
+            StateSlotId(2),
+        );
+        endpoint.ancestors = vec![full.key_at(130).unwrap(), message.key];
+        assert_eq!(store.store(&endpoint).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.outbound[&endpoint.key].parent, Some(message.key));
+        assert!(!store.memory.index().node(&endpoint.key).unwrap().row);
+        poll_until(&mut store, &mut Vec::new(), |s| {
+            !s.outbound.contains_key(&endpoint.key)
+        });
+        let node = store.disk.index().node(&endpoint.key).unwrap();
+        assert_eq!(node.parent, Some(message.key));
+        assert!(!node.row);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn a_same_page_endpoint_spills_its_link_and_preserves_the_message_row() {
         let Some(directory) = test_directory("composite", "same-page-spill") else {
             return;
@@ -2777,40 +2833,70 @@ mod tests {
     }
 
     #[test]
-    fn a_spilled_root_keeps_its_published_parent_for_the_pool_put() {
+    fn a_spilled_root_keeps_every_offered_ancestor_for_the_pool_put() {
         let Some(directory) = test_directory("composite", "published-parent") else {
             return;
         };
         let mut store = composite(&directory, 48, 4, 1 << 30);
         let full = history(2000);
         let mut ids = Ids::new();
-        // The parent is indexed in neither tier, so the record is a root; the pool put still
-        // names that parent as a candidate ancestor, so the hint must reach the disk index.
-        let root = checkpoint(
+        // No ancestor is indexed in either tier, so the record is a root; the pool put
+        // still names every offered ancestor as a candidate, so the whole list must
+        // reach the disk index, nearest first.
+        let mut root = checkpoint(
             &mut ids,
             &full,
             1990,
             Some(1500),
             pages(0..31),
-            31,
+            8,
             StateSlotId(1),
         );
-        let parent = full.key_at(1500).unwrap();
-        let (_, bytes) = copy_landed(&mut store, &root, None, 1);
-        store
-            .memory
-            .index_mut()
-            .set_published_parent(&root.key, root.parent);
-        assert_eq!(store.memory.index().ancestor_keys(&root.key), [parent]);
+        let offered = [1500, 1200, 400].map(|tokens| full.key_at(tokens).unwrap());
+        root.ancestors = offered.to_vec();
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry()).unwrap();
+        store.memory = MemoryStore::new_flat(IDENTITY, store.memory.pool().clone(), copier).unwrap();
+        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         let mut events = Vec::new();
-        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
-        assert!(store.disk.index().contains(&root.key));
-        assert_eq!(store.disk.index().ancestor_keys(&root.key), [parent]);
+        poll_until(&mut store, &mut events, |s| s.disk.index().contains(&root.key));
+        assert_eq!(store.memory.index().ancestor_keys(&root.key), offered);
+        assert_eq!(store.disk.index().ancestor_keys(&root.key), offered);
         store.spill(root.key);
-        poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
+        poll_until(&mut store, &mut events, |s| s.outbound.is_empty());
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn composite_counts_root_and_deeper_link_copies() {
+        let Some(directory) = test_directory("composite", "deeper-link") else {
+            return;
+        };
+        let mut store = composite(&directory, 16, 4, 1 << 30);
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry()).unwrap();
+        store.memory = MemoryStore::new_flat(IDENTITY, store.memory.pool().clone(), copier).unwrap();
+        let full = history(256);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 128, None, pages(0..2), 2, StateSlotId(1));
+        let mut child = checkpoint(&mut ids, &full, 192, Some(130), pages(0..3), 1, StateSlotId(2));
+        child.ancestors.push(root.key);
+        let mut events = Vec::new();
+        for publication in [&root, &child] {
+            assert_eq!(store.store(publication).unwrap(), StoreOutcome::Queued);
+            poll_until(&mut store, &mut events, |s| s.disk.index().contains(&publication.key));
+        }
+        let stats = store.stats();
+        assert_eq!(stats.root_records[0], [1, 0]);
+        assert_eq!(stats.root_pages[0], [2, 0]);
+        assert_eq!(stats.deeper_link_records[0], 1);
+        assert_eq!(stats.deeper_link_pages[0], 1);
+        let node = &store.disk.index()[&child.key];
+        assert_eq!(node.parent, Some(root.key));
+        assert!(node.published_ancestors.is_empty());
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4630,7 +4716,7 @@ mod tests {
             &full,
             1280,
             Some(640),
-            pages(10..20),
+            pages(0..20),
             10,
             StateSlotId(2),
         );

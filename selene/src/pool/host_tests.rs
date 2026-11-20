@@ -83,6 +83,7 @@ impl Rig {
             id: CheckpointId::new(self.next),
             key: self.history.key_at(consumed).unwrap(),
             parent: None,
+            ancestors: Vec::new(),
             bucket: self.history.bucket_at(consumed).unwrap(),
             chain_pages: (0..pages as u32).map(|p| PageId(first_id + p)).collect(),
             tail_pages: pages,
