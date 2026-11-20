@@ -188,7 +188,7 @@ Reload model finishes accepted requests before releasing and loading the core.
 | Setting | Runtime behavior |
 |---|---|
 | Serving memory limit | `30G` caps occupied memory, `-8G` reserves free memory, and `0.8` selects a total-memory fraction per GPU. Blank inherits the configured/core reserve. KV pages use the remainder after model and runtime allocations. |
-| KV capacity limit | Available memory, one prepared context, or prepared context times concurrency; this does not change prepared context length. |
+| KV history capacity | One model context by default. Available memory and Context × concurrency are also selectable. The limit applies to KV history shared across requests. |
 | Maximum concurrent requests | Blank inherits model/configuration/core defaults. An override must fit prepared capacity. |
 | Listener | Localhost by default; all IPv4 interfaces (`0.0.0.0`) or a custom IP and port are selectable. Client URLs use loopback for wildcard listeners, while Settings shows the actual bind. |
 | Verify weights on load | Off by default, matching the CLI. Enabling it scans stored weight ranges before GPU loading. Publisher/executable checks and download-integrity checks remain enabled. |
