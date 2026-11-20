@@ -320,6 +320,7 @@ struct Pending {
 }
 
 struct Frame {
+    residency_reader: Option<crate::parallax::residency::ReaderLease>,
     input: PinnedHost,
     output: PinnedHost,
     confidence: Option<Readback>,
@@ -452,6 +453,7 @@ struct Resources {
 
 /// Thread-bound executor over one borrowed prepared model and its CUDA context.
 pub struct GraphExecutor {
+    residency: Option<crate::parallax::residency::execution::ExecutionGate>,
     manifest: ExecutionManifest,
     pub(super) copy_logprobs: bool,
     resources: Option<Resources>,
@@ -483,6 +485,12 @@ impl GraphExecutor {
     /// Construct rank-local streams without launching any collective graphs.
     pub(super) unsafe fn new_unstarted(manifest: ExecutionManifest) -> Result<Self> {
         manifest.validate()?;
+        let residency = manifest
+            .residency
+            .as_ref()
+            .map(|binding| unsafe { binding.claim() })
+            .transpose()
+            .map_err(|e| Error::from(e.to_string()))?;
         let upload_capacity = manifest
             .graphs
             .iter()
@@ -497,6 +505,7 @@ impl GraphExecutor {
             let index = frame_index;
             frame_index += 1;
             Ok(Frame {
+                residency_reader: None,
                 input: model.host_buffer(manifest.input_frame_bytes)?,
                 output: model.host_buffer(manifest.completion_bytes())?,
                 logprobs: if manifest.max_top_logprobs()? != 0 {
@@ -555,6 +564,7 @@ impl GraphExecutor {
             .map(|binding| crate::engram::Transfers::new(binding, &manifest))
             .transpose()?;
         Ok(Self {
+            residency,
             manifest,
             copy_logprobs: true,
             resources: Some(Resources {
@@ -672,7 +682,9 @@ impl GraphExecutor {
         let Some(resources) = &self.resources else {
             return false;
         };
-        self.startup_ready && self.poison.is_none()
+        self.startup_ready
+            && self.poison.is_none()
+            && self.residency.as_ref().is_none_or(|gate| !gate.paused())
             && resources.frames[self.next_sequence as usize % 2].pending.is_none()
             && !resources
                 .frames
@@ -779,6 +791,12 @@ impl GraphExecutor {
                 "startup tuning has not completed",
             ));
         }
+        // Only polling may advance residency and close its submission gate.
+        // The scheduler can already own this fence after checking can_submit;
+        // a newly ready transfer must not revoke that reservation here.
+        if self.residency.as_ref().is_some_and(|gate| gate.paused()) {
+            return Ok(None);
+        }
         let resources = self
             .resources
             .as_mut()
@@ -839,6 +857,12 @@ impl GraphExecutor {
             }
             bytes / 4
         } else { 0 };
+        frame.residency_reader = self
+            .residency
+            .as_mut()
+            .map(|gate| gate.reader())
+            .transpose()
+            .map_err(|e| Error::from(e.to_string()))?;
         frame.pending = Some(Pending {
             logprobs,
             logprob_width,
@@ -938,6 +962,7 @@ impl GraphExecutor {
             ))
             .into());
         }
+        self.progress_residency()?;
         let resources = self
             .resources
             .as_mut()
@@ -962,6 +987,12 @@ impl GraphExecutor {
             if let Err(error) = (health.0)() {
                 self.poison = Some(error.clone());
                 return Err(error);
+            }
+        }
+        if let Some(reader) = frame.residency_reader.take() {
+            // SAFETY: The completed readback event follows the joined graph and all reads.
+            unsafe {
+                reader.complete();
             }
         }
         let pending = frame.pending.take().unwrap();
@@ -1118,11 +1149,24 @@ impl GraphExecutor {
         }))
     }
 
+    fn progress_residency(&mut self) -> Result<()> {
+        if let Some(gate) = &mut self.residency {
+            // SAFETY: This executor is the sole graph submitter. Pending frames
+            // retain reader leases; publication waits until their fences finish.
+            if let Err(error) = unsafe { gate.tick(crate::parallax::now_ns()) } {
+                let error = Error::from(format!("expert residency failed: {error}"));
+                self.poison = Some(error.clone());
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub fn close(&mut self) -> Shutdown {
         if let Some(shutdown) = &self.shutdown {
             return shutdown.clone();
         }
-        let resources = self.resources.take().unwrap();
+        let mut resources = self.resources.take().unwrap();
         if let Some(engram) = &resources.engram {
             engram.cancel();
         }
@@ -1140,6 +1184,14 @@ impl GraphExecutor {
             .or(engram.err())
             .or(self.poison.take());
         if drained {
+            for frame in &mut resources.frames {
+                if let Some(reader) = frame.residency_reader.take() {
+                    // SAFETY: Both execution streams and auxiliary transfers have drained.
+                    unsafe {
+                        reader.complete();
+                    }
+                }
+            }
             drop(resources);
         } else {
             std::mem::forget(resources);

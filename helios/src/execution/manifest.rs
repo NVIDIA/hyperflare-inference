@@ -231,6 +231,7 @@ impl std::fmt::Debug for CollectiveHealth {
 
 #[derive(Clone, Debug)]
 pub struct ExecutionManifest {
+    pub residency: Option<crate::parallax::residency::execution::ExecutionBinding>,
     pub engram: Option<crate::engram::Binding>,
     /// Present when this rank's graphs launch collectives over a transport between hosts.
     pub collectives: Option<CollectiveHealth>,

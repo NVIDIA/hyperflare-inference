@@ -1186,6 +1186,7 @@ impl ServingOptions {
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
+            parallax_residency: None,
             history_drafts: if self.history_drafts {
                 Some(true)
             } else if self.no_history_drafts {

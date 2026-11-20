@@ -28,6 +28,7 @@ pub struct LoadOptions {
     pub embedding_table_workers: Option<usize>,
     pub max_concurrency: Option<usize>,
     pub mtp_draft_tokens: Option<usize>,
+    pub parallax_residency: Option<super::ResidencyOptions>,
     pub history_drafts: Option<bool>,
     /// Select one exact packed verification capacity per batch before proposal sampling.
     pub mtp_verification_token_budget: Option<usize>,

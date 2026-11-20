@@ -30,6 +30,8 @@ mod memory;
 mod model;
 mod payload;
 mod peer_access;
+mod parallax;
+pub use parallax::{ResidencyOptions, VirtualMemoryOptions};
 mod protection;
 mod protobuf;
 pub use protobuf::wire;
@@ -106,6 +108,10 @@ pub struct NativeResources {
     integrated: bool,
     events: HashMap<String, Handle>,
     cache: Option<flare_selene::CacheGeometry>,
+    parallax_loading: Option<crate::parallax::residency::gb300::Loading>,
+    parallax: Option<crate::parallax::residency::execution::ExecutionBinding>,
+    parallax_device_bytes_removed: u64,
+    parallax_pool_bytes: u64,
     #[cfg(windows)]
     host_mappings: Vec<(u64, usize)>,
 }
@@ -364,6 +370,10 @@ impl NativeResources {
                 integrated: integrated != 0,
                 events: HashMap::new(),
                 cache: None,
+                parallax_loading: None,
+                parallax: None,
+                parallax_device_bytes_removed: 0,
+                parallax_pool_bytes: 0,
                 #[cfg(windows)]
                 host_mappings: Vec::new(),
             };
@@ -1159,10 +1169,21 @@ impl NativeResources {
             let mut previous = null_mut();
             (self.driver.context_get)(&mut previous);
             if (self.driver.context_set)(self.context) != 0 || (self.driver.context_sync)() != 0 {
+                std::mem::forget(self.parallax_loading.take());
+                std::mem::forget(self.parallax.take());
                 std::mem::forget(self.driver.clone());
                 self.context = null_mut();
                 return false;
             }
+            if self.parallax.as_ref().is_some_and(|owner| owner.close().is_err()) {
+                std::mem::forget(self.parallax_loading.take());
+                std::mem::forget(self.parallax.take());
+                std::mem::forget(self.driver.clone());
+                self.context = null_mut();
+                return false;
+            }
+            drop(self.parallax_loading.take());
+            drop(self.parallax.take());
             for executable in self.executables.drain(..).rev() {
                 (self.driver.executable_destroy)(executable);
             }

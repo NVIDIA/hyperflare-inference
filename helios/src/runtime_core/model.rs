@@ -275,6 +275,25 @@ impl NativeModel {
         if device_labels.len() != devices.len() {
             return Err(invalid("GPU label count must match selected devices"));
         }
+        let residency_regions = if let Some(config) = &options.parallax_residency {
+            if devices.len() != 1 || options.cluster_rank.is_some() {
+                return Err(invalid(
+                    "expert residency requires local single-GPU execution",
+                ));
+            }
+            match &authorized.kind {
+                AuthorizedKind::Payload(package) => {
+                    Some(config.resolve(package.verified_metadata())?)
+                }
+                _ => {
+                    return Err(invalid(
+                        "expert residency requires authenticated prepared weight views",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let phase = progress.phase("Prepare model", None);
         let (mut descriptor, mut legacy_bundles, mut ready_cores, files) = match authorized.kind {
             AuthorizedKind::Legacy { archive, index } => {
@@ -693,6 +712,9 @@ impl NativeModel {
                     .map(|rank| rank.memory_snapshot())
                     .collect::<Result<Vec<_>>>()?,
             };
+            if let Some(residency) = &residency_regions {
+                residency.plan(&mut model.ranks[0], &cores[0])?;
+            }
             model.check_memory_limit(&cores, options, &initial, embedding_host_bytes)?;
             let (mut gpu_bytes, mut host_bytes, mut payload_bytes) = (0u64, 0u64, 0u64);
             for allocation in cores.iter().flat_map(|core| &core.allocations) {
@@ -703,9 +725,15 @@ impl NativeModel {
                 }
                 payload_bytes += allocation.stored_bytes() as u64;
             }
+            gpu_bytes = gpu_bytes - model.ranks[0].parallax_device_bytes_removed
+                + model.ranks[0].parallax_pool_bytes;
+            host_bytes += model.ranks[0].parallax_device_bytes_removed;
             let phase = progress.phase("Allocate model memory", Some(gpu_bytes + host_bytes));
             // Reservations cover all ranks and must exist before parallel mapping.
             model.ranks[0].reserve(&cores[0])?;
+            if let Some(residency) = &residency_regions {
+                residency.prepare(&mut model.ranks[0], &cores[0])?;
+            }
             model.parallel(&cores, &files, |rank, core, _| {
                 rank.allocate(core, &phase)
             })?;
@@ -728,6 +756,11 @@ impl NativeModel {
                 "{:.1} GiB",
                 payload_bytes as f64 / (1u64 << 30) as f64
             ));
+            if let Some(residency) = residency_regions {
+                let phase = progress.phase("Place expert weights", None);
+                residency.finish(&mut model.ranks[0])?;
+                phase.finish("Grace backing and HBM residency ready");
+            }
             let kernels = cores
                 .iter()
                 .map(|p| p.functions.len() as u64)
@@ -912,6 +945,7 @@ impl NativeModel {
             .map(|(index, rank)| {
                 let mut manifest = rank.execution_manifest()?;
                 manifest.offload = self.offload.binding(index);
+                manifest.residency = rank.parallax.clone();
                 if let Some((shared, delivery_rank)) = self.engram.get(index) {
                     let events = shared
                         .index

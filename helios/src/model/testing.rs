@@ -389,6 +389,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         graphs,
         cache: None,
         collectives: None,
+        residency: None,
         engram: None,
         offload: None,
     }

@@ -250,6 +250,7 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
     }
     Ok(ExecutionManifest {
         collectives: None,
+        residency: None,
         engram: crate::embedding_tables::binding(value)?,
         cache: None,
         offload: None,
@@ -587,6 +588,7 @@ fn flare_heliopause(module: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         module.add_class::<GraphReplayWorker>()?;
         module.add_class::<ReplayCompletion>()?;
+        module.add_class::<crate::residency_test::ExpertResidencyTestStorage>()?;
         module.add_function(wrap_pyfunction!(validate_prepared_contract, module)?)?;
     }
     #[cfg(all(feature = "server", feature = "qualification"))]
@@ -635,7 +637,7 @@ mod binding_tests {
         Python::attach(|py| {
             let module = PyModule::new(py, "flare_heliopause").unwrap();
             flare_heliopause(&module).unwrap();
-            for name in ["GraphReplayWorker", "ReplayCompletion"] {
+            for name in ["GraphReplayWorker", "ReplayCompletion", "ExpertResidencyTestStorage"] {
                 assert_eq!(
                     module.hasattr(name).unwrap(),
                     cfg!(feature = "qualification")

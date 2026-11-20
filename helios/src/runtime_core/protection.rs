@@ -225,6 +225,14 @@ pub struct AuthorizedCore {
 }
 
 impl AuthorizedCore {
+    /// Signed payload identity for binding expert storage catalogs.
+    pub fn payload_id(&self) -> Option<[u8; 32]> {
+        match &self.kind {
+            AuthorizedKind::Payload(core) => Some(core.source.authorized.verified().core_id()),
+            AuthorizedKind::Legacy { .. } => None,
+        }
+    }
+
     /// Canonical model ID followed by serving aliases from the signed serving contract.
     pub fn model_names(&self) -> Result<Vec<&str>> {
         let contract = match &self.kind {
@@ -2529,6 +2537,10 @@ pub struct PayloadAuthorizedCore {
 }
 
 impl PayloadAuthorizedCore {
+    pub(super) fn verified_metadata(&self) -> &payload_auth::VerifiedCore {
+        self.source.authorized.verified()
+    }
+
     /// Verified identity of the selected deployment: model, hardware, TP, architecture.
     /// Signed cluster topology of the authorized deployment, when declared.
     pub fn cluster_identity(&self) -> Option<super::model::ClusterIdentity> {
