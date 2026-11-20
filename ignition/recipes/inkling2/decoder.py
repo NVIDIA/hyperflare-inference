@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tensor-parallel target execution with complete accepted-state commits."""
+"""Tensor-parallel target execution with complete accepted-state commits.
+
+Ranks on one host reduce FP32 partial sums. Ranks on separate hosts reduce through RoCEnante,
+which carries BF16: each rank rounds its partial sum to BF16 before the reduction.
+"""
 
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -9,7 +13,7 @@ from types import SimpleNamespace
 import torch
 
 from ignition.components.causal_convolution import PreparedCausalConvolution
-from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
+from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce, _roce
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.rms_norm import PreparedTorchRMSNorm
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
@@ -36,6 +40,11 @@ class Scratch:
         return type(self)(self.logits[:samples], self.local_logits[:samples], tokens)
 
 
+def reduction_dtype(runtime):
+    """Element type of cross-rank hidden reductions: BF16 over RoCEnante, FP32 on one host."""
+    return torch.bfloat16 if runtime is not None and _roce(runtime) else torch.float32
+
+
 @dataclass(frozen=True)
 class ResidualState:
     blocks: tuple[torch.Tensor, ...]
@@ -43,11 +52,11 @@ class ResidualState:
 
 
 class PreparedLayer(torch.nn.Module):
-    def __init__(self, layer, weights, text, pool, metadata, reduction, *, mode, tokens,
+    def __init__(self, layer, weights, text, pool, metadata, reduction, reduction_dtype, *, mode, tokens,
                  session, workspace, name, examples=None):
         super().__init__()
         self.layer, self.weights, self.text, self.mode = layer, weights, text, mode
-        self.reduction = reduction
+        self.reduction, self.reduction_dtype = reduction, reduction_dtype
         self.attention = PreparedAttention(layer, weights.attention, text, LayerCache.of(pool, layer), metadata,
             mode=mode, tokens=tokens, session=session, workspace=workspace, name=name + ".attention", examples=examples,
             tuning_page_count=((int(pool.memory_capacity[0].item()) - 1) * pool.ring_row_pages + pool.geometry.ring // 128
@@ -85,7 +94,7 @@ class PreparedLayer(torch.nn.Module):
         streams = (tuple(norm(state.partial) for norm in self.input_norms) if self.input_mix is None
                    else self.input_mix((*state.blocks, state.partial)))
         _, attention_partial, attention_values = self.attention.attend(streams, m)
-        attention_raw = self.reduction(attention_partial).to(torch.bfloat16)
+        attention_raw = self.reduction(attention_partial.to(self.reduction_dtype)).to(torch.bfloat16)
         attention, attention_previous = self.attention_convolution(attention_raw, m)
         if self.layer % t.residual_block == 0:
             mlp_input = self.mlp_mix((*state.blocks, state.partial, attention))[0]
@@ -93,7 +102,7 @@ class PreparedLayer(torch.nn.Module):
             mlp_input = self.mlp_mix((*state.blocks, state.partial), addend=attention)[0]
         routes = self.router(self.router_projection(mlp_input.float()), num_valid_tokens=m.live_counts[:1])
         expert_partial = self.experts(mlp_input, routes.ids, routes.weights)
-        mlp_raw = self.reduction(expert_partial.float()).to(torch.bfloat16)
+        mlp_raw = self.reduction(expert_partial.to(self.reduction_dtype)).to(torch.bfloat16)
         mlp, mlp_previous = self.mlp_convolution(mlp_raw, m)
         if self.mode != "verify":
             self.attention_convolution.commit(attention_previous, attention_raw, m)
@@ -124,10 +133,12 @@ class PreparedDecoder:
         examples = {} if examples is None else examples
         def example(role, shape, dtype=torch.bfloat16):
             return declaration_tensor(examples, "inkling.decoder." + role, shape, dtype, device)
-        partial = example("partial", (tokens, text.hidden), torch.float32)
-        self.reduce = PreparedChunkedAllReduce(partial, example("reduced", partial.shape, torch.float32),
+        # Traced forwards read this attribute, never the runtime, which compile workers see as a placeholder.
+        self.reduction_dtype = reduction_dtype(runtime)
+        partial = example("partial", (tokens, text.hidden), self.reduction_dtype)
+        self.reduce = PreparedChunkedAllReduce(partial, example("reduced", partial.shape, self.reduction_dtype),
             runtime=runtime, coordinator=coordinator, session=session, name=name + ".reduction").functional(session=session)
-        self.layers = [PreparedLayer(index, layer, text, pool, metadata, self.reduce, mode=mode, tokens=tokens,
+        self.layers = [PreparedLayer(index, layer, text, pool, metadata, self.reduce, self.reduction_dtype, mode=mode, tokens=tokens,
             session=session, workspace=workspace, name=f"{name}.layer{index}", examples=examples)
             for index, layer in enumerate(weights.layers)]
         self.logits = PreparedLogits(weights.head, text, weights.rank, tokens=samples,
@@ -155,7 +166,7 @@ class PreparedDecoder:
     def __call__(self, metadata):
         w, t, m = self.weights, self.weights.config.text, metadata
         embedded = embedding_rows(w.embedding, m.token_ids, self.first_token)
-        hidden = self.reduce(embedded.float()).to(torch.bfloat16)
+        hidden = self.reduce(embedded.to(self.reduction_dtype)).to(torch.bfloat16)
         hidden = self.embedding_norm(hidden)
         if self.vision_state is not None and self.mode == "prefill":
             self.vision_state.inject(m, hidden)

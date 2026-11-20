@@ -1412,8 +1412,9 @@ flare-cli/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.sa
 ## Inkling 2 Small NVFP4
 
 The `inkling-2-small-nvfp4` alias selects the local checkpoint
-`/data/models/Inkling-2-Small-NVFP4`. Preparation requires four SM120 GPUs and
-the bundled DSpark weights in `mtp.safetensors`. Target experts retain the
+`/data/models/Inkling-2-Small-NVFP4`. Preparation requires four SM120 GPUs on
+one host, or four SM121 GPUs with one rank per host, and the bundled DSpark
+weights in `mtp.safetensors`. Target experts retain the
 checkpoint's static NVFP4 scales, with A4 activations for prefill and A16
 activations for decoding and speculative verification. DSpark uses MXFP8
 feed-forward projections and BF16 attention and recurrent state. Target and
@@ -1463,6 +1464,30 @@ serving checks with:
 FLARE_RUN_CUDA_TESTS=1 FLARE_INKLING2_TEST_URL=http://127.0.0.1:8000 \
   .venv/bin/python -m pytest tests/server/test_inkling2.py -k default-effort -q
 ```
+
+Each rank holds a quarter of the 344 GB checkpoint, so four-host DGX Spark
+serving runs one rank on each of four GB10 (SM121) hosts, reducing through
+RoCEnante over their ConnectX-7 ports. Ranks on one host reduce FP32 partial
+sums; ranks on separate hosts round each partial sum to BF16 before the
+reduction, because RoCEnante reduces BF16. One runtime carries the hidden
+reductions, the vocabulary gathers of FP32 logits as BF16 column pairs, the
+sampling and log-probability gathers, and the sampling broadcasts. Multi-host
+export requires the checkpoint directory on rank zero only; peers read their
+tensor ranges from it.
+
+On four DGX Sparks (GB10, SM121, 121 GiB each) joined by a switch, a reduced
+core (`--no-mtp --language-model-only --max-concurrency 1 --prefill-chunk-size
+512 --autotune-effort off --no-compile`, no memory reserve) exported 8 graphs
+in 18 min 43 s, loaded 82.9 GiB per rank with a 24.5 GiB cache (6,414,336 KV
+tokens), and passed chat completion, streaming, and a 7,150-token prompt with
+no change in RoCE loss counters. Drop the page cache on every host before
+export and before serving so cached checkpoint and peer rank-core files do not
+exhaust unified memory. Follow the [multi-host guide](multi-host.md) for
+preparation authentication, rank placement, and publisher acceptance. Hosts that
+share a switch need neither `--roce-ring` nor `--roce-chain`. Not run:
+single-host SM120 preparation after the multi-host changes, `--roce-ring`,
+`--roce-chain`, and a numerical comparison of BF16 cross-host reductions
+against single-host FP32 output.
 
 ## Muse Spark Open
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare Inkling 2 text, vision and complete DSpark generation graphs on four local GPUs."""
+"""Prepare Inkling 2 text, vision and complete DSpark generation graphs on four GPUs, on one host or across four hosts."""
 
 import contextlib
 import hashlib
@@ -23,7 +23,8 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime, create_all_gather_runtime
+from ignition.preparation.collectives import (CollectivePreparation, create_all_reduce_runtime, create_all_gather_runtime,
+                                              create_roce_runtime)
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.host_memory import release_unused
@@ -40,7 +41,7 @@ from .contract import prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch
 from .weights import ModelWeights
 from .pool import PAGE_TOKENS, ContinuationPool, RankGeometry, continuation_layout, page_specs
-from ignition.preparation.bootstrap import BasePreparationConfig
+from ignition.preparation.bootstrap import BasePreparationConfig, validate_host_topology
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,10 @@ class PreparationConfig(BasePreparationConfig):
     image_concurrency: int | None = None
     autotune_effort: str = "off"
     devices: tuple[int, ...] = (0, 1, 2, 3)
+    # Device ordinals are host-local when each rank runs on its own host.
+    hosts: tuple[str, ...] | None = None
+    roce_ring: bool = False
+    roce_chain: bool = False
     context: int = 1048576
     max_active: int = 8
     compile_decoder: bool = False
@@ -61,8 +66,13 @@ class PreparationConfig(BasePreparationConfig):
     benchmark_selection: object | None = None
 
     def __post_init__(self):
-        if len(self.devices) != WORLD_SIZE or len(set(self.devices)) != WORLD_SIZE or min(self.devices) < 0:
-            raise ValueError("Inkling 2 preparation requires four distinct GPUs on one host")
+        placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
+        if (not isinstance(self.devices, tuple) or len(self.devices) != WORLD_SIZE
+                or len(set(placements)) != WORLD_SIZE
+                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != WORLD_SIZE)
+                or any(type(d) is not int or d < 0 for d in self.devices)):
+            raise ValueError("Inkling 2 preparation requires four distinct GPUs")
+        validate_host_topology(self.roce_ring, self.roce_chain, self.hosts)
         request_capacity(self.max_active)
         if not 1 <= self.max_active <= 8:
             raise ValueError("Inkling 2 request capacity must be in [1, 8]")
@@ -112,6 +122,41 @@ def _logit_gather_bytes(rows, width):
     return rows * width * 4
 
 
+def _collective_runtimes(config, group, device, *, coordinator, core_storage, hidden, local_vocabulary, draft_block):
+    """Allocate the hidden reduction and the vocabulary, sampling and log-probability gather channels.
+
+    `hidden` is the model width, `local_vocabulary` one rank's padded vocabulary columns and `draft_block`
+    the positions the drafter reduces per request. Ranks on separate hosts run every collective in
+    rank-serial order over one RoCEnante runtime, which all four roles share; the sampling and
+    log-probability channels are None without drafting.
+    """
+    slots, world = request_capacity(config.max_active), len(config.devices)
+    tokens = max(config.prefill_chunk_size, config.decode_tokens)
+    vocabulary_rows = max(config.decode_samples, slots)
+    if coordinator.spans_hosts:
+        # One-shot reductions cover decode and verification rows and the drafter's block of every request;
+        # prefill chunks reduce through the pipelined two-shot path. The largest gather is each rank's FP32
+        # vocabulary partition of every sampled row, carried as BF16 column pairs: 4 * local_vocabulary
+        # bytes per row. A row of the other gathers is at most 1024 bytes (the FP32 log-probability summary),
+        # and the packed sampling results of all rows fit in one vocabulary row.
+        runtime = create_roce_runtime(group, device,
+            max_tokens=max(config.decode_tokens, slots * draft_block if config.drafting else 0), pipe_tokens=tokens,
+            hidden_size=hidden, gather_bytes=vocabulary_rows * local_vocabulary * 4,
+            ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage)
+        drafting = runtime if config.drafting else None
+        return runtime, runtime, drafting, drafting
+    ipc = core_storage.peer_storage
+    runtime = create_all_reduce_runtime(group, device, max_tokens=min(tokens, 1024),
+        hidden_size=hidden, element_bytes=4, ipc=ipc, collective_tuning=config.collective_tuning)
+    vocabulary = create_all_gather_runtime(group, device, max_rows=vocabulary_rows,
+        columns=2 * local_vocabulary * world, ipc=ipc)
+    sampling = (create_all_gather_runtime(group, device, max_rows=config.decode_samples,
+        columns=64 * world, ipc=ipc) if config.drafting else None)
+    logprob = (create_all_gather_runtime(group, device, max_rows=config.decode_samples,
+        columns=512 * world, ipc=ipc) if config.drafting else None)
+    return runtime, vocabulary, sampling, logprob
+
+
 class _Softcapped:
     def __init__(self, projection, softcap):
         self.projection, self.softcap = projection, softcap
@@ -143,8 +188,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     shard = TensorParallelShard(rank, world)
     device = torch.device("cuda", config.devices[rank])
     torch.cuda.set_device(device)
-    if torch.cuda.get_device_capability(device) != (12, 0):
-        raise ValueError("Inkling 2 preparation requires SM120 GPUs")
+    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+        raise ValueError("Inkling 2 preparation requires SM120 or SM121 GPUs")
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
         headers = [entry.header_sha256 for entry in manifest.shards]
@@ -158,6 +203,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         weights = ModelWeights.load(manifest, device, shard=shard, layers=config.decoder_layers,
                                     progress=progress, drafting=config.drafting, vision=config.vision)
         weights_bytes = torch.cuda.memory_allocated(device)
+    if torch.cuda.get_device_properties(device).is_integrated:
+        from ignition.preparation.host_memory import release_page_cache
+
+        # Unified memory counts cached checkpoint pages against the GPU; drop them after loading.
+        release_page_cache(manifest.shard_paths)
     del manifest
     release_unused()
     transient = contextlib.ExitStack()
@@ -188,16 +238,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         width = max((w for _, w, _ in config.speculative_round_shapes), default=1)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + width), device=device)
         coordinator = CollectivePreparation(group)
-        runtime = create_all_reduce_runtime(group, device, max_tokens=min(tokens, 1024),
-            hidden_size=text.hidden, element_bytes=4, ipc=core_storage.peer_storage,
-            collective_tuning=config.collective_tuning)
-        vocabulary_runtime = create_all_gather_runtime(group, device,
-            max_rows=max(config.decode_samples, slots), columns=2 * weights.head.shape[0] * world,
-            ipc=core_storage.peer_storage)
-        sampling_runtime = (create_all_gather_runtime(group, device, max_rows=config.decode_samples,
-            columns=64 * world, ipc=core_storage.peer_storage) if config.drafting else None)
-        logprob_runtime = (create_all_gather_runtime(group, device, max_rows=config.decode_samples,
-            columns=512 * world, ipc=core_storage.peer_storage) if config.drafting else None)
+        runtime, vocabulary_runtime, sampling_runtime, logprob_runtime = _collective_runtimes(
+            config, group, device, coordinator=coordinator, core_storage=core_storage,
+            hidden=text.hidden, local_vocabulary=weights.head.shape[0],
+            draft_block=model.draft.block)
         identity = hashlib.sha256(json.dumps({"text": model.text.__dict__ | {"local_layers": sorted(model.text.local_layers)},
             "quantization": model.quantization, "headers": headers, "world_size": world,
             "decoder_layers": len(weights.layers), "contract": "inkling2.paged-text.v1"},
@@ -357,4 +401,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         export_zero_ranges=completion.zero_ranges(),
         resources=(weights, pool, requests, inputs, admission, commands, completion, forwards, arena, session,
                    compiled, stream, graph_pool, coordinator, runtime, vocabulary_runtime, sampling_runtime, logprob_runtime, speculation, vision_state),
-        close_resources=tuple(r for r in (runtime, vocabulary_runtime, sampling_runtime, logprob_runtime) if r is not None))
+        # Ranks on separate hosts share one runtime across these roles; close it once.
+        close_resources=tuple(dict.fromkeys(
+            r for r in (runtime, vocabulary_runtime, sampling_runtime, logprob_runtime) if r is not None)))

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inkling 2 Small NVFP4 preparation on four GPUs with bundled DSpark and vision."""
+"""Inkling 2 Small NVFP4 preparation on four GPUs, on one host or one per host, with bundled DSpark and vision."""
 
 from types import MappingProxyType
 
@@ -12,11 +12,13 @@ from .frontend import SAMPLING_DEFAULTS
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
             core_storage=None, ranks=None):
+    """Prepare the plan's catalog on process-local GPUs 0 through 3.
+
+    With `ranks`, rank zero's multi-host rendezvous, each rank uses its own host's GPU 0.
+    """
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
 
-    if ranks is not None:
-        raise ValueError("Inkling 2 preparation requires four GPUs on one host")
     if plan.prompt_logprobs:
         raise ValueError("Inkling 2 preparation does not capture prompt scoring graphs")
     speculation = plan.speculation
@@ -31,7 +33,9 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
-        devices=tuple(range(plan.world_size)), context=plan.recipe.context, prefill_chunk_size=plan.prefill_chunk,
+        devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
+        hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
+        context=plan.recipe.context, prefill_chunk_size=plan.prefill_chunk,
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
@@ -40,7 +44,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         mtp_only=speculation is not None and speculation.mtp_only,
         benchmark_selection=plan.benchmark_selection, **drafting)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
-                         checkpoint=plan.checkpoint)
+                         ranks=ranks, checkpoint=plan.checkpoint)
 
 
 def usage(prepared):

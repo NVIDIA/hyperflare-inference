@@ -8,6 +8,13 @@
     populated large vision graphs. Canonical vision comparisons cover at most
     256 live patches.
 
+[ ] Compare Inkling 2 output across four DGX Sparks, where cross-host hidden
+    reductions round partial sums to BF16, against single-host FP32 reductions.
+    Also run the unverified Inkling 2 multi-host combinations: effort-zero
+    cases of tests/server/test_inkling2.py on Sparks, single-host SM120
+    preparation after the multi-host changes, and --roce-ring and --roce-chain
+    routing.
+
 [ ] Fix native TP4 shutdown reporting "free(): double free detected in tcache 2"
     after server drain with Inkling 2 cores. Reproduces with compiled and
     uncompiled graphs; preserve the successful request drain and GPU release.
