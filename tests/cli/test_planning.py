@@ -914,6 +914,31 @@ def test_collective_tuning_plan_recipe_default_and_override(mode):
         replace(default, collective_tuning="unknown")
 
 
+def synthetic_collective_ladder(world):
+    """One reduction bucket and, on supported rank counts, one column-gather bucket."""
+    geometry = {"max_bytes": 4096, "threads": 128, "blocks": 1}
+    gather = None
+    if world in (2, 4, 8, 10):
+        gather = {"min_bytes": 16, "buckets": [
+            geometry | {"implementation": "gather_selected_barrier", "profiles": {"barrier": [1]}}]}
+    return {
+        "version": 2, "name": f"synthetic-tp{world}", "compute_capability": [12, 0],
+        "world_size": world, "dtype": "bfloat16", "inplace": False, "cache_policy": "cold",
+        "min_bytes": 16, "buckets": [geometry | {"implementation": "joint_latency", "profiles": {"full": [1]}}],
+        "all_gather": gather,
+    }
+
+
+def test_eight_rank_ladder_rejects_word_exchange():
+    from ignition.preparation.collective_ladder import validate
+
+    ladder = synthetic_collective_ladder(8)
+    ladder["all_gather"]["buckets"][0].update(implementation="gather_selected_word_exchange",
+                                              profiles={"word_exchange": [1]})
+    with pytest.raises(UsageError, match="word exchange requires TP2/TP4"):
+        validate(ladder)
+
+
 @pytest.mark.parametrize("recipe", recipes(), ids=lambda recipe: recipe.name)
 @pytest.mark.parametrize("mode", ["static", "runtime"])
 def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_path, recipe, mode):
@@ -923,10 +948,8 @@ def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_p
     bootstrap = import_module(f"ignition.recipes.{bootstrap_name}.bootstrap")
     assert recipe.collective_tuning == "static"
     assert bootstrap.PreparationConfig.__dataclass_fields__["collective_tuning"].default == "static"
-    from ignition.preparation.collective_ladder import load
-
     world = min((size for size in recipe.tensor_parallel if size > 1), default=1)
-    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json") | {"world_size": world} if mode == "runtime" and world in (2, 3, 4, 6, 8, 10) else None
+    ladder = synthetic_collective_ladder(world) if mode == "runtime" and world in (2, 3, 4, 6, 8, 10) else None
     devices = tuple(replace(gpu(i, 4096), total_bytes=4096 * GIB) for i in range(world))
     plan = replace(derive(model=recipe, gpus=devices, selected=tuple(range(world)), speculation=None), collective_tuning=mode, collective_ladder=ladder)
     original = bootstrap.PreparationConfig
