@@ -215,6 +215,39 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
     let image = json!({"model":"glm53_full", "messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,AA=="}}]}]});
     assert!(prepare_request(&frontend, None, &compiler, &config, image).is_err());
 
+    // An advisory block hint adds one cut at the end of the hinted block, through the template's
+    // content macro, without changing the prompt; a changed later block keeps that prefix.
+    let history = "History 17. An earlier action read a file and checked its output.\n".repeat(20);
+    let mut messages = json!([{"role":"user","content":[
+        {"type":"text","text":history},
+        {"type":"text","text":"First action: inspect the file. Reply OK."}]}]);
+    let options = json!({"add_generation_prompt":true});
+    let render = |messages: &Value| {
+        frontend
+            .render_chat(messages.as_array().unwrap(), options.as_object().unwrap())
+            .unwrap()
+    };
+    let plain = render(&messages);
+    messages[0]["_checkpoint_hints"] = json!([1]);
+    let marked = render(&messages);
+    assert_eq!(marked.text, plain.text);
+    assert_eq!(marked.token_ids, plain.token_ids);
+    assert_eq!(
+        marked.message_boundaries.len(),
+        plain.message_boundaries.len() + 1
+    );
+    let cut = *marked
+        .message_boundaries
+        .iter()
+        .find(|cut| !plain.message_boundaries.contains(cut))
+        .unwrap();
+    let prefix = frontend.tokenizer().decode(&marked.token_ids[..cut], false).unwrap();
+    assert!(prefix.ends_with(history.trim_end()) || prefix.ends_with(&history), "{prefix}");
+    messages[0]["content"][1]["text"] = json!("Second action: run the tests. Reply OK.");
+    let changed = render(&messages);
+    assert!(changed.token_ids.starts_with(&marked.token_ids[..cut]));
+    assert!(changed.message_boundaries.contains(&cut));
+
     // Control: marks moved by one byte no longer sit at root output sites after a completed
     // message, so the template fails to load or reports different endpoints.
     let shifted = {

@@ -699,12 +699,24 @@
     round, which no reference confirms. Close when a reference forward of
     layer 78 exists and tests/recipes compares the prepared layer with it.
 
-[ ] Run the GLM 5.3 checks that have not run: tests/server/test_protocols.py
-    (the test environment lacks the `anthropic` package), concurrency above
-    eight, a server-level control that corrupts one draft proposal, and a
+[ ] Run the GLM 5.3 checks that have not run: concurrency above eight and a
     component test of the draft round in tests/recipes. Close when each has
     run or is removed from the qualification statement in
     docs/model-preparation.md.
+
+[ ] Decide how tests/server/test_protocols.py applies to GLM 5.3. Against a
+    served `glm53_full` core 87 cases pass. Four expect a reply within 32
+    tokens with `enable_thinking: false`, which the checkpoint's template
+    does not read: it always opens reasoning. The image case needs image
+    input. The raw-completion case expects two tokens after the bare prompt
+    "Hello", where the model's first token ends the sequence. The hinted
+    case of test_messages_block_hint_reuses_history_after_suffix_changes
+    reuses no tokens: the frontend places the hinted cut
+    (helios/tests/glm53_full_frontend.rs), and the scheduler declines it for
+    exceeding the checkpoint work budget, because one more 128-token
+    prefill launch costs more than 5% of the prompt's prefill. Close when
+    each case passes, is skipped for a stated model property, or is
+    reported as a defect.
 
 [ ] Add `glm53_full` to the sampling-defaults table in docs/api.md and to the
     speculative catalog description in docs/cli-design.md. Close when both
