@@ -521,6 +521,7 @@ pub(super) fn render(
         text: prompt.text,
         token_ids: prompt.token_ids,
         image_sources: prompt.image_sources,
+        video_sources: Vec::new(),
         image_checkpoint_hints: Vec::new(),
         ordinary: Vec::new(),
         message_boundaries: boundaries,

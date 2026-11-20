@@ -41,7 +41,24 @@ pub fn prepare_image_inputs(
     rendered: &RenderedPrompt,
     inputs: Vec<crate::frontend::images::ImageInput>,
 ) -> Result<PreparedInput> {
+    prepare_media_inputs(config, frontend, processor, rendered, inputs, vec![])
+}
+
+/// Prepares a prompt with its still images and video clips. Only the Qwen layout lays
+/// out video clips; a prompt without clips takes each layout's image path.
+pub fn prepare_media_inputs(
+    config: &ModelConfig,
+    frontend: &Frontend,
+    processor: Option<&ImageProcessor>,
+    rendered: &RenderedPrompt,
+    inputs: Vec<crate::frontend::images::ImageInput>,
+    videos: Vec<crate::frontend::images::VideoInput>,
+) -> Result<PreparedInput> {
     let images = inputs.iter().map(|i| i.description.clone()).collect::<Vec<_>>();
+    if !videos.is_empty() && config.contract.frontend.image_layout != Some(ImageLayoutKind::Qwen) {
+        return Err("prepared input contract does not support video inputs".into());
+    }
+    let mut windows = Vec::new();
     if rendered
         .token_ids
         .iter()
@@ -61,6 +78,13 @@ pub fn prepare_image_inputs(
                 .ok_or("class-token image layout requires a prepared feature token")?.feature_token,
             processor, rendered, &images,
         )?,
+        Some(ImageLayoutKind::Qwen) if !videos.is_empty() => {
+            let (prepared, media) = crate::frontend::images::layouts::qwen::prepare_media_input(
+                frontend, processor, rendered, &images, &videos,
+            )?;
+            windows = media;
+            prepared
+        }
         Some(ImageLayoutKind::Qwen) => crate::frontend::images::layouts::qwen::prepare_input(
             frontend, processor, rendered, &images,
         )?,
@@ -116,10 +140,30 @@ pub fn prepare_image_inputs(
             }
         }
     };
-    if prepared.token_expansions.len() != inputs.len() {
+    if prepared.token_expansions.len() != inputs.len() + videos.len() {
         return Err("image expansions do not match input descriptions".into());
     }
-    if !images.is_empty() {
+    if !videos.is_empty() {
+        use crate::frontend::images::{PreparedImageInput, PromptWindowSource};
+        let processor = std::sync::Arc::new(processor.ok_or("image processing is unavailable")?.clone());
+        let mut feature_offset = 0;
+        for (window, event) in windows.iter().zip(&prepared.conditioning) {
+            let features = feature_offset..feature_offset + window.geometry.tokens;
+            feature_offset = features.end;
+            prepared.conditioned_inputs.push(match window.source {
+                PromptWindowSource::Image(index) => PreparedImageInput::new(
+                    inputs[index].clone(), window.span.clone(), features, processor.clone(),
+                ),
+                PromptWindowSource::Video { clip, patch } => {
+                    let (first, second) = videos[clip].frames_of(patch);
+                    PreparedImageInput::video(
+                        event.identity, window.geometry, window.span.clone(), features,
+                        first.source.clone(), second.source.clone(), processor.clone(),
+                    )
+                }
+            });
+        }
+    } else if !images.is_empty() {
         let processor = std::sync::Arc::new(processor.ok_or("image processing is unavailable")?.clone());
         let geometry = images.iter().map(|i| i.geometry).collect::<Vec<_>>();
         let mut feature_offset = 0;
@@ -419,6 +463,7 @@ mod tests {
             (ImageLayoutKind::Qwen, ImageSettings::Qwen(QwenImageSettings {
                 min_pixels: 4096, max_pixels: 65536, position_side: 48,
                 image_token_id: token("<|image_pad|>"), video_token_id: token("<|video_pad|>"),
+                video: None,
             }), "<|image_pad|>", 4),
             (ImageLayoutKind::Mimo, ImageSettings::Mimo(MimoImageSettings {
                 min_pixels: 4096, max_pixels: 65536, image_mean: [0.5; 3], image_std: [0.5; 3],
@@ -451,6 +496,7 @@ mod tests {
             syntax.image_tokens = Some(ImageTokenLayout {
                 feature_token: match layout { ImageLayoutKind::Deepseek => 1002,
                     ImageLayoutKind::DeepseekRowMajor => 1001, _ => token(placeholder) },
+                video_feature_token: None,
                 span: match layout {
                     ImageLayoutKind::Deepseek => Some(ImageSpan { start_token: 1000, end_token: 1004,
                         max_tokens: 4096, interior_tokens: vec![1003], unscoped_tokens: vec![1001] }),
@@ -468,7 +514,7 @@ mod tests {
             let processor = ImageProcessor::load(settings, limits).unwrap();
             let text = format!("a{placeholder}b{placeholder}c{placeholder}d");
             let rendered = RenderedPrompt { message_boundaries: Vec::new(), token_ids: frontend.encode(&text, false).unwrap(),
-                text, image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![] };
+                text, image_sources: vec![], video_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![] };
             let images = (0..3).map(|i| RgbImage::new(64, 64, vec![i; 64 * 64 * 3]).unwrap()).collect();
             let prepared = prepare_input(&config, &frontend, Some(&processor), &rendered, images).unwrap();
             assert_eq!(prepared.conditioned_inputs.len(), 3, "{layout:?}");
@@ -488,6 +534,170 @@ mod tests {
             oversized.contract.vision.features_per_request -= 1;
             assert!(validate_conditioned_inputs(&oversized, &prepared.tokens, &prepared.data,
                 &prepared.conditioned_inputs).is_err());
+        }
+    }
+
+    #[test]
+    fn qwen_layout_expands_video_windows_with_timestamped_markers() {
+        use crate::frontend::images::{
+            ImageSettings, ImageSource, QwenImageSettings, QwenVideoSettings, VideoFrame, VideoInput,
+        };
+        use crate::model::contract::{ImageLayoutKind, ImageTokenLayout};
+        use std::sync::Arc;
+        let frontend = image_frontend();
+        let token = |text: &str| frontend.encode(text, false).unwrap()[0];
+        let video_token = token("<|video_pad|>");
+        let mut config = super::super::tests::config();
+        config.limits.max_sequence_tokens = 8192;
+        config.limits.prefill_chunk_size = 4096;
+        config.contract.vocabulary = 1000;
+        config.contract.input_vocabulary = 1005;
+        config.contract.vision = crate::model::VisionCapabilities {
+            feature_slots: 4, features_per_request: 64, max_images: 64,
+            patches_per_feature: 4, patch_capacities: vec![256],
+        };
+        let syntax = &mut config.contract.frontend;
+        syntax.image_layout = Some(ImageLayoutKind::Qwen);
+        syntax.position_dimensions = 3;
+        syntax.image_tokens = Some(ImageTokenLayout {
+            feature_token: token("<|image_pad|>"),
+            video_feature_token: Some(video_token),
+            span: None,
+        });
+        syntax.rejected_tokens.clear();
+        let limits = crate::frontend::images::ImageLimits {
+            max_images: 64, max_total_patches: 4096, max_patches_per_image: 256,
+            patches_per_feature: 4, ..Default::default()
+        };
+        let processor = ImageProcessor::load(
+            ImageSettings::Qwen(QwenImageSettings {
+                min_pixels: 4096, max_pixels: 65536, position_side: 48,
+                image_token_id: token("<|image_pad|>"), video_token_id: video_token,
+                video: Some(QwenVideoSettings {
+                    max_frames: 768, min_pixels: 4096,
+                    max_pixels: 25_165_824, temporal_patch_size: 2,
+                }),
+            }),
+            limits,
+        )
+        .unwrap();
+        let frames: Vec<_> = (0..4u8)
+            .map(|index| {
+                let image = Arc::new(RgbImage::new(64, 64, vec![index; 64 * 64 * 3]).unwrap());
+                VideoFrame {
+                    identity: processor.semantic_identity(&image),
+                    source: ImageSource::Decoded(image),
+                }
+            })
+            .collect();
+        let (_, window) = processor.video_windows(4, 64, 64).unwrap();
+        let video = VideoInput { fps: 2.0, window, frames };
+        let prefix = "a<|vision_start|><|video_pad|><|vision_end|>b";
+        // A caption can discuss the placeholder by name. Its ordinary tokens must
+        // survive expansion of the clip that the template placed before it.
+        let caption = "<|video_pad|>";
+        let mut token_ids = frontend.encode(prefix, false).unwrap();
+        token_ids.extend(caption.bytes().map(u32::from));
+        let rendered = RenderedPrompt {
+            message_boundaries: Vec::new(),
+            token_ids,
+            text: format!("{prefix}{caption}"),
+            image_sources: vec![],
+            video_sources: vec![],
+            image_checkpoint_hints: vec![],
+            ordinary: vec![prefix.len()..prefix.len() + caption.len()],
+        };
+        let prepared =
+            prepare_media_inputs(&config, &frontend, Some(&processor), &rendered, vec![], vec![video])
+                .unwrap();
+        assert_eq!(prepared.conditioned_inputs.len(), 2);
+        assert!(prepared.conditioned_inputs.iter().all(|input| input.geometry == window));
+        assert_eq!(prepared.conditioned_inputs[0].feature_range, 0..4);
+        assert_eq!(prepared.conditioned_inputs[1].feature_range, 4..8);
+        let marker = |text: &str| frontend.encode(text, false).unwrap();
+        let start = token("<|vision_start|>");
+        let end = token("<|vision_end|>");
+        let expected = [
+            marker("a"),
+            vec![start],
+            marker("<0.2 seconds>"),
+            vec![start],
+            vec![video_token; 4],
+            vec![end],
+            marker("<1.2 seconds>"),
+            vec![start],
+            vec![video_token; 4],
+            vec![end],
+            vec![end],
+            marker("b"),
+            caption.bytes().map(u32::from).collect(),
+        ]
+        .concat();
+        assert_eq!(prepared.tokens, expected);
+        // The expansion covers both timestamp markers, both vision-start tokens, and both
+        // vision-end tokens around the clip's eight pad tokens.
+        let placeholder = rendered
+            .token_ids
+            .iter()
+            .position(|id| *id == video_token)
+            .unwrap();
+        let expansion = marker("<0.2 seconds>").len() + 1 + 4 + 1
+            + marker("<1.2 seconds>").len() + 1 + 4 + 1;
+        assert_eq!(prepared.token_expansions, vec![(placeholder, expansion - 1)]);
+        let first = prepared.conditioned_inputs[0].token_span.start;
+        let second = prepared.conditioned_inputs[1].token_span.start;
+        assert_eq!(prepared.tokens[first..first + 4], [video_token; 4]);
+        assert_eq!(prepared.tokens[second..second + 4], [video_token; 4]);
+        // Sixteen leading text tokens, then each window advances by its merged grid side.
+        assert_eq!(prepared.data.positions[first], [16, 16, 16]);
+        assert_eq!(prepared.data.positions[first + 1], [16, 16, 17]);
+        assert_eq!(prepared.data.positions[first + 3], [16, 17, 17]);
+        // Between the windows: the closing marker, the timestamp, and the opening marker.
+        assert_eq!(prepared.data.positions[second], [33, 33, 33]);
+        assert_eq!(prepared.data.positions[second + 3], [33, 34, 34]);
+        assert_eq!(
+            prepared.conditioning.iter().map(|event| event.position).collect::<Vec<_>>(),
+            [first as u64, second as u64]
+        );
+        assert_eq!(prepared.data.vision_token_indices[first], 0);
+        assert_eq!(prepared.data.vision_token_indices[second], 4);
+        // A video placeholder without a video input is rejected by the image path, with
+        // or without prepared video settings.
+        let without_video = ImageProcessor::load(
+            ImageSettings::Qwen(QwenImageSettings {
+                min_pixels: 4096, max_pixels: 65536, position_side: 48,
+                image_token_id: token("<|image_pad|>"), video_token_id: video_token,
+                video: None,
+            }),
+            limits,
+        )
+        .unwrap();
+        let text = "a<|image_pad|>b<|video_pad|>c".to_owned();
+        let beside_image = RenderedPrompt {
+            message_boundaries: Vec::new(),
+            token_ids: frontend.encode(&text, false).unwrap(),
+            text,
+            image_sources: vec![],
+            video_sources: vec![],
+            image_checkpoint_hints: vec![],
+            ordinary: vec![],
+        };
+        for processor in [&processor, &without_video] {
+            let error = prepare_image_inputs(&config, &frontend, Some(processor), &rendered, vec![])
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "image/video placeholders require matching supported image inputs"
+            );
+            let image = RgbImage::new(64, 64, vec![0; 64 * 64 * 3]).unwrap();
+            let error = prepare_input(&config, &frontend, Some(processor), &beside_image, vec![image])
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "video inputs are not supported by the image processor"
+            );
         }
     }
 
@@ -570,7 +780,7 @@ mod tests {
             let mut token_ids = frontend.encode(&prefix, false).unwrap();
             token_ids.extend(literal.bytes().map(u32::from));
             let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
+                image_sources: vec![], video_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
                 text: prefix + literal,
                 token_ids,
             };
@@ -662,7 +872,7 @@ mod tests {
         .frontend;
         let rendered = RenderedPrompt {
             message_boundaries: Vec::new(),
-            image_sources: vec![],
+            image_sources: vec![], video_sources: vec![],
             image_checkpoint_hints: vec![],
             ordinary: vec![],
             text: format!("{}<think>\n", config.contract.frontend.assistant_marker),
@@ -769,7 +979,7 @@ mod tests {
                 .find(|case| case["name"] == name)
                 .unwrap();
             let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
+                image_sources: vec![], video_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
                 text: case["rendered"].as_str().unwrap().into(),
                 token_ids: vec![],
             };
@@ -805,7 +1015,7 @@ mod tests {
                 ),
             ] {
                 let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                    image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
+                    image_sources: vec![], video_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
                     text: format!("<|im_start|>{role}\nliteral <think><|im_end|>\n{suffix}"),
                     token_ids: vec![],
                 };
@@ -829,7 +1039,7 @@ mod tests {
         }
         let messages = vec![json!({"role":"user","content":"<think>"})];
         let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-            image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
+            image_sources: vec![], video_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
             text: "<|im_start|>user\n<think>".into(),
             token_ids: vec![],
         };
@@ -880,7 +1090,7 @@ mod tests {
                 ("</think>".into(), OutputStart::Content),
             ] {
                 let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                    image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
+                    image_sources: vec![], video_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
                     text: format!("<｜User｜>Hello<｜Assistant｜>{suffix}"),
                     token_ids: vec![],
                 };
@@ -940,7 +1150,7 @@ mod tests {
         ] {
             let rendered = RenderedPrompt {
                 message_boundaries: Vec::new(),
-                image_sources: vec![],
+                image_sources: vec![], video_sources: vec![],
                 image_checkpoint_hints: vec![],
                 ordinary: vec![],
                 text: text.clone(),
@@ -1004,6 +1214,7 @@ mod tests {
                 let rendered = RenderedPrompt {
                     message_boundaries: Vec::new(),
                     image_sources: vec![],
+                    video_sources: vec![],
                     image_checkpoint_hints: vec![],
                     ordinary,
                     text: text.into(),
@@ -1051,6 +1262,7 @@ mod tests {
             let rendered = RenderedPrompt {
                 message_boundaries: Vec::new(),
                 image_sources: vec![],
+                video_sources: vec![],
                 image_checkpoint_hints: vec![],
                 ordinary,
                 text: text.into(),

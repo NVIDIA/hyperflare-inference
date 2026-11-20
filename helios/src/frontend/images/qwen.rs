@@ -7,12 +7,16 @@
 
 use super::*;
 
+const VISION_START_TOKEN: &str = "<|vision_start|>";
+const VISION_END_TOKEN: &str = "<|vision_end|>";
+
 #[derive(Clone)]
 pub(super) struct QwenProcessor {
     pub(super) patches: patches::PatchProcessor,
     pub(super) position_side: usize,
     pub(super) image_token_id: u32,
     pub(super) video_token_id: u32,
+    pub(super) video: Option<video::VideoProcessor>,
 }
 
 impl QwenProcessor {
@@ -24,6 +28,11 @@ impl QwenProcessor {
         {
             return Err("invalid prepared Qwen image settings".into());
         }
+        let video = settings
+            .video
+            .as_ref()
+            .map(|video| video::VideoProcessor::load(video, limits))
+            .transpose()?;
         Ok(Self {
             patches: patches::PatchProcessor {
                 limits,
@@ -36,11 +45,30 @@ impl QwenProcessor {
             position_side: settings.position_side,
             image_token_id: settings.image_token_id,
             video_token_id: settings.video_token_id,
+            video,
         })
     }
 
     pub fn process(&self, images: &[RgbImage]) -> Result<ProcessedImages> {
         let mut result = self.patches.process(images)?;
+        self.fill_interpolation(&mut result);
+        Ok(result)
+    }
+
+    /// One temporal patch of a video clip: the vision window of a still image with one
+    /// frame in each temporal slice.
+    pub fn process_pair(
+        &self,
+        first: &RgbImage,
+        second: &RgbImage,
+        geometry: &ImageGeometry,
+    ) -> Result<ProcessedImages> {
+        let mut result = self.patches.pack_pair(first, second, geometry)?;
+        self.fill_interpolation(&mut result);
+        Ok(result)
+    }
+
+    fn fill_interpolation(&self, result: &mut ProcessedImages) {
         let side = self.position_side;
         let mut start = 0;
         result
@@ -70,7 +98,6 @@ impl QwenProcessor {
             }
             start += geometry.patches;
         }
-        Ok(result)
     }
 
     /// Expands the image placeholders in already rendered chat tokens, in image order.
@@ -167,6 +194,142 @@ impl QwenProcessor {
             token_ids,
             mm_token_type_ids,
             position_ids: positions,
+        })
+    }
+
+    /// Expands the image and video placeholders in rendered token IDs, in prompt order.
+    /// A still image fills one vision window. A clip replaces its placeholder with one
+    /// window per temporal patch, each preceded by its timestamp marker and enclosed in
+    /// vision delimiters, which is the text the checkpoint processor writes.
+    pub fn expand_media_prompt(
+        &self,
+        video: &video::VideoProcessor,
+        frontend: &Frontend,
+        prompt_token_ids: &[u32],
+        images: &ProcessedImages,
+        videos: &[VideoInput],
+    ) -> Result<MediaPrompt> {
+        let invalid = |message: &str| Error::frontend(FrontendError::Input(Failure::new(message)));
+        if frontend.encode(IMAGE_TOKEN, false)? != [self.image_token_id]
+            || frontend.encode(VIDEO_TOKEN, false)? != [self.video_token_id]
+        {
+            return Err(invalid("image or video token ID does not match tokenizer"));
+        }
+        let placeholders: Vec<_> = video::media_placeholders(
+            prompt_token_ids, self.image_token_id, self.video_token_id,
+        ).collect();
+        let stills = placeholders.iter().filter(|(_, still)| *still).count();
+        if stills != images.geometry.len() || placeholders.len() - stills != videos.len() {
+            return Err(invalid(
+                "image and video placeholder counts do not match prepared inputs",
+            ));
+        }
+        let vision_start = frontend.encode(VISION_START_TOKEN, false)?;
+        let vision_end = frontend.encode(VISION_END_TOKEN, false)?;
+        let mut token_ids = Vec::with_capacity(prompt_token_ids.len());
+        let mut plan = Vec::new();
+        let mut expansions = Vec::with_capacity(placeholders.len());
+        let (mut copied, mut image, mut clip) = (0, 0, 0);
+        for (at, still) in placeholders {
+            token_ids.extend_from_slice(&prompt_token_ids[copied..at]);
+            let start = token_ids.len();
+            if still {
+                let geometry = images.geometry[image];
+                token_ids.extend(std::iter::repeat_n(self.image_token_id, geometry.tokens));
+                plan.push((PromptWindowSource::Image(image), geometry));
+                image += 1;
+            } else {
+                let input = &videos[clip];
+                for (patch, seconds) in video
+                    .timestamps(input.frames.len(), input.fps)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    token_ids.extend(frontend.encode(&video::timestamp_marker(seconds), false)?);
+                    token_ids.extend_from_slice(&vision_start);
+                    token_ids.extend(std::iter::repeat_n(self.video_token_id, input.window.tokens));
+                    token_ids.extend_from_slice(&vision_end);
+                    plan.push((PromptWindowSource::Video { clip, patch }, input.window));
+                }
+                clip += 1;
+            }
+            expansions.push(token_ids.len() - start);
+            copied = at + 1;
+        }
+        token_ids.extend_from_slice(&prompt_token_ids[copied..]);
+        let mm_token_type_ids: Vec<i32> = token_ids
+            .iter()
+            .map(|id| {
+                if *id == self.image_token_id {
+                    1
+                } else if *id == self.video_token_id {
+                    2
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let mut positions: [Vec<i64>; 4] =
+            std::array::from_fn(|_| Vec::with_capacity(token_ids.len()));
+        positions[0].extend((0..token_ids.len()).map(|index| index as i64));
+        let mut windows = Vec::with_capacity(plan.len());
+        let mut planned = plan.into_iter();
+        let (mut offset, mut current) = (0, 0i64);
+        while offset < token_ids.len() {
+            let modality = mm_token_type_ids[offset];
+            let end = offset
+                + mm_token_type_ids[offset..]
+                    .iter()
+                    .take_while(|value| **value == modality)
+                    .count();
+            if modality == 0 {
+                for row in &mut positions[1..] {
+                    row.extend((0..end - offset).map(|index| current + index as i64));
+                }
+                current += (end - offset) as i64;
+            } else {
+                let (source, geometry) = planned
+                    .next()
+                    .ok_or_else(|| invalid("unexpected vision token group"))?;
+                let expected = match source {
+                    PromptWindowSource::Image(_) => 1,
+                    PromptWindowSource::Video { .. } => 2,
+                };
+                if modality != expected || end - offset != geometry.tokens {
+                    return Err(invalid("vision token group does not match its prepared input"));
+                }
+                let (height, width) = (
+                    geometry.grid_thw[1] / MERGE as i64,
+                    geometry.grid_thw[2] / MERGE as i64,
+                );
+                for y in 0..height {
+                    for x in 0..width {
+                        positions[1].push(current);
+                        positions[2].push(current + y);
+                        positions[3].push(current + x);
+                    }
+                }
+                current += height.max(width);
+                windows.push(PromptWindow {
+                    span: offset..end,
+                    geometry,
+                    source,
+                });
+            }
+            offset = end;
+        }
+        if planned.next().is_some() {
+            return Err(invalid("prepared vision input was not consumed by prompt"));
+        }
+        Ok(MediaPrompt {
+            prompt: ImagePrompt {
+                rope_delta: current - token_ids.len() as i64,
+                token_ids,
+                mm_token_type_ids,
+                position_ids: positions,
+            },
+            windows,
+            expansions,
         })
     }
 }

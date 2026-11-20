@@ -514,6 +514,7 @@ pub(super) fn render(
         text: rendered.prompt,
         token_ids,
         image_sources,
+        video_sources: Vec::new(),
         image_checkpoint_hints: Vec::new(),
         ordinary: Vec::new(),
         message_boundaries,
