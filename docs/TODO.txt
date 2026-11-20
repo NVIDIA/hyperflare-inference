@@ -406,12 +406,16 @@
     capture and passes those checks.
 
 [ ] Explain why GIF and JPEG colour answers of glm-5.3-flash-nvfp4 at TP4 are less
-    reliable than vLLM's: 14 and 10 correct of 20 at default sampling, against 19
-    and 20 (PNG and WebP answers match vLLM's). The vision tower matches the
-    Transformers reference in tests/recipes/test_glm53_vision.py. One candidate is
-    the tower's RMS-norm epsilon, 1e-5 here and 1e-6 in vLLM. Close when an
-    isolated comparison of the epsilon, or another identified cause, restores
-    vLLM's accuracy on these images.
+    reliable than vLLM's on small solid-colour images. The vision block norms and
+    final norm run at epsilon 1e-6 (the checkpoint declares 1e-5),
+    which raised correct answers on 64x64 images at default sampling from 14 to 18
+    of 20 for GIF and from 10 to 15 of 20 for JPEG; vLLM answers 20 of 20 for
+    both. The chat template's default reasoning effort and its thinking behaviour
+    also change these answers, and in some request configurations identical
+    requests at temperature 0 return different answers. The vision tower matches
+    the Transformers reference in tests/recipes/test_glm53_vision.py. Close when
+    an identified cause restores vLLM's accuracy and run-to-run repeatability on
+    these images.
 
 [ ] Repair the CUDA test cases that fail on upstream main and with this series:
     test_glm_mla_checkpoint_native_replay[4-decode-1-True] fails

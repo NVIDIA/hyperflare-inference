@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,11 +18,15 @@ import torch
 from ignition.components.weights import DirectWeightLoader
 from ignition.preparation.checkpoint import IndexedCheckpoint, _read_header
 from ignition.preparation.graphs import PreparedGraphBundle
+from ignition.recipes import resolve
+from ignition.recipes.glm53 import vision as vision_module
 from ignition.recipes.glm53.vision import PreparedVision, VisionMetadata, VisionScratch, VisionWeights
 from ignition.reference.qwen38_quant import (
     CheckpointTensors, decode_mxfp8, decode_nvfp4, quantize_mxfp8_activation,
     read_nvfp4_projection,
 )
+
+HUB = Path.home() / ".cache/huggingface/hub"
 
 CUDA = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                          reason="requires explicit GPU assignment and FLARE_RUN_CUDA_TESTS=1")
@@ -49,6 +54,31 @@ def test_vision_geometry():
     assert metadata.cu_seqlens.shape == (3,)
     with pytest.raises(ValueError):
         scratch.rows(255)
+
+
+@pytest.mark.parametrize("alias", ["glm-5.3-flash", "glm-5.3-flash-nvfp4"])
+def test_vision_block_and_final_norms_use_1e6_and_qk_norms_keep_the_declared_epsilon(alias, monkeypatch):
+    """Both checkpoints declare 1e-5; the tower's block and final norms run at 1e-6, the Q/K norms at 1e-5."""
+    config_file = resolve(alias).snapshot(HUB) / "config.json"
+    if not config_file.is_file():
+        pytest.skip(f"the {alias} checkpoint is not in the hub cache")
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextVisionConfig
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextVisionModel
+    config = Glm5NextVisionConfig.from_dict(json.loads(config_file.read_text())["vision_config"])
+    assert config.rms_norm_eps == 1e-5
+    with torch.device("meta"):
+        module = Glm5NextVisionModel(config).eval()
+    # Only the epsilon assignment is under test, so the CUDA-backed projections and attention are stubs.
+    for name in ("prepare_projection", "UnquantizedProjection", "PreparedVarlenAttention"):
+        monkeypatch.setattr(vision_module, name, lambda *args, **kwargs: object())
+    weights = VisionWeights({}, defaultdict(object), torch.empty(0))
+    PreparedVision(module, VisionScratch.allocate(256, "cpu"), VisionMetadata.allocate(256, 2, "cpu"), weights,
+                   session=None)
+    assert len(module.blocks) == 24
+    assert module.post_layernorm.variance_epsilon == 1e-6
+    for block in module.blocks:
+        assert block.norm1.variance_epsilon == block.norm2.variance_epsilon == 1e-6
+        assert block.attn.q_norm.variance_epsilon == block.attn.k_norm.variance_epsilon == 1e-5
 
 
 @pytest.fixture(scope="module")
@@ -95,6 +125,10 @@ class _ReferenceProjection(torch.nn.Module):
 def _reference(manifest, weights, device):
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextVisionRotaryEmbedding
     module = _module(manifest)
+    # The checkpoint declares 1e-5 for every vision norm; PreparedVision runs the block norms and the final norm at
+    # 1e-6 and keeps the Q/K norms at the declared value, so the reference uses the same rule.
+    for norm in (module.post_layernorm, *(n for block in module.blocks for n in (block.norm1, block.norm2))):
+        norm.variance_epsilon = 1e-6
     for path, value in weights.parameters.items():
         parent, _, attribute = path.rpartition(".")
         setattr(module.get_submodule(parent), attribute, torch.nn.Parameter(value, requires_grad=False))

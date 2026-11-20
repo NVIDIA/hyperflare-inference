@@ -161,6 +161,10 @@ class PreparedVision:
             raise ValueError("GLM vision metadata and scratch capacities differ")
         if metadata.num_patches.item() or bool(metadata.cu_seqlens.any().item()):
             raise ValueError("GLM vision preparation requires inactive metadata")
+        # The checkpoint declares vision rms_norm_eps 1e-5. The block and final RMS norms run at 1e-6, the value
+        # vLLM's GLM vision config forces after validation against reference results. Q/K norms keep 1e-5.
+        for norm in (module.post_layernorm, *(n for block in module.blocks for n in (block.norm1, block.norm2))):
+            norm.variance_epsilon = 1e-6
         self.module, self.scratch, self.metadata = module, scratch, metadata
         for path, tensor in weights.parameters.items():
             parent, _, attribute = path.rpartition(".")
