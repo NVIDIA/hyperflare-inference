@@ -392,6 +392,43 @@ def test_compiled_variants_release_warmup_storage(tmp_path, mailbox_storage):
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                     reason="requires an explicitly assigned CUDA device")
+def test_compiled_warmup_orders_largest_allocation_first_under_retention(tmp_path, mailbox_storage):
+    from contextlib import contextmanager
+    import torch
+    from ignition.preparation.aot import ForwardCache
+    from ignition.preparation.execution import GraphSignature
+    from tests.preparation.test_capture_order_cuda import Forward
+
+    device = torch.device("cuda:0")
+    mib = 1 << 20
+    storage = mailbox_storage
+    source = torch.ones(1, dtype=torch.uint8, device=device)
+    functions = {name: Forward(size, source, torch.empty_like(source))
+                 for name, size in (("small", 32 * mib + 65), ("large", 35 * mib))}
+    signatures = {name: GraphSignature("decode", 1, 1) for name in functions}
+    cache = ForwardCache(namespace={"model": "warmup-order"}, device=device, root=tmp_path, compile_workers=1)
+    peak_bytes = []
+
+    @contextmanager
+    def warmup():
+        with storage.transient():
+            yield
+        pool = storage._retention_pool
+        assert pool is not None
+        segments = [segment for segment in torch.cuda.memory_snapshot(include_traces=False)
+                    if tuple(segment["segment_pool_id"]) == tuple(pool.id)]
+        peak_bytes.append(sum(segment["total_size"] for segment in segments))
+
+    with storage.retain_transient_backing():
+        compiled = cache.prepare_many(functions, signatures, materialize=lambda: None, warmup=warmup)
+    assert tuple(compiled) == ("large", "small")
+    assert max(peak_bytes) == 36 * mib
+    assert storage._snapshot()["retained_handles"] == 0
+    assert storage.error is None
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
+                    reason="requires an explicitly assigned CUDA device")
 def test_transient_retention_reuses_one_torch_pool(mailbox_storage):
     import torch
 
