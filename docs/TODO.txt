@@ -675,3 +675,45 @@
     `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `ignition/components/linear.py`; SM103 execution is unqualified.
+
+[ ] Find the source of run-to-run differences in the prepared GLM 5.3 decoder
+    (`ignition/recipes/glm53_full`). Two runs of
+    tests/recipes/test_glm53_full_stack_tp_cuda.py on the same inputs differ
+    by one BF16 unit from layer 3 onward and disagree on about 300 of 2722
+    most likely tokens, one of them at a logit margin of 8.2. Candidates are
+    all-reduce arrival order, routed-expert accumulation, and indexer tie
+    order. Close when the operator is identified and the decoder is either
+    repeatable or the difference is bounded by a test.
+
+[ ] Check Kimi K3 and Kimi K3.1 MLA key and value absorption under core
+    storage. GLM 5.3 faulted in `torch.bmm` with an illegal memory access when
+    its operands were interleaved, transposed views of one row-major weight
+    stored in core storage; it now passes contiguous head-major operands
+    (`ignition/recipes/glm53_full/attention.py`). The Kimi recipes build the
+    same views. Close when an export of each at eight decode rows completes or
+    the views are replaced.
+
+[ ] Validate the GLM 5.3 draft layer (decoder layer 78) against an external
+    forward. Transformers 5.23 does not execute it; the recipe follows the
+    GLM 5.3 Flash draft layout. Served rounds emit about three tokens per
+    round, which no reference confirms. Close when a reference forward of
+    layer 78 exists and tests/recipes compares the prepared layer with it.
+
+[ ] Run the GLM 5.3 checks that have not run: tests/server/test_protocols.py
+    (the test environment lacks the `anthropic` package), concurrency above
+    eight, a server-level control that corrupts one draft proposal, and a
+    component test of the draft round in tests/recipes. Close when each has
+    run or is removed from the qualification statement in
+    docs/model-preparation.md.
+
+[ ] Add `glm53_full` to the sampling-defaults table in docs/api.md and to the
+    speculative catalog description in docs/cli-design.md. Close when both
+    name the recipe.
+
+[ ] Include the GLM 5.3 draft layer's replicated tensors, about 0.18 GB per
+    rank, in the checkpoint's declared expansion bytes
+    (`ignition/recipes/glm53_full/recipe.py`), and implement or reject the
+    checkpoint's `index_share_for_mtp_iteration` option, which would reuse one
+    indexer selection across draft steps. Close when the planner's estimate
+    with drafts equals loaded bytes within the graph allowance and the option
+    is decided.

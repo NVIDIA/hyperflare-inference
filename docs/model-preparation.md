@@ -163,7 +163,8 @@ available GPUs explicitly on shared hosts. `--gpus 2` means one rank on GPU 2;
 `--gpus 0,1` means two ranks on GPUs 0 and 1. With `CUDA_VISIBLE_DEVICES` set,
 indices refer to the exposed device list. Each tensor-parallel size requires a
 separately prepared core; a TP2 core cannot be loaded as TP1. Qualified end to
-end: Qwen at TP1 and TP2, and GLM at TP4. Not qualified: Qwen at TP4.
+end: Qwen at TP1 and TP2, GLM 5.3 Flash at TP4, and GLM 5.3 at TP8. Not
+qualified: Qwen at TP4.
 
 ## Preparation resources
 
@@ -736,6 +737,81 @@ correctness. To race again after changing a host's wiring, delete the `preparati
 directory under `<kernel_cache>/b12x` (by default `~/.cache/flare/kernels/b12x/preparation`).
 That discards every cached tuning selection kept there, and the next export tunes
 again.
+
+## GLM 5.3
+
+The `glm-5.3` alias of the `glm53_full` recipe prepares text generation,
+reasoning, and tool calls for `local-inference-lab/GLM-5.3-NVFP4` at revision
+`cca10d1586255195d3279785fc85577bfc1e9227`, a `GlmMoeDsaForCausalLM`
+checkpoint, on eight GPUs. It is a separate recipe from
+[GLM 5.3 Flash](#glm-53-flash): the model has 78 decoder layers of hidden
+size 6144, latent attention with rotary positions on every layer, 256 routed
+experts with one shared expert on layers 3 through 77, dense MLPs on layers 0
+through 2, and no recurrent layers, residual mixing, or vision tower. The
+logical context is 1,048,576 tokens; the default 4096-token prefill chunk
+controls graph execution size independently of that context.
+
+Attention is sparse. An indexer on 21 layers scores every earlier position
+and keeps the 2048 highest-scoring positions for each token; each following
+layer without an indexer attends to the positions kept by the nearest indexer
+layer below it. Index keys are stored as FP8 with one FP32 scale per token,
+so a selection can differ from a BF16 evaluation where scores are nearly
+tied. Each cached token holds a 656-byte latent attention record per layer
+(512 FP8 latent values, four FP32 scales, and 64 BF16 rotary values) and a
+132-byte index key per indexer layer. Pages hold 256 tokens.
+
+Weights keep the checkpoint's precision: NVFP4 for the routed experts of
+layers 3 through 77, and BF16 for attention, shared experts, dense MLPs,
+embeddings, and the vocabulary head. The NVFP4 experts execute with BF16
+activations.
+Eight ranks each hold eight of the 64 attention heads, an eighth of each
+expert's intermediate columns, and an eighth of the vocabulary head; the
+embeddings, normalization, low-rank attention inputs, routers, and indexer
+are replicated.
+
+Learned drafts use the checkpoint's draft layer, decoder layer 78, with its
+own indexer, attention record, and unquantized routed experts, and share the
+target's vocabulary head. A round verifies the pending token and up to five
+drafts by default, seven at most. `--no-mtp` omits the draft layer's
+weights, cache fields, and graphs.
+
+The published checkpoint's `model.safetensors.index.json` declares a
+`total_size` 27,799,760 bytes larger than its tensors, which checkpoint
+inspection rejects. Prepare from a directory that links every checkpoint
+file and replaces the index with one whose `total_size` equals the sum of
+its tensors' bytes, and pass that directory with the repository identity:
+
+```sh
+.venv/bin/ignition export /path/to/glm-5.3-view --gpus 0-7 \
+  --repo-id local-inference-lab/GLM-5.3-NVFP4
+flare run CACHE_ENTRY --host 127.0.0.1 --port 8000
+```
+
+Default capacities are eight concurrent requests and 128 speculative
+target-token rows, which capture verification of five drafts at batches 1,
+2, 4, and 8. The declared sampling ranges are temperature 0.95 to 1.0 and
+top-p 0.95 to 1.0, so requests cannot select greedy output; top-k is fixed
+off. Prompt log probabilities and images are not prepared. Requests with
+image content are rejected.
+
+Implemented and qualified on eight RTX PRO 6000 Blackwell Max-Q GPUs (SM120,
+96 GB each) at the default capacities: export with compiled forwards with
+and without learned drafts, and serving through `flare run`. Loading the
+core with learned drafts places 62.96 GiB of fixed data on each GPU and
+leaves a cache of 613,632 tokens and 2268 snapshot slots. The served most
+likely next token and log probabilities follow an FP32 Transformers 5.23
+forward of the same checkpoint within statistical bounds on a 2722-token
+prompt, and tokens emitted by speculative rounds receive the same log
+probabilities from ordinary decode as repeated ordinary decodes give each
+other. The prepared decoder is not bitwise repeatable between runs, so
+per-token equality with the reference is not a tested property. Transformers
+does not execute the draft layer; its numerics have no external reference,
+and the measured yield is about three emitted tokens per round.
+
+Not qualified: other rank counts, concurrency above eight, multi-host
+ranks, SM103 and SM121 hardware, and the optional sharing of indexer
+selections between draft steps that the checkpoint configuration names
+(`index_share_for_mtp_iteration`); every draft step runs the indexer.
 
 ## DeepSeek V4.1 Flash
 
@@ -1900,7 +1976,8 @@ top-p 0.95, and top-k 64.
 Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
 target-token capacity is the larger of padded concurrency and draft count plus
 one, giving six rows at its default settings. Muse Spark declares 32 packed
-target-token rows for seven DFlash2 drafts at concurrency four. Other recipes
+target-token rows for seven DFlash2 drafts at concurrency four. GLM 5.3
+defaults to eight concurrent requests. Other recipes
 default to 32 concurrent requests, with speculative recipes declaring 128 target-token rows independently
 of concurrency.
 Explicit flags and configuration override these defaults; a core's capacities
@@ -1909,7 +1986,8 @@ selected GPUs.
 
 | Recipe | Draft tokens | Verification layout | Speculative graphs at default concurrency | Maximum drafts at batch 32 |
 |---|---:|---|---:|---:|
-| Qwen3.8 Flash, GLM 5.3 | 5 | Rectangular | 34 | 3 |
+| Qwen3.8 Flash, GLM 5.3 Flash | 5 | Rectangular | 34 | 3 |
+| GLM 5.3 | 5 | Rectangular | 24 at concurrency 8 | 3 |
 | Step-5 | 3 | Rectangular | 24 | 3 |
 | DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
 | DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, Qwen3.8 27B | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
