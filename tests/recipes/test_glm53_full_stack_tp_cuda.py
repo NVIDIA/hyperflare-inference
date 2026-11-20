@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""GLM 5.3 decoder layers and the text stack across tensor-parallel ranks equal the Transformers reference.
+"""Compare GLM 5.3 tensor-parallel decoder layers and full-stack outputs with Transformers.
 
 Each rank is one process on one GPU; ranks sum partial updates through b12x
 all-reduces and gather vocabulary shards. Two comparisons use the fixtures of
@@ -9,14 +9,14 @@ all-reduces and gather vocabulary shards. Two comparisons use the fixtures of
 
 - Layer-isolated: every layer receives the reference output of the preceding
   layer, so its residual update is compared without the error that earlier
-  layers accumulate. This comparison decides layer correctness.
+  layers accumulate. The test bounds relative errors on the two fixtures.
 - Whole stack: the prepared forward runs from token IDs to logits. BF16
   arithmetic alone moves late hidden states far from an FP32 reference: the
   Transformers forward in BF16 differs from its FP32 run by 0.21 in the final
   hidden states of the `long` fixture and changes 299 of its 2722 greedy
   tokens, 29 of them at a top-two logit margin of at least 1.0. Token equality
-  with the FP32 reference is therefore not decidable row by row; this
-  comparison bounds the hidden-state error and the number of changed tokens by
+  with the FP32 reference is checked on the final position. Across the sequence,
+  the test bounds the hidden-state error and the number of changed tokens by
   twice those measurements. It does not bound the largest margin at which a
   token changes, because that value is not repeatable: the prepared stack is
   not bitwise deterministic, and five runs of this test on the same weights
@@ -238,7 +238,7 @@ def _run(world, layers, sequences, tmp_path):
 
 
 def _check_verified(record):
-    """Rows verified together reproduce their single-row decodes and not their neighbors'."""
+    """Compare each verified row with its single-row decode and a whole-row substitution."""
     for row in record["verified"]:
         assert row["own"] < 2 * HIDDEN_FLOOR < row["neighbor"], row
 

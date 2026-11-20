@@ -144,8 +144,8 @@ def test_selection_matches_transformers_ranking(manifest, canonical):
         same = len(set(single.records[0, :2048].tolist()) & set(selection.records[row, :2048].tolist()))
         print(f"decode row {row}: {same} of 2048 records shared with prefill")
         assert int(single.lengths[0]) == 2048 and same >= 2040
-    # FP8 index keys and queries reorder candidates near the cutoff. Measured on this sequence: mean
-    # 0.9907, minimum 0.9790, deepest canonical rank 2272. The bounds are those values with margin.
+    # On the 674 rows with more than 2048 candidates, mean overlap was 0.9907, minimum
+    # overlap was 0.9790, and the deepest selected canonical rank was 2272.
     assert fraction.mean() > 0.985 and fraction.min() > 0.97 and int(excess.max()) < 256, (
         float(fraction.mean()), float(fraction.min()), int(excess.max()))
 

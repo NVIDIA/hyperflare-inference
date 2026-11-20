@@ -754,9 +754,14 @@ controls graph execution size independently of that context.
 Attention is sparse. An indexer on 21 layers scores every earlier position
 and keeps the 2048 highest-scoring positions for each token; each following
 layer without an indexer attends to the positions kept by the nearest indexer
-layer below it. Index keys are stored as FP8 with one FP32 scale per token,
-so a selection can differ from a BF16 evaluation where scores are nearly
-tied. Each cached token holds a 656-byte latent attention record per layer
+layer below it. The indexer quantizes queries and keys to FP8 and computes
+head weights from a BF16 projection. On 674 positions with more than 2048
+candidates in a 2722-token prompt, the layer 6 selection retained 99.07% of
+the FP32 Transformers selection on average and 97.90% in the worst row.
+Only two sets matched exactly. Each other set omitted a strictly higher-scoring
+position. Changing only the selection changed the prepared attention output by
+0.247% in relative L2 norm across those positions. Each cached token holds a
+656-byte latent attention record per layer
 (512 FP8 latent values, four FP32 scales, and 64 BF16 rotary values) and a
 132-byte index key per indexer layer. Pages hold 256 tokens.
 
@@ -798,20 +803,17 @@ Implemented and qualified on eight RTX PRO 6000 Blackwell Max-Q GPUs (SM120,
 96 GB each) at the default capacities: export with compiled forwards with
 and without learned drafts, and serving through `flare run`. Loading the
 core with learned drafts places 62.96 GiB of fixed data on each GPU and
-leaves a cache of 613,632 tokens and 2268 snapshot slots. The served most
-likely next token and log probabilities follow an FP32 Transformers 5.23
-forward of the same checkpoint within statistical bounds on a 2722-token
-prompt, and tokens emitted by speculative rounds receive the same log
-probabilities from ordinary decode as repeated ordinary decodes give each
-other. The prepared decoder is not bitwise repeatable between runs, so
-per-token equality with the reference is not a tested property. Transformers
-does not execute the draft layer; its numerics have no external reference,
-and the measured yield is about three emitted tokens per round.
+leaves a cache of 613,632 tokens and 2268 snapshot slots. On three sampled
+continuations, ordinary decode re-scored 279 tokens emitted with drafts.
+The mean absolute difference in their pre-sampling log probabilities was
+0.039. This comparison measures scores for tokens already drawn.
+Equivalence of the sampled distributions and agreement of the draft layer
+with an independent implementation are unqualified.
 
-Not qualified: other rank counts, concurrency above eight, multi-host
-ranks, SM103 and SM121 hardware, and the optional sharing of indexer
-selections between draft steps that the checkpoint configuration names
-(`index_share_for_mtp_iteration`); every draft step runs the indexer.
+The checkpoint requests index reuse between recursive drafts through
+`index_share_for_mtp_iteration`. The recipe runs the indexer at each
+draft step. Other rank counts, concurrency above eight, multi-host serving,
+and SM103 and SM121 hardware are unqualified.
 
 ## DeepSeek V4.1 Flash
 

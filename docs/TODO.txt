@@ -676,22 +676,29 @@
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `ignition/components/linear.py`; SM103 execution is unqualified.
 
-[ ] Find the source of run-to-run differences in the prepared GLM 5.3 decoder
-    (`ignition/recipes/glm53_full`). Two runs of
-    tests/recipes/test_glm53_full_stack_tp_cuda.py on the same inputs differ
-    by one BF16 unit from layer 3 onward and disagree on about 300 of 2722
-    most likely tokens, one of them at a logit margin of 8.2. Candidates are
-    all-reduce arrival order, routed-expert accumulation, and indexer tie
-    order. Close when the operator is identified and the decoder is either
-    repeatable or the difference is bounded by a test.
+[ ] Establish a bound that distinguishes GLM 5.3 verification rows from
+    incorrect ordinary-decode results. Holding b12x W4A16 route packing
+    fixed made the layer 3 prefill expert replay repeatable at TP8.
+    Changing another row's expert routes changed the watched row's local
+    expert output. On a 2047-token prefix, unchanged runs also differed
+    in layer 0's index order and by 0.94 relative L2 in the final hidden
+    state. The layer-level results do not supply a width-independent
+    full-stack tolerance.
 
-[ ] Check Kimi K3 and Kimi K3.1 MLA key and value absorption under core
-    storage. GLM 5.3 faulted in `torch.bmm` with an illegal memory access when
-    its operands were interleaved, transposed views of one row-major weight
-    stored in core storage; it now passes contiguous head-major operands
-    (`ignition/recipes/glm53_full/attention.py`). The Kimi recipes build the
-    same views. Close when an export of each at eight decode rows completes or
-    the views are replaced.
+[ ] Qualify exact GLM 5.3 index selection against FP32 Transformers apart
+    from equal-score ties. At layer 6 on a 2722-token prompt the prepared
+    FP8 indexer matched two of 674 nontrivial sets. Each other row omitted
+    a position with a strictly higher FP32 score than a retained position.
+    Recomputing the head projection with FP32 output also matched two sets.
+    Close when the selected positions meet the reference criterion.
+
+[ ] Exercise Kimi K3 and K3.1 MLA key absorption and value expansion with
+    core-backed storage at eight decode rows. Their shared weight loader
+    (ignition/recipes/kimi3/weights.py) allocates separate contiguous
+    head-major weight stacks. The batched products in
+    ignition/recipes/kimi3/attention.py receive strided activation and output
+    views. Close when an export and replay on each recipe's supported rank
+    count validate these operands.
 
 [ ] Validate the GLM 5.3 draft layer (decoder layer 78) against an external
     forward. Transformers 5.23 does not execute it; the recipe follows the
@@ -704,19 +711,13 @@
     run or is removed from the qualification statement in
     docs/model-preparation.md.
 
-[ ] Decide how tests/server/test_protocols.py applies to GLM 5.3. Against a
-    served `glm53_full` core 87 cases pass. Four expect a reply within 32
-    tokens with `enable_thinking: false`, which the checkpoint's template
-    does not read: it always opens reasoning. The image case needs image
-    input. The raw-completion case expects two tokens after the bare prompt
-    "Hello", where the model's first token ends the sequence. The hinted
-    case of test_messages_block_hint_reuses_history_after_suffix_changes
-    reuses no tokens: the frontend places the hinted cut
-    (helios/tests/glm53_full_frontend.rs), and the scheduler declines it for
-    exceeding the checkpoint work budget, because one more 128-token
-    prefill launch costs more than 5% of the prompt's prefill. Close when
-    each case passes, is skipped for a stated model property, or is
-    reported as a defect.
+[ ] Validate the shared Messages block-cache hint on the GLM 5.3 core
+    (tests/server/test_protocols.py). The frontend emits the hinted cut.
+    A changed suffix reused zero tokens in the served test, and the
+    scheduler counted a work-budget rejection after prefill costs became
+    available. Measure the selected cuts, snapshot and prefill cost
+    estimates, and remaining budget for that request. Close when an
+    admitted hinted checkpoint is restored and its continuation verified.
 
 [ ] Add `glm53_full` to the sampling-defaults table in docs/api.md and to the
     speculative catalog description in docs/cli-design.md. Close when both
