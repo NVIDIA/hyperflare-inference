@@ -447,7 +447,7 @@ fn append_planes(
 
 #[pyclass(module = "flare_heliopause")]
 pub(crate) struct NativeExportStage {
-    directory: std::sync::Mutex<Option<tempfile::TempDir>>,
+    directory: std::sync::RwLock<Option<tempfile::TempDir>>,
     cache: Option<std::path::PathBuf>,
     leases: std::sync::Mutex<Vec<crate::core::cache::PayloadObject>>,
     #[pyo3(get)]
@@ -455,6 +455,18 @@ pub(crate) struct NativeExportStage {
 }
 
 impl NativeExportStage {
+    /// Keep staged rank sources and their cache leases alive through publication.
+    pub(super) fn with_workspace<T>(
+        &self,
+        run: impl FnOnce(&std::path::Path) -> super::Result<T>,
+    ) -> super::Result<T> {
+        let directory = self.directory.read().unwrap_or_else(|e| e.into_inner());
+        let directory = directory
+            .as_ref()
+            .ok_or_else(|| super::invalid("export stage is closed"))?;
+        run(directory.path())
+    }
+
     /// Retain payload object leases for the export's lifetime.
     ///
     /// A closed stage rejects retention instead of accepting leases it will drop
@@ -465,7 +477,7 @@ impl NativeExportStage {
     ) -> super::Result<()> {
         let directory = self
             .directory
-            .lock()
+            .read()
             .unwrap_or_else(|error| error.into_inner());
         if directory.is_none() {
             return Err(super::invalid("export stage is closed"));
@@ -485,7 +497,7 @@ impl NativeExportStage {
     #[cfg(test)]
     pub(crate) fn for_test(cache: Option<std::path::PathBuf>, closed: bool) -> Self {
         Self {
-            directory: std::sync::Mutex::new(if closed {
+            directory: std::sync::RwLock::new(if closed {
                 None
             } else {
                 Some(tempfile::tempdir().unwrap())
@@ -523,31 +535,25 @@ impl NativeExportStage {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {
             path: directory.path().to_string_lossy().into_owned(),
-            directory: std::sync::Mutex::new(Some(directory)),
+            directory: std::sync::RwLock::new(Some(directory)),
             cache: cache.map(|path| path.to_path_buf()),
             leases: std::sync::Mutex::new(Vec::new()),
         })
     }
     /// Reserve one rank's staged source path inside the live workspace.
     fn rank_path(&self, py: Python<'_>, rank: usize) -> PyResult<String> {
-        let directory = self
-            .directory
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let directory = directory
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("export stage is closed"))?;
-        if !py
-            .detach(|| directory.path().try_exists())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        {
-            return Err(PyRuntimeError::new_err("export stage is closed"));
-        }
-        Ok(directory
-            .path()
-            .join(format!("rank-{rank}.json"))
-            .to_string_lossy()
-            .into_owned())
+        py.detach(|| {
+            self.with_workspace(|directory| {
+                if !directory.try_exists()? {
+                    return Err(super::invalid("export stage is closed"));
+                }
+                Ok(directory
+                    .join(format!("rank-{rank}.json"))
+                    .to_string_lossy()
+                    .into_owned())
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
     /// Lease every cache payload named by staged rank sources.
     ///
@@ -581,20 +587,15 @@ impl NativeExportStage {
         Ok(count)
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let directory = self
-            .directory
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        self.leases
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-        if let Some(directory) = directory {
-            py.detach(|| directory.close())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-        Ok(())
+        py.detach(|| {
+            let directory = self.directory.write().unwrap_or_else(|e| e.into_inner()).take();
+            self.leases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            directory.map_or(Ok(()), tempfile::TempDir::close)
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
@@ -628,6 +629,25 @@ pub(crate) fn staging_parent(
 mod stage_tests {
     use super::staging_parent;
     use std::path::Path;
+
+    #[test]
+    fn assembly_retains_the_workspace_until_publication_returns() {
+        let stage = super::NativeExportStage::for_test(None, false);
+        stage
+            .with_workspace(|directory| {
+                assert!(directory.is_dir());
+                assert!(stage.directory.try_read().is_ok());
+                assert!(matches!(
+                    stage.directory.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let directory = stage.directory.try_write().unwrap().take().unwrap();
+        directory.close().unwrap();
+        assert!(stage.with_workspace(|_| Ok(())).is_err());
+    }
 
     #[test]
     fn staging_parent_normalizes_relative_and_absent_destinations() {
