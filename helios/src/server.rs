@@ -289,7 +289,10 @@ impl Server {
             .queue_capacity
             .checked_add(model.limits.max_active)
             .ok_or("HTTP request capacity overflows")?;
-        let frontend = Arc::new(frontend);
+        let max_encode_threads = config
+            .frontend_workers
+            .min(frontend.max_encode_threads());
+        let frontend = Arc::new(frontend.with_max_encode_threads(max_encode_threads));
         // SAFETY: The caller grants exclusive graph/storage access and retains
         // their owners until drain. This server propagates that obligation to the
         // model worker and reports uncertain drain through StartFailure or close.
