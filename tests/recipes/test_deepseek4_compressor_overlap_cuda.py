@@ -105,7 +105,8 @@ class CompressionForward:
             else:
                 torch.library.wrap_triton(_write_keys)[(self.source.shape[0],)](
                     normalized, self.indexer.cache.view(torch.float8_e4m3fn), self.indexer.cache.view(torch.float32),
-                    self.slots, self.indexer.cache.stride(0), num_warps=4)
+                    self.slots, self.indexer.cache.stride(0), HADAMARD=self.indexer.hadamard,
+                    POWER_OF_TWO_SCALE=self.indexer.key_power_of_two, num_warps=4)
             compressed.extend((pooled, normalized))
             offset += 2 * width
         compressed.append(self.head(self.source))
@@ -196,7 +197,7 @@ def test_compression_overlap_retains_inputs_until_native_join(requests, inactive
             compressors[-1].state_scores.normal_()
         writer = PreparedCompressedCacheWriter(compressors[0].output, pool.pages["layer2.latent_page"],
             slots, page_size=64, kind="indexed", cache_format="deepseek_v4", session=session, name="writer")
-        indexer = SimpleNamespace(cache=pool.pages["layer2.index_page"])
+        indexer = SimpleNamespace(cache=pool.pages["layer2.index_page"], hadamard=True, key_power_of_two=True)
         overlap = ConcurrentGatedCompression(projection, compressors, writer, indexer=indexer,
             index_weight=head, metadata=metadata, positions=positions, frequencies=frequencies,
             angles=angles.values,

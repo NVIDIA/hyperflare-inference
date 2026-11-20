@@ -19,7 +19,7 @@ from ignition.preparation.tuning import register_finalizer
 def _start(source: torch.Tensor, weights: list[torch.Tensor], history: list[torch.Tensor],
            metadata: list[torch.Tensor], positions: torch.Tensor, frequencies: torch.Tensor, angles: torch.Tensor | None,
            slots: torch.Tensor, borrowed: list[torch.Tensor], outputs: list[torch.Tensor], caches: list[torch.Tensor],
-           plans: list[int], ratio: int, eps: float, stream: int) -> None:
+           plans: list[int], ratio: int, eps: float, hadamard: bool, key_power_of_two: bool, stream: int) -> None:
     inputs = [source, *metadata, positions, slots]
     if angles is not None:
         inputs.append(angles)
@@ -54,14 +54,15 @@ def _start(source: torch.Tensor, weights: list[torch.Tensor], history: list[torc
             else:
                 torch.library.wrap_triton(_write_keys)[(normalized.shape[0],)](
                     normalized, caches[1].view(torch.float8_e4m3fn), caches[1].view(torch.float32),
-                    slots, caches[1].stride(0), num_warps=4)
+                    slots, caches[1].stride(0), HADAMARD=hadamard, POWER_OF_TWO_SCALE=key_power_of_two,
+                    num_warps=4)
         if len(caches) == 2:
             torch.ops.b12x.bf16_gemv_small_n_out(source, weights[-1], outputs[-1], plans[-2], None)
 
 
 @_start.register_fake
 def _start_fake(source, weights, history, metadata, positions, frequencies, angles, slots, borrowed, outputs, caches,
-                plans, ratio, eps, stream):
+                plans, ratio, eps, hadamard, key_power_of_two, stream):
     pass
 
 
@@ -110,6 +111,10 @@ class ConcurrentGatedCompression:
             self.side_plans.append(index_weight.plan)
         self.plans.append(writer.plan.handle)
         self.side_plans.append(writer.plan)
+        # The chain writes the indexer's key pages that selection later reads, so the
+        # write launch must use the key transforms the indexer declared for that cache.
+        self.hadamard = indexer.hadamard if indexer is not None else True
+        self.key_power_of_two = indexer.key_power_of_two if indexer is not None else True
         self.metadata = [metadata.requests, metadata.positions, metadata.starts,
                          metadata.query_start_loc, metadata.state_rows]
         self.positions, self.frequencies, self.slots = positions, frequencies, writer.slots
@@ -143,7 +148,8 @@ class ConcurrentGatedCompression:
             inputs.append(angles)
         borrowed = [torch.empty_like(value) for value in inputs]
         _start(source, self.weights, self.history, operands, positions, self.frequencies, angles,
-               slots, borrowed, outputs, self.caches, self.plans, self.ratio, self.eps, self.stream_handle)
+               slots, borrowed, outputs, self.caches, self.plans, self.ratio, self.eps,
+               self.hadamard, self.key_power_of_two, self.stream_handle)
         return borrowed, outputs
 
     def finish(self, pending, dependencies):
