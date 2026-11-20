@@ -79,6 +79,126 @@ def test_traced_forward_shares_operators_without_instrumenting_plain_forward():
         assert getattr(mtp_round, name) is getattr(operation, name)
 
 
+def test_traced_glm_decoder_forward_passes_valid_tokens_to_indexed_attention_moe_layers(monkeypatch):
+    from types import SimpleNamespace as NS
+    import torch
+    from ignition.components.routing_trace import HEADER, validate_counter
+    from ignition.recipes.glm53 import stack as glm_stack
+    from ignition.recipes.glm53.decoder import PreparedGlmLayer
+    from ignition.recipes.glm53.indexer import IndexMetadata
+    from ignition.recipes.glm53.moe import PreparedGlmMoe
+    from ignition.recipes.glm53.stack import PreparedDecoder
+    from ignition.recipes.glm53.state import DecoderMetadata
+    from ignition.recipes.glm53.weights import MoEWeights
+
+    tokens, experts, top_k = 4, 8, 2
+    metadata = DecoderMetadata.allocate(tokens, sequences=2, blocks=2, device="cpu")
+    metadata.recurrent.num_tokens.fill_(3)
+    assert isinstance(metadata.indexed, IndexMetadata) and not hasattr(metadata.indexed, "num_tokens")
+
+    def make_layer(block_type, route_ids, seen_metadata):
+        moe = PreparedGlmMoe.__new__(PreparedGlmMoe)
+        moe.router_projection = lambda x: torch.zeros((x.shape[0], experts), dtype=torch.float32)
+        moe.routing = lambda logits: NS(ids=route_ids, weights=torch.ones_like(route_ids, dtype=torch.float32))
+        moe.experts = lambda x, ids, weights: x * 0.5
+        moe.shared = lambda x: x * 0.25
+        moe.concurrent_shared = None
+        moe.routing_counter = None
+
+        layer = PreparedGlmLayer.__new__(PreparedGlmLayer)
+        layer.module = NS(block_type=block_type, mlp=NS(gate=NS(top_k=top_k)))
+        layer.has_carry = False
+        layer.defer_post = False
+        layer.attention_hc = lambda src: (src, torch.ones((tokens, 4)), torch.ones((tokens, 4)), src[:, 0, :])
+        if block_type == "indexed_attention":
+            def attention(inp, meta):
+                seen_metadata.append((block_type, meta))
+                return inp
+        else:
+            def attention(inp, meta, *, records=None):
+                seen_metadata.append((block_type, meta))
+                return inp
+        layer.attention = attention
+        layer.attention_reduce = lambda x: x
+        layer.mlp_hc = lambda attn, res, post, comb: (res, post, comb, attn)
+        layer.mlp = moe
+        layer.mlp_reduce = lambda x: x
+        layer.post = lambda mlp, res, post, comb: res
+        return layer
+
+    seen_metadata = []
+    routes = (
+        torch.tensor([[0, 1], [1, 2], [2, 3], [7, 7]], dtype=torch.int32),
+        torch.tensor([[4, 5], [5, 6], [6, 4], [7, 7]], dtype=torch.int32),
+    )
+    layers = [
+        make_layer("linear_attention", routes[0], seen_metadata),
+        make_layer("indexed_attention", routes[1], seen_metadata),
+    ]
+
+    output = torch.zeros((2, 2, HEADER + experts), dtype=torch.int64)
+    begins = []
+
+    class CpuTrace:
+        def begin(self):
+            begins.append(True)
+            output[0].zero_()
+
+        def functional_counter(self, layer_index, capacity, layer_top_k):
+            assert capacity == tokens and layer_top_k == top_k
+
+            def count(ids, valid_tokens):
+                validate_counter(output, layer_index, ids, valid_tokens)
+                valid = int(valid_tokens.item())
+                output[0, layer_index, 1] = valid
+                output[0, layer_index, 2] = layer_top_k
+                for expert_id in ids[:valid].reshape(-1).tolist():
+                    output[0, layer_index, HEADER + expert_id] += 1
+
+            return count
+
+    def cpu_rms_norm(x, weight, out, eps, round_before_weight=True):
+        denom = torch.sqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+        out.copy_((x.float() / denom * weight.float()).to(out.dtype))
+
+    monkeypatch.setattr(glm_stack, "rms_norm", cpu_rms_norm)
+
+    decoder = PreparedDecoder.__new__(PreparedDecoder)
+    decoder.routing_trace = None
+    decoder.tokens = tokens
+    decoder.full_feedback = False
+    decoder.scoring = None
+    decoder.vision = None
+    decoder.embedding = lambda token_ids, num_rows: torch.ones((tokens, 16), dtype=torch.bfloat16)
+    decoder.layers = layers
+    decoder.weights = NS(
+        layers=[NS(mlp=MoEWeights.__new__(MoEWeights)), NS(mlp=MoEWeights.__new__(MoEWeights))],
+        tree=NS(model=NS(language_model=NS(
+            hc_head=lambda x: x.mean(dim=2),
+            norm=NS(weight=torch.ones(16, dtype=torch.bfloat16), variance_epsilon=1e-6),
+        ))),
+    )
+    decoder.lm_head = lambda hidden: hidden
+
+    # Plain forward runs both attention types without triggering routing counters.
+    decoder(metadata)
+    assert begins == [] and torch.count_nonzero(output).item() == 0
+    assert seen_metadata == [("linear_attention", metadata.recurrent), ("indexed_attention", metadata.indexed)]
+
+    seen_metadata.clear()
+    traced = decoder.with_routing_trace(CpuTrace())
+    traced(metadata)
+    assert begins == [True]
+    assert seen_metadata == [("linear_attention", metadata.recurrent), ("indexed_attention", metadata.indexed)]
+    # Row 3 is padded (expert 7) and must be excluded because valid_tokens == 3.
+    assert output[0, 0].tolist() == [0, 3, 2, 0, 1, 2, 2, 1, 0, 0, 0, 0]
+    assert output[0, 1].tolist() == [0, 3, 2, 0, 0, 0, 0, 0, 2, 2, 2, 0]
+
+    # Direct indexed_attention traced layer call without valid_tokens fails cleanly with ValueError.
+    with pytest.raises(ValueError, match="valid_tokens"):
+        traced.layers[1](torch.ones((tokens, 4, 16), dtype=torch.bfloat16), metadata.indexed)
+
+
 @pytest.mark.parametrize("layers,experts,tokens,top_k", [(45, 288, 32, 8), (45, 288, 8192, 8), (3, 5, 4, 2)])
 def test_route_geometry_and_valid_token_metadata(layers, experts, tokens, top_k):
     import torch

@@ -6,7 +6,10 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
+
+const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 trait Storage: Send {
     fn expert_storage(&self) -> Vec<(ExpertId, u64, usize)>;
@@ -17,7 +20,7 @@ trait Storage: Send {
     fn begin(&mut self, plan: Plan, now: u64) -> Result<Progress>;
     unsafe fn progress(&mut self, now: u64) -> Result<Progress>;
     fn cancel(&mut self) -> Result<Progress>;
-    fn closeable(&mut self) -> Result<()>;
+    fn closeable(&mut self, timeout: Duration) -> Result<()>;
 }
 impl<B: Backend + Send> Storage for Controller<B> {
     fn expert_storage(&self) -> Vec<(ExpertId, u64, usize)> {
@@ -42,17 +45,25 @@ impl<B: Backend + Send> Storage for Controller<B> {
     fn cancel(&mut self) -> Result<Progress> {
         self.cancel()
     }
-    fn closeable(&mut self) -> Result<()> {
+    fn closeable(&mut self, timeout: Duration) -> Result<()> {
         let snapshot = self.snapshot();
         if snapshot.poisoned || snapshot.readers != 0 {
             return Err(Error::Poisoned(
                 "expert storage has unconfirmed readers or mappings".into(),
             ));
         }
-        if matches!(self.cancel()?, Progress::WaitingForTransfer) {
-            return Err(Error::Busy);
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.cancel()? {
+                Progress::WaitingForTransfer => {
+                    if Instant::now() >= deadline {
+                        return Err(Error::Busy);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                _ => return Ok(()),
+            }
         }
-        Ok(())
     }
 }
 #[derive(Clone, Debug)]
@@ -278,11 +289,18 @@ impl ExecutionBinding {
     /// The context is drained, no executor can submit, and address reservations
     /// remain owned until this returns. Failure requires retaining that context.
     pub unsafe fn close(&self) -> Result<()> {
+        unsafe { self.close_with_timeout(DEFAULT_CLOSE_TIMEOUT) }
+    }
+    /// # Safety
+    /// Same preconditions as [`Self::close`], waiting up to `timeout` for an
+    /// in-flight staging transfer to complete before returning [`Error::Busy`].
+    pub unsafe fn close_with_timeout(&self, timeout: Duration) -> Result<()> {
         let mut state = self.state()?;
-        if let Some(storage) = state.storage.as_mut() {
-            storage.closeable()?;
-        }
         state.queued = None;
+        if let Some(storage) = state.storage.as_mut() {
+            storage.closeable(timeout)?;
+        }
+        state.active = None;
         drop(state.storage.take());
         Ok(())
     }

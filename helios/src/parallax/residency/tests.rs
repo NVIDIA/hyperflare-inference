@@ -584,3 +584,39 @@ fn observed_target_cancels_a_copy_even_before_its_estimated_time_deadline() {
     assert!(binding.report().unwrap().events[1].outcome.contains("Expired"));
     unsafe {binding.close()}.unwrap();
 }
+
+#[test]
+fn close_drains_inflight_staging_copy_and_times_out_if_stuck() {
+    use std::time::Duration;
+
+    // An in-flight staging copy completing within the close wait drains and releases storage.
+    let (controller, state, dropped) = setup(4);
+    let binding = execution::ExecutionBinding::new(controller);
+    let mut gate = unsafe { binding.claim() }.unwrap();
+    state.lock().unwrap().ready = false;
+    binding.submit(plan(0, &[0], &[])).unwrap();
+    unsafe { gate.tick(1) }.unwrap();
+    let complete = state.clone();
+    let finisher = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(15));
+        complete.lock().unwrap().ready = true;
+    });
+    unsafe { binding.close_with_timeout(Duration::from_secs(2)) }.unwrap();
+    finisher.join().unwrap();
+    assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+    // A stuck transfer exceeds the bounded close timeout and retains storage on drop.
+    let (controller, state, dropped) = setup(4);
+    let binding = execution::ExecutionBinding::new(controller);
+    let mut gate = unsafe { binding.claim() }.unwrap();
+    state.lock().unwrap().ready = false;
+    binding.submit(plan(0, &[0], &[])).unwrap();
+    unsafe { gate.tick(1) }.unwrap();
+    assert_eq!(
+        unsafe { binding.close_with_timeout(Duration::from_millis(15)) },
+        Err(Error::Busy)
+    );
+    drop(gate);
+    drop(binding);
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
+}

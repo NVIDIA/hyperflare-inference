@@ -1168,6 +1168,7 @@ impl Drop for NativeResources {
                 return;
             }
             if self.parallax.as_ref().is_some_and(|owner| owner.close().is_err()) {
+                std::mem::forget(self.parallax_loading.take());
                 std::mem::forget(self.parallax.take());
                 std::mem::forget(self.driver.clone());
                 return;

@@ -178,7 +178,8 @@ class PreparedDecoder:
         for index, layer in enumerate(self.layers):
             layer_records = None if records is None or index not in records.layers else records.layer(index)
             attention_metadata = metadata.indexed if layer.module.block_type == "indexed_attention" else metadata.recurrent
-            value, carry = layer(value, attention_metadata, carry, records=layer_records)
+            value, carry = layer(value, attention_metadata, carry, records=layer_records,
+                                 valid_tokens=metadata.recurrent.num_tokens)
         auxiliary = None
         if not self.full_feedback and self.scoring is None:
             selected = value[metadata.sample_indices]

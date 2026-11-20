@@ -567,9 +567,15 @@
     added token that is neither special nor named by the chat template (a
     lexical token) keeps that token. Close when each tokenizer passes it.
 
-[ ] Parallax: qualify functional GLM routing capture, default-off overhead, MTP
-    replay and active residency against the rebased runtime before applying the
-    GB300 results in parallax-research.md to it.
+[ ] Parallax: qualify functional GLM routing capture, default-off overhead,
+    fixed-MTP3 and adaptive-MTP5 exact-response parity, and controlled
+    static-versus-active residency comparisons on GB300 against the rebased
+    core runtime.
+[ ] Parallax: qualify the authored HTTP workloads in scripts/parallax/workloads.py
+    (including tool-history template acceptance and actual token lengths)
+    against a live GPU core.
+[ ] Parallax: add a model recipe producer for Execution.expert_rows or move the
+    row-residency consumer and protobuf schema into the producer PR.
 [ ] Parallax: validate CUDA host-NUMA capability admission on GB300; qualify other
     NVIDIA hardware before claiming physical residency support. See parallax.md.
 [ ] Parallax: compare protected-core LRU and predictive policies on held-out

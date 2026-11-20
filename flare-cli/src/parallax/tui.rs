@@ -34,9 +34,33 @@ impl Drop for Screen {
     }
 }
 fn refresh(view: &Shared) {
-    let path = view.lock().unwrap().output.join("capture/comparison.json");
-    if let Ok(report) = read(&path) {
-        view.lock().unwrap().report = Some(report);
+    let (output, done, has_report) = {
+        let state = view.lock().unwrap();
+        (state.output.clone(), state.done, state.report.is_some())
+    };
+    if done && has_report {
+        return;
+    }
+    let capture = output.join("capture");
+    let candidates = if done {
+        [
+            capture.join("comparison.json"),
+            capture.join("live-comparison.json"),
+        ]
+    } else {
+        [
+            capture.join("live-comparison.json"),
+            capture.join("comparison.json"),
+        ]
+    };
+    for path in candidates {
+        if let Ok(report) = read(&path) {
+            let mut state = view.lock().unwrap();
+            if !(state.done && state.report.is_some()) {
+                state.report = Some(report);
+            }
+            break;
+        }
     }
 }
 fn value(row: &Value, key: &str, scale: f64, suffix: &str) -> String {
@@ -401,5 +425,108 @@ mod tests {
                 .collect::<String>()
                 .contains("Resize")
         );
+    }
+
+    #[test]
+    fn refresh_reads_live_comparison_during_serving_and_preserves_final_report() {
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+
+        let root = std::env::temp_dir().join(format!(
+            "flare-parallax-tui-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let capture = root.join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        let live = json!({
+            "routing_frames": 42,
+            "evaluation": {"version": 2},
+            "hardware": {"identity": "synthetic-gb300"},
+            "workers": {"ewma": {"dropped_busy": 0, "failures": 0, "timeouts": 0}},
+            "contenders": {
+                "ewma/economic": {
+                    "prediction_records": 40,
+                    "forecast_precision": 0.5,
+                    "demand_coverage": 0.75,
+                    "usable_lead_p50_ns": 12_000_000.0,
+                    "hbm_hit_rate": 0.8,
+                    "promotion_count": 3,
+                    "modeled_balance_ns": 4_500_000.0
+                }
+            }
+        });
+        std::fs::write(
+            capture.join("live-comparison.json"),
+            serde_json::to_vec(&live).unwrap(),
+        )
+        .unwrap();
+
+        let view = Arc::new(Mutex::new(View {
+            phase: "Serving".into(),
+            output: root.clone(),
+            ..View::default()
+        }));
+        refresh(&view);
+        assert_eq!(
+            view.lock().unwrap().report.as_ref().unwrap()["routing_frames"],
+            json!(42)
+        );
+
+        // Render with the live report to confirm the TUI displays periodic live updates.
+        let mut terminal = Terminal::new(TestBackend::new(110, 28)).unwrap();
+        {
+            let state = view.lock().unwrap();
+            terminal
+                .draw(|f| draw(f, &state, 0, Duration::from_secs(2), 0))
+                .unwrap();
+        }
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Frames evaluated: 42"));
+        assert!(text.contains("ewma/economic"));
+
+        // While still running, live-comparison.json takes precedence over comparison.json.
+        let final_report = json!({"routing_frames": 100, "contenders": {}});
+        std::fs::write(
+            capture.join("comparison.json"),
+            serde_json::to_vec(&final_report).unwrap(),
+        )
+        .unwrap();
+        refresh(&view);
+        assert_eq!(
+            view.lock().unwrap().report.as_ref().unwrap()["routing_frames"],
+            json!(42)
+        );
+
+        // Once finished with an explicit report (for example verified replay), refresh preserves it.
+        {
+            let mut state = view.lock().unwrap();
+            state.done = true;
+            state.report = Some(json!({"routing_frames": 999}));
+        }
+        refresh(&view);
+        assert_eq!(
+            view.lock().unwrap().report.as_ref().unwrap()["routing_frames"],
+            json!(999)
+        );
+
+        // When finished without an in-memory report, refresh falls back to comparison.json.
+        view.lock().unwrap().report = None;
+        refresh(&view);
+        assert_eq!(
+            view.lock().unwrap().report.as_ref().unwrap()["routing_frames"],
+            json!(100)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

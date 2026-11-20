@@ -470,8 +470,11 @@ impl<B: Backend> Controller<B> {
 }
 impl<B: Backend> Drop for Controller<B> {
     fn drop(&mut self) {
-        if self.readers.load(Ordering::Acquire) != 0 || self.poisoned.is_some() {
-            // A missing completion fence must retain storage, even during error cleanup.
+        if self.readers.load(Ordering::Acquire) != 0
+            || self.poisoned.is_some()
+            || self.pending.is_some()
+        {
+            // A missing completion fence or undrained transfer must retain storage, even during error cleanup.
             if let Some(backend) = self.backend.take() {
                 std::mem::forget(backend);
             }

@@ -45,12 +45,13 @@ reactive baselines (`static_core_lru` and `decayed_miss_lru`), independent
 shadow simulations, a live routing observatory, and two physical GB300
 residency backends (virtual-address remapping and reader-gated expert-row
 exchange). GLM-5.3-Flash preparation includes optional routing instrumentation
-for single-GPU decode, prefill, and MTP verification; a bounded fixed-MTP3
-forced-offload comparison on GB300 observed 18.8% higher request throughput
-with EWMA-driven virtual-memory movement. The [native serving guide](parallax-demo.md)
-describes in-process providers, the serving dashboard, and CPU-only replay; the
-[research guide](parallax-research.md) records measured findings, the native
-predictor contract, a canary implementation, and workload examples.
+for single-GPU decode, prefill, and MTP verification. Full-model GLM serving
+qualification and controlled static-versus-active throughput comparisons on the
+current core runtime remain pending in [TODO.txt](TODO.txt). The
+[native serving guide](parallax-demo.md) describes in-process providers, the
+serving dashboard, and CPU-only replay; the
+[research guide](parallax-research.md) records the observational cost ledger,
+the native predictor contract, a canary implementation, and workload examples.
 
 The modular separation between providers, policies, storage backends, and the
 observatory targets three forward research directions:
@@ -767,18 +768,12 @@ Pointer-bearing, dynamically sized and peer allocations are rejected. Scales and
 calibration views omitted from the movement configuration retain ordinary HBM
 ownership.
 
-The MTP-instrumented LIL GLM package
-`73afdd3add534c3473addaabe68c9fa88c19089b117623c6da4c26cb02c26172`
-has a signed catalog that resolves 24,192 packed-weight
-regions for 12,096 target experts, totaling 152,202,903,552 movable bytes, at 2 MiB
-granularity. No export or kernel layout change was needed for this metadata
-preflight. The native loader additionally verifies that these regions cover 84
-entire immutable allocations before substituting Grace mappings.
-
-To reproduce the metadata preflight, set `FLARE_PARALLAX_PACKAGE` to the
-instrumented GLM package and `FLARE_PUBLISHER_PROFILES` to its trusted public-key
+The native loader verifies that resolved weight regions cover complete
+immutable allocations before substituting Grace mappings. To run the CPU-only
+metadata preflight against a signed core, set `FLARE_PARALLAX_PACKAGE` to the
+instrumented GLM core and `FLARE_PUBLISHER_PROFILES` to its trusted public-key
 profile JSON. `FLARE_PARALLAX_STORAGE_CONFIG` optionally names the output file
-for the resolved configuration. This opt-in test uses no GPU:
+for the resolved configuration:
 
 ```sh
 CUDA_VISIBLE_DEVICES='' cargo test --locked --offline \
@@ -887,59 +882,19 @@ residency as a fallback. Runtime compilation, graph recapture and steady-state G
 allocation remain prohibited. Additional captured operation families require the
 approval specified in [repository guidance](../AGENTS.md).
 
-Active residency is experimental. A GB300 native serving check with the ordinary
-tracing package `8597b2ad0229e33f9e0fb6c100a2e0b1b45cb8ce2a3523d8199bfc7cde2342e0`
-used TP1, runtime MTP disabled, concurrency up to four, 8,064 HBM
-experts and 4,032 Grace experts. Seven requests completed while 41 serving
-transactions promoted and evicted 328 experts each, copying 4,127,195,136 bytes.
-There were no movement faults, cancellations or rollbacks. Three sequential
-requests matched the all-HBM reference exactly in output, token log probabilities,
-finish reason and usage. This bounded check does not establish full-model state
-equivalence or correctness for untested capacities.
+Active residency is experimental and not qualified for production serving.
+CPU tests cover catalog selection, storage binding validation, controller
+ownership, rollback, active-policy accounting, and observational cost-ledger
+arithmetic. Component GPU tests cover captured routing counters, virtual-memory
+and row-map exchanges, and single-layer MoE replay on GB300. Full-model GLM
+routing capture, default-off overhead, fixed-MTP3 and adaptive-MTP5
+exact-response parity, and controlled static-versus-active serving throughput
+comparisons against the current core runtime are tracked in
+[TODO.txt](TODO.txt). See the
+[research guide](parallax-research.md#what-the-cost-ledger-means) for cost-ledger
+assumptions and experiment design.
 
-The MTP-instrumented package identified above was tested on GB300 with fixed
-three-draft execution, TP1, concurrency up to four and the same 8,064/4,032
-HBM/Grace placement. Traced all-HBM, static split and active split runs each
-matched the untraced all-HBM reference on three sequential requests: output,
-token log probabilities, finish reason and usage were exact. A separate
-8,192-token prefill with 16 output tokens also matched. Native readback tests
-exercised verification widths 1, 4 and 6 across both execution frames, including
-invalid telemetry, exact synthetic state and allocation stability. These checks
-do not establish full-model state equivalence or long-context correctness.
-
-With a two-second forecast horizon, the fixed-MTP3 static and active split runs
-averaged 66.6 and 74.3 output tokens/s respectively across three four-request
-coding cohorts of 256 output tokens per request. Untraced and traced all-HBM
-runs averaged 464.5 and 500.7 tokens/s. Timing includes prefill and HTTP. Each
-configuration ran once; scheduling and speculative acceptance varied, and no
-confidence interval was established. The active split run completed 84 serving
-exchanges, promoting and evicting 672 experts each, without movement faults or
-rollbacks. These measurements demonstrate working movement during MTP serving;
-they do not establish a tracing speedup or a reproducible policy advantage.
-
-Adaptive five-draft execution exercised verification widths 1 through 6 and
-completed 96 active exchanges without routing or movement faults. Its three
-sequential responses differed from the untraced all-HBM reference. A fresh
-untraced all-HBM repeat and a traced all-HBM control each differed on two of
-those three requests. This
-baseline variability prevents attributing the adaptive differences to Parallax;
-it does not establish instrumentation equivalence. Adaptive MTP exact-response
-qualification remains unresolved. Use fixed three-draft execution for the
-bounded residency demonstration described above.
-
-The exchange check assumed a synthetic cold penalty of 1 ms per use to exercise
-physical movement. It establishes neither predictive value nor a serving speedup.
-
-A separate EWMA `predictor_rank` comparison uses zero cold-cost input and measures
-actual movement alongside an observational execution-cost ledger. The
-[research findings](parallax-research.md#what-the-gb300-experiments-establish)
-record its package, workload, static/active throughput and qualification limits.
-The [ledger explanation](parallax-research.md#what-the-cost-ledger-means)
-distinguishes estimated resource savings from measured serving time.
-
-Production qualification requires measured cold-execution and publication costs,
-broader correctness coverage and comparable static-placement serving benchmarks.
-Controlled switching between active providers is unimplemented. Leaderboard
+Controlled switching between active providers is not implemented. Leaderboard
 changes do not authorize automatic promotion to active control.
 
 ## Research basis

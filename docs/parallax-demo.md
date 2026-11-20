@@ -340,14 +340,8 @@ an explicitly reserved GPU selected through `CUDA_VISIBLE_DEVICES`. It allocates
 only scratch buffers and checks copy verification, both directional fits, the
 sample-count bound and wall time. It does not load model weights.
 
-An evaluation-version-1 GB300 release serving check with the instrumented LIL GLM package, TP1 and MTP
-disabled measured 8.5 ms for startup calibration. Ten artificial prompts produced
-1,291 real routing frames. Both providers completed all 1,291 forecasts without
-busy drops, failures or timeouts. Initial trace retention filled at 805 frames;
-continuous prediction reached the end with an 832-frame statistics window and
-unchanged lifetime residency accounting. The retained prefix replayed exactly.
-These checks validate instrumentation and lifecycle behavior, not model accuracy,
-predictive generalization, production overhead or physical residency performance.
+Full-model GLM live serving checks against the current core runtime remain
+pending; see [TODO.txt](TODO.txt).
 
 
 To compare expanded scoring and placement against the same recorded forecasts,
@@ -402,11 +396,9 @@ and are excluded from the target catalog. The executor retains residency reader
 leases through each complete speculative graph, including its state commit;
 weight mappings cannot change while a round is in flight.
 
-The bounded GLM residency checks used fixed three-draft execution. Adaptive
-five-draft serving exercised tracing and exchanges, but exact-response
-qualification remains unresolved because untraced repeats also varied. See the
-[serving measurements](parallax.md#connecting-storage-to-serving) for the tested
-package, comparison scope and limitations.
+Fixed-draft and adaptive-draft MTP residency qualification against the current
+core runtime remain pending; see [TODO.txt](TODO.txt) and
+[connecting storage to serving](parallax.md#connecting-storage-to-serving).
 
 The dashboard's **Actual weights** line and `physical_residency` response describe
 real storage. Predictor comparison rows still describe independent simulations.

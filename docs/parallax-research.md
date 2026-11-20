@@ -1,68 +1,26 @@
-# Parallax findings and predictor experiments
+# Parallax predictor contract, cost ledger, and experiment design
 
 Parallax runs compiled expert-demand predictors inside Flare, evaluates their
 forecasts independently, and can submit bounded Grace/HBM exchanges through the
-native residency backend. This guide records the measured scope of the GB300
-prototype, explains how to write a predictor, and provides traffic for broader
-experiments. [Architecture](parallax.md) describes the subsystem boundaries;
-[running Parallax](parallax-demo.md) covers packages, profiles and serving flags.
+native residency backend. This guide defines the observational cost ledger, the
+compiled predictor contract, the `uniform_canary` control, authored synthetic
+workloads, and the controlled experiment methodology.
+[Architecture](parallax.md) describes the subsystem boundaries;
+[running Parallax](parallax-demo.md) covers cores, profiles, and serving flags.
 
-## What the GB300 experiments establish
+## Present qualification status
 
-On 6 November 2026, an EWMA-driven residency policy completed a comparison against
-static placement using GLM-5.3-Flash on one GB300. Both configurations used the
-same forced-offload split, release Flare runtime, fixed MTP3, and disabled adaptive
-verification. The policy ranked experts without assigning a synthetic monetary
-or latency value to each cold route.
+CPU tests cover offline replay, causal timing boundaries, predictor worker
+lifecycles, shadow residency accounting, cost-ledger least-squares arithmetic,
+native residency transaction ownership and rollback, and the authored HTTP
+workload driver. Component GPU tests cover captured routing counters,
+virtual-memory and row-map storage exchanges, and isolated single-layer MoE
+graph replay on GB300 SM103.
 
-| Condition | Static placement | EWMA rank policy |
-| --- | ---: | ---: |
-| Combined output tokens per second | 65.83 | 78.22 |
-| Coding cohorts | 8 | 8 |
-| Concurrent requests per cohort | 4 | 4 |
-| Output tokens per request | 256 | 256 |
-| Total cohort output tokens | 8,192 | 8,192 |
-
-The observed rate was **18.8% higher** with movement. These rates include HTTP and
-prefill time; they are not inter-token latency or steady decode measurements.
-There was one run per condition, no confidence interval, and a narrow synthetic
-coding workload. This is a useful reason to run broader controlled experiments,
-not an established production speedup. Earlier exploratory runs that overlapped
-development compilation are excluded from these figures.
-
-The tested package was `gb300-tp1-202611062241`, with authenticated ID
-`73afdd3add534c3473addaabe68c9fa88c19089b117623c6da4c26cb02c26172`, prepared from
-`local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD` revision
-`dec48abd33efa73c3bb7c95b74eee10cad34f9be`. It has TP1, text-only inputs,
-concurrency capacity 32, an 8,192-token prefill chunk, native expanded expert
-scales, and MTP5/192-row preparation capacity. Runtime concurrency was capped at
-four. Package capacity does not describe the runtime MTP setting: this comparison
-used `--mtp-draft-tokens 3 --no-mtp-adaptive-verification`.
-
-Target layers 3 through 44 contain 12,096 experts. The experiment placed 8,064
-experts' packed weights in HBM and 4,032 in Grace, with eight complete experts of
-spare HBM staging capacity. Expanded scales and calibration remained in HBM;
-draft layer 45 remained resident and outside Parallax's target catalog. This
-compares two policies under the same split. It does not show an advantage over
-an all-HBM model, or implement GB300-to-RTX expert transfers.
-
-Three separate sequential requests and an 8,192-token prefill probe matched
-output choices, log probabilities and usage exactly between static and active
-serving. The active run completed 199 exchanges with 1,592 promotions and no
-reported routing gaps, movement faults or rollbacks. These bounded checks do not
-establish full-model state equivalence. Adaptive MTP5 exact repeatability remains
-unresolved: output differences also occurred in uninstrumented controls. Preserve
-that limitation when choosing acceptance criteria; do not attribute every model
-difference to movement or waive a discrepancy because a control also varies.
-
-Raw requests, responses, launch settings and summaries are retained on the
-measurement host under `/home/jasonc/research/parallax-ledger-20261106/`:
-`comparison.json`, `static-2/` and `rank-2/`. The package is under
-`/data/checkpoints/flare/packages/models/local-inference-lab_2FGLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD/`.
-These are host-local research artifacts. The runtime was built from a modified
-research worktree; its base commit alone does not identify the tested source.
-An independently reproducible release and broader serving qualification remain
-necessary before publishing a general performance claim.
+Full-model GLM-5.3-Flash routing capture, default-off overhead checks,
+fixed-MTP3 and adaptive-MTP5 exact-response parity, and controlled
+static-versus-active serving throughput comparisons on the current core runtime
+are not yet qualified; open items are tracked in [TODO.txt](TODO.txt).
 
 ## What the cost ledger means
 
@@ -72,9 +30,6 @@ with an intercept. Fits are separate for graph, batch size and target-row count.
 Each fit retains up to 256 uncontended samples and needs at least 32 samples plus
 sufficient independent variation. A frame is scored using prior samples before
 it updates the fit. Missing fits remain unpriced rather than becoming zero cost.
-The native coefficients for one retained 256-sample static graph were independently
-reproduced with NumPy least squares. Agreement validates the arithmetic, not the
-model's causal interpretation.
 
 The actual reader generation identifies each frame's placement. The ledger asks
 how its executed canonical expert selections would have differed under the
@@ -82,26 +37,17 @@ initial static placement. This avoids charging repeated routes as independent
 full expert loads, but remains an observational estimate: bytes are representation
 extents, not measured memory traffic, and routing can correlate with other work.
 
-| Active-run ledger item | Result |
-| --- | ---: |
-| Observed / modeled routing frames | 938 / 676 |
-| Estimated execution savings versus initial placement | 15.06 s |
-| Measured GPU copy time | 577.6 ms |
-| Measured host publication time | 882.3 ms |
-| Estimated resource-accounting balance | +13.60 s |
-| Promotions used / evicted unused / still awaiting use | 1,579 / 3 / 10 |
+The accounting balance subtracts all measured GPU copy time and host publication
+time from estimated execution savings. Copy overlap, interference, and predictor
+overhead are not fully attributed. Reader-drain gate time is reported separately
+because inference can still be doing useful work during it. Startup movement is
+excluded. Promotions still awaiting use are censored observations, not proven
+waste.
 
-Balance subtracts all measured copy and publication time from estimated execution
-savings. Copy overlap, interference, and predictor overhead are not fully
-attributed. Reader-drain gate time is reported separately because inference can
-still be doing useful work during it. Startup movement is excluded. Promotions
-still awaiting use are censored observations, not proven waste.
-
-The ledger includes sequential checks and the prefill probe as well as the coding
-cohorts. Its scope therefore differs from the throughput table. A positive ledger
-balance is a hypothesis about useful placement, not measured wall time saved or
-a substitute for controlled serving measurements. Startup copy calibration alone
-cannot price direct Grace execution under inference contention.
+A positive ledger balance is an observational hypothesis about useful placement,
+not measured wall time saved or a substitute for controlled serving
+measurements. Startup copy calibration alone cannot price direct Grace execution
+under inference contention.
 
 ## Native predictor contract
 
@@ -268,10 +214,9 @@ Failed stages have no successful throughput value and produce a nonzero exit.
 Results already written survive a final drain failure. Rates include prefill and
 HTTP; there is no streaming TTFT/ITL measurement or output-quality score.
 
-These workload cases have CPU tests but have not been qualified against the GLM
-package on a GPU. In particular, tool-history template acceptance and actual
-token lengths still need a bounded serving check. They are separate from the
-coding corpus used for the measured 18.8% result.
+These workload cases have CPU tests and have not been qualified against a GLM
+core on a GPU; tool-history template acceptance and actual token-length checks
+are tracked in [TODO.txt](TODO.txt).
 
 ## Public workloads to adapt
 
