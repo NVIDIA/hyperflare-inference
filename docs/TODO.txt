@@ -659,3 +659,14 @@
     tensor. The TP4 overlap decode case also fails runs_concurrently, and its cause
     is not found. Close when the test passes in every case or each remaining
     failure has a stated cause.
+
+[ ] Qualify Qwen3.8 27B QAD (`qwen3.8-27b-qad`) image input. The checkpoint
+    shares the `qwen38_dense` recipe and defaults to four image slots, but only
+    `qwen3.8-27b` (`nvidia/Qwen3.8-27B-NVFP4`) has been exported and served with
+    images. Remove this entry when a `qwen3.8-27b-qad` image core has been
+    exported and served.
+
+[ ] Qualify Qwen3.8 27B vision projections that carry bias on SM103.
+    `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
+    `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
+    in `ignition/components/linear.py`; SM103 execution is unqualified.
