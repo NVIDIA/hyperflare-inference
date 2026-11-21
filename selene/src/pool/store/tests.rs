@@ -611,7 +611,6 @@ fn gpu_publications_are_announced_and_their_evictions_reported() {
         capture_role: crate::CaptureRole::Endpoint,
         id: CheckpointId::new(42),
         key,
-        parent: Some(rig.key(64)),
         ancestors: vec![rig.key(64)],
         bucket: [4; 16],
         chain_pages: (0..10).map(PageId).collect(),
@@ -873,7 +872,9 @@ fn a_dram_leaf_retires_through_its_local_root_carrying_every_offered_ancestor() 
     let mut tip = rig.retiring(5);
     tip.tier = Tier::Dram;
     tip.parent = Some(root.key);
-    tip.ancestor_keys = vec![root.key, b, a];
+    let nearer = rig.key(5 * PT - 1);
+    let next = rig.key(5 * PT - 2);
+    tip.ancestor_keys = vec![nearer, next, root.key, b, a];
     rig.local.0.lock().unwrap().ancestors = vec![root.clone(), tip.clone()];
     rig.offer(std::slice::from_ref(&tip));
     rig.poll();
@@ -892,9 +893,18 @@ fn a_dram_leaf_retires_through_its_local_root_carrying_every_offered_ancestor() 
     rig.poll();
     assert_eq!(rig.started()[1].1, tip.key);
     assert_eq!(rig.pool.lock().unwrap().puts[1].1.parent, Some(root.key));
-    rig.end(rig.started()[1].0, PutOutcome::Present);
+    rig.end(
+        rig.started()[1].0,
+        PutOutcome::Stored {
+            bytes: 1,
+            pages: 1,
+            linked: Some(next),
+        },
+    );
     rig.poll();
     assert_eq!(rig.retired(), [(tip.key, Retirement::Moved)]);
+    assert_eq!(rig.store.stats().deeper_link_records[1], 2);
+    assert_eq!(rig.store.stats().deeper_link_pages[1], 4);
 }
 
 #[test]
@@ -1443,7 +1453,6 @@ impl Rig {
             capture_role: crate::CaptureRole::Endpoint,
             id: CheckpointId::new(5),
             key: self.key(end),
-            parent: None,
             ancestors: Vec::new(),
             bucket: [3; 16],
             chain_pages: (0..pages as u32).map(PageId).collect(),
@@ -1482,7 +1491,6 @@ fn publication_copies_row_only_records_even_when_recompute_is_cheaper() {
     let parent = rig.publication(800);
     let mut child = rig.publication(800);
     child.key = rig.key(807);
-    child.parent = Some(parent.key);
     child.ancestors.push(parent.key);
     child.tail_pages = 0;
     assert_eq!(rig.store.store(&child).unwrap(), StoreOutcome::Queued);

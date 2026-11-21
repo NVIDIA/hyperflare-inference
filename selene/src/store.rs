@@ -26,13 +26,10 @@ pub struct PublishedCheckpoint {
     pub capture_role: crate::CaptureRole,
     pub id: CheckpointId,
     pub key: PrefixKey,
-    /// Key of the nearest offered GPU ancestor, or `None` when none was offered.
-    pub parent: Option<PrefixKey>,
     /// Every offered GPU ancestor on the checkpoint's parent chain, nearest first
     /// with strictly decreasing consumed tokens, at most [`MAX_PUBLISHED_ANCESTORS`].
-    /// The first entry is `parent`. A tier links the record under the first one it
-    /// holds, so a nearest ancestor that no tier stores (a page-less Endpoint on
-    /// the same page as its parent) does not force a copy of the whole chain.
+    /// A tier links the record under the first ancestor it holds, so a skipped
+    /// same-page Endpoint does not force a copy of the whole chain.
     pub ancestors: Vec<PrefixKey>,
     /// Digest of the aligned hash-block boundary at or below the endpoint.
     pub bucket: [u8; 16],
@@ -44,8 +41,9 @@ pub struct PublishedCheckpoint {
     pub slot: StateSlotId,
 }
 
-/// Bounds the walk over offered ancestors and the key storage per publication.
-/// A pool put can name up to 4096 candidates across the local chain.
+/// Limits the length and memory of each publication's ancestor list.
+/// 256 leaves ample room for offered conversation boundaries and is well
+/// below the manager's limit of 4096 candidates per put.
 pub const MAX_PUBLISHED_ANCESTORS: usize = 256;
 
 /// Why a tier stored a root record.
@@ -70,8 +68,9 @@ impl RootReason {
 }
 
 impl PublishedCheckpoint {
-    pub fn tail(&self) -> &[PageId] {
-        &self.chain_pages[self.chain_pages.len() - self.tail_pages..]
+    /// Key of the nearest offered GPU ancestor, if any.
+    pub fn parent(&self) -> Option<PrefixKey> {
+        self.ancestors.first().copied()
     }
 
     /// Offered GPU ancestors, nearest first.

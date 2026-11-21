@@ -513,7 +513,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
             &self.pool,
             IndexEntry {
                 key: checkpoint.key,
-                parent: checkpoint.parent,
+                parent: checkpoint.parent(),
                 bucket: checkpoint.bucket,
                 tail_pages: checkpoint.tail_pages as u32,
                 row: true,
@@ -578,7 +578,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
             Tier::Gpu,
             heir.map(|heir| IndexEntry {
                 key: heir.key,
-                parent: heir.parent,
+                parent: heir.parent(),
                 bucket: heir.bucket,
                 tail_pages: heir.tail_pages as u32,
                 row: true,

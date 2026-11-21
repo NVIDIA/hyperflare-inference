@@ -1815,7 +1815,6 @@ impl RequestScheduler {
             },
             id,
             key: checkpoint.prefix(),
-            parent,
             ancestors,
             bucket: checkpoint.bucket(),
             chain_pages: self.cache.page_chain(id).ok()?,

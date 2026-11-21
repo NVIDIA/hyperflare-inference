@@ -828,10 +828,11 @@ writer                          manager
 
 - `PutCancel` is legal only before `PutCommit`. Unfilled windows stay leased to
   the writer until `FenceAck{put_id}` or process exit.
-- For a record not already indexed, `PutBegin.ancestor_keys` lists candidate
-  ancestors in strictly decreasing consumed-token order: local chain keys,
-  deepest first, followed by the published-parent hint on the local root. The
-  manager considers at most the first 4096 keys and chooses the first ready
+- For a record not already indexed, `PutBegin.ancestor_keys` walks the local
+  chain, listing each record's nearer offered ancestors before its local parent
+  and ending with the root's offered ancestors.
+  The entire list is strictly descending by consumed tokens and contains at
+  most `MAX_CHAIN_NODES` (4,096) keys. The manager chooses the first ready
   ancestor whose pages it holds, including a page-only ancestor. `PutAccept`
   names that parent and its chain-relative end page as `first_page`.
   The writer sends the remaining pages and the accepted endpoint row, if any.

@@ -2675,10 +2675,7 @@ impl HostStore for DiskStore {
         };
         let id = self.next_job();
         let detect = self.announce.is_none() && self.geometry.len() > 1;
-        if parent.is_none() {
-            self.index
-                .set_published_ancestors(&checkpoint.key, checkpoint.offered().collect());
-        }
+        self.index.set_published_ancestors(&checkpoint.key, parent, &checkpoint.ancestors);
         let write = if row {
             self.transport
                 .store(id, header, temporary, path, checkpoint, detect)
@@ -3319,11 +3316,11 @@ mod tests {
         );
         let node = &store.index[&endpoint.key];
         assert_eq!(node.parent, Some(message));
+        assert_eq!(node.published_ancestors, [full.key_at(130).unwrap()]);
         assert!(!node.row);
         // Without any ancestor the disk keeps a root and its row.
         let mut lone = endpoint.clone();
         lone.key = full.key_at(135).unwrap();
-        lone.parent = None;
         lone.ancestors.clear();
         lone.tail_pages = lone.chain_pages.len();
         assert_eq!(store.plan_record(&lone).0, None);

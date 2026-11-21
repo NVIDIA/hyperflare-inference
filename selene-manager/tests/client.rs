@@ -1270,7 +1270,6 @@ fn publication(gpu: &GpuMemory, salt: u32, pages: usize) -> (PublishedCheckpoint
         capture_role: flare_selene::CaptureRole::Endpoint,
         id: CheckpointId::new(u64::from(salt)),
         key,
-        parent: None,
         ancestors: Vec::new(),
         bucket: history.bucket_at(key.consumed_tokens).unwrap(),
         chain_pages: (base..base + pages as u32).map(PageId).collect(),
@@ -1464,7 +1463,6 @@ fn a_retired_same_page_tip_restores_from_its_endpoint_parent() {
                 capture_role: flare_selene::CaptureRole::Endpoint,
                 id: CheckpointId::new(tokens),
                 key,
-                parent: ancestors.first().copied(),
                 ancestors: ancestors.clone(),
                 bucket: history.bucket_at(tokens).unwrap(),
                 chain_pages: (0..(tokens / PT) as u32).map(PageId).collect(),
@@ -1558,7 +1556,6 @@ fn retire_leaf_over_root_hint(evict_hint: bool, list: bool) {
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(pages as u64),
             key: history.key_at(pages as u64 * PT).unwrap(),
-            parent: ancestors.first().copied(),
             ancestors: ancestors.clone(),
             bucket: history.bucket_at(pages as u64 * PT).unwrap(),
             chain_pages: (0..pages as u32).map(PageId).collect(),
@@ -1630,6 +1627,65 @@ fn a_retired_leaf_with_every_offered_ancestor_evicted_is_stored_as_a_root() {
     retire_leaf_over_root_hint(true, true);
 }
 
+#[test]
+fn a_retired_child_links_to_a_nearer_ancestor_held_only_by_the_manager() {
+    let mut manager = Manager::dram_only(16 << 20);
+    manager.run();
+    let geometry = geo();
+    let mut reader = instance(&manager, 2);
+    reader.ready();
+
+    let (mut source, gpu) = memory_instance(&manager, &geometry, 4);
+    let (nearer, history) = publication(&gpu, 7, 3);
+    publish(&mut source, &nearer);
+    drive(&mut source, "the three-page ancestor to retire", |store| {
+        store.stats().memory_records == 0
+    });
+    source.close().unwrap();
+    wait_store_index(&reader, &history);
+    stored_candidate(&reader, &history, nearer.key);
+
+    let intake = flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1);
+    let pool = SlabPool::new(PAGE as u64, intake + 6, intake).unwrap();
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    let mut memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
+    let (local, _) = publication(&gpu, 7, 1);
+    store_and_wait(&mut memory, &local);
+    let (mut child, _) = publication(&gpu, 7, 4);
+    child.id = CheckpointId::new(8);
+    child.slot = StateSlotId(8);
+    gpu.rows.lock().unwrap().insert(8, salted_row(8));
+    child.ancestors = vec![nearer.key, local.key];
+    child.tail_pages = 1;
+    store_and_wait(&mut memory, &child);
+    assert_eq!(memory.index()[&child.key].parent, Some(local.key));
+    assert_eq!(memory.index()[&child.key].tail_pages, 3);
+
+    let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let mut store =
+        PooledStore::connect(memory, config(&manager, 1), copier, Arc::new(OkRegistrar)).unwrap();
+    drive(&mut store, "the local chain to retire", |store| {
+        store.stats().memory_records == 0
+    });
+    assert_eq!(store.stats().deeper_link_records[1], 0);
+    store.close().unwrap();
+    let candidate = stored_candidate(&reader, &history, child.key);
+    let nodes: Vec<_> = candidate.plan.nodes.iter().map(|node| (node.key, node.tail_pages)).collect();
+    assert_eq!(nodes, [(nearer.key, 3), (child.key, 1)]);
+    // Three pages for the nearer ancestor, one for the local parent, one for the child.
+    assert_eq!(manager.gauge("put_bytes_total{part=\"pages\"}"), (5 * PAGE) as u64);
+
+    let scratch = [100, 101, 102, 103];
+    let fetch = fetch_for(&mut reader, &history, 4, &scratch);
+    assert!(fetch.part.candidate.source.instance.is_empty());
+    assert_eq!(restore_bytes(&mut reader, fetch), (4 * PAGE + ROW) as u64);
+    for (page, dest) in scratch.iter().enumerate() {
+        assert_eq!(reader.gpu.pages.lock().unwrap()[dest], salted_page(7, page));
+    }
+    assert_eq!(reader.gpu.rows.lock().unwrap()[&9], salted_row(8));
+    reader.client.close().unwrap();
+}
+
 /// Retire the Anchor before publishing the terminal under its missing prompt end.
 fn retire_anchor_and_terminal(
     manager: &Manager,
@@ -1672,7 +1728,6 @@ fn retire_anchor_and_terminal(
             },
             id: CheckpointId::new(id),
             key,
-            parent,
             ancestors,
             bucket: history.bucket_at(key.consumed_tokens).unwrap(),
             chain_pages: (0..pages as u32).map(PageId).collect(),
@@ -1868,7 +1923,6 @@ fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(turn as u64),
             key,
-            parent: ancestors.first().copied(),
             ancestors: ancestors.clone(),
             bucket: history.bucket_at(tokens).unwrap(),
             chain_pages: (0..pages as u32).map(PageId).collect(),
@@ -2260,7 +2314,6 @@ fn large_recovered_nvme_records_restore_consecutively() {
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(u64::from(salt)),
             key: history.key_at(110_000).unwrap(),
-            parent: None,
             ancestors: Vec::new(),
             bucket: history.bucket_at(110_000).unwrap(),
             chain_pages: (0..pages as u32).map(PageId).collect(),

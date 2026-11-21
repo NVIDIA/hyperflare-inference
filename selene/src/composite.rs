@@ -477,14 +477,14 @@ impl CompositeStore {
             return;
         }
         self.stats.held[0] += u64::from(!reserved_file);
-        if parent.is_none() {
-            let hint = self
-                .memory
-                .index()
-                .node(&key)
-                .map(|node| node.published_ancestors.clone())
-                .unwrap_or_default();
-            self.disk.index_mut().set_published_ancestors(&key, hint);
+        let kept = self
+            .memory
+            .index()
+            .node(&key)
+            .map(|node| node.published_ancestors.clone())
+            .unwrap_or_default();
+        if let Some(node) = self.disk.index_mut().node_mut(&key) {
+            node.published_ancestors = kept;
         }
         if let Some(parent) = parent
             && self
@@ -1188,7 +1188,7 @@ impl HostStore for CompositeStore {
             return Err(error);
         }
         let accepted = if covered {
-            self.memory.store_empty(checkpoint)
+            self.memory.store_empty(checkpoint, parent)
         } else {
             self.memory.store_record(checkpoint, parent, &tail, false)
         };
@@ -1942,11 +1942,11 @@ mod tests {
                 StateSlotId(turn),
             );
             checkpoint.capture_role = crate::CaptureRole::Message;
-            if let Some(parent) = checkpoint.parent {
+            if let Some(parent) = checkpoint.parent() {
                 store.disk.index_mut().pin(&parent).unwrap();
             }
             let (record, bytes) =
-                copy_landed(&mut store, &checkpoint, checkpoint.parent, u64::from(turn));
+                copy_landed(&mut store, &checkpoint, checkpoint.parent(), u64::from(turn));
             let contents = record_bytes(&store, &record);
             expected_pages.push(contents[0].clone());
             expected_row = contents[1].clone();
@@ -2027,7 +2027,7 @@ mod tests {
             1,
             StateSlotId(9),
         );
-        written(&mut store, &fork, fork.parent, 9);
+        written(&mut store, &fork, fork.parent(), 9);
         assert!(store.disk.index()[&checkpoints[5].key].row);
         assert_eq!(store.disk.index()[&checkpoints[5].key].children(), 2);
         total += store.disk.record(&fork.key).unwrap().bytes;
@@ -2095,11 +2095,11 @@ mod tests {
                 StateSlotId(turn),
             );
             checkpoint.capture_role = crate::CaptureRole::Message;
-            if let Some(parent) = checkpoint.parent {
+            if let Some(parent) = checkpoint.parent() {
                 store.disk.index_mut().pin(&parent).unwrap();
             }
             let (_, bytes) =
-                copy_landed(&mut store, &checkpoint, checkpoint.parent, u64::from(turn));
+                copy_landed(&mut store, &checkpoint, checkpoint.parent(), u64::from(turn));
             store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut Vec::new());
             checkpoints.push(checkpoint);
         }
@@ -2145,11 +2145,11 @@ mod tests {
             if turn == 4 {
                 store.reused(checkpoints[1]);
             }
-            if let Some(parent) = checkpoint.parent {
+            if let Some(parent) = checkpoint.parent() {
                 store.disk.index_mut().pin(&parent).unwrap();
             }
             let (_, bytes) =
-                copy_landed(&mut store, &checkpoint, checkpoint.parent, u64::from(turn));
+                copy_landed(&mut store, &checkpoint, checkpoint.parent(), u64::from(turn));
             store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut Vec::new());
             checkpoints.push(checkpoint.key);
         }
@@ -2187,10 +2187,10 @@ mod tests {
                         1,
                         StateSlotId(turn),
                     );
-                    if let Some(parent) = checkpoint.parent {
+                    if let Some(parent) = checkpoint.parent() {
                         store.disk.index_mut().pin(&parent).unwrap();
                     }
-                    written(&mut store, &checkpoint, checkpoint.parent, u64::from(salt));
+                    written(&mut store, &checkpoint, checkpoint.parent(), u64::from(salt));
                     if turn == 2 {
                         store.memory.pin_record(&checkpoint.key).unwrap();
                     }
@@ -2277,7 +2277,7 @@ mod tests {
             StateSlotId(2),
         );
         written(&mut store, &root, None, 1);
-        written(&mut store, &parent, parent.parent, 2);
+        written(&mut store, &parent, parent.parent(), 2);
         assert_eq!(store.store(&tip).unwrap(), StoreOutcome::Queued);
         poll_until(&mut store, &mut Vec::new(), |s| {
             s.parked.contains_key(&tip.key)
@@ -2367,7 +2367,7 @@ mod tests {
 
         written(&mut store, &root, None, 1);
         store.disk.index_mut().pin(&root.key).unwrap();
-        let (record, bytes) = copy_landed(&mut store, &anchor, anchor.parent, 2);
+        let (record, bytes) = copy_landed(&mut store, &anchor, anchor.parent(), 2);
         let expected = record_bytes(&store, &record);
         store.memory_stored(anchor.id, anchor.key, Ok(bytes), &mut Vec::new());
         anchor.capture_role = crate::CaptureRole::Anchor;
@@ -2379,7 +2379,7 @@ mod tests {
         assert!(store.memory.record(&deep.key).unwrap().row.is_none());
         assert_eq!(store.store(&deep).unwrap(), StoreOutcome::Present);
         store.disk.index_mut().pin(&deep.key).unwrap();
-        let (_, bytes) = copy_landed(&mut store, &next, next.parent, 3);
+        let (_, bytes) = copy_landed(&mut store, &next, next.parent(), 3);
         store.memory_stored(next.id, next.key, Ok(bytes), &mut Vec::new());
         assert!(store.memory.record(&anchor.key).unwrap().row.is_some());
 
@@ -2452,13 +2452,13 @@ mod tests {
         store.disk.set_limit(3 * file_bytes + 2 * ROW_RECORD);
         // Match `store`'s parent pin for each synthetic copy-out.
         store.disk.index_mut().pin(&root.key).unwrap();
-        let (record, bytes) = copy_landed(&mut store, parent, parent.parent, 2);
+        let (record, bytes) = copy_landed(&mut store, parent, parent.parent(), 2);
         let expected = record_bytes(&store, &record);
         store.memory_stored(parent.id, parent.key, Ok(bytes), &mut Vec::new());
         store.spill(parent.key).unwrap();
         assert!(store.parked[&parent.key].writing);
         store.disk.index_mut().pin(&parent.key).unwrap();
-        let (_, bytes) = copy_landed(&mut store, child, child.parent, 3);
+        let (_, bytes) = copy_landed(&mut store, child, child.parent(), 3);
         store.memory_stored(child.id, child.key, Ok(bytes), &mut Vec::new());
         assert_eq!(store.disk.index()[&parent.key].pins(), 1);
         assert!(store.memory.record(&parent.key).unwrap().row.is_some());
@@ -2893,7 +2893,7 @@ mod tests {
         assert_eq!(stats.deeper_link_pages[0], 1);
         let node = &store.disk.index()[&child.key];
         assert_eq!(node.parent, Some(root.key));
-        assert!(node.published_ancestors.is_empty());
+        assert_eq!(node.published_ancestors, [full.key_at(130).unwrap()]);
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();

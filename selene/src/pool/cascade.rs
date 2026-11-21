@@ -101,8 +101,14 @@ struct Move {
     /// Shapes offered on this pass, checked before releasing a locally promoted row.
     offered: Vec<Retiring>,
     started: Instant,
-    /// Candidates sent for the active put of a local root.
-    root_candidates: Option<Vec<crate::PrefixKey>>,
+    /// A predecessor's put has its own candidates; the leaf uses `record.ancestor_keys`.
+    predecessor_candidates: Option<Vec<crate::PrefixKey>>,
+}
+
+impl Move {
+    fn candidates(&self) -> &[crate::PrefixKey] {
+        self.predecessor_candidates.as_deref().unwrap_or(&self.record.ancestor_keys)
+    }
 }
 
 pub(crate) struct Cascade {
@@ -221,7 +227,7 @@ impl Cascade {
                     record,
                     failures: 0,
                     leaf_only: false,
-                    root_candidates: None,
+                    predecessor_candidates: None,
                 });
             } else {
                 inner.retired(record.key, record.tier, Retirement::Failed);
@@ -259,17 +265,12 @@ impl Cascade {
             Ok(pin) => pin,
             Err(_) => return self.failed(inner, &entry.record),
         };
-        // The path holds local records. The keys after the local chain are the root's offered candidates.
-        let ancestors = if key == entry.record.key {
-            entry.record.ancestor_keys.clone()
-        } else {
-            std::mem::take(&mut record.ancestor_keys)
-        };
-        entry.root_candidates = record.parent.is_none().then(|| ancestors.clone());
+        entry.predecessor_candidates = (key != entry.record.key)
+            .then(|| std::mem::take(&mut record.ancestor_keys));
         let request = PutRequest {
             key: record.key,
             parent: record.parent,
-            ancestor_keys: ancestors,
+            ancestor_keys: entry.candidates().to_vec(),
             bucket: record.bucket,
             chain_pages: pin.chain().total_pages,
             tail_pages: record.tail_pages as u64,
@@ -319,15 +320,15 @@ impl Cascade {
         let Some(mut entry) = self.moving.remove(&id) else {
             return false;
         };
-        if let (Some(candidates), PutOutcome::Stored { pages, linked, .. }) =
-            (entry.root_candidates.take(), outcome)
-        {
+        if let PutOutcome::Stored { pages, linked, .. } = outcome {
+            let put = entry.offered.last().unwrap_or(&entry.record);
+            let candidates = entry.candidates();
             if let Some(parent) = linked {
                 if candidates.iter().skip(1).any(|key| key == parent) {
                     self.deeper_link_records += 1;
                     self.deeper_link_pages += pages;
                 }
-            } else {
+            } else if put.parent.is_none() {
                 let reason = crate::RootReason::from_nearest(candidates.first().copied()) as usize;
                 self.root_records[reason] += 1;
                 self.root_pages[reason] += pages;

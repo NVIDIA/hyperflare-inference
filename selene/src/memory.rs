@@ -325,10 +325,10 @@ impl Core {
         pages: usize,
     ) {
         if parent.is_none() {
-            let reason = crate::RootReason::from_nearest(checkpoint.parent);
+            let reason = crate::RootReason::from_nearest(checkpoint.parent());
             self.stats.root_records[0][reason as usize] += 1;
             self.stats.root_pages[0][reason as usize] += pages as u64;
-        } else if parent != checkpoint.parent {
+        } else if parent != checkpoint.parent() {
             self.stats.deeper_link_records[0] += 1;
             self.stats.deeper_link_pages[0] += pages as u64;
         }
@@ -408,32 +408,29 @@ impl Core {
         if self.known(&checkpoint.key) {
             return Ok(false);
         }
-        let parent = if self.flat { None } else { parent };
+        let indexed_parent = if self.flat { None } else { parent };
         // Eviction during allocation must not remove the record being extended.
-        if let Some(parent) = &parent
+        if let Some(parent) = &indexed_parent
             && self.pin_record(parent).is_err()
         {
             return Err(invalid("host record parent is not indexed"));
         }
         let allocated = self.allocate(
             checkpoint.key,
-            parent,
+            indexed_parent,
             checkpoint.bucket,
             tail.len(),
             row,
             durable,
         );
-        if let Some(parent) = &parent {
+        if let Some(parent) = &indexed_parent {
             let _ = self.unpin_record(parent);
         }
         let Some(record) = allocated? else {
             return Ok(false);
         };
         self.index[&checkpoint.key].location.capture_role = checkpoint.capture_role;
-        if parent.is_none() {
-            self.index
-                .set_published_ancestors(&checkpoint.key, checkpoint.offered().collect());
-        }
+        self.index.set_published_ancestors(&checkpoint.key, parent, &checkpoint.ancestors);
         let id = self.next_job();
         let pages = tail
             .iter()
@@ -1494,8 +1491,12 @@ impl MemoryStore {
     }
 
     /// Index the zero-page link without allocating a row or starting a device copy.
-    pub(crate) fn store_empty(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool> {
-        self.core.start_record(checkpoint, None, &[], false, false)
+    pub(crate) fn store_empty(
+        &mut self,
+        checkpoint: &PublishedCheckpoint,
+        parent: Option<PrefixKey>,
+    ) -> Result<bool> {
+        self.core.start_record(checkpoint, parent, &[], false, false)
     }
 
     /// Allocate slots for a record read in from elsewhere, evicting under the
@@ -2030,7 +2031,6 @@ mod tests {
             capture_role: crate::CaptureRole::Endpoint,
             id: checkpoint_id(slot),
             key: history.key_at(consumed).unwrap(),
-            parent,
             ancestors: parent.into_iter().collect(),
             bucket: history.bucket_at(consumed).unwrap(),
             chain_pages: (first_page..first_page + chain).map(PageId).collect(),
@@ -2691,7 +2691,7 @@ mod tests {
         store_anchor(&mut core, &full, 640, 1);
         let anchor = full.key_at(640).unwrap();
         let terminal = published_under(&full, 1098, &[642, 640], 0, 3);
-        assert_eq!(terminal.parent, Some(full.key_at(642).unwrap()));
+        assert_eq!(terminal.parent(), Some(full.key_at(642).unwrap()));
         assert!(core.store(&terminal).unwrap());
         let node = core.index.node(&terminal.key).unwrap();
         assert_eq!(node.parent, Some(anchor));
@@ -3467,13 +3467,15 @@ mod tests {
 
         // A child record under flat links is a root holding only its tail.
         let child = published(&full, 400, Some(200), 10, 2);
+        let parent = child.parent().unwrap();
+        let tail = child.tail_below(&parent, PT).unwrap();
         assert!(
-            core.store_record(&child, child.parent, child.tail(), false)
+            core.store_record(&child, Some(parent), tail, false)
                 .unwrap()
         );
         assert!(
             !core
-                .store_record(&child, child.parent, child.tail(), false)
+                .store_record(&child, Some(parent), tail, false)
                 .unwrap()
         );
         let node = core.index.node(&child.key).unwrap();

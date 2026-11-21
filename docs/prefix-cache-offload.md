@@ -261,9 +261,9 @@ stores, so the whole list is offered. Each tier chooses its parent in one place
 children), and that choice also decides whether an Endpoint keeps its row, so an
 Endpoint covered by a row on its page is always stored under the record that
 covers it. A publication waits for the first known offered ancestor that is still
-copying out. A local root keeps the list as its hint. A put to the manager's
-store lists up to 4096 candidates, starting with local ancestors and continuing
-with the root's offered ancestors. The manager links the record under the
+copying out. A put to the manager offers up to 4096 ancestors, nearest first.
+Each record offers any ancestors nearer than its local parent before that parent,
+and the local root offers its remaining ancestors. The manager links the record under the
 nearest ready candidate. The writer sends only the pages after that ancestor.
 The manager stores a root with the complete chain only when it holds none of them, when the
 chosen ancestor's chain is already half the lookup limit long, or when the
@@ -1167,7 +1167,8 @@ same completion events the store produces.
   `flare_host_cache_deeper_link_records_total{tier}` and
   `flare_host_cache_deeper_link_pages_total{tier}` count records linked under a
   later offered ancestor and the pages copied after it. These counters cover
-  GPU-to-DRAM copies started and local-root puts the pool manager stored.
+  GPU-to-DRAM copies started and puts the pool manager stored. Pool root
+  counters cover puts of local roots that the manager also stored as roots.
   A `Present` response and local writes in a disk-only store contribute zero.
   `flare_host_cache_expired_total{tier}` counts direct age removals. Slot gauges
   `flare_host_cache_slots_in_use`, `flare_host_cache_slots_total` and

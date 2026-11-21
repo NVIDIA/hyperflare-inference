@@ -390,7 +390,6 @@ pub fn checkpoint(
         capture_role: crate::CaptureRole::Endpoint,
         id: ids.next(),
         key: history.key_at(consumed).unwrap(),
-        parent,
         ancestors: parent.into_iter().collect(),
         bucket: history
             .key_at(consumed - consumed % HASH_BLOCK_TOKENS as u64)
