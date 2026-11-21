@@ -378,31 +378,41 @@ class _SparseDraftContextForward:
 
 
 @torch.no_grad()
-def test_checkpoint_draft_aot_reads_only_selected_mapped_context_rows(tmp_path):
+@pytest.mark.parametrize("variant", ["small", "mini"])
+def test_checkpoint_draft_aot_reads_only_selected_mapped_context_rows(tmp_path, variant):
     from ignition.preparation.aot import aot_forward
     from ignition.preparation.core_storage import CoreStorage
     from ignition.recipes.inkling2.config import ModelConfig
     from ignition.recipes.inkling2.pool import ContinuationPool, RankGeometry, continuation_layout, page_specs
 
-    snapshot = os.environ.get("FLARE_INKLING2_SNAPSHOT")
+    variable = "FLARE_INKLING2_MINI_SNAPSHOT" if variant == "mini" else "FLARE_INKLING2_SNAPSHOT"
+    snapshot = os.environ.get(variable)
     if snapshot is None:
-        pytest.skip("requires FLARE_INKLING2_SNAPSHOT")
+        pytest.skip(f"requires {variable}")
     device, batch, block = torch.device("cuda:0"), 8, 8
     torch.cuda.set_device(device)
-    config, shard = ModelConfig.load(snapshot), TensorParallelShard(0, 4)
-    with DirectWeightLoader(inspect_indexed_checkpoint(snapshot), device) as loader:
-        head = loader.load_tensor("lm_head.weight", extent=(slice(0, 50304), slice(None)))
+    config, shard = ModelConfig.load(snapshot), TensorParallelShard(0, 1 if variant == "mini" else 4)
+    manifest = inspect_indexed_checkpoint(snapshot)
+    if variant == "mini":
+        from ignition.recipes.inkling2.mini_weights import MiniWeightLoader
+        context = MiniWeightLoader(manifest, device, shard=shard, vision=False)
+    else:
+        context = DirectWeightLoader(manifest, device)
+    first, last = shard.padded_partition(config.vocabulary, alignment=64)
+    with context as loader:
+        head = loader.load_tensor("lm_head.weight", extent=(slice(first, last), slice(None)))
         embedding = loader.load_tensor("model.language_model.embed_tokens.weight",
-            extent=(slice(0, 50304), slice(None)))
+            extent=(slice(first, last), slice(None)))
         embedding_norm = loader.load_tensor("model.language_model.embed_norm.weight")
     weights = SimpleNamespace(config=config, shard=shard, head=head, embedding=embedding,
         embedding_norm=embedding_norm, draft=DraftWeights.load(snapshot, config, device, shard, target_head=head))
-    geometry = RankGeometry.of(config.text, shard.world_size)
+    text = config.text.cache_config
+    geometry = RankGeometry.of(text, shard.world_size)
     total = torch.cuda.get_device_properties(device).total_memory
-    page_bytes = sum(shape[0] for _, shape in page_specs(config.text, geometry, config.draft))
-    row_bytes = continuation_layout(config.text, geometry, config.draft).row_bytes
+    page_bytes = sum(shape[0] for _, shape in page_specs(text, geometry, config.draft))
+    row_bytes = continuation_layout(text, geometry, config.draft).row_bytes
     storage = CoreStorage(device=0)
-    pool = ContinuationPool.allocate(config.text, geometry, batch + 1, batch, device, storage=storage,
+    pool = ContinuationPool.allocate(text, geometry, batch + 1, batch, device, storage=storage,
         maximum_pages=total // page_bytes, maximum_rows=total // row_bytes, backed_slots=batch + 1,
         draft=config.draft)
     pool.clear_for_preparation()
