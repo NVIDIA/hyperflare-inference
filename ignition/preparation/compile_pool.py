@@ -141,6 +141,7 @@ class CompilePool:
         from torch._inductor.compile_worker.subproc_pool import SubprocKind, SubprocPool
 
         if self.pool is None:
+            runtime_patches.apply()
             if os.name == "nt":
                 self.pool = ProcessPoolExecutor(self.workers, mp_context=multiprocessing.get_context("spawn"))
             else:

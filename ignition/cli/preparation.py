@@ -52,22 +52,52 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
            joint_tuning: bool = False, shard_hyperconnections: bool = False,
-           force_moe_decode_a16: bool | None = None) -> planning.Plan:
+           force_moe_decode_a16: bool | None = None, sm103_preparation=None) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     from ignition.preparation.collective_ladder import resolve as resolve_ladder
 
     mode = collective_tuning_mode(configuration, model, collective_tuning)
     ladder = resolve_ladder(mode, collective_ladder)
     workers = compiler_workers(configuration, compile_workers)
+    sm103 = None
+    devices = host.gpus
+    selected = None if gpus is None else planning.parse_gpus(gpus)
+    if sm103_preparation is not None:
+        from ignition.recipes.deepseek41.sm103 import SM103Config
+        from ignition.preparation.host_memory import available_bytes
+
+        if expert_scale_compression not in (None, "native"):
+            raise UsageError("--sm103-preparation requires expanded native expert scales")
+        if tuning_gpus is not None:
+            raise UsageError("--sm103-preparation retains its assigned GPU; --tuning-gpus is not supported")
+        try:
+            sm103 = SM103Config.load(sm103_preparation)
+            recipe, checkpoint = sm103.planning_inputs(model.recipe, model.checkpoint,
+                model.snapshot(configuration.directory("hub_cache")), dspark=speculation is not None,
+                draft_tokens=None if speculation is None else speculation.draft_tokens)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            raise UsageError(f"--sm103-preparation: {error}") from error
+        model = replace(model, recipe=recipe, checkpoint=checkpoint)
+        expert_scale_compression = "native"
+        if selected is not None:
+            if (len(selected) != 1 or selected[0] >= len(devices)
+                    or devices[selected[0]].capability != (10, 3)):
+                raise UsageError("--sm103-preparation requires one SM103 GPU")
+        else:
+            devices = tuple(gpu for gpu in devices if gpu.capability == (10, 3))
+            if not devices:
+                raise UsageError("--sm103-preparation requires one SM103 GPU")
+        if checkpoint.mapped_host_bytes + (8 << 30) > available_bytes():
+            raise UsageError("insufficient host memory for mapped expert weights and 8 GiB preparation headroom")
     result = planning.plan(
-        model.recipe, model.checkpoint, host.gpus, selected=None if gpus is None else planning.parse_gpus(gpus),
+        model.recipe, model.checkpoint, devices, selected=selected,
         concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes, speculation=speculation,
         prefill_chunk=prefill_chunk, context_parallel=context_parallel, context_parallel_size=context_parallel_size,
         stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
         online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
-    result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
+    result = replace(result, sm103=sm103, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
                      collective_tuning=mode, collective_ladder=ladder,
                      force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", force_moe_decode_a16).value,

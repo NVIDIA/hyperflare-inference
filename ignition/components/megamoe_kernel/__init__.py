@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Preparation bindings for DeepGEMM and isolated DerpSeek host-tier kernels."""
+
+from functools import cache
+import errno
+import hashlib
+from pathlib import Path
+import shutil
+import tempfile
+
+
+@cache
+def initialize(kernel_cache: Path):
+    """Use DeepGEMM with the headers matching its installed native launcher.
+
+    Host-tier launchers own a separate runtime and bind ``header_root`` there.
+    Repointing DeepGEMM's global runtime at those headers mixes kernel template
+    signatures and scheduling layouts from different implementations.
+    """
+    import deep_gemm
+    return deep_gemm
+
+
+@cache
+def header_root(kernel_cache: Path):
+    """Materialize the pinned kernel headers in an isolated preparation directory."""
+    import deep_gemm
+
+    source = Path(deep_gemm.__file__).parent / "include"
+    overlay = Path(__file__).parent / "include"
+    files = {path.relative_to(source): path for path in source.rglob("*") if path.is_file()}
+    files.update({path.relative_to(overlay): path for path in overlay.rglob("*") if path.is_file()})
+    digest = hashlib.sha256()
+    for name, path in sorted(files.items()):
+        digest.update(str(name).encode() + b"\0")
+        digest.update(path.read_bytes())
+    parent = Path(kernel_cache) / "megamoe-headers"
+    parent.mkdir(parents=True, exist_ok=True)
+    root = parent / digest.hexdigest()
+    if not root.exists():
+        with tempfile.TemporaryDirectory(dir=parent) as temporary:
+            candidate = Path(temporary) / "root"
+            for name, path in files.items():
+                target = candidate / "include" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
+            try:
+                candidate.rename(root)
+            except OSError as error:
+                if error.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not root.is_dir():
+                    raise
+    return root

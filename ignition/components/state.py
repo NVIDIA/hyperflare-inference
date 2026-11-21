@@ -30,7 +30,9 @@ class StateLayout:
     row_bytes: int
 
     @classmethod
-    def from_specs(cls, specifications):
+    def from_specs(cls, specifications, *, alignment=256):
+        if type(alignment) is not int or alignment < 256 or alignment & (alignment - 1):
+            raise ValueError("state alignment must be a power of two of at least 256 bytes")
         regions, names, offset = [], set(), 0
         for name, shape, dtype in specifications:
             if not isinstance(name, str) or not name or name in names:
@@ -40,14 +42,14 @@ class StateLayout:
                 raise ValueError("state region extents must be positive integers")
             if not isinstance(dtype, torch.dtype):
                 raise TypeError("state regions require a tensor dtype")
-            offset = (offset + 255) // 256 * 256
+            offset = (offset + alignment - 1) // alignment * alignment
             region = StateRegion(name, offset, shape, dtype)
             regions.append(region)
             names.add(name)
             offset += region.nbytes
         if not regions:
             raise ValueError("state storage requires at least one region")
-        return cls(tuple(regions), (offset + 255) // 256 * 256)
+        return cls(tuple(regions), (offset + alignment - 1) // alignment * alignment)
 
     def region(self, name):
         for region in self.regions:

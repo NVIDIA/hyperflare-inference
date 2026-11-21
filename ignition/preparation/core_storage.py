@@ -35,7 +35,11 @@ class CoreStorage:
     DEVICE_BASE = 0x40000000000 if os.name == "nt" else 0x80000000000
     # The native allocator selects a higher base when the device ranks need this range.
     HOST_BASE = 0xc0000000000
-    RESERVATION_BYTES = 1 << 40
+    # Half serves the caching allocator. The other half holds persistent tensors,
+    # continuation rows and KV pages, each reserving up to one device's memory.
+    # Three full-device extents on a 288 GiB GPU need 864 GiB of virtual space.
+    # Windows keeps its smaller extent to fit the WDDM host-address window.
+    RESERVATION_BYTES = (1 if os.name == "nt" else 2) << 40
     # Each rank's host range; independent of an explicit device window.
     HOST_RESERVATION_BYTES = 1 << 40
     # Keep library-owned device storage above the ranges occupied by Linux and WDDM contexts.

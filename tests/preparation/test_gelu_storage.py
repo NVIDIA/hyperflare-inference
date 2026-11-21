@@ -109,3 +109,21 @@ def test_compiled_gelu_reuses_storage_after_opaque_consumer(device):
             torch.testing.assert_close(output, expected)
     finally:
         compilation._INVOCATIONS.reset(token)
+
+
+class _ScalarConstantForward:
+    def __init__(self):
+        self.source = torch.linspace(-2.0, 2.0, 16, dtype=torch.float32)
+        self.output = torch.empty_like(self.source)
+
+    def __call__(self):
+        self.output.copy_(self.source * torch.tensor(2.5, dtype=torch.float32))
+
+
+def test_lower_storage_inlines_zero_dimensional_cpu_tensor_constants():
+    from ignition.preparation import aot
+
+    forward = _ScalarConstantForward()
+    compiled = aot.aot_forward(forward)
+    compiled(forward)
+    torch.testing.assert_close(forward.output, forward.source * 2.5)

@@ -3,11 +3,28 @@
 from contextlib import nullcontext
 
 import torch
+import pytest
 
 from b12x.gemm.blockscaled import _a16
 from flashinfer import gemm
 from flashinfer.gemm import gemm_base
 from ignition.components import sm103_projection as projection
+from b12x.preparation.tuning import BackendConfig
+
+
+@pytest.mark.parametrize("rows", [1, 8, 9])
+def test_low_latency_candidate_respects_row_capacity(rows):
+    query = projection.PackedProjectionQuery(recipe="mxfp8", rows=rows, in_features=128,
+        padded_in_features=128, out_features=128, global_scale_kind="none", workspace_form="provided")
+    config = BackendConfig(backend="cutedsl_low_latency:-1")
+    candidates = projection.TUNING.parameters(query, None)["backend"]
+    if rows <= 8:
+        assert config.backend in candidates
+        projection.TUNING.validate_config(query, config, None)
+    else:
+        assert config.backend not in candidates
+        with pytest.raises(ValueError, match="unsupported"):
+            projection.TUNING.validate_config(query, config, None)
 
 
 def test_expanded_nvfp4_separates_matrix_and_aligned_gemm_workspace(monkeypatch):
