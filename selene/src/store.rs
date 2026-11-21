@@ -154,14 +154,18 @@ pub struct ExportChain {
 /// Completion of work a store accepted earlier.
 #[derive(Debug)]
 pub enum StoreEvent {
-    /// The copy-out of a published checkpoint finished; the worker may unpin it.
+    /// Every rank's copy has fenced. Host encoding or disk publication can continue.
+    SourceReleased { checkpoint: CheckpointId },
+    /// Publication finished. Release the copy-out pin unless SourceReleased already did.
     Stored {
+        source_released: bool,
         checkpoint: CheckpointId,
         key: PrefixKey,
         result: Result<u64>,
     },
     /// No copy still reads the GPU checkpoint; retry its publication after progress.
     Deferred {
+        source_released: bool,
         checkpoint: CheckpointId,
         reason: StoreReason,
     },
@@ -182,9 +186,46 @@ pub enum StoreEvent {
     ExportEnded { export: ExportId },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BackstopStats {
+    pub by_encoder: [u64; 4],
+    pub events: u64,
+    pub bytes: u64,
+    pub queue_bytes: u64,
+    pub oldest_ns: u64,
+    pub abandoned: u64,
+    pub peak_bytes: u64,
+    pub heap_reserved: u64,
+    pub heap_intake: u64,
+    pub ready_ns: u64,
+    pub ready_buckets: [u64; 7],
+}
+
+impl std::ops::Add for BackstopStats {
+    type Output = Self;
+    fn add(self, b: Self) -> Self {
+        Self {
+            by_encoder: std::array::from_fn(|i| self.by_encoder[i] + b.by_encoder[i]),
+            events: self.events + b.events,
+            bytes: self.bytes + b.bytes,
+            queue_bytes: self.queue_bytes + b.queue_bytes,
+            oldest_ns: self.oldest_ns.max(b.oldest_ns),
+            abandoned: self.abandoned + b.abandoned,
+            // Composite tiers share the same host pool.
+            peak_bytes: self.peak_bytes.max(b.peak_bytes),
+            heap_reserved: self.heap_reserved.max(b.heap_reserved),
+            heap_intake: self.heap_intake.max(b.heap_intake),
+            ready_ns: self.ready_ns + b.ready_ns,
+            ready_buckets: std::array::from_fn(|i| self.ready_buckets[i] + b.ready_buckets[i]),
+        }
+    }
+}
+
 /// Counters every store maintains; rates are bytes per second of completed transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoreStats {
+    /// Time under DRAM retirement pressure without releasing a retired record.
+    pub dram_retirement_wait_ns: u64,
     pub retirement_paths: u64,
     pub retirement_max_depth: u64,
     pub retirement_ns: u64,
@@ -206,9 +247,23 @@ pub struct StoreStats {
     pub held: [u64; 2],
     /// Each tier's end_of_chain/oversize/io_error, then DRAM/NVMe pool_refused.
     pub dropped: [u64; 8],
+    /// Recovery discarded these files because this reader cannot restore their chain.
+    pub disk_scan_dropped: u64,
     /// Discarded leaves and exhausted ancestor retries, by refusal reason:
-    /// invalid, unlinked, oversize, budget, inflight.
-    pub refusal_drops: [u64; 5],
+    /// invalid, unlinked, oversize, budget, inflight, raw required, oversized offer.
+    pub refusal_drops: [u64; 7],
+    /// Original bytes removed after pool retirement, including cascaded ancestors.
+    pub codec_retired_bytes: u64,
+    pub codec_put_drop_bytes: [u64; 7],
+    pub codec_pending_bytes: u64,
+    pub codec_oldest_ns: u64,
+    pub codec_pin_ns: u64,
+    pub codec_pin_buckets: [u64; 7],
+    pub codec_mirrored_original_bytes: u64,
+    pub backstop: BackstopStats,
+    pub codec_fallback_events: [u64; 11],
+    pub codec_fallback_bytes: [u64; 11],
+    pub codec_skipped_mirrors: u64,
     pub expired: [u64; 2],
     /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
     pub rows_thinned: [u64; 2],
@@ -315,10 +370,11 @@ pub(crate) fn retry_once(failures: &mut u8) -> Retirement {
 /// `poll` and stops producing events. The worker then stops, so ids and pins
 /// held by transfers it cannot account for are never reused or released.
 pub trait HostStore {
+    fn set_codec_peer(&mut self, _peer: crate::codec_copy::PeerCapability) {}
     /// Deepest record chain extending `resident` and strictly below `before`.
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit>;
     /// Copy a published checkpoint. Only Queued promises an event and retains
-    /// its GPU copy-out pin until Stored or Deferred.
+    /// its GPU copy-out pin until SourceReleased or terminal completion.
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     /// A request reused this GPU checkpoint: refresh any retained host record.
     fn reused(&mut self, _key: PrefixKey) {}

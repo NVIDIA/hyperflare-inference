@@ -409,3 +409,11 @@ requesting an export, and the instance falls back to an equivalent local
 copy or recomputes after draining. An occasional warning during restarts is
 expected; repeated warnings on a quiet pool warrant checking source sessions
 and record retention.
+
+### Upgrading a checkpoint root for codec envelopes
+
+Upgrade readers of a shared root before enabling a packed writer. Current readers accept raw v1–v3 and packed v4 together. Writers require a positive envelope acknowledgement. Rolling a root back to a pre-v4 manager deletes packed `.ckpt` files during the scan and can evict dependent cache entries. This causes cache loss. An upgraded manager retains the shared cache when Flare writers turn compression off. Flare drops unreadable packed files from its own local disk cache on restart. Flare can write packed mirrors for qualified prepared layouts with `--lossless-kv-compression cpu` or `gpu`. Both placements read the same format. An RDMA requester advertises raw-only capability before lookup.
+
+A packed record occupies one power-of-two arena extent. `selene_packed_arena_buddy_slack_bytes` reports the difference between the allocated capacity and stored lengths of resident packed records. Staging must fit the biggest indivisible physical row window. The on-disk file includes the header, directory and actual payload bytes. Write-back and shutdown preserve those bytes verbatim.
+
+For store windows, `selene_store_wire_logical_bytes_total` counts the selected original page and row sizes, and `selene_store_wire_physical_bytes_total` counts the stored payload. Put windows count on validation and Get windows count when ready. Arena and NVMe inventory use `selene_record_logical_bytes` and `selene_record_physical_bytes`. The shutdown log and `selene_shutdown_nvme_write_bytes_total` include writes of ancestors needed by the flush.

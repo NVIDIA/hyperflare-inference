@@ -270,6 +270,7 @@ pub(super) struct Metrics {
     host_retirement: [AtomicU64; 4],
     host_retirement_buckets: [AtomicU64; 8],
     host_retirement_pinned: AtomicU64,
+    host_dram_retirement_wait_ns: AtomicU64,
     host_restores_by_tier: [AtomicU64; 3],
     host_lookup_outcomes: [AtomicU64; 5],
     host_store_reasons: [AtomicU64; 6],
@@ -293,7 +294,18 @@ pub(super) struct Metrics {
     host_deeper_link_pages: [AtomicU64; 2],
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 8],
-    host_refusal_drops: [AtomicU64; 5],
+    host_disk_scan_dropped: AtomicU64,
+    codec_queue: [AtomicU64; 4],
+    codec_mirrored_original_bytes: AtomicU64,
+    codec_retired_bytes: AtomicU64,
+    codec_put_drop_bytes: [AtomicU64; 7],
+    codec_pin_buckets: [AtomicU64; 7],
+    codec_fallback: [AtomicU64; 22],
+    codec_state: std::sync::OnceLock<(crate::offload::KvCompression, Option<&'static str>)>,
+    codec_backstop: [AtomicU64; 9],
+    codec_encoder: [AtomicU64; 4],
+    codec_ready: [AtomicU64; 7],
+    host_refusal_drops: [AtomicU64; 7],
     pub(super) host_reoffer_calls: AtomicU64,
     pub(super) host_reoffer_present: AtomicU64,
     host_parked: AtomicU64,
@@ -547,10 +559,98 @@ impl Metrics {
         }
     }
 
+    pub(super) fn configure_codec(
+        &self,
+        placement: crate::offload::KvCompression,
+        revision: Option<u32>,
+        geometry: &[flare_selene::CacheGeometry],
+        workspace_error: Option<&str>,
+        warn: impl FnOnce(String),
+    ) {
+        use crate::offload::KvCompression;
+        let failure = match (placement, workspace_error, revision) {
+            (KvCompression::Off, _, _) => None,
+            (_, Some(error), _) => Some(("workspace_unavailable", error.to_owned())),
+            (_, None, None) => Some((
+                "layout_missing",
+                "this core has no codec layout; export it with a Flare that writes one".into(),
+            )),
+            (_, None, Some(1)) => flare_selene::codec_copy::checked_profile(geometry)
+                .err()
+                .map(|detail| ("field_unqualified", detail)),
+            (_, None, Some(rev)) => Some((
+                "field_unqualified",
+                format!("unsupported codec layout revision {rev}"),
+            )),
+        };
+        let reason = if placement == KvCompression::Off {
+            Some("off")
+        } else {
+            failure.as_ref().map(|f| f.0)
+        };
+        if self.codec_state.set((placement, reason)).is_ok()
+            && let Some((_, detail)) = failure
+        {
+            warn(format!(
+                "lossless KV compression ({placement}) is inactive: {detail}"
+            ));
+        }
+    }
+
+    fn store_codec(&self, stats: &StoreStats) {
+        self.codec_mirrored_original_bytes
+            .store(stats.codec_mirrored_original_bytes, Ordering::Relaxed);
+        self.codec_retired_bytes
+            .store(stats.codec_retired_bytes, Ordering::Relaxed);
+        for (dst, n) in self
+            .codec_queue
+            .iter()
+            .zip([
+                stats.codec_pending_bytes,
+                stats.codec_oldest_ns,
+                stats.codec_pin_ns,
+                stats.codec_skipped_mirrors,
+            ])
+            .chain(
+                self.codec_fallback.iter().zip(
+                    stats
+                        .codec_fallback_events
+                        .into_iter()
+                        .chain(stats.codec_fallback_bytes),
+                ),
+            )
+            .chain(
+                self.codec_put_drop_bytes
+                    .iter()
+                    .zip(stats.codec_put_drop_bytes),
+            )
+            .chain(self.codec_encoder.iter().zip(stats.backstop.by_encoder))
+            .chain(self.codec_ready.iter().zip(stats.backstop.ready_buckets))
+            .chain(self.codec_backstop.iter().zip([
+                stats.backstop.events,
+                stats.backstop.bytes,
+                stats.backstop.queue_bytes,
+                stats.backstop.oldest_ns,
+                stats.backstop.ready_ns,
+                stats.backstop.abandoned,
+                stats.backstop.heap_intake,
+                stats.backstop.heap_reserved,
+                stats.backstop.peak_bytes,
+            ]))
+            .chain(self.codec_pin_buckets.iter().zip(stats.codec_pin_buckets))
+        {
+            dst.store(n, Ordering::Relaxed);
+        }
+    }
+
     /// Host prefix store counters and gauges, written from the model thread.
     /// Lookups, hits, and reused tokens come from the scheduler, which applies
     /// the fetch policy.
     pub fn store(&self, stats: StoreStats) {
+        if self.codec_state.get().is_some_and(|(placement, _)| *placement != crate::offload::KvCompression::Off) {
+            self.store_codec(&stats);
+        }
+        self.host_disk_scan_dropped.store(stats.disk_scan_dropped, Ordering::Relaxed);
         for (gauge, value) in self
             .host_retirement_buckets
             .iter()
@@ -558,6 +658,8 @@ impl Metrics {
         {
             gauge.store(value, Ordering::Relaxed);
         }
+        self.host_dram_retirement_wait_ns
+            .store(stats.dram_retirement_wait_ns, Ordering::Relaxed);
         self.host_retirement_pinned
             .store(stats.retirement_pinned_bytes, Ordering::Relaxed);
         for (gauge, count) in self
@@ -643,8 +745,188 @@ impl Metrics {
         }
     }
 
+    fn render_codec(&self, text: &mut String) {
+        crate::offload::transfer::codec_metrics(text);
+        for (i, name) in [
+            "encode_pending_bytes",
+            "encode_oldest_nanoseconds",
+            "mirror_pin_nanoseconds_total",
+            "mirror_skipped_total{cause=\"headroom\"}",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_{name} {}",
+                self.codec_queue[i].load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            text,
+            "flare_kv_codec_retired_bytes_total {}",
+            self.codec_retired_bytes.load(Ordering::Relaxed)
+        );
+        for (cause, n) in [
+            "invalid",
+            "unlinked",
+            "oversize",
+            "budget",
+            "inflight",
+            "raw_required",
+            "offer_bound",
+        ]
+        .iter()
+        .zip(&self.codec_put_drop_bytes)
+        {
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_put_dropped_bytes_total{{cause=\"{cause}\"}} {}",
+                n.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            text,
+            "flare_kv_codec_mirrored_original_bytes_total {}",
+            self.codec_mirrored_original_bytes.load(Ordering::Relaxed)
+        );
+        for (i, cause) in [
+            "queue_bytes",
+            "queue_age",
+            "intake_slots",
+            "rank_files",
+            "peer_capability",
+            "offer_bounds",
+            "raw_refill",
+            "backstop_raw",
+            "unqualified_layout",
+            "backstop_budget",
+            "workspace_unavailable",
+        ]
+        .iter()
+        .enumerate()
+        {
+            for (name, idx) in [
+                ("raw_fallback_total", i),
+                (
+                    "raw_fallback_bytes_total",
+                    i + self.codec_fallback.len() / 2,
+                ),
+            ] {
+                let _ = writeln!(
+                    text,
+                    "flare_kv_codec_{name}{{cause=\"{cause}\"}} {}",
+                    self.codec_fallback[idx].load(Ordering::Relaxed)
+                );
+            }
+        }
+        for (encoder, n) in ["gpu", "cpu_backstop", "cpu", "raw"]
+            .into_iter()
+            .zip(&self.codec_encoder)
+        {
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_mirrored_original_bytes_by_encoder_total{{encoder=\"{encoder}\"}} {}",
+                n.load(Ordering::Relaxed)
+            );
+        }
+        for (name, n) in ["events_total", "bytes_total", "queue_bytes"]
+            .into_iter()
+            .zip(&self.codec_backstop)
+        {
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_backstop_{name} {}",
+                n.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            text,
+            "flare_kv_codec_backstop_queue_age_seconds {}",
+            self.codec_backstop[3].load(Ordering::Relaxed) as f64 / 1e9
+        );
+        for (name, kind, i) in [
+            ("abandoned_total", "counter", 5),
+            ("heap_intake_bytes", "gauge", 6),
+            ("heap_reserved_bytes", "gauge", 7),
+            ("peak_bytes", "gauge", 8),
+        ] {
+            let _ = writeln!(text, "# TYPE flare_kv_codec_backstop_{name} {kind}");
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_backstop_{name} {}",
+                self.codec_backstop[i].load(Ordering::Relaxed)
+            );
+        }
+        text.push_str("# TYPE flare_kv_codec_backstop_encode_to_ready_seconds histogram\n");
+        for (le, n) in ["0.05", "0.25", "1", "4", "8", "30", "+Inf"]
+            .into_iter()
+            .zip(&self.codec_ready)
+        {
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_backstop_encode_to_ready_seconds_bucket{{le=\"{le}\"}} {}",
+                n.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            text,
+            "flare_kv_codec_backstop_encode_to_ready_seconds_count {}",
+            self.codec_ready[6].load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            text,
+            "flare_kv_codec_backstop_encode_to_ready_seconds_sum {}",
+            self.codec_backstop[4].load(Ordering::Relaxed) as f64 / 1e9
+        );
+        text.push_str("# TYPE flare_kv_codec_mirror_pin_seconds histogram\n");
+        for (le, count) in ["0.001", "0.01", "0.05", "0.1", "0.5", "1", "+Inf"]
+            .into_iter()
+            .zip(&self.codec_pin_buckets)
+        {
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_mirror_pin_seconds_bucket{{le=\"{le}\"}} {}",
+                count.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            text,
+            "flare_kv_codec_mirror_pin_seconds_count {}",
+            self.codec_pin_buckets[6].load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            text,
+            "flare_kv_codec_mirror_pin_seconds_sum {}",
+            self.codec_queue[2].load(Ordering::Relaxed) as f64 / 1e9
+        );
+    }
+
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
+        use crate::offload::KvCompression;
+        let (requested, reason) = self
+            .codec_state
+            .get()
+            .copied()
+            .unwrap_or((KvCompression::Off, Some("off")));
+        text.push_str("# TYPE flare_kv_codec_active gauge\n");
+        for placement in [KvCompression::Cpu, KvCompression::Gpu, KvCompression::Off] {
+            let active = u8::from(placement == requested && reason.is_none());
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_active{{placement=\"{placement}\"}} {active}"
+            );
+        }
+        if let Some(reason) = reason {
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_inactive_info{{placement=\"{requested}\",reason=\"{reason}\"}} 1"
+            );
+        }
+        if requested != KvCompression::Off {
+            self.render_codec(&mut text);
+        }
         for (tier, count) in ["gpu", "dram", "nvme"]
             .iter()
             .zip(&self.host_restores_by_tier)
@@ -655,6 +937,13 @@ impl Metrics {
                 count.load(Ordering::Relaxed)
             );
         }
+        text.push_str("# HELP flare_host_cache_dram_retirement_wait_seconds Time under DRAM retirement pressure without releasing a retired record.\n");
+        text.push_str("# TYPE flare_host_cache_dram_retirement_wait_seconds gauge\n");
+        let _ = writeln!(
+            text,
+            "flare_host_cache_dram_retirement_wait_seconds {}",
+            self.host_dram_retirement_wait_ns.load(Ordering::Relaxed) as f64 / 1e9
+        );
         let _ = writeln!(text, "# TYPE flare_host_cache_retirement_seconds histogram");
         for (ms, count) in flare_selene::RETIREMENT_LATENCY_MS
             .iter()
@@ -694,11 +983,19 @@ impl Metrics {
         ] {
             let _ = writeln!(text, "flare_host_cache_retirement_{name} {value}");
         }
-        text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end, through oversize or I/O errors, or by a refused pool put.\n# TYPE flare_host_cache_dropped_total counter\n");
+        text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end, after a pool refusal, or because recovery could not read their chain.\n# TYPE flare_host_cache_dropped_total counter\n");
         text.push_str("# TYPE flare_host_cache_pool_refusal_drops_total counter\n");
-        for (reason, count) in ["invalid", "unlinked", "oversize", "budget", "inflight"]
-            .iter()
-            .zip(&self.host_refusal_drops)
+        for (reason, count) in [
+            "invalid",
+            "unlinked",
+            "oversize",
+            "budget",
+            "inflight",
+            "raw_required",
+            "offer_bound",
+        ]
+        .iter()
+        .zip(&self.host_refusal_drops)
         {
             let _ = writeln!(
                 text,
@@ -782,6 +1079,7 @@ impl Metrics {
                 );
             }
         }
+        let _ = writeln!(text, "flare_host_cache_dropped_total{{tier=\"nvme\",reason=\"unreadable_chain\"}} {}", self.host_disk_scan_dropped.load(Ordering::Relaxed));
         for (name, label, names, counters) in [
             ("checkpoint_captures_total", "role", &["anchor", "message", "endpoint"][..], &self.checkpoint_captures[..]),
             ("checkpoint_skips_total", "reason", &["unknown_cost", "work_budget", "storage"][..], &self.checkpoint_skips[..]),
@@ -1374,6 +1672,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_refusal_warns_and_exports_the_requested_placement_as_inactive() {
+        let metrics = Metrics::new(1, 64, 0, 1);
+        let mut warning = String::new();
+        metrics.configure_codec(
+            crate::offload::KvCompression::Gpu,
+            Some(1),
+            &[],
+            Some("rank 1: cudaMalloc failed"),
+            |message| warning = message,
+        );
+        assert!(warning.contains("compression (gpu) is inactive: rank 1: cudaMalloc failed"));
+        let text = metrics.render();
+        assert!(text.contains("flare_kv_codec_active{placement=\"gpu\"} 0\n"));
+        assert!(text.contains(
+            "flare_kv_codec_inactive_info{placement=\"gpu\",reason=\"workspace_unavailable\"} 1\n"
+        ));
+    }
+
+    #[test]
+    fn requested_codec_warns_on_missing_and_invalid_layouts() {
+        use crate::offload::KvCompression;
+        for placement in [KvCompression::Cpu, KvCompression::Gpu] {
+            let mut messages = Vec::new();
+            let g = flare_selene::testing::geometry(64, &[("kv", 4096)], 4096);
+            Metrics::new(1, 64, 0, 1).configure_codec(
+                placement,
+                None,
+                std::slice::from_ref(&g),
+                None,
+                |s| messages.push(s),
+            );
+            assert_eq!(
+                messages,
+                [format!(
+                    "lossless KV compression ({placement}) is inactive: this core has no codec layout; export it with a Flare that writes one"
+                )]
+            );
+            let mut g = g;
+            g.codec_fields.push(flare_selene::geometry::CodecField {
+                buffer: "kv".into(),
+                offset: 0,
+                length: 4096,
+                encoding: 999,
+            });
+            let mut warning = String::new();
+            Metrics::new(1, 64, 0, 1)
+                .configure_codec(placement, Some(1), &[g], None, |s| warning = s);
+            assert!(
+                warning.contains("rank 0: codec field kv at 0 has unsupported encoding 999"),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_activity_gauges_follow_the_effective_profile() {
+        use crate::offload::KvCompression::{Cpu, Gpu, Off};
+        let mut g = flare_selene::testing::geometry(64, &[("kv", 4096)], 4096);
+        for name in ["kv", "state"] {
+            g.codec_fields.push(flare_selene::geometry::CodecField {
+                buffer: name.into(),
+                offset: 0,
+                length: 4096,
+                encoding: 0,
+            });
+        }
+        for (placement, revision, reason) in [
+            (Gpu, None, Some("layout_missing")),
+            (Cpu, Some(2), Some("field_unqualified")),
+            (Off, None, Some("off")),
+            (Cpu, Some(1), None),
+            (Gpu, Some(1), None),
+        ] {
+            let metrics = Metrics::new(1, 64, 0, 1);
+            metrics.configure_codec(placement, revision, std::slice::from_ref(&g), None, |_| {
+                assert!(placement != Off && reason.is_some())
+            });
+            metrics.configure_codec(placement, revision, std::slice::from_ref(&g), None, |_| panic!("duplicate warning"));
+            let text = metrics.render();
+            assert_eq!(text.contains("flare_kv_codec_mirrored_original_bytes_total "), placement != Off);
+            if placement == Off {
+                assert!(text.lines().filter(|line| line.contains("flare_kv_codec_"))
+                    .all(|line| line.contains("flare_kv_codec_active") || line.contains("flare_kv_codec_inactive_info")));
+            }
+            for lane in [Cpu, Gpu, Off] {
+                let active = u8::from(placement == lane && reason.is_none());
+                assert!(text.contains(&format!(
+                    "flare_kv_codec_active{{placement=\"{lane}\"}} {active}\n"
+                )));
+            }
+            if let Some(reason) = reason {
+                assert!(text.contains(&format!("flare_kv_codec_inactive_info{{placement=\"{placement}\",reason=\"{reason}\"}} 1\n")));
+            } else {
+                assert!(!text.contains("flare_kv_codec_inactive_info{"));
+            }
+        }
+    }
+
+    #[test]
     fn checkpoint_metrics_report_capture_roles_rejection_reasons_work_and_reservations() {
         let metrics = Metrics::new(0, 0, 0, 16);
         metrics.scheduler(SchedulerStats {
@@ -1663,6 +2060,7 @@ mod tests {
     #[test]
     fn counters_expose_fixed_names_without_request_payloads() {
         let metrics = Metrics::new(100, 128, 0, 16);
+        metrics.configure_codec(crate::offload::KvCompression::Cpu, None, &[], None, |_| {});
         metrics.scheduler(SchedulerStats {
             cache_lookups: 5,
             cache_hits: 2,
@@ -1691,12 +2089,31 @@ mod tests {
             per_rank_records: [9, 10],
             abandoned_stores: 11,
             held: [3, 4],
+            disk_scan_dropped: 12,
             dropped: [1, 2, 3, 4, 5, 6, 7, 8],
-            refusal_drops: [1, 2, 3, 4, 5],
+            backstop: flare_selene::store::BackstopStats {
+                by_encoder: [10000, 1000, 1000, 345],
+                abandoned: 3,
+                heap_intake: 512,
+                heap_reserved: 2048,
+                peak_bytes: 4096,
+                events: 2,
+                bytes: 1345,
+                queue_bytes: 800,
+                oldest_ns: 500_000_000,
+                ready_ns: 750_000_000,
+                ready_buckets: [0, 0, 1, 1, 1, 1, 1],
+            },
+            codec_fallback_bytes: [0, 0, 0, 0, 0, 0, 0, 345, 123, 456, 0],
+            codec_mirrored_original_bytes: 12345,
+            codec_retired_bytes: 65536,
+            codec_put_drop_bytes: [10, 20, 30, 40, 50, 60, 70],
+            refusal_drops: [1, 2, 3, 4, 5, 6, 7],
             root_records: [[1, 2], [3, 4]],
             deeper_link_records: [5, 6],
             deeper_link_pages: [50, 60],
             root_pages: [[10, 20], [30, 40]],
+            dram_retirement_wait_ns: 1_250_000_000,
             retirement_paths: 2,
             retirement_ns: 1_250_000_000,
             retirement_latency_buckets: [0, 0, 0, 1, 2, 2, 2, 2],
@@ -1704,6 +2121,7 @@ mod tests {
             ..StoreStats::default()
         });
         let text = metrics.render();
+        assert!(text.contains("flare_host_cache_dropped_total{tier=\"nvme\",reason=\"unreadable_chain\"} 12\n"));
         for (name, value) in [
             ("total_kv_pages", 100),
             ("kv_page_tokens", 128),
@@ -1761,6 +2179,8 @@ mod tests {
                 "flare_host_cache_retry_abandoned_total{{reason=\"{reason}\"}} 0\n"
             )));
         }
+        assert!(text.contains("# TYPE flare_host_cache_dram_retirement_wait_seconds gauge\n"));
+        assert!(text.contains("flare_host_cache_dram_retirement_wait_seconds 1.25\n"));
         assert!(text.contains("# TYPE flare_host_cache_retirement_seconds histogram\n"));
         assert!(text.contains("flare_host_cache_retirement_seconds_bucket{le=\"0.5\"} 1\n"));
         assert!(text.contains("flare_host_cache_retirement_seconds_bucket{le=\"+Inf\"} 2\n"));
@@ -1768,11 +2188,65 @@ mod tests {
         assert!(text.contains("flare_host_cache_retirement_seconds_sum 1.25\n"));
         assert!(text.contains("flare_host_cache_retirement_paths_total 2\n"));
         assert!(text.contains("flare_host_cache_retirement_nanoseconds_total 1250000000\n"));
+        for series in [
+            "abandoned_total 3",
+            "heap_intake_bytes 512",
+            "heap_reserved_bytes 2048",
+            "peak_bytes 4096",
+        ] {
+            assert!(text.contains(&format!("flare_kv_codec_backstop_{series}\n")));
+        }
         assert!(!text.contains("flare_host_cache_replay_tokens_total"));
         assert!(text.contains("# TYPE flare_host_cache_parked_records gauge\n"));
         assert!(text.contains("flare_host_cache_parked_records 2\n"));
-        for (i, reason) in ["invalid", "unlinked", "oversize", "budget", "inflight"].iter().enumerate() {
-            assert!(text.contains(&format!("flare_host_cache_pool_refusal_drops_total{{reason=\"{reason}\"}} {}\n", i + 1)));
+        assert!(text.contains(
+            "flare_kv_codec_raw_fallback_bytes_total{cause=\"unqualified_layout\"} 123\n"
+        ));
+        for (encoder, bytes) in [
+            ("gpu", 10000),
+            ("cpu_backstop", 1000),
+            ("cpu", 1000),
+            ("raw", 345),
+        ] {
+            assert!(text.contains(&format!("flare_kv_codec_mirrored_original_bytes_by_encoder_total{{encoder=\"{encoder}\"}} {bytes}\n")));
+        }
+        for series in [
+            "backstop_events_total 2",
+            "backstop_bytes_total 1345",
+            "backstop_queue_bytes 800",
+            "backstop_queue_age_seconds 0.5",
+            "backstop_encode_to_ready_seconds_sum 0.75",
+            "backstop_encode_to_ready_seconds_count 1",
+            "raw_fallback_bytes_total{cause=\"backstop_budget\"} 456",
+            "raw_fallback_bytes_total{cause=\"backstop_raw\"} 345",
+        ] {
+            assert!(
+                text.contains(&format!("flare_kv_codec_{series}\n")),
+                "missing {series}"
+            );
+        }
+        assert!(text.contains("flare_kv_codec_mirrored_original_bytes_total 12345\n"));
+        assert!(text.contains("flare_kv_codec_retired_bytes_total 65536\n"));
+        for (i, reason) in [
+            "invalid",
+            "unlinked",
+            "oversize",
+            "budget",
+            "inflight",
+            "raw_required",
+            "offer_bound",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(text.contains(&format!(
+                "flare_host_cache_pool_refusal_drops_total{{reason=\"{reason}\"}} {}\n",
+                i + 1
+            )));
+            assert!(text.contains(&format!(
+                "flare_kv_codec_put_dropped_bytes_total{{cause=\"{reason}\"}} {}\n",
+                10 * (i + 1)
+            )));
         }
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
             assert!(text.contains(&format!(

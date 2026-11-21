@@ -41,6 +41,7 @@ fn identity() -> Identity {
 
 #[derive(Default)]
 struct LocalState {
+    packed: bool,
     hit: Option<HostHit>,
     fetches: Vec<(HostHit, InboundTicket)>,
     events: Vec<StoreEvent>,
@@ -116,7 +117,7 @@ impl crate::store::TierStore for FakeLocal {
         state.pinned.push((tier, key));
         match state.refuse_pin {
             Some(reason) => Err(reason),
-            None => Ok(Box::new(NoPin(key))),
+            None => Ok(Box::new(NoPin(key, state.packed))),
         }
     }
     fn set_spill(&mut self, enabled: bool) {
@@ -139,8 +140,11 @@ impl crate::store::TierStore for FakeLocal {
     }
 }
 
-struct NoPin(PrefixKey);
+struct NoPin(PrefixKey, bool);
 impl HostPin for NoPin {
+    fn is_packed(&self, _: usize) -> bool {
+        self.1
+    }
     fn chain(&self) -> &crate::pool::HostChain {
         // The chain a put asks the pin for: a single record of 10 pages.
         static CHAIN: std::sync::OnceLock<crate::pool::HostChain> = std::sync::OnceLock::new();
@@ -1211,6 +1215,8 @@ fn refusal_discards_count_the_source_tier() {
             PutRefusal::Oversize,
             PutRefusal::Budget,
             PutRefusal::Inflight,
+            PutRefusal::RawRequired,
+            PutRefusal::OfferBound,
         ]
         .into_iter()
         .enumerate()
@@ -1221,6 +1227,8 @@ fn refusal_discards_count_the_source_tier() {
             rig.ready(true);
             let mut record = rig.retiring(4);
             record.tier = tier;
+            let packed = tier == Tier::Nvme;
+            rig.local.0.lock().unwrap().packed = packed;
             rig.offer(std::slice::from_ref(&record));
             rig.poll();
             assert!(rig.store.stats().dropped.iter().all(|count| *count == 0));
@@ -1235,6 +1243,12 @@ fn refusal_discards_count_the_source_tier() {
             }
             assert_eq!(rig.retired(), [(record.key, Retirement::Dropped)]);
             let stats = rig.store.stats();
+            let logical = record.tail_pages as u64 * layout().page_record_bytes
+                + u64::from(record.row) * layout().row_record_bytes;
+            assert_eq!(
+                stats.codec_put_drop_bytes[reason],
+                if packed || reason >= 5 { logical } else { 0 }
+            );
             assert_eq!(stats.refusal_drops[reason], 1);
             assert_eq!(stats.dropped[6 + index], 1, "{tier:?} {refusal:?}");
             assert_eq!(stats.dropped.iter().sum::<u64>(), 1);
@@ -1532,3 +1546,5 @@ fn a_full_copy_queue_tells_the_worker_to_retry_and_the_tiers_answers_pass_throug
         assert_eq!(rig.store.store(&checkpoint).unwrap(), inner);
     }
 }
+
+mod dram_retirement;

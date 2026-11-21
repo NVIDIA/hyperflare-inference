@@ -77,6 +77,45 @@ impl TierView {
     /// Announce a node that became ready, or whose row was dropped, with the
     /// parent the manager should chain it under.
     pub fn announce(&mut self, notice: &NodeNotice, parent: Option<PrefixKey>) {
+        self.publish(notice, parent, Vec::new(), None);
+    }
+
+    pub(crate) fn announce_packed(
+        &mut self,
+        notice: &NodeNotice,
+        parent: Option<PrefixKey>,
+        offer: &crate::shared::wire::PackedOffer,
+    ) {
+        let mut profiles: Vec<_> = offer
+            .units
+            .iter()
+            .filter(|u| u.representation == 1)
+            .map(|u| u.profile.clone())
+            .collect();
+        profiles.sort_unstable();
+        profiles.dedup();
+        self.publish(
+            notice,
+            parent,
+            profiles,
+            Some(
+                offer
+                    .units
+                    .iter()
+                    .filter(|u| notice.row || u.kind == 0)
+                    .map(|u| u.stored_length)
+                    .sum(),
+            ),
+        );
+    }
+
+    fn publish(
+        &mut self,
+        notice: &NodeNotice,
+        parent: Option<PrefixKey>,
+        required_profiles: Vec<Vec<u8>>,
+        physical: Option<u64>,
+    ) {
         match notice.event {
             NodeEvent::Ready => {
                 self.announced.insert(notice.key);
@@ -85,14 +124,18 @@ impl TierView {
             _ => return,
         }
         self.announcer.saved(IndexEntry {
+            packed: physical.is_some(),
+            required_profiles,
             key: notice.key,
             parent,
             bucket: notice.bucket,
             tail_pages: notice.tail_pages as u32,
             row: notice.row,
             tier: self.tier,
-            bytes: notice.tail_pages as u64 * self.page_record_bytes
-                + if notice.row { self.row_record_bytes } else { 0 },
+            bytes: physical.unwrap_or(
+                notice.tail_pages as u64 * self.page_record_bytes
+                    + if notice.row { self.row_record_bytes } else { 0 },
+            ),
         });
     }
 

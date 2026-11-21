@@ -680,6 +680,18 @@ impl ModelRuntime {
                     .as_ref()
                     .and_then(|binding| binding.take())
                     .map(|prepared| {
+                        worker_metrics.configure_codec(
+                            prepared.compression,
+                            worker_config
+                                .contract
+                                .cache
+                                .codec_layout
+                                .as_ref()
+                                .map(|l| l.revision),
+                            &prepared.geometry,
+                            prepared.codec_workspace_error.as_deref(),
+                            |warning| eprintln!("warning: {warning}"),
+                        );
                         if let Some(warning) =
                             prepared.intake_warning(worker_config.limits.max_active)
                         {
@@ -1238,7 +1250,16 @@ impl<'a> Worker<'a> {
             return;
         }
         shutdown.drained = false;
-        match store.close() {
+        let closed = store.close();
+        let stats = store.stats();
+        self.metrics.store(stats);
+        if stats.backstop.abandoned != 0 {
+            eprintln!(
+                "host cache shutdown abandoned {} unpublished CPU-backstopped captures",
+                stats.backstop.abandoned
+            );
+        }
+        match closed {
             Ok(()) => {
                 shutdown.drained = true;
                 drop(std::mem::ManuallyDrop::into_inner(store));
@@ -2333,8 +2354,15 @@ impl<'a> Worker<'a> {
         let mut released = false;
         for event in events {
             match event {
+                StoreEvent::SourceReleased { checkpoint } => {
+                    self.scheduler.unpin_checkpoint(checkpoint)?;
+                    released = true;
+                }
                 StoreEvent::Stored {
-                    checkpoint, result, ..
+                    checkpoint,
+                    result,
+                    source_released,
+                    ..
                 } => {
                     if let Err(error) = &result {
                         eprintln!(
@@ -2344,12 +2372,20 @@ impl<'a> Worker<'a> {
                     }
                     self.metrics.host_retry_abandoned[5]
                         .fetch_add(u64::from(result.is_err()), Ordering::Relaxed);
-                    self.scheduler.unpin_checkpoint(checkpoint)?;
-                    released = true;
+                    if !source_released {
+                        self.scheduler.unpin_checkpoint(checkpoint)?;
+                        released = true;
+                    }
                 }
-                StoreEvent::Deferred { checkpoint, reason } => {
-                    self.scheduler.unpin_checkpoint(checkpoint)?;
-                    released = true;
+                StoreEvent::Deferred {
+                    checkpoint,
+                    reason,
+                    source_released,
+                } => {
+                    if !source_released {
+                        self.scheduler.unpin_checkpoint(checkpoint)?;
+                        released = true;
+                    }
                     if !self.deferred_stores.iter().any(|(id, _)| *id == checkpoint) {
                         self.deferred_stores.push((checkpoint, reason));
                     }

@@ -241,6 +241,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if membership.is_some() {
         cluster::require_transport()?;
     }
+    if args.rank.unwrap_or(0) == 0 && let Some(message) = args.serving.codec_duty_warning() {
+        eprintln!("warning: {message}");
+    }
     let options = args.load_options();
     let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
     let routing = cluster::Routing {

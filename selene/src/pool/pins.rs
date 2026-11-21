@@ -72,23 +72,26 @@ pub(crate) fn host_chain_kept(
     (chain, kept)
 }
 
-fn check_window(
-    chain: &HostChain,
-    window: &HostWindow,
-    dst: &[u8],
-    page: u64,
-    row: u64,
-) -> Result<()> {
+fn check_range(chain: &HostChain, window: &HostWindow) -> Result<()> {
     let record = chain
         .records
         .get(window.record as usize)
         .ok_or_else(|| Error::new("window names no record"))?;
-    let end = record.first_page + record.pages;
+    let end = u64::from(record.first_page) + u64::from(record.pages);
     if window.first_page < record.first_page
-        || window.first_page + window.page_count > end
+        || u64::from(window.first_page) + u64::from(window.page_count) > end
         || (window.row && !record.row)
-        || dst.len() as u64
-            != u64::from(window.page_count) * page + if window.row { row } else { 0 }
+    {
+        return Err(Error::new("window does not fit the pinned record"));
+    }
+    Ok(())
+}
+
+fn check_raw_length(window: &HostWindow, dst: &[u8], page: u64, row: u64) -> Result<()> {
+    if u64::from(window.page_count)
+        .checked_mul(page)
+        .and_then(|n| n.checked_add(if window.row { row } else { 0 }))
+        != Some(dst.len() as u64)
     {
         return Err(Error::new("window does not fit the pinned record"));
     }
@@ -97,6 +100,7 @@ fn check_window(
 
 /// One pinned record in memory.
 pub(crate) struct MemorySpan {
+    pub packed: Option<crate::memory_packed::Retained>,
     /// Addresses of every tail page of the record.
     pub pages: Vec<usize>,
     pub row: Option<Vec<usize>>,
@@ -114,13 +118,41 @@ pub struct MemoryPin {
 }
 
 impl HostPin for MemoryPin {
+    fn is_packed(&self, i: usize) -> bool {
+        self.spans.get(i).is_some_and(|s| s.packed.is_some())
+    }
+    fn packed(&self, record: usize) -> Option<crate::shared::wire::PackedOffer> {
+        Some(self.spans.get(record)?.packed.as_ref()?.offer.clone())
+    }
     fn chain(&self) -> &HostChain {
         &self.chain
     }
 
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
-        check_window(
-            &self.chain,
+        check_range(&self.chain, window)?;
+        if let Some(span) = self.spans.get(window.record as usize)
+            && let Some(held) = &span.packed
+        {
+            let packets = held.read(
+                &span.pages,
+                span.row.as_deref().unwrap_or_default(),
+                self.layout.page_record_bytes as usize,
+                window.first_page as usize,
+                window.page_count as usize,
+                window.row,
+            )?;
+            let length = packets.iter().map(|p| p.data.len()).sum::<usize>();
+            if length != dst.len() {
+                return Err(Error::new("invalid packed export length"));
+            }
+            let mut offset = 0;
+            for p in packets {
+                p.data.copy_to(0, &mut dst[offset..offset + p.data.len()]);
+                offset += p.data.len();
+            }
+            return Ok(Checksums::default());
+        }
+        check_raw_length(
             window,
             dst,
             self.layout.page_record_bytes,
@@ -210,12 +242,48 @@ pub struct FilePin {
 }
 
 impl HostPin for FilePin {
+    fn is_packed(&self, i: usize) -> bool {
+        self.spans.get(i).is_some_and(|s| s.header.packed.is_some())
+    }
+    fn packed(&self, record: usize) -> Option<crate::shared::wire::PackedOffer> {
+        Some(
+            self.spans
+                .get(record)?
+                .header
+                .packed
+                .as_ref()?
+                .offer()
+                .clone(),
+        )
+    }
     fn chain(&self) -> &HostChain {
         &self.chain
     }
 
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
-        check_window(&self.chain, window, dst, self.page_bytes, self.row_bytes)?;
+        check_range(&self.chain, window)?;
+        if let Some(span) = self.spans.get(window.record as usize)
+            && let Some(layout) = &span.header.packed
+        {
+            let first = window.first_page as usize;
+            let units = layout
+                .units(first, window.page_count as usize, window.row)
+                .ok_or_else(|| Error::new("packed export outside file"))?;
+            if units.iter().map(|u| u.stored_length).sum::<u64>() != dst.len() as u64 {
+                return Err(Error::new("invalid packed file grant length"));
+            }
+            let at = if window.page_count == 0 {
+                span.header.row_segment
+            } else {
+                span.header.page_segment + layout.page_offset(first)
+            };
+            File::open(&span.path)
+                .and_then(|f| f.read_exact_at(dst, at))
+                .map_err(|e| Error::caused_by("read packed file grant", e))?;
+            crate::shared::packed::verify_units(units, dst)?;
+            return Ok(Checksums::default());
+        }
+        check_raw_length(window, dst, self.page_bytes, self.row_bytes)?;
         let (record_first, record_pages) = {
             let record = &self.chain.records[window.record as usize];
             (record.first_page, record.pages)
@@ -390,6 +458,7 @@ mod tests {
         let mut pin = MemoryPin {
             chain: host_chain(16, 16, true, &nodes),
             spans: vec![MemorySpan {
+                packed: None,
                 pages: vec![base, base + page, base + 2 * page],
                 row: Some(vec![base + 3 * page]),
                 sums,

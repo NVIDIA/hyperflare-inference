@@ -159,6 +159,9 @@ pub fn geometry(page_tokens: u64, planes: &[(&str, u64)], row_bytes: u64) -> Cac
         })
         .collect();
     CacheGeometry {
+        placement: Default::default(),
+        gpu_mirror_duty: None,
+        codec_fields: Vec::new(),
         snapshot_pages: Vec::new(),
         page_tokens,
         page_capacity: 4096,

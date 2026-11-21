@@ -40,6 +40,15 @@ impl Plane {
     }
 }
 
+/// Prepared transform for a byte interval within a named physical allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodecField {
+    pub buffer: String,
+    pub offset: u64,
+    pub length: u64,
+    pub encoding: u32,
+}
+
 /// One rank's checkpoint storage: the row plane and the page planes in name order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheGeometry {
@@ -51,9 +60,92 @@ pub struct CacheGeometry {
     /// KV ids sharing physical bytes with each snapshot row, excluding execution rows.
     /// Ownership of a snapshot excludes every page in its range through GPU retirement.
     pub snapshot_pages: Vec<std::ops::Range<u32>>,
+    pub codec_fields: Vec<CodecField>,
+    pub placement: crate::offload::KvCompression,
+    pub gpu_mirror_duty: Option<u8>,
 }
 
 impl CacheGeometry {
+    pub fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.checked_codec_profile().ok()
+    }
+
+    pub fn checked_codec_profile(&self) -> std::result::Result<[u8; 32], String> {
+        if self.codec_fields.is_empty() {
+            return Err("codec layout has no fields".into());
+        }
+        let padded = |n: u64| {
+            n.checked_add(BLOCK_BYTES - 1)
+                .map(|v| v & !(BLOCK_BYTES - 1))
+        };
+        let pages = self
+            .planes
+            .iter()
+            .try_fold(0u64, |n, p| n.checked_add(padded(p.unit_bytes)?));
+        if !pages.is_some_and(|n| n <= 256 << 20)
+            || !padded(self.row.unit_bytes).is_some_and(|n| n <= 256 << 20)
+        {
+            return Err("page or row share exceeds the 256 MiB codec limit".into());
+        }
+        let mut hash = Blake2b::<blake2::digest::consts::U32>::new();
+        hash.update(b"SGC1/v1/64-pivots");
+        hash.update(self.page_tokens.to_le_bytes());
+        for plane in self.planes.iter().chain([&self.row]) {
+            let mut end = 0;
+            let mut count = 0;
+            for f in self.codec_fields.iter().filter(|f| f.buffer == plane.name) {
+                let next = f
+                    .offset
+                    .checked_add(f.length)
+                    .ok_or_else(|| format!("codec field {} at {} overflows", f.buffer, f.offset))?;
+                let block = match f.encoding {
+                    0 => 1,
+                    1 => 65536,
+                    2 => 2,
+                    20 => 20,
+                    32 => 32,
+                    40 => 135168,
+                    41 => 8448,
+                    42 => 32768,
+                    45 => 33792,
+                    47 => 18432,
+                    _ => {
+                        return Err(format!(
+                            "codec field {} at {} has unsupported encoding {}",
+                            f.buffer, f.offset, f.encoding
+                        ));
+                    }
+                };
+                if f.length == 0
+                    || f.offset < end
+                    || next > plane.unit_bytes
+                    || f.length % block != 0
+                    || (f.encoding == 1 && f.offset % 4 != 0)
+                {
+                    return Err(format!(
+                        "codec field {} at {} with length {} is invalid for encoding {} and a {}-byte plane",
+                        f.buffer, f.offset, f.length, f.encoding, plane.unit_bytes
+                    ));
+                }
+                hash.update((f.buffer.len() as u64).to_le_bytes());
+                hash.update(f.buffer.as_bytes());
+                hash.update(f.offset.to_le_bytes());
+                hash.update(f.length.to_le_bytes());
+                hash.update(f.encoding.to_le_bytes());
+                end = next;
+                count += 1;
+            }
+            if count == 0 {
+                return Err(format!(
+                    "codec layout has no field for plane {}",
+                    plane.name
+                ));
+            }
+            hash.update(plane.unit_bytes.to_le_bytes());
+        }
+        Ok(hash.finalize().into())
+    }
+
     /// Bytes a page occupies on the GPU across every plane.
     pub fn page_bytes(&self) -> u64 {
         self.planes.iter().map(|plane| plane.unit_bytes).sum()

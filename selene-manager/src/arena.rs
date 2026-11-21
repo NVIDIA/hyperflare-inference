@@ -120,12 +120,14 @@ impl Arena {
             split /= 2;
             free.entry(split).or_default().insert(offset + split);
         }
-        Some(Extent {
+        let mut extent = Extent {
             mapping: self.0.clone(),
             offset,
             capacity,
             length,
-        })
+        };
+        extent.zero_padding();
+        Some(extent)
     }
 
     /// Takes everything that is free, so nothing can be allocated until the extents drop.
@@ -215,6 +217,28 @@ impl Extent {
     pub fn offset(&self) -> usize {
         self.offset
     }
+    fn zero_padding(&mut self) {
+        let end = self.length.next_multiple_of(4096);
+        // This allocation owns the entire buddy through its last disk block.
+        unsafe {
+            self.mapping
+                .pointer
+                .as_ptr()
+                .add(self.offset + self.length)
+                .write_bytes(0, end - self.length)
+        };
+    }
+
+    pub(crate) fn disk_blocks(&self) -> &[u8] {
+        // Allocation and truncation zero the padding before anyone can share the extent.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mapping.pointer.as_ptr().add(self.offset),
+                self.length.next_multiple_of(4096),
+            )
+        }
+    }
+
     pub fn truncate(&mut self, length: usize) {
         assert!(length <= self.length);
         let needed = length.max(4096).next_power_of_two();
@@ -225,7 +249,9 @@ impl Extent {
                 .or_default()
                 .insert(self.offset + self.capacity);
         }
+        drop(free);
         self.length = length;
+        self.zero_padding();
     }
 
     fn free(&self) {

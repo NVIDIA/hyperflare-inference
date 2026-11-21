@@ -110,7 +110,12 @@ pub fn entry_from(entry: &v2::IndexEntry) -> Checked<Entry> {
     if key.consumed_tokens == 0 {
         return Err(Violation::new("zero consumed_tokens"));
     }
+    if entry.required_profiles.len() > 64 || entry.required_profiles.iter().any(|p| p.len() != 32) {
+        return Err(Violation::new("invalid profile list"));
+    }
     Ok(Entry {
+        packed: entry.packed,
+        required_profiles: entry.required_profiles.clone(),
         key,
         parent,
         bucket,
@@ -123,6 +128,8 @@ pub fn entry_from(entry: &v2::IndexEntry) -> Checked<Entry> {
 
 pub fn entry_to(entry: &Entry) -> v2::IndexEntry {
     v2::IndexEntry {
+        packed: entry.packed,
+        required_profiles: entry.required_profiles.clone(),
         key: Some(key_to(entry.key)),
         has_parent: entry.parent.is_some(),
         parent: entry.parent.map(key_to),

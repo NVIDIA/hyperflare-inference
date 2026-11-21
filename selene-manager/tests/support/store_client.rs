@@ -354,6 +354,7 @@ impl Client {
         let page_tokens = self.descriptor.page_tokens;
         let chain_pages = key.consumed_tokens / page_tokens;
         v2::PutBegin {
+            packed: None,
             ancestor_keys: Vec::new(),
             put_id: id,
             key: Some(key_to(key)),

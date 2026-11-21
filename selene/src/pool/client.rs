@@ -219,6 +219,10 @@ impl PoolClient {
         &self.registered
     }
 
+    pub(crate) fn codec_acceptance(&self) -> crate::codec_copy::PeerCapability {
+        self.shared.codec_peer.clone()
+    }
+
     pub fn status(&self) -> PoolStatus {
         self.shared.status()
     }

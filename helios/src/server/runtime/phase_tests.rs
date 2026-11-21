@@ -3022,7 +3022,9 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
     let mut worker = fixture.worker(receiver);
     let checkpoint = unpinned_checkpoint(&mut worker, 0, 70);
     let key = worker.scheduler.publication(checkpoint).unwrap().key;
-    let mut store = FakeStore::new(None);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&[0; 70], &[]).unwrap();
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
     store.pooled = true;
     store.pending_tickets = true;
     worker.attach_store(Some(Box::new(store)));
@@ -3035,6 +3037,8 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
     assert!(worker.active[0].is_some());
     assert!(fake_store(&mut worker).tickets_seen.is_empty());
     assert_eq!(fake_store(&mut worker).reused, [key]);
+    // Both host decoders are downstream of fetch.
+    assert!(fake_store(&mut worker).fetched.is_empty());
 }
 
 #[test]
@@ -5690,6 +5694,15 @@ fn zero_output_budget_requires_prompt_scoring_at_both_admission_checks() {
 
 #[test]
 fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
+    copyout_unblocks_admission(false);
+}
+
+#[test]
+fn source_release_admits_a_waiter_before_host_publication() {
+    copyout_unblocks_admission(true);
+}
+
+fn copyout_unblocks_admission(early: bool) {
     let mut fixture = Fixture::new();
     fixture.config.limits.pages = 2;
     let (sender, receiver) = mpsc::channel();
@@ -5722,19 +5735,31 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     assert_eq!(worker.pending.len(), 1);
     assert!(worker.pending[0].blocked.is_some());
     let fence = worker.scheduler.completed();
-    fake_store(&mut worker)
-        .events
-        .push_back(flare_selene::StoreEvent::Stored {
+    let stored = flare_selene::StoreEvent::Stored {
+        checkpoint: publication.id,
+        key: publication.key,
+        result: Ok(4096),
+        source_released: early,
+    };
+    let mut publication_event = Some(stored);
+    let event = if early {
+        flare_selene::StoreEvent::SourceReleased {
             checkpoint: publication.id,
-            key: publication.key,
-            result: Ok(4096),
-        });
+        }
+    } else {
+        publication_event.take().unwrap()
+    };
+    fake_store(&mut worker).events.push_back(event);
     worker.service_store().unwrap();
     assert_eq!(worker.scheduler.completed(), fence);
     assert!(worker.pending[0].blocked.is_none());
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     assert!(worker.pending.is_empty());
     assert_eq!(worker.scheduler.stats().active_requests, 1);
+    if let Some(event) = publication_event {
+        fake_store(&mut worker).events.push_back(event);
+        worker.service_store().unwrap(); // The old checkpoint may already have been evicted.
+    }
 }
 
 #[test]
@@ -5815,6 +5840,7 @@ fn complete_store(worker: &mut Worker<'_>, id: crate::cache::CheckpointId, succe
     fake_store(worker)
         .events
         .push_back(flare_selene::StoreEvent::Stored {
+            source_released: false,
             checkpoint: id,
             key,
             result: if success {
@@ -6104,6 +6130,7 @@ fn publication_retries_wait_for_progress_and_abandon_evicted_ids() {
         fake_store(&mut worker)
             .events
             .push_back(flare_selene::StoreEvent::Deferred {
+                source_released: false,
                 checkpoint: id,
                 reason: reason,
             });

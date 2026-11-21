@@ -267,6 +267,8 @@ fn source(args: &Args) {
     let key = history.key_at(PAGES as u64 * PT).unwrap();
     let (page, row) = whole(args.world);
     client.saved(IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key,
         parent: None,
         bucket: history.bucket_at(key.consumed_tokens).unwrap(),

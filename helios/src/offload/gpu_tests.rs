@@ -308,6 +308,7 @@ mod memory {
         assert_eq!(store.stats().outbound_in_flight, 1);
         match super::wait_event(&mut store, 60) {
             StoreEvent::Stored {
+                source_released: false,
                 checkpoint: id,
                 key,
                 result,
@@ -1067,6 +1068,7 @@ mod composite {
             assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Queued);
             match super::wait_event(store, 120) {
                 StoreEvent::Stored {
+                    source_released: false,
                     checkpoint: id,
                     key,
                     result,
@@ -1583,6 +1585,7 @@ mod disk_store {
         assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().outbound_in_flight, 1);
         let StoreEvent::Stored {
+            source_released: false,
             checkpoint: stored,
             key,
             result,

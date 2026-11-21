@@ -36,6 +36,47 @@ struct PinBytes {
 }
 
 impl PutBytes for PinBytes {
+    fn raw_available(&self, first: u64) -> bool {
+        let mut end = 0u64;
+        self.pin.chain().records.iter().enumerate().all(|(i, r)| {
+            end += u64::from(r.pages);
+            (end <= first && i + 1 != self.pin.chain().records.len()) || !self.pin.is_packed(i)
+        })
+    }
+    fn packed(&self) -> Option<crate::shared::wire::PackedOffer> {
+        let end = self.pin.chain().records.len().checked_sub(1)?;
+        let mut offer = self.pin.packed(end)?;
+        if !self.pin.chain().row {
+            offer.units.retain(|u| u.kind == 0);
+        }
+        Some(offer)
+    }
+    fn fill_packed(
+        &mut self,
+        first: u64,
+        pages: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<Checksums> {
+        let n = self.pin.chain().records.len() - 1;
+        let offer = self
+            .pin
+            .packed(n)
+            .ok_or_else(|| Error::new("packed source expired"))?;
+        let first_page = first
+            .checked_sub(offer.first_page)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| Error::new("requested pages precede the packed suffix"))?;
+        self.pin.read(
+            &HostWindow {
+                record: n as u32,
+                first_page,
+                page_count: pages,
+                row,
+            },
+            dst,
+        )
+    }
     fn fill(
         &mut self,
         first_page: u64,
@@ -100,6 +141,7 @@ struct Move {
     depth: u64,
     /// Shapes offered on this pass, checked before releasing a locally promoted row.
     offered: Vec<Retiring>,
+    packed: bool,
     started: Instant,
     /// A predecessor's put has its own candidates; the leaf uses `record.ancestor_keys`.
     predecessor_candidates: Option<Vec<crate::PrefixKey>>,
@@ -122,7 +164,8 @@ pub(crate) struct Cascade {
     pub(crate) now: Option<Instant>,
     /// Refusal discards by DRAM/NVMe source tier.
     pub(crate) dropped: [u64; 2],
-    pub(crate) refusal_drops: [u64; 5],
+    pub(crate) codec_put_drop_bytes: [u64; 7],
+    pub(crate) refusal_drops: [u64; 7],
     page_bytes: usize,
     row_bytes: usize,
     pub(crate) paths: u64,
@@ -157,7 +200,8 @@ impl Cascade {
             #[cfg(test)]
             now: None,
             dropped: [0; 2],
-            refusal_drops: [0; 5],
+            refusal_drops: [0; 7],
+            codec_put_drop_bytes: [0; 7],
             page_bytes: layout.page_record_bytes as usize,
             row_bytes: layout.row_record_bytes as usize,
         }
@@ -223,6 +267,7 @@ impl Cascade {
                     depth: 1 + path.len() as u64,
                     started: self.now(),
                     offered: Vec::new(),
+                    packed: false,
                     path,
                     record,
                     failures: 0,
@@ -267,6 +312,12 @@ impl Cascade {
         };
         entry.predecessor_candidates = (key != entry.record.key)
             .then(|| std::mem::take(&mut record.ancestor_keys));
+        entry.packed = pin
+            .chain()
+            .records
+            .len()
+            .checked_sub(1)
+            .is_some_and(|i| pin.is_packed(i));
         let request = PutRequest {
             key: record.key,
             parent: record.parent,
@@ -335,6 +386,8 @@ impl Cascade {
             }
         }
         let record = &entry.record;
+        let bytes =
+            (record.tail_pages * self.page_bytes + usize::from(record.row) * self.row_bytes) as u64;
         match outcome {
             PutOutcome::Stored { .. } | PutOutcome::Present => {
                 if entry.path.pop_front().is_some() {
@@ -377,6 +430,14 @@ impl Cascade {
                     inner.retired(record.key, record.tier, how);
                 }
             }
+            PutOutcome::Refused(reason @ (PutRefusal::RawRequired | PutRefusal::OfferBound)) => {
+                // Only the mirror and restore transform bytes. Retirement cannot recreate raw pages.
+                let index = usize::from(*reason == PutRefusal::OfferBound);
+                self.refusal_drops[5 + index] += 1;
+                self.codec_put_drop_bytes[5 + index] += bytes;
+                self.dropped[usize::from(record.tier == Tier::Nvme)] += 1;
+                inner.retired(record.key, record.tier, Retirement::Dropped);
+            }
             PutOutcome::Refused(
                 reason @ (PutRefusal::Invalid
                 | PutRefusal::Unlinked
@@ -408,6 +469,9 @@ impl Cascade {
                     self.refusal_drops[index] += 1;
                 }
                 if entry.path.is_empty() {
+                    if entry.packed {
+                        self.codec_put_drop_bytes[index] += bytes;
+                    }
                     self.dropped[usize::from(record.tier == Tier::Nvme)] += 1;
                     inner.retired(record.key, record.tier, Retirement::Dropped);
                 } else {
@@ -461,6 +525,7 @@ mod tests {
             chain: host_chain(16, 0, true, &nodes),
             spans: vec![
                 MemorySpan {
+                    packed: None,
                     pages: vec![a, a + PAGE, a + 2 * PAGE],
                     row: Some(vec![a + 3 * PAGE]),
                     sums: Arc::new(RecordSums {
@@ -469,6 +534,7 @@ mod tests {
                     }),
                 },
                 MemorySpan {
+                    packed: None,
                     pages: vec![b, b + PAGE],
                     row: Some(vec![b + 2 * PAGE]),
                     sums: Arc::new(RecordSums {

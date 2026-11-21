@@ -19,6 +19,33 @@ FRONTEND = c.frontend(tools=p.GLM_ARGUMENT_TAGS, assistant_marker="<|assistant|>
         required_start="[gMASK]<sop><|system|>", required_end="<|user|>"))
 
 
+def history_regions(buffers, pool, page_tokens):
+    from .mla import MLAState
+    regions = []
+    for layer, value in enumerate((*pool.decoder.layers, *((pool.draft,) if pool.draft is not None else ()))):
+        if isinstance(value, MLAState):
+            regions.append(c.history_region(buffers, f"cache.{layer}.latent", value.cache.view(-1, 4, 64, 528),
+                p.PAGED_LATENT, tokens_per_record=page_tokens // 256))
+            regions.append(c.history_region(buffers, f"cache.{layer}.index", value.index.cache,
+                p.PAGED_LATENT, tokens_per_record=page_tokens // 64))
+    return regions
+
+
+def checkpoint_encoding(name, dtype, shape):
+    if name.endswith(".recurrent") and str(dtype) == "torch.float32" and tuple(shape[-2:]) == (128, 128):
+        return 1
+    if str(dtype) == "torch.bfloat16":
+        if name.endswith("convolution") and shape[-1] in (10, 16):
+            return 2 * shape[-1]
+        return 2
+    if str(dtype) == "torch.uint8":
+        if name.endswith((".latent", ".latent_page")) and tuple(shape[-2:]) == (64, 528):
+            return 40
+        if name.endswith((".index", ".index_page")) and tuple(shape[-2:]) == (64, 132):
+            return 41
+    return 0
+
+
 def prepare(signatures, buffers, pool, *, page_tokens, draft_lag, rows=1, embedding_tables=(), regions=(),
             image_slots=4):
     inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()} if kind != "vision"}
@@ -40,5 +67,6 @@ def prepare(signatures, buffers, pool, *, page_tokens, draft_lag, rows=1, embedd
     return c.model_contract(vocabulary=VOCABULARY, input_vocabulary=INPUT_VOCABULARY,
         page_tokens=page_tokens, page_tables=[dict(buffer="page_tables", page_offset=0),
             *([dict(buffer="draft_page_tables", page_offset=1)] if "draft_page_tables" in buffers else [])],
+        codec_layout=c.codec_layout(pool, regions, buffers, field_encoding=checkpoint_encoding),
         regions=[dict(kind=p.CONTINUATION_STATE, storage=continuation, tokens_per_record=1, window_tokens=0), *regions],
         graphs=graphs, vision=vision, frontend=frontend)

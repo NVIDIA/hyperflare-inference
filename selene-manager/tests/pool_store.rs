@@ -212,6 +212,7 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
     }
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            packed: None,
             ancestor_keys: Vec::new(),
             put_id: 6,
             key: Some(pool::pkey(4096)),
@@ -230,6 +231,7 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
         .await;
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            packed: None,
             ancestor_keys: Vec::new(),
             put_id: 7,
             key: Some(pool::pkey(5120)),
@@ -358,7 +360,7 @@ async fn read_claim(
     let mut pages = 0;
     while pages < granted.total_pages || windows.is_empty() {
         let ready = reader.window_ready(id).await;
-        let window = ready.window.unwrap();
+        let window = ready.window.clone().unwrap();
         let bytes = reader.shm.as_ref().unwrap().read(&window);
         pages += u64::from(window.page_count);
         reader.released(id, window.index).await;
@@ -589,6 +591,7 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
     let mut writer = open(&mut pool, "writer").await;
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            packed: None,
             ancestor_keys: Vec::new(),
             put_id: 1,
             key: Some(pool::pkey(1024)),
@@ -613,7 +616,7 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
         .await;
     let grant = writer
         .take(|m| match m {
-            v2::server_message::M::PutGrant(grant) if grant.put_id == 1 => Some(*grant),
+            v2::server_message::M::PutGrant(grant) if grant.put_id == 1 => Some(grant.clone()),
             _ => None,
         })
         .await;
@@ -746,7 +749,7 @@ async fn put_grants_are_record_relative_when_the_published_parent_is_stored() {
     assert_eq!(accept.first_page, 16);
     let window = writer
         .take_within(Duration::from_secs(5), &mut |message| match message {
-            M::PutGrant(grant) if grant.put_id == 2 => grant.window,
+            M::PutGrant(grant) if grant.put_id == 2 => grant.window.clone(),
             _ => None,
         })
         .await

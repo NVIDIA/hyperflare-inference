@@ -142,6 +142,25 @@ struct PlannedGrant {
 }
 
 impl PlannedGrant {
+    fn count_payload(self, header: &Header, bytes: &mut [u64; 2]) {
+        bytes[0] += u64::from(self.pages) * header.page_record_bytes()
+            + if self.row {
+                header.row_record_bytes()
+            } else {
+                0
+            };
+        bytes[1] += self.length;
+    }
+
+    fn read_prefix(self) -> usize {
+        (self.record_offset % 4096) as usize
+    }
+    fn read_length(self) -> usize {
+        usize::try_from(self.length)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.read_prefix())
+    }
+
     fn window(
         self,
         transfer: u64,
@@ -149,8 +168,19 @@ impl PlannedGrant {
         region: Region,
         offset: u64,
         hold: Arc<Extent>,
+        header: &Header,
     ) -> WindowGrant {
+        let packed = header.packed.as_ref().map(|p| {
+            let first = self.page_first.saturating_sub(p.offer().first_page) as usize;
+            flare_selene::shared::wire::PackedWindow {
+                units: p
+                    .units(first, self.pages as usize, self.row)
+                    .expect("planned range")
+                    .to_vec(),
+            }
+        });
         WindowGrant {
+            packed,
             transfer,
             index,
             record: self.record,
@@ -393,6 +423,7 @@ enum Job {
         namespace: NamespaceId,
         key: Key,
         reason: &'static str,
+        shutdown: bool,
         _memory: Arc<Extent>,
         _temporary: Arc<DiskExtent>,
     },
@@ -459,6 +490,11 @@ pub struct Metrics {
     pub puts_unlinked: u64,
     pub put_links_linked: u64,
     pub put_links_root: u64,
+    pub raw_required: [u64; 3],
+    pub raw_required_bytes: [u64; 3],
+    pub put_physical_bytes: u64,
+    wire_payload: [[u64; 2]; 2],
+    shutdown_write_bytes: u64,
     pub put_page_bytes: u64,
     pub put_row_bytes: u64,
     pub put_shapes_row: u64,
@@ -487,6 +523,8 @@ pub struct Metrics {
 
 #[derive(Clone, Debug)]
 pub struct EntryData {
+    pub packed: bool,
+    pub required_profiles: Vec<Vec<u8>>,
     pub key: Key,
     pub parent: Option<Key>,
     pub bucket: [u8; 16],
@@ -513,6 +551,7 @@ struct PendingGet {
 }
 
 pub struct PutRequest {
+    pub packed: Option<flare_selene::shared::wire::PackedOffer>,
     pub namespace: NamespaceId,
     pub key: Key,
     pub published_parent: Option<Key>,
@@ -945,6 +984,13 @@ impl Store {
     fn entry(namespace: &Namespace, key: Key) -> EntryData {
         let node = &namespace.tree[&key];
         EntryData {
+            packed: node.location.header.packed.is_some(),
+            required_profiles: node
+                .location
+                .header
+                .packed
+                .as_ref()
+                .map_or_else(Vec::new, |p| p.required_profiles(true)),
             key,
             parent: node.parent,
             bucket: node.bucket,
@@ -1443,6 +1489,63 @@ impl Store {
                 return;
             }
         };
+        let logical_record_bytes = child_header.length(row);
+        let offered_bytes = u64::from(request.published_tail_pages)
+            * child_header.page_record_bytes()
+            + if request.row {
+                descriptor.row_bytes()
+            } else {
+                0
+            };
+        let child_header = if let Some(offer) = &request.packed {
+            let published_first = u64::from(request.chain_pages - request.published_tail_pages);
+            if (row && !offer.units.iter().any(|unit| unit.kind == 1))
+                || offer.first_page != published_first
+                || flare_selene::shared::packed::Layout::new(
+                    offer.clone(),
+                    &descriptor.ranks,
+                    published_first,
+                    request.published_tail_pages,
+                )
+                .is_err()
+            {
+                self.reject_put_detail(
+                    &events,
+                    proto::Reason::Invalid as u8,
+                    "invalid packed suffix",
+                );
+                return;
+            }
+            let result = flare_selene::shared::packed::select(offer, initial_first, row)
+                .and_then(|suffix| child_header.with_packed(suffix));
+            match result {
+                Ok(header) if !row || header.stored_row_bytes() > 0 => header,
+                _ => {
+                    let reroot = ancestors
+                        .iter()
+                        .filter_map(|k| self.namespaces[&id].tree.node(k))
+                        .find(|n| {
+                            n.ready && (n.location.memory.is_some() || n.location.disk.is_some())
+                        })
+                        .is_some_and(|n| n.chain_depth >= REROOT_DEPTH);
+                    self.metrics.raw_required[usize::from(reroot)] += 1;
+                    self.metrics.raw_required_bytes[usize::from(reroot)] += offered_bytes;
+                    self.reject_put_detail(
+                        &events,
+                        proto::Reason::Invalid as u8,
+                        flare_selene::shared::packed::RAW_REQUIRED,
+                    );
+                    return;
+                }
+            }
+        } else {
+            child_header
+        };
+        let root_header = if initial_parent.is_none() && request.packed.is_some() {
+            child_header.clone()
+        } else {
+            root_header
+        };
         let rootless = self.config.root.is_none();
         let replacement = initial_old.is_some();
         let arena_bytes = self.memory.capacity() as u64;
@@ -1495,6 +1598,16 @@ impl Store {
                         (child_header, initial_parent, selected_pins, requirement)
                     }
                     None if rootless => {
+                        if request.packed.is_some() && initial_parent.is_some() {
+                            self.metrics.raw_required[2] += 1;
+                            self.metrics.raw_required_bytes[2] += offered_bytes;
+                            self.reject_put_detail(
+                                &events,
+                                proto::Reason::Invalid as u8,
+                                flare_selene::shared::packed::RAW_REQUIRED,
+                            );
+                            return;
+                        }
                         if !request.row {
                             self.metrics.retry_budget += 1;
                             self.reject_put(&events, proto::Reason::Budget as u8);
@@ -1673,6 +1786,7 @@ impl Store {
         } else {
             self.metrics.put_links_root += 1;
         }
+        self.metrics.put_physical_bytes += header.length(row) - header.page_segment;
         self.metrics.put_page_bytes += u64::from(header.tail_pages) * header.page_record_bytes();
         self.metrics.put_row_bytes += if row { header.row_record_bytes() } else { 0 };
         if row {
@@ -1694,7 +1808,18 @@ impl Store {
             transfer,
             first_page: first,
             parent,
-            record_bytes: length,
+            packed: header
+                .packed
+                .as_ref()
+                .map(|_| flare_selene::shared::wire::PackedSelection {
+                    row_required: row,
+                    physical_record_bytes: length,
+                }),
+            record_bytes: if header.packed.is_some() {
+                logical_record_bytes
+            } else {
+                length
+            },
             windows: put.grants.len(),
         })));
         self.sessions.get_mut(&connection).unwrap().ops.insert(
@@ -2047,9 +2172,14 @@ impl Store {
                         put.hold_slots[slot] = Some(HoldSlot { index, job: None });
                     }
                     put.windows.granted.insert(index, plan);
-                    put.outbox.push_back(Ok(PutAnswer::Grant(
-                        plan.window(transfer, index, region, offset, extent),
-                    )));
+                    put.outbox.push_back(Ok(PutAnswer::Grant(plan.window(
+                        transfer,
+                        index,
+                        region,
+                        offset,
+                        extent,
+                        &put.header,
+                    ))));
                     *progress = Instant::now();
                 }
                 true
@@ -2121,7 +2251,12 @@ impl Store {
                     return progressed;
                 }
             };
-            let Some(table) = metadata.get(4096..4096 + header.tail_pages as usize * 8) else {
+            let sum_count = if header.packed.is_some() {
+                0
+            } else {
+                header.tail_pages as usize
+            };
+            let Some(table) = metadata.get(4096..4096 + sum_count * 8) else {
                 self.fail_get(
                     connection,
                     transfer,
@@ -2223,18 +2358,23 @@ impl Store {
                 };
                 get.next_grant += 1;
                 get.requested -= 1;
+                plan.count_payload(
+                    &get.records[plan.record as usize].header,
+                    &mut self.metrics.wire_payload[1],
+                );
                 get.outbox.push_back(Ok(GetAnswer::Ready(plan.window(
                     transfer,
                     position as u32,
                     Region::Arena,
                     offset,
                     memory,
+                    &get.records[plan.record as usize].header,
                 ))));
                 *progress = Instant::now();
                 return true;
             }
             Next::Read { file } => {
-                let length = usize::try_from(plan.length).unwrap_or(usize::MAX);
+                let length = plan.read_length();
                 // Restore windows are transient staging traffic: reads do not
                 // grow the durable set, so they are bounded by the staging
                 // region alone and never by the NVMe budget.
@@ -2274,7 +2414,7 @@ impl Store {
             file,
             span: Span {
                 address: extent.bytes().as_ptr() as usize,
-                offset: plan.record_offset,
+                offset: plan.record_offset - plan.read_prefix() as u64,
                 length: extent.bytes().len(),
             },
         };
@@ -2415,10 +2555,11 @@ impl Store {
             return Ok(());
         };
         let plan = prepared.plan;
-        if page_xxh3.len() != plan.pages as usize
-            || (plan.row && row_xxh3.is_none())
-            || (!plan.row && row_xxh3.is_some())
-            || plan.pages > 64
+        if prepared.header.packed.is_none()
+            && (page_xxh3.len() != plan.pages as usize
+                || (plan.row && row_xxh3.is_none())
+                || (!plan.row && row_xxh3.is_some())
+                || plan.pages > 64)
         {
             self.abort_put_window(connection, transfer, index);
             self.fail_put(
@@ -2452,38 +2593,63 @@ impl Store {
         let bytes = data.bytes();
         let page_bytes = prepared.header.page_record_bytes() as usize;
         let mut verified = Vec::with_capacity(page_xxh3.len());
-        for (position, hash) in page_xxh3.iter().enumerate() {
-            let start = position * page_bytes;
-            if flare_selene::shared::record::checksum(&bytes[start..start + page_bytes]) != *hash {
+        if let Some(packed) = &prepared.header.packed {
+            let first = plan
+                .page_first
+                .saturating_sub(u64::from(prepared.first_page)) as usize;
+            if !page_xxh3.is_empty()
+                || row_xxh3.is_some()
+                || packed
+                    .units(first, plan.pages as usize, plan.row)
+                    .is_none_or(|u| flare_selene::shared::packed::verify_units(u, bytes).is_err())
+            {
                 self.abort_put_window(connection, transfer, index);
                 self.fail_put(
                     connection,
                     transfer,
                     proto::Reason::Invalid as u8,
-                    invalid("page checksum"),
+                    invalid("invalid stored unit"),
                 );
                 return Ok(());
             }
-            verified.push(*hash);
-        }
-        if plan.row {
-            let row_bytes = prepared.header.row_record_bytes() as usize;
-            let start = bytes.len() - row_bytes;
-            if flare_selene::shared::record::checksum(&bytes[start..]) != row_xxh3.unwrap() {
-                self.abort_put_window(connection, transfer, index);
-                self.fail_put(
-                    connection,
-                    transfer,
-                    proto::Reason::Invalid as u8,
-                    invalid("row checksum"),
-                );
-                return Ok(());
+            verified.resize(plan.pages as usize, 0);
+        } else {
+            for (position, hash) in page_xxh3.iter().enumerate() {
+                let start = position * page_bytes;
+                if flare_selene::shared::record::checksum(&bytes[start..start + page_bytes])
+                    != *hash
+                {
+                    self.abort_put_window(connection, transfer, index);
+                    self.fail_put(
+                        connection,
+                        transfer,
+                        proto::Reason::Invalid as u8,
+                        invalid("page checksum"),
+                    );
+                    return Ok(());
+                }
+                verified.push(*hash);
+            }
+            if plan.row {
+                let row_bytes = prepared.header.row_record_bytes() as usize;
+                let start = bytes.len() - row_bytes;
+                if flare_selene::shared::record::checksum(&bytes[start..]) != row_xxh3.unwrap() {
+                    self.abort_put_window(connection, transfer, index);
+                    self.fail_put(
+                        connection,
+                        transfer,
+                        proto::Reason::Invalid as u8,
+                        invalid("row checksum"),
+                    );
+                    return Ok(());
+                }
             }
         }
         {
             let Some((put, progress)) = put_mut(&mut self.sessions, connection, transfer) else {
                 return Ok(());
             };
+            plan.count_payload(&prepared.header, &mut self.metrics.wire_payload[0]);
             put.windows.granted.remove(&index);
             // The slot stays occupied until the chunk write drains.
             for (position, hash) in verified.iter().enumerate() {
@@ -2601,10 +2767,21 @@ impl Store {
                     invalid("commit before every payload range"),
                 )
             } else {
+                let packed = put.header.packed.is_some();
+                let metadata = if packed && metadata_offset == 0 && metadata.is_empty() {
+                    put.header = put.header.clone().with_capture_role(put.stored_role);
+                    put.header
+                        .packed_metadata()
+                        .map_err(|e| invalid(e.to_string()))?
+                } else if packed {
+                    return Err(invalid("packed commit must have empty metadata"));
+                } else {
+                    metadata
+                };
                 let header_page_segment = put.header.page_segment as usize;
                 if metadata_offset as usize != put.commit_bytes.len()
                     || metadata.is_empty()
-                    || !metadata.len().is_multiple_of(4096)
+                    || (!packed && !metadata.len().is_multiple_of(4096))
                     || put.commit_bytes.len() + metadata.len() > header_page_segment
                     || !(metadata_offset as usize).is_multiple_of(4096)
                 {
@@ -2613,7 +2790,11 @@ impl Store {
                     put.commit_bytes.extend_from_slice(&metadata);
                     if put.commit_bytes.len() < header_page_segment {
                         Action::None
-                    } else if let Err(error) = validate_commit(put, &descriptor) {
+                    } else if let Err(error) = if packed {
+                        Ok(())
+                    } else {
+                        validate_commit(put, &descriptor)
+                    } {
                         Action::Fail(proto::Reason::Invalid, error)
                     } else {
                         if let Some(memory) = &mut put.memory {
@@ -2903,7 +3084,7 @@ impl Store {
                 )
         }) || grants.iter().any(|grant| {
             records[grant.record as usize].memory.is_none()
-                && !self.staging_can_ever_hold(usize::try_from(grant.length).unwrap_or(usize::MAX))
+                && !self.staging_can_ever_hold(grant.read_length())
         });
         if unservable {
             self.metrics.gets_error += 1;
@@ -2956,6 +3137,25 @@ impl Store {
         };
         let mut get = get;
         get.outbox.push_back(Ok(GetAnswer::Leased {
+            packed: get
+                .records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    r.header.packed.as_ref().map(|p| {
+                        let skip = if i == 0 {
+                            request.skip_pages as usize
+                        } else {
+                            0
+                        };
+                        let row = i + 1 == get.records.len() && request.row;
+                        flare_selene::shared::wire::PackedOffer {
+                            first_page: p.offer().first_page + skip as u64,
+                            units: p.units(skip, p.page_count() - skip, row).unwrap().to_vec(),
+                        }
+                    })
+                })
+                .collect(),
             transfer,
             windows: get.grants.len(),
         }));
@@ -3202,7 +3402,12 @@ impl Store {
                     *plan
                 };
                 let extent = Arc::new(extent);
-                let offset = match self.local.offset(Region::Staging, &extent, 0, plan.length) {
+                let offset = match self.local.offset(
+                    Region::Staging,
+                    &extent,
+                    plan.read_prefix(),
+                    plan.length,
+                ) {
                     Ok(offset) => offset,
                     Err(error) => {
                         self.fail_get(connection, transfer, proto::Reason::Invalid as u8, error);
@@ -3210,12 +3415,17 @@ impl Store {
                     }
                 };
                 if let Some((get, progress)) = get_mut(&mut self.sessions, connection, transfer) {
+                    plan.count_payload(
+                        &get.records[plan.record as usize].header,
+                        &mut self.metrics.wire_payload[1],
+                    );
                     get.outbox.push_back(Ok(GetAnswer::Ready(plan.window(
                         transfer,
                         grant,
                         Region::Staging,
                         offset,
                         extent,
+                        &get.records[plan.record as usize].header,
                     ))));
                     *progress = Instant::now();
                 }
@@ -3502,6 +3712,9 @@ impl Store {
                 self.metrics.nvme_read_bytes += completion.bytes;
             } else {
                 self.metrics.nvme_bytes += completion.bytes;
+                if matches!(job, Job::Write { shutdown: true, .. }) {
+                    self.metrics.shutdown_write_bytes += completion.bytes;
+                }
             }
             if completion
                 .result
@@ -3859,7 +4072,7 @@ impl Store {
             JobId(job),
             temporary.path.clone(),
             0,
-            &memory.bytes()[..length as usize],
+            &memory.disk_blocks()[..(length as usize).next_multiple_of(4096)],
             Some((namespace.path(key).unwrap(), length)),
         );
         if worker.submit(task).is_ok() {
@@ -3870,6 +4083,7 @@ impl Store {
                     namespace: id,
                     key,
                     reason: if key == target { reason } else { "dependency" },
+                    shutdown: reason == "shutdown",
                     _memory: memory,
                     _temporary: temporary,
                 },
@@ -4119,6 +4333,12 @@ impl Store {
             }
         }
         self.metrics.shutdown_unflushed = Some((records, bytes));
+        if self.metrics.shutdown_write_bytes != 0 {
+            eprintln!(
+                "selene: shutdown wrote {} NVMe bytes",
+                self.metrics.shutdown_write_bytes
+            );
+        }
         if records > 0 {
             eprintln!("selene: shutdown left {records} dirty records ({bytes} bytes)");
         }
@@ -4176,6 +4396,65 @@ impl Store {
 
     pub fn metrics_text(&self) -> String {
         let mut text = String::new();
+        for (label, bytes) in ["put", "get"].into_iter().zip(self.metrics.wire_payload) {
+            text.push_str(&format!("selene_store_wire_logical_bytes_total{{operation=\"{label}\"}} {}\nselene_store_wire_physical_bytes_total{{operation=\"{label}\"}} {}\n",bytes[0],bytes[1]));
+        }
+        text.push_str(&format!(
+            "selene_shutdown_nvme_write_bytes_total {}\n",
+            self.metrics.shutdown_write_bytes
+        ));
+        let mut slack = 0;
+        let mut extents = std::collections::BTreeMap::<usize, u64>::new();
+        let mut inventory = [(0u64, 0u64); 2];
+        for node in self.namespaces.values().flat_map(|ns| ns.tree.nodes()) {
+            let location = &node.location;
+            let h = &location.header;
+            let logical = u64::from(h.tail_pages) * h.page_record_bytes()
+                + if node.row { h.row_record_bytes() } else { 0 };
+            let physical = h.length(node.row) - h.page_segment;
+            if let Some(extent) = &location.memory {
+                inventory[0].0 += logical;
+                inventory[0].1 += physical;
+                if h.packed.is_some() {
+                    slack += extent.capacity() - extent.bytes().len();
+                    *extents.entry(extent.capacity()).or_default() += 1;
+                }
+            }
+            if location.disk.is_some() {
+                inventory[1].0 += logical;
+                inventory[1].1 += physical;
+            }
+        }
+        text.push_str(&format!("selene_packed_arena_buddy_slack_bytes {slack}\n"));
+        for (extent, count) in extents {
+            text.push_str(&format!(
+                "selene_packed_arena_records{{extent_bytes=\"{extent}\"}} {count}\n"
+            ));
+        }
+        for ((logical, physical), tier) in inventory.into_iter().zip(["arena", "nvme"]) {
+            text.push_str(&format!("selene_record_logical_bytes{{tier=\"{tier}\"}} {logical}\nselene_record_physical_bytes{{tier=\"{tier}\"}} {physical}\n"));
+        }
+        for (cause, count) in ["parent_not_held", "reroot", "rootless_fallback"]
+            .into_iter()
+            .zip(self.metrics.raw_required)
+        {
+            text.push_str(&format!(
+                "selene_put_raw_required_total{{cause=\"{cause}\"}} {count}\n"
+            ));
+        }
+        for (cause, bytes) in ["parent_not_held", "reroot", "rootless_fallback"]
+            .into_iter()
+            .zip(self.metrics.raw_required_bytes)
+        {
+            text.push_str(&format!(
+                "selene_put_raw_required_original_bytes_total{{cause=\"{cause}\"}} {bytes}\n"
+            ));
+        }
+        text.push_str(&format!(
+            "selene_put_logical_bytes_total {}\nselene_put_physical_bytes_total {}\n",
+            self.metrics.put_page_bytes + self.metrics.put_row_bytes,
+            self.metrics.put_physical_bytes
+        ));
         if self.config.root.is_some() {
             let mut arena_only = 0u64;
             let mut oldest = Duration::ZERO;
@@ -4358,6 +4637,7 @@ impl Store {
 pub type Reply<T> = tokio::sync::oneshot::Sender<T>;
 
 pub struct PutAccept {
+    pub packed: Option<flare_selene::shared::wire::PackedSelection>,
     pub capture_role: CaptureRole,
     pub transfer: u64,
     pub first_page: u32,
@@ -4371,6 +4651,7 @@ pub struct WindowGrant {
     pub transfer: u64,
     pub index: u32,
     pub record: u32,
+    pub packed: Option<flare_selene::shared::wire::PackedWindow>,
     pub record_offset: u64,
     pub length: u64,
     pub region: i32,
@@ -4400,6 +4681,7 @@ pub enum PutAnswer {
 
 pub enum GetAnswer {
     Leased {
+        packed: Vec<Option<flare_selene::shared::wire::PackedOffer>>,
         transfer: u64,
         windows: usize,
     },
@@ -4431,6 +4713,7 @@ pub enum StoreCommand {
         reply: Reply<Result<Vec<EntryData>>>,
     },
     PutBegin {
+        packed: Option<flare_selene::shared::wire::PackedOffer>,
         connection: u64,
         transfer: u64,
         namespace: NamespaceId,
@@ -4508,6 +4791,24 @@ fn record_grants(
     max_window: u64,
     record: u32,
 ) -> Vec<PlannedGrant> {
+    if let Some(packed) = &header.packed {
+        return packed
+            .windows(skip, include_row, max_window)
+            .into_iter()
+            .map(|w| PlannedGrant {
+                record,
+                record_offset: header.page_segment + w.offset,
+                length: w.length,
+                pages: w.pages,
+                row: w.row,
+                page_first: if w.pages == 0 {
+                    0
+                } else {
+                    u64::from(first_page) + u64::from(w.first)
+                },
+            })
+            .collect();
+    }
     use crate::pool::windows::{self, RecordShape};
     let shape = RecordShape {
         first_page: skip,
@@ -4565,6 +4866,7 @@ impl Store {
                 let _ = reply.send(self.catalog(descriptor, events));
             }
             StoreCommand::PutBegin {
+                packed,
                 connection,
                 transfer,
                 namespace,
@@ -4608,6 +4910,7 @@ impl Store {
                     connection,
                     transfer,
                     PutRequest {
+                        packed,
                         namespace,
                         key,
                         published_parent,
@@ -4963,6 +5266,7 @@ mod tests {
                     connection: 1,
                     transfer: index + 1,
                     request: PutRequest {
+                        packed: None,
                         ancestor_keys: Vec::new(),
                         namespace: id,
                         key: key(pages + index as u32),
@@ -6178,6 +6482,7 @@ mod tests {
         let (events, mut receiver) = tokio::sync::mpsc::channel(4);
         let (reply, _answer) = tokio::sync::oneshot::channel();
         store.handle(StoreCommand::PutBegin {
+            packed: None,
             ancestor_keys: Vec::new(),
             connection: 1,
             transfer: 1,
@@ -6230,6 +6535,7 @@ mod tests {
         let (events, mut receiver) = tokio::sync::mpsc::channel(4);
         let (reply, _answer) = tokio::sync::oneshot::channel();
         store.handle(StoreCommand::PutBegin {
+            packed: None,
             ancestor_keys: Vec::new(),
             connection: 1,
             transfer: 1,
@@ -6326,6 +6632,7 @@ mod tests {
             connection: 1,
             transfer: 1,
             request: PutRequest {
+                packed: None,
                 namespace: id,
                 key,
                 published_parent: parent,
@@ -6549,6 +6856,7 @@ mod tests {
                 connection: 1,
                 transfer: 1,
                 request: PutRequest {
+                    packed: None,
                     namespace: id,
                     key: endpoint,
                     published_parent: parent.map(key),
@@ -6628,6 +6936,7 @@ mod tests {
                 connection: 1,
                 transfer: 1,
                 request: PutRequest {
+                    packed: None,
                     namespace: id,
                     key: key(128),
                     published_parent: Some(key(64)),
@@ -6876,6 +7185,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: id,
                 key: parent,
@@ -7177,6 +7487,7 @@ mod tests {
         let put = |store: &mut Store, transfer: u64| {
             let (reply, answer) = tokio::sync::oneshot::channel();
             store.handle(StoreCommand::PutBegin {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 connection: 1,
                 transfer,
@@ -7375,6 +7686,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: id,
                 key: Key {
@@ -7421,6 +7733,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
@@ -7483,6 +7796,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace,
                 key,
@@ -7569,6 +7883,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
@@ -7640,6 +7955,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
@@ -7682,6 +7998,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: id,
                 key,
@@ -7775,6 +8092,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: id,
                 key: Key {
@@ -7845,6 +8163,7 @@ mod tests {
                 1,
                 200 + index,
                 PutRequest {
+                    packed: None,
                     ancestor_keys: Vec::new(),
                     namespace: id,
                     key: Key {
@@ -7902,6 +8221,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
@@ -8259,6 +8579,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: id,
                 key: Key {
@@ -8315,6 +8636,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
@@ -8402,6 +8724,7 @@ mod tests {
             1,
             1,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: store.namespace_id().unwrap(),
                 key: Key {
@@ -8428,6 +8751,7 @@ mod tests {
             1,
             2,
             PutRequest {
+                packed: None,
                 ancestor_keys: Vec::new(),
                 namespace: id,
                 key: Key {

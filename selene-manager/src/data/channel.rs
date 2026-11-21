@@ -66,6 +66,7 @@ pub enum Kind {
 /// record. The window lies in one of the manager's regions.
 #[derive(Clone, Debug)]
 pub struct WindowOut {
+    pub packed: Option<flare_selene::shared::wire::PackedWindow>,
     pub shape: Shape,
     pub page_xxh3: Vec<u64>,
     pub row_xxh3: u64,
@@ -74,8 +75,9 @@ pub struct WindowOut {
 }
 
 /// A put's window, granted by the store for the instance to fill.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GrantOut {
+    pub packed: Option<flare_selene::shared::wire::PackedWindow>,
     pub shape: Shape,
     pub region: Region,
     pub offset: u64,
@@ -654,6 +656,43 @@ async fn send_windows(
             let _ = timeout(GOODBYE, conn.shutdown()).await;
             return Ok(());
         };
+        if window.packed.is_some() && rdma.is_some() {
+            return Err(invalid("packed windows require TCP"));
+        }
+        if let Some(manifest) = &window.packed {
+            let rank = entry
+                .slicing
+                .as_ref()
+                .filter(|(layout, _)| layout.world() > 1)
+                .map(|(_, r)| *r as u32);
+            let parts: Vec<_> =
+                flare_selene::shared::packed::leg_units(manifest, rank, true).collect();
+            let mut shape = window.shape;
+            shape.length = parts.iter().map(|(_, u)| u.stored_length).sum();
+            let units = flare_selene::shared::wire::PackedWindow {
+                units: parts.iter().map(|(_, u)| (*u).clone()).collect(),
+            };
+            within(IO_TIMEOUT, "the instance stopped reading", async {
+                ToInstance::PackedWindow(shape, units).write(conn).await?;
+                for (at, u) in parts {
+                    // The granted extent is held until this handler has fenced.
+                    let data = unsafe {
+                        inner
+                            .regions
+                            .bytes(window.region, window.offset + at, u.stored_length)?
+                    };
+                    conn.write_all(data).await?;
+                }
+                conn.flush().await
+            })
+            .await?;
+            inner.counters.add(0, shape.length);
+            let _ = inner.events.send(Event::Sent {
+                transfer,
+                index: shape.index,
+            });
+            continue;
+        }
         let slot = if let Some(channel) = rdma.as_mut() {
             let ToManager::Credit { offset, length } = within(
                 IO_TIMEOUT,
@@ -771,9 +810,27 @@ async fn receive_windows(
             }
             for grant in grants {
                 // Tell the reader first: the instance may answer before this write returns.
-                let _ = expect.send(grant);
+                let _ = expect.send(grant.clone());
                 within(IO_TIMEOUT, "the instance stopped reading", async {
-                    ToInstance::Grant(grant.shape).write(&mut writer).await?;
+                    let frame = match grant.packed {
+                        Some(units) => {
+                            let rank = entry
+                                .slicing
+                                .as_ref()
+                                .filter(|(layout, _)| layout.world() > 1)
+                                .map(|(_, r)| *r as u32);
+                            let units = flare_selene::shared::wire::PackedWindow {
+                                units: flare_selene::shared::packed::leg_units(&units, rank, false)
+                                    .map(|(_, u)| u.clone())
+                                    .collect(),
+                            };
+                            let mut shape = grant.shape;
+                            shape.length = units.units.iter().map(|u| u.stored_length).sum();
+                            ToInstance::PackedGrant(shape, units)
+                        }
+                        None => ToInstance::Grant(grant.shape),
+                    };
+                    frame.write(&mut writer).await?;
                     writer.flush().await
                 })
                 .await?;
@@ -788,61 +845,90 @@ async fn receive_windows(
                 ToManager::read(&mut reader, inner.max_pages),
             )
             .await?;
-            let ToManager::Filled {
-                index,
-                row_xxh3,
-                page_xxh3,
-            } = frame
-            else {
-                return Err(invalid("the instance sent a frame a put does not take"));
+            let (index, row_xxh3, page_xxh3) = match frame {
+                ToManager::PackedFilled(index) if grant.packed.is_some() => {
+                    (index, None, Vec::new())
+                }
+                ToManager::Filled {
+                    index,
+                    row_xxh3,
+                    page_xxh3,
+                } if grant.packed.is_none()
+                    && page_xxh3.len() == grant.shape.page_count as usize
+                    && row_xxh3.is_some() == grant.shape.row =>
+                {
+                    (index, row_xxh3, page_xxh3)
+                }
+                _ => return Err(invalid("fill disagrees with the granted representation")),
             };
-            if index != grant.shape.index
-                || page_xxh3.len() != grant.shape.page_count as usize
-                || row_xxh3.is_some() != grant.shape.row
-            {
-                return Err(invalid("a filled window does not match its grant"));
+            if index != grant.shape.index {
+                return Err(invalid("fill index disagrees with grant"));
             }
-            // SAFETY: the handler owns this window until `Closed`; the store leased this window to the put.
-            match &entry.slicing {
-                None => {
-                    let payload = unsafe {
+            if let Some(manifest) = &grant.packed {
+                let rank = entry
+                    .slicing
+                    .as_ref()
+                    .filter(|(layout, _)| layout.world() > 1)
+                    .map(|(_, r)| *r as u32);
+                let mut transferred = 0;
+                for (at, unit) in flare_selene::shared::packed::leg_units(manifest, rank, false) {
+                    // Different writer ranks own disjoint stored units.
+                    let data = unsafe {
                         inner
                             .regions
-                            .bytes(grant.region, grant.offset, grant.shape.length)?
+                            .bytes(grant.region, grant.offset + at, unit.stored_length)?
                     };
                     within(
                         IO_TIMEOUT,
                         "the instance stopped writing",
-                        reader.read_exact(payload),
+                        reader.read_exact(data),
                     )
                     .await?;
+                    transferred += unit.stored_length;
                 }
-                Some((layout, rank)) => {
-                    let (pages, row) = (grant.shape.page_count, grant.shape.row);
-                    if grant.shape.length != layout.slice_bytes(*rank, pages, row) {
-                        return Err(invalid("a rank window's length is not its slice's"));
+                inner.counters.add(0, transferred);
+            } else {
+                match &entry.slicing {
+                    None => {
+                        let payload = unsafe {
+                            inner
+                                .regions
+                                .bytes(grant.region, grant.offset, grant.shape.length)?
+                        };
+                        within(
+                            IO_TIMEOUT,
+                            "the instance stopped writing",
+                            reader.read_exact(payload),
+                        )
+                        .await?;
                     }
-                    let mut packed = vec![0u8; grant.shape.length as usize];
-                    within(
-                        IO_TIMEOUT,
-                        "the instance stopped writing",
-                        reader.read_exact(&mut packed),
-                    )
-                    .await?;
-                    // SAFETY: as above, over the whole window the slice lies in.
-                    let whole = unsafe {
-                        inner.regions.bytes(
-                            grant.region,
-                            grant.offset,
-                            layout.window_bytes(pages, row),
-                        )?
-                    };
-                    layout
-                        .scatter(*rank, whole, pages, row, &packed)
-                        .map_err(|error| invalid(error.to_string()))?;
+                    Some((layout, rank)) => {
+                        let (pages, row) = (grant.shape.page_count, grant.shape.row);
+                        if grant.shape.length != layout.slice_bytes(*rank, pages, row) {
+                            return Err(invalid("a rank window's length is not its slice's"));
+                        }
+                        let mut packed = vec![0u8; grant.shape.length as usize];
+                        within(
+                            IO_TIMEOUT,
+                            "the instance stopped writing",
+                            reader.read_exact(&mut packed),
+                        )
+                        .await?;
+                        // SAFETY: as above, over the whole window the slice lies in.
+                        let whole = unsafe {
+                            inner.regions.bytes(
+                                grant.region,
+                                grant.offset,
+                                layout.window_bytes(pages, row),
+                            )?
+                        };
+                        layout
+                            .scatter(*rank, whole, pages, row, &packed)
+                            .map_err(|error| invalid(error.to_string()))?;
+                    }
                 }
+                inner.counters.add(0, grant.shape.length);
             }
-            inner.counters.add(0, grant.shape.length);
             let _ = inner.events.send(Event::Filled {
                 transfer,
                 index,
@@ -985,6 +1071,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 2, true),
                     page_xxh3: vec![11, 12],
                     row_xxh3: 13,
@@ -995,6 +1082,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(1, 1, false),
                     page_xxh3: vec![21],
                     row_xxh3: 0,
@@ -1087,6 +1175,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: Shape {
                             length: 1 << 20,
                             page_count: 256,
@@ -1130,6 +1219,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: Shape {
                             length: 1 << 20,
                             page_count: 256,
@@ -1165,6 +1255,7 @@ mod tests {
             hub.push_grant(
                 transfer,
                 GrantOut {
+                    packed: Default::default(),
                     shape: shape(0, 2, true),
                     region: Region::Staging,
                     offset: 4096,
@@ -1205,6 +1296,7 @@ mod tests {
             hub.push_grant(
                 transfer,
                 GrantOut {
+                    packed: Default::default(),
                     shape: shape(1, 1, false),
                     region: Region::Staging,
                     offset: 65536,
@@ -1260,6 +1352,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: rank_shape(&layout, rank, 0, 2, true),
                         page_xxh3: vec![1, 2],
                         row_xxh3: 3,
@@ -1309,6 +1402,7 @@ mod tests {
                 hub.push_grant(
                     transfer,
                     GrantOut {
+                        packed: Default::default(),
                         shape: rank_shape(&layout, rank, 0, 2, true),
                         region: Region::Staging,
                         offset: 16384,
@@ -1350,6 +1444,7 @@ mod tests {
             hub.push_grant(
                 transfer,
                 GrantOut {
+                    packed: Default::default(),
                     shape: shape(0, 2, true),
                     region: Region::Staging,
                     offset: 16384,
@@ -1389,6 +1484,7 @@ mod tests {
             hub.push_grant(
                 transfer,
                 GrantOut {
+                    packed: Default::default(),
                     shape: shape(0, 2, false),
                     region: Region::Staging,
                     offset: 0,
@@ -1451,6 +1547,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 1, false),
                     page_xxh3: vec![1],
                     row_xxh3: 0,
@@ -1690,6 +1787,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 1, false),
                     page_xxh3: vec![1],
                     row_xxh3: 0,

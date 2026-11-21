@@ -353,6 +353,9 @@ mod tests {
                     unit_bytes: unit,
                 })
                 .collect(),
+            placement: Default::default(),
+            gpu_mirror_duty: None,
+            codec_fields: Vec::new(),
             snapshot_pages: Vec::new(),
         }
     }
@@ -745,6 +748,9 @@ mod tests {
                     unit_bytes: row_bytes,
                 },
                 planes,
+                placement: Default::default(),
+                gpu_mirror_duty: None,
+                codec_fields: Vec::new(),
                 snapshot_pages: Vec::new(),
             };
             let layout =

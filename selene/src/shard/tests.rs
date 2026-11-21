@@ -336,7 +336,7 @@ use std::net::TcpListener;
             )
             .unwrap();
         let mut events = events(&mut transport, 3);
-        events.sort_by_key(|event| Kind::of(event).1);
+        events.sort_by_key(|event| Kind::of(event).unwrap().1);
         assert!(matches!(
             events.as_slice(),
             [
@@ -589,7 +589,7 @@ use std::net::TcpListener;
             id: JobId(11),
             error: invalid("partial store"),
         };
-        let (kind, id, result) = Kind::of(&event);
+        let (kind, id, result) = Kind::of(&event).unwrap();
         let frame = encode_event(kind, id, &result);
         let (kind, id, result) = decode_event(&frame[5..]).unwrap();
         assert!(matches!(

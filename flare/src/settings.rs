@@ -107,6 +107,8 @@ impl Settings {
         };
         let memory_reserve = size(configuration.memory.reserve.as_deref(), "memory.reserve")?;
         let prefix_cache = PrefixCacheOffload {
+            compression: Default::default(),
+            gpu_mirror_duty: None,
             memory_bytes: size(
                 nonempty(configuration.prefix_cache.memory.as_deref()),
                 "prefix_cache.memory",

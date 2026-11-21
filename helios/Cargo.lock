@@ -927,6 +927,7 @@ dependencies = [
  "prost",
  "prost-build",
  "ratatui",
+ "rayon",
  "ring",
  "ryu",
  "serde",
@@ -946,6 +947,7 @@ name = "flare-selene"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "crc32fast",
  "flare-eos",
  "hyper-util",
  "ibverbs-sys",

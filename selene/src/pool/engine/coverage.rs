@@ -15,6 +15,8 @@ use super::{super::wire, requester::ExpectedRecord};
 /// pages.
 pub(crate) struct Coverage {
     pub(crate) expected: Vec<ExpectedRecord>,
+    packed: Vec<Option<crate::shared::packed::Layout>>,
+    pub(crate) channel_rank: Option<u32>,
     taken: Vec<u32>,
     cursor: usize,
     windows: u32,
@@ -23,11 +25,37 @@ pub(crate) struct Coverage {
 impl Coverage {
     pub(crate) fn new(expected: Vec<ExpectedRecord>) -> Self {
         Self {
+            packed: vec![None; expected.len()],
+            channel_rank: None,
             taken: vec![0; expected.len()],
             expected,
             cursor: 0,
             windows: 0,
         }
+    }
+
+    pub(crate) fn set_packed(&mut self, record: usize, layout: crate::shared::packed::Layout) {
+        self.packed[record] = Some(layout);
+    }
+    pub(crate) fn pinned_units(&self, spec: &wire::WindowSpec) -> Option<Vec<wire::PackedUnit>> {
+        let r = spec.record as usize;
+        let layout = self.packed.get(r)?.as_ref()?;
+        let first = if spec.page_count == 0 && spec.row {
+            layout.page_count()
+        } else {
+            spec.first_page.checked_sub(self.expected[r].first_page)? as usize
+        };
+        Some(
+            layout
+                .units(first, spec.page_count as usize, spec.row)?
+                .iter()
+                .filter(|u| {
+                    self.channel_rank
+                        .is_none_or(|r| r == u.stored_rank || u.replicas.contains(&r))
+                })
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Every record, page and the row has been covered once.
@@ -74,7 +102,20 @@ impl Coverage {
             return Err(format!("window {} carries the row wrongly", spec.index));
         }
         let row = if spec.row { row_bytes } else { 0 };
-        if spec.length != u64::from(spec.page_count) * page_bytes + row {
+        let length = match (&self.packed[record], &spec.packed) {
+            (None, None) => u64::from(spec.page_count) * page_bytes + row,
+            (Some(_), Some(window)) => {
+                let units = self
+                    .pinned_units(spec)
+                    .ok_or("window outside packed selection")?;
+                if units != window.units {
+                    return Err("window differs from pinned selection".into());
+                }
+                units.iter().map(|u| u.stored_length).sum()
+            }
+            _ => return Err("window representation differs from pinned selection".into()),
+        };
+        if spec.length != length {
             return Err(format!("window {} has the wrong length", spec.index));
         }
         let before: u64 = self.expected[..record]

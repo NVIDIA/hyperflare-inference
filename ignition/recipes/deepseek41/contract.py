@@ -26,7 +26,21 @@ VISION_FRONTEND = c.frontend(tools=p.DSML, tag_separator=" ", assistant_marker="
     image_preparation=p.DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION, image_layout=p.DEEPSEEK_ROW_MAJOR_IMAGE_LAYOUT)
 
 
+def checkpoint_encoding(name, dtype, shape):
+    from .pool import COMPRESSED_RECORD_BYTES, SWA_RECORD_BYTES
+
+    if str(dtype) == "torch.bfloat16":
+        return 2
+    if str(dtype) == "torch.uint8" and len(shape) == 1:
+        if name.endswith(".window") and shape[0] % SWA_RECORD_BYTES == 0:
+            return 45
+        if name.endswith(".latent_page") and shape[0] % COMPRESSED_RECORD_BYTES == 0:
+            return 47
+    return 0
+
+
 def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag, rows=1, embedding_tables=(), regions=()):
+
     regions = list(regions)
     for name, tensor in pool.pages.items():
         layer = int(name.split(".")[0].removeprefix("layer"))
@@ -45,6 +59,7 @@ def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag,
     return c.model_contract(vocabulary=VOCABULARY, input_vocabulary=INPUT_VOCABULARY if vision else VOCABULARY,
         page_tokens=page_tokens, page_tables=[dict(buffer="page_tables", page_offset=0),
             *([dict(buffer="draft_page_tables", page_offset=1)] if "draft_page_tables" in buffers else [])],
+        codec_layout=c.codec_layout(pool, regions, buffers, field_encoding=checkpoint_encoding),
         regions=[dict(kind=p.CONTINUATION_STATE, storage=continuation, tokens_per_record=1, window_tokens=0), *regions],
         graphs=graphs, vision={**VISION, "feature_slots": image_slots} if vision else TEXT_VISION,
         frontend=VISION_FRONTEND if vision else FRONTEND)

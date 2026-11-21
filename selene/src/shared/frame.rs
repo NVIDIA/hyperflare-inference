@@ -41,6 +41,8 @@
 //! the stream carrier. Windows arrive in index order and only the transfer's own windows are
 //! ever named, so a reader needs no state beyond the grant's plan to check them.
 
+use super::{packed, wire::PackedWindow};
+use prost::Message;
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -54,6 +56,25 @@ pub async fn within<T>(
     tokio::time::timeout(duration, future)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, what))?
+}
+
+/// Read into a caller-reserved physical window and authenticate it before returning the bytes to Flare.
+pub async fn read_packed_payload<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    expected: &[super::wire::PackedUnit],
+    manifest: &PackedWindow,
+    dst: &mut [u8],
+) -> io::Result<()> {
+    if expected != manifest.units
+        || expected
+            .iter()
+            .try_fold(0u64, |n, u| n.checked_add(u.stored_length))
+            != Some(dst.len() as u64)
+    {
+        return Err(invalid("packed payload outside expected grant"));
+    }
+    reader.read_exact(dst).await?;
+    packed::verify_units(expected, dst).map_err(|e| invalid(e.to_string()))
 }
 
 /// Bytes of the single-use token that names a transfer.
@@ -106,10 +127,12 @@ pub struct Window {
 }
 
 /// A frame the manager sends.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ToInstance {
     /// A window of a claim; its payload follows.
     Window(Window),
+    PackedWindow(Shape, PackedWindow),
+    PackedGrant(Shape, PackedWindow),
     End,
     Abort(String),
     /// A window of a put the instance is to fill.
@@ -122,6 +145,7 @@ pub enum ToInstance {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToManager {
     Hello(Carrier),
+    PackedFilled(u32),
     /// A granted window, filled; its payload follows.
     Filled {
         index: u32,
@@ -211,6 +235,16 @@ impl ToInstance {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            ToInstance::PackedWindow(shape, units) | ToInstance::PackedGrant(shape, units) => {
+                out.push(if matches!(self, Self::PackedWindow(..)) {
+                    8
+                } else {
+                    9
+                });
+                put_shape(&mut out, shape);
+                out.extend_from_slice(&(units.encoded_len() as u32).to_le_bytes());
+                units.encode(&mut out).expect("Vec write");
+            }
             ToInstance::Window(window) => {
                 out.push(WINDOW);
                 put_shape(&mut out, &window.shape);
@@ -289,6 +323,33 @@ impl ToInstance {
                     String::from_utf8_lossy(&text).into_owned(),
                 ))
             }
+            tag @ (8 | 9) => {
+                let mut bytes = [0; SHAPE_BYTES];
+                reader.read_exact(&mut bytes).await?;
+                let shape = parse_shape(&bytes)?;
+                let size = reader.read_u32_le().await? as usize;
+                if size > packed::MAX_DIRECTORY || shape.page_count > max_pages {
+                    return Err(invalid("oversized packed window"));
+                }
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes).await?;
+                let window =
+                    PackedWindow::decode(&*bytes).map_err(|_| invalid("bad packed window"))?;
+                if window.units.len() > packed::MAX_UNITS
+                    || window
+                        .units
+                        .iter()
+                        .try_fold(0u64, |sum, u| sum.checked_add(u.stored_length))
+                        != Some(shape.length)
+                {
+                    return Err(invalid("packed window length disagrees with units"));
+                }
+                Ok(if tag == 8 {
+                    Self::PackedWindow(shape, window)
+                } else {
+                    Self::PackedGrant(shape, window)
+                })
+            }
             GRANT => {
                 let mut shape = [0u8; SHAPE_BYTES];
                 reader.read_exact(&mut shape).await?;
@@ -331,6 +392,10 @@ impl ToManager {
                 out.extend_from_slice(&(page_xxh3.len() as u32).to_le_bytes());
                 put_sums(&mut out, page_xxh3);
             }
+            ToManager::PackedFilled(index) => {
+                out.push(10);
+                out.extend_from_slice(&index.to_le_bytes());
+            }
             ToManager::Credit { offset, length } => {
                 out.push(CREDIT);
                 out.extend_from_slice(&offset.to_le_bytes());
@@ -372,6 +437,7 @@ impl ToManager {
                 ))),
                 _ => Err(invalid("an unknown payload carrier")),
             },
+            10 => Ok(Self::PackedFilled(reader.read_u32_le().await?)),
             CREDIT => Ok(ToManager::Credit {
                 offset: reader.read_u64_le().await?,
                 length: reader.read_u64_le().await?,
