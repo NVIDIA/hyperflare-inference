@@ -648,7 +648,7 @@ def test_sm103_8sm_1d_tma_mover_host_numa_vmm_bandwidth():
             E, S, 0, 0,
         )
         descs = torch.tensor(list(entry) + [0] * (192 - len(entry)), dtype=torch.uint8, device=dev)
-        q_hdr = torch.zeros((64,), dtype=torch.uint8, device=dev)
+        q_hdr = torch.zeros((binding.queue_header_bytes(),), dtype=torch.uint8, device=dev)
         q_hdr[:12].copy_(torch.tensor(list(struct.pack("<III", 0, 0, 1023)), dtype=torch.uint8))
         q_ring = torch.zeros((1024 * 16,), dtype=torch.uint8, device=dev)
 
@@ -891,5 +891,187 @@ def test_sm103_indirection_vs_static_megamoe_per_call_latency(sm103_storage):
                 r.close()
         if dyn_tier is not None:
             for r in dyn_tier.regions:
+                r.close()
+        gc.close()
+
+
+def test_sm103_dynamic_prefill_staging_bit_exact_under_concurrent_swaps(sm103_storage):
+    """Verify dynamic PreparedExpertStage + Dekker race-free binding under live concurrent 8-SM mover swaps."""
+    import deep_gemm
+    from b12x.preparation import PreparationSession
+    from ignition.components.megamoe import MegaMoeGeometry, MegaMoeWorkspace, PreparedMegaMoe
+    from ignition.components.megamoe_staging import PreparedExpertStage
+    from ignition.components.megamoe_tiers import MegaMoeDynamicHostTier
+    from ignition.components.megamoe_weights import allocate_mxfp4_weights
+    from ignition.components.sm103_expert_mover import SM103ExpertMoverRuntime
+    from ignition.preparation.scratch import ScratchArena
+
+    device = torch.device("cuda", 0)
+    props = torch.cuda.get_device_properties(0)
+    if (props.major, props.minor) != (10, 3):
+        pytest.skip("SM103 GB300 required")
+
+    kernel_cache = Path("/tmp/flare-test-sm103-mover-cache")
+    kernel_cache.mkdir(parents=True, exist_ok=True)
+
+    E, HOST_EXPERTS, HBM_ACTIVE, SPARE = 32, 20, 22, 1
+    HBM_SLOTS = HBM_ACTIVE + SPARE
+    ROWS, TOP_K, HIDDEN, INTER = 128, 4, 2048, 512
+    CLAMP = 7.0
+
+    gc = _GreenCtxPair(0, worker_sm_count=8)
+    tier = None
+    mover = None
+    try:
+        gc.set_primary()
+        gen = torch.Generator(device="cpu").manual_seed(20261121)
+        all_weights = _make_random_mxfp4_weights(E, HIDDEN, INTER, device, gen)
+        shared = _make_random_shared_fp8(HIDDEN, INTER, device, gen)
+
+        geom = MegaMoeGeometry(E, ROWS, TOP_K, HIDDEN, INTER, shared_experts=1)
+        ws_ref = MegaMoeWorkspace(geom, device=device, kernel_cache=kernel_cache)
+        ws_dyn = MegaMoeWorkspace(geom, device=device, kernel_cache=kernel_cache)
+
+        # Movable experts: 0..19 (10 initially resident in HBM, 10 cold); pinned HBM-only: 20..31 (12 pinned).
+        initial_hbm = tuple(range(HOST_EXPERTS, E)) + tuple(range(0, 10))
+        assert len(initial_hbm) == HBM_ACTIVE
+        tier = MegaMoeDynamicHostTier(
+            ws_dyn.geometry,
+            hbm_slots=HBM_SLOTS,
+            initial_hbm_experts=initial_hbm,
+            storage=sm103_storage,
+            name="stage_dyn_tier",
+            host_experts=HOST_EXPERTS,
+        )
+        for dst_cpu, src_gpu in zip(tier.host_views, (*all_weights.gate_up, *all_weights.down)):
+            dst_cpu.copy_(src_gpu[:HOST_EXPERTS].cpu())
+        hbm_weights = allocate_mxfp4_weights(HBM_SLOTS, HIDDEN, INTER, device=device)
+        for dst, src in zip((*hbm_weights.gate_up, *hbm_weights.down), (*all_weights.gate_up, *all_weights.down)):
+            for slot, e in enumerate(initial_hbm):
+                dst[slot].copy_(src[e])
+            dst[HBM_ACTIVE:].zero_()
+
+        mover = SM103ExpertMoverRuntime(
+            [(tier, hbm_weights)],
+            storage=sm103_storage,
+            kernel_cache=kernel_cache,
+            worker_sm_count=gc.worker_sms,
+            queue_capacity=256,
+            control_buffer_name="stage_dyn_mover_ctl",
+        )
+
+        x = (torch.randn((ROWS, HIDDEN), generator=gen) * 0.2).to(torch.bfloat16).to(device).contiguous()
+        ids = torch.stack([torch.randperm(E, generator=gen)[:TOP_K] for _ in range(ROWS)]).to(torch.int32).to(device).contiguous()
+        probs = torch.full((ROWS, TOP_K), 1.0 / TOP_K, dtype=torch.float32, device=device)
+        pad = torch.zeros((ROWS,), dtype=torch.bool, device=device)
+
+        deep_gemm.set_num_sms(gc.compute_sms)
+        arena = ScratchArena(device)
+        stage_stream = torch.cuda.Stream(device=device)
+        with PreparationSession(device=device, autotune=False) as s_ref:
+            op_ref = PreparedMegaMoe(
+                x, ids, probs, pad, all_weights, shared,
+                workspace=ws_ref, clamp=CLAMP, session=s_ref, name="stage_ref",
+                host_shared_first=True, compute_sm_count=gc.compute_sms,
+            )
+        with PreparationSession(device=device, autotune=False) as s_dyn:
+            op_dyn = PreparedMegaMoe(
+                x, ids, probs, pad, hbm_weights, shared,
+                workspace=ws_dyn, clamp=CLAMP, session=s_dyn, name="stage_dyn",
+                host_tier=tier, host_shared_first=True, compute_sm_count=gc.compute_sms,
+            )
+            stager = PreparedExpertStage(
+                tier, stage_stream, tier.live_slot_map, range(HOST_EXPERTS),
+                session=s_dyn, workspace=arena, name="stage_dyn_copy", min_cold=4,
+            )
+
+        expected = op_ref(x, ids, probs, pad).clone()
+        torch.cuda.synchronize()
+
+        # 1. Verify eager staged execution + forced race-fallback path (simulate missed cold expert).
+        pending = stager.start(x)
+        out_staged = op_dyn(x, ids, probs, pad, staged=(stager, pending))
+        torch.cuda.synchronize()
+        assert torch.equal(out_staged, expected), (
+            f"staged dynamic MegaMoE diverged: max_diff={(out_staged.float() - expected.float()).abs().max().item()}"
+        )
+
+        # Force missed-eviction fallback by clearing staged_mask for all experts while keeping cold experts < 0.
+        pending_fallback = stager.start(x)
+        torch.cuda.synchronize()
+        pending_fallback.staged_mask.zero_()
+        out_fallback = op_dyn(x, ids, probs, pad, staged=(stager, pending_fallback))
+        torch.cuda.synchronize()
+        assert torch.equal(out_fallback, expected), "Dekker fallback path diverged on simulated mid-flight eviction"
+
+        # 2. Capture staged prefill + enqueue + worker graphs and replay on partitioned green contexts!
+        out_buf = torch.empty_like(expected)
+        cap_stream = torch.cuda.Stream(device=device)
+        g = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.stream(cap_stream):
+            with torch.cuda.graph(g, pool=sm103_storage.graph_pool, stream=cap_stream):
+                p = stager.start(x)
+                out_buf.copy_(op_dyn(x, ids, probs, pad, staged=(stager, p)))
+        g.instantiate()
+
+        swap_layers = torch.zeros((HOST_EXPERTS,), dtype=torch.int32, device=device)
+        swap_experts = torch.arange(HOST_EXPERTS, dtype=torch.int32, device=device)
+        swap_victims = torch.full((HOST_EXPERTS,), -1, dtype=torch.int32, device=device)
+        enq_g = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.stream(cap_stream):
+            with torch.cuda.graph(enq_g, pool=sm103_storage.graph_pool, stream=cap_stream):
+                mover.enqueue_swap_batch(swap_layers, swap_experts, swap_victims)
+        enq_g.instantiate()
+
+        worker_decl = mover.capture_worker_graph(name="stage_dyn_worker", retain_graphs=True, stream=cap_stream)
+        worker_exec = int(worker_decl.graph.raw_cuda_graph_exec())
+        stage_exec = int(g.raw_cuda_graph_exec())
+        enq_exec = int(enq_g.raw_cuda_graph_exec())
+        expected_cpu = expected.cpu()
+        host_out = torch.empty_like(expected_cpu)
+        mover.reset_stop_flag()
+        torch.cuda.synchronize()
+
+        gc.launch_graph(worker_exec, worker=True)
+        try:
+            for step in range(20):
+                # Rotate movable experts while replaying staged prefill graph on compute green context!
+                if step % 4 == 0:
+                    rotated = torch.roll(torch.arange(HOST_EXPERTS, dtype=torch.int32), shifts=(step * 3) % HOST_EXPERTS)
+                    gc.set_compute()
+                    gc._call(
+                        "cuMemcpyHtoDAsync_v2",
+                        C.c_uint64(swap_experts.data_ptr()),
+                        C.c_void_p(rotated.data_ptr()),
+                        C.c_size_t(rotated.numel() * 4),
+                        gc.c_stream,
+                    )
+                    gc.launch_graph(enq_exec, worker=False)
+                gc.launch_graph(stage_exec, worker=False)
+                gc.set_compute()
+                gc._call(
+                    "cuMemcpyDtoHAsync_v2",
+                    C.c_void_p(host_out.data_ptr()),
+                    C.c_uint64(out_buf.data_ptr()),
+                    C.c_size_t(host_out.numel() * host_out.element_size()),
+                    gc.c_stream,
+                )
+                gc.sync_compute()
+                assert torch.equal(host_out, expected_cpu), f"staged graph diverged under concurrent swaps at step {step}"
+        finally:
+            mover.signal_stop()
+            gc.sync_worker()
+            gc.set_primary()
+
+        metrics = mover.read_metrics()
+        assert metrics.swaps_completed >= 10, f"expected >= 10 concurrent swaps during staged prefill, got {metrics}"
+        g.reset()
+        enq_g.reset()
+        worker_decl.graph.reset()
+    finally:
+        if mover is not None:
+            mover.close()
+        if tier is not None:
+            for r in tier.regions:
                 r.close()
         gc.close()

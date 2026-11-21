@@ -585,9 +585,15 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
                 expert = experts.weights[f"layers.{index}.ffn"]
                 host_experts = placements[f"layers.{index}.ffn"].host
                 if expert.host_tier is not None and expert.host_tier.rows >= staging.min_cold_experts:
+                    if getattr(expert.host_tier, "indirection", False):
+                        stage_map = expert.host_tier.live_slot_map
+                        stage_ids = range(expert.host_tier.rows)
+                    else:
+                        stage_map = expert.expert_map
+                        stage_ids = host_experts
                     expert_stagers[index] = PreparedExpertStage(
                         expert.host_tier, streams[len(expert_stagers) % 2],
-                        expert.expert_map, host_experts, session=session, workspace=arena,
+                        stage_map, stage_ids, session=session, workspace=arena,
                         name=f"prefill-stage-{index}", min_cold=staging.min_cold_experts)
             if not expert_stagers:
                 raise ValueError("prefill staging requires eligible target host experts")
@@ -815,8 +821,12 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             embedding_tables=range(len(delivery.sources)))}
     staging_estimate = 0
     if config.sm103 is not None and config.sm103.prefill_staging is not None:
-        from .config import ModelConfig
-        staging_estimate = config.sm103.staging_bytes(ModelConfig.load(metadata_path))
+        from types import SimpleNamespace
+        geom = experts.weights["layers.0.ffn"].workspace.geometry
+        staging_model = SimpleNamespace(
+            text={"hidden_size": geom.hidden, "moe_intermediate_size": geom.intermediate}
+        )
+        staging_estimate = config.sm103.staging_bytes(staging_model)
     workspace_bytes = sum(workspace.buffer.nbytes for workspace in {
         id(w.workspace): w.workspace for w in experts.weights.values()}.values())
     expert_host_bytes = sum(region.extent for w in experts.weights.values()

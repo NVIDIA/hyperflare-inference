@@ -36,12 +36,13 @@ class DynamicExpertMoverConfig:
     worker_sm_count: int = 8
     spare_slots: int = 2
     queue_capacity: int = 1024
-    decay_shift: int = 4
-    promote_threshold: int = 384
-    hysteresis: int = 64
-    cooldown_steps: int = 2
-    max_enqueues: int = 2
-    max_predict_rows: int = 64
+    decay_shift: int = 6
+    promote_threshold: int = 256
+    min_age_steps: int = 64
+    interval_steps: int = 8
+    cooldown_steps: int = 16
+    max_enqueues: int = 1
+    max_predict_rows: int = 256
 
     def __post_init__(self):
         if any(type(v) is not int for v in vars(self).values()):
@@ -61,7 +62,8 @@ class DynamicExpertMoverConfig:
         return PredictorConfig(
             decay_shift=self.decay_shift,
             promote_threshold=self.promote_threshold,
-            hysteresis=self.hysteresis,
+            min_age_steps=self.min_age_steps,
+            interval_steps=self.interval_steps,
             cooldown_steps=self.cooldown_steps,
             max_enqueues=self.max_enqueues,
             max_predict_rows=self.max_predict_rows,
@@ -74,7 +76,8 @@ class DynamicExpertMoverConfig:
             "queue_capacity": self.queue_capacity,
             "decay_shift": self.decay_shift,
             "promote_threshold": self.promote_threshold,
-            "hysteresis": self.hysteresis,
+            "min_age_steps": self.min_age_steps,
+            "interval_steps": self.interval_steps,
             "cooldown_steps": self.cooldown_steps,
             "max_enqueues": self.max_enqueues,
             "max_predict_rows": self.max_predict_rows,
@@ -149,8 +152,6 @@ class SM103Config:
         if self.dynamic_mover is not None:
             if not isinstance(self.dynamic_mover, DynamicExpertMoverConfig):
                 raise ValueError("SM103 dynamic_mover must be a DynamicExpertMoverConfig")
-            if self.prefill_staging is not None:
-                raise ValueError("SM103 dynamic_mover cannot be combined with static prefill_staging")
             tiered_target = False
             for name, placement in self.placements:
                 if name.startswith("layers.") and placement.host:

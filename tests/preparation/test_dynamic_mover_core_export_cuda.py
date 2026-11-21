@@ -16,7 +16,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from ignition.components.expert_placement import ExpertPlacement
+from ignition.components.expert_placement import ExpertPlacement, PrefillExpertStaging
 from ignition.components.megamoe import MegaMoeGeometry, MegaMoeWorkspace
 from ignition.components.megamoe_tiers import MegaMoeDynamicHostTier, MegaMoeLayerWeights
 from ignition.components.megamoe_weights import allocate_mxfp4_weights
@@ -228,7 +228,8 @@ def test_miniature_dynamic_mover_core_export_and_fresh_process_flare_run(tmp_pat
         queue_capacity=1024,
         decay_shift=2,
         promote_threshold=256,
-        hysteresis=0,
+        min_age_steps=0,
+        interval_steps=1,
         cooldown_steps=1,
         max_enqueues=2,
         max_predict_rows=64,
@@ -236,6 +237,7 @@ def test_miniature_dynamic_mover_core_export_and_fresh_process_flare_run(tmp_pat
     sm103 = SM103Config(
         placements,
         host_lane_clusters=0,
+        prefill_staging=PrefillExpertStaging(min_rows=256, min_cold_experts=2),
         execution="reference",
         context=1024,
         dynamic_mover=dynamic_mover,

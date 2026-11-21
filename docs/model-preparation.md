@@ -749,12 +749,13 @@ per-layer enter kernel, and an 8-SM 1D-TMA persistent mover exported through
   "worker_sm_count": 8,
   "spare_slots": 2,
   "queue_capacity": 1024,
-  "decay_shift": 4,
-  "promote_threshold": 384,
-  "hysteresis": 64,
-  "cooldown_steps": 2,
-  "max_enqueues": 2,
-  "max_predict_rows": 64
+  "decay_shift": 6,
+  "promote_threshold": 256,
+  "min_age_steps": 64,
+  "interval_steps": 8,
+  "cooldown_steps": 16,
+  "max_enqueues": 1,
+  "max_predict_rows": 256
 }
 ```
 

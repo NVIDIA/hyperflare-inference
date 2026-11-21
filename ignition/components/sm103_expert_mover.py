@@ -23,14 +23,15 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 
 @dataclass(frozen=True)
 class PredictorConfig:
-    """Parameters for the inline on-GPU decayed-frequency + LFU/LRU routing predictor."""
+    """Parameters for the inline on-GPU decayed-miss LRU routing predictor."""
 
-    decay_shift: int = 4
-    promote_threshold: int = 384
-    hysteresis: int = 64
-    cooldown_steps: int = 2
-    max_enqueues: int = 2
-    max_predict_rows: int = 64
+    decay_shift: int = 6
+    promote_threshold: int = 256
+    min_age_steps: int = 64
+    interval_steps: int = 8
+    cooldown_steps: int = 16
+    max_enqueues: int = 1
+    max_predict_rows: int = 256
 
     def __post_init__(self):
         if any(type(v) is not int for v in vars(self).values()):
@@ -39,8 +40,10 @@ class PredictorConfig:
             raise ValueError("decay_shift must be in [0, 30]")
         if self.promote_threshold <= 0:
             raise ValueError("promote_threshold must be positive")
-        if self.hysteresis < 0:
-            raise ValueError("hysteresis must be nonnegative")
+        if not 0 <= self.min_age_steps < (1 << 31):
+            raise ValueError("min_age_steps must be in [0, 2**31 - 1]")
+        if self.interval_steps < 1:
+            raise ValueError("interval_steps must be at least 1")
         if self.cooldown_steps < 1:
             raise ValueError("cooldown_steps must be at least 1")
         if not 0 <= self.max_enqueues <= 4:
@@ -57,6 +60,7 @@ class PredictorLayerBinding:
     state: torch.Tensor
     scores: torch.Tensor
     last_seen: torch.Tensor
+    born: torch.Tensor
     cooldown: torch.Tensor
     queue_header: torch.Tensor
     queue_ring: torch.Tensor
@@ -170,7 +174,7 @@ class SM103ExpertMoverRuntime:
         hdr_bytes = self.binding.queue_header_bytes()
         req_bytes = self.binding.queue_request_bytes()
         pred_bytes = self.binding.predictor_state_bytes()
-        if desc_bytes != 192 or hdr_bytes != 128 or req_bytes != 16 or pred_bytes != 64:
+        if desc_bytes != 192 or hdr_bytes != 128 or req_bytes != 16 or pred_bytes != 128:
             raise RuntimeError(
                 f"unexpected mover struct sizes: desc={desc_bytes}, hdr={hdr_bytes}, req={req_bytes}, pred={pred_bytes}"
             )
@@ -222,6 +226,15 @@ class SM103ExpertMoverRuntime:
         for tensor in (self.queue_header, self.queue_ring, self.control_region.device_view):
             record_numeric_tensor(tensor)
 
+    def _initial_born_tensor(self, tier: MegaMoeDynamicHostTier) -> torch.Tensor:
+        # Bit 31 (0x80000000 == -2**31 in int32) marks initially resident movable experts born at step 0.
+        resident = tier.live_slot_map[:tier.rows] >= 0
+        return torch.where(
+            resident,
+            torch.full((tier.rows,), -(1 << 31), dtype=torch.int32, device=self.device),
+            torch.zeros((tier.rows,), dtype=torch.int32, device=self.device),
+        )
+
     def attach_predictors(self, config: PredictorConfig | None = None) -> tuple[PredictorLayerBinding, ...]:
         """Allocate per-layer GPU predictor tables and bind them to each MegaMoeDynamicHostTier."""
         if self.predictor_bindings:
@@ -229,40 +242,45 @@ class SM103ExpertMoverRuntime:
         cfg = PredictorConfig() if config is None else config
         pred_bytes = self.binding.predictor_state_bytes()
         bindings = []
-        init_clock = max(1, cfg.cooldown_steps)
+        init_clock = max(1, cfg.cooldown_steps, cfg.min_age_steps, cfg.interval_steps)
         for layer_idx, (tier, _) in enumerate(self.layers):
             if tier.experts > 1024:
                 raise ValueError(f"inline GPU predictor supports up to 1024 experts, got {tier.experts}")
             scores = persistent_zeros((tier.rows,), dtype=torch.int32, device=self.device)
             last_seen = persistent_zeros((tier.rows,), dtype=torch.int32, device=self.device)
+            born = persistent_copy(self._initial_born_tensor(tier))
             cooldown = persistent_zeros((tier.rows,), dtype=torch.int32, device=self.device)
             raw = struct.pack(
-                "<3Q9I",
+                "<4Q11I",
                 int(scores.data_ptr()),
                 int(last_seen.data_ptr()),
+                int(born.data_ptr()),
                 int(cooldown.data_ptr()),
                 init_clock,
+                0,  # last_enqueue_step
                 layer_idx,
                 cfg.decay_shift,
                 cfg.promote_threshold,
-                cfg.hysteresis,
+                cfg.min_age_steps,
+                cfg.interval_steps,
                 cfg.cooldown_steps,
                 cfg.max_enqueues,
                 cfg.max_predict_rows,
                 int(tier.rows),
             )
-            assert len(raw) == 60, len(raw)
+            assert len(raw) == 76, len(raw)
             state = persistent_copy(
                 torch.tensor(list(raw) + [0] * (pred_bytes - len(raw)), dtype=torch.uint8, device=self.device)
             )
-            # Omit state: it stores 64-bit pointers to scores, last_seen, and cooldown.
-            for tensor in (scores, last_seen, cooldown):
+            # Omit state: it stores 64-bit pointers to scores, last_seen, born, and cooldown.
+            for tensor in (scores, last_seen, born, cooldown):
                 record_numeric_tensor(tensor)
             binding = PredictorLayerBinding(
                 layer_idx=layer_idx,
                 state=state,
                 scores=scores,
                 last_seen=last_seen,
+                born=born,
                 cooldown=cooldown,
                 queue_header=self.queue_header,
                 queue_ring=self.queue_ring,
@@ -348,16 +366,21 @@ class SM103ExpertMoverRuntime:
         self.control_region.host_view.zero_()
         for tier, _ in self.layers:
             tier.layer_epoch.zero_()
-        for binding in self.predictor_bindings:
-            binding.scores.zero_()
-            binding.last_seen.zero_()
-            binding.cooldown.zero_()
-            # Restore step_clock = max(1, cooldown_steps) at offset 24 (after 3 x uint64 pointers).
-            cooldown_steps = struct.unpack_from("<I", bytes(binding.state[44:48].cpu().tolist()), 0)[0]
-            init_clock = max(1, cooldown_steps)
-            binding.state[24:28].copy_(
-                torch.tensor(list(struct.pack("<I", init_clock)), dtype=torch.uint8, device=self.device)
-            )
+        if self.predictor_bindings:
+            for (tier, _), binding in zip(self.layers, self.predictor_bindings, strict=True):
+                binding.scores.zero_()
+                binding.last_seen.zero_()
+                binding.born.copy_(self._initial_born_tensor(tier))
+                binding.cooldown.zero_()
+                # Restore step_clock at [32:36] and last_enqueue_step = 0 at [36:40] from
+                # (min_age_steps, interval_steps, cooldown_steps) at [52:64].
+                min_age_steps, interval_steps, cooldown_steps = struct.unpack_from(
+                    "<3I", bytes(binding.state[52:64].cpu().tolist()), 0
+                )
+                init_clock = max(1, cooldown_steps, min_age_steps, interval_steps)
+                binding.state[32:40].copy_(
+                    torch.tensor(list(struct.pack("<2I", init_clock, 0)), dtype=torch.uint8, device=self.device)
+                )
 
     def reset_stop_flag(self) -> None:
         self.binding.store_stop_flag_release(self.stop_flag_ptr, 0)

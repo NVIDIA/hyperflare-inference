@@ -6,6 +6,7 @@
 import ctypes as C
 import os
 from pathlib import Path
+import struct
 import time
 
 import pytest
@@ -102,12 +103,14 @@ def test_sm103_inline_gpu_predictor_adapts_across_regime_shifts_bit_exact(sm103_
             worker_sm_count=worker_sms,
             queue_capacity=1024,
         )
-        # Fast adaptation settings: 256 = 1-hit promote threshold, 4 enqueues/step, decay_shift=2 (0.75x) for rapid regime shift.
+        # Fast adaptation settings: 256 = 1-miss promote threshold, 4 enqueues/step, decay_shift=2,
+        # min_age_steps=4, and interval_steps=1 for rapid regime shift within 24 steps.
         mover.attach_predictors(
             PredictorConfig(
                 decay_shift=2,
                 promote_threshold=256,
-                hysteresis=64,
+                min_age_steps=4,
+                interval_steps=1,
                 cooldown_steps=1,
                 max_enqueues=4,
                 max_predict_rows=64,
@@ -293,7 +296,14 @@ def test_sm103_inline_predictor_mixed_active_and_padded_rows_invariant(sm103_pre
         control_buffer_name="mix_ctrl_b",
     )
     try:
-        cfg = PredictorConfig(decay_shift=3, promote_threshold=256, hysteresis=64, cooldown_steps=2, max_enqueues=2)
+        cfg = PredictorConfig(
+            decay_shift=6,
+            promote_threshold=256,
+            min_age_steps=4,
+            interval_steps=2,
+            cooldown_steps=2,
+            max_enqueues=2,
+        )
         (bind_a,) = mover_a.attach_predictors(cfg)
         (bind_b,) = mover_b.attach_predictors(cfg)
 
@@ -321,15 +331,271 @@ def test_sm103_inline_predictor_mixed_active_and_padded_rows_invariant(sm103_pre
 
         assert torch.equal(bind_a.scores, bind_b.scores), "padded rows mutated predictor scores"
         assert torch.equal(bind_a.last_seen, bind_b.last_seen), "padded rows mutated predictor last_seen"
+        assert torch.equal(bind_a.born, bind_b.born), "padded rows mutated predictor born"
         assert torch.equal(bind_a.cooldown, bind_b.cooldown), "padded rows mutated predictor cooldown"
-        assert torch.equal(bind_a.state[24:28], bind_b.state[24:28]), "padded rows mutated step_clock"
+        assert torch.equal(bind_a.state[32:40], bind_b.state[32:40]), "padded rows mutated step_clock or last_enqueue_step"
         # Compare HBM shadow counters in queue_header[48:72] (predict_hits, predict_misses, predict_enqueues).
         assert torch.equal(bind_a.queue_header[48:72], bind_b.queue_header[48:72]), "padded rows mutated HBM counters"
-        assert int(bind_a.scores.sum().item()) > 0, "expected active rows to produce nonzero predictor scores"
+        assert int(bind_a.scores.sum().item()) > 0, "expected active rows to produce nonzero cold-miss scores"
     finally:
         mover_a.close()
         mover_b.close()
         for r in (*tier_a.regions, *tier_b.regions):
+            r.close()
+
+
+def _read_queue_tail_and_requests(queue_header: torch.Tensor, queue_ring: torch.Tensor) -> list[tuple[int, int, int, int]]:
+    head, tail, mask = struct.unpack_from("<III", bytes(queue_header[:12].cpu().tolist()), 0)
+    ring_bytes = bytes(queue_ring.cpu().tolist())
+    reqs = []
+    for idx in range(head, tail):
+        off = (idx & mask) * 16
+        reqs.append(struct.unpack_from("<IiiI", ring_bytes, off))
+    return reqs
+
+
+def _read_predictor_clocks(state: torch.Tensor) -> tuple[int, int]:
+    return struct.unpack_from("<2I", bytes(state[32:40].cpu().tolist()), 0)
+
+
+def _read_born_u32(born: torch.Tensor) -> list[int]:
+    return [int(v) & 0xFFFFFFFF for v in born.cpu().tolist()]
+
+
+def test_sm103_predictor_min_age_protection_and_physical_install_birth(sm103_pred_storage):
+    """Verify min_age_steps protects newly installed experts and born updates only on live_slot_map transitions."""
+    from ignition.components.megamoe import MegaMoeGeometry
+    from ignition.components.megamoe_tiers import MegaMoeDynamicHostTier
+    from ignition.components.megamoe_weights import allocate_mxfp4_weights
+    from ignition.components.sm103_expert_mover import PredictorConfig, SM103ExpertMoverRuntime
+
+    device = torch.device("cuda", 0)
+    E, HBM_SLOTS, TOP_K = 16, 5, 4
+    kernel_cache = Path("/tmp/flare-test-kcache")
+    geom = MegaMoeGeometry(E, 128, TOP_K, 128, 128, shared_experts=1)
+    tier = MegaMoeDynamicHostTier(
+        geom, hbm_slots=HBM_SLOTS, initial_hbm_experts=(0, 1, 2, 3),
+        storage=sm103_pred_storage, name="pred_age_tier",
+    )
+    hbm = allocate_mxfp4_weights(HBM_SLOTS, 128, 128, device=device)
+    mover = SM103ExpertMoverRuntime(
+        [(tier, hbm)], storage=sm103_pred_storage, kernel_cache=kernel_cache, worker_sm_count=8,
+        control_buffer_name="age_ctrl",
+    )
+    try:
+        cfg = PredictorConfig(
+            decay_shift=6, promote_threshold=256, min_age_steps=5,
+            interval_steps=1, cooldown_steps=1, max_enqueues=1,
+        )
+        (bind,) = mover.attach_predictors(cfg)
+
+        born_init = _read_born_u32(bind.born)
+        assert born_init[:4] == [0x80000000] * 4
+        assert born_init[4:] == [0] * (E - 4)
+        step0, last_enq0 = _read_predictor_clocks(bind.state)
+        assert step0 == 5 and last_enq0 == 0
+
+        def step_ids(expert_ids):
+            t = torch.tensor([expert_ids], dtype=torch.int64, device=device)
+            mover.binding.launch_layer_enter_predict(
+                tier.live_slot_map, tier.control, tier.layer_epoch, t,
+                1, TOP_K, E, bind.state, bind.queue_header, bind.queue_ring,
+                bind.metrics_ptr, bind.metrics_count,
+            )
+            torch.cuda.synchronize()
+
+        # Step 1: cold expert 4 misses while residents 1, 2, 3 are hit -> enqueues (in=4, victim=0).
+        step_ids([1, 2, 3, 4])
+        reqs = _read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)
+        assert len(reqs) == 1
+        assert reqs[0][:3] == (0, 4, 0)
+        # An unexecuted enqueue MUST NOT mark expert 4 as born/resident or clear expert 0's resident bit.
+        born_after_enq = _read_born_u32(bind.born)
+        assert born_after_enq[4] == 0
+        assert born_after_enq[0] == 0x80000000
+        assert int(bind.scores[4].item()) == 256
+
+        # Step 2: simulate physical swap completion by mover (evict 0, install 4 into slot 0).
+        tier.live_slot_map[0] = -1
+        tier.live_slot_map[4] = 0
+        step_ids([1, 2, 3, 4])
+        step2, _ = _read_predictor_clocks(bind.state)
+        born_after_install = _read_born_u32(bind.born)
+        assert born_after_install[0] == 0
+        assert born_after_install[4] == (0x80000000 | step2)
+        assert int(bind.last_seen[4].item()) == step2
+        assert int(bind.scores[4].item()) == 0
+
+        # Steps 3..6: hit 1, 2, 3 and cold expert 6 (expert 4 is the ONLY unhit resident, age = 1..4 < 5).
+        for expected_age in range(1, 5):
+            step_ids([1, 2, 3, 6])
+            cur_step, _ = _read_predictor_clocks(bind.state)
+            assert cur_step - step2 == expected_age
+            assert len(_read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)) == 1, (
+                f"newly installed expert 4 was evicted prematurely at age {expected_age} < min_age_steps=5"
+            )
+
+        # Step 7: expert 4 reaches age == 5 >= min_age_steps -> now evictable in favor of cold expert 6.
+        step_ids([1, 2, 3, 6])
+        reqs = _read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)
+        assert len(reqs) == 2
+        assert reqs[1][:3] == (0, 6, 4)
+
+        # Verify reset_runtime_state() syncs born to current live_slot_map and resets clocks.
+        mover.reset_runtime_state()
+        torch.cuda.synchronize()
+        born_reset = _read_born_u32(bind.born)
+        assert born_reset[0] == 0
+        assert born_reset[1] == 0x80000000 and born_reset[2] == 0x80000000
+        assert born_reset[3] == 0x80000000 and born_reset[4] == 0x80000000
+        assert _read_predictor_clocks(bind.state) == (5, 0)
+        assert int(bind.scores.sum().item()) == 0
+        assert int(bind.last_seen.sum().item()) == 0
+        assert int(bind.cooldown.sum().item()) == 0
+    finally:
+        mover.close()
+        for r in tier.regions:
+            r.close()
+
+
+def test_sm103_predictor_pure_lru_victim_ordering(sm103_pred_storage):
+    """Verify victim selection uses pure LRU (oldest last_seen) regardless of historical hit count."""
+    from ignition.components.megamoe import MegaMoeGeometry
+    from ignition.components.megamoe_tiers import MegaMoeDynamicHostTier
+    from ignition.components.megamoe_weights import allocate_mxfp4_weights
+    from ignition.components.sm103_expert_mover import PredictorConfig, SM103ExpertMoverRuntime
+
+    device = torch.device("cuda", 0)
+    E, HBM_SLOTS, TOP_K = 16, 5, 4
+    kernel_cache = Path("/tmp/flare-test-kcache")
+    geom = MegaMoeGeometry(E, 128, TOP_K, 128, 128, shared_experts=1)
+    tier = MegaMoeDynamicHostTier(
+        geom, hbm_slots=HBM_SLOTS, initial_hbm_experts=(0, 1, 2, 3),
+        storage=sm103_pred_storage, name="pred_lru_tier",
+    )
+    hbm = allocate_mxfp4_weights(HBM_SLOTS, 128, 128, device=device)
+    mover = SM103ExpertMoverRuntime(
+        [(tier, hbm)], storage=sm103_pred_storage, kernel_cache=kernel_cache, worker_sm_count=8,
+        control_buffer_name="lru_ctrl",
+    )
+    try:
+        cfg = PredictorConfig(
+            decay_shift=6, promote_threshold=256, min_age_steps=0,
+            interval_steps=1, cooldown_steps=1, max_enqueues=1,
+        )
+        (bind,) = mover.attach_predictors(cfg)
+
+        def step_rows(rows):
+            t = torch.tensor(rows, dtype=torch.int64, device=device)
+            mover.binding.launch_layer_enter_predict(
+                tier.live_slot_map, tier.control, tier.layer_epoch, t,
+                len(rows), TOP_K, E, bind.state, bind.queue_header, bind.queue_ring,
+                bind.metrics_ptr, bind.metrics_count,
+            )
+            torch.cuda.synchronize()
+
+        # Give expert 2 high hit frequency first, then touch 0, 3, 1 later so LRU order is 2 < 0 < 3 < 1.
+        step_rows([[2, 2, 2, 2], [2, 2, 2, 2], [2, 2, 2, 2], [2, 2, 2, 2]])
+        step_rows([[0, -1, -1, -1]])
+        step_rows([[3, -1, -1, -1]])
+        step_rows([[1, -1, -1, -1]])
+
+        # All residents are unhit on this step while cold expert 8 misses -> oldest last_seen is expert 2.
+        step_rows([[8, -1, -1, -1]])
+        reqs = _read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)
+        assert len(reqs) == 1
+        assert reqs[0][:3] == (0, 8, 2)
+
+        # Touch expert 2 to make it MRU while cold expert 9 misses -> next oldest last_seen is expert 0.
+        step_rows([[2, 9, -1, -1]])
+        reqs = _read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)
+        assert len(reqs) == 2
+        assert reqs[1][:3] == (0, 9, 0)
+
+        # Verify resident scores remain 0 (cold-miss-only scoring).
+        assert bind.scores[:4].cpu().tolist() == [0, 0, 0, 0]
+    finally:
+        mover.close()
+        for r in tier.regions:
+            r.close()
+
+
+def test_sm103_predictor_interval_steps_pacing(sm103_pred_storage):
+    """Verify interval_steps gates per-layer enqueue cadence while scores and last_seen update every active step."""
+    from ignition.components.megamoe import MegaMoeGeometry
+    from ignition.components.megamoe_tiers import MegaMoeDynamicHostTier
+    from ignition.components.megamoe_weights import allocate_mxfp4_weights
+    from ignition.components.sm103_expert_mover import PredictorConfig, SM103ExpertMoverRuntime
+
+    device = torch.device("cuda", 0)
+    E, HBM_SLOTS, TOP_K = 16, 5, 4
+    kernel_cache = Path("/tmp/flare-test-kcache")
+    geom = MegaMoeGeometry(E, 128, TOP_K, 128, 128, shared_experts=1)
+    tier = MegaMoeDynamicHostTier(
+        geom, hbm_slots=HBM_SLOTS, initial_hbm_experts=(0, 1, 2, 3),
+        storage=sm103_pred_storage, name="pred_interval_tier",
+    )
+    hbm = allocate_mxfp4_weights(HBM_SLOTS, 128, 128, device=device)
+    mover = SM103ExpertMoverRuntime(
+        [(tier, hbm)], storage=sm103_pred_storage, kernel_cache=kernel_cache, worker_sm_count=8,
+        control_buffer_name="interval_ctrl",
+    )
+    try:
+        cfg = PredictorConfig(
+            decay_shift=6, promote_threshold=256, min_age_steps=0,
+            interval_steps=4, cooldown_steps=1, max_enqueues=1,
+        )
+        (bind,) = mover.attach_predictors(cfg)
+
+        def step_ids(expert_ids):
+            t = torch.tensor([expert_ids], dtype=torch.int64, device=device)
+            mover.binding.launch_layer_enter_predict(
+                tier.live_slot_map, tier.control, tier.layer_epoch, t,
+                1, TOP_K, E, bind.state, bind.queue_header, bind.queue_ring,
+                bind.metrics_ptr, bind.metrics_count,
+            )
+            torch.cuda.synchronize()
+
+        # Step 1: initial enqueue is immediately allowed (init_clock=4, step_now=5, last_enqueue_step=0).
+        step_ids([1, 4, -1, -1])
+        step1, last_enq1 = _read_predictor_clocks(bind.state)
+        assert step1 == 5 and last_enq1 == 5
+        assert len(_read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)) == 1
+
+        # Steps 2, 3, 4 (delta = 1, 2, 3 < interval_steps=4): enqueue is gated, but last_seen and scores update.
+        step_ids([2, 5, -1, -1])
+        step2, last_enq2 = _read_predictor_clocks(bind.state)
+        assert step2 == 6 and last_enq2 == 5
+        assert int(bind.last_seen[2].item()) == 6
+        assert int(bind.scores[5].item()) == 256
+        assert len(_read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)) == 1
+
+        step_ids([3, 6, -1, -1])
+        step3, last_enq3 = _read_predictor_clocks(bind.state)
+        assert step3 == 7 and last_enq3 == 5
+        assert int(bind.last_seen[3].item()) == 7
+        assert int(bind.scores[6].item()) == 256
+        # Cold expert 5 decayed by 1/64 on step 3: 256 - (256 >> 6) = 252.
+        assert int(bind.scores[5].item()) == 252
+        assert len(_read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)) == 1
+
+        step_ids([1, 7, -1, -1])
+        step4, last_enq4 = _read_predictor_clocks(bind.state)
+        assert step4 == 8 and last_enq4 == 5
+        assert int(bind.last_seen[1].item()) == 8
+        assert int(bind.scores[7].item()) == 256
+        assert len(_read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)) == 1
+
+        # Step 5 (delta = 9 - 5 = 4 >= interval_steps=4): enqueue opens again and picks cold expert 8 with LRU victim 0.
+        step_ids([1, 8, -1, -1])
+        step5, last_enq5 = _read_predictor_clocks(bind.state)
+        assert step5 == 9 and last_enq5 == 9
+        reqs = _read_queue_tail_and_requests(bind.queue_header, bind.queue_ring)
+        assert len(reqs) == 2
+        assert reqs[1][:3] == (0, 8, 0)
+    finally:
+        mover.close()
+        for r in tier.regions:
             r.close()
 
 
@@ -353,7 +619,7 @@ def test_sm103_inline_predictor_kernel_latency_deepseek41_shape(sm103_pred_stora
         [(tier, hbm_pool)], storage=sm103_pred_storage, kernel_cache=kernel_cache, worker_sm_count=8
     )
     try:
-        (binding,) = mover.attach_predictors(PredictorConfig(max_enqueues=2, max_predict_rows=64))
+        (binding,) = mover.attach_predictors(PredictorConfig(max_enqueues=1, max_predict_rows=256))
         gen = torch.Generator(device="cpu").manual_seed(99)
         cap_s = torch.cuda.Stream(device=device)
         iters = 200
@@ -391,7 +657,7 @@ def test_sm103_inline_predictor_kernel_latency_deepseek41_shape(sm103_pred_stora
             lambda: mover.binding.launch_layer_enter(tier.live_slot_map, tier.control, tier.layer_epoch, E)
         )
         results = {}
-        for rows in (1, 16, 64, 1024, 8192):
+        for rows in (1, 16, 64, 256, 1024, 8192):
             ids_hit = torch.stack([torch.randperm(288, generator=gen)[:TOP_K] for _ in range(rows)]).to(torch.int64).to(device).contiguous()
             ids_miss = torch.stack([torch.randperm(E, generator=gen)[:TOP_K] for _ in range(rows)]).to(torch.int64).to(device).contiguous()
             hit_us = measure_graph(
@@ -416,7 +682,7 @@ def test_sm103_inline_predictor_kernel_latency_deepseek41_shape(sm103_pred_stora
         print(f"\n[Predictor Latency (Graph) E={E} top_k={TOP_K}] base_enter={base_us:.2f} us | {summary}")
         assert results[16][0] < 8.0, f"rows=16 steady hit too slow: {results[16][0]:.2f} us"
         assert results[16][1] < 12.0, f"rows=16 active miss too slow: {results[16][1]:.2f} us"
-        # Prefill chunks above max_predict_rows=64 skip route tallying and pay only Dekker snapshot latency.
+        # Prefill chunks above max_predict_rows=256 skip route tallying and pay only Dekker snapshot latency.
         assert results[8192][1] < 6.0, f"rows=8192 prefill bypass too slow: {results[8192][1]:.2f} us"
     finally:
         mover.close()

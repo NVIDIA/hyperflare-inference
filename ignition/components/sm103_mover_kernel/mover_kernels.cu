@@ -15,7 +15,8 @@
 
 namespace flare::sm103_mover {
 
-static constexpr uint32_t kTmaChunkBytes = 32768u; // 32 KiB x 2 stages = 64 KiB dynamic SMEM
+static constexpr uint32_t kTmaChunkBytes = 32768u; // 32 KiB x 4 stages = 128 KiB dynamic SMEM
+static constexpr uint32_t kTmaStages = 4u;
 
 struct alignas(64) LayerMoverDesc {
     uint64_t host_planes[4];     // HOST_NUMA base pointers: gate_up, gate_up_sf, down, down_sf
@@ -63,22 +64,25 @@ struct alignas(64) MoverQueueHeader {
 static_assert(sizeof(MoverQueueHeader) == 80 || sizeof(MoverQueueHeader) == 128, "MoverQueueHeader layout mismatch");
 
 struct alignas(64) PredictorLayerState {
-    uint64_t scores;            // uint32_t[num_experts] fixed-point decayed frequency (1 hit = 256)
-    uint64_t last_seen;         // uint32_t[num_experts] monotonic step clock of last active hit
-    uint64_t cooldown;          // uint32_t[num_experts] monotonic step clock of last enqueue
-    uint32_t step_clock;        // initialized >= cooldown_steps; incremented only on active steps
+    uint64_t scores;            // uint32_t[num_host_experts] fixed-point decayed cold-miss score (1 cold miss = 256)
+    uint64_t last_seen;         // uint32_t[num_host_experts] monotonic step clock of last HBM hit or physical install
+    uint64_t born;              // uint32_t[num_host_experts] bit 31 = was_resident, bits 0..30 = install step clock
+    uint64_t cooldown;          // uint32_t[num_host_experts] monotonic step clock of last enqueue
+    uint32_t step_clock;        // initialized >= max(1, cooldown_steps, min_age_steps, interval_steps); incremented on active steps
+    uint32_t last_enqueue_step; // monotonic step clock of the most recent enqueue wave for this layer
     uint32_t layer_idx;
-    uint32_t decay_shift;       // e.g. 4 -> score -= score >> 4 (0.9375x decay per active step)
-    uint32_t promote_threshold; // fixed-point threshold (256 = 1 hit, 384 = 1.5 hits)
-    uint32_t hysteresis;        // minimum score margin above victim to enqueue swap
-    uint32_t cooldown_steps;    // minimum steps before re-enqueuing the same cold expert
+    uint32_t decay_shift;       // e.g. 6 -> score -= score >> 6 (64-step exponential decay window)
+    uint32_t promote_threshold; // fixed-point cold-miss score threshold (256 = 1.0 miss)
+    uint32_t min_age_steps;     // minimum resident age in active steps before a newly installed expert is evictable
+    uint32_t interval_steps;    // minimum active steps between enqueue waves for this layer
+    uint32_t cooldown_steps;    // minimum active steps before re-enqueuing the same cold expert
     uint32_t max_enqueues;      // cap on swap requests enqueued per layer invocation (<= 4)
     uint32_t max_predict_rows;  // skip scoring/enqueueing when num_rows > max_predict_rows
     uint32_t num_host_experts;  // movable host-backed experts [0, num_host_experts); >= num_host_experts are pinned HBM-only
-    uint32_t _pad;
+    uint32_t _pad[13];
 };
 
-static_assert(sizeof(PredictorLayerState) == 64, "PredictorLayerState layout mismatch");
+static_assert(sizeof(PredictorLayerState) == 128, "PredictorLayerState layout mismatch");
 
 __device__ __forceinline__ void worker_grid_barrier(MoverQueueHeader* hdr, uint32_t& local_sense) {
     __syncthreads();
@@ -141,6 +145,83 @@ __global__ void sm103_layer_enter_kernel(
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+    }
+}
+
+__global__ void sm103_layer_enter_staged_kernel(
+    const int32_t* __restrict__ live_slot_map,
+    const int32_t* __restrict__ base_control,
+    int32_t* __restrict__ staged_control,
+    uint32_t* __restrict__ layer_epoch,
+    const int32_t* __restrict__ staged_mask,
+    uint64_t staged_plane0,
+    uint64_t staged_plane1,
+    uint64_t staged_plane2,
+    uint64_t staged_plane3,
+    uint32_t num_experts,
+    uint32_t num_host_experts,
+    uint32_t min_cold
+) {
+    if (blockIdx.x != 0) return;
+
+    // Dekker half 1: mark layer ACTIVE (even -> odd) and fence SC before reading live_slot_map.
+    if (threadIdx.x == 0) {
+        uint32_t old_ep;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"
+                     : "=r"(old_ep) : "l"(layer_epoch) : "memory");
+        asm volatile("fence.sc.gpu;" ::: "memory");
+    }
+    __syncthreads();
+
+    __shared__ uint32_t s_staged_count;
+    __shared__ uint32_t s_missed;
+    if (threadIdx.x == 0) {
+        s_staged_count = 0u;
+        s_missed = 0u;
+    }
+    if (threadIdx.x < 16u) {
+        staged_control[threadIdx.x] = base_control[threadIdx.x];
+    }
+    __syncthreads();
+
+    const uint32_t host_limit = num_host_experts <= num_experts ? num_host_experts : num_experts;
+    int32_t* active_slot_map = staged_control + 16;
+    uint32_t local_staged = 0u;
+    uint32_t local_missed = 0u;
+    for (uint32_t e = threadIdx.x; e < num_experts; e += blockDim.x) {
+        int32_t slot = -1;
+        asm volatile("ld.acquire.gpu.global.s32 %0, [%1];"
+                     : "=r"(slot) : "l"(live_slot_map + e) : "memory");
+        active_slot_map[e] = slot;
+        if (e < host_limit) {
+            const int32_t present = staged_mask[e];
+            if (present != 0) {
+                local_staged += 1u;
+            } else if (slot < 0) {
+                // Rare race: background mover evicted expert e between stager.start() and Dekker enter.
+                // Fall back to mapped-host pointers for this layer invocation so output stays bit-exact.
+                local_missed = 1u;
+            }
+        }
+    }
+    if (local_staged > 0u) {
+        atomicAdd(&s_staged_count, local_staged);
+    }
+    if (local_missed != 0u) {
+        atomicOr(&s_missed, 1u);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        if (s_missed == 0u && s_staged_count >= min_cold) {
+            uint64_t* hdr64 = reinterpret_cast<uint64_t*>(staged_control);
+            hdr64[1] = staged_plane0;
+            hdr64[2] = staged_plane1;
+            hdr64[3] = staged_plane2;
+            hdr64[4] = staged_plane3;
+        }
         asm volatile("fence.proxy.async.global;" ::: "memory");
         asm volatile("fence.acq_rel.gpu;" ::: "memory");
     }
@@ -269,21 +350,24 @@ __global__ void sm103_layer_enter_predict_kernel(
         }
         __syncthreads();
 
-        // 4. Update decayed frequency & recency ONLY when at least one active route occurred.
+        // 4. Update decayed cold-miss scores, birth stamps, and HBM recency ONLY when at least one active route occurred.
         if (s_active_routes > 0u) {
             const uint32_t step_now = pred->step_clock + 1u;
             uint32_t* scores = reinterpret_cast<uint32_t*>(pred->scores);
             uint32_t* last_seen = reinterpret_cast<uint32_t*>(pred->last_seen);
+            uint32_t* born = reinterpret_cast<uint32_t*>(pred->born);
             uint32_t* cooldown = reinterpret_cast<uint32_t*>(pred->cooldown);
 
-            // Parallel score/recency update and candidate key evaluation across all 256 threads.
+            // Parallel decayed-miss LRU state update and candidate key evaluation across all 256 threads.
             // Cold key (maximize): ((uint64_t)sc << 32) | (uint64_t)(e + 1), 0 = ineligible.
-            // Victim key (minimize): ((uint64_t)sc << 32) | ((uint64_t)(ls & 0x3FFFFFu) << 10) | e, ~0ull = ineligible.
+            // Victim key (minimize): ((uint64_t)last_seen[e] << 32) | (uint64_t)e, ~0ull = ineligible.
             uint64_t my_cold_key = 0ull;
             uint64_t my_vic_key = ~0ull;
-            const bool eval_swap = (s_host_misses > 0u && pred->max_enqueues > 0u);
+            const bool eval_swap = (s_host_misses > 0u && pred->max_enqueues > 0u &&
+                                    (step_now - pred->last_enqueue_step) >= pred->interval_steps);
             const uint32_t decay_shift = pred->decay_shift;
             const uint32_t promote_threshold = pred->promote_threshold;
+            const uint32_t min_age_steps = pred->min_age_steps;
             const uint32_t cooldown_steps = pred->cooldown_steps;
             const uint32_t host_limit =
                 (pred->num_host_experts > 0u && pred->num_host_experts <= num_experts)
@@ -291,32 +375,51 @@ __global__ void sm103_layer_enter_predict_kernel(
                     : num_experts;
 
             for (uint32_t e = threadIdx.x; e < host_limit; e += blockDim.x) {
-                uint32_t sc = scores[e];
-                if (decay_shift > 0u && decay_shift < 31u) {
-                    sc = sc - (sc >> decay_shift);
-                }
+                const int32_t slot = s_slot[e];
                 const uint32_t hits = s_hits[e];
-                if (hits > 0u) {
-                    const uint32_t capped = hits < 16u ? hits : 16u;
-                    const uint32_t boost = capped << 8;
-                    sc = (sc + boost < 0x7FFFFFFFu) ? (sc + boost) : 0x7FFFFFFFu;
-                    last_seen[e] = step_now;
-                }
-                scores[e] = sc;
+                uint32_t b = born[e];
+                uint32_t sc = scores[e];
 
-                if (eval_swap) {
-                    if (s_slot[e] < 0) {
-                        if (hits > 0u && sc >= promote_threshold &&
-                            (step_now - cooldown[e]) >= cooldown_steps) {
-                            const uint64_t ck = (static_cast<uint64_t>(sc) << 32) | static_cast<uint64_t>(e + 1u);
-                            if (ck > my_cold_key) my_cold_key = ck;
+                if (slot >= 0) {
+                    uint32_t ls = last_seen[e];
+                    if ((b & 0x80000000u) == 0u) {
+                        // Physical installation into HBM just became visible: stamp birth step and initial recency.
+                        b = 0x80000000u | (step_now & 0x7FFFFFFFu);
+                        born[e] = b;
+                        ls = step_now;
+                        last_seen[e] = ls;
+                    } else if (hits > 0u) {
+                        ls = step_now;
+                        last_seen[e] = ls;
+                    }
+                    if (sc != 0u) {
+                        scores[e] = 0u;
+                    }
+                    if (eval_swap && hits == 0u) {
+                        const uint32_t age = (step_now - (b & 0x7FFFFFFFu)) & 0x7FFFFFFFu;
+                        if (age >= min_age_steps) {
+                            const uint64_t vk = (static_cast<uint64_t>(ls) << 32) | static_cast<uint64_t>(e);
+                            if (vk < my_vic_key) my_vic_key = vk;
                         }
-                    } else if (hits == 0u) {
-                        const uint32_t ls = last_seen[e];
-                        const uint64_t vk = (static_cast<uint64_t>(sc) << 32) |
-                                            (static_cast<uint64_t>(ls & 0x003FFFFFu) << 10) |
-                                            static_cast<uint64_t>(e);
-                        if (vk < my_vic_key) my_vic_key = vk;
+                    }
+                } else {
+                    if ((b & 0x80000000u) != 0u) {
+                        // Physical eviction from HBM just became visible: clear resident flag.
+                        born[e] = 0u;
+                    }
+                    if (decay_shift > 0u && decay_shift < 31u) {
+                        sc = sc - (sc >> decay_shift);
+                    }
+                    if (hits > 0u) {
+                        const uint32_t capped = hits < 16u ? hits : 16u;
+                        const uint32_t boost = capped << 8;
+                        sc = (sc + boost < 0x7FFFFFFFu) ? (sc + boost) : 0x7FFFFFFFu;
+                    }
+                    scores[e] = sc;
+                    if (eval_swap && hits > 0u && sc >= promote_threshold &&
+                        (step_now - cooldown[e]) >= cooldown_steps) {
+                        const uint64_t ck = (static_cast<uint64_t>(sc) << 32) | static_cast<uint64_t>(e + 1u);
+                        if (ck > my_cold_key) my_cold_key = ck;
                     }
                 }
             }
@@ -403,16 +506,10 @@ __global__ void sm103_layer_enter_predict_kernel(
                     const uint32_t pairs = n_cold < n_vic ? n_cold : n_vic;
                     int32_t enq_cold[4];
                     int32_t enq_vic[4];
-                    uint32_t n_valid = 0u;
+                    uint32_t n_valid = pairs;
                     for (uint32_t p = 0u; p < pairs; ++p) {
-                        const uint32_t cold_score = static_cast<uint32_t>(top_cold[p] >> 32);
-                        const uint32_t vic_score = static_cast<uint32_t>(top_vic[p] >> 32);
-                        if (cold_score < vic_score + pred->hysteresis) {
-                            break;
-                        }
-                        enq_cold[n_valid] = static_cast<int32_t>((top_cold[p] & 0xFFFFFFFFull) - 1ull);
-                        enq_vic[n_valid] = static_cast<int32_t>(top_vic[p] & 0x3FFull);
-                        n_valid += 1u;
+                        enq_cold[p] = static_cast<int32_t>((top_cold[p] & 0xFFFFFFFFull) - 1ull);
+                        enq_vic[p] = static_cast<int32_t>(top_vic[p] & 0xFFFFFFFFull);
                     }
 
                     uint32_t base_idx = 0u;
@@ -428,6 +525,7 @@ __global__ void sm103_layer_enter_predict_kernel(
                             rslot->victim_expert = enq_vic[p];
                             cooldown[enq_cold[p]] = step_now;
                         }
+                        pred->last_enqueue_step = step_now;
                         asm volatile("fence.acq_rel.gpu;" ::: "memory");
                         for (uint32_t p = 0u; p < n_valid; ++p) {
                             MoverRequest* rslot = queue_ring + ((base_idx + p) & mask);
@@ -502,20 +600,24 @@ __global__ void sm103_persistent_mover_kernel(
     uint32_t metrics_count
 ) {
     extern __shared__ __align__(128) uint8_t smem[];
-    __shared__ __align__(8) uint64_t mbar[2];
-    uint8_t* buf[2] = {smem, smem + kTmaChunkBytes};
+    __shared__ __align__(8) uint64_t mbar[kTmaStages];
+    uint8_t* buf[kTmaStages];
+    #pragma unroll
+    for (uint32_t s = 0u; s < kTmaStages; ++s) {
+        buf[s] = smem + s * kTmaChunkBytes;
+    }
 
     if (threadIdx.x == 0) {
-        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
-                     :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&mbar[0]))));
-        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
-                     :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&mbar[1]))));
+        #pragma unroll
+        for (uint32_t s = 0u; s < kTmaStages; ++s) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
+                         :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&mbar[s]))));
+        }
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
     __syncthreads();
 
-    uint32_t phase[2] = {0u, 0u};
-    int stage = 0;
+    uint32_t phase[kTmaStages] = {0u, 0u, 0u, 0u};
     uint32_t local_sense = 0u;
     uint64_t swaps_completed = 0ull;
     uint64_t bytes_copied = 0ull;
@@ -683,47 +785,85 @@ __global__ void sm103_persistent_mover_kernel(
         asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(spare_slot) : "l"(&hdr->active_spare_slot) : "memory");
         const LayerMoverDesc& L = layers[layer_idx];
 
-        // Step 3: Parallel 8-SM double-buffered 1D TMA copy across all 4 MXFP4 planes.
+        // Step 3: Parallel 8-SM 4-stage pipelined 1D TMA copy across all 4 MXFP4 planes.
+        // Keeps up to 3 NVLink-C2C 32 KiB loads in flight per SM while overlapping HBM stores.
         if (threadIdx.x == 0) {
+            uint32_t plane_chunks[4];
+            uint32_t plane_prefix[5];
+            plane_prefix[0] = 0u;
+            #pragma unroll
             for (int p = 0; p < 4; ++p) {
-                const uint64_t row_bytes = L.plane_row_bytes[p];
-                if (row_bytes == 0ull) continue;
-                const uint32_t num_chunks = static_cast<uint32_t>((row_bytes + kTmaChunkBytes - 1ull) / kTmaChunkBytes);
-                const uint8_t* src_base = reinterpret_cast<const uint8_t*>(L.host_planes[p]) +
-                                          static_cast<uint64_t>(expert_in) * row_bytes;
-                uint8_t* dst_base = reinterpret_cast<uint8_t*>(L.hbm_planes[p]) +
-                                    static_cast<uint64_t>(spare_slot) * row_bytes;
-                for (uint32_t ch = blockIdx.x; ch < num_chunks; ch += gridDim.x) {
-                    const uint64_t off = static_cast<uint64_t>(ch) * kTmaChunkBytes;
-                    const uint64_t rem = row_bytes - off;
-                    const uint32_t chunk_bytes = static_cast<uint32_t>(rem < kTmaChunkBytes ? rem : kTmaChunkBytes);
-                    const uint32_t s_addr = static_cast<uint32_t>(__cvta_generic_to_shared(buf[stage]));
-                    const uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&mbar[stage]));
+                const uint64_t rb = L.plane_row_bytes[p];
+                plane_chunks[p] = rb == 0ull ? 0u : static_cast<uint32_t>((rb + kTmaChunkBytes - 1ull) / kTmaChunkBytes);
+                plane_prefix[p + 1] = plane_prefix[p] + plane_chunks[p];
+            }
+            const uint32_t total_chunks = plane_prefix[4];
 
-                    asm volatile("cp.async.bulk.wait_group.read 1;");
+            uint8_t* pending_dst[kTmaStages];
+            uint32_t pending_bytes[kTmaStages];
+            uint32_t iter = 0u;
+
+            auto issue_store = [&](uint32_t st) {
+                const uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&mbar[st]));
+                uint32_t done = 0u;
+                do {
                     asm volatile(
-                        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
-                        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%2], [%3], %1, [%0];\n"
-                        :: "r"(b_addr), "r"(chunk_bytes), "r"(s_addr), "l"(src_base + off) : "memory"
+                        "{ .reg .pred p; "
+                        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2; "
+                        "selp.b32 %0, 1, 0, p; }"
+                        : "=r"(done) : "r"(b_addr), "r"(phase[st]) : "memory"
                     );
-                    uint32_t done = 0u;
-                    do {
-                        asm volatile(
-                            "{ .reg .pred p; "
-                            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2; "
-                            "selp.b32 %0, 1, 0, p; }"
-                            : "=r"(done) : "r"(b_addr), "r"(phase[stage]) : "memory"
-                        );
-                    } while (!done);
-                    phase[stage] ^= 1u;
-                    asm volatile("fence.proxy.async.shared::cta;");
-                    asm volatile(
-                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n"
-                        "cp.async.bulk.commit_group;\n"
-                        :: "l"(dst_base + off), "r"(s_addr), "r"(chunk_bytes) : "memory"
-                    );
-                    stage ^= 1;
+                } while (!done);
+                phase[st] ^= 1u;
+                asm volatile("fence.proxy.async.shared::cta;");
+                const uint32_t s_addr = static_cast<uint32_t>(__cvta_generic_to_shared(buf[st]));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n"
+                    "cp.async.bulk.commit_group;\n"
+                    :: "l"(pending_dst[st]), "r"(s_addr), "r"(pending_bytes[st]) : "memory"
+                );
+            };
+
+            for (uint32_t gch = blockIdx.x; gch < total_chunks; gch += gridDim.x) {
+                int p = 0;
+                if (gch >= plane_prefix[2]) {
+                    p = (gch >= plane_prefix[3]) ? 3 : 2;
+                } else {
+                    p = (gch >= plane_prefix[1]) ? 1 : 0;
                 }
+                const uint32_t local_ch = gch - plane_prefix[p];
+                const uint64_t row_bytes = L.plane_row_bytes[p];
+                const uint64_t off = static_cast<uint64_t>(local_ch) * kTmaChunkBytes;
+                const uint64_t rem = row_bytes - off;
+                const uint32_t chunk_bytes = static_cast<uint32_t>(rem < kTmaChunkBytes ? rem : kTmaChunkBytes);
+                const uint8_t* src_ptr = reinterpret_cast<const uint8_t*>(L.host_planes[p]) +
+                                         static_cast<uint64_t>(expert_in) * row_bytes + off;
+                uint8_t* dst_ptr = reinterpret_cast<uint8_t*>(L.hbm_planes[p]) +
+                                   static_cast<uint64_t>(spare_slot) * row_bytes + off;
+
+                const uint32_t st = iter & (kTmaStages - 1u);
+                if (iter >= kTmaStages) {
+                    // At most 1 committed bulk_group (iter - 2) may still read SMEM; iter - 4 (same stage st) is done.
+                    asm volatile("cp.async.bulk.wait_group.read 1;");
+                }
+                const uint32_t s_addr = static_cast<uint32_t>(__cvta_generic_to_shared(buf[st]));
+                const uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&mbar[st]));
+                pending_dst[st] = dst_ptr;
+                pending_bytes[st] = chunk_bytes;
+                asm volatile(
+                    "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
+                    "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%2], [%3], %1, [%0];\n"
+                    :: "r"(b_addr), "r"(chunk_bytes), "r"(s_addr), "l"(src_ptr) : "memory"
+                );
+                if (iter >= 2u) {
+                    issue_store((iter - 2u) & (kTmaStages - 1u));
+                }
+                iter += 1u;
+            }
+            // Drain final 1-2 in-flight loads and emit their HBM stores.
+            const uint32_t drain_start = iter >= 2u ? (iter - 2u) : 0u;
+            for (uint32_t d = drain_start; d < iter; ++d) {
+                issue_store(d & (kTmaStages - 1u));
             }
             asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
             asm volatile("fence.proxy.async.global;" ::: "memory");
@@ -845,6 +985,48 @@ void launch_layer_enter_predict(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void launch_layer_enter_staged(
+    torch::Tensor live_slot_map,
+    torch::Tensor base_control,
+    torch::Tensor staged_control,
+    torch::Tensor layer_epoch,
+    torch::Tensor staged_mask,
+    torch::Tensor plane0,
+    torch::Tensor plane1,
+    torch::Tensor plane2,
+    torch::Tensor plane3,
+    int num_experts,
+    int num_host_experts,
+    int min_cold
+) {
+    TORCH_CHECK(live_slot_map.is_cuda() && live_slot_map.scalar_type() == torch::kInt && live_slot_map.is_contiguous());
+    TORCH_CHECK(base_control.is_cuda() && base_control.scalar_type() == torch::kInt && base_control.is_contiguous());
+    TORCH_CHECK(staged_control.is_cuda() && staged_control.scalar_type() == torch::kInt && staged_control.is_contiguous());
+    TORCH_CHECK(layer_epoch.is_cuda() && layer_epoch.is_contiguous() && layer_epoch.numel() >= 1);
+    TORCH_CHECK(staged_mask.is_cuda() && staged_mask.scalar_type() == torch::kInt && staged_mask.is_contiguous());
+    TORCH_CHECK(plane0.is_cuda() && plane1.is_cuda() && plane2.is_cuda() && plane3.is_cuda());
+    TORCH_CHECK(num_experts > 0 && num_host_experts > 0 && num_host_experts <= num_experts && min_cold >= 1);
+    TORCH_CHECK(live_slot_map.numel() >= num_experts && base_control.numel() >= 16 + num_experts &&
+                staged_control.numel() >= 16 + num_experts && staged_mask.numel() >= num_host_experts);
+    const c10::cuda::CUDAGuard device_guard(live_slot_map.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    sm103_layer_enter_staged_kernel<<<1, 256, 0, stream>>>(
+        live_slot_map.data_ptr<int32_t>(),
+        base_control.data_ptr<int32_t>(),
+        staged_control.data_ptr<int32_t>(),
+        reinterpret_cast<uint32_t*>(layer_epoch.data_ptr()),
+        staged_mask.data_ptr<int32_t>(),
+        reinterpret_cast<uint64_t>(plane0.data_ptr()),
+        reinterpret_cast<uint64_t>(plane1.data_ptr()),
+        reinterpret_cast<uint64_t>(plane2.data_ptr()),
+        reinterpret_cast<uint64_t>(plane3.data_ptr()),
+        static_cast<uint32_t>(num_experts),
+        static_cast<uint32_t>(num_host_experts),
+        static_cast<uint32_t>(min_cold)
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void launch_enqueue_swap(
     torch::Tensor queue_header,
     torch::Tensor queue_ring,
@@ -893,7 +1075,7 @@ void launch_enqueue_swap_batch(
 }
 
 void configure_persistent_mover() {
-    const size_t smem_bytes = 2u * kTmaChunkBytes;
+    const size_t smem_bytes = kTmaStages * kTmaChunkBytes;
     cudaError_t err = cudaFuncSetAttribute(
         sm103_persistent_mover_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -923,7 +1105,7 @@ void launch_persistent_mover(
     cudaStream_t stream = stream_handle != 0
         ? reinterpret_cast<cudaStream_t>(stream_handle)
         : c10::cuda::getCurrentCUDAStream().stream();
-    const size_t smem_bytes = 2u * kTmaChunkBytes;
+    const size_t smem_bytes = kTmaStages * kTmaChunkBytes;
     sm103_persistent_mover_kernel<<<static_cast<uint32_t>(worker_sm_count), 32, smem_bytes, stream>>>(
         reinterpret_cast<LayerMoverDesc*>(layer_descs.data_ptr()),
         static_cast<uint32_t>(num_layers),
@@ -952,6 +1134,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("configure_persistent_mover", &flare::sm103_mover::configure_persistent_mover);
     m.def("launch_layer_enter", &flare::sm103_mover::launch_layer_enter);
     m.def("launch_layer_enter_predict", &flare::sm103_mover::launch_layer_enter_predict);
+    m.def("launch_layer_enter_staged", &flare::sm103_mover::launch_layer_enter_staged);
     m.def("launch_enqueue_swap", &flare::sm103_mover::launch_enqueue_swap);
     m.def("launch_enqueue_swap_batch", &flare::sm103_mover::launch_enqueue_swap_batch);
     m.def("launch_persistent_mover", &flare::sm103_mover::launch_persistent_mover);
