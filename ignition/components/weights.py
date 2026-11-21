@@ -1757,11 +1757,13 @@ class DirectWeightLoader:
                     if encoding == "csf_32x2_v1" else (f"{quantization}_csf_fixed", f"{quantization}_csf_exceptions"))
         components = [tuple(self._sources[f"{prefix}.{suffix}"] for suffix in suffixes) for prefix in prefixes]
         copy = self._session
-        if encoding == "csf" and quantization == "mxfp4":
+        if encoding == "csf" and components[0][0].ndim == 1:
             from types import SimpleNamespace
+            from ignition.preparation.csf_checkpoint import FORMATS
 
-            # Lossless MXFP4 checkpoints store each slab stream flat; this view changes only metadata.
-            components = [(fixed.reshape(rows // 16, 16 * (1 + (columns + 7) // 8)), exceptions)
+            # Lossless containers store each slab stream flat. This view changes only metadata.
+            container = next(entry for entry in FORMATS.values() if entry.quantization == quantization)
+            components = [(fixed.reshape(rows // 16, container.slab_bytes(columns)), exceptions)
                           for fixed, exceptions in components]
             # Direct transfers validate the original checkpoint geometry. Only the destination
             # needs the slab shape; source byte streams remain whole, unmodified flat tensors.

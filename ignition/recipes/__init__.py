@@ -61,7 +61,10 @@ def _csf_container(snapshot: Path):
     if not path.is_file():
         return None
     value = json.loads(path.read_text())
-    return value if isinstance(value, dict) and value.get("schema") == "lil-mxfp4-csf-checkpoint/1" else None
+    from ignition.preparation.csf_checkpoint import FORMATS
+
+    schema = value.get("schema") if isinstance(value, dict) else None
+    return value if isinstance(schema, str) and schema in FORMATS else None
 
 
 def _csf_stored_bytes(container, snapshot):
