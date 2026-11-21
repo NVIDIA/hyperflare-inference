@@ -232,6 +232,71 @@ fn fixed_bytes(core: &Core, integrated: bool) -> Result<u64> {
         })
 }
 
+fn has_persistent_worker(core: &Core) -> bool {
+    core.execution
+        .as_ref()
+        .and_then(|execution| execution.persistent_worker.as_ref())
+        .is_some()
+}
+
+pub(super) fn mapped_host_bytes(core: &Core) -> Result<u64> {
+    core.allocations
+        .iter()
+        .filter(|a| a.sizing.is_none() && matches!(a.memory, Memory::MappedHost))
+        .try_fold(0u64, |total, a| {
+            total
+                .checked_add(a.nbytes as u64)
+                .ok_or_else(|| invalid("mapped host memory overflows host address space"))
+        })
+}
+
+pub(super) fn available_host_memory() -> Result<u64> {
+    #[cfg(unix)]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?;
+        Ok(shared_available(&meminfo, usize::MAX)? as u64)
+    }
+    #[cfg(windows)]
+    {
+        commit_available()
+    }
+}
+
+pub(super) fn check_host_memory_fit(required: u64, available: u64) -> Result<()> {
+    if required > available {
+        return Err(invalid(format!(
+            "core needs {required} mapped host bytes; only {available} are free"
+        )));
+    }
+    Ok(())
+}
+
+fn check_worker_host_memory_limit(
+    cores: &[Core],
+    integrated: &[bool],
+    embedding_host_bytes: u64,
+    available: impl FnOnce() -> Result<u64>,
+) -> Result<()> {
+    let discrete_mapped_host = cores
+        .iter()
+        .zip(integrated)
+        .filter(|(core, is_integrated)| !**is_integrated && has_persistent_worker(core))
+        .try_fold(0u64, |total, (core, _)| {
+            mapped_host_bytes(core).and_then(|bytes| {
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid("mapped host memory overflows host address space"))
+            })
+        })?;
+    if discrete_mapped_host == 0 {
+        return Ok(());
+    }
+    let required = discrete_mapped_host
+        .checked_add(embedding_host_bytes)
+        .ok_or_else(|| invalid("host model memory overflows host address space"))?;
+    check_host_memory_fit(required, available()?)
+}
+
 fn limited_budget(
     memory: MemorySnapshot,
     loaded: u64,
@@ -514,7 +579,8 @@ fn capacities(
 }
 
 impl NativeModel {
-    /// Refuse an occupied limit smaller than the known fixed model storage before loading it.
+    /// Refuse an occupied limit smaller than the known fixed model storage before loading it,
+    /// and refuse discrete-GPU persistent-worker mapped-host allocations exceeding available host memory.
     pub(super) unsafe fn check_memory_limit(
         &self,
         cores: &[Core],
@@ -522,6 +588,13 @@ impl NativeModel {
         initial: &[MemorySnapshot],
         embedding_host_bytes: u64,
     ) -> Result<()> {
+        let integrated: Vec<bool> = self.ranks.iter().map(|r| r.integrated).collect();
+        check_worker_host_memory_limit(
+            cores,
+            &integrated,
+            embedding_host_bytes,
+            available_host_memory,
+        )?;
         if !matches!(
             options.memory_limit,
             Some(MemoryLimit::Bytes(_) | MemoryLimit::Fraction(_))
@@ -1621,6 +1694,118 @@ mod tests {
         }
         assert!(capacities(&cores, &[1 << 30, 1 << 20], 4, 6, 64, limit, |_, _| Some(0)).is_err());
         assert!(capacities(&cores, &[1 << 30, 20 << 20], 4, 6, 64, None, |_, _| Some(0)).is_err());
+    }
+
+    #[test]
+    fn mapped_host_allocations_are_counted_in_shared_and_worker_host_budgets() {
+        use super::super::protobuf::wire;
+
+        let gib = 1u64 << 30;
+        let build_core = |with_worker: bool| {
+            let mut p = core(65536, 1 << 20, 1000);
+            p.allocations.push(Allocation {
+                name: "weights".into(),
+                nbytes: (10 * gib) as usize,
+                alignment: 65536,
+                file: None,
+                data_spans: vec![],
+                sources: vec![],
+                relocations: vec![],
+                address: Some(0x2000_0000_0000),
+                memory: Memory::Device,
+                sizing: None,
+            });
+            p.allocations.push(Allocation {
+                name: "host_numa_region".into(),
+                nbytes: (12 * gib) as usize,
+                alignment: 4096,
+                file: None,
+                data_spans: vec![],
+                sources: vec![],
+                relocations: vec![],
+                address: Some(0x2400_0000_0000),
+                memory: Memory::MappedHost,
+                sizing: None,
+            });
+            p.allocations.push(Allocation {
+                name: "peer_region".into(),
+                nbytes: (4 * gib) as usize,
+                alignment: 65536,
+                file: None,
+                data_spans: vec![],
+                sources: vec![],
+                relocations: vec![],
+                address: Some(0x2800_0000_0000),
+                memory: Memory::Peer,
+                sizing: None,
+            });
+            if with_worker {
+                p.execution = Some(wire::Execution {
+                    persistent_worker: Some(wire::PersistentWorker {
+                        worker_sm_count: 8,
+                        graph: "worker".into(),
+                        stop_flag_buffer: "host_numa_region".into(),
+                        stop_flag_offset: 0,
+                    }),
+                    ..Default::default()
+                });
+            }
+            p
+        };
+        let non_worker = build_core(false);
+        let worker = build_core(true);
+        assert_eq!(fixed_bytes(&non_worker, false).unwrap(), 10 * gib);
+        assert_eq!(fixed_bytes(&non_worker, true).unwrap(), 22 * gib);
+        assert_eq!(mapped_host_bytes(&non_worker).unwrap(), 12 * gib);
+        // Integrated GPUs charge MappedHost against the unified MemoryLimit.
+        let memory = MemorySnapshot {
+            free: 64 * gib,
+            total: 128 * gib,
+        };
+        assert!(
+            limited_budget(
+                memory,
+                fixed_bytes(&non_worker, true).unwrap(),
+                Some(MemoryLimit::Bytes(20 * gib)),
+                HEADROOM_BYTES,
+                true,
+                0,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            limited_budget(
+                memory,
+                fixed_bytes(&non_worker, true).unwrap(),
+                Some(MemoryLimit::Bytes(30 * gib)),
+                HEADROOM_BYTES,
+                true,
+                0,
+            )
+            .unwrap(),
+            6 * gib - HEADROOM_BYTES
+        );
+        // Non-worker discrete cores bypass the persistent-worker host-RAM check even when
+        // mapped-host plus embedding host bytes exceed MemAvailable.
+        check_worker_host_memory_limit(&[non_worker], &[false], 8 * gib, || {
+            panic!("non-worker core must not query host RAM availability")
+        })
+        .unwrap();
+        // Integrated worker cores use the unified MemoryLimit rather than the discrete host check.
+        check_worker_host_memory_limit(&[build_core(true)], &[true], 8 * gib, || {
+            panic!("integrated core must not run discrete worker host-RAM check")
+        })
+        .unwrap();
+        // Discrete worker cores check mapped-host plus embedding host bytes against MemAvailable.
+        let worker_slice = [worker];
+        assert!(
+            check_worker_host_memory_limit(&worker_slice, &[false], 8 * gib, || Ok(20 * gib))
+                .is_ok()
+        );
+        assert!(
+            check_worker_host_memory_limit(&worker_slice, &[false], 8 * gib, || Ok(20 * gib - 1))
+                .is_err()
+        );
     }
 
     #[test]

@@ -102,9 +102,16 @@ n-gram request mailboxes, use fixed addresses from `0x0c00_0000_0000` when
 the device rank ranges fit below it. Larger Linux layouts start host storage
 at `0x2000_0000_0000` to avoid overlap. Each rank has a disjoint 1 TiB host
 range; the native allocator reports the selected base to Ignition.
-Linux maps and registers host pages; Windows uses host-backed CUDA VMM.
-Both expose the recorded address to the CPU and GPU. A CUPTI subscriber logs
-driver allocations and removes records when their context is destroyed.
+Linux maps fixed-address host storage with `MAP_FIXED_NOREPLACE` plus
+`cuMemHostRegister_v2`. Windows uses host-backed CUDA VMM. Both expose the
+recorded address to the CPU and GPU. Discrete-GPU cores that declare
+`Execution.persistent_worker` check mapped-host physical bytes (plus
+host-resident embedding tables during memory-limit validation) against
+available host DRAM before mapping; integrated GPUs charge mapped-host
+allocations against the unified `MemoryLimit` budget without adding them to
+the per-rank device allocation footprint check.
+A CUPTI subscriber logs driver allocations and removes records when their
+context is destroyed.
 Persistent device allocations outside the arena are grouped into complete
 VMM pages and placed within reservations aligned to the device's allocation
 granularity. Reservations without retained allocations are omitted. Only their
@@ -589,6 +596,25 @@ instantiate each graph with its recorded flags. The execution manifest is
 then rebased onto the live addresses and validated, and the server starts
 from this reconstructed contract. `flare run CORE` in
 `flare-cli/src/main.rs` starts the shared server directly from the typed contract.
+
+When `Execution.persistent_worker` is declared, `NativeResources` resolves the
+CUDA driver Green Context entrypoints optionally at driver load (failing load
+explicitly only when a core requires them on an unsupported driver), retains
+the device's primary context, partitions device SMs with
+`cuDevSmResourceSplitByCount` into a worker green context and a non-empty
+compute green context, applies the core's recorded CUDA context limits and
+cache configuration to the primary context and both green contexts, and opens
+non-blocking streams for each. All modules,
+kernels, and graph executables are loaded, instantiated under their partition's
+green context (clamping cooperative grids to that partition's SM count), and
+uploaded on their partition's non-blocking stream before the persistent worker
+starts; the executor launches the worker graph once on its worker stream only
+after startup completes, while compute graphs replay on the compute green
+context. Shutdown drains compute and copy streams first, writes `1u32`
+(release) to the mapped-host stop flag, and synchronizes the worker stream with
+context save/restore before releasing pinned host buffers, streams, executables,
+modules, mappings, green contexts, virtual-address reservations, and the
+primary context.
 
 Before CUDA initialization or serving worker threads, Flare restricts
 `CUDA_VISIBLE_DEVICES` to `--gpus`, resolving indices within an inherited mask.
