@@ -22,6 +22,11 @@
     after server drain with Inkling 2 cores. Reproduces with compiled and
     uncompiled graphs; preserve the successful request drain and GPU release.
 
+[ ] Qualify `strict: true` function tools on a TMLv0 core (ToolParserKind::TmlJson,
+    e.g. Inkling 2) served by `flare run`. Check Chat Completions and Responses,
+    buffered and streamed, including max_tokens and max_output_tokens truncation.
+    Close when a served TMLv0 core passes those checks and the result is recorded.
+
 [ ] Make test_explicit_worker_budget_compiles_and_replays_a_catalog account for
     host memory admission. Its nine-worker assertion requires 296 GiB available
     under the 32 GiB worker allowance and 8 GiB headroom; smaller hosts admit fewer.

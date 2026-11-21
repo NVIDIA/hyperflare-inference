@@ -30,8 +30,11 @@ pub(crate) const CONTROL_MARKERS: [&str; 2] = [
 struct Call {
     name: String,
     arguments: String,
+    strict: bool,
     /// Where the current `string="false"` value starts in `arguments`.
     literal: Option<usize>,
+    literal_quoted: bool,
+    literal_escaped: bool,
 }
 
 impl Call {
@@ -47,6 +50,8 @@ impl Call {
         let Some(start) = self.literal.take() else {
             return;
         };
+        self.literal_quoted = false;
+        self.literal_escaped = false;
         let text = &self.arguments[start..];
         // A one-element array consumes the same nesting level as the argument object
         // and requires the parameter to contain exactly one JSON value.
@@ -65,6 +70,7 @@ pub struct DsmlOutput<const SPACED: bool> {
     pending: String,
     last_action: OutputAction,
     call: Option<Call>,
+    strict_tools: HashSet<String>,
     calls: usize,
     structured: bool,
     verbatim: bool,
@@ -121,12 +127,9 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         .push_str(source);
                 }
                 OutputAction::ToolNameEnd if !repeated => {
-                    let name = &self
-                        .call
-                        .as_ref()
-                        .ok_or("DeepSeek tool name has no call")?
-                        .name;
-                    if name.is_empty() {
+                    let call = self.call.as_mut().ok_or("DeepSeek tool name has no call")?;
+                    call.strict = self.strict_tools.contains(&call.name);
+                    if call.name.is_empty() {
                         return Err("tool function name is empty".into());
                     }
                 }
@@ -149,17 +152,20 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                 OutputAction::ToolCallArgumentsText {
                     is_string_value: string,
                 } => {
-                    let arguments = &mut self
-                        .call
-                        .as_mut()
-                        .ok_or("DeepSeek tool arguments have no call")?
-                        .arguments;
+                    let call = self.call.as_mut().ok_or("DeepSeek tool arguments have no call")?;
                     if string {
                         let escaped = serde_json::to_string(source)
                             .expect("serializing a string cannot fail");
-                        arguments.push_str(&escaped[1..escaped.len() - 1]);
+                        call.arguments.push_str(&escaped[1..escaped.len() - 1]);
                     } else {
-                        arguments.push_str(source);
+                        if call.strict && call.literal.is_some() {
+                            for b in source.bytes() {
+                                if call.literal_escaped { call.literal_escaped = false; }
+                                else if call.literal_quoted && b == b'\\' { call.literal_escaped = true; }
+                                else if b == b'"' { call.literal_quoted = !call.literal_quoted; }
+                            }
+                        }
+                        call.arguments.push_str(source);
                     }
                 }
                 OutputAction::ToolCallArgumentsEnd { closing_text } if !repeated => {
@@ -279,6 +285,10 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
             pending: String::new(),
             last_action: OutputAction::Skip,
             call: None,
+            strict_tools: config.tools.iter().filter_map(|tool| {
+                let f = tool.get("function")?;
+                (f["strict"].as_bool() == Some(true)).then(|| f["name"].as_str()).flatten().map(str::to_owned)
+            }).collect(),
             calls: 0,
             structured: config.structured,
             verbatim: false,
@@ -341,7 +351,10 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
             }
             let end = text.len() - marker.len();
             self.present(&text[..end], plain_kind, &mut events)?;
-            self.present(&text[end..], ChunkKind::SpecialToken, &mut events)?;
+            let kind = if marker == "｜DSML｜" && self.call.as_ref().is_some_and(|call| call.literal_quoted) {
+                ChunkKind::PlainTokens
+            } else { ChunkKind::SpecialToken };
+            self.present(&text[end..], kind, &mut events)?;
         } else {
             self.present(text, plain_kind, &mut events)?;
         }

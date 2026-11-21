@@ -88,6 +88,8 @@ pub(crate) struct Encoder {
     parallel_tool_calls: bool,
     pub tool_limit_reached: bool,
     tool_grammars: std::collections::HashMap<String, crate::grammar::TextGrammar>,
+    strict_validators: std::collections::HashMap<String, crate::grammar::TextGrammar>,
+    pending_strict_calls: Vec<Option<(usize, String, Option<String>, String)>>,
     prompts: Vec<PromptUsage>,
     choices_per_prompt: usize,
     usage: Vec<Usage>,
@@ -139,6 +141,8 @@ impl Encoder {
             parallel_tool_calls,
             tool_limit_reached: false,
             tool_grammars: Default::default(),
+            strict_validators: Default::default(),
+            pending_strict_calls: vec![None; choices],
             prompts,
             choices_per_prompt,
             include_usage,
@@ -154,6 +158,12 @@ impl Encoder {
         grammars: std::collections::HashMap<String, crate::grammar::TextGrammar>,
     ) {
         self.tool_grammars = grammars;
+    }
+    pub(crate) fn set_strict_validators(
+        &mut self,
+        validators: std::collections::HashMap<String, crate::grammar::TextGrammar>,
+    ) {
+        self.strict_validators = validators;
     }
     pub fn set_logprobs(&mut self, options: Option<crate::server::inference::LogprobOptions>, frontend: std::sync::Arc<crate::frontend::Frontend>, streaming: bool) {
         self.logprob_format = options.map(|options| (options, frontend));
@@ -483,7 +493,15 @@ impl Encoder {
                 }
                 _ => {}
             }
-            if let Event::ToolBegin { name, .. } = &event {
+            if let Event::ToolBegin {
+                index: call_idx,
+                name,
+                id,
+            } = &event
+            {
+                if self.pending_strict_calls[index].is_some() {
+                    return Err("tool call began before the pending strict call ended".into());
+                }
                 if !self.parallel_tool_calls && self.outputs[index].has_tools() {
                     self.tool_limit_reached = true;
                     break;
@@ -496,17 +514,57 @@ impl Encoder {
                 if self.tool_choice != ToolChoice::Auto && self.tool(name).is_none() {
                     return Err(format!("model emitted undeclared tool {name}").into());
                 }
-            }
-            if self.protocol == Protocol::Chat {
-                for delta in self.chats[index].apply(vec![event.clone()])? {
-                    frames.push(self.chunk(index, delta, Value::Null));
-                }
-            } else if self.protocol == Protocol::Completions {
-                if let Event::Content(text) = &event {
-                    frames.push(self.chunk(index, json!(text), Value::Null));
+                if self.tool(name).is_some_and(|t| t.strict) {
+                    self.pending_strict_calls[index] =
+                        Some((*call_idx, name.clone(), id.clone(), String::new()));
+                    continue;
                 }
             }
-            for change in self.outputs[index].apply(event, &self.id)? {
+            if let Event::ToolArguments { index: arg_idx, text } = &event
+                && let Some((call_idx, _, _, pending_args)) = &mut self.pending_strict_calls[index]
+            {
+                if arg_idx != call_idx {
+                    return Err("argument index does not match the pending strict call".into());
+                }
+                pending_args.push_str(text);
+                continue;
+            }
+            let (single, group) = if let Event::ToolEnd { index: end_idx } = &event
+                && let Some((pending_idx, ..)) = &self.pending_strict_calls[index]
+            {
+                if end_idx != pending_idx {
+                    return Err("end index does not match the pending strict call".into());
+                }
+                let (call_idx, name, id, arguments) = self.pending_strict_calls[index].take().unwrap();
+                self.strict_validators.get(&name)
+                    .ok_or_else(|| format!("missing compiled strict validator for tool {name:?}"))?
+                    .validate(&arguments)?;
+                (None, Some([
+                    Event::ToolBegin {
+                        index: call_idx,
+                        name,
+                        id,
+                    },
+                    Event::ToolArguments {
+                        index: call_idx,
+                        text: arguments,
+                    },
+                    Event::ToolEnd { index: call_idx },
+                ]))
+            } else {
+                (Some(event), None)
+            };
+            for event in single.into_iter().chain(group.into_iter().flatten()) {
+                if self.protocol == Protocol::Chat {
+                    for delta in self.chats[index].apply(vec![event.clone()])? {
+                        frames.push(self.chunk(index, delta, Value::Null));
+                    }
+                } else if self.protocol == Protocol::Completions {
+                    if let Event::Content(text) = &event {
+                        frames.push(self.chunk(index, json!(text), Value::Null));
+                    }
+                }
+                for change in self.outputs[index].apply(event, &self.id)? {
                 if let Change::Delta(part, _) = &change {
                     if self.protocol == Protocol::Responses && self.logprob_format.is_some()
                         && matches!(self.outputs[index].blocks[*part], Block::Text(_)) {
@@ -523,7 +581,8 @@ impl Encoder {
                         continue;
                     }
                 }
-                frames.extend(self.change(change)?);
+                    frames.extend(self.change(change)?);
+                }
             }
         }
         Ok(frames)
@@ -537,6 +596,11 @@ impl Encoder {
         stop: Option<String>,
     ) -> Result<Vec<Frame>> {
         let cause = if self.tool_limit_reached { Termination::Cancelled } else { cause };
+        if let Some((_, name, _, _)) = self.pending_strict_calls[index].take()
+            && cause == Termination::Eos
+        {
+            return Err(format!("incomplete strict tool call {name:?} at end of generation").into());
+        }
         let stop = if self.tool_limit_reached { None } else { stop };
         let mut frames = vec![];
         if self.protocol == Protocol::Chat {
