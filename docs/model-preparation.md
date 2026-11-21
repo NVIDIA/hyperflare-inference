@@ -802,6 +802,26 @@ target's vocabulary head. A round verifies the pending token and up to five
 drafts by default, seven at most. `--no-mtp` omits the draft layer's
 weights, cache fields, and graphs.
 
+Weight prefetch is **implemented** for target decode and verification on
+eight SM120 GPUs. At up to 64 physical rows, each layer starts prefetching
+the following layer's packed attention input and query expansion weights
+just before its feed-forward all-reduce. The reads include the index query
+weights when the following layer selects sparse records. At up to eight
+rows, each layer also starts reading its own output projection before its
+attention input projections run. These reads warm L2 on a second CUDA
+stream. Projections can consume cache lines as they arrive.
+`--no-stream-overlap` disables both windows.
+
+At up to 16 physical rows, routed target layers can use CUDA Programmatic
+Dependent Launch when the statically prepared BF16 two-shot all-reduce sums
+each shard in cyclic rank order starting at its owner. The fused reduction
+retains that order and rounds the normalized activation to BF16 before
+multiplying by the learned scale. While the reduction is in flight, the
+dependent projection stages router and shared-expert weights. It waits
+for the activation before computing FP32 router logits and BF16 shared
+gate and up channels. Physical rows include padding at the captured batch
+and verification width.
+
 The published checkpoint's `model.safetensors.index.json` declares a
 `total_size` 27,799,760 bytes larger than its tensors, which checkpoint
 inspection rejects. Prepare from a directory that links every checkpoint
@@ -874,9 +894,18 @@ outputs and every vocabulary score bitwise identical through position 2,047
 in both the prepared prefill and the matched FP8 reference.
 
 The repository lockfile selects FlashInfer `598c8547be335bcd833254177ac18ccb2bf4dabc`.
-Reproducing the sparse cutoff and target causal checks requires the FlashInfer
-revision with both the logical-position tie rule and the column-based expert
-reduction described above.
+Local GLM 5.3 preparation with decode overlap uses the paired FlashInfer
+revision `f364798ac3093402e6acfb0782889019d1701f41`. It includes the
+logical-position tie rule, column-based expert reduction, attention weight
+reads, and the mixed FP32 and BF16 projection. With that revision checked
+out in `../flashinfer`, run these commands from the Flare repository before
+exporting the checkpoint.
+
+```sh
+uv sync --locked --extra prepare --extra test
+BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 \
+  uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e ../flashinfer
+```
 
 The signed plain core declared 59.662 GiB of fixed device allocations on
 seven ranks and 59.727 GiB on rank five. The draft-enabled core declared

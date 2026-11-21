@@ -56,6 +56,7 @@ class PreparationConfig(BasePreparationConfig):
     devices: tuple[int, ...] = tuple(range(8))
     context: int = 1048576
     max_active: int = 8
+    stream_overlap: bool = True
     sampling_defaults: dict | None = None
     # Speculation with the checkpoint's draft layer: a round verifies the pending token and width - 1 drafts.
     mtp: bool = False
@@ -174,7 +175,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             workload_schema="glm53-full", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
         session.__enter__()
-        arena = ScratchArena(device, overlap=False)
+        arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
         buffers = dict(inputs.buffers(), **commands.buffers(),
             **{name: getattr(admission, name) for name in admission.__dataclass_fields__},
@@ -209,7 +210,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                     name = f"{mode}{capacity}" + (suffix if mode == "prefill" else "")
                     metadata = Metadata.allocate(capacity, rows, blocks, device)
                     decoder = PreparedDecoder(mode_weights, metadata, pool, mode=mode, session=session, name=name,
-                                              workspace=arena, examples=examples, **collectives)
+                                              workspace=arena, examples=examples, overlap=config.stream_overlap, **collectives)
                     batch = PreparedBatch(inputs, requests, metadata, mode=mode, shard=shard, pool=pool,
                                           page_tokens=PAGE_TOKENS)
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
@@ -221,7 +222,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         if config.mtp:
             speculation = SimpleNamespace(weights=weights, pool=pool, inputs=inputs, requests=requests,
                 scratch=SimpleNamespace(rows=lambda tokens, rows: None), draft_scratch=None, session=session,
-                workspace=arena, collectives=collectives, overlap=False, completion=completion, frame=frame,
+                workspace=arena, collectives=collectives, overlap=config.stream_overlap, completion=completion, frame=frame,
                 sequence=sequence, rng=SpeculativeRngState.allocate(device, capacity=slots),
                 offset=torch.zeros(slots, dtype=torch.int64, device=device),
                 generation=torch.zeros(slots, dtype=torch.int64, device=device), page_tokens=PAGE_TOKENS)
@@ -229,7 +230,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             def verifier(weights, scratch, metadata, pool, *, mode, name, overlap, **common):
                 # Verification rows of one request are consecutive positions, each attending to the
                 # records the rows before it stored in this forward, as decode rows do.
-                return PreparedDecoder(weights, metadata, pool, mode="decode", name=name, examples=examples, **common)
+                return PreparedDecoder(weights, metadata, pool, mode="decode", name=name, examples=examples, overlap=overlap, **common)
 
             def accepted(weights, metadata, pool, **common):
                 # The round passes its context no name; `name` is the round under construction.

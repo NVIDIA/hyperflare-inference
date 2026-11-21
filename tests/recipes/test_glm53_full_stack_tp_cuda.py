@@ -103,6 +103,7 @@ def _rank(rank, world, rendezvous, snapshot, reference, layers, sequences, outpu
     from ignition.recipes.glm53_full.attention import PAGE_TOKENS
     from ignition.recipes.glm53_full.decoder import PreparedDecoder
     from ignition.recipes.glm53_full.pool import ContinuationPool
+    from ignition.recipes.glm53_full.recipe import RECIPE
     from ignition.recipes.glm53_full.weights import ModelWeights
 
     torch.cuda.set_device(rank)
@@ -128,7 +129,7 @@ def _rank(rank, world, rendezvous, snapshot, reference, layers, sequences, outpu
     vocabulary_runtime = create_all_gather_runtime(group, device, max_rows=max(CAPACITY.values()),
                                                    columns=weights.head.shape[0] * world)
     pool = ContinuationPool.for_model(config, 2, pages, device)
-    arena = ScratchArena(device, overlap=False)
+    arena = ScratchArena(device, overlap=RECIPE.stream_overlap)
     results = {}
     with torch.no_grad(), RecordedPreparationSession(device=device, checkpoint="glm53-full-test",
             workload_schema="glm53-full-stack-tp-v1", numerical_policy="default", coordinator=coordinator) as session:
@@ -140,7 +141,7 @@ def _rank(rank, world, rendezvous, snapshot, reference, layers, sequences, outpu
             metadata[name] = Metadata.allocate(rows, 1, pages, device, samples=rows)
             decoders[name] = PreparedDecoder(weights, metadata[name], pool, mode=mode, runtime=runtime,
                 vocabulary_runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name,
-                workspace=arena)
+                workspace=arena, overlap=arena.overlap)
         progress("tuning")
         session.tune()
         arena.release_preparation()

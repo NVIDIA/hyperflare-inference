@@ -450,7 +450,8 @@ class PreparedAllReduceRMSNorm:
                 and 0 < source.numel() * source.element_size() <= runtime.max_size)
 
     def __init__(self, source, residual, weight, output, *, eps, runtime, session, coordinator, name,
-                 zero_centered=False, reduction_dtype=None, input_addend=None):
+                 zero_centered=False, reduction_dtype=None, input_addend=None, round_before_weight=False,
+                 reduction_order="local", trigger_dependents=False):
         import torch.distributed as dist
         from b12x.comm.pcie._oneshot_preparation import _prepare_fused_call
 
@@ -467,7 +468,8 @@ class PreparedAllReduceRMSNorm:
         self.eps, self.zero_centered, self.reduction_dtype = eps, zero_centered, reduction_dtype
         self.plan = runtime.plan(source, operation="all_reduce_fused_add_rms_norm", residual=residual,
             weight=weight, out=output, residual_out=residual, zero_centered=zero_centered, reduction_dtype=reduction_dtype,
-            input_addend=input_addend, **group_arguments)
+            input_addend=input_addend, round_before_weight=round_before_weight, reduction_order=reduction_order,
+            trigger_dependents=trigger_dependents, **group_arguments)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: _prepare_fused_call(state, inp=source, residual=residual, weight=weight,

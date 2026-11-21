@@ -41,6 +41,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         speculative_fixed_width=None if speculation is None else speculation.fixed_width,
         speculative_token_capacity=None if speculation is None else plan.speculative_token_capacity,
         prompt_logprobs=plan.prompt_logprobs, devices=tuple(range(plan.world_size)),
+        stream_overlap=plan.stream_overlap,
         sampling_defaults=RECIPE.sampling_defaults.as_dict())
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          checkpoint=plan.checkpoint)
@@ -67,7 +68,7 @@ RECIPE = Recipe(
         expansion_bytes=35_354_135_040),),
     context=1048576, page_tokens=256, concurrency=8, max_concurrency=32, prefill_chunk=4096,
     # A round verifies the pending token and up to five drafts of the checkpoint's draft layer.
-    speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
+    speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0, stream_overlap=True,
     ranks=MappingProxyType({8: RankCosts(_STATE_ROW_BYTES + _DRAFT_PAGE_BYTES, _PAGE_BYTES + _DRAFT_PAGE_BYTES,
                                          _GRAPH_BYTES)}),
     plain_ranks=MappingProxyType({8: RankCosts(_STATE_ROW_BYTES, _PAGE_BYTES, _GRAPH_BYTES)}),

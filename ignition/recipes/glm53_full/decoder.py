@@ -15,7 +15,7 @@ import torch
 from flashinfer.triton.norm import rms_norm
 
 from ignition.components.bf16_experts import PreparedBF16Experts
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import PreparedAllReduce, PreparedAllReduceRMSNorm
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import PreparedMLP
@@ -24,6 +24,9 @@ from ignition.components.paged_batch import Metadata
 from ignition.components.rotary import PreparedRotaryAngles
 from ignition.components.state import gather_rows
 from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.components.weight_first_projection import PreparedWeightFirstProjection
+from ignition.components.weight_prefetch import PreparedWeightPrefetch, join_weight_prefetch
+from ignition.preparation.tuning import register_finalizer
 
 from .attention import PAGE_TOKENS, AttentionMetadata, ExampleBuffers, PreparedAttention, Selection, rotary_frequencies
 from .indexer import PreparedIndexer
@@ -87,15 +90,17 @@ class PreparedMoE:
             operator.functional(session=session)
         return self
 
-    def __call__(self, source):
-        routes = self.routing(self.router_projection(source))
+    def __call__(self, source, projections=None):
+        logits = self.router_projection(source) if projections is None else projections[0]
+        routes = self.routing(logits)
         if self.unquantized:
             valid = torch.full((1,), source.shape[0], dtype=torch.int32, device=source.device)
             rows = self.experts.run(source, routes.ids, routes.weights, valid)
             routed = (rows.float() * routes.weights[:, :, None]).sum(1).to(torch.bfloat16)
         else:
             routed = self.experts(source, routes.ids, routes.weights)
-        return torch.add(routed, self.shared(source))
+        shared = self.shared(source) if projections is None else self.shared.from_gate_up(projections[1])
+        return torch.add(routed, shared)
 
 
 class PreparedLayer:
@@ -103,8 +108,11 @@ class PreparedLayer:
 
     def __init__(self, config, index, weights: LayerWeights, pool: ContinuationPool, metadata: AttentionMetadata,
                  angles: PreparedRotaryAngles, *, rows, heads, mode, runtime, coordinator, session, name, workspace,
-                 buffers: ExampleBuffers, cache_only=False):
+                 buffers: ExampleBuffers, cache_only=False, weight_first=False):
+        self.attention_norm = self.moe_projection = None
+        self.use_weight_first = False
         self.index, self.selects, self.eps, self.norms = index, config.selects(index), config.norm_eps, weights.norms
+        self.following_prefetch = self.output_prefetch = None
         cache, index_cache = pool.latent(index), pool.index(index)
         if self.selects != (index_cache is not None):
             raise ValueError("GLM 5.3 index key pages exist exactly for layers that select")
@@ -131,11 +139,33 @@ class PreparedLayer:
             self.mlp = PreparedMLP(source, weights.mlp, buffers("mlp.gate_up", rows, 2 * local),
                 buffers("mlp.intermediate", rows, local), buffers("mlp.output", rows, HIDDEN), session=session,
                 name=f"{name}.mlp", workspace=workspace)
+        if (weight_first and isinstance(weights.mlp, MoEWeights) and not isinstance(weights.mlp.experts, BF16Experts)
+                and PreparedWeightFirstProjection.fits(source, weights.mlp.router, weights.mlp.shared.gate_up)
+                and tuple(weights.mlp.router.shape) == (256, HIDDEN)
+                and tuple(weights.mlp.shared.gate_up.shape) == (512, HIDDEN)
+                and PreparedAllReduceRMSNorm.fits(runtime, source)):
+            self.attention_norm = PreparedAllReduceRMSNorm(buffers("layer.part", rows, HIDDEN), source,
+                weights.norms["post_attention_layernorm"], buffers("layer.norm", rows, HIDDEN),
+                runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.attention_reduce_norm",
+                eps=self.eps, reduction_dtype=torch.bfloat16, round_before_weight=True, reduction_order="shard_owner",
+                trigger_dependents=True)
+            self.moe_projection = PreparedWeightFirstProjection(source, weights.mlp.router, weights.mlp.shared.gate_up,
+                                                                 session=session, name=f"{name}.moe.input_projections")
+            register_finalizer(session, self._select_weight_first)
         self.mlp_reduce = PreparedAllReduce(buffers("layer.part", rows, HIDDEN), buffers("layer.sum", rows, HIDDEN),
             runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.mlp_reduce")
 
+    def _select_weight_first(self):
+        from b12x.preparation.types import require_prepared
+
+        # Different transports can accumulate BF16 rank contributions in a different order.
+        # The fused producer uses the shard owner's two-shot order.
+        query = require_prepared(self.attention_reduce.plan, "comm.pcie").query
+        self.use_weight_first = (query.surface == "PCIeTwoShotBF16.all_reduce"
+                                 and query.call.get("payload_schedule") != "pairwise")
+
     def functional(self, *, session):
-        for operator in (self.attention, self.indexer, self.attention_reduce, self.mlp, self.mlp_reduce):
+        for operator in (self.attention, self.indexer, self.attention_reduce, self.attention_norm, self.mlp, self.mlp_reduce):
             if operator is not None:
                 operator.functional(session=session)
         return self
@@ -165,10 +195,20 @@ class PreparedLayer:
         """This rank's part of the MLP update."""
         return self.mlp(self._normalized(hidden, "post_attention_layernorm"))
 
-    def __call__(self, hidden, metadata, angles, selection: Selection | None, *, reuse_selection=False):
+    def __call__(self, hidden, metadata, angles, selection: Selection | None, *, reuse_selection=False, prefetch_sums=None):
+        if prefetch_sums is not None and self.output_prefetch is not None:
+            self.output_prefetch(hidden, prefetch_sums)
         part, selection = self.attention_part(hidden, metadata, angles, selection, reuse_selection=reuse_selection)
-        hidden = torch.add(hidden, self.attention_reduce(part))
-        return torch.add(hidden, self.mlp_reduce(self.mlp_part(hidden))), selection
+        if self.use_weight_first:
+            hidden = hidden.clone()
+            normalized = self.attention_norm(part, hidden)
+            local = self.mlp(normalized, self.moe_projection(normalized))
+        else:
+            hidden = torch.add(hidden, self.attention_reduce(part))
+            local = self.mlp_part(hidden)
+        if prefetch_sums is not None and self.following_prefetch is not None:
+            self.following_prefetch(local, prefetch_sums)
+        return torch.add(hidden, self.mlp_reduce(local)), selection
 
 
 class PreparedDecoder:
@@ -181,7 +221,8 @@ class PreparedDecoder:
     """
 
     def __init__(self, weights: ModelWeights, metadata: Metadata, pool: ContinuationPool, *, mode, runtime,
-                 vocabulary_runtime, coordinator, session, name, workspace, examples: ExampleBuffers | None = None):
+                 vocabulary_runtime, coordinator, session, name, workspace, examples: ExampleBuffers | None = None,
+                 overlap=False):
         config, shard = weights.config, weights.shard
         tokens, samples = metadata.token_ids.shape[0], metadata.sample_indices.shape[0]
         device = weights.embedding.device
@@ -196,11 +237,28 @@ class PreparedDecoder:
         self.angles = PreparedRotaryAngles(metadata.positions, self.frequencies)
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, buffers("layer.sum", tokens, HIDDEN),
             num_rows=metadata.live_counts[:1], session=session, name=f"{name}.embedding")
+        small_tp8_decode = (mode == "decode" and tokens <= 64 and shard.world_size == 8
+                            and device.type == "cuda" and torch.cuda.get_device_capability(device) == (12, 0))
+        weight_first = small_tp8_decode and tokens <= 16 and getattr(session, "collective_tuning", "static") == "static"
         self.layers = tuple(PreparedLayer(config, index, layer, pool, example, self.angles, rows=tokens,
             heads=config.raw["num_attention_heads"] // shard.world_size, mode=mode, runtime=runtime,
             coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
-            buffers=buffers)
+            buffers=buffers, weight_first=weight_first)
             for index, layer in enumerate(weights.layers))
+        self.stream_handle = None
+        if overlap and small_tp8_decode:
+            stream = workspace.auxiliary_stream
+            self.stream_handle = stream.cuda_stream
+            # Narrower reads leave more memory bandwidth for attention and the feed-forward reduction at three rows.
+            output_programs, following_programs = (16, 24) if tokens == 3 else (32, 64)
+            if tokens <= 8:
+                for layer, source in zip(self.layers, weights.layers, strict=True):
+                    layer.output_prefetch = PreparedWeightPrefetch([source.attention["o_proj"]], output_programs, stream)
+            for layer, following in zip(self.layers[:-1], weights.layers[1:], strict=True):
+                attention = following.attention
+                names = ("input_proj", "q_b_proj", "indexer.wq_b")
+                targets = [attention[key] for key in names if key in attention]
+                layer.following_prefetch = PreparedWeightPrefetch(targets, following_programs, stream)
         self.scratch = SimpleNamespace(logits=buffers("head.logits", samples, VOCABULARY))
         self.head = PreparedVocabularyProjection(buffers("head.source", samples, HIDDEN), weights.head,
             buffers("head.local", samples, weights.head.shape[0]), self.scratch.logits,
@@ -236,10 +294,13 @@ class PreparedDecoder:
         embedded = hidden = self.embedding(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1])
         angles = self.angles(metadata.positions)
         selection = None
+        sums = None if self.stream_handle is None else torch.empty(64, dtype=torch.int64, device=hidden.device)
         for layer in self.layers:
-            hidden, selection = layer(hidden, placement, angles, selection)
+            hidden, selection = layer(hidden, placement, angles, selection, prefetch_sums=sums)
             if observe is not None:
                 observe(layer.index, hidden, selection)
+        if sums is not None:
+            join_weight_prefetch(hidden, sums, self.stream_handle)
         if self.feeds_draft:
             every = torch.empty_like(hidden)
             rms_norm(hidden, self.weights.norm, every, self.eps, round_before_weight=True)
