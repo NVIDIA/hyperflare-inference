@@ -4,6 +4,7 @@
 """Storage snapshots preserve reads across aliased writes and last-use boundaries."""
 
 import operator
+import os
 import random
 
 import pytest
@@ -229,6 +230,51 @@ def _fill(destination: torch.Tensor, value: float) -> None:
 @_fill.register_fake
 def _fake_fill(destination, value):
     pass
+
+
+@torch.library.custom_op('flare_test_lifetimes::accumulate', mutates_args=('destination',))
+def _accumulate(destination: torch.Tensor, source: torch.Tensor) -> None:
+    destination.add_(source)
+
+
+@_accumulate.register_fake
+def _fake_accumulate(destination, source):
+    pass
+
+
+@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1',
+                   reason='requires an assigned NVIDIA GPU')
+@pytest.mark.parametrize('computed', [False, True])
+@torch.no_grad()
+def test_compiled_mutated_clones_keep_selected_source_offsets(computed):
+    source = torch.arange(7 * 256, dtype=torch.float32, device='cuda').reshape(1, 7, 256)
+    output = torch.empty_like(source)
+
+    def forward():
+        values = source + 1 if computed else source
+        for index in range(7):
+            selected = values[:, index].clone()
+            _accumulate(selected.view(1, 256), selected.view(1, 256))
+            output[:, index].copy_(selected)
+
+    compiled = compilation.compile_forward(forward)
+    compiled()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    try:
+        for step in range(3):
+            source.add_(step)
+            expected = (source + 1 if computed else source) * 2
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_stats()['allocation.all.allocated']
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()['allocation.all.allocated'] == allocated
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
 
 
 @pytest.mark.parametrize('offset', [0, 16])

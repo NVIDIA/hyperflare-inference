@@ -7,7 +7,7 @@ from fractions import Fraction
 
 import pytest
 
-from ignition.components.capacity import batch_capacities, packed_speculative_shapes
+from ignition.components.capacity import batch_capacities, packed_speculative_shapes, packed_speculative_depth_shapes
 
 
 @pytest.mark.parametrize("concurrency", [1, 3, 8, 32, 64])
@@ -80,3 +80,35 @@ def test_budget_must_cover_mandatory_endpoints(budget):
 def test_logical_width_is_a_supported_positive_draft_block(width):
     with pytest.raises(ValueError, match="width"):
         packed_speculative_shapes(32, width)
+
+
+@pytest.mark.parametrize("concurrency", [1, 16, 32, 64])
+@pytest.mark.parametrize("capacity", [8, 64, 128])
+def test_depth_catalog_covers_runtime_choices_with_one_total_graph_budget(concurrency, capacity):
+    widths = tuple(range(1, 9))
+    shapes = packed_speculative_depth_shapes(concurrency, widths, capacity)
+    assert len(shapes) == len(set(shapes)) <= 64
+    for batch in batch_capacities(concurrency):
+        for width in widths[1:]:
+            selected = [p for b, w, p in shapes if (b, w) == (batch, width)]
+            upper = min(capacity, batch * width)
+            assert bool(selected) == (upper > batch)
+            if selected:
+                assert max(selected) == upper
+                assert all(batch < p <= upper for p in selected)
+                if width == widths[-1]:
+                    assert min(selected) == batch + 1
+
+
+def test_depth_catalog_refines_monotonically_and_rejects_incomplete_runtime_coverage():
+    widths = (1, 2, 4, 6, 8)
+    previous = set(packed_speculative_depth_shapes(16, widths, 128, 25))
+    with pytest.raises(ValueError, match="every draft depth"):
+        packed_speculative_depth_shapes(16, widths, 128, len(previous) - 1)
+    for budget in range(26, 70):
+        selected = set(packed_speculative_depth_shapes(16, widths, 128, budget))
+        assert previous < selected and len(selected) == budget
+        previous = selected
+    complete = packed_speculative_depth_shapes(2, (1, 2, 3), 6, 100)
+    assert set(complete) == {(b, w, p) for b in (1, 2) for w in (2, 3)
+                            for p in range(b + 1, b * w + 1)}

@@ -2,6 +2,13 @@ version = 1
 revision = 3
 requires-python = "==3.12.*"
 
+[manifest]
+
+[[manifest.dependency-metadata]]
+name = "deepinfer"
+version = "0.1.0"
+requires-dist = ["einops>=0.8"]
+
 [[package]]
 name = "accelerate"
 version = "1.14.0"
@@ -357,6 +364,19 @@ tileiras = [
 ]
 
 [[package]]
+name = "deep-gemm"
+version = "2.8.0+local"
+source = { git = "https://github.com/vllm-project/DeepGEMM.git?rev=1e1842a833699298f7afc02eefb2ed168fff6938#1e1842a833699298f7afc02eefb2ed168fff6938" }
+
+[[package]]
+name = "deepinfer"
+version = "0.1.0"
+source = { git = "https://github.com/local-inference-lab/DeepInfer.git?rev=0d8f05928995d866aeb155da1d55285daa358f8c#0d8f05928995d866aeb155da1d55285daa358f8c" }
+dependencies = [
+    { name = "einops" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -550,6 +570,10 @@ prepare = [
     { name = "torchvision" },
     { name = "transformers", extra = ["chat-template", "torch", "vision"] },
 ]
+sm103-reference = [
+    { name = "deep-gemm" },
+    { name = "deepinfer" },
+]
 test = [
     { name = "pytest" },
     { name = "tiktoken" },
@@ -562,6 +586,8 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'prepare'", specifier = ">=46,<52" },
     { name = "cuda-python", marker = "extra == 'prepare'", specifier = "==13.3.1" },
     { name = "cuda-tile", extras = ["tileiras"], marker = "extra == 'prepare'", specifier = "==1.6.0" },
+    { name = "deep-gemm", marker = "extra == 'sm103-reference'", git = "https://github.com/vllm-project/DeepGEMM.git?rev=1e1842a833699298f7afc02eefb2ed168fff6938" },
+    { name = "deepinfer", marker = "extra == 'sm103-reference'", git = "https://github.com/local-inference-lab/DeepInfer.git?rev=0d8f05928995d866aeb155da1d55285daa358f8c" },
     { name = "flare-heliopause", marker = "extra == 'prepare'", directory = "heliopause" },
     { name = "flashinfer-python", extras = ["b12x"], marker = "extra == 'prepare'", git = "https://github.com/local-inference-lab/flashinfer.git?branch=main" },
     { name = "huggingface-hub", marker = "extra == 'prepare'", specifier = "==1.33.0" },
@@ -578,7 +604,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'prepare'", specifier = "==0.29.1+cu132", index = "https://download.pytorch.org/whl/cu132" },
     { name = "transformers", extras = ["torch", "vision", "chat-template"], marker = "extra == 'prepare'", specifier = "==5.23.0" },
 ]
-provides-extras = ["test", "api-test", "prepare"]
+provides-extras = ["test", "api-test", "sm103-reference", "prepare"]
 
 [[package]]
 name = "iniconfig"

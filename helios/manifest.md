@@ -109,6 +109,15 @@ lists. Graph executable handles are nonzero and unique. Registered device
 spans do not overlap; captured weights and scratch need not appear in this I/O
 manifest but must remain in the resource owner.
 
+`Execution.expert_rows` optionally declares version-1 canonical expert row
+storage for a rank's authenticated execution manifest. Each `ExpertRowLayer`
+identifies its canonical `layer`, total logical `experts`, physical
+`host_experts` and `hbm_experts` row orderings, a registered `int32[experts]`
+`mapping_buffer` with host-first physical row indices, and `ExpertRowPlane`
+pairs naming matching host and HBM views in the rank's prepared-weight catalog.
+This describes explicit storage layout rather than a placement policy or a new
+graph operation; cores without `expert_rows` retain static expert placement.
+
 Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `scored_prefill`,
 `decode`, `speculative`, `mixed`, `resume`, and `vision`. Decode and speculative
 batch capacities are powers of two through 64. Decode has one token per lane.

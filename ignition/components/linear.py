@@ -199,7 +199,7 @@ class UnquantizedProjection:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.dense:
-            sm103_projection.bf16_out(source, self.weight, output, self.plan.handle)
+            sm103_projection.dense_out(source, self.weight, output, self.plan.handle)
             return output
         return bf16_gemv.mm(source, self.weight, out=output, plan=self.plan, bias=self.bias)
 
