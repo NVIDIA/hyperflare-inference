@@ -489,10 +489,6 @@
     prefix-cache-offload.md section 4 must hold before derived host-store
     defaults are implemented.
 
-[ ] Measure GPU copy-out bytes and cold restore latency for GLM-5.3-Flash TP4
-    on cn5 with only a prefix-cache pool. Check manager retention after a
-    producer restart with the DRAM-to-pool shutdown drain enabled.
-
 [ ] Run multi-rank host offload acceptance for Qwen TP2, GLM TP4, and DeepSeek
     TP4 with Engram tables in disk mode, using qualify/host_cache.py. Close
     when every rank shows identical results and transfer byte counts match the

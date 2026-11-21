@@ -301,10 +301,18 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
         let mut skipped = 0;
         let mut failed = 0;
         let mut stats = before;
+        let mut stopped = "done";
         // The index keeps copying, hashing and export-pinned records until retirement.
-        while (stats.memory_records != 0 || stats.outbound_in_flight != 0 || self.cascade.in_progress() != 0)
-            && started.elapsed() < timeout
-        {
+        while stats.memory_records != 0 || stats.outbound_in_flight != 0 || self.cascade.in_progress() != 0 {
+            if started.elapsed() >= timeout {
+                stopped = "deadline";
+                break;
+            }
+            // A pool that cannot accept puts retires nothing, so waiting would last the whole drain time.
+            if !self.pool.ready() {
+                stopped = "pool_unavailable";
+                break;
+            }
             let progress = stats.progress;
             let result = self.poll(&mut events);
             for event in events.drain(..) {
@@ -326,6 +334,7 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
             stats = self.inner.stats();
             if result.is_err() {
                 failed += 1;
+                stopped = "poll_failed";
                 break;
             }
             if stats.progress == progress || self.cascade.in_progress() != 0 {
@@ -333,10 +342,12 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
             }
         }
         self.collect_cascade_puts = false;
-        let (left, _) = self.inner.begin_pool_drain().unwrap();
+        let left = self.inner.begin_pool_drain().map_or(0, |(left, _)| left);
         skipped += stats.expired[0] - before.expired[0] + stats.dropped[0] - before.dropped[0];
         failed += stats.store_failed - before.store_failed;
-        eprintln!("prefix cache shutdown drain: moved={moved} skipped={skipped} failed={failed} left={left}");
+        eprintln!(
+            "prefix cache shutdown drain: moved={moved} skipped={skipped} failed={failed} left={left} stopped={stopped}"
+        );
     }
 
     fn pool_finished(

@@ -1260,7 +1260,12 @@ local disks, the manager can restore records it retained before shutdown.
 With only a pool configured and all ranks in one process, Flare registers a
 CPU-readable capture buffer. Its slot count is the larger of automatic intake
 and the largest GPU page capacity plus one row's slots, bounded by the host
-budget. All slots are available for capture. While the manager can accept
+budget. All slots are available for capture. For GLM-5.3-Flash NVFP4 at TP4
+with 32 concurrent requests, automatic intake sets it to 11.0 GiB (1,664 slots);
+the full-chain floor is 7.1 GiB. Helios limits GPU page capacity so the buffer
+fits the host budget. If even the minimum page capacity plus one row does not
+fit, startup fails with `host budget cannot hold a full pool capture`. Configure `--prefix-cache-memory` to choose
+the host memory explicitly. While the manager can accept
 records, each poll selects completed leaves for retirement, with up to four
 selected at once. If a capture has no resident ancestor, it copies the full
 GPU chain and offers its ancestors for linking at the manager. While the manager
@@ -1269,7 +1274,9 @@ With separate rank processes, a pool without a local disk tier only restores.
 
 When DRAM feeds the pool directly, the shutdown drain continues copying,
 checksumming and retiring records until they finish or the configured time
-expires. Pool close cancels unfinished puts before the host copier closes.
+expires. It stops early when the manager cannot accept records, so a manager
+that is down does not hold shutdown for the whole drain time. Pool close cancels
+unfinished puts before the host copier closes.
 
 ## 3. Components and required test coverage
 

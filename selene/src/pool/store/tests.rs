@@ -58,6 +58,8 @@ struct LocalState {
     stored: Vec<PrefixKey>,
     store_outcome: Option<StoreOutcome>,
     copies_in_flight: usize,
+    /// Records a shutdown drain finds resident and never sees retire.
+    drain_records: Option<usize>,
 }
 
 #[derive(Clone, Default)]
@@ -91,8 +93,10 @@ impl HostStore for FakeLocal {
         Ok(())
     }
     fn stats(&self) -> StoreStats {
+        let state = self.0.lock().unwrap();
         StoreStats {
-            outbound_in_flight: self.0.lock().unwrap().copies_in_flight,
+            outbound_in_flight: state.copies_in_flight,
+            memory_records: state.drain_records.unwrap_or(0),
             ..StoreStats::default()
         }
     }
@@ -102,6 +106,13 @@ impl HostStore for FakeLocal {
 }
 
 impl crate::store::TierStore for FakeLocal {
+    fn begin_pool_drain(&mut self) -> Option<(usize, u64)> {
+        self.0
+            .lock()
+            .unwrap()
+            .drain_records
+            .map(|records| (records, 0))
+    }
     fn announce_to(&mut self, _: Announcer) {
         self.0.lock().unwrap().announced = true;
     }
@@ -1338,6 +1349,17 @@ fn a_source_that_cannot_be_pinned_counts_as_a_failed_write() {
         assert_eq!(rig.retired(), [(record.key, expected)]);
     }
     assert!(rig.started().is_empty());
+}
+
+#[test]
+fn a_shutdown_drain_ends_when_the_pool_cannot_accept_records() {
+    let mut rig = rig();
+    // The fake pool is not ready, so the resident record can never retire.
+    rig.local.0.lock().unwrap().drain_records = Some(1);
+    rig.store.drain_on_shutdown = Duration::from_secs(10);
+    let started = Instant::now();
+    rig.store.close().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
