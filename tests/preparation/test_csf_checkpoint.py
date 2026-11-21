@@ -103,6 +103,14 @@ def test_manifest_with_an_object_schema_reads_as_a_plain_checkpoint(tmp_path):
     assert inspect_indexed_checkpoint(tmp_path).shard_paths == (tmp_path / "model.safetensors",)
 
 
+def test_directory_with_an_object_manifest_schema_resolves_from_its_own_config(tmp_path):
+    from ignition.recipes import resolve
+
+    (tmp_path / "manifest.json").write_text(json.dumps({"schema": {"name": "lil-nvfp4-csf-checkpoint/1"}}))
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["GlmMoeDsaForCausalLM"]}))
+    assert resolve(str(tmp_path)).recipe.name == "glm_dsa"
+
+
 def nvfp4_container(root, *, fixed_shape=(32 * 3,)):
     """A 32x64 NVFP4 projection whose packed weight and scale planes lie in different shards."""
     metadata, tensors = root / "metadata", root / "tensors"
@@ -160,3 +168,13 @@ def test_nvfp4_container_rejects_another_codec(tmp_path):
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(CheckpointError, match="scale codec"):
         inspect_indexed_checkpoint(tmp_path)
+
+
+def test_nvfp4_container_directory_resolves_to_its_architecture(tmp_path):
+    from ignition.recipes import resolve
+
+    declared = nvfp4_container(tmp_path)
+    model = resolve(str(tmp_path))
+    assert model.recipe.name == "glm_dsa"
+    assert model.checkpoint.stored_bytes == declared["compressed_weight_file_bytes"]
+    assert model.cached(tmp_path)
