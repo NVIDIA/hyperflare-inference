@@ -392,7 +392,8 @@ impl RequestScheduler {
             let cut = accounting
                 .cuts
                 .iter()
-                .find(|cut| cut.endpoint == end)
+                .find(|cut| cut.endpoint == end
+                    && (self.terminal_prefill_min_tokens == 0 || step.kind != GraphKind::Prefill))
                 .copied();
             let reserve_guard = cut.is_some_and(|cut| cut.endpoint < anchor)
                 && request.anchor_guard.is_none()

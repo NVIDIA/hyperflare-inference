@@ -50,7 +50,8 @@ def _vision_buffers(recipe):
     return values
 
 
-def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completion_capacity=None):
+def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completion_capacity=None,
+                     include_terminal_prefill=None):
     module = importlib.import_module(f"ignition.recipes.{recipe}.contract")
     bootstrap = importlib.import_module(f"ignition.recipes.{recipe}.bootstrap")
     options = {}
@@ -80,7 +81,7 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     layout = StateLayout.from_specs((("consumed_tokens", (1,), torch.int64),))
     storage = StateStorage.allocate(layout, capacity * 8 + 1, "cpu")
     pool = SimpleNamespace(layout=layout, pages={}, backing=storage.backing,
-        config=SimpleNamespace(text={"compress_ratios": []}))
+        config=SimpleNamespace(text={"compress_ratios": [], "sliding_window": 128}))
     buffers.update(state_pool=storage.backing, memory_capacity=storage.memory_capacity,
         request_pending_token=torch.zeros(capacity, dtype=torch.int64),
         sampling_grammar_mask=torch.zeros((capacity, (vocabulary + 31) // 32), dtype=torch.int32),
@@ -111,7 +112,7 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
                 fields = [*row_fields, "sampling_grammar_mask"]
             else:
                 fields = [*inputs.buffers(), "sampling_grammar_mask"]
-                if kind in ("prefill", "scored_prefill"):
+                if kind in ("prefill", "terminal_prefill", "scored_prefill"):
                     fields.extend(("vision_token_indices", "vision_feature_slot"))
                 if kind == "scored_prefill":
                     fields.append("prompt_target_tokens")
@@ -136,9 +137,15 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
             for enabled in ((True, False) if recipe == "deepseek41" and kind != "decode" else
                             (False,) if recipe == "deepseek41" else (None,)):
                 add(kind, batch, 1, enabled=enabled)
+    emit_terminal = (
+        recipe == "deepseek41" and bootstrap.deferred_prefill_enabled(config, pool.config.text["sliding_window"])
+        if include_terminal_prefill is None else include_terminal_prefill
+    )
     for tokens in getattr(config, "prefill_capacities", prefill_capacities(config.prefill_chunk_size)):
         for enabled in ((True, False) if recipe == "deepseek41" else (None,)):
             add("prefill", 1, tokens, enabled=enabled)
+            if emit_terminal:
+                add("terminal_prefill", 1, tokens, enabled=enabled)
     from ignition.components.prompt_logprobs import scored_prefill_capacities
     for tokens in scored_prefill_capacities(config.prefill_chunk_size):
         for enabled in ((True, False) if recipe == "deepseek41" else (None,)):
@@ -309,3 +316,50 @@ def test_native_capacity_one_omits_survival_without_narrowing_state_row_storage(
     assert "completion_speculative_survival" not in fields
     assert all(graph["kind"] != "speculative" for graph in manifest["graphs"])
     flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+
+
+def test_deepseek_short_chunk_catalog_retains_complete_prefill_semantics():
+    import flare_heliopause
+
+    _, contract, manifest = _recipe_metadata("deepseek41", config_options={"prefill_chunk_size": 128})
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    assert contract["version"] == 3
+    assert not any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])
+
+
+@pytest.mark.parametrize("devices", [(0, 1, 2), (0, 1, 2, 3), (0, 1, 2, 3, 4, 5)])
+def test_deepseek_non_sm103_tp_layouts_retain_contract_v3_without_terminal_prefill(devices):
+    import flare_heliopause
+    from ignition.recipes.deepseek41 import bootstrap
+
+    config, contract, manifest = _recipe_metadata(
+        "deepseek41", config_options={"devices": devices, "prefill_chunk_size": 4096}
+    )
+    assert getattr(config, "sm103", None) is None
+    assert not bootstrap.deferred_prefill_enabled(config, 128)
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    assert contract["version"] == 3
+    assert not any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])
+
+
+def test_deepseek_terminal_prefill_catalog_validates_contract_v4():
+    import flare_heliopause
+    from ignition.recipes.deepseek41 import bootstrap
+
+    assert bootstrap.deferred_prefill_enabled(
+        SimpleNamespace(sm103=object(), prefill_chunk_size=4096), 128
+    )
+    assert not bootstrap.deferred_prefill_enabled(
+        SimpleNamespace(sm103=object(), prefill_chunk_size=128), 128
+    )
+    _, contract, manifest = _recipe_metadata(
+        "deepseek41",
+        config_options={"prefill_chunk_size": 4096},
+        include_terminal_prefill=True,
+    )
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    assert contract["version"] == 4
+    terminal = [graph for graph in contract["graphs"] if graph["kind"] == 14]
+    assert terminal
+    assert all(graph["terminal_prefill_min_tokens"] == 129 for graph in terminal)
+    assert any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])
