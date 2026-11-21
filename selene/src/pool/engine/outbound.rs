@@ -130,6 +130,7 @@ impl Outbound {
             let sent = self.slots.get(&spec.index).is_some_and(|slot| {
                 self.channel.as_ref().is_some_and(|channel| {
                     channel.send(Filled {
+                        packed: spec.packed.is_some(),
                         index: spec.index,
                         row_xxh3: sums.row,
                         page_xxh3: sums.pages.clone(),

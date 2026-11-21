@@ -463,8 +463,10 @@ impl Kind {
         })
     }
 
-    fn of(event: &TransportEvent) -> (Self, JobId, Result<u64>) {
-        match event {
+    fn of(event: &TransportEvent) -> Option<(Self, JobId, Result<u64>)> {
+        Some(match event {
+            // A local fence cannot release the other ranks' source pins.
+            TransportEvent::SourceReleased { .. } => return None,
             TransportEvent::Stored { id, result, header } => {
                 debug_assert!(header.as_ref().is_none_or(|h| !h.replicated()));
                 (Self::Stored, *id, copy(result))
@@ -479,7 +481,7 @@ impl Kind {
             TransportEvent::Unlinked { id, result } => {
                 (Self::Unlinked, *id, copy(result).map(|()| 0))
             }
-        }
+        })
     }
 
     fn event(self, id: JobId, result: Result<u64>) -> TransportEvent {
@@ -716,7 +718,9 @@ impl Sharded {
         let mut events = Vec::new();
         let _ = self.local.poll(&mut events);
         for event in events {
-            let (kind, id, result) = Kind::of(&event);
+            let Some((kind, id, result)) = Kind::of(&event) else {
+                continue;
+            };
             self.record(kind, id, 0, result);
         }
     }
@@ -1138,7 +1142,9 @@ impl Peer {
         let mut events = Vec::new();
         self.staged.poll(&mut events)?;
         for event in &events {
-            let (kind, id, result) = Kind::of(event);
+            let Some((kind, id, result)) = Kind::of(event) else {
+                continue;
+            };
             self.link.send(&encode_event(kind, id, &result))?;
         }
         Ok(())

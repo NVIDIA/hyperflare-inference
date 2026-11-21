@@ -629,32 +629,28 @@ impl Core {
                 &n.required_profiles,
             )
         }) {
+            self.count("codec_incompatible_total", "action=\"claim\"");
             return refuse(self, v2::ClaimReason::ChainGap);
         }
         if source == SourceId::Manager {
             return self.manager_claim(sid, key, &m, walk, &geometry, mode);
         }
-        let packed_hint = walk.nodes.iter().any(|n| n.packed || !n.required_profiles.is_empty());
-        let total = if packed_hint {
-            0
-        } else {
-            let Some(plan) = windows::plan(
-                &shapes_of(&walk, m.want_row),
-                geometry.page_bytes(),
-                geometry.row_bytes(),
-                self.cfg.limits.max_window_bytes,
-            ) else {
-                return refuse(self, v2::ClaimReason::InvalidClaim);
-            };
-            windows::total_bytes(&plan)
+        // Pinning supplies the stored lengths. Until then the raw shape bounds every packet.
+        let Some(plan) = windows::plan(
+            &shapes_of(&walk, m.want_row),
+            geometry.page_bytes(),
+            geometry.row_bytes(),
+            self.cfg.limits.max_window_bytes,
+        ) else {
+            return refuse(self, v2::ClaimReason::InvalidClaim);
         };
+        let total = windows::total_bytes(&plan);
 
         // Retained staging: required for a GPU export, preferred for host tiers.
         let mut block = None;
         let mut retained = false;
         match usize::try_from(total)
             .ok()
-            .filter(|_| !packed_hint)
             .and_then(|total| self.staging.allocate(total))
         {
             Some(extent) => {

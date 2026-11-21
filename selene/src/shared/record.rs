@@ -295,6 +295,9 @@ impl Header {
             .checked_add(layout.row_bytes())
             .filter(|n| *n <= isize::MAX as u64)
             .ok_or_else(|| invalid("v4 row offset overflow"))?;
+        // v4 authenticates and names replicas per unit.
+        self.row_checksum = 0;
+        self.flags &= !(REPLICATED | REPLICATED_ROW);
         self.version = packed::REVISION;
         self.packed = Some(Arc::new(layout));
         self.validate()?;
@@ -1143,6 +1146,10 @@ pub fn scan(
             Inspection::Unreadable(error) => return Err(error),
         }
     }
+    remove_orphans(records)
+}
+
+pub(crate) fn remove_orphans(mut records: Vec<Scanned>) -> Result<Vec<Scanned>> {
     loop {
         let keys: HashSet<PrefixKey> = records.iter().map(|record| record.header.key).collect();
         let parents: HashSet<PrefixKey> = records.iter().filter_map(|r| r.header.parent).collect();
@@ -1235,7 +1242,7 @@ fn inspect(
     })
 }
 
-fn remove(path: &Path) -> Result<()> {
+pub(crate) fn remove(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

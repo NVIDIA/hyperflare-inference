@@ -49,6 +49,7 @@ enum Phase {
 }
 
 struct Put {
+    offer: Option<wire::PackedOffer>,
     capture_role: crate::CaptureRole,
     child_paths: u32,
     key: PrefixKey,
@@ -106,6 +107,9 @@ fn refusal(reason: i32, detail: &str) -> PutOutcome {
         Ok(R::Oversize) => PutOutcome::Refused(PutRefusal::Oversize),
         Ok(R::Invalid) if detail == crate::shared::PUT_UNLINKED => {
             PutOutcome::Refused(PutRefusal::Unlinked)
+        }
+        Ok(R::Invalid) if detail == crate::shared::packed::RAW_REQUIRED => {
+            PutOutcome::Refused(PutRefusal::RawRequired)
         }
         Ok(R::Invalid) => PutOutcome::Refused(PutRefusal::Invalid),
         Ok(R::Queue) => PutOutcome::Refused(PutRefusal::Queue),
@@ -179,8 +183,30 @@ impl Engine {
         if request.tail_pages > request.chain_pages {
             return fail(self, "the put does not describe a consistent record");
         }
+        let PutSource::Host(source) = &request.source;
+        let mut offer = source.packed();
+        if let Some(o) = &offer {
+            let caps = self.sess.as_ref().and_then(|s| s.codec.as_ref());
+            let refusal = if !crate::shared::packed::offer_fits(o) {
+                Some(PutRefusal::OfferBound)
+            } else if !crate::shared::packed::permits_offer(caps, o) {
+                Some(PutRefusal::RawRequired)
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
+                if !source.raw_available(0) {
+                    self.event(PoolEvent::Put {
+                        id,
+                        outcome: PutOutcome::Refused(reason),
+                    });
+                    return;
+                }
+                offer = None;
+            }
+        }
         self.emit(Out::PutBegin(wire::PutBegin {
-            packed: None,
+            packed: offer.clone(),
             put_id: id,
             key: Some(codec::key_to(request.key)),
             chain_pages: request.chain_pages,
@@ -207,6 +233,7 @@ impl Engine {
         self.writer.puts.insert(
             id,
             Put {
+                offer,
                 capture_role: request.capture_role,
                 child_paths: request.child_paths,
                 key: request.key,
@@ -337,6 +364,35 @@ impl Engine {
                 Error::new("the manager accepted a put with nothing to write"),
             );
         }
+        let put = &self.writer.puts[&id];
+        if put.offer.is_none() && !put.source.lock().unwrap().raw_available(accept.first_page) {
+            self.writer.puts.get_mut(&id).unwrap().phase = Phase::Accepted;
+            self.writer.puts.get_mut(&id).unwrap().refused =
+                Some(PutOutcome::Refused(PutRefusal::RawRequired));
+            return self.fail_put(id, Error::new(crate::shared::packed::RAW_REQUIRED));
+        }
+        let selected = match (&self.writer.puts[&id].offer, &accept.packed) {
+            (None, None) => None,
+            (Some(offer), Some(selection)) => {
+                let packed = crate::shared::packed::select(offer, accept.first_page, row)
+                    .and_then(|o| header.with_packed(o));
+                match packed {
+                    Ok(h)
+                        if selection.row_required == row
+                            && h.length(row) == selection.physical_record_bytes =>
+                    {
+                        h.packed
+                    }
+                    _ => {
+                        return self.fail_put(
+                            id,
+                            Error::new("manager chose an incompatible packed suffix"),
+                        );
+                    }
+                }
+            }
+            _ => return self.fail_put(id, Error::new("manager changed the put representation")),
+        };
         let put = self.writer.puts.get_mut(&id).expect("present");
         put.row = row;
         put.coverage = Some(Coverage::new(vec![ExpectedRecord {
@@ -345,7 +401,14 @@ impl Engine {
             pages: pages as u32,
             row: put.row,
         }]));
-        put.sums = vec![0; pages as usize];
+        if let Some(layout) = selected {
+            put.coverage
+                .as_mut()
+                .unwrap()
+                .set_packed(0, layout.as_ref().clone());
+        } else {
+            put.sums = vec![0; pages as usize];
+        }
         put.phase = Phase::Accepted;
         if self.ranks.is_some()
             && let Err(why) = self.open_put_peers(id, pages as u32, &accept.rank_channels)
@@ -372,12 +435,18 @@ impl Engine {
     }
 
     /// The manager granted a window over the data channel; its bytes go in `slot`.
-    pub(crate) fn on_net_grant(&mut self, put: u64, shape: frame::Shape, slot: u32) {
+    pub(crate) fn on_net_grant(
+        &mut self,
+        put: u64,
+        shape: frame::Shape,
+        slot: u32,
+        packed: Option<wire::PackedWindow>,
+    ) {
         let Some(staging) = self.net.clone() else {
             return;
         };
         let spec = wire::WindowSpec {
-            packed: None,
+            packed,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -430,6 +499,7 @@ impl Engine {
         let first = put.first_page + dest;
         put.windows.insert(spec.index, (spec.clone(), dest));
         let bytes = put.source.clone();
+        let packed = spec.packed.is_some();
         let job = put.out.fill_host(
             FillOwner::Put(id),
             spec.clone(),
@@ -437,10 +507,12 @@ impl Engine {
             slot,
             self.ranks.as_ref(),
             Box::new(move |dst| {
-                bytes
-                    .lock()
-                    .unwrap()
-                    .fill(first, spec.page_count, spec.row, dst)
+                let mut bytes = bytes.lock().unwrap();
+                if packed {
+                    bytes.fill_packed(first, spec.page_count, spec.row, dst)
+                } else {
+                    bytes.fill(first, spec.page_count, spec.row, dst)
+                }
             }),
         );
         let fan_out = put.out.fan_out(self.ranks.as_mut(), spec.clone());
@@ -482,12 +554,14 @@ impl Engine {
         let Some((spec, dest)) = put.windows.remove(&window) else {
             return;
         };
-        let Some(sums) = supplied.filter(|s| s.pages.len() == spec.page_count as usize) else {
+        let Some(sums) =
+            supplied.filter(|s| spec.packed.is_some() || s.pages.len() == spec.page_count as usize)
+        else {
             return self.fail_put(id, Error::new("a window's checksums are missing"));
         };
         // A multi-process writer cannot state whole-page checksums; the manager computes the
         // ones the record keeps.
-        if self.ranks.is_none() {
+        if self.ranks.is_none() && spec.packed.is_none() {
             for (i, sum) in sums.pages.iter().enumerate() {
                 put.sums[dest as usize + i] = *sum;
             }
@@ -618,6 +692,14 @@ impl Engine {
     }
 
     fn commit_put(&mut self, id: u64) {
+        if self.writer.puts[&id].offer.is_some() {
+            self.writer.puts.get_mut(&id).unwrap().phase = Phase::Committed;
+            self.emit(Out::PutCommit(wire::PutCommit {
+                put_id: id,
+                ..Default::default()
+            }));
+            return;
+        }
         let put = &self.writer.puts[&id];
         let metadata = self.put_header(put).and_then(|mut header| {
             header.row_checksum = put.row_sum.unwrap_or(0);

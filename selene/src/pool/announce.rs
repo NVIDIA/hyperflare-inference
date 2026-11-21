@@ -28,6 +28,8 @@ pub const DEFAULT_MAX_ENTRIES: usize = 4_000_000;
 /// One (key, tier) holding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexEntry {
+    pub packed: bool,
+    pub required_profiles: Vec<Vec<u8>>,
     pub key: PrefixKey,
     pub parent: Option<PrefixKey>,
     pub bucket: [u8; 16],
@@ -248,6 +250,8 @@ mod tests {
 
     fn entry(n: u64, tier: Tier, _generation: u64) -> IndexEntry {
         IndexEntry {
+            packed: false,
+            required_profiles: Vec::new(),
             key: key(n),
             parent: None,
             bucket: [0; 16],

@@ -40,14 +40,24 @@ use flare_selene::{
     slab::{RankPart, SlabPool, WINDOW_PAGES},
 };
 
+mod codec;
 use crate::cuda::{Event, Stream};
+#[cfg(feature = "server")]
+pub(crate) use codec::codec_metrics;
+#[cfg(all(test, feature = "runtime-core"))]
+pub(crate) use codec::{live_scratch, workspace_parts};
 
 pub use crate::cuda::{BATCH_BYTES, BATCH_ENTRIES};
 
 pub const NICE: i32 = 10;
 
 pub struct Transfers {
+    profile: Option<[u8; 32]>,
+    encode: bool,
     layout: Layout,
+    policy: flare_selene::codec_copy::MirrorPolicy,
+    backstops: Vec<RankThread>,
+    mirrors: Vec<RankThread>,
     ranks: Vec<RankThread>,
     receiver: Receiver<RankReply>,
     pending: HashMap<(JobId, u32), Pending>,
@@ -61,6 +71,7 @@ struct RankThread {
 }
 
 struct RankReply {
+    encoded: Option<(bool, u64)>,
     id: JobId,
     window: u32,
     rank: usize,
@@ -69,6 +80,9 @@ struct RankReply {
 }
 
 struct Pending {
+    encoded: [u64; 2],
+    mirror: Option<std::sync::Arc<flare_selene::codec_copy::MirrorProgress>>,
+    reported: bool,
     direction: Direction,
     remaining: usize,
     bytes: u64,
@@ -277,6 +291,7 @@ fn lower_priority() {
 }
 
 struct RankWorker {
+    codec: Option<codec::RankCodec>,
     rank: usize,
     geometry: CacheGeometry,
     layout: RankLayout,
@@ -301,9 +316,11 @@ impl RankWorker {
         geometry: CacheGeometry,
         layout: RankLayout,
         part: Option<RankPart>,
+        mirror: bool,
     ) -> Result<Self> {
         let stream = Stream::open_lowest_priority(context, device)?;
         let event = stream.blocking_event()?;
+        let codec = codec::RankCodec::new(context, &stream, &geometry, &layout, mirror)?;
         let chunks = |bytes: u64| bytes.div_ceil(BATCH_BYTES as u64) as usize;
         let window = geometry
             .planes
@@ -313,6 +330,7 @@ impl RankWorker {
             * WINDOW_PAGES
             + chunks(geometry.row.unit_bytes);
         Ok(Self {
+            codec,
             rank,
             geometry,
             layout,
@@ -328,6 +346,21 @@ impl RankWorker {
 
     /// Issue every batch of the job, then wait for the last one; returns the bytes copied.
     fn run(&mut self, job: &Job) -> Result<u64> {
+        if let Some(window) = &job.codec {
+            return self
+                .codec
+                .as_mut()
+                .ok_or_else(|| invalid("unqualified codec layout"))?
+                .run(
+                    self.rank,
+                    &self.geometry,
+                    &self.layout,
+                    &self.stream,
+                    &self.event,
+                    job,
+                    window,
+                );
+        }
         expand(
             &self.geometry,
             &self.layout,
@@ -373,7 +406,7 @@ impl RankWorker {
         }
     }
 
-    fn serve(mut self, jobs: Receiver<Job>, replies: Sender<RankReply>) {
+    fn serve(mut self, jobs: Receiver<Job>, replies: Sender<RankReply>, reply_rank: usize) {
         for job in jobs {
             let (result, bytes) = match self.run(&job) {
                 Ok(bytes) => (Ok(()), bytes),
@@ -384,10 +417,31 @@ impl RankWorker {
                     (Err(error), 0)
                 }
             };
+            let encoded = job
+                .codec
+                .as_ref()
+                .and_then(|window| match window.0.as_ref() {
+                    flare_selene::codec_copy::Action::Mirror { literal: false, .. }
+                        if result.is_ok() =>
+                    {
+                        let bytes = job.pages.len() as u64 * self.geometry.page_record_bytes()
+                            + if job.row.is_some() {
+                                self.geometry.row_record_bytes()
+                            } else {
+                                0
+                            };
+                        Some((
+                            self.geometry.placement == flare_selene::offload::KvCompression::Gpu,
+                            bytes,
+                        ))
+                    }
+                    _ => None,
+                });
             let reply = RankReply {
+                encoded,
                 id: job.id,
                 window: job.window,
-                rank: self.rank,
+                rank: reply_rank,
                 result,
                 bytes,
             };
@@ -443,63 +497,171 @@ impl Transfers {
         layout: Layout,
         parts: Vec<Option<RankPart>>,
     ) -> Result<Self> {
+        Self::reserve(contexts, &geometry, layout.clone())?.bind(geometry, &layout, parts)
+    }
+
+    fn reserve(
+        contexts: &[(usize, i32)],
+        geometry: &[CacheGeometry],
+        layout: Layout,
+    ) -> Result<PendingTransfers> {
+        if contexts.is_empty() || contexts.len() != geometry.len() {
+            return Err(invalid("transfer threads need one context per cache rank"));
+        }
         let (reply_sender, receiver) = mpsc::channel();
+        let policy = codec::mirror_policy(geometry, &layout)?;
         let mut transfers = Self {
+            profile: flare_selene::codec_copy::profile(geometry),
+            encode: geometry
+                .iter()
+                .all(|g| g.placement != flare_selene::offload::KvCompression::Off),
             layout,
+            policy,
+            backstops: Vec::new(),
+            mirrors: Vec::new(),
             ranks: Vec::with_capacity(contexts.len()),
             receiver,
             pending: HashMap::new(),
         };
-        for (rank, ((&(context, device), geometry), part)) in
-            contexts.iter().zip(geometry).zip(parts).enumerate()
-        {
+        let mut scratch = vec![[0u64; 2]; contexts.len()];
+        let mut bindings = Vec::new();
+        for (rank, (&(context, device), geometry)) in contexts.iter().zip(geometry).enumerate() {
             let layout = transfers.layout.ranks[rank].clone();
-            let (sender, jobs) = mpsc::sync_channel(QUEUE_DEPTH);
-            let (ready_sender, ready) = mpsc::channel();
-            let replies = reply_sender.clone();
-            let thread = std::thread::Builder::new()
-                .name(format!("flare-offload-{rank}"))
-                .spawn(move || {
-                    let worker =
-                        match RankWorker::open(rank, context, device, geometry, layout, part) {
+            let lanes = if transfers.encode && transfers.profile.is_some() {
+                2 + usize::from(transfers.policy.backstop.is_some())
+            } else {
+                1
+            };
+            for lane in 0..lanes {
+                #[cfg(test)]
+                if lane == 1 && FAIL_MIRROR_RESERVATION.replace(false) {
+                    return Err(invalid("injected GPU mirror workspace refusal"));
+                }
+                let mirror = lane != 0;
+                let reply_rank = rank + lane * contexts.len();
+                let mut geometry = geometry.clone();
+                if transfers.profile.is_none() {
+                    geometry.codec_fields.clear();
+                }
+                if lane == 2 {
+                    geometry.placement = flare_selene::offload::KvCompression::Off;
+                }
+                let layout = layout.clone();
+                let (bind, binding) = mpsc::channel::<(CacheGeometry, Option<RankPart>)>();
+                let (sender, jobs) = mpsc::sync_channel(QUEUE_DEPTH);
+                let (ready_sender, ready) = mpsc::channel();
+                let replies = reply_sender.clone();
+                let thread = std::thread::Builder::new()
+                    .name(format!(
+                        "flare-{}-{rank}",
+                        ["copy", "mirror", "intake"][lane]
+                    ))
+                    .spawn(move || {
+                        let mut worker = match RankWorker::open(
+                            rank, context, device, geometry, layout, None, mirror,
+                        ) {
                             Ok(worker) => worker,
                             Err(error) => {
                                 let _ = ready_sender.send(Err(error));
                                 return;
                             }
                         };
-                    lower_priority();
-                    if ready_sender.send(Ok(())).is_err() {
-                        return;
+                        lower_priority();
+                        let bytes = worker.codec.as_ref().map_or([0; 2], |codec| codec.reserved);
+                        if ready_sender.send(Ok(bytes)).is_err() {
+                            return;
+                        }
+                        if let Ok((mut final_geometry, part)) = binding.recv() {
+                            final_geometry.placement = worker.geometry.placement;
+                            worker.geometry = final_geometry;
+                            worker.part = part;
+                            worker.serve(jobs, replies, reply_rank);
+                        }
+                    })
+                    .map_err(|error| {
+                        Error::caused_by(
+                            format!("cannot spawn the offload thread for rank {rank}"),
+                            error,
+                        )
+                    })?;
+                let worker = RankThread {
+                    sender: Some(sender),
+                    thread: Some(thread),
+                    outstanding: 0,
+                };
+                match ready.recv() {
+                    Ok(Ok([host, device])) => {
+                        scratch[rank][0] += host;
+                        scratch[rank][1] += device;
                     }
-                    worker.serve(jobs, replies);
-                })
-                .map_err(|error| {
-                    Error::caused_by(
-                        format!("cannot spawn the offload thread for rank {rank}"),
-                        error,
-                    )
-                })?;
-            transfers.ranks.push(RankThread {
-                sender: Some(sender),
-                thread: Some(thread),
-                outstanding: 0,
-            });
-            match ready.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(invalid(format!(
-                        "offload thread for rank {rank} stopped during startup"
-                    )));
+                    Ok(Err(error)) => {
+                        return Err(invalid(format!(
+                            "rank {rank} {} lane: {error}",
+                            ["restore", "mirror", "intake"][lane]
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(invalid(format!(
+                            "offload thread for rank {rank} stopped during startup"
+                        )));
+                    }
+                }
+                bindings.push((rank, bind));
+                if lane == 2 {
+                    transfers.backstops.push(worker);
+                } else if mirror {
+                    transfers.mirrors.push(worker);
+                } else {
+                    transfers.ranks.push(worker);
                 }
             }
         }
-        Ok(transfers)
+        Ok(PendingTransfers {
+            bindings,
+            transfers,
+            scratch,
+        })
+    }
+}
+
+// Drop the binding senders before joining workers that have not received their final slots.
+pub(crate) struct PendingTransfers {
+    scratch: Vec<[u64; 2]>,
+    bindings: Vec<(usize, Sender<(CacheGeometry, Option<RankPart>)>)>,
+    transfers: Transfers,
+}
+
+impl PendingTransfers {
+    fn bind(
+        self,
+        geometry: Vec<CacheGeometry>,
+        layout: &Layout,
+        parts: Vec<Option<RankPart>>,
+    ) -> Result<Transfers> {
+        if &self.transfers.layout != layout || parts.len() != geometry.len() {
+            return Err(invalid(
+                "reserved codec geometry differs from the final cache",
+            ));
+        }
+        for (rank, sender) in self.bindings {
+            sender
+                .send((geometry[rank].clone(), parts[rank].clone()))
+                .map_err(|_| invalid("reserved transfer worker stopped before binding"))?;
+        }
+        Ok(self.transfers)
     }
 }
 
 impl PageCopier for Transfers {
+    fn mirror_policy(&self) -> flare_selene::codec_copy::MirrorPolicy {
+        self.policy.clone()
+    }
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.profile
+    }
+    fn encode_mirrors(&self) -> bool {
+        self.encode && self.profile.is_some()
+    }
     fn layout(&self) -> &Layout {
         &self.layout
     }
@@ -520,7 +682,20 @@ impl PageCopier for Transfers {
                 job.id.0, job.window
             )));
         }
-        for (rank, thread) in self.ranks.iter().enumerate() {
+        let lanes = if job.codec.as_ref().is_some_and(|w| {
+            matches!(
+                w.0.as_ref(),
+                flare_selene::codec_copy::Action::Mirror { backstop: true, .. }
+            )
+        }) {
+            &mut self.backstops
+        } else if !self.mirrors.is_empty() && job.direction == Direction::Out && job.codec.is_some()
+        {
+            &mut self.mirrors
+        } else {
+            &mut self.ranks
+        };
+        for (rank, thread) in lanes.iter().enumerate() {
             if thread.sender.is_none() || thread.thread.as_ref().is_none_or(JoinHandle::is_finished)
             {
                 return Err(invalid(format!(
@@ -533,15 +708,28 @@ impl PageCopier for Transfers {
                 )));
             }
         }
+        let mirror = job.codec.as_ref().and_then(|w| match w.0.as_ref() {
+            flare_selene::codec_copy::Action::Mirror { progress, .. } => Some(progress.clone()),
+            _ => None,
+        });
+        if let Some(progress) = &mirror {
+            progress.submitted();
+            if progress.can_release(Instant::now()) {
+                return Err(invalid("mirror stalled"));
+            }
+        }
         let mut pending = Pending {
+            encoded: [0; 2],
+            mirror,
+            reported: false,
             direction: job.direction,
-            remaining: self.ranks.len(),
+            remaining: lanes.len(),
             bytes: 0,
             error: None,
             started: Instant::now(),
         };
         let mut accepted = 0;
-        if let Some((last, rest)) = self.ranks.split_last_mut() {
+        if let Some((last, rest)) = lanes.split_last_mut() {
             for (rank, thread) in rest.iter_mut().enumerate() {
                 accepted += usize::from(thread.offer(rank, job.clone(), &mut pending));
             }
@@ -561,10 +749,24 @@ impl PageCopier for Transfers {
         while let Ok(reply) = self.receiver.try_recv() {
             self.absorb(reply, replies);
         }
+        let now = Instant::now();
+        for (&(id, window), pending) in &mut self.pending {
+            if !pending.reported && pending.mirror.as_ref().is_some_and(|p| p.can_release(now)) {
+                pending.reported = true;
+                replies.push(Reply {
+                    id,
+                    window,
+                    direction: pending.direction,
+                    result: Err(invalid("mirror stalled")),
+                    bytes: 0,
+                    elapsed: pending.started.elapsed(),
+                });
+            }
+        }
     }
 
     fn in_flight(&self) -> usize {
-        self.pending.len()
+        self.pending.values().filter(|p| !p.reported).count()
     }
 
     /// Wait up to [`CLOSE_TIMEOUT`] for outstanding jobs, discarding their
@@ -588,11 +790,22 @@ impl PageCopier for Transfers {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        for rank in &mut self.ranks {
+        for rank in self
+            .ranks
+            .iter_mut()
+            .chain(&mut self.mirrors)
+            .chain(&mut self.backstops)
+        {
             rank.sender.take();
         }
         let mut stopped = Vec::new();
-        for (rank, thread) in self.ranks.iter_mut().enumerate() {
+        for (rank, thread) in self
+            .ranks
+            .iter_mut()
+            .chain(&mut self.mirrors)
+            .chain(&mut self.backstops)
+            .enumerate()
+        {
             if thread
                 .thread
                 .take()
@@ -618,13 +831,22 @@ impl PageCopier for Transfers {
 
 impl Transfers {
     fn absorb(&mut self, reply: RankReply, replies: &mut Vec<Reply>) {
-        if let Some(thread) = self.ranks.get_mut(reply.rank) {
+        if let Some(thread) = self
+            .ranks
+            .iter_mut()
+            .chain(&mut self.mirrors)
+            .chain(&mut self.backstops)
+            .nth(reply.rank)
+        {
             thread.outstanding = thread.outstanding.saturating_sub(1);
         }
         let key = (reply.id, reply.window);
         let Some(pending) = self.pending.get_mut(&key) else {
             return;
         };
+        if let Some((gpu, bytes)) = reply.encoded {
+            pending.encoded[usize::from(gpu)] += bytes;
+        }
         pending.bytes += reply.bytes;
         if let Err(error) = reply.result {
             pending.error.get_or_insert(error);
@@ -633,12 +855,22 @@ impl Transfers {
         if pending.remaining > 0 {
             return;
         }
-        if let Some(pending) = self.pending.remove(&key) {
+        if let Some(pending) = self.pending.remove(&key)
+            && !pending.reported
+        {
+            let result = if pending.mirror.as_ref().is_some_and(|p| p.cancelled()) {
+                Err(invalid("mirror stalled"))
+            } else {
+                pending.error.map_or(Ok(()), Err)
+            };
+            if result.is_ok() {
+                codec::count_encoded_input(pending.encoded);
+            }
             replies.push(Reply {
                 id: reply.id,
                 window: reply.window,
                 direction: pending.direction,
-                result: pending.error.map_or(Ok(()), Err),
+                result,
                 bytes: pending.bytes,
                 elapsed: pending.started.elapsed(),
             });
@@ -669,10 +901,20 @@ impl RankThread {
 
 impl Drop for Transfers {
     fn drop(&mut self) {
-        for rank in &mut self.ranks {
+        for rank in self
+            .ranks
+            .iter_mut()
+            .chain(&mut self.mirrors)
+            .chain(&mut self.backstops)
+        {
             rank.sender.take();
         }
-        for rank in &mut self.ranks {
+        for rank in self
+            .ranks
+            .iter_mut()
+            .chain(&mut self.mirrors)
+            .chain(&mut self.backstops)
+        {
             if let Some(thread) = rank.thread.take() {
                 let _ = thread.join();
             }
@@ -697,6 +939,7 @@ mod tests {
 
     fn job(direction: Direction) -> Job {
         Job {
+            codec: None,
             replication: Default::default(),
             id: JobId(9),
             window: 2,
@@ -715,6 +958,7 @@ mod tests {
         let host = pool.slot_address(flare_selene::slab::Slot(0));
         let parts = pool.registered_parts(&layout, device);
         let mut job = Job {
+            codec: None,
             id: JobId(1),
             window: 0,
             direction: Direction::In,
@@ -790,6 +1034,7 @@ mod tests {
         let rows: Vec<_> = (0..2).map(|_| pool.allocate_page().unwrap()).collect();
         for (rank, part) in parts.iter().enumerate() {
             let mut job = Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(1),
                 window: 0,
@@ -905,6 +1150,7 @@ mod tests {
         );
         let rows = start + 8 * page_record;
         let job = Job {
+            codec: None,
             replication: Default::default(),
             id: JobId(4),
             window: 0,
@@ -1099,7 +1345,12 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let layout = Layout::new(&[geometry(64, &[("k", 8192)], 4096)]).unwrap();
         let transfers = Transfers {
+            profile: None,
+            encode: false,
             layout,
+            policy: Default::default(),
+            backstops: Vec::new(),
+            mirrors: Vec::new(),
             ranks: (0..ranks)
                 .map(|_| RankThread {
                     sender: None,
@@ -1114,6 +1365,128 @@ mod tests {
     }
 
     #[test]
+    fn stalled_encode_releases_the_source_once_and_fences_a_late_rank_reply() {
+        use flare_selene::codec_copy::{MirrorProgress, STALL_LIMIT};
+        for poll_first in [true, false] {
+            let (mut transfers, _) = detached(1);
+            let progress = std::sync::Arc::new(MirrorProgress::default());
+            progress.submitted();
+            let reading = progress.source().unwrap();
+            let id = JobId(9);
+            transfers.pending.insert(
+                (id, 0),
+                Pending {
+                    encoded: [0; 2],
+                    mirror: Some(progress.clone()),
+                    reported: false,
+                    direction: Direction::Out,
+                    remaining: 1,
+                    bytes: 0,
+                    error: None,
+                    started: Instant::now(),
+                },
+            );
+            assert!(!progress.can_release(Instant::now() + STALL_LIMIT));
+            let mut replies = Vec::new();
+            transfers.poll(&mut replies);
+            assert!(replies.is_empty());
+            drop(reading);
+            if poll_first {
+                transfers.poll(&mut replies);
+                assert_eq!(replies.len(), 1);
+                assert_eq!(transfers.in_flight(), 0);
+            }
+            transfers.absorb(
+                RankReply {
+                    encoded: None,
+                    id,
+                    window: 0,
+                    rank: 0,
+                    result: Ok(()),
+                    bytes: 1,
+                },
+                &mut replies,
+            );
+            assert_eq!(replies.len(), 1);
+            assert!(replies[0].result.is_err());
+            assert_eq!(transfers.in_flight(), 0);
+        }
+    }
+
+    #[test]
+    fn restore_fences_while_the_mirror_lane_is_occupied() {
+        restore_on_busy_lane(false);
+    }
+    #[test]
+    fn restore_fences_while_backstop_intake_is_occupied() {
+        restore_on_busy_lane(true);
+    }
+    fn restore_on_busy_lane(backstop: bool) {
+        let (mut transfers, tx) = detached(0);
+        let (entered, busy) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let make_lane = |rank, wait: Option<Receiver<()>>| {
+            let (send, jobs) = mpsc::sync_channel::<Job>(2);
+            let tx = tx.clone();
+            let entered = entered.clone();
+            let thread = std::thread::spawn(move || {
+                for job in jobs {
+                    if let Some(w) = &wait {
+                        entered.send(()).unwrap();
+                        let _ = w.recv_timeout(Duration::from_secs(3));
+                    }
+                    tx.send(RankReply {
+                        encoded: None,
+                        id: job.id,
+                        window: job.window,
+                        rank,
+                        result: Ok(()),
+                        bytes: 0,
+                    })
+                    .unwrap();
+                }
+            });
+            RankThread {
+                sender: Some(send),
+                thread: Some(thread),
+                outstanding: 0,
+            }
+        };
+        transfers.ranks.push(make_lane(0, None));
+        if backstop {
+            transfers.mirrors.push(make_lane(1, None));
+            transfers.backstops.push(make_lane(2, Some(wait)));
+        } else {
+            transfers.mirrors.push(make_lane(1, Some(wait)));
+        }
+        let mut mirror = job(Direction::Out);
+        mirror.codec = Some(flare_selene::codec_copy::Window::capture_on(
+            0,
+            1,
+            false,
+            Default::default(),
+            backstop,
+        ));
+        transfers.submit(mirror).unwrap();
+        busy.recv_timeout(Duration::from_secs(2))
+            .expect("mirror started");
+        let mut restore = job(Direction::In);
+        restore.window += 1;
+        restore.codec = Some(flare_selene::codec_copy::Window::restore(0, vec![]));
+        transfers.submit(restore).unwrap();
+        let completed = transfers
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("restore completed");
+        let mut out = vec![];
+        transfers.absorb(completed, &mut out);
+        assert_eq!(out[0].direction, Direction::In);
+        assert_eq!(transfers.in_flight(), 1);
+        release.send(()).unwrap();
+        transfers.close().unwrap();
+    }
+
+    #[test]
     fn poll_merges_rank_replies_and_keeps_the_first_error() {
         let (mut transfers, sender) = detached(2);
         let started = Instant::now();
@@ -1121,6 +1494,9 @@ mod tests {
             transfers.pending.insert(
                 (id, window),
                 Pending {
+                    encoded: [0; 2],
+                    mirror: None,
+                    reported: false,
                     direction: Direction::Out,
                     remaining: 2,
                     bytes: 0,
@@ -1129,7 +1505,9 @@ mod tests {
                 },
             );
         }
+        let before = codec::encoded_input();
         let reply = |id, window, rank, result, bytes| RankReply {
+            encoded: Some((rank == 1, bytes)),
             id,
             window,
             rank,
@@ -1158,6 +1536,7 @@ mod tests {
         let finished = replies.iter().find(|reply| reply.window == 1).unwrap();
         assert!(finished.result.is_ok());
         assert_eq!(finished.bytes, 15);
+        assert_eq!(codec::encoded_input(), [before[0] + 7, before[1] + 8]);
         assert!(finished.elapsed >= Duration::ZERO);
         assert_eq!(transfers.in_flight(), 0);
         sender.send(reply(JobId(42), 0, 0, Ok(()), 1)).unwrap();
@@ -1174,6 +1553,9 @@ mod tests {
         transfers.pending.insert(
             (JobId(9), 2),
             Pending {
+                encoded: [0; 2],
+                mirror: None,
+                reported: false,
                 direction: Direction::In,
                 remaining: 1,
                 bytes: 0,
@@ -1222,7 +1604,12 @@ mod tests {
             outstanding: 0,
         };
         let mut transfers = Transfers {
+            profile: None,
+            encode: false,
             layout,
+            policy: Default::default(),
+            backstops: Vec::new(),
+            mirrors: Vec::new(),
             ranks: vec![rank(accepting), rank(full), rank(disconnected)],
             receiver,
             pending: HashMap::new(),
@@ -1248,6 +1635,7 @@ mod tests {
         assert!(replies.is_empty());
         reply_sender
             .send(RankReply {
+                encoded: None,
                 id: JobId(9),
                 window: 2,
                 rank: 0,
@@ -1396,6 +1784,7 @@ mod tests {
         };
         transfers
             .submit(Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(1),
                 window: 0,
@@ -1456,6 +1845,7 @@ mod tests {
 
         transfers
             .submit(Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(2),
                 window: 0,
@@ -1507,6 +1897,7 @@ mod tests {
         for (id, slot) in [(capacity, 0), (0, rank.row_capacity as u32)] {
             transfers
                 .submit(Job {
+                    codec: None,
                     replication: Default::default(),
                     id: JobId(3 + u64::from(slot != 0)),
                     window: 0,
@@ -1581,6 +1972,9 @@ mod tests {
                     })
                     .collect();
                 geometry.push(CacheGeometry {
+                    placement: Default::default(),
+                    gpu_mirror_duty: None,
+                    codec_fields: Vec::new(),
                     snapshot_pages: Vec::new(),
                     page_tokens: 64,
                     page_capacity: PAGES,
@@ -1735,6 +2129,7 @@ mod tests {
             .sum();
         transfers
             .submit(Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(1),
                 window: 0,
@@ -1786,6 +2181,7 @@ mod tests {
 
         transfers
             .submit(Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(2),
                 window: 0,
@@ -1885,6 +2281,7 @@ mod tests {
         for parts in [&registered, &split] {
             for (rank, geometry) in ranks.iter().enumerate() {
                 let mut job = Job {
+                    codec: None,
                     replication: Default::default(),
                     id: JobId(1),
                     window: 0,
@@ -1933,12 +2330,99 @@ mod tests {
     }
 }
 
-pub(crate) struct Copiers;
-impl flare_selene::offload::CopierFactory for Copiers {
-    fn mapped(&self, contexts: &[(usize, i32)], geometry: Vec<flare_selene::CacheGeometry>, slabs: &flare_selene::slab::SlabPool) -> flare_selene::Result<flare_selene::SharedCopier> {
-        Ok(std::sync::Arc::new(std::sync::Mutex::new(Transfers::start(contexts, geometry, slabs)?)))
+#[derive(Copy, Clone, Default)]
+pub(crate) struct CodecMemory {
+    pub device: u64,   // per device
+    pub pinned: u64,   // across local ranks
+    pub backstop: u64, // later CPU verification scratch
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_MIRROR_RESERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) enum Copiers {
+    OnDemand,
+    Reserved(std::sync::Mutex<Vec<PendingTransfers>>),
+    Raw,
+}
+
+impl Copiers {
+    pub(crate) fn reserve(
+        contexts: &[(usize, i32)],
+        geometry: &[CacheGeometry],
+        tiers: usize,
+    ) -> Result<(Self, CodecMemory)> {
+        let layout = Layout::new(geometry)?;
+        let mut workers = Vec::with_capacity(tiers);
+        let mut memory = CodecMemory::default();
+        for _ in 0..tiers {
+            let pending = Transfers::reserve(contexts, geometry, layout.clone())?;
+            memory.device += pending.scratch.iter().map(|s| s[1]).max().unwrap_or(0);
+            memory.pinned += pending.scratch.iter().map(|s| s[0]).sum::<u64>();
+            if pending.transfers.policy.backstop.is_some() {
+                memory.backstop += geometry
+                    .iter()
+                    .map(|g| g.page_record_bytes().max(g.row_record_bytes()))
+                    .max()
+                    .unwrap_or(0);
+            }
+            workers.push(pending);
+        }
+        Ok((Self::Reserved(std::sync::Mutex::new(workers)), memory))
     }
-    fn unmapped(&self, contexts: &[(usize, i32)], geometry: Vec<flare_selene::CacheGeometry>) -> flare_selene::Result<Box<dyn flare_selene::PageCopier>> {
-        Ok(Box::new(Transfers::start_unmapped(contexts, geometry)?))
+
+    fn start(
+        &self,
+        contexts: &[(usize, i32)],
+        mut geometry: Vec<CacheGeometry>,
+        pool: Option<&SlabPool>,
+    ) -> Result<Transfers> {
+        let layout = Layout::new(&geometry)?;
+        let parts = match pool {
+            Some(pool) => pool.device_parts(&layout)?.into_iter().map(Some).collect(),
+            None => vec![None; contexts.len()],
+        };
+        if let Self::Reserved(workers) = self {
+            return workers
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| invalid("no reserved copy engine for this tier"))?
+                .bind(geometry, &layout, parts);
+        }
+        if matches!(self, Self::Raw) {
+            for rank in &mut geometry {
+                rank.codec_fields.clear();
+            }
+        }
+        let mut transfers = Transfers::start_parts(contexts, geometry, layout, parts)?;
+        if matches!(self, Self::Raw) && transfers.encode {
+            transfers.policy.workspace_unavailable = true;
+        }
+        Ok(transfers)
+    }
+}
+
+impl flare_selene::offload::CopierFactory for Copiers {
+    fn mapped(
+        &self,
+        contexts: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+        slabs: &SlabPool,
+    ) -> Result<flare_selene::SharedCopier> {
+        Ok(std::sync::Arc::new(std::sync::Mutex::new(self.start(
+            contexts,
+            geometry,
+            Some(slabs),
+        )?)))
+    }
+    fn unmapped(
+        &self,
+        contexts: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+    ) -> Result<Box<dyn PageCopier>> {
+        Ok(Box::new(self.start(contexts, geometry, None)?))
     }
 }

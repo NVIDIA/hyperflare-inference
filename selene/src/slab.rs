@@ -143,6 +143,7 @@ struct Split {
 /// Shared slots with immutable mapping geometry and resource ownership.
 #[derive(Clone)]
 pub struct SlabPool {
+    pub(crate) backstop_usage: Arc<crate::codec_copy::BackstopUsage>,
     pub(crate) memory: Arc<Memory>,
     slots: Arc<Mutex<Slots>>,
 }
@@ -173,6 +174,7 @@ impl SlabPool {
                 registration: None,
                 split: None,
             }),
+            backstop_usage: Default::default(),
             slots: Arc::new(Mutex::new(Slots::new(count))),
         })
     }
@@ -250,6 +252,7 @@ impl SlabPool {
                     _memory: memory,
                 }),
             }),
+            backstop_usage: Default::default(),
             slots: Arc::new(Mutex::new(Slots::new(slot_count))),
         })
     }
@@ -337,8 +340,12 @@ impl SlabPool {
     }
 
     pub fn allocate(&self, count: usize) -> Option<Vec<Slot>> {
+        self.allocate_leaving(count, 0)
+    }
+
+    pub(crate) fn allocate_leaving(&self, count: usize, leave: usize) -> Option<Vec<Slot>> {
         let mut slots = self.lock();
-        if slots.free.len() < count {
+        if slots.free.len().saturating_sub(leave) < count {
             return None;
         }
         Some(

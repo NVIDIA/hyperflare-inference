@@ -233,6 +233,18 @@ pub(crate) enum Id {
 
 #[derive(Debug)]
 pub(crate) enum Event {
+    PackedWindow {
+        claim: u64,
+        shape: Shape,
+        manifest: wire::PackedWindow,
+        slot: u32,
+    },
+    PackedGrant {
+        id: Id,
+        shape: Shape,
+        manifest: wire::PackedWindow,
+        slot: u32,
+    },
     /// A claim's window is in `slot`, whole.
     Window {
         claim: u64,
@@ -291,6 +303,7 @@ impl Drop for ClosedOnDrop {
 
 /// A put's filled window, for the task to write.
 pub(crate) struct Filled {
+    pub packed: bool,
     pub index: u32,
     pub row_xxh3: Option<u64>,
     pub page_xxh3: Vec<u64>,
@@ -351,6 +364,9 @@ pub(crate) struct Open {
 
 /// Opens transfers. The engine owns one per session; tests substitute their own.
 pub(crate) trait Dial: Send + Sync {
+    fn may_use_rdma(&self) -> bool {
+        false
+    }
     fn open(&self, request: Open) -> io::Result<Channel>;
 }
 
@@ -368,7 +384,14 @@ pub(crate) struct Tcp {
     pub rdma_broken: Arc<AtomicBool>,
 }
 
+pub(crate) fn can_negotiate_rdma(offered: bool, tls: bool) -> bool {
+    cfg!(feature = "rdma") && offered && !tls
+}
 impl Dial for Tcp {
+    fn may_use_rdma(&self) -> bool {
+        can_negotiate_rdma(self.rdma_offered, self.tls.is_some())
+            && !self.rdma_broken.load(Ordering::Relaxed)
+    }
     fn open(&self, request: Open) -> io::Result<Channel> {
         let token: [u8; TOKEN_BYTES] = request
             .reference
@@ -391,9 +414,7 @@ impl Dial for Tcp {
             token,
             staging: self.staging.clone(),
             events: self.events.clone(),
-            rdma: transport == wire::DataTransport::Rdma as i32
-                && self.rdma_offered
-                && !self.rdma_broken.load(Ordering::Relaxed),
+            rdma: transport == wire::DataTransport::Rdma as i32 && self.may_use_rdma(),
             rdma_broken: self.rdma_broken.clone(),
         };
         let (events, id) = (self.events.clone(), request.id);
@@ -656,8 +677,11 @@ fn note_failure(target: &Target, link_was_rdma: bool, result: &io::Result<()>) {
 }
 
 /// The length of a window must fit a slot and the page grid.
+fn fits_slot(target: &Target, length: u64) -> bool {
+    length != 0 && length <= target.staging.slot_bytes()
+}
 fn usable_length(target: &Target, length: u64) -> bool {
-    length != 0 && length.is_multiple_of(ALIGN) && length <= target.staging.slot_bytes()
+    length.is_multiple_of(ALIGN) && fits_slot(target, length)
 }
 
 /// A claim: windows arrive until the manager ends the transfer.
@@ -757,6 +781,31 @@ async fn receive_windows(
         )
         .await?;
         match frame {
+            ToInstance::PackedWindow(shape, manifest) => {
+                if lent.is_some() || !fits_slot(target, shape.length) {
+                    return Err(invalid("unusable packed TCP window"));
+                }
+                let held = target.staging.take().await;
+                // This task owns the slot until the event transfers it to the requester.
+                let bytes = unsafe { target.staging.bytes(held.slot(), shape.length)? };
+                within(
+                    IDLE_TIMEOUT,
+                    "the manager stopped sending a packed window",
+                    crate::shared::frame::read_packed_payload(
+                        conn,
+                        &manifest.units,
+                        &manifest,
+                        bytes,
+                    ),
+                )
+                .await?;
+                target.events.push(Event::PackedWindow {
+                    claim,
+                    shape,
+                    manifest,
+                    slot: held.give(),
+                });
+            }
             ToInstance::Window(window) => {
                 let length = window.shape.length;
                 if !usable_length(target, length) {
@@ -833,6 +882,18 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
                 return Ok(());
             };
             match frame {
+                ToInstance::PackedGrant(shape, manifest) => {
+                    if !fits_slot(target, shape.length) {
+                        return Err(invalid("unusable packed put grant"));
+                    }
+                    let held = target.staging.take().await;
+                    target.events.push(Event::PackedGrant {
+                        id,
+                        shape,
+                        manifest,
+                        slot: held.give(),
+                    });
+                }
                 ToInstance::Grant(shape) => {
                     let length = shape.length;
                     if !usable_length(target, length) {
@@ -862,10 +923,14 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
     let writing = async {
         let mut filled = filled;
         while let Some(window) = filled.recv().await {
-            let frame = ToManager::Filled {
-                index: window.index,
-                row_xxh3: window.row_xxh3,
-                page_xxh3: window.page_xxh3,
+            let frame = if window.packed {
+                ToManager::PackedFilled(window.index)
+            } else {
+                ToManager::Filled {
+                    index: window.index,
+                    row_xxh3: window.row_xxh3,
+                    page_xxh3: window.page_xxh3,
+                }
             };
             // SAFETY: the engine handed the slot over with the window and does not touch
             // it until `Sent`.
@@ -1406,6 +1471,7 @@ mod tests {
             .unwrap()
             .copy_from_slice(&bytes);
         assert!(channel.send(Filled {
+            packed: false,
             index: 0,
             row_xxh3: Some(11),
             page_xxh3: vec![1, 2],

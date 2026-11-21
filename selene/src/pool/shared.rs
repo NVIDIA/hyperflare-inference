@@ -133,6 +133,10 @@ pub enum PutRefusal {
     Invalid,
     /// No held ancestor could supply the missing pages.
     Unlinked,
+    /// The selected manager parent needs bytes outside the packed suffix.
+    RawRequired,
+    /// The writer cannot describe this many packed units in one offer.
+    OfferBound,
     /// The manager has as many puts open as it allows.
     Queue,
     /// A manager device error.
@@ -218,6 +222,7 @@ struct Registry {
 }
 
 pub(crate) struct Shared {
+    pub(crate) codec_peer: crate::codec_copy::PeerCapability,
     pub(crate) wake: Arc<Notify>,
     status: Mutex<PoolStatus>,
     events: Mutex<VecDeque<PoolEvent>>,
@@ -235,6 +240,7 @@ impl Shared {
     pub(crate) fn new(wake: Arc<Notify>) -> Arc<Self> {
         Arc::new(Self {
             wake,
+            codec_peer: Default::default(),
             status: Mutex::new(PoolStatus::Connecting),
             events: Mutex::new(VecDeque::new()),
             commands: Mutex::new(VecDeque::new()),

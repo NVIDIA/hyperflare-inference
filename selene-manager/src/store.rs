@@ -142,6 +142,25 @@ struct PlannedGrant {
 }
 
 impl PlannedGrant {
+    fn count_payload(self, header: &Header, bytes: &mut [u64; 2]) {
+        bytes[0] += u64::from(self.pages) * header.page_record_bytes()
+            + if self.row {
+                header.row_record_bytes()
+            } else {
+                0
+            };
+        bytes[1] += self.length;
+    }
+
+    fn read_prefix(self) -> usize {
+        (self.record_offset % 4096) as usize
+    }
+    fn read_length(self) -> usize {
+        usize::try_from(self.length)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.read_prefix())
+    }
+
     fn window(
         self,
         transfer: u64,
@@ -404,6 +423,7 @@ enum Job {
         namespace: NamespaceId,
         key: Key,
         reason: &'static str,
+        shutdown: bool,
         _memory: Arc<Extent>,
         _temporary: Arc<DiskExtent>,
     },
@@ -470,6 +490,11 @@ pub struct Metrics {
     pub puts_unlinked: u64,
     pub put_links_linked: u64,
     pub put_links_root: u64,
+    pub raw_required: [u64; 3],
+    pub raw_required_bytes: [u64; 3],
+    pub put_physical_bytes: u64,
+    wire_payload: [[u64; 2]; 2],
+    shutdown_write_bytes: u64,
     pub put_page_bytes: u64,
     pub put_row_bytes: u64,
     pub put_shapes_row: u64,
@@ -1465,9 +1490,17 @@ impl Store {
             }
         };
         let logical_record_bytes = child_header.length(row);
+        let offered_bytes = u64::from(request.published_tail_pages)
+            * child_header.page_record_bytes()
+            + if request.row {
+                descriptor.row_bytes()
+            } else {
+                0
+            };
         let child_header = if let Some(offer) = &request.packed {
             let published_first = u64::from(request.chain_pages - request.published_tail_pages);
-            if offer.first_page != published_first
+            if (row && !offer.units.iter().any(|unit| unit.kind == 1))
+                || offer.first_page != published_first
                 || flare_selene::shared::packed::Layout::new(
                     offer.clone(),
                     &descriptor.ranks,
@@ -1488,6 +1521,15 @@ impl Store {
             match result {
                 Ok(header) if !row || header.stored_row_bytes() > 0 => header,
                 _ => {
+                    let reroot = ancestors
+                        .iter()
+                        .filter_map(|k| self.namespaces[&id].tree.node(k))
+                        .find(|n| {
+                            n.ready && (n.location.memory.is_some() || n.location.disk.is_some())
+                        })
+                        .is_some_and(|n| n.chain_depth >= REROOT_DEPTH);
+                    self.metrics.raw_required[usize::from(reroot)] += 1;
+                    self.metrics.raw_required_bytes[usize::from(reroot)] += offered_bytes;
                     self.reject_put_detail(
                         &events,
                         proto::Reason::Invalid as u8,
@@ -1557,6 +1599,8 @@ impl Store {
                     }
                     None if rootless => {
                         if request.packed.is_some() && initial_parent.is_some() {
+                            self.metrics.raw_required[2] += 1;
+                            self.metrics.raw_required_bytes[2] += offered_bytes;
                             self.reject_put_detail(
                                 &events,
                                 proto::Reason::Invalid as u8,
@@ -1742,6 +1786,7 @@ impl Store {
         } else {
             self.metrics.put_links_root += 1;
         }
+        self.metrics.put_physical_bytes += header.length(row) - header.page_segment;
         self.metrics.put_page_bytes += u64::from(header.tail_pages) * header.page_record_bytes();
         self.metrics.put_row_bytes += if row { header.row_record_bytes() } else { 0 };
         if row {
@@ -2313,6 +2358,10 @@ impl Store {
                 };
                 get.next_grant += 1;
                 get.requested -= 1;
+                plan.count_payload(
+                    &get.records[plan.record as usize].header,
+                    &mut self.metrics.wire_payload[1],
+                );
                 get.outbox.push_back(Ok(GetAnswer::Ready(plan.window(
                     transfer,
                     position as u32,
@@ -2325,7 +2374,7 @@ impl Store {
                 return true;
             }
             Next::Read { file } => {
-                let length = usize::try_from(plan.length).unwrap_or(usize::MAX);
+                let length = plan.read_length();
                 // Restore windows are transient staging traffic: reads do not
                 // grow the durable set, so they are bounded by the staging
                 // region alone and never by the NVMe budget.
@@ -2365,7 +2414,7 @@ impl Store {
             file,
             span: Span {
                 address: extent.bytes().as_ptr() as usize,
-                offset: plan.record_offset,
+                offset: plan.record_offset - plan.read_prefix() as u64,
                 length: extent.bytes().len(),
             },
         };
@@ -2600,6 +2649,7 @@ impl Store {
             let Some((put, progress)) = put_mut(&mut self.sessions, connection, transfer) else {
                 return Ok(());
             };
+            plan.count_payload(&prepared.header, &mut self.metrics.wire_payload[0]);
             put.windows.granted.remove(&index);
             // The slot stays occupied until the chunk write drains.
             for (position, hash) in verified.iter().enumerate() {
@@ -3034,7 +3084,7 @@ impl Store {
                 )
         }) || grants.iter().any(|grant| {
             records[grant.record as usize].memory.is_none()
-                && !self.staging_can_ever_hold(usize::try_from(grant.length).unwrap_or(usize::MAX))
+                && !self.staging_can_ever_hold(grant.read_length())
         });
         if unservable {
             self.metrics.gets_error += 1;
@@ -3176,13 +3226,7 @@ impl Store {
                     .location
                     .disk
                     .as_ref()
-                    .map(|extent| {
-                        if header.packed.is_some() {
-                            std::fs::File::open(&extent.path).map(Arc::new)
-                        } else {
-                            extent.reader()
-                        }
-                    })
+                    .map(|extent| extent.reader())
                     .transpose()?,
                 header,
                 meta: None,
@@ -3358,7 +3402,12 @@ impl Store {
                     *plan
                 };
                 let extent = Arc::new(extent);
-                let offset = match self.local.offset(Region::Staging, &extent, 0, plan.length) {
+                let offset = match self.local.offset(
+                    Region::Staging,
+                    &extent,
+                    plan.read_prefix(),
+                    plan.length,
+                ) {
                     Ok(offset) => offset,
                     Err(error) => {
                         self.fail_get(connection, transfer, proto::Reason::Invalid as u8, error);
@@ -3366,6 +3415,10 @@ impl Store {
                     }
                 };
                 if let Some((get, progress)) = get_mut(&mut self.sessions, connection, transfer) {
+                    plan.count_payload(
+                        &get.records[plan.record as usize].header,
+                        &mut self.metrics.wire_payload[1],
+                    );
                     get.outbox.push_back(Ok(GetAnswer::Ready(plan.window(
                         transfer,
                         grant,
@@ -3659,6 +3712,9 @@ impl Store {
                 self.metrics.nvme_read_bytes += completion.bytes;
             } else {
                 self.metrics.nvme_bytes += completion.bytes;
+                if matches!(job, Job::Write { shutdown: true, .. }) {
+                    self.metrics.shutdown_write_bytes += completion.bytes;
+                }
             }
             if completion
                 .result
@@ -4016,7 +4072,7 @@ impl Store {
             JobId(job),
             temporary.path.clone(),
             0,
-            &memory.bytes()[..length as usize],
+            &memory.disk_blocks()[..(length as usize).next_multiple_of(4096)],
             Some((namespace.path(key).unwrap(), length)),
         );
         if worker.submit(task).is_ok() {
@@ -4027,6 +4083,7 @@ impl Store {
                     namespace: id,
                     key,
                     reason: if key == target { reason } else { "dependency" },
+                    shutdown: reason == "shutdown",
                     _memory: memory,
                     _temporary: temporary,
                 },
@@ -4276,6 +4333,12 @@ impl Store {
             }
         }
         self.metrics.shutdown_unflushed = Some((records, bytes));
+        if self.metrics.shutdown_write_bytes != 0 {
+            eprintln!(
+                "selene: shutdown wrote {} NVMe bytes",
+                self.metrics.shutdown_write_bytes
+            );
+        }
         if records > 0 {
             eprintln!("selene: shutdown left {records} dirty records ({bytes} bytes)");
         }
@@ -4333,15 +4396,65 @@ impl Store {
 
     pub fn metrics_text(&self) -> String {
         let mut text = String::new();
-        let slack: usize = self
-            .namespaces
-            .values()
-            .flat_map(|ns| ns.tree.nodes())
-            .filter(|n| n.location.header.packed.is_some())
-            .filter_map(|n| n.location.memory.as_ref())
-            .map(|e| e.capacity() - e.bytes().len())
-            .sum();
+        for (label, bytes) in ["put", "get"].into_iter().zip(self.metrics.wire_payload) {
+            text.push_str(&format!("selene_store_wire_logical_bytes_total{{operation=\"{label}\"}} {}\nselene_store_wire_physical_bytes_total{{operation=\"{label}\"}} {}\n",bytes[0],bytes[1]));
+        }
+        text.push_str(&format!(
+            "selene_shutdown_nvme_write_bytes_total {}\n",
+            self.metrics.shutdown_write_bytes
+        ));
+        let mut slack = 0;
+        let mut extents = std::collections::BTreeMap::<usize, u64>::new();
+        let mut inventory = [(0u64, 0u64); 2];
+        for node in self.namespaces.values().flat_map(|ns| ns.tree.nodes()) {
+            let location = &node.location;
+            let h = &location.header;
+            let logical = u64::from(h.tail_pages) * h.page_record_bytes()
+                + if node.row { h.row_record_bytes() } else { 0 };
+            let physical = h.length(node.row) - h.page_segment;
+            if let Some(extent) = &location.memory {
+                inventory[0].0 += logical;
+                inventory[0].1 += physical;
+                if h.packed.is_some() {
+                    slack += extent.capacity() - extent.bytes().len();
+                    *extents.entry(extent.capacity()).or_default() += 1;
+                }
+            }
+            if location.disk.is_some() {
+                inventory[1].0 += logical;
+                inventory[1].1 += physical;
+            }
+        }
         text.push_str(&format!("selene_packed_arena_buddy_slack_bytes {slack}\n"));
+        for (extent, count) in extents {
+            text.push_str(&format!(
+                "selene_packed_arena_records{{extent_bytes=\"{extent}\"}} {count}\n"
+            ));
+        }
+        for ((logical, physical), tier) in inventory.into_iter().zip(["arena", "nvme"]) {
+            text.push_str(&format!("selene_record_logical_bytes{{tier=\"{tier}\"}} {logical}\nselene_record_physical_bytes{{tier=\"{tier}\"}} {physical}\n"));
+        }
+        for (cause, count) in ["parent_not_held", "reroot", "rootless_fallback"]
+            .into_iter()
+            .zip(self.metrics.raw_required)
+        {
+            text.push_str(&format!(
+                "selene_put_raw_required_total{{cause=\"{cause}\"}} {count}\n"
+            ));
+        }
+        for (cause, bytes) in ["parent_not_held", "reroot", "rootless_fallback"]
+            .into_iter()
+            .zip(self.metrics.raw_required_bytes)
+        {
+            text.push_str(&format!(
+                "selene_put_raw_required_original_bytes_total{{cause=\"{cause}\"}} {bytes}\n"
+            ));
+        }
+        text.push_str(&format!(
+            "selene_put_logical_bytes_total {}\nselene_put_physical_bytes_total {}\n",
+            self.metrics.put_page_bytes + self.metrics.put_row_bytes,
+            self.metrics.put_physical_bytes
+        ));
         if self.config.root.is_some() {
             let mut arena_only = 0u64;
             let mut oldest = Duration::ZERO;

@@ -77,6 +77,9 @@ pub struct DiskRecord {
 /// Completion the transport reports to the disk store.
 #[derive(Debug)]
 pub enum TransportEvent {
+    SourceReleased {
+        id: JobId,
+    },
     Stored {
         id: super::JobId,
         result: Result<u64>,
@@ -179,6 +182,7 @@ struct Buffers {
 /// The threads and pool every pipeline draws on, with the counters that keep
 /// submissions within the queues' depths so a refusal is a failure, not backpressure.
 struct Resources {
+    codec_stats: StoreStats,
     /// Shared slots for device transfers; host-buffer-only users may omit them.
     pool: Option<SlabPool>,
     transfers: SharedCopier,
@@ -228,6 +232,29 @@ impl Resources {
         })
     }
 
+    fn mirror_buffers(
+        &mut self,
+        pages: usize,
+        traffic: &mut crate::codec_copy::MirrorBytes,
+    ) -> Option<(Buffers, Arc<crate::codec_copy::MirrorProgress>)> {
+        if traffic.fallback.is_some() {
+            return None;
+        }
+        let mut buffers = self.allocate(pages, true)?;
+        let pool = self.pool.as_ref().unwrap();
+        let progress = traffic.copy_progress(pool, |count| {
+            let restore = lock(&self.transfers)
+                .layout()
+                .record_slots(WINDOW_PAGES, true);
+            pool.allocate_leaving(count, restore)
+        });
+        if traffic.fallback.is_some() {
+            self.release(&mut buffers);
+            return None;
+        }
+        Some((buffers, progress))
+    }
+
     fn release(&mut self, buffers: &mut Buffers) {
         if let (Some(pool), Some((pages, row))) = (self.pool.as_ref(), buffers.slots.take()) {
             pool.release(pages.into_iter().chain(row.into_iter().flatten()));
@@ -246,6 +273,11 @@ enum Owner {
 
 /// Where an outbound record's bytes come from.
 enum Source {
+    Packed {
+        held: crate::memory_packed::Retained,
+        pages: Vec<usize>,
+        row: Option<Vec<usize>>,
+    },
     /// GPU ids and the row's state slot, staged through the pool.
     Device {
         pages: Vec<PageId>,
@@ -287,7 +319,18 @@ struct OutWindow {
     referenced: usize,
 }
 
+struct DiskMirror {
+    source_released: bool,
+    queued: VecDeque<copier::Job>,
+    windows: Vec<crate::codec_copy::Window>,
+    first: u64,
+    logical: u64,
+    born: Instant,
+}
 struct OutboundRecord {
+    traffic: Option<crate::codec_copy::MirrorBytes>,
+    mirror: Option<DiskMirror>,
+    reserved: Option<Buffers>,
     disk: JobId,
     header: Header,
     temporary: PathBuf,
@@ -310,6 +353,9 @@ impl OutboundRecord {
     fn new(disk: JobId, header: Header, temporary: PathBuf, path: PathBuf, source: Source) -> Self {
         let windows = (header.tail_pages as usize).div_ceil(WINDOW_PAGES).max(1) as u32;
         Self {
+            traffic: None,
+            mirror: None,
+            reserved: None,
             disk,
             header,
             temporary,
@@ -376,6 +422,12 @@ impl OutboundRecord {
 
     fn apply_transfer(&mut self, reply: copier::Reply) {
         self.outstanding = self.outstanding.saturating_sub(1);
+        if self.mirror.is_some() {
+            if let Err(error) = reply.result {
+                self.fail(error);
+            }
+            return;
+        }
         let Some(window) = self
             .active
             .iter_mut()
@@ -392,7 +444,82 @@ impl OutboundRecord {
 
     /// Advance as far as slots and queue space allow; `Some` when the record
     /// is finished and nothing references its buffers or its temporary file.
-    fn pump(&mut self, id: JobId, resources: &mut Resources) -> Option<Result<u64>> {
+    fn pump(
+        &mut self,
+        id: JobId,
+        resources: &mut Resources,
+        events: &mut Vec<TransportEvent>,
+    ) -> Option<Result<u64>> {
+        if let Some(mirror) = self.mirror.as_mut() {
+            while self.error.is_none() && resources.transfer_space() {
+                let Some(job) = mirror.queued.pop_front() else {
+                    break;
+                };
+                match resources.submit_transfer(job) {
+                    Ok(()) => self.outstanding += 1,
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            if self.outstanding != 0 {
+                return None;
+            }
+            if let Some(e) = self.error.clone() {
+                return Some(Err(e));
+            }
+            if !mirror.queued.is_empty() {
+                return None;
+            }
+            let traffic = self.traffic.as_mut().unwrap();
+            if matches!(
+                traffic.encoder,
+                crate::codec_copy::Encoder::Gpu | crate::codec_copy::Encoder::Backstop
+            ) && !mirror.source_released
+            {
+                events.push(TransportEvent::SourceReleased { id });
+                mirror.source_released = true;
+                traffic.record_pin_time(mirror.born, &mut resources.codec_stats);
+            }
+            if !traffic.ready(&mirror.windows, Instant::now()) {
+                return None;
+            }
+            let mirror = self.mirror.take().unwrap();
+            if !mirror.source_released {
+                traffic.record_pin_time(mirror.born, &mut resources.codec_stats);
+            }
+            let result = (|| -> Result<()> {
+                let packets = traffic.packets(&mirror.windows, &mut resources.codec_stats)?;
+                let buffers = self.reserved.as_mut().unwrap();
+                let (pages, row) = buffers.slots.as_mut().unwrap();
+                let pool = resources.pool.as_ref().unwrap();
+                let layout = lock(&resources.transfers).layout().clone();
+                let held = crate::memory_packed::Retained::install(
+                    &layout,
+                    pool,
+                    pages,
+                    row.as_mut(),
+                    mirror.first,
+                    self.header.tail_pages as usize,
+                    packets,
+                    None,
+                )?;
+                let pages = pool.addresses(pages);
+                let row = row.as_ref().map(|slots| pool.addresses(slots));
+                self.source = if let Some(held) = held {
+                    self.header = self.header.clone().with_packed(held.offer.clone())?;
+                    Source::Packed { held, pages, row }
+                } else {
+                    Source::Host {
+                        pages,
+                        row,
+                        sums: None,
+                    }
+                };
+                Ok(())
+            })();
+            if let Err(e) = result {
+                return Some(Err(e));
+            }
+        }
         if let Some(bytes) = self.committed {
             return Some(Ok(bytes));
         }
@@ -405,14 +532,16 @@ impl OutboundRecord {
                 temporary: self.temporary.clone(),
                 header: self.header.clone(),
                 row: match &self.source {
-                    Source::Host { row, .. } => row.is_some(),
+                    Source::Host { row, .. } | Source::Packed { row, .. } => row.is_some(),
                     Source::Device { .. } => true,
                 },
                 sums: match &self.source {
+                    Source::Packed { .. } => None,
                     Source::Host { sums, .. } => sums.clone(),
                     Source::Device { .. } => None,
                 },
                 replication: match &self.source {
+                    Source::Packed { .. } => None,
                     Source::Host { .. } => Some(self.header.replication()),
                     Source::Device { detect, .. } => (!detect).then_some(Default::default()),
                 },
@@ -497,10 +626,15 @@ impl OutboundRecord {
                 if !resources.transfer_space() {
                     return Ok(false);
                 }
-                let Some(mut buffers) = resources.allocate(count, last) else {
+                let Some(mut buffers) = self
+                    .reserved
+                    .take()
+                    .or_else(|| resources.allocate(count, last))
+                else {
                     return Ok(false);
                 };
                 let job = copier::Job {
+                    codec: None,
                     replication: Default::default(),
                     id,
                     window: index,
@@ -518,6 +652,42 @@ impl OutboundRecord {
                 }
                 self.outstanding += 1;
                 (buffers, OutPhase::Transferring, 1)
+            }
+            Source::Packed { held, pages, row } => {
+                if !resources.disk_space() {
+                    return Ok(false);
+                }
+                let include_row = last && row.is_some();
+                let packets = held.read(
+                    pages,
+                    row.as_deref().unwrap_or_default(),
+                    self.header.page_record_bytes() as usize,
+                    first,
+                    count,
+                    include_row,
+                )?;
+                let data: Vec<_> = packets
+                    .iter()
+                    .flat_map(|p| p.data.chunks().flatten().copied())
+                    .collect();
+                resources.submit_disk(disk::Job::WritePacked {
+                    id: self.disk,
+                    window: index,
+                    first: first as u32,
+                    pages: count as u32,
+                    row: include_row,
+                    bytes: data.into(),
+                })?;
+                self.outstanding += 1;
+                (
+                    Buffers {
+                        pages: Vec::new(),
+                        row: None,
+                        slots: None,
+                    },
+                    OutPhase::Writing,
+                    1,
+                )
             }
             Source::Host { pages, row, .. } => (
                 Buffers {
@@ -948,7 +1118,40 @@ impl InboundRecord {
             return Ok(());
         }
         let plan = window.plan;
+        let h = &self.segments[plan.segment].expected;
+        let codec = if let Some(layout) = &h.packed {
+            let mut packets = Vec::new();
+            let width = h.page_record_bytes() as usize;
+            let first = plan.first as usize;
+            let mut append =
+                |units: &[crate::shared::wire::PackedUnit], slots: &[usize]| -> Result<()> {
+                    let mut offset = 0;
+                    for unit in units {
+                        packets.push(crate::memory_packed::pinned_unit(
+                            unit, slots, width, offset,
+                        )?);
+                        offset += unit.stored_length as usize;
+                    }
+                    Ok(())
+                };
+            for (i, addr) in window.buffers.pages.iter().enumerate() {
+                let units = layout
+                    .units(first + i, 1, false)
+                    .ok_or_else(|| invalid("packed disk window outside record"))?;
+                append(units, std::slice::from_ref(addr))?;
+            }
+            if let Some(slots) = &window.buffers.row {
+                append(layout.units(0, 0, true).unwrap(), slots)?;
+            }
+            Some(crate::codec_copy::Window::restore_pinned(
+                layout.offer().first_page + first as u64,
+                packets,
+            ))
+        } else {
+            None
+        };
         resources.submit_transfer(copier::Job {
+            codec,
             replication: Default::default(),
             id,
             window: plan.index,
@@ -1005,6 +1208,7 @@ impl InboundRecord {
 /// Without a pool the transport never submits transfer jobs and never polls
 /// the shared transfer threads, whose replies then belong to the memory store.
 pub struct Staged {
+    peer: Option<crate::codec_copy::PeerCapability>,
     resources: Resources,
     outbound: HashMap<JobId, OutboundRecord>,
     inbound: HashMap<JobId, InboundRecord>,
@@ -1019,7 +1223,9 @@ pub struct Staged {
 impl Staged {
     pub fn new(pool: Option<SlabPool>, transfers: SharedCopier, disk: DiskThread) -> Self {
         Self {
+            peer: None,
             resources: Resources {
+                codec_stats: StoreStats::default(),
                 pool,
                 transfers,
                 disk,
@@ -1046,6 +1252,27 @@ impl Staged {
     /// Records of each direction whose pipelines have not finished.
     pub fn in_flight(&self) -> (usize, usize) {
         (self.outbound.len(), self.inbound.len())
+    }
+
+    pub(crate) fn write_packed_from(
+        &mut self,
+        id: JobId,
+        header: Header,
+        temporary: PathBuf,
+        path: PathBuf,
+        held: crate::memory_packed::Retained,
+        pages: Vec<usize>,
+        row: Option<Vec<usize>>,
+    ) -> Result<()> {
+        self.accept(id)?;
+        self.start_outbound(
+            id,
+            header,
+            temporary,
+            path,
+            Source::Packed { held, pages, row },
+        );
+        Ok(())
     }
 
     /// Write a record whose page and row bytes already sit in caller-owned
@@ -1136,12 +1363,26 @@ impl Staged {
                 pages.len()
             )));
         }
+        let copier = lock(&self.resources.transfers);
+        let mut traffic = crate::codec_copy::MirrorBytes::new(
+            pages.len(),
+            header.page_record_bytes(),
+            header.row_record_bytes(),
+        )
+        .with_policy(&copier.mirror_policy());
+        if copier.encode_mirrors() {
+            traffic.fallback = Some(crate::codec_copy::RawMirror::RankFiles);
+        }
+        drop(copier);
         let source = Source::Device {
             pages,
             slot,
             detect,
         };
-        self.start_outbound(id, header, temporary, path, source);
+        let mut record =
+            OutboundRecord::new(self.resources.disk_id(), header, temporary, path, source);
+        record.traffic = Some(traffic);
+        self.queue_outbound(id, record);
         Ok(())
     }
 
@@ -1167,20 +1408,45 @@ impl Staged {
         source: Source,
     ) {
         let disk = self.resources.disk_id();
-        self.owners.insert(disk, Owner::Outbound(id));
-        self.outbound.insert(
+        self.queue_outbound(
             id,
             OutboundRecord::new(disk, header, temporary, path, source),
         );
+    }
+
+    fn queue_outbound(&mut self, id: JobId, record: OutboundRecord) {
+        self.owners.insert(record.disk, Owner::Outbound(id));
+        self.outbound.insert(id, record);
         self.pump_outbound(id);
+    }
+
+    pub(crate) fn abandon_backstops(&mut self) {
+        for record in self.outbound.values_mut() {
+            if record.mirror.is_some()
+                && record
+                    .traffic
+                    .as_mut()
+                    .is_some_and(|t| t.abandon_backstop(&mut self.resources.codec_stats))
+            {
+                record.fail(invalid("backstop capture abandoned at shutdown"));
+            }
+        }
     }
 
     fn pump_outbound(&mut self, id: JobId) {
         let Some(record) = self.outbound.get_mut(&id) else {
             return;
         };
-        if let Some(result) = record.pump(id, &mut self.resources) {
-            let record = self.outbound.remove(&id).unwrap();
+        if let Some(result) = record.pump(id, &mut self.resources, &mut self.events) {
+            let mut record = self.outbound.remove(&id).unwrap();
+            if let Some(mut buffers) = record.reserved.take() {
+                self.resources.release(&mut buffers);
+            }
+            if result.is_ok()
+                && let Some(t) = &record.traffic
+            {
+                t.published(&mut self.resources.codec_stats);
+            }
             self.owners.remove(&record.disk);
             self.events.push(TransportEvent::Stored {
                 id,
@@ -1263,6 +1529,11 @@ impl Staged {
                 match reply.direction {
                     Direction::Out => {
                         if let Some(record) = self.outbound.get_mut(&reply.id) {
+                            if reply.result.is_ok()
+                                && let Some(traffic) = &mut record.traffic
+                            {
+                                traffic.completed(&mut self.resources.codec_stats, reply.window);
+                            }
                             record.apply_transfer(reply);
                         }
                     }
@@ -1304,15 +1575,103 @@ impl DiskTransport for Staged {
                 record::file_name(&header.key)
             )));
         }
-        self.store_pages(
-            id,
-            header,
-            temporary,
-            path,
-            checkpoint.chain_pages[chain - tail..].to_vec(),
-            checkpoint.slot,
-            detect,
-        )
+        let pages = checkpoint.chain_pages[chain - tail..].to_vec();
+        if lock(&self.resources.transfers).encode_mirrors() {
+            self.accept(id)?;
+            let mut traffic = crate::codec_copy::MirrorBytes::new(
+                tail,
+                header.page_record_bytes(),
+                header.row_record_bytes(),
+            );
+            let logical = traffic.total();
+            let waiting = self.outbound.values().filter_map(|r| {
+                let m = r.mirror.as_ref()?;
+                Some((m.born, m.logical, r.traffic.as_ref()?.encoder))
+            });
+            traffic.choose(
+                self.peer.as_ref(),
+                header.ranks.len(),
+                &lock(&self.resources.transfers).mirror_policy(),
+                waiting,
+                Instant::now(),
+            );
+            if let Some((buffers, progress)) = self.resources.mirror_buffers(tail, &mut traffic) {
+                let first = header
+                    .parent
+                    .map_or(0, |p| p.consumed_tokens / header.page_tokens);
+                let mut queued = crate::memory::windows(
+                    id,
+                    Direction::Out,
+                    pages.iter().copied().zip(buffers.pages.iter().copied()),
+                    buffers.row.clone().map(|r| (checkpoint.slot, r)),
+                );
+                let mut start = first;
+                let ranks = header.ranks.len();
+                let windows = queued
+                    .iter_mut()
+                    .map(|job| {
+                        let window = crate::codec_copy::Window::capture_on(
+                            start,
+                            ranks,
+                            false,
+                            Arc::clone(&progress),
+                            traffic.encoder == crate::codec_copy::Encoder::Backstop,
+                        );
+                        start += job.pages.len() as u64;
+                        job.codec = Some(window.clone());
+                        window
+                    })
+                    .collect();
+                let disk = self.resources.disk_id();
+                let mut record = OutboundRecord::new(
+                    disk,
+                    header,
+                    temporary,
+                    path,
+                    Source::Device {
+                        pages,
+                        slot: checkpoint.slot,
+                        detect,
+                    },
+                );
+                traffic.admitted(&mut self.resources.codec_stats);
+                record.traffic = Some(traffic);
+                record.mirror = Some(DiskMirror {
+                    source_released: false,
+                    queued,
+                    windows,
+                    logical,
+                    first,
+                    born: Instant::now(),
+                });
+                record.reserved = Some(buffers);
+                self.queue_outbound(id, record);
+                return Ok(());
+            }
+            traffic.intake_full();
+            // Reserve the first raw window before taking the source pin into the pipeline.
+            let first = self
+                .resources
+                .allocate(tail.min(WINDOW_PAGES), tail <= WINDOW_PAGES)
+                .ok_or_else(|| invalid("raw mirror staging is full"))?;
+            let disk = self.resources.disk_id();
+            let mut record = OutboundRecord::new(
+                disk,
+                header,
+                temporary,
+                path,
+                Source::Device {
+                    pages,
+                    slot: checkpoint.slot,
+                    detect,
+                },
+            );
+            record.traffic = Some(traffic);
+            record.reserved = Some(first);
+            self.queue_outbound(id, record);
+            return Ok(());
+        }
+        self.store_pages(id, header, temporary, path, pages, checkpoint.slot, detect)
     }
 
     fn fetch(
@@ -1407,6 +1766,7 @@ impl DiskTransport for Staged {
     /// the transfer threads. Completions reached before the deadline remain
     /// available through `poll`.
     fn close(&mut self) -> Result<()> {
+        self.abandon_backstops();
         let deadline = Instant::now() + copier::CLOSE_TIMEOUT;
         loop {
             self.step();
@@ -1443,6 +1803,7 @@ impl DiskTransport for Staged {
 }
 
 struct Outbound {
+    source_released: bool,
     checkpoint: CheckpointId,
     key: PrefixKey,
     started: Instant,
@@ -1524,20 +1885,40 @@ impl DiskStore {
         let layout = Layout::new(&geometry)?;
         let mut index = Index::new(layout.page_tokens);
         let mut used = 0u64;
+        let profile = transport
+            .staged()
+            .and_then(|staged| lock(&staged.resources.transfers).codec_profile());
+        let scanned_count = scanned.len();
+        let mut retained = Vec::with_capacity(scanned_count);
+        for record in scanned {
+            let readable = record.header.packed.as_ref().is_none_or(|layout| {
+                profile.is_some_and(|profile| {
+                    layout
+                        .required_profiles(record.row)
+                        .iter()
+                        .all(|required| required.as_slice() == profile)
+                })
+            });
+            if readable {
+                retained.push(record);
+            } else {
+                record::remove(&record.path)?;
+            }
+        }
+        let scanned = if retained.len() < scanned_count {
+            record::remove_orphans(retained)?
+        } else {
+            retained
+        };
+        let dropped = (scanned_count - scanned.len()) as u64;
         for record in &scanned {
-            // Until this copier has a decoder, it cannot restore this root or its dependents.
-            let ready = record.header.packed.is_none()
-                && record
-                    .header
-                    .parent
-                    .is_none_or(|k| index.node(&k).is_some_and(|n| n.ready));
             index.insert(
                 record.header.key,
                 record.header.parent,
                 record.header.bucket,
                 record.header.tail_pages as usize,
                 record.row,
-                ready,
+                true,
                 DiskRecord {
                     path: record.path.clone(),
                     header: record.header.clone(),
@@ -1562,7 +1943,10 @@ impl DiskStore {
             budget: None,
             used,
             transport,
-            stats: StoreStats::default(),
+            stats: StoreStats {
+                disk_scan_dropped: dropped,
+                ..StoreStats::default()
+            },
             next_job: 1,
             geometry,
             layout,
@@ -1613,18 +1997,20 @@ impl DiskStore {
             return None;
         }
         Some(IndexEntry {
+            packed: node.location.header.packed.is_some(),
+            required_profiles: node
+                .location
+                .header
+                .packed
+                .as_ref()
+                .map_or_else(Vec::new, |p| p.required_profiles(node.row)),
             key: *key,
             parent: node.parent,
             bucket: node.bucket,
             tail_pages: node.tail_pages as u32,
             row: node.row,
             tier: PoolTier::Nvme,
-            bytes: node.tail_pages as u64 * self.layout.page_record_bytes
-                + if node.row {
-                    self.layout.row_record_bytes
-                } else {
-                    0
-                },
+            bytes: node.location.header.length(node.row) - node.location.header.page_segment,
         })
     }
 
@@ -1640,12 +2026,13 @@ impl DiskStore {
         for notice in a.view.drain() {
             match notice.event {
                 NodeEvent::Ready | NodeEvent::RowDropped => {
-                    if self
-                        .index
-                        .node(&notice.key)
-                        .is_some_and(|n| !n.location.header.replicated())
-                    {
-                        a.view.announce(&notice, notice.parent);
+                    if let Some(n) = self.index.node(&notice.key) {
+                        if let Some(packed) = &n.location.header.packed {
+                            a.view
+                                .announce_packed(&notice, notice.parent, packed.offer());
+                        } else if !n.location.header.replicated() {
+                            a.view.announce(&notice, notice.parent);
+                        }
                     }
                 }
                 NodeEvent::Gone => a.view.retire(&notice.key),
@@ -2360,8 +2747,13 @@ impl DiskStore {
             }
             if let Ok(removed) = self.index.remove(key, |_| false) {
                 for node in removed {
+                    let original = node.tail_pages as u64
+                        * node.location.header.page_record_bytes()
+                        + u64::from(node.row) * node.location.header.row_record_bytes();
                     if let Err(error) = self.unlink(node) {
                         result = Err(error);
+                    } else {
+                        self.stats.codec_retired_bytes += original;
                     }
                 }
                 self.stats.progress += 1;
@@ -2529,6 +2921,14 @@ impl DiskStore {
     pub fn apply(&mut self, event: TransportEvent, events: &mut Vec<StoreEvent>) {
         self.stats.progress += 1;
         match event {
+            TransportEvent::SourceReleased { id } => {
+                if let Some(job) = self.outbound.get_mut(&id) {
+                    job.source_released = true;
+                    events.push(StoreEvent::SourceReleased {
+                        checkpoint: job.checkpoint,
+                    });
+                }
+            }
             TransportEvent::Stored { id, result, header } => {
                 if self.outbound.contains_key(&id)
                     && result.as_ref().err().is_some_and(|e| {
@@ -2628,11 +3028,13 @@ impl DiskStore {
         self.stats.held[1] += u64::from(pressure);
         events.push(if pressure {
             StoreEvent::Deferred {
+                source_released: job.source_released,
                 checkpoint: job.checkpoint,
                 reason: StoreReason::Budget,
             }
         } else {
             StoreEvent::Stored {
+                source_released: job.source_released,
                 checkpoint: job.checkpoint,
                 key: job.key,
                 result,
@@ -2642,6 +3044,11 @@ impl DiskStore {
 }
 
 impl HostStore for DiskStore {
+    fn set_codec_peer(&mut self, peer: crate::codec_copy::PeerCapability) {
+        if let Some(s) = self.transport.staged_mut() {
+            s.peer = Some(peer);
+        }
+    }
     fn reused(&mut self, key: PrefixKey) {
         self.index.touch(&key);
     }
@@ -2666,6 +3073,21 @@ impl HostStore for DiskStore {
             return Ok(outcome);
         }
         let (parent, tail) = self.plan_record(checkpoint);
+        if row
+            && let Some(staged) = self.transport.staged()
+            && let Some(pool) = staged.pool()
+        {
+            let copier = lock(&staged.resources.transfers);
+            let first = copier
+                .layout()
+                .record_slots(tail.len().min(WINDOW_PAGES), tail.len() <= WINDOW_PAGES);
+            if copier.encode_mirrors() && pool.free_slots() < first {
+                self.stats.codec_skipped_mirrors += 1;
+                self.stats.store_skipped += 1;
+                return Ok(StoreOutcome::Retry(StoreReason::Slabs));
+            }
+        }
+
         let Some((header, temporary, path)) = self.reserve_capture(
             checkpoint.key,
             parent,
@@ -2695,6 +3117,7 @@ impl HostStore for DiskStore {
         self.outbound.insert(
             id,
             Outbound {
+                source_released: false,
                 checkpoint: checkpoint.id,
                 key: checkpoint.key,
                 started: Instant::now(),
@@ -2769,8 +3192,50 @@ impl HostStore for DiskStore {
     }
 
     fn stats(&self) -> StoreStats {
-        let pool = self.transport.staged().and_then(Staged::pool);
+        let staged = self.transport.staged();
+        let pool = staged.and_then(Staged::pool);
+        let codec = staged.map(|s| s.resources.codec_stats).unwrap_or_default();
+        let mirrors = staged
+            .into_iter()
+            .flat_map(|s| s.outbound.values())
+            .filter_map(|r| Some((r.mirror.as_ref()?, r.traffic.as_ref()?.encoder)));
+        let backstops = mirrors
+            .clone()
+            .filter(|(_, e)| *e == crate::codec_copy::Encoder::Backstop);
         StoreStats {
+            codec_pending_bytes: mirrors.clone().map(|(m, _)| m.logical).sum(),
+            codec_oldest_ns: mirrors
+                .map(|(m, _)| m.born.elapsed().as_nanos() as u64)
+                .max()
+                .unwrap_or(0),
+            codec_pin_ns: codec.codec_pin_ns,
+            codec_pin_buckets: codec.codec_pin_buckets,
+            backstop: crate::store::BackstopStats {
+                queue_bytes: backstops.clone().map(|(m, _)| m.logical).sum(),
+                oldest_ns: backstops
+                    .map(|(m, _)| m.born.elapsed().as_nanos() as u64)
+                    .max()
+                    .unwrap_or(0),
+                peak_bytes: pool.map_or(0, |p| {
+                    p.backstop_usage
+                        .peak
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                }),
+                heap_reserved: pool.map_or(0, |p| {
+                    p.backstop_usage
+                        .reserved
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                }),
+                heap_intake: pool.map_or(0, |p| {
+                    p.backstop_usage
+                        .intake
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                }),
+                ..codec.backstop
+            },
+            codec_mirrored_original_bytes: codec.codec_mirrored_original_bytes,
+            codec_fallback_events: codec.codec_fallback_events,
+            codec_fallback_bytes: codec.codec_fallback_bytes,
             slots_used: pool.map_or(0, |pool| pool.slot_count() - pool.free_slots()),
             slots_total: pool.map_or(0, SlabPool::slot_count),
             intake_slots: pool.map_or(0, |pool| pool.intake_slots()),
@@ -2779,6 +3244,11 @@ impl HostStore for DiskStore {
             disk_records: self.index.len(),
             disk_bytes: self.used,
             progress: self.stats.progress
+                + pool.map_or(0, |p| {
+                    p.backstop_usage
+                        .releases
+                        .load(std::sync::atomic::Ordering::Acquire)
+                })
                 + self.budget.as_ref().map_or(0, |budget| budget.progress()),
             outbound_rate: self.outbound_rate.get(),
             inbound_rate: self.inbound_rate.get(),
@@ -3785,7 +4255,7 @@ mod tests {
             &mut events,
         );
         assert!(
-            matches!(&events[..], [StoreEvent::Deferred { checkpoint, reason: StoreReason::Budget }] if *checkpoint == record.id)
+            matches!(&events[..], [StoreEvent::Deferred { checkpoint, reason: StoreReason::Budget, source_released: false }] if *checkpoint == record.id)
         );
         assert!(store.outbound.is_empty());
         assert_eq!(store.stats().dropped, [0; 8]);
@@ -4181,6 +4651,7 @@ mod tests {
         match &events[..] {
             [
                 StoreEvent::Stored {
+                    source_released: false,
                     checkpoint,
                     key,
                     result,
@@ -4245,6 +4716,7 @@ mod tests {
         match &events[..] {
             [
                 StoreEvent::Stored {
+                    source_released: false,
                     checkpoint,
                     key,
                     result,
@@ -5258,6 +5730,599 @@ mod tests {
         file.read_exact(&mut byte).unwrap();
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&[byte[0] ^ 0x5a]).unwrap();
+    }
+
+    fn codec_transport(fail: Option<(JobId, u32)>, qualified: bool) -> (Staged, usize) {
+        codec_transport_with_backstop(fail, qualified, None)
+    }
+
+    fn codec_transport_with_backstop(
+        fail: Option<(JobId, u32)>,
+        qualified: bool,
+        backstop: Option<Arc<dyn crate::codec_copy::BackstopEncoder>>,
+    ) -> (Staged, usize) {
+        use crate::codec_copy::{Action, Packet};
+        let literal = vec![12; PAGE_RECORD as usize];
+        let row: &[u8] = include_bytes!("../tests/fixtures/codec/row.sgc");
+        let units = vec![
+            Packet {
+                unit: crate::shared::wire::PackedUnit {
+                    original_length: PAGE_RECORD,
+                    stored_length: PAGE_RECORD,
+                    raw_xxh3: record::checksum(&literal),
+                    ..Default::default()
+                },
+                data: literal.into(),
+            },
+            Packet {
+                unit: crate::shared::wire::PackedUnit {
+                    kind: 1,
+                    representation: 1,
+                    original_length: ROW_RECORD,
+                    stored_length: row.len() as u64,
+                    stored_crc: crate::shared::packed::crc32(row),
+                    original_crc: 0xb2b29b40,
+                    profile: vec![7; 32],
+                    ..Default::default()
+                },
+                data: row.into(),
+            },
+        ];
+        struct Copier {
+            backstop: Option<Arc<dyn crate::codec_copy::BackstopEncoder>>,
+            qualified: bool,
+            fail: Option<(JobId, u32)>,
+            layout: Layout,
+            units: Vec<Packet>,
+            replies: Vec<copier::Reply>,
+        }
+        impl PageCopier for Copier {
+            fn layout(&self) -> &Layout {
+                &self.layout
+            }
+            fn codec_profile(&self) -> Option<[u8; 32]> {
+                self.qualified.then_some([7; 32])
+            }
+            fn encode_mirrors(&self) -> bool {
+                self.qualified
+            }
+            fn mirror_policy(&self) -> crate::codec_copy::MirrorPolicy {
+                crate::codec_copy::MirrorPolicy {
+                    unqualified_layout: !self.qualified,
+                    workspace_unavailable: false,
+                    gpu: self.backstop.is_some(),
+                    backstop: self.backstop.clone(),
+                }
+            }
+            fn submit(&mut self, job: copier::Job) -> Result<()> {
+                if let Some(window) = job.codec {
+                    match &*window.0 {
+                        Action::Mirror { ranks, .. } => ranks[0].set(self.units.clone()).unwrap(),
+                        Action::Restore { .. } => panic!("disk restore copied its staging window"),
+                        Action::RestorePinned { packets, .. } => {
+                            assert_eq!(packets.len(), self.units.len());
+                            for (view, expected) in packets.iter().zip(&self.units) {
+                                assert_eq!(view.unit, expected.unit);
+                                assert_eq!(
+                                    unsafe { view.chunks() }.concat(),
+                                    expected.data.contiguous().as_ref()
+                                );
+                            }
+                        }
+                    }
+                }
+                self.replies.push(copier::Reply {
+                    id: job.id,
+                    window: job.window,
+                    direction: job.direction,
+                    result: if self.fail == Some((job.id, job.window)) {
+                        Err(invalid("test copy failed"))
+                    } else {
+                        Ok(())
+                    },
+                    bytes: PAGE_RECORD + ROW_RECORD,
+                    elapsed: Duration::ZERO,
+                });
+                Ok(())
+            }
+            fn poll(&mut self, replies: &mut Vec<copier::Reply>) {
+                replies.append(&mut self.replies);
+            }
+            fn in_flight(&self) -> usize {
+                self.replies.len()
+            }
+            fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let pool = host_pool();
+        let free = pool.free_slots();
+        let copier = Arc::new(Mutex::new(Copier {
+            backstop,
+            qualified,
+            fail,
+            layout: Layout::new(&geometry()).unwrap(),
+            units,
+            replies: vec![],
+        }));
+        let staged = Staged::new(
+            Some(pool),
+            copier,
+            DiskThread::start("disk-mirror").unwrap(),
+        );
+        (staged, free)
+    }
+
+    #[test]
+    fn disk_backstop_admission_leaves_a_complete_restore_window() {
+        use crate::codec_copy::{
+            BackstopEncoder, BackstopJob, Encoder, MAX_AGE, MirrorBytes, RawMirror,
+        };
+        #[derive(Debug)]
+        struct Paused;
+        impl BackstopEncoder for Paused {
+            fn submit(&self, _: BackstopJob) -> Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let (mut stage, _) = codec_transport_with_backstop(None, true, Some(Arc::new(Paused)));
+        let r = &mut stage.resources;
+        let pool = r.pool.clone().unwrap();
+        let layout = lock(&r.transfers).layout().clone();
+        let policy = lock(&r.transfers).mirror_policy();
+        let now = Instant::now();
+        let choose = || {
+            let mut t = MirrorBytes::new(1, PAGE_RECORD, ROW_RECORD);
+            t.choose(
+                None,
+                layout.ranks.len(),
+                &policy,
+                [(now - MAX_AGE, 1, Encoder::Gpu); 2].into_iter(),
+                now,
+            );
+            assert_eq!(t.encoder, Encoder::Backstop);
+            t
+        };
+        let charge = (2 * (PAGE_RECORD + ROW_RECORD)).div_ceil(PAGE_RECORD) as usize;
+        let keep = layout.record_slots(WINDOW_PAGES, true);
+        let needed = keep + layout.record_slots(1, true) + charge;
+        let mut busy = pool.allocate(pool.free_slots() - needed + 1).unwrap();
+        let mut traffic = choose();
+        assert!(r.mirror_buffers(1, &mut traffic).is_none());
+        assert_eq!(traffic.fallback, Some(RawMirror::BackstopBudget));
+        assert_eq!(pool.free_slots(), needed - 1);
+        pool.release([busy.pop().unwrap()]);
+        let (mut buffers, progress) = r.mirror_buffers(1, &mut choose()).unwrap();
+        assert_eq!(pool.free_slots(), keep);
+        let mut restore = r.allocate(WINDOW_PAGES, true).unwrap();
+        assert_eq!(pool.free_slots(), 0);
+        r.release(&mut restore);
+        r.release(&mut buffers);
+        drop(progress);
+        pool.release(busy);
+        assert_eq!(pool.free_slots(), pool.slot_count());
+    }
+
+    #[test]
+    fn disk_backstop_releases_the_source_before_publication_and_abandons_on_close() {
+        #[derive(Debug)]
+        struct Paused(std::sync::mpsc::Sender<crate::codec_copy::BackstopJob>);
+        impl crate::codec_copy::BackstopEncoder for Paused {
+            fn submit(&self, job: crate::codec_copy::BackstopJob) -> Result<bool> {
+                self.0.send(job).unwrap();
+                Ok(true)
+            }
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let (mut stage, free) =
+            codec_transport_with_backstop(None, true, Some(Arc::new(Paused(send))));
+        let dir = directory();
+        fs::create_dir_all(&dir).unwrap();
+        let history = history(PAGE_TOKENS);
+        let mut ids = crate::testing::Ids::new();
+        for i in 1..=3 {
+            let cp = crate::testing::checkpoint(
+                &mut ids,
+                &history,
+                PAGE_TOKENS,
+                None,
+                vec![PageId(0)],
+                1,
+                StateSlotId(0),
+            );
+            stage
+                .store(
+                    JobId(i),
+                    header(&geometry(), &history, PAGE_TOKENS, None),
+                    dir.join(format!("{i}.tmp")),
+                    dir.join(format!("{i}.ckpt")),
+                    &cp,
+                    false,
+                )
+                .unwrap();
+            stage
+                .outbound
+                .get_mut(&JobId(i))
+                .unwrap()
+                .mirror
+                .as_mut()
+                .unwrap()
+                .born -= crate::codec_copy::MAX_AGE;
+        }
+        assert!(stage.events.is_empty(), "copy replies have not fenced yet");
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let job = loop {
+            stage.poll(&mut events).unwrap();
+            if let Ok(job) = receive.try_recv() {
+                break job;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "backstop encoder did not receive the fenced capture"
+            );
+            std::thread::yield_now();
+        };
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TransportEvent::SourceReleased { id: JobId(3) }))
+        );
+        for id in [1, 2] {
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, TransportEvent::SourceReleased { id: job } if job.0 == id)
+                ),
+                "primary GPU source should release after verified D2H"
+            );
+            assert!(!dir.join(format!("{id}.ckpt")).exists());
+        }
+        assert!(!dir.join("3.ckpt").exists());
+        stage.close().unwrap();
+        let mut terminal = Vec::new();
+        stage.poll(&mut terminal).unwrap();
+        assert!(terminal.iter().any(|e| matches!(
+            e,
+            TransportEvent::Stored {
+                id: JobId(3),
+                result: Err(_),
+                ..
+            }
+        )));
+        for id in [1, 2] {
+            assert!(terminal.iter().any(|e| matches!(e, TransportEvent::Stored { id: job, result: Ok(_), .. } if job.0 == id)));
+            assert!(dir.join(format!("{id}.ckpt")).exists());
+        }
+        assert_eq!(stage.resources.codec_stats.backstop.abandoned, 1);
+        assert_eq!(stage.pool().unwrap().free_slots(), free);
+        assert!(
+            job.run(|_| panic!("closed capture reached the encoder"))
+                .is_none()
+        );
+        assert!(!dir.join("3.ckpt").exists());
+        assert!(!dir.join("3.tmp").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completed_mirror_windows_reconcile_with_raw_bytes_by_cause() {
+        use crate::codec_copy::{MAX_AGE, MAX_PENDING_BYTES};
+        let (mut staged, _) = codec_transport(Some((JobId(9), 1)), true);
+        let dir = directory();
+        fs::create_dir_all(&dir).unwrap();
+        let base = header(&geometry(), &history(128), 64, None);
+        let put = |stage: &mut Staged, id: u64, pages: usize, rank_file: bool| {
+            let mut key = base.key;
+            key.consumed_tokens = pages as u64 * PAGE_TOKENS;
+            let header = Header::new(
+                &geometry(),
+                IDENTITY,
+                FINGERPRINT,
+                key,
+                None,
+                base.bucket,
+                pages as u32,
+                UNIX_EPOCH + CREATED,
+            )
+            .unwrap();
+            let checkpoint = PublishedCheckpoint {
+                id: CheckpointId::new(id),
+                key,
+                bucket: base.bucket,
+                ancestors: Vec::new(),
+                tail_pages: pages,
+                chain_pages: (0..pages as u32).map(PageId).collect(),
+                slot: StateSlotId(0),
+                capture_role: crate::CaptureRole::Endpoint,
+            };
+            let tmp = dir.join(format!("{id}.tmp"));
+            let path = dir.join(format!("{id}.ckpt"));
+            if rank_file {
+                stage.store_pages(
+                    JobId(id),
+                    header,
+                    tmp,
+                    path,
+                    checkpoint.chain_pages,
+                    checkpoint.slot,
+                    false,
+                )
+            } else {
+                stage.store(JobId(id), header, tmp, path, &checkpoint, false)
+            }
+            .unwrap();
+        };
+        let finish = |stage: &mut Staged, n| {
+            assert!(
+                transport_events(stage, n)
+                    .iter()
+                    .all(|e| matches!(e, TransportEvent::Stored { result: Ok(_), .. }))
+            );
+        };
+        let unit = PAGE_RECORD + ROW_RECORD;
+        let (mut raw, _) = codec_transport(None, false);
+        for (id, rank_file) in [(11, false), (12, true)] {
+            put(&mut raw, id, 1, rank_file);
+            finish(&mut raw, 1);
+        }
+        let inactive = raw.resources.codec_stats;
+        assert_eq!(
+            inactive.codec_fallback_bytes[crate::codec_copy::RawMirror::UnqualifiedLayout as usize],
+            2 * unit
+        );
+        assert_eq!(
+            inactive.codec_fallback_bytes.iter().sum::<u64>(),
+            inactive.codec_mirrored_original_bytes
+        );
+        // Two pending codec captures supply a deterministic queue size and clock.
+        put(&mut staged, 1, 1, false);
+        put(&mut staged, 2, 1, false);
+        staged
+            .outbound
+            .get_mut(&JobId(2))
+            .unwrap()
+            .mirror
+            .as_mut()
+            .unwrap()
+            .logical = MAX_PENDING_BYTES;
+        put(&mut staged, 3, 1, false);
+        for id in [1, 2] {
+            let mirror = staged
+                .outbound
+                .get_mut(&JobId(id))
+                .unwrap()
+                .mirror
+                .as_mut()
+                .unwrap();
+            mirror.logical = unit;
+            mirror.born -= MAX_AGE;
+        }
+        put(&mut staged, 4, 1, false);
+        assert_eq!(
+            staged.resources.codec_stats.codec_mirrored_original_bytes,
+            0
+        );
+        finish(&mut staged, 4);
+        put(&mut staged, 5, 1, true);
+        finish(&mut staged, 1);
+        staged.peer = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        put(&mut staged, 6, 1, false);
+        finish(&mut staged, 1);
+        staged.peer = None;
+        let pages = staged.pool().unwrap().free_slots() + 1;
+        put(&mut staged, 7, pages, false);
+        finish(&mut staged, 1);
+        // The offer is over the directory limit. Only its first raw window succeeds.
+        put(&mut staged, 9, crate::shared::packed::MAX_UNITS, false);
+        assert!(matches!(
+            transport_events(&mut staged, 1).as_slice(),
+            [TransportEvent::Stored { result: Err(_), .. }]
+        ));
+        let stats = &staged.resources.codec_stats;
+        let expected = [
+            unit,
+            unit,
+            pages as u64 * PAGE_RECORD + ROW_RECORD,
+            unit,
+            unit,
+            WINDOW_PAGES as u64 * PAGE_RECORD,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(
+            stats.codec_fallback_events,
+            [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(stats.codec_fallback_bytes, expected);
+        let encoded_input = 2 * unit;
+        assert_eq!(
+            encoded_input + expected.iter().sum::<u64>(),
+            stats.codec_mirrored_original_bytes
+        );
+    }
+
+    #[test]
+    fn disk_only_mirrors_and_restores_a_packet_without_transforming_it_in_the_store() {
+        let raw = header(&geometry(), &history(128), 64, None);
+        let key = raw.key;
+        let bucket = raw.bucket;
+        let (mut staged, free) = codec_transport(None, true);
+        let dir = directory();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(record::file_name(&key));
+        let checkpoint = PublishedCheckpoint {
+            id: CheckpointId::new(1),
+            key,
+            bucket,
+            ancestors: Vec::new(),
+            tail_pages: 1,
+            chain_pages: vec![PageId(1)],
+            slot: StateSlotId(1),
+            capture_role: crate::CaptureRole::Endpoint,
+        };
+        staged
+            .store(
+                JobId(1),
+                raw,
+                dir.join("tmp"),
+                path.clone(),
+                &checkpoint,
+                false,
+            )
+            .unwrap();
+        let Some(TransportEvent::Stored {
+            result: Ok(bytes),
+            header: Some(h),
+            ..
+        }) = transport_events(&mut staged, 1).pop()
+        else {
+            panic!("no v4 commit")
+        };
+        assert!(h.packed.is_some());
+        assert_eq!(fs::metadata(&path).unwrap().len(), bytes);
+        staged
+            .fetch(
+                JobId(2),
+                vec![FetchSegment {
+                    path: path.clone(),
+                    header: *h,
+                    first_page: 0,
+                    pages: 1,
+                    row: true,
+                }],
+                &InboundTicket {
+                    key,
+                    pages: vec![PageId(2)],
+                    slot: StateSlotId(2),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            transport_events(&mut staged, 1).as_slice(),
+            [TransportEvent::Fetched { result: Ok(_), .. }]
+        ));
+        assert_eq!(staged.pool().unwrap().free_slots(), free);
+        let raw = header(&geometry(), &history(128), 64, None);
+        let rank_file = dir.join("rank-file");
+        staged
+            .store_pages(
+                JobId(3),
+                raw,
+                dir.join("rank-tmp"),
+                rank_file.clone(),
+                checkpoint.chain_pages.clone(),
+                checkpoint.slot,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            transport_events(&mut staged, 1).as_slice(),
+            [TransportEvent::Stored { result: Ok(_), .. }]
+        ));
+        let metadata = Header::read_metadata(std::fs::File::open(rank_file).unwrap()).unwrap();
+        assert!(Header::decode(&metadata).unwrap().packed.is_none());
+        assert_eq!(staged.resources.codec_stats.codec_fallback_events[3], 1);
+        assert_eq!(
+            staged.resources.codec_stats.codec_fallback_bytes[3],
+            PAGE_RECORD + ROW_RECORD
+        );
+        let memory = staged.pool().unwrap().clone();
+        let busy = memory.allocate(free).unwrap();
+        let mut store = DiskStore::new(
+            crate::testing::directory_lock(&dir).unwrap(),
+            IDENTITY,
+            FINGERPRINT,
+            1 << 30,
+            geometry(),
+            vec![],
+            Box::new(staged),
+        )
+        .unwrap();
+        let outcome = store.store(&checkpoint).unwrap();
+        memory.release(busy);
+        assert_eq!(outcome, StoreOutcome::Retry(StoreReason::Slabs));
+        assert_eq!(store.stats().codec_skipped_mirrors, 1);
+        assert!(store.outbound.is_empty());
+        store.close().unwrap();
+        drop(store);
+        for (qualified, composite) in [(true, false), (true, true), (false, false)] {
+            let guard = crate::testing::directory_lock(&dir).unwrap();
+            let files = record::scan(
+                &guard,
+                &IDENTITY,
+                &FINGERPRINT,
+                PAGE_TOKENS,
+                &record::rank_sizes(&geometry()),
+            )
+            .unwrap();
+            assert_eq!(files.len(), 1);
+            let (mut transport, _) = codec_transport(None, qualified);
+            let memory = composite.then(|| {
+                let pool = SlabPool::new(PAGE_RECORD, 32, 8).unwrap();
+                transport.resources.pool = Some(pool.clone());
+                let (copies, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry()).unwrap();
+                crate::memory::MemoryStore::new_flat(IDENTITY, pool, copies).unwrap()
+            });
+            let disk = DiskStore::new(
+                guard,
+                IDENTITY,
+                FINGERPRINT,
+                header(&geometry(), &history(128), 64, None).length_with_row(),
+                geometry(),
+                files,
+                Box::new(transport),
+            )
+            .unwrap();
+            let mut reopened: Box<dyn HostStore> = match memory {
+                Some(memory) => {
+                    Box::new(crate::composite::CompositeStore::new(memory, disk).unwrap())
+                }
+                None => Box::new(disk),
+            };
+            let hit = reopened.lookup(&history(128), 0, u64::MAX);
+            assert_eq!(hit.is_some(), qualified);
+            if !qualified {
+                assert!(!path.exists());
+                assert_eq!(reopened.stats().disk_scan_dropped, 1);
+                assert_eq!(reopened.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+                crate::testing::poll_until(
+                    reopened.as_mut(),
+                    Instant::now() + Duration::from_secs(5),
+                    |e| matches!(e, StoreEvent::Stored { result: Ok(_), .. }),
+                );
+                assert_eq!(reopened.stats().disk_bytes, fs::metadata(&path).unwrap().len());
+                assert_eq!(reopened.stats().disk_bytes, header(&geometry(), &history(128), 64, None).length_with_row());
+                assert!(reopened.lookup(&history(128), 0, u64::MAX).is_some());
+            }
+            if let Some(hit) = hit {
+                assert_eq!(hit.tier, Tier::Nvme);
+                reopened
+                    .fetch(
+                        hit,
+                        InboundTicket {
+                            key,
+                            pages: vec![PageId(2)],
+                            slot: StateSlotId(2),
+                        },
+                    )
+                    .unwrap();
+                crate::testing::poll_until(
+                    reopened.as_mut(),
+                    Instant::now() + Duration::from_secs(5),
+                    |e| matches!(e, StoreEvent::Fetched { result: Ok(_), .. }),
+                );
+                assert_eq!(
+                    reopened.lookup(&history(128), 0, u64::MAX).unwrap().tier,
+                    Tier::Nvme
+                );
+            }
+            reopened.close().unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

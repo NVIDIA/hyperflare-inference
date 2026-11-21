@@ -482,6 +482,8 @@ fn offer(source: &Source, history: &TestHistory, world: usize, pages: usize) -> 
     let key = history.key_at(pages as u64 * PT).unwrap();
     let (page, row) = whole(world);
     source.client.saved(IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key,
         parent: None,
         bucket: history.bucket_at(key.consumed_tokens).unwrap(),
@@ -905,6 +907,8 @@ fn publish(source: &Instance, history: &TestHistory, world: usize, pages: usize)
     let key = history.key_at(pages as u64 * PT).unwrap();
     let (page, row) = whole(world);
     source.rank0.saved(IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key,
         parent: None,
         bucket: history.bucket_at(key.consumed_tokens).unwrap(),
@@ -1541,6 +1545,8 @@ fn host_export(
     let key = history.key_at(pages as u64 * PT).unwrap();
     let (page, row) = whole(world);
     source.rank0.saved(IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key,
         parent: None,
         bucket: history.bucket_at(key.consumed_tokens).unwrap(),

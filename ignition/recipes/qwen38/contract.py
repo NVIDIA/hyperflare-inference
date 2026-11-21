@@ -3,6 +3,8 @@
 
 """Prepared graph inputs, continuation storage, and frontend syntax."""
 
+from math import prod
+
 from ignition.preparation import contract as c
 from ignition.preparation import runtime_core_pb2 as p
 
@@ -16,6 +18,26 @@ FRONTEND = c.frontend(tools=p.QWEN_CODER, wrapping_newlines=1, terminal_markers=
         required_start="<|im_start|>system\n", required_marker="<|im_end|>"),
     image_tokens=dict(feature_token=248056, span=None),
     image_preparation=p.QWEN_IMAGE_PREPARATION, image_layout=p.QWEN_IMAGE_LAYOUT, position_dimensions=3)
+
+
+def history_regions(buffers, cache):
+    return [c.history_region(buffers, f"cache.{layer}.{name}", getattr(value, name), p.PAGED_KEY_VALUE,
+            tokens_per_record=4 if name == "compressed_k_cache" else 1)
+            for layer, value in cache.items()
+            for name in ("main_k_cache", "main_v_cache", "compressed_k_cache")]
+
+
+def checkpoint_encoding(name, dtype, shape):
+    if name.endswith(".recurrent") and str(dtype) == "torch.float32" and tuple(shape[-2:]) == (128, 128):
+        return 1
+    if str(dtype) == "torch.bfloat16":
+        if name.endswith("convolution") and shape[-1] in (10, 16):
+            return 2 * shape[-1]
+        return 2
+    if name.endswith((".main_k_cache", ".main_v_cache")) and str(dtype) in ("torch.uint8", "torch.float8_e4m3fn"):
+        if prod(shape) == 32768:
+            return 42
+    return 0
 
 
 def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag, rows=1, embedding_tables=(), regions=()):
@@ -47,5 +69,6 @@ def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag,
     return c.model_contract(vocabulary=VOCABULARY, input_vocabulary=INPUT_VOCABULARY,
         page_tokens=page_tokens, page_tables=[dict(buffer="page_tables", page_offset=0),
             *([dict(buffer="draft_page_tables", page_offset=1)] if "draft_page_tables" in buffers else [])],
+        codec_layout=c.codec_layout(pool, regions, buffers, field_encoding=checkpoint_encoding),
         regions=[dict(kind=p.CONTINUATION_STATE, storage=continuation, tokens_per_record=1, window_tokens=0), *regions],
         graphs=graphs, vision={**VISION, "feature_slots": image_slots}, frontend=FRONTEND)

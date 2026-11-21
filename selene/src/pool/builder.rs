@@ -20,11 +20,15 @@ use std::sync::{Arc, Mutex};
 
 /// Registration precedes cache sizing; copying starts with the final cache geometry.
 struct Copier {
+    profile: Option<[u8; 32]>,
     layout: Layout,
     transfers: Option<Box<dyn crate::PageCopier>>,
 }
 
 impl PageCopier for Copier {
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.profile
+    }
     fn layout(&self) -> &Layout {
         &self.layout
     }
@@ -105,6 +109,7 @@ impl PoolBuilder<'_> {
             disk,
         } = self;
         let copier = Arc::new(Mutex::new(Copier {
+            profile: crate::codec_copy::profile(geometry),
             layout: Layout::new(geometry)?,
             transfers: None,
         }));

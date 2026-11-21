@@ -26,11 +26,9 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
-from .contract import prepare as prepare_contract
+from .contract import history_regions, prepare as prepare_contract
 from .frontend import chat_template_asset
-from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
-from ignition.preparation import runtime_core_pb2 as contract_proto
 from ignition.preparation.deferred import deferred_mode
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
@@ -679,14 +677,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     if template is not None:
         assets["chat_template"] = template
     generation = json.loads((snapshot / "generation_config.json").read_text())
-    from .mla import MLAState
-    cache_regions = []
-    for layer, value in enumerate((*pool.decoder.layers, *((pool.draft,) if pool.draft is not None else ()))):
-        if isinstance(value, MLAState):
-            cache_regions.append(history_region(buffers, f"cache.{layer}.latent", value.cache.view(-1, 4, 64, 528),
-                contract_proto.PAGED_LATENT, tokens_per_record=config.page_tokens // 256))
-            cache_regions.append(history_region(buffers, f"cache.{layer}.index", value.index.cache,
-                contract_proto.PAGED_LATENT, tokens_per_record=config.page_tokens // 64))
+    cache_regions = history_regions(buffers, pool, config.page_tokens)
     buffers["request_pending_token"] = requests.pending_token
     server_config = {"identity": identity, "model_id": snapshot.name, "max_sequence_tokens": config.context,
         "prefill_chunk_size": config.prefill_chunk_size, "pages": pages, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": config.page_tokens,

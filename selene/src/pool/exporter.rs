@@ -42,6 +42,13 @@ pub use crate::shared::SliceSums as Checksums;
 /// A host record chain held against eviction. Dropping it releases the hold.
 pub trait HostPin: Send {
     fn chain(&self) -> &HostChain;
+    /// The pinned record's own suffix, including only units this capture retained.
+    fn is_packed(&self, record: usize) -> bool {
+        self.packed(record).is_some()
+    }
+    fn packed(&self, _record: usize) -> Option<crate::shared::wire::PackedOffer> {
+        None
+    }
     /// Copy the span into `dst` (page records, then the row) and return its
     /// persisted checksums. May block on a device: it runs on a copy thread.
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums>;
@@ -49,6 +56,21 @@ pub trait HostPin: Send {
 
 /// Bytes a store or a probe supplies for a put, window by window.
 pub trait PutBytes: Send {
+    fn raw_available(&self, _first_page: u64) -> bool {
+        self.packed().is_none()
+    }
+    fn packed(&self) -> Option<crate::shared::wire::PackedOffer> {
+        None
+    }
+    fn fill_packed(
+        &mut self,
+        _first: u64,
+        _pages: u32,
+        _row: bool,
+        _dst: &mut [u8],
+    ) -> Result<Checksums> {
+        Err(crate::Error::new("put has no packed suffix"))
+    }
     /// Fill `dst` with `page_count` page records starting at page `first_page`
     /// of the chain, then the row record when `row`, and return the checksums to
     /// commit with them: the persisted ones when the source has them, never

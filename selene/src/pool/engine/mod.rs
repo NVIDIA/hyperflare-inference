@@ -110,6 +110,7 @@ struct Resync {
 }
 
 pub(crate) struct Session {
+    pub(crate) codec: Option<wire::CodecCaps>,
     header: wire::Header,
     pub(crate) limits: wire::Limits,
     pub(crate) regions: Option<Arc<Regions>>,
@@ -263,6 +264,10 @@ impl Engine {
         std::mem::take(&mut self.out)
     }
 
+    pub(crate) fn codec_caps(&self, rdma: bool) -> wire::CodecCaps {
+        crate::codec_copy::reader_caps(self.copier.lock().unwrap().codec_profile(), rdma)
+    }
+
     // ---- session ----------------------------------------------------------
 
     /// The manager opened a session. `regions` are the mapped and registered
@@ -282,7 +287,17 @@ impl Engine {
         self.announce
             .set_max_entries(limits.max_resync_entries as usize);
         self.shared.set_max_lookups(limits.max_concurrent_lookups);
+        let accepted = self
+            .copier
+            .lock()
+            .unwrap()
+            .codec_profile()
+            .is_some_and(|p| crate::shared::packed::permits(opened.codec.as_ref(), &[p.to_vec()]));
+        self.shared
+            .codec_peer
+            .store(accepted, std::sync::atomic::Ordering::Release);
         self.sess = Some(Session {
+            codec: opened.codec.clone(),
             header: wire::Header {
                 manager_incarnation,
                 session_incarnation: opened.session_incarnation,
@@ -324,6 +339,9 @@ impl Engine {
     /// depends on the session, and let the copies drain before anything is
     /// released. Callers keep ticking until [`Engine::quiet`].
     pub(crate) fn session_lost(&mut self, now: Instant) {
+        self.shared
+            .codec_peer
+            .store(false, std::sync::atomic::Ordering::Release);
         let Some(sess) = self.sess.take() else {
             return;
         };

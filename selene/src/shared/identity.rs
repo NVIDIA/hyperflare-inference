@@ -95,6 +95,9 @@ impl Scope {
                         unit_bytes: *bytes,
                     })
                     .collect(),
+                placement: Default::default(),
+                gpu_mirror_duty: None,
+                codec_fields: Vec::new(),
                 snapshot_pages: Vec::new(),
             })
             .collect()

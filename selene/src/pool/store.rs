@@ -41,6 +41,9 @@ use super::{
 /// What the store uses of the pool client. [`PoolClient`] is the implementation;
 /// tests of the store's planning and sequencing substitute a recording one.
 pub trait PoolPort {
+    fn codec_peer(&self) -> Option<crate::codec_copy::PeerCapability> {
+        None
+    }
     fn begin_lookup(&self, history: &dyn History, resident: u64) -> LookupTicket;
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64>;
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
@@ -59,6 +62,9 @@ pub trait PoolPort {
 }
 
 impl PoolPort for PoolClient {
+    fn codec_peer(&self) -> Option<crate::codec_copy::PeerCapability> {
+        Some(self.codec_acceptance())
+    }
     fn begin_lookup(&self, history: &dyn History, resident: u64) -> LookupTicket {
         PoolClient::begin_lookup(self, history, resident)
     }
@@ -182,6 +188,9 @@ impl<S: crate::store::TierStore> PooledStore<S, PoolClient> {
 
 impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
     pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
+        if let Some(peer) = pool.codec_peer() {
+            inner.set_codec_peer(peer);
+        }
         inner.announce_to(pool.announcer());
         Self {
             inner,
@@ -512,6 +521,8 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         PoolPort::saved(
             &self.pool,
             IndexEntry {
+                packed: false,
+                required_profiles: Vec::new(),
                 key: checkpoint.key,
                 parent: checkpoint.parent(),
                 bucket: checkpoint.bucket,
@@ -532,6 +543,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
             *count += pool;
         }
         stats.refusal_drops = self.cascade.refusal_drops;
+        stats.codec_put_drop_bytes = self.cascade.codec_put_drop_bytes;
         stats.retirement_paths = self.cascade.paths;
         stats.retirement_latency_buckets = self.cascade.latency_buckets;
         stats.retirement_max_depth = self.cascade.max_depth;
@@ -577,6 +589,8 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
             key,
             Tier::Gpu,
             heir.map(|heir| IndexEntry {
+                packed: false,
+                required_profiles: Vec::new(),
                 key: heir.key,
                 parent: heir.parent(),
                 bucket: heir.bucket,

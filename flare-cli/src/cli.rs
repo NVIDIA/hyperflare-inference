@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand, builder::PossibleValuesParser, builder::Typ
 use flare_helios::{
     engram::Storage,
     offload::{
-        PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
+        KvCompression, PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
         parse_pool_address, parse_size,
     },
     runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit},
@@ -957,6 +957,19 @@ pub struct ServingOptions {
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
+    /// bit-exact; restored state is identical to the original; no quality change [default: off]
+    #[arg(
+        long,
+        value_name = "gpu|cpu|off",
+        help_heading = "Prefix cache options"
+    )]
+    pub lossless_kv_compression: Option<KvCompression>,
+
+    /// Maximum busy percentage of each GPU mirror lane (1–100, default 25).
+    #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(1..=100),
+        help_heading = "Prefix cache options")]
+    pub kv_codec_gpu_duty: Option<u8>,
+
     /// Warm host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables warm retention.
     /// Automatic intake is additional when memory or disk is enabled [default: prefix_cache.memory, else 0].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
@@ -1053,6 +1066,11 @@ impl Run {
 }
 
 impl ServingOptions {
+    pub fn codec_duty_warning(&self) -> Option<&'static str> {
+        (self.kv_codec_gpu_duty.is_some() && self.lossless_kv_compression != Some(KvCompression::Gpu))
+            .then_some("--kv-codec-gpu-duty only applies to GPU compression")
+    }
+
     pub fn select_gpus(&mut self, local_ranks: usize) {
         if self.gpus.is_empty() {
             self.gpus = (0..local_ranks as i32).collect();
@@ -1075,6 +1093,12 @@ impl ServingOptions {
         }
         if self.roce_switch_only {
             options.push(ROCE_SWITCH_ONLY.into());
+        }
+        if let Some(duty) = self.kv_codec_gpu_duty {
+            options.extend(["--kv-codec-gpu-duty".into(), duty.to_string()]);
+        }
+        if let Some(mode) = self.lossless_kv_compression {
+            options.extend(["--lossless-kv-compression".into(), mode.to_string()]);
         }
         if self.verify_weights {
             options.push("--verify-weights".into());
@@ -1208,6 +1232,8 @@ impl ServingOptions {
             },
             device_labels: (!self.gpus.is_empty()).then(|| self.gpus.clone()),
             prefix_cache: PrefixCacheOffload {
+                compression: self.lossless_kv_compression.unwrap_or_default(),
+                gpu_mirror_duty: self.kv_codec_gpu_duty,
                 memory_bytes: self.prefix_cache_memory,
                 disk: self.prefix_cache_disk.clone(),
                 disk_limit: self.prefix_cache_disk_limit,
@@ -1646,6 +1672,8 @@ mod tests {
         assert_eq!(
             options.prefix_cache,
             PrefixCacheOffload {
+                compression: Default::default(),
+                gpu_mirror_duty: None,
                 memory_bytes: Some(3 << 29),
                 disk: Some(PathBuf::from("prefixes")),
                 disk_limit: Some(0),
@@ -2108,6 +2136,33 @@ mod tests {
             peer.load_options().prefix_cache.pool,
             args.load_options().prefix_cache.pool
         );
+    }
+
+    #[test]
+    fn codec_placement_reaches_each_rank_and_defaults_to_off() {
+        let base = ["flare", "run", "model.safetensors"];
+        assert_eq!(
+            run(&base).load_options().prefix_cache.compression,
+            KvCompression::Off
+        );
+        for name in ["cpu", "gpu", "off"] {
+            let mut argv = base.to_vec();
+            argv.extend(["--lossless-kv-compression", name]);
+            let args = run(&argv);
+            assert_eq!(args.rank_options(), ["--lossless-kv-compression", name]);
+            assert_eq!(
+                args.load_options().prefix_cache.compression.to_string(),
+                name
+            );
+        }
+        let mut argv = base.to_vec();
+        argv.extend(["--kv-codec-gpu-duty", "40"]);
+        let args = run(&argv);
+        assert!(args.serving.codec_duty_warning().is_some());
+        argv.extend(["--lossless-kv-compression", "gpu"]);
+        assert!(run(&argv).serving.codec_duty_warning().is_none());
+        assert_eq!(args.rank_options(), ["--kv-codec-gpu-duty", "40"]);
+        assert_eq!(args.load_options().prefix_cache.gpu_mirror_duty, Some(40));
     }
 
     #[test]

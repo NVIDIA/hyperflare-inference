@@ -67,6 +67,7 @@ pub const IN_FLIGHT_WINDOWS: usize = crate::shared::WINDOW_CREDITS as usize;
 /// copy is complete; a standalone memory store treats every record as durable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecord {
+    pub(crate) packed: Option<crate::memory_packed::Retained>,
     pub capture_role: crate::CaptureRole,
     pub pages: Vec<Slot>,
     pub row: Option<Vec<Slot>>,
@@ -75,6 +76,29 @@ pub struct MemoryRecord {
 }
 
 impl MemoryRecord {
+    pub fn page_count(&self) -> usize {
+        self.packed.as_ref().map_or(self.pages.len(), |p| p.pages)
+    }
+    fn packets(
+        &self,
+        pool: &SlabPool,
+        skip: usize,
+        count: usize,
+        row: bool,
+    ) -> Result<Vec<crate::codec_copy::PinnedPacket>> {
+        self.packed
+            .as_ref()
+            .ok_or_else(|| invalid("missing packed mirror"))?
+            .pinned(
+                &pool.addresses(&self.pages),
+                &pool.addresses(self.row.as_deref().unwrap_or_default()),
+                pool.page_bytes(),
+                skip,
+                count,
+                row,
+            )
+    }
+
     pub(crate) fn slots(&self) -> usize {
         self.pages.chunk_by(|a, b| a == b).count() + self.row.as_ref().map_or(0, Vec::len)
     }
@@ -156,6 +180,10 @@ impl Pending {
 
 #[derive(Debug)]
 struct Outbound {
+    source_released: bool,
+    mirrors: Vec<crate::codec_copy::Window>,
+    queued_at: std::time::Instant,
+    traffic: crate::codec_copy::MirrorBytes,
     refill: bool,
     checkpoint: CheckpointId,
     key: PrefixKey,
@@ -176,6 +204,9 @@ struct Inbound {
 /// state, and the counters. It submits windows through a caller-supplied
 /// function, so it is exercised without transfer threads.
 struct Core {
+    codec: bool,
+    policy: crate::codec_copy::MirrorPolicy,
+    peer: Option<crate::codec_copy::PeerCapability>,
     index: Index<MemoryRecord>,
     pool: SlabPool,
     /// Ready, unpinned, durable slots eligible for local eviction.
@@ -199,6 +230,7 @@ struct Core {
     retiring: Vec<Retiring>,
     /// Slot counts of records held until their moves end.
     held: HashMap<PrefixKey, usize>,
+    retirement_wait_since: Option<Instant>,
     /// Records whose moves ended and that leave once nothing reads them.
     finishing: Vec<PrefixKey>,
     /// Parents whose committed child made their row redundant, waiting for pins.
@@ -237,6 +269,9 @@ impl Core {
             identity,
             flat,
             pack_shares,
+            codec: false,
+            policy: Default::default(),
+            peer: None,
             outbound: BTreeMap::new(),
             inbound: BTreeMap::new(),
             deferred: Vec::new(),
@@ -247,6 +282,7 @@ impl Core {
             spill: false,
             retiring: Vec::new(),
             held: HashMap::new(),
+            retirement_wait_since: None,
             finishing: Vec::new(),
             thinning: HashSet::new(),
             announced: Default::default(),
@@ -349,6 +385,55 @@ impl Core {
             )
     }
 
+    fn attach_mirrors(
+        &self,
+        jobs: &mut VecDeque<Job>,
+        mut first: u64,
+        traffic: &crate::codec_copy::MirrorBytes,
+        progress: Arc<crate::codec_copy::MirrorProgress>,
+    ) -> Vec<crate::codec_copy::Window> {
+        jobs.iter_mut()
+            .map(|j| {
+                let w = crate::codec_copy::Window::capture_on(
+                    first,
+                    self.layout.ranks.len(),
+                    false,
+                    Arc::clone(&progress),
+                    traffic.encoder == crate::codec_copy::Encoder::Backstop,
+                );
+                first += j.pages.len() as u64;
+                j.codec = Some(w.clone());
+                w
+            })
+            .collect()
+    }
+
+    fn mirror_windows(
+        &mut self,
+        jobs: &mut VecDeque<Job>,
+        first: u64,
+        traffic: &mut crate::codec_copy::MirrorBytes,
+        now: std::time::Instant,
+    ) -> Vec<crate::codec_copy::Window> {
+        if !self.codec {
+            return Vec::new();
+        }
+        let ranks = self.layout.ranks.len();
+        let pending = self
+            .outbound
+            .values()
+            .filter(|o| !o.mirrors.is_empty())
+            .map(|o| (o.queued_at, o.traffic.total(), o.traffic.encoder));
+        traffic.choose(self.peer.as_ref(), ranks, &self.policy, pending, now);
+        let pool = self.pool.clone();
+        let progress = traffic.copy_progress(&pool, |count| self.allocate_slots(count, false));
+        if traffic.fallback.is_some() {
+            return Vec::new();
+        }
+        traffic.admitted(&mut self.stats);
+        self.attach_mirrors(jobs, first, traffic, progress)
+    }
+
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool> {
         if checkpoint.tail_pages > checkpoint.chain_pages.len() {
             self.stats.store_failed += 1;
@@ -408,6 +493,13 @@ impl Core {
         if self.known(&checkpoint.key) {
             return Ok(false);
         }
+        let first = if self.codec {
+            (checkpoint.key.consumed_tokens / self.layout.page_tokens)
+                .checked_sub(tail.len() as u64)
+                .ok_or_else(|| invalid("checkpoint tail exceeds its consumed pages"))?
+        } else {
+            0
+        };
         let indexed_parent = if self.flat { None } else { parent };
         // Eviction during allocation must not remove the record being extended.
         if let Some(parent) = &indexed_parent
@@ -427,6 +519,9 @@ impl Core {
             let _ = self.unpin_record(parent);
         }
         let Some(record) = allocated? else {
+            if self.codec {
+                self.stats.codec_skipped_mirrors += 1;
+            }
             return Ok(false);
         };
         self.index[&checkpoint.key].location.capture_role = checkpoint.capture_role;
@@ -440,11 +535,27 @@ impl Core {
             .row
             .as_ref()
             .map(|slots| (checkpoint.slot, self.pool.addresses(slots)));
-        let queued = windows(id, Direction::Out, pages, row);
+        let mut queued = windows(id, Direction::Out, pages, row);
+        let mut traffic = crate::codec_copy::MirrorBytes::new(
+            tail.len(),
+            self.layout.page_record_bytes,
+            if record.row.is_some() {
+                self.layout.row_record_bytes
+            } else {
+                0
+            },
+        )
+        .with_policy(&self.policy);
+        let now = std::time::Instant::now();
+        let mirrors = self.mirror_windows(&mut queued, first, &mut traffic, now);
         self.outbound.insert(
             id,
             Outbound {
+                source_released: false,
                 refill: false,
+                mirrors,
+                traffic,
+                queued_at: now,
                 checkpoint: checkpoint.id,
                 key: checkpoint.key,
                 pending: Pending::new(queued),
@@ -471,6 +582,7 @@ impl Core {
         };
         let row_slots = slots.split_off(tail_pages);
         let record = MemoryRecord {
+            packed: None,
             capture_role: crate::CaptureRole::Endpoint,
             pages: slots,
             row: row.then_some(row_slots),
@@ -550,15 +662,55 @@ impl Core {
         let addresses = self.pool.addresses(&slots);
         self.index[&key].location.row = Some(slots);
         let id = self.next_job();
-        let queued = windows(
+        let mut queued = windows(
             id,
             Direction::Out,
             std::iter::empty(),
             Some((checkpoint.slot, addresses)),
         );
+        let now = std::time::Instant::now();
+        let mut traffic = crate::codec_copy::MirrorBytes::new(
+            0,
+            self.layout.page_record_bytes,
+            self.layout.row_record_bytes,
+        )
+        .with_policy(&self.policy);
+        let mirrors = if self.index[&key].location.packed.is_some() {
+            let windows = self.mirror_windows(&mut queued, 0, &mut traffic, now);
+            if windows.is_empty() {
+                queued
+                    .iter_mut()
+                    .map(|j| {
+                        let w = crate::codec_copy::Window::literal(0, self.layout.ranks.len());
+                        j.codec = Some(w.clone());
+                        w
+                    })
+                    .collect()
+            } else {
+                windows
+            }
+        } else {
+            if self.codec {
+                traffic.choose(
+                    self.peer.as_ref(),
+                    self.layout.ranks.len(),
+                    &self.policy,
+                    std::iter::empty(),
+                    now,
+                );
+                traffic
+                    .fallback
+                    .get_or_insert(crate::codec_copy::RawMirror::RawRefill);
+            }
+            Vec::new()
+        };
         self.outbound.insert(
             id,
             Outbound {
+                source_released: false,
+                mirrors,
+                queued_at: now,
+                traffic,
                 checkpoint: checkpoint.id,
                 key,
                 refill: true,
@@ -727,7 +879,11 @@ impl Core {
                 }
                 return true;
             }
-            if node.children() == 0 && self.remove_record(key).is_ok() {
+            if node.children() == 0
+                && let Ok(bytes) = self.remove_record(key)
+            {
+                self.retirement_wait_since = None;
+                self.stats.codec_retired_bytes += bytes;
                 self.stats.progress += 1;
             }
             false
@@ -758,7 +914,7 @@ impl Core {
 
     fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
         if success && self.index.node(key).is_some_and(|node| !node.ready) {
-            if self.pack_shares {
+            if self.pack_shares && self.index[key].location.packed.is_none() {
                 self.pack_shares(key);
             }
             let r = self.index[key].location.replication;
@@ -781,7 +937,7 @@ impl Core {
             self.thin_rows();
             return Ok(());
         }
-        self.remove_record(key)
+        self.remove_record(key).map(|_| ())
     }
 
     /// Copy-out has drained and the unpublished record has no readers.
@@ -922,13 +1078,16 @@ impl Core {
             .map(|node| &node.location)
     }
 
-    fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
+    fn remove_record(&mut self, key: &PrefixKey) -> Result<u64> {
+        let mut original = 0;
         for node in self.index.remove(key, |_| false)? {
+            original += node.tail_pages as u64 * self.layout.page_record_bytes
+                + u64::from(node.row) * self.layout.row_record_bytes;
             self.thinning.remove(&node.key);
             self.clean_slots -= self.clean_slots(&node);
             self.release(&node.location);
         }
-        Ok(())
+        Ok(original)
     }
 
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
@@ -969,9 +1128,9 @@ impl Core {
         {
             return Err(invalid("an inbound transfer for this key is in flight"));
         }
-        let mut slots = Vec::with_capacity(chain.pages);
+        let mut count = 0;
         let id = self.next_job();
-        let mut groups: Vec<(bool, Vec<(PageId, usize)>)> = Vec::new();
+        let mut groups: Vec<(bool, Option<(PrefixKey, usize)>, Vec<(PageId, usize)>)> = Vec::new();
         let mut row = None;
         let mut row_replicated = false;
         for (position, key) in chain.nodes.iter().enumerate() {
@@ -986,46 +1145,80 @@ impl Core {
             }
             let record = &node.location;
             let skip = if position == 0 { chain.skip_pages } else { 0 };
-            if skip > record.pages.len() {
+            if skip > record.page_count() {
                 return Err(invalid(format!(
                     "host chain skips {skip} pages of a {}-page record",
-                    record.pages.len()
+                    record.page_count()
                 )));
             }
-            let addresses = record.page_addresses(&self.pool, &self.layout, skip);
-            let offset = slots.len();
-            slots.extend_from_slice(&addresses);
+            let packed = record.packed.is_some().then_some((*key, skip));
+            let addresses = if packed.is_some() {
+                vec![0; record.page_count() - skip]
+            } else {
+                record.page_addresses(&self.pool, &self.layout, skip)
+            };
+            let offset = count;
+            count += addresses.len();
             if key == last {
                 let slot = record
                     .row
                     .as_ref()
                     .ok_or_else(|| invalid("host chain endpoint has no row"))?;
-                row = Some((ticket.slot, self.pool.addresses(slot)));
+                row = Some((
+                    ticket.slot,
+                    if packed.is_some() {
+                        Vec::new()
+                    } else {
+                        self.pool.addresses(slot)
+                    },
+                ));
                 row_replicated = record.replication.row;
             }
             let ids = ticket
                 .pages
-                .get(offset..slots.len())
+                .get(offset..count)
                 .ok_or_else(|| invalid("host chain exceeds ticket pages"))?;
             if groups
                 .last()
-                .is_none_or(|g| g.0 != record.replication.pages)
+                .is_none_or(|g| g.0 != record.replication.pages || g.1 != packed)
             {
-                groups.push((record.replication.pages, Vec::new()));
+                groups.push((record.replication.pages, packed, Vec::new()));
             }
             groups
                 .last_mut()
                 .unwrap()
-                .1
+                .2
                 .extend(ids.iter().copied().zip(addresses));
         }
-        if slots.len() != ticket.pages.len() || slots.len() != chain.pages {
+        if count != ticket.pages.len() || count != chain.pages {
             return Err(invalid(format!(
                 "host chain supplies {} pages for a ticket of {} and a match of {}",
-                slots.len(),
+                count,
                 ticket.pages.len(),
                 chain.pages
             )));
+        }
+        let mut queued = VecDeque::new();
+        let last = groups.len() - 1;
+        for (i, (replicated, packed, pages)) in groups.into_iter().enumerate() {
+            let mut group = windows(id, Direction::In, pages, row.clone().filter(|_| i == last));
+            let mut offset = packed.map_or(0, |(_, skip)| skip);
+            for job in &mut group {
+                if let Some((key, _)) = packed {
+                    let r = &self.index[&key].location;
+                    let first = r.packed.as_ref().unwrap().offer.first_page + offset as u64;
+                    let packets =
+                        r.packets(&self.pool, offset, job.pages.len(), job.row.is_some())?;
+                    job.codec = Some(crate::codec_copy::Window::restore_pinned(first, packets));
+                    offset += job.pages.len();
+                }
+                job.replication = crate::record::Replication {
+                    pages: replicated,
+                    row: row_replicated && job.row.is_some(),
+                };
+                job.window += queued.len() as u32;
+            }
+            queued.extend(group);
         }
         for (pinned, key) in chain.nodes.iter().enumerate() {
             if let Err(error) = self.pin_record(key) {
@@ -1034,19 +1227,6 @@ impl Core {
                 }
                 return Err(error);
             }
-        }
-        let mut queued = VecDeque::new();
-        let last = groups.len() - 1;
-        for (i, (packed, pages)) in groups.into_iter().enumerate() {
-            let mut group = windows(id, Direction::In, pages, row.clone().filter(|_| i == last));
-            for job in &mut group {
-                job.replication = crate::record::Replication {
-                    pages: packed,
-                    row: row_replicated && job.row.is_some(),
-                };
-                job.window += queued.len() as u32;
-            }
-            queued.extend(group);
         }
         self.inbound_rate.started();
         self.inbound.insert(
@@ -1065,6 +1245,9 @@ impl Core {
     /// submit is ignored.
     fn absorb(&mut self, reply: Reply) {
         if let Some(outbound) = self.outbound.get_mut(&reply.id) {
+            if reply.result.is_ok() {
+                outbound.traffic.completed(&mut self.stats, reply.window);
+            }
             self.outbound_rate.observe(reply.bytes, reply.elapsed);
             outbound.pending.absorb(reply);
         } else if let Some(inbound) = self.inbound.get_mut(&reply.id) {
@@ -1110,9 +1293,30 @@ impl Core {
     fn settle(&mut self, events: &mut Vec<StoreEvent>) {
         let done: Vec<JobId> = self
             .outbound
-            .iter()
-            .filter(|(_, outbound)| outbound.pending.done())
-            .map(|(id, _)| *id)
+            .iter_mut()
+            .filter_map(|(id, outbound)| {
+                if !outbound.pending.done() {
+                    return None;
+                }
+                if outbound.pending.error.is_some() {
+                    return Some(*id);
+                }
+                if outbound.traffic.encoder == crate::codec_copy::Encoder::Backstop
+                    && !outbound.source_released
+                {
+                    outbound.source_released = true;
+                    events.push(StoreEvent::SourceReleased {
+                        checkpoint: outbound.checkpoint,
+                    });
+                    outbound
+                        .traffic
+                        .record_pin_time(outbound.queued_at, &mut self.stats);
+                }
+                outbound
+                    .traffic
+                    .ready(&outbound.mirrors, std::time::Instant::now())
+                    .then_some(*id)
+            })
             .collect();
         for id in done {
             if let Some(outbound) = self.outbound.remove(&id) {
@@ -1138,9 +1342,37 @@ impl Core {
         let Outbound {
             checkpoint,
             key,
-            pending,
+            mut pending,
             refill,
+            mirrors,
+            queued_at,
+            mut traffic,
+            ..
         } = outbound;
+        if !outbound.source_released && !mirrors.is_empty() {
+            traffic.record_pin_time(queued_at, &mut self.stats);
+        }
+        if pending.error.is_none() && !mirrors.is_empty() {
+            let captured = traffic.packets(&mirrors, &mut self.stats);
+            let record = &mut self.index[&key].location;
+            let pages = record.page_count();
+            let first = key.consumed_tokens / self.layout.page_tokens - pages as u64;
+            match captured.and_then(|packets| {
+                crate::memory_packed::Retained::install(
+                    &self.layout,
+                    &self.pool,
+                    &mut record.pages,
+                    record.row.as_mut(),
+                    first,
+                    pages,
+                    packets,
+                    record.packed.as_ref(),
+                )
+            }) {
+                Ok(held) => record.packed = held,
+                Err(e) => pending.fail(e),
+            }
+        }
         let result = if refill {
             let result = match pending.error {
                 None => {
@@ -1181,7 +1413,11 @@ impl Core {
                 }
             }
         };
+        if result.is_ok() {
+            traffic.published(&mut self.stats);
+        }
         events.push(StoreEvent::Stored {
+            source_released: outbound.source_released,
             checkpoint,
             key,
             result,
@@ -1225,6 +1461,7 @@ impl Core {
                     }
                     Ok(false) => {
                         events.push(StoreEvent::Deferred {
+                            source_released: false,
                             checkpoint: checkpoint.id,
                             reason: StoreReason::Slabs,
                         });
@@ -1235,6 +1472,7 @@ impl Core {
                 };
                 self.stats.store_failed += 1;
                 events.push(StoreEvent::Stored {
+                    source_released: false,
                     checkpoint: checkpoint.id,
                     key: checkpoint.key,
                     result,
@@ -1277,6 +1515,17 @@ impl Core {
         events.push(StoreEvent::Fetched { key, result });
     }
 
+    fn abandon_backstops(&mut self) {
+        self.policy.backstop = None;
+        for outbound in self.outbound.values_mut() {
+            if outbound.traffic.abandon_backstop(&mut self.stats) {
+                outbound
+                    .pending
+                    .fail(invalid("backstop capture abandoned at shutdown"));
+            }
+        }
+    }
+
     /// Drop every transfer in progress: unready records leave the index and
     /// pinned chains are released. No event follows.
     fn abandon(&mut self) {
@@ -1315,6 +1564,53 @@ impl Core {
             .map(|key| self.index[key].location.slots())
             .sum();
         StoreStats {
+            backstop: crate::store::BackstopStats {
+                queue_bytes: self
+                    .outbound
+                    .values()
+                    .filter(|o| o.traffic.encoder == crate::codec_copy::Encoder::Backstop)
+                    .map(|o| o.traffic.total())
+                    .sum(),
+                oldest_ns: self
+                    .outbound
+                    .values()
+                    .filter(|o| o.traffic.encoder == crate::codec_copy::Encoder::Backstop)
+                    .map(|o| o.queued_at.elapsed().as_nanos() as u64)
+                    .max()
+                    .unwrap_or(0),
+                peak_bytes: self
+                    .pool
+                    .backstop_usage
+                    .peak
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                heap_reserved: self
+                    .pool
+                    .backstop_usage
+                    .reserved
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                heap_intake: self
+                    .pool
+                    .backstop_usage
+                    .intake
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                ..self.stats.backstop
+            },
+            codec_pending_bytes: self
+                .outbound
+                .values()
+                .filter(|o| !o.mirrors.is_empty())
+                .map(|o| o.traffic.total())
+                .sum(),
+            codec_oldest_ns: self
+                .outbound
+                .values()
+                .filter(|o| !o.mirrors.is_empty())
+                .map(|o| o.queued_at.elapsed().as_nanos() as u64)
+                .max()
+                .unwrap_or(0),
+            dram_retirement_wait_ns: self
+                .retirement_wait_since
+                .map_or(0, |since| since.elapsed().as_nanos() as u64),
             retirement_pinned_bytes: slots as u64 * self.pool.page_bytes() as u64,
             outbound_in_flight: self.outbound.len() + self.deferred.len(),
             inbound_in_flight: self.inbound.len(),
@@ -1325,6 +1621,12 @@ impl Core {
             memory_bytes: self.resident_bytes(),
             outbound_rate: self.outbound_rate.get(),
             inbound_rate: self.inbound_rate.get(),
+            progress: self.stats.progress
+                + self
+                    .pool
+                    .backstop_usage
+                    .releases
+                    .load(std::sync::atomic::Ordering::Acquire),
             ..self.stats
         }
     }
@@ -1333,7 +1635,7 @@ impl Core {
 /// Split a record into transfer windows of at most [`WINDOW_PAGES`] pages,
 /// attaching the row to the last one. A row alone needs one window. An empty
 /// link needs none.
-fn windows(
+pub(crate) fn windows(
     id: JobId,
     direction: Direction,
     pages: impl IntoIterator<Item = (PageId, usize)>,
@@ -1345,6 +1647,7 @@ fn windows(
     while let Some(chunk) = chunks.next() {
         let last = chunks.peek().is_none();
         queued.push_back(Job {
+            codec: None,
             replication: Default::default(),
             id,
             window: queued.len() as u32,
@@ -1355,6 +1658,7 @@ fn windows(
     }
     if queued.is_empty() && row.is_some() {
         queued.push_back(Job {
+            codec: None,
             replication: Default::default(),
             id,
             window: 0,
@@ -1395,6 +1699,9 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    pub(crate) fn abandon_backstops(&mut self) {
+        self.core.abandon_backstops();
+    }
     /// A standalone store whose index mirrors the GPU checkpoint tree.
     pub fn new(identity: [u8; 32], pool: SlabPool, transfers: SharedCopier) -> Result<Self> {
         Self::open(identity, pool, transfers, false)
@@ -1421,7 +1728,13 @@ impl MemoryStore {
             return Err(invalid("slot size disagrees with the record layout"));
         }
         Ok(Self {
-            core: Core::new(identity, pool, layout, flat),
+            core: {
+                let mut core = Core::new(identity, pool, layout, flat);
+                let copier = transfers.lock().unwrap_or_else(PoisonError::into_inner);
+                core.policy = copier.mirror_policy();
+                core.codec = copier.encode_mirrors();
+                core
+            },
             announce: None,
             transfers,
             replies: Vec::new(),
@@ -1518,6 +1831,17 @@ impl MemoryStore {
         self.core.complete_record(key, success)
     }
 
+    pub(crate) fn packed_read(&mut self, key: &PrefixKey, layout: &crate::shared::packed::Layout) {
+        let width = self.core.pool.page_bytes();
+        let record = &mut self.core.index[key].location;
+        let held = crate::memory_packed::Retained::scattered(layout, width);
+        if let Some(slots) = &mut record.row {
+            self.core
+                .pool
+                .release(slots.drain((layout.row_bytes() as usize).div_ceil(width)..));
+        }
+        record.packed = Some(held);
+    }
     pub fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
         self.core.mark_durable(key)
     }
@@ -1560,7 +1884,7 @@ impl MemoryStore {
 
     /// Remove an unpinned childless record and release its slots.
     pub fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
-        self.core.remove_record(key)
+        self.core.remove_record(key).map(|_| ())
     }
 
     /// Hold a record in place while a job outside this store references its
@@ -1664,6 +1988,21 @@ impl MemoryStore {
                     let Some(node) = self.core.index.node(&key).filter(|n| n.ready) else {
                         continue;
                     };
+                    if let Some(held) = &node.location.packed {
+                        a.sums.insert(key, Arc::new(RecordSums::default()));
+                        a.view.announce_packed(
+                            &notice,
+                            parent_of(&key, notice.parent),
+                            &held.offer,
+                        );
+                        // Packed records skip the checksum worker's pin. Announcing one
+                        // under spill removes its slots from the locally evictable reserve.
+                        if self.core.spill {
+                            self.core.clean_slots -= self.core.clean_slots(node);
+                        }
+                        self.core.announced.insert(key);
+                        continue;
+                    }
                     debug_assert!(
                         !node.location.replication.row && !node.location.replication.pages
                     );
@@ -1700,7 +2039,18 @@ impl MemoryStore {
                     }
                 }
                 NodeEvent::RowDropped => {
-                    if a.sums.contains_key(&key) {
+                    if let Some(held) = self
+                        .core
+                        .index
+                        .node(&key)
+                        .and_then(|n| n.location.packed.as_ref())
+                    {
+                        a.view.announce_packed(
+                            &notice,
+                            parent_of(&key, notice.parent),
+                            &held.offer,
+                        );
+                    } else if a.sums.contains_key(&key) {
                         a.view.announce(&notice, parent_of(&key, notice.parent));
                     }
                 }
@@ -1739,8 +2089,9 @@ impl MemoryStore {
             if want_row && position + 1 == keys.len() && node.location.row.is_none() {
                 return Err(ExportRefusal::ChainGap);
             }
-            nodes.push((*key, node.location.pages.len()));
+            nodes.push((*key, node.location.page_count()));
             spans.push(MemorySpan {
+                packed: node.location.packed.clone(),
                 pages: pool.addresses(&node.location.pages),
                 row: node
                     .location
@@ -1813,6 +2164,9 @@ impl MemoryStore {
 }
 
 impl HostStore for MemoryStore {
+    fn set_codec_peer(&mut self, peer: crate::codec_copy::PeerCapability) {
+        self.core.peer = Some(peer);
+    }
     fn reused(&mut self, key: PrefixKey) {
         self.core.reused(&key);
     }
@@ -1891,9 +2245,20 @@ impl HostStore for MemoryStore {
                 }
             }
             self.flush_announcements(&|_, parent| parent, &|_| None);
+            let watermark = 2 * self.core.pool.intake_slots();
             if self.core.spill {
+                self.core.retire_for(self.reserve(watermark));
+            }
+            // Measure physical pressure even if the accounting selects no candidate.
+            let pressure = self.core.spill
+                && !self.core.announced.is_empty()
+                && self.core.pool.free_slots() < watermark;
+            if pressure || !self.core.held.is_empty() || !self.core.finishing.is_empty() {
                 self.core
-                    .retire_for(self.reserve(2 * self.core.pool.intake_slots()));
+                    .retirement_wait_since
+                    .get_or_insert_with(Instant::now);
+            } else {
+                self.core.retirement_wait_since = None;
             }
         }
         Ok(())
@@ -1908,6 +2273,7 @@ impl HostStore for MemoryStore {
     /// threads and abandon whatever remains after a confirmed drain. Events
     /// raised meanwhile are dropped: nothing polls a closed store.
     fn close(&mut self) -> Result<()> {
+        self.core.abandon_backstops();
         let deadline = Instant::now() + CLOSE_TIMEOUT;
         let mut events = Vec::new();
         while !(self.core.outbound.is_empty() && self.core.inbound.is_empty())
@@ -2096,6 +2462,757 @@ mod tests {
                 _ => panic!("unexpected event"),
             })
             .collect()
+    }
+
+    #[test]
+    fn packed_mirror_releases_slack_and_restores_the_selected_units() {
+        for packed in [false, true] {
+            let mut core = store_core(32, 4, false);
+            core.codec = true;
+            let full = history(256, 9);
+            let root = published(&full, 192, None, 1, 1);
+            assert!(core.store(&root).unwrap());
+            let mut jobs = Vec::new();
+            pump_into(&mut core, &mut jobs);
+            assert_eq!(jobs.len(), 1);
+            let j = &jobs[0];
+            let crate::codec_copy::Action::Mirror { ranks, .. } = &*j.codec.as_ref().unwrap().0
+            else {
+                panic!("expected a capture")
+            };
+            let packets: Vec<_> = (0..4)
+                .map(|i| {
+                    let row = i == 3;
+                    let raw = if row { ROW } else { PAGE };
+                    let data: std::sync::Arc<[u8]> =
+                        vec![i as u8; if packed { 100 } else { raw as usize }].into();
+                    crate::codec_copy::Packet {
+                        unit: crate::shared::wire::PackedUnit {
+                            kind: i32::from(row),
+                            logical_index: if row { 0 } else { i },
+                            original_length: raw,
+                            stored_length: data.len() as u64,
+                            representation: i32::from(packed),
+                            profile: if packed { vec![9; 32] } else { vec![] },
+                            raw_xxh3: if packed {
+                                0
+                            } else {
+                                crate::record::checksum(&data)
+                            },
+                            stored_crc: if packed {
+                                crate::shared::packed::crc32(&data)
+                            } else {
+                                0
+                            },
+                            ..Default::default()
+                        },
+                        data: data.into(),
+                    }
+                })
+                .collect();
+            ranks[0].set(packets.clone()).unwrap();
+            core.absorb(reply(j, Ok(())));
+            let mut events = Vec::new();
+            core.settle(&mut events);
+            assert!(matches!(
+                &events[..],
+                [StoreEvent::Stored { result: Ok(_), .. }]
+            ));
+            let record = core.record(&root.key).unwrap();
+            assert_eq!(record.packed.is_some(), packed);
+            assert_eq!(record.pages.len(), if packed { 1 } else { 3 });
+            let hit = core.lookup(&full, 64, u64::MAX).unwrap();
+            core.fetch_chain(
+                &hit.chain,
+                InboundTicket {
+                    key: root.key,
+                    pages: vec![PageId(5), PageId(6)],
+                    slot: StateSlotId(2),
+                },
+            )
+            .unwrap();
+            jobs.clear();
+            pump_into(&mut core, &mut jobs);
+            assert_eq!(jobs.len(), 1);
+            if packed {
+                let crate::codec_copy::Action::RestorePinned {
+                    first,
+                    packets: got,
+                } = &*jobs[0].codec.as_ref().unwrap().0
+                else {
+                    panic!("expected stored bytes")
+                };
+                assert_eq!(*first, 1);
+                assert_eq!(got.len(), packets.len() - 1);
+                for (view, expected) in got.iter().zip(&packets[1..]) {
+                    assert_eq!(view.unit, expected.unit);
+                    // The restore still owns the slab pin. Only span descriptors were queued.
+                    let record = core.record(&root.key).unwrap();
+                    let addresses = core.pool.addresses(if view.unit.kind == 0 {
+                        &record.pages
+                    } else {
+                        record.row.as_ref().unwrap()
+                    });
+                    for &(address, _) in &view.spans {
+                        assert!(
+                            addresses
+                                .iter()
+                                .any(|&base| (base..base + core.pool.page_bytes())
+                                    .contains(&address))
+                        );
+                    }
+                    assert_eq!(
+                        unsafe { view.chunks() }.concat(),
+                        expected.data.contiguous().as_ref()
+                    );
+                }
+            } else {
+                assert!(jobs[0].codec.is_none());
+                for ((_, addr), p) in jobs[0].pages.iter().zip(&packets[1..3]) {
+                    assert_eq!(
+                        unsafe { std::slice::from_raw_parts(*addr as *const u8, PAGE as usize) },
+                        p.data.contiguous().as_ref()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_packed_row_can_be_truncated_and_refilled_with_a_literal_in_off_mode() {
+        let mut core = store_core(16, 4, false);
+        core.codec = true;
+        let full = history(128, 9);
+        let root = published(&full, 64, None, 0, 1);
+        assert!(core.store(&root).unwrap());
+        let packet = |row: bool, packed: bool| {
+            let size = if row { ROW } else { PAGE };
+            let data: Arc<[u8]> =
+                vec![if row { 7 } else { 3 }; if packed { 100 } else { size as usize }].into();
+            crate::codec_copy::Packet {
+                unit: crate::shared::wire::PackedUnit {
+                    kind: i32::from(row),
+                    original_length: size,
+                    stored_length: data.len() as u64,
+                    representation: i32::from(packed),
+                    profile: if packed { vec![1; 32] } else { vec![] },
+                    raw_xxh3: if packed {
+                        0
+                    } else {
+                        crate::record::checksum(&data)
+                    },
+                    stored_crc: if packed {
+                        crate::shared::packed::crc32(&data)
+                    } else {
+                        0
+                    },
+                    ..Default::default()
+                },
+                data: data.into(),
+            }
+        };
+        let mut jobs = vec![];
+        pump_into(&mut core, &mut jobs);
+        let job = jobs.pop().unwrap();
+        let crate::codec_copy::Action::Mirror { ranks, .. } = &*job.codec.as_ref().unwrap().0
+        else {
+            panic!()
+        };
+        ranks[0]
+            .set(vec![packet(false, false), packet(true, true)])
+            .unwrap();
+        core.absorb(reply(&job, Ok(())));
+        core.settle(&mut vec![]);
+        assert!(core.drop_row(&root.key));
+        let held = core.record(&root.key).unwrap().packed.as_ref().unwrap();
+        assert_eq!(
+            held.offer.units.len(),
+            2,
+            "disk truncate preserves the directory"
+        );
+        assert_eq!(held.units(0, 1, false).count(), 1);
+        core.codec = false;
+        assert_eq!(core.refill_row(&root).unwrap(), StoreOutcome::Queued);
+        pump_into(&mut core, &mut jobs);
+        let job = jobs.pop().unwrap();
+        let crate::codec_copy::Action::Mirror {
+            literal: true,
+            ranks,
+            ..
+        } = &*job.codec.as_ref().unwrap().0
+        else {
+            panic!("raw refill must work with encoding off")
+        };
+        ranks[0].set(vec![packet(true, false)]).unwrap();
+        core.absorb(reply(&job, Ok(())));
+        core.settle(&mut vec![]);
+        let record = core.record(&root.key).unwrap();
+        assert!(record.packed.is_none());
+        let page = core.pool.slot_address(record.pages[0]);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(page as *const u8, PAGE as usize) },
+            packet(false, false).data.contiguous().as_ref()
+        );
+    }
+
+    #[derive(Default, Debug)]
+    struct PausedBackstop(std::sync::Mutex<Option<crate::codec_copy::BackstopJob>>);
+    impl crate::codec_copy::BackstopEncoder for PausedBackstop {
+        fn submit(&self, job: crate::codec_copy::BackstopJob) -> Result<bool> {
+            *self.0.lock().unwrap() = Some(job);
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn backstop_budget_refusal_mirrors_raw_and_preserves_transfer_headroom() {
+        let mut core = store_core(6, 0, false);
+        core.codec = true;
+        core.policy.gpu = true;
+        core.policy.backstop = Some(Arc::new(PausedBackstop::default()));
+        for salt in 1..=3 {
+            assert!(
+                core.store(&published(&history(PT, salt), PT, None, 0, salt))
+                    .unwrap()
+            );
+            for o in core.outbound.values_mut() {
+                o.queued_at -= crate::codec_copy::MAX_AGE;
+            }
+        }
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
+        let mut jobs = Vec::new();
+        pump_into(&mut core, &mut jobs);
+        let raw: Vec<_> = jobs.iter().filter(|j| j.codec.is_none()).collect();
+        assert_eq!(raw.len(), 1);
+        core.absorb(reply(raw[0], Ok(())));
+        let mut events = Vec::new();
+        core.settle(&mut events);
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Stored { result: Ok(_), .. }]
+        ));
+        let stats = core.stats();
+        let cause = crate::codec_copy::RawMirror::BackstopBudget as usize;
+        assert_eq!(stats.codec_fallback_events[cause], 1);
+        assert_eq!(stats.codec_fallback_bytes[cause], PAGE + ROW);
+        assert_eq!(stats.codec_mirrored_original_bytes, PAGE + ROW);
+        assert_eq!(stats.backstop.peak_bytes, 0);
+    }
+
+    fn backstopped_capture(stall: bool, shutdown: bool) {
+        use crate::codec_copy::{Action, Encoder, MirrorPolicy, Packet, RawMirror, STALL_LIMIT};
+        use std::time::Instant;
+        let mut core = store_core(16, 5, false);
+        core.codec = true;
+        let worker = Arc::new(PausedBackstop::default());
+        core.policy = MirrorPolicy {
+            unqualified_layout: false,
+            workspace_unavailable: false,
+            gpu: true,
+            backstop: Some(worker.clone()),
+        };
+        for salt in [1, 2] {
+            assert!(
+                core.store(&published(&history(64, salt), 64, None, 0, salt))
+                    .unwrap()
+            );
+        }
+        for o in core.outbound.values_mut() {
+            o.queued_at -= crate::codec_copy::MAX_AGE;
+        }
+        let target = published(&history(64, 3), 64, None, 0, 3);
+        assert!(core.store(&target).unwrap());
+        let mut jobs = Vec::new();
+        pump_into(&mut core, &mut jobs);
+        let job = jobs
+            .iter()
+            .find(|j| {
+                matches!(
+                    j.codec.as_ref().map(|w| w.0.as_ref()),
+                    Some(Action::Mirror { backstop: true, .. })
+                )
+            })
+            .expect("GPU pressure selects the backstop");
+        let Action::Mirror {
+            literal: true,
+            ranks,
+            ..
+        } = job.codec.as_ref().unwrap().0.as_ref()
+        else {
+            panic!("backstop needs literal intake")
+        };
+        let originals: Vec<_> = [PAGE, ROW]
+            .into_iter()
+            .enumerate()
+            .map(|(kind, n)| {
+                let data = vec![kind as u8 + 1; n as usize];
+                Packet {
+                    unit: crate::shared::wire::PackedUnit {
+                        kind: kind as i32,
+                        original_length: n,
+                        stored_length: n,
+                        raw_xxh3: crate::record::checksum(&data),
+                        ..Default::default()
+                    },
+                    data: data.into(),
+                }
+            })
+            .collect();
+        let mut events = vec![];
+        core.settle(&mut events);
+        assert!(
+            events.is_empty(),
+            "source still belongs to the outstanding copy"
+        );
+        let Action::Mirror { progress, .. } = &*job.codec.as_ref().unwrap().0 else {
+            unreachable!()
+        };
+        ranks[0]
+            .set(
+                originals
+                    .iter()
+                    .map(|p| Packet {
+                        unit: p.unit.clone(),
+                        data: progress.literal_packet(&p.data.contiguous()).unwrap(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        core.absorb(reply(job, Ok(())));
+        core.settle(&mut events);
+        assert!(
+            matches!(events.as_slice(), [StoreEvent::SourceReleased { checkpoint }] if *checkpoint == target.id)
+        );
+        events.clear();
+        core.settle(&mut events);
+        assert!(events.is_empty());
+        assert_eq!(core.stats().backstop.heap_reserved, 2 * (PAGE + ROW));
+        assert_eq!(core.stats().backstop.heap_intake, PAGE + ROW);
+        assert!(
+            core.record(&target.key).is_none(),
+            "raw intake must stay private"
+        );
+        let work = worker
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("CPU encode submitted");
+        assert_eq!(core.stats().backstop.queue_bytes, PAGE + ROW);
+        let pack = |p: &Packet| {
+            let mut q = p.clone();
+            q.data = p.data.verified(vec![7; 100])?;
+            q.unit.representation = 1;
+            q.unit.profile = vec![1; 32];
+            q.unit.raw_xxh3 = 0;
+            q.unit.original_crc = crate::shared::packed::crc32(&p.data.contiguous());
+            q.unit.stored_crc = crate::shared::packed::crc32(&q.data.contiguous());
+            q.unit.stored_length = q.data.len() as u64;
+            Ok(q)
+        };
+        let target_job = job.id;
+        jobs.retain(|j| j.id != target_job);
+        if shutdown {
+            for j in &jobs {
+                core.absorb(reply(j, Err(invalid("primary copy failed"))));
+            }
+            core.settle(&mut vec![]);
+            drop(jobs);
+            let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+            let transfers = crate::testing::StoppedCopier::shared(&geometry).unwrap();
+            let mut store = MemoryStore {
+                core,
+                announce: None,
+                transfers,
+                replies: vec![],
+                events: vec![],
+            };
+            let (entered, busy) = std::sync::mpsc::sync_channel(0);
+            let (release, wait) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let thread = scope.spawn(move || {
+                    work.run(|p| {
+                        if p.unit.kind == 1 {
+                            entered.send(()).unwrap();
+                            let _ = wait.recv_timeout(std::time::Duration::from_secs(3));
+                        }
+                        pack(p)
+                    })
+                });
+                busy.recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                let start = Instant::now();
+                store.close().unwrap();
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(1),
+                    "close waited for CPU encoding"
+                );
+                assert_eq!(store.stats().backstop.heap_reserved, 2 * (PAGE + ROW));
+                release.send(()).unwrap();
+                assert!(thread.join().unwrap().is_none());
+            });
+            assert_eq!(store.stats().backstop.abandoned, 1);
+            assert_eq!(store.stats().backstop.heap_reserved, 0);
+            assert_eq!(store.stats().backstop.heap_intake, 0);
+            assert!(!store.core.index.contains(&target.key));
+            assert_eq!(store.stats().stored, 0);
+            store.close().unwrap();
+            assert_eq!(store.stats().backstop.abandoned, 1);
+            return;
+        }
+        if stall {
+            let (entered, busy) = std::sync::mpsc::sync_channel(0);
+            let (release, wait) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let thread = scope.spawn(move || {
+                    work.run(|p| {
+                        if p.unit.kind == 1 {
+                            entered.send(()).unwrap();
+                            wait.recv_timeout(std::time::Duration::from_secs(5))
+                                .unwrap();
+                            assert!(p.data.chunks().flatten().all(|&byte| byte == 2));
+                        }
+                        pack(p)
+                    })
+                });
+                busy.recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                let o = &core.outbound[&target_job];
+                assert!(o.traffic.ready(&o.mirrors, Instant::now() + STALL_LIMIT));
+                core.settle(&mut events);
+                let rec = core.record(&target.key).expect("raw stall publication");
+                assert!(rec.packed.is_none());
+                let page = rec.pages[0];
+                let row = rec.row.as_ref().unwrap()[0];
+                assert_eq!(
+                    core.pool.page(page),
+                    originals[0].data.contiguous().as_ref()
+                );
+                assert_eq!(
+                    &core.pool.page(row)[..ROW as usize],
+                    originals[1].data.contiguous().as_ref()
+                );
+                core.remove_record(&target.key).unwrap();
+                let free = core.pool.free_slots();
+                let replacement = core.pool.allocate(free).unwrap();
+                assert!(replacement.contains(&page) && replacement.contains(&row));
+                for &slot in &replacement {
+                    core.pool.page_mut(slot).fill(0xc7);
+                }
+                assert_eq!(core.stats().backstop.heap_reserved, 2 * (PAGE + ROW));
+                release.send(()).unwrap();
+                assert!(thread.join().unwrap().is_none());
+                assert_eq!(
+                    core.pool.free_slots(),
+                    3,
+                    "last reader returns its three charged slots"
+                );
+                assert_eq!(core.stats().backstop.heap_reserved, 0);
+                assert!(core.pool.page(row).iter().all(|&byte| byte == 0xc7));
+                core.pool.release(replacement);
+            });
+        } else {
+            assert_eq!(work.run(pack), Some(PAGE + ROW));
+            core.settle(&mut events);
+            assert!(core.record(&target.key).unwrap().packed.is_some());
+        }
+        assert!(
+            matches!(events.as_slice(), [StoreEvent::Stored { checkpoint, source_released: true, result: Ok(_), .. }] if *checkpoint == target.id)
+        );
+        assert_eq!(core.stats().backstop.heap_reserved, 0);
+        assert_eq!(core.stats().backstop.peak_bytes, 2 * (PAGE + ROW));
+        for primary in &jobs {
+            let Action::Mirror { ranks, .. } = primary.codec.as_ref().unwrap().0.as_ref() else {
+                unreachable!()
+            };
+            ranks[0].set(originals.clone()).unwrap();
+            core.absorb(reply(primary, Ok(())));
+        }
+        core.settle(&mut vec![]);
+        core.policy = Default::default();
+        for (salt, peer_accepts) in [(4, true), (5, false)] {
+            core.peer = Some(Arc::new(std::sync::atomic::AtomicBool::new(peer_accepts)));
+            assert!(
+                core.store(&published(&history(64, salt), 64, None, 0, salt))
+                    .unwrap()
+            );
+            let mut submitted = Vec::new();
+            pump_into(&mut core, &mut submitted);
+            assert_eq!(submitted.len(), 1);
+            let j = &submitted[0];
+            if let Some(w) = &j.codec {
+                let Action::Mirror { ranks, .. } = w.0.as_ref() else {
+                    unreachable!()
+                };
+                ranks[0].set(originals.clone()).unwrap();
+            }
+            core.absorb(reply(j, Ok(())));
+            core.settle(&mut vec![]);
+        }
+        let stats = core.stats();
+        let size = PAGE + ROW;
+        assert_eq!(stats.backstop.events, 1);
+        assert_eq!(stats.backstop.bytes, size);
+        assert_eq!(stats.backstop.queue_bytes, 0);
+        assert_eq!(stats.backstop.ready_buckets[6], 1);
+        let by = stats.backstop.by_encoder;
+        assert_eq!(by[Encoder::Gpu as usize], 2 * size);
+        assert_eq!(by[Encoder::Cpu as usize], size);
+        assert_eq!(by[Encoder::Backstop as usize], if stall { 0 } else { size });
+        assert_eq!(
+            by[Encoder::Raw as usize],
+            if stall { 2 * size } else { size }
+        );
+        assert_eq!(
+            stats.codec_fallback_bytes[RawMirror::BackstopRaw as usize],
+            if stall { size } else { 0 }
+        );
+        assert_eq!(
+            stats.codec_fallback_bytes.iter().sum::<u64>(),
+            by[Encoder::Raw as usize]
+        );
+        assert_eq!(by.iter().sum::<u64>(), stats.codec_mirrored_original_bytes);
+        assert_eq!(stats.codec_mirrored_original_bytes, 5 * size);
+    }
+
+    #[test]
+    fn backstop_source_waits_for_the_last_window_even_when_the_row_fences_first() {
+        let pages = crate::slab::WINDOW_PAGES + 1;
+        let mut core = store_core(3 * pages + 4, 4, false);
+        core.codec = true;
+        let worker = Arc::new(PausedBackstop::default());
+        core.policy.gpu = true;
+        core.policy.backstop = Some(worker.clone());
+        for salt in [1, 2] {
+            assert!(
+                core.store(&published(&history(64, salt), 64, None, 0, salt))
+                    .unwrap()
+            );
+        }
+        for record in core.outbound.values_mut() {
+            record.queued_at -= crate::codec_copy::MAX_AGE;
+        }
+        let tokens = pages as u64 * PT;
+        let cp = published(&history(tokens, 3), tokens, None, 0, 3);
+        assert!(core.store(&cp).unwrap());
+        let mut jobs = vec![];
+        pump_into(&mut core, &mut jobs);
+        let windows: Vec<_> = jobs
+            .iter()
+            .filter(|j| core.outbound[&j.id].checkpoint == cp.id)
+            .collect();
+        assert_eq!(windows.len(), 2);
+        let mut events = vec![];
+        core.absorb(reply(windows[1], Ok(())));
+        core.settle(&mut events);
+        assert!(worker.0.lock().unwrap().is_none());
+        assert!(events.is_empty());
+        core.absorb(reply(windows[0], Ok(())));
+        core.settle(&mut events);
+        assert!(worker.0.lock().unwrap().is_some());
+        assert!(
+            matches!(&events[..], [StoreEvent::SourceReleased { checkpoint }] if *checkpoint == cp.id)
+        );
+        assert!(core.record(&cp.key).is_none());
+    }
+
+    #[test]
+    fn gpu_pressure_backstops_the_whole_capture_until_verified() {
+        backstopped_capture(false, false);
+    }
+    #[test]
+    fn stalled_backstop_reader_survives_raw_publication_eviction_and_slot_reuse() {
+        backstopped_capture(true, false);
+    }
+
+    #[test]
+    fn close_mid_encode_discards_partial_output_and_counts_the_capture_once() {
+        backstopped_capture(false, true);
+    }
+
+    #[test]
+    fn a_codec_tail_cannot_start_before_page_zero() {
+        let mut core = store_core(8, 1, false);
+        core.codec = true;
+        let checkpoint = published(&history(128, 9), 64, None, 0, 1);
+        let free = core.pool.free_slots();
+        let error = core.start_record(&checkpoint, None, &[PageId(0), PageId(1)], true, true).unwrap_err();
+        assert!(error.to_string().contains("tail exceeds"));
+        assert_eq!(core.pool.free_slots(), free);
+        assert!(!core.known(&checkpoint.key));
+    }
+
+    #[test]
+    fn mirror_pressure_trips_bytes_age_and_headroom_independently() {
+        let mut core = store_core(8, 1, false);
+        core.codec = true;
+        let full = history(2048, 9);
+        let root = published(&full, 128, None, 0, 1);
+        assert!(core.store(&root).unwrap());
+        let mut queued = VecDeque::new();
+        let created = core.outbound.values().next().unwrap().queued_at;
+        let now = created + crate::codec_copy::MAX_AGE;
+        // An active capture does not count as queue age or queued bytes.
+        let mut fits =
+            crate::codec_copy::MirrorBytes::new(0, PAGE, crate::codec_copy::MAX_PENDING_BYTES);
+        core.mirror_windows(&mut queued, 0, &mut fits, now);
+        assert_eq!(fits.fallback, None);
+        let mut large =
+            crate::codec_copy::MirrorBytes::new(0, PAGE, crate::codec_copy::MAX_PENDING_BYTES + 1);
+        core.mirror_windows(&mut queued, 0, &mut large, now);
+        assert_eq!(
+            large.fallback,
+            Some(crate::codec_copy::RawMirror::QueueBytes)
+        );
+        assert!(
+            core.store(&published(&history(128, 42), 64, None, 0, 2))
+                .unwrap()
+        );
+        let queued_at = core.outbound.values().map(|v| v.queued_at).max().unwrap();
+        let mut late = crate::codec_copy::MirrorBytes::new(0, PAGE, 1);
+        core.mirror_windows(
+            &mut queued,
+            0,
+            &mut late,
+            queued_at + crate::codec_copy::MAX_AGE,
+        );
+        assert_eq!(late.fallback, Some(crate::codec_copy::RawMirror::QueueAge));
+        assert_eq!(core.stats().codec_mirrored_original_bytes, 0);
+        for traffic in [&mut large, &mut late] {
+            traffic.completed(&mut core.stats, 0);
+        }
+        assert_eq!(
+            core.stats().codec_fallback_events,
+            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            core.stats().codec_fallback_bytes,
+            [
+                crate::codec_copy::MAX_PENDING_BYTES + 1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+        assert_eq!(core.stats().codec_pending_bytes, PAGE * 3 + ROW * 2);
+        assert!(!core.store(&published(&full, 2048, None, 0, 2)).unwrap());
+        assert_eq!(core.stats().codec_skipped_mirrors, 1);
+    }
+
+    #[test]
+    fn inactive_codec_counts_fenced_raw_captures_and_row_refills_by_cause() {
+        use crate::codec_copy::{Encoder, RawMirror};
+        for cause in [
+            RawMirror::UnqualifiedLayout,
+            RawMirror::WorkspaceUnavailable,
+        ] {
+            let mut core = store_core(8, 4, false);
+            core.policy.unqualified_layout = cause == RawMirror::UnqualifiedLayout;
+            core.policy.workspace_unavailable = cause == RawMirror::WorkspaceUnavailable;
+            let checkpoint = published(&history(64, 1), 64, None, 0, 1);
+            assert!(core.store(&checkpoint).unwrap());
+            for expected in [PAGE + ROW, ROW] {
+                let mut jobs = Vec::new();
+                pump_into(&mut core, &mut jobs);
+                assert_eq!(jobs.len(), 1);
+                assert!(jobs[0].codec.is_none());
+                let before = core.stats();
+                core.absorb(reply(&jobs[0], Ok(())));
+                core.settle(&mut vec![]);
+                let after = core.stats();
+                assert_eq!(
+                    after.codec_fallback_bytes[cause as usize]
+                        - before.codec_fallback_bytes[cause as usize],
+                    expected
+                );
+                assert_eq!(
+                    after.codec_fallback_bytes.iter().sum::<u64>(),
+                    after.codec_mirrored_original_bytes
+                );
+                assert_eq!(
+                    after.backstop.by_encoder[Encoder::Raw as usize],
+                    after.codec_mirrored_original_bytes
+                );
+                if expected != ROW {
+                    assert!(core.drop_row(&checkpoint.key));
+                    assert_eq!(core.refill_row(&checkpoint).unwrap(), StoreOutcome::Queued);
+                }
+            }
+            assert_eq!(core.stats().codec_fallback_events[cause as usize], 2);
+        }
+    }
+
+    #[test]
+    fn an_over_bound_capture_queues_only_raw_copies() {
+        let mut core = store_core(1, 1, false);
+        core.codec = true;
+        for pages in [
+            crate::shared::packed::MAX_UNITS - 1,
+            crate::shared::packed::MAX_UNITS,
+        ] {
+            let mut jobs = windows(
+                JobId(1),
+                Direction::Out,
+                (0..pages).map(|i| (PageId(i as u32), 0)),
+                Some((StateSlotId(1), vec![0])),
+            );
+            let result = core.mirror_windows(
+                &mut jobs,
+                0,
+                &mut crate::codec_copy::MirrorBytes::new(pages, PAGE, ROW),
+                Instant::now(),
+            );
+            let fits = pages + 1 <= crate::shared::packed::MAX_UNITS;
+            assert_eq!(!result.is_empty(), fits);
+            assert!(jobs.iter().all(|j| j.codec.is_some() == fits));
+        }
+    }
+
+    #[test]
+    fn a_codec_writer_publishes_a_raw_mirror_for_a_raw_only_pool() {
+        let mut core = store_core(8, 2, false);
+        core.codec = true;
+        let peer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        core.peer = Some(peer.clone());
+        for (salt, packed) in [(11, false), (12, true)] {
+            peer.store(packed, std::sync::atomic::Ordering::Release);
+            let root = published(&history(128, salt), 128, None, 0, salt);
+            assert!(core.store(&root).unwrap());
+            let mut jobs = Vec::new();
+            pump_into(&mut core, &mut jobs);
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].codec.is_some(), packed);
+            if !packed {
+                core.absorb(reply(&jobs[0], Ok(())));
+                core.settle(&mut vec![]);
+                assert!(core.index[&root.key].ready);
+                assert!(core.record(&root.key).unwrap().packed.is_none());
+                assert_eq!(core.stats().codec_mirrored_original_bytes, PAGE * 2 + ROW);
+                assert_eq!(core.stats().codec_fallback_bytes[4], PAGE * 2 + ROW);
+                assert!(core.drop_row(&root.key));
+                peer.store(true, std::sync::atomic::Ordering::Release);
+                assert_eq!(core.refill_row(&root).unwrap(), StoreOutcome::Queued);
+                jobs.clear();
+                pump_into(&mut core, &mut jobs);
+                assert!(jobs[0].codec.is_none());
+                core.absorb(reply(&jobs[0], Ok(())));
+                core.settle(&mut vec![]);
+                assert_eq!(core.stats().codec_fallback_bytes[6], ROW);
+                assert_eq!(
+                    core.stats().codec_fallback_bytes.iter().sum::<u64>(),
+                    core.stats().codec_mirrored_original_bytes
+                );
+
+                assert_eq!(core.stats().codec_skipped_mirrors, 0);
+            }
+        }
     }
 
     #[test]
@@ -3070,6 +4187,7 @@ mod tests {
         assert!(!node.pinned());
         assert_eq!(core.stats().stored, 1);
         assert_eq!(core.stats().bytes_out, 3 * PAGE + ROW);
+        assert_eq!(core.stats().codec_mirrored_original_bytes, 3 * PAGE + ROW);
 
         // The deferred child starts as the root's child with only its tail pages.
         assert!(core.deferred.is_empty());
@@ -3662,10 +4780,10 @@ mod tests {
             matches!(&events[0], StoreEvent::Stored { key, result: Ok(_), .. } if *key == root.key)
         );
         assert!(
-            matches!(&events[1], StoreEvent::Deferred { checkpoint, reason: StoreReason::Slabs } if *checkpoint == child.id)
+            matches!(&events[1], StoreEvent::Deferred { checkpoint, reason: StoreReason::Slabs, .. } if *checkpoint == child.id)
         );
         assert!(
-            matches!(&events[2], StoreEvent::Deferred { checkpoint, reason: StoreReason::Slabs } if *checkpoint == grandchild.id)
+            matches!(&events[2], StoreEvent::Deferred { checkpoint, reason: StoreReason::Slabs, .. } if *checkpoint == grandchild.id)
         );
         assert!(core.deferred.is_empty());
         assert!(core.outbound.is_empty());
@@ -4164,12 +5282,15 @@ mod tests {
         assert!(core.retire_for(1));
         let tip = core.retiring.pop().unwrap().key;
         core.pin_record(&tip).unwrap();
+        let n = core.index[&tip].tail_pages as u64 * PAGE + u64::from(core.index[&tip].row) * ROW;
         core.retired(&tip, Retirement::Moved);
+        assert_eq!(core.stats().codec_retired_bytes, 0);
         assert!(core.index.contains(&tip));
         core.unpin_record(&tip).unwrap();
         core.finish_retired();
         assert!(!core.index.contains(&tip));
         assert_eq!(core.index.len(), 3);
+        assert_eq!(core.stats().codec_retired_bytes, n);
         assert!(core.index[&fork.key].row);
         assert_eq!(core.index[&fork.key].children(), 1);
     }
@@ -4215,11 +5336,22 @@ mod tests {
         assert!(store.take_retiring().is_empty());
         store.set_spill(true);
         assert_eq!(store.reserve(2 * intake), 2);
+        let pinned: Vec<_> = store.core.announced.iter().copied().collect();
+        for key in &pinned {
+            store.core.pin_record(key).unwrap();
+        }
+        store.poll(&mut Vec::new()).unwrap();
+        assert!(store.take_retiring().is_empty());
+        assert!(store.stats().dram_retirement_wait_ns > 0);
+        for key in &pinned {
+            store.core.unpin_record(key).unwrap();
+        }
         store.poll(&mut Vec::new()).unwrap();
         let retiring = store.take_retiring();
         assert_eq!(retiring.len(), 1);
         assert_eq!(retiring[0].tail_pages, 22);
         store.retired(retiring[0].key, PoolTier::Dram, Retirement::Moved);
+        assert_eq!(store.stats().dram_retirement_wait_ns, 0);
         let h = history(22 * PT, 5);
         let next = published(&h, 22 * PT, None, 0, 5);
         assert_eq!(store.store(&next).unwrap(), StoreOutcome::Queued);

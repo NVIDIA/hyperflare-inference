@@ -17,7 +17,11 @@ pub const MAX_DIRECTORY: usize = 2 * 1024 * 1024;
 pub const MAX_UNITS: usize = 16384;
 pub const MAX_RANKS: usize = 64;
 
-/// Phase-one instances can negotiate framing but still restore only raw snapshots.
+pub fn offer_fits(offer: &PackedOffer) -> bool {
+    offer.units.len() <= MAX_UNITS && offer.encoded_len() <= MAX_DIRECTORY
+}
+
+/// A reader that accepts raw records only.
 pub fn raw_reader() -> CodecCaps {
     CodecCaps {
         envelope_revision: REVISION,
@@ -294,6 +298,10 @@ pub fn verify_window(
     verify_units(expected, bytes)
 }
 
+static STORED_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn stored_checksum_failures() -> u64 {
+    STORED_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
 // Check before handing the bytes to a decoder, including on shared-memory reads.
 pub fn verify_units(units: &[PackedUnit], bytes: &[u8]) -> Result<()> {
     let mut rest = bytes;
@@ -308,6 +316,7 @@ pub fn verify_units(units: &[PackedUnit], bytes: &[u8]) -> Result<()> {
             _ => false,
         };
         if !valid {
+            STORED_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(invalid("unit stored checksum mismatch"));
         }
         rest = tail;

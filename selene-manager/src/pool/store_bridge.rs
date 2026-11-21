@@ -1541,6 +1541,9 @@ mod tests {
                     unit_bytes: 4096,
                 })
                 .collect(),
+            placement: Default::default(),
+            gpu_mirror_duty: None,
+            codec_fields: Vec::new(),
             snapshot_pages: Vec::new(),
         };
         let geometry = vec![rank; 2];

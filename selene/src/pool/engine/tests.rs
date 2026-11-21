@@ -43,6 +43,7 @@ const SESSION: u64 = 7;
 
 #[derive(Default)]
 pub(super) struct FakeCopier {
+    codec_profile: Option<[u8; 32]>,
     layout: Option<Layout>,
     /// Device pages and rows by id.
     pub gpu_pages: HashMap<u32, Vec<u8>>,
@@ -119,6 +120,9 @@ impl FakeCopier {
 }
 
 impl PageCopier for FakeCopier {
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.codec_profile
+    }
     fn layout(&self) -> &Layout {
         self.layout.as_ref().unwrap()
     }
@@ -495,6 +499,8 @@ pub(super) fn fetched(events: &[PoolEvent]) -> Vec<(u64, std::result::Result<u64
 fn the_session_opens_with_a_snapshot_and_becomes_ready_when_it_installs() {
     let mut rig = Rig::new();
     rig.announce.saved(IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key: key(64, 1),
         parent: None,
         bucket: [0; 16],
@@ -518,6 +524,8 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
     rig.open();
     for n in 1..=3u64 {
         rig.announce.saved(IndexEntry {
+            packed: false,
+            required_profiles: Vec::new(),
             key: key(n * 64, n as u8),
             parent: None,
             bucket: [0; 16],
@@ -537,6 +545,8 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
     }));
     assert_eq!(rig.shared.status(), PoolStatus::NotReady);
     rig.announce.saved(IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key: key(999, 9),
         parent: None,
         bucket: [0; 16],
@@ -558,6 +568,8 @@ fn a_resync_request_from_the_manager_takes_a_new_snapshot() {
     let mut rig = Rig::new();
     rig.open();
     rig.announce.saved(IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key: key(64, 1),
         parent: None,
         bucket: [0; 16],
@@ -793,6 +805,96 @@ fn records_that_do_not_match_the_plan_are_abandoned_after_nothing_was_copied() {
     let events = rig.events();
     assert_eq!(fetched(&events).len(), 1);
     assert!(fetched(&events)[0].1.is_err());
+}
+
+#[test]
+fn capture_acceptance_tracks_the_negotiated_profile_across_reconnects() {
+    let mut rig = Rig::new();
+    rig.copier.lock().unwrap().codec_profile = Some([3; 32]);
+    let shared = rig.shared.codec_peer.clone();
+    for (caps, accepts) in [
+        (None, false),
+        (Some(rig.engine.codec_caps(true)), false),
+        (
+            Some(crate::codec_copy::reader_caps(Some([4; 32]), false)),
+            false,
+        ),
+        (Some(rig.engine.codec_caps(false)), true),
+    ] {
+        rig.engine.session_opened(
+            1,
+            &wire::SessionOpened {
+                codec: caps,
+                ..Default::default()
+            },
+            rig.limits.clone(),
+            None,
+        );
+        assert_eq!(shared.load(std::sync::atomic::Ordering::Acquire), accepts);
+        rig.engine.session_lost(rig.now);
+        assert!(!shared.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
+#[test]
+fn a_packed_shm_grant_is_authenticated_before_the_first_decode_job() {
+    for corrupt in [false, true] {
+        let mut rig = Rig::new();
+        rig.open();
+        rig.engine.sess.as_mut().unwrap().codec =
+            Some(crate::codec_copy::reader_caps(Some([3; 32]), false));
+        let fetch = single_part();
+        let begun = rig.command(Command::Fetch(fetch.clone()));
+        let claim = pick!(begun, Claim)[0].claim_id;
+        let In::ClaimGranted(mut g) = granted(claim, &fetch) else {
+            unreachable!()
+        };
+        let bytes = vec![17; 15];
+        let units = (0..2)
+            .map(|logical_index| wire::PackedUnit {
+                logical_index,
+                original_length: PAGE,
+                stored_length: 15,
+                representation: 1,
+                profile: vec![3; 32],
+                stored_crc: crate::shared::packed::crc32(&bytes),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        g.records[0].packed = Some(wire::PackedOffer {
+            first_page: 0,
+            units: units.clone(),
+        });
+        let out = rig.send(In::ClaimGranted(g));
+        assert!(
+            pick!(out, CopyResult).is_empty(),
+            "the pinned selection must be accepted"
+        );
+        let mut wire_bytes = bytes.repeat(2);
+        if corrupt {
+            wire_bytes[27] ^= 1;
+        }
+        rig.staging(0, &wire_bytes);
+        let mut spec = window(0, 0, 0, 2, false, 0);
+        spec.packed = Some(wire::PackedWindow { units });
+        spec.length = wire_bytes.len() as u64;
+        let out = rig.send(In::WindowReady(wire::WindowReady {
+            claim_id: claim,
+            window: Some(spec),
+            ..Default::default()
+        }));
+        if corrupt {
+            assert_eq!(
+                pick!(out, CopyResult)[0].outcome,
+                wire::CopyOutcome::CopyErrorOutcome as i32
+            );
+            assert!(rig.copier.lock().unwrap().submitted.is_empty());
+            assert_eq!(pick!(out, WindowReleased).len(), 1);
+        } else {
+            assert!(pick!(out, CopyResult).is_empty());
+            assert!(rig.copier.lock().unwrap().submitted[0].codec.is_some());
+        }
+    }
 }
 
 #[test]
@@ -1741,6 +1843,59 @@ pub(super) fn puts(events: &[PoolEvent]) -> Vec<(u64, String)> {
 }
 
 #[test]
+fn offer_bounds_are_checked_before_a_put_leaves_flare() {
+    struct Source(wire::PackedOffer, bool);
+    impl crate::pool::PutBytes for Source {
+        fn packed(&self) -> Option<wire::PackedOffer> {
+            Some(self.0.clone())
+        }
+        fn raw_available(&self, _first: u64) -> bool {
+            self.1
+        }
+        fn fill(
+            &mut self,
+            _first: u64,
+            _pages: u32,
+            _row: bool,
+            _dst: &mut [u8],
+        ) -> crate::Result<crate::pool::Checksums> {
+            panic!("an offer must not pull any payload")
+        }
+    }
+    use crate::shared::packed::{MAX_UNITS, MAX_DIRECTORY};
+    let many = vec![wire::PackedUnit::default(); MAX_UNITS + 1];
+    let large = vec![wire::PackedUnit {
+        profile: vec![0; MAX_DIRECTORY],
+        ..Default::default()
+    }];
+    for units in [many, large] {
+        for raw in [false, true] {
+            let mut rig = Rig::new();
+            rig.open();
+            let mut request = host_put(None);
+            request.source = crate::pool::PutSource::Host(Box::new(Source(
+                wire::PackedOffer {
+                    first_page: 0,
+                    units: units.clone(),
+                },
+                raw,
+            )));
+            let sent = rig.command(Command::Put { id: 1, request });
+            if raw {
+                assert!(
+                    sent.iter().any(
+                        |m| matches!(&m.m,Some(Out::PutBegin(begin)) if begin.packed.is_none())
+                    )
+                );
+            } else {
+                assert!(sent.is_empty());
+                assert_eq!(puts(&rig.events()), [(1, "Refused(OfferBound)".to_owned())]);
+            }
+        }
+    }
+}
+
+#[test]
 fn an_unlinked_put_keeps_its_refusal_reason() {
     let mut rig = Rig::new();
     rig.open();
@@ -1932,6 +2087,8 @@ fn mutations_after_a_snapshot_cut_follow_its_last_chunk() {
     let mut rig = Rig::new();
     rig.open();
     let entry = IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key: key(64, 1),
         parent: None,
         bucket: [0; 16],

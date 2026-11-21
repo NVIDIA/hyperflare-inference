@@ -229,39 +229,79 @@ impl Engine {
         let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
         let total: u64 = expected.iter().map(|r| u64::from(r.pages)).sum();
         let bytes = total * page_bytes + if row { row_bytes } else { 0 };
-        let valid = !expected.is_empty() && row == run.want_row;
-        // A GPU export always has its staging reserved; a host export with none
-        // reserved streams.
-        let over = if matches!(pin, Pin::Gpu(_)) {
-            bytes > run.reserved
-        } else {
-            run.reserved != 0 && bytes > run.reserved
+        let ranks = self
+            .st
+            .scope
+            .geometry
+            .ranks
+            .iter()
+            .map(|r| crate::record::RankSizes {
+                planes: r.plane_bytes.clone(),
+                row_bytes: r.row_bytes,
+            })
+            .collect::<Vec<_>>();
+        let select = || -> crate::Result<(Vec<wire::Record>, Coverage, u64)> {
+            let mut coverage = Coverage::new(expected.clone());
+            let mut records = Vec::with_capacity(expected.len());
+            let mut physical = 0u64;
+            for (i, r) in expected.iter().enumerate() {
+                let offer = match &pin {
+                    Pin::Host(pin) if r.pages > 0 || r.row => pin.lock().unwrap().packed(i),
+                    _ => None,
+                };
+                let offer = if let Some(o) = offer {
+                    let first = (r.key.consumed_tokens / self.st.scope.geometry.page_tokens)
+                        .checked_sub(r.pages as u64)
+                        .ok_or_else(|| crate::Error::new("invalid packed chain range"))?;
+                    let selected = crate::shared::packed::select(&o, first, r.row)?;
+                    let layout = crate::shared::packed::Layout::new(
+                        selected.clone(),
+                        &ranks,
+                        first,
+                        r.pages,
+                    )?;
+                    physical += layout.page_offset(layout.page_count()) + layout.row_bytes();
+                    coverage.set_packed(i, layout);
+                    Some(selected)
+                } else {
+                    physical += u64::from(r.pages) * page_bytes + if r.row { row_bytes } else { 0 };
+                    None
+                };
+                records.push(wire::Record {
+                    packed: offer,
+                    key: Some(codec::key_to(r.key)),
+                    first_page: r.first_page,
+                    pages: r.pages,
+                    row: r.row,
+                });
+            }
+            Ok((records, coverage, physical))
         };
-        if run.cancelled || run.lost || run.answered || !valid || over {
-            let (answered, cancelled) = (run.answered, run.cancelled);
+        let selection = select();
+        // A host pin with no staging reservation streams its windows.
+        let refusal = if run.cancelled {
+            Some(wire::ClaimReason::Cancelled)
+        } else if expected.is_empty() || row != run.want_row || selection.is_err() {
+            Some(wire::ClaimReason::ChainGap)
+        } else if match &pin {
+            Pin::Gpu(_) => bytes > run.reserved,
+            Pin::Host(_) => {
+                run.reserved != 0 && selection.as_ref().is_ok_and(|(_, _, n)| *n > run.reserved)
+            }
+        } {
+            Some(wire::ClaimReason::NoWindows)
+        } else {
+            None
+        };
+        if refusal.is_some() || run.lost || run.answered {
+            let answered = run.answered;
             self.source.exports.remove(&id);
             if !answered {
-                let why = if cancelled {
-                    wire::ClaimReason::Cancelled
-                } else if valid {
-                    wire::ClaimReason::NoWindows
-                } else {
-                    wire::ClaimReason::ChainGap
-                };
-                self.pin_refused(id, why);
+                self.pin_refused(id, refusal.unwrap_or(wire::ClaimReason::SourceBusy));
             }
             return release(self, pin);
         }
-        let records: Vec<wire::Record> = expected
-            .iter()
-            .map(|r| wire::Record {
-                packed: None,
-                key: Some(codec::key_to(r.key)),
-                first_page: r.first_page,
-                pages: r.pages,
-                row: r.row,
-            })
-            .collect();
+        let (records, coverage, _) = selection.expect("validated the pinned chain");
         let rank_channels = run.rank_channels.clone();
         // A multi-process instance's peers start before the manager can send a window.
         if self.ranks.is_some() {
@@ -283,7 +323,7 @@ impl Engine {
             return release(self, pin);
         };
         run.phase = Phase::Pinned;
-        run.coverage = Some(Coverage::new(expected));
+        run.coverage = Some(coverage);
         run.pin = Some(pin);
         let reference = run.reference.clone();
         self.emit(Out::PinAck(wire::PinAck {
@@ -386,12 +426,13 @@ impl Engine {
         export: u64,
         shape: super::super::frame::Shape,
         slot: u32,
+        packed: Option<wire::PackedWindow>,
     ) {
         let Some(staging) = self.net.clone() else {
             return;
         };
         let spec = wire::WindowSpec {
-            packed: None,
+            packed,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),

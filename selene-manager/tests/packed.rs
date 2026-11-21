@@ -232,6 +232,8 @@ async fn canonical_packets_survive_shared_windows_tcp_drain_and_recovery() {
         64 << 20,
     );
     config.name = support::instance_name("packed");
+    let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    config.faults.trace = Some(trace.clone());
     config.listen = Some(support::net::free_address());
     config.listen_data = Some(support::net::free_address());
     let mut host = Host::open_config(config.clone());
@@ -247,8 +249,45 @@ async fn canonical_packets_survive_shared_windows_tcp_drain_and_recovery() {
         .await;
     let mut writer = open(&mut pool, "writer", true).await;
     let physical = put(&mut writer, true, begin(true)).await;
+    let metrics = host.metrics();
+    let payload = PAGE0.len() + PAGE1.len() + ROW.len();
+    for expected in [
+        "selene_put_logical_bytes_total 12288".to_owned(),
+        format!("selene_put_physical_bytes_total {payload}"),
+        "selene_store_wire_logical_bytes_total{operation=\"put\"} 12288".to_string(),
+        format!("selene_store_wire_physical_bytes_total{{operation=\"put\"}} {payload}"),
+        format!("selene_record_physical_bytes{{tier=\"arena\"}} {payload}"),
+        "selene_packed_arena_records{extent_bytes=\"8192\"} 1".to_owned(),
+    ] {
+        assert!(metrics.contains(&expected), "{expected}");
+    }
+    let mut rdma_ident = Ident::new("rdma-reader");
+    rdma_ident.codec = Some(flare_selene::codec_copy::reader_caps(Some([3; 32]), true));
+    let mut rdma = pool.open(&rdma_ident).await;
+    rdma.snapshot(vec![]).await;
+    let miss = rdma
+        .lookup_request(v2::LookupRequest {
+            lookup_id: 8,
+            boundaries: vec![v2::PrefixKey {
+                consumed_tokens: 0,
+                digest: vec![4; 16],
+            }],
+            before_tokens: 129,
+            ..Default::default()
+        })
+        .await;
+    assert!(miss.candidates.is_empty());
+    drop(rdma);
     let mut reader = open(&mut pool, "reader", true).await;
     read(&mut reader, 1, false).await;
+    let bytes = PAGE1.len() + ROW.len();
+    assert!(host.metrics().contains(&format!(
+        "selene_store_wire_physical_bytes_total{{operation=\"get\"}} {bytes}"
+    )));
+    assert!(
+        host.metrics()
+            .contains("selene_store_wire_logical_bytes_total{operation=\"get\"} 8192")
+    );
     let reply = legacy
         .lookup_request(v2::LookupRequest {
             lookup_id: 1,
@@ -289,6 +328,12 @@ async fn canonical_packets_survive_shared_windows_tcp_drain_and_recovery() {
     read(&mut reader, 2, true).await;
     drop((pool, reader));
     second.stop();
+    let trace = trace.lock().unwrap();
+    assert!(trace.contains(&b'w'), "no direct record write: {trace:?}");
+    assert!(
+        trace.iter().filter(|&&op| op == b'r').count() >= 3,
+        "expected direct metadata, suffix and final row reads: {trace:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -483,8 +528,32 @@ async fn incompatible_suffix_and_bad_unit_are_refused_without_publishing() {
         })
         .await;
     assert_eq!(refusal.detail, packed::RAW_REQUIRED);
+    assert!(
+        host.metrics().contains(
+            "selene_put_raw_required_original_bytes_total{cause=\"parent_not_held\"} 8192"
+        )
+    );
+    assert!(
+        host.metrics()
+            .contains("selene_put_raw_required_total{cause=\"parent_not_held\"} 1")
+    );
+    let mut missing = begin(false);
+    missing.put_id = 2;
+    missing
+        .packed
+        .as_mut()
+        .unwrap()
+        .units
+        .retain(|u| u.kind == 0);
+    writer.send(C::PutBegin(missing)).await;
+    writer
+        .take(|m| match m {
+            M::PutRefused(r) => Some(assert_eq!(r.detail, "invalid packed suffix")),
+            _ => None,
+        })
+        .await;
     let mut req = begin(false);
-    req.put_id = 2;
+    req.put_id = 3;
     writer.send(C::PutBegin(req)).await;
     let w = writer
         .take(|m| match m {
@@ -504,7 +573,7 @@ async fn incompatible_suffix_and_bad_unit_are_refused_without_publishing() {
     writer.shm.as_ref().unwrap().write(&w, &data);
     writer
         .send(C::PutFilled(v2::PutFilled {
-            put_id: 2,
+            put_id: 3,
             index: w.index,
             ..Default::default()
         }))
@@ -519,13 +588,13 @@ async fn incompatible_suffix_and_bad_unit_are_refused_without_publishing() {
     assert!(refusal.detail.contains("unit"), "{refusal:?}");
     writer
         .send(C::FenceAck(v2::FenceAck {
-            subject: Some(v2::fence_ack::Subject::PutId(2)),
+            subject: Some(v2::fence_ack::Subject::PutId(3)),
             outcome: v2::FenceOutcome::Drained as i32,
         }))
         .await;
     assert!(matches!(
         writer
-            .put_record(3, key(128), None, Default::default())
+            .put_record(4, key(128), None, Default::default())
             .await,
         support::pool::PutResult::Stored(_)
     ));
@@ -789,4 +858,149 @@ async fn a_row_larger_than_staging_uses_only_its_stored_length() {
     writer.fence(1, v2::FenceOutcome::Drained).await;
     drop((writer, pool));
     host.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_export_with_a_packed_ancestor_reserves_before_pinning() {
+    let mut host = Host::dram_only(1 << 20);
+    host.run();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut source = open(&mut pool, "gpu-source", true).await;
+    let mut reader = open(&mut pool, "gpu-reader", true).await;
+    let mut parent = pool::entry(128, None, v2::Tier::Gpu);
+    parent.required_profiles = vec![vec![3; 32]];
+    let endpoint = pool::entry(192, Some(128), v2::Tier::Gpu);
+    source.snapshot(vec![parent, endpoint.clone()]).await;
+    source.barrier().await;
+    let candidate = reader
+        .lookup(1, 193, 0)
+        .await
+        .candidates
+        .into_iter()
+        .find(|c| c.key == endpoint.key)
+        .expect("GPU chain visible");
+    reader.claim(reader.claim_for(1, &candidate, 0, true)).await;
+    let export = source.export_request().await;
+    assert_eq!(export.key, endpoint.key);
+    drop((source, reader, pool));
+    host.stop();
+}
+
+#[test]
+fn a_local_v4_row_refill_replaces_the_page_only_file_after_commit() {
+    use flare_selene::{
+        JobId,
+        disk::{DiskThread, Job},
+    };
+    let base = support::base("v4-refill");
+    std::fs::create_dir_all(&base).unwrap();
+    let final_path = base.join("holding.ckpt");
+    let mut raw =
+        selene_manager::record::new_header(&support::descriptor(), key(128), None, [4; 16], 2)
+            .unwrap();
+    raw.row_checksum = 0x08c3_31ab;
+    raw.set_replication(flare_selene::record::Replication {
+        pages: true,
+        row: true,
+    })
+    .unwrap();
+    let header = raw.with_packed(offer()).unwrap();
+    assert_eq!(
+        Header::decode(&header.packed_metadata().unwrap()).unwrap(),
+        header
+    );
+    assert!(!header.replicated());
+    assert_eq!(header.row_checksum, 0);
+    let disk = DiskThread::start("v4-refill").unwrap();
+    let submit = |job| {
+        disk.submit(job).unwrap();
+        let start = std::time::Instant::now();
+        let mut replies = Vec::new();
+        loop {
+            disk.poll(&mut replies);
+            if let Some(reply) = replies.pop() {
+                reply.result.unwrap();
+                break;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::yield_now();
+        }
+    };
+    for row in [false, true] {
+        let id = JobId(1 + row as u64);
+        let tmp = base.join("partial.tmp");
+        submit(Job::Create {
+            id,
+            temporary: tmp,
+            header: header.clone(),
+            row,
+            sums: None,
+            replication: None,
+        });
+        submit(Job::WritePacked {
+            id,
+            window: 0,
+            first: 0,
+            pages: 2,
+            row: false,
+            bytes: [PAGE0, PAGE1].concat().into(),
+        });
+        if row {
+            submit(Job::WritePacked {
+                id,
+                window: 1,
+                first: 2,
+                pages: 0,
+                row: true,
+                bytes: ROW.into(),
+            });
+            assert_eq!(
+                std::fs::metadata(&final_path).unwrap().len(),
+                header.row_segment
+            );
+        }
+        submit(Job::Commit {
+            id,
+            path: final_path.clone(),
+            sync: true,
+        });
+        let bytes = std::fs::read(&final_path).unwrap();
+        assert_eq!(
+            Header::decode(&bytes)
+                .unwrap()
+                .row_present(bytes.len() as u64),
+            row
+        );
+        let expected = if row {
+            [PAGE0, PAGE1, ROW].concat()
+        } else {
+            [PAGE0, PAGE1].concat()
+        };
+        assert_eq!(&bytes[header.page_segment as usize..], expected);
+        submit(Job::Open {
+            id,
+            path: final_path.clone(),
+            expected: header.clone(),
+        });
+        let mut page = vec![0u8; header.page_record_bytes() as usize];
+        submit(Job::ReadPages {
+            id,
+            window: 0,
+            first: 1,
+            buffers: vec![page.as_mut_ptr() as usize],
+        });
+        assert_eq!(&page[..PAGE1.len()], PAGE1);
+        if row {
+            let mut output = vec![0u8; header.row_record_bytes() as usize];
+            let slots = output
+                .chunks_mut(header.page_record_bytes() as usize)
+                .map(|p| p.as_mut_ptr() as usize)
+                .collect();
+            submit(Job::ReadRow { id, buffers: slots });
+            assert_eq!(&output[..ROW.len()], ROW);
+        }
+        submit(Job::Close { id });
+    }
+    drop(disk);
+    std::fs::remove_dir_all(base).unwrap();
 }

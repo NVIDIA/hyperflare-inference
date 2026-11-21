@@ -33,10 +33,8 @@ from ignition.components.capacity import speculative_token_capacity, batch_capac
 from ignition.components.sampling import AdmissionBuffers
 from ignition.preparation import inspect_qwen38_checkpoint
 from ignition.preparation.capture import capture_forwards
-from .contract import prepare as prepare_contract
-from ignition.preparation.contract import history_region
+from .contract import history_regions, prepare as prepare_contract
 from ignition.preparation.rebuild_manifest import declare_weights
-from ignition.preparation import runtime_core_pb2 as contract_proto
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import device_memory_info
 from ignition.preparation.deferred import deferred_mode
@@ -664,10 +662,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 speculative_state_columns=8, draft_raw_ring_capacity=layout.draft_ring_capacity if has_mtp else 0,
                 speculative_fixed_width=config.speculative_fixed_width)
         hashes = {"tokenizer": ("tokenizer.json", FRONTEND_SHA256["tokenizer.json"])}
-        cache_regions = [history_region(buffers, f"cache.{layer}.{name}", getattr(value, name), contract_proto.PAGED_KEY_VALUE,
-            tokens_per_record=4 if name == "compressed_k_cache" else 1)
-            for layer, value in (final_cache or cache).items()
-            for name in ("main_k_cache", "main_v_cache", "compressed_k_cache")]
+        cache_regions = history_regions(buffers, final_cache or cache)
         buffers["request_pending_token"] = requests.pending_token
         server_config = {"model_id": MODEL_ID, "identity": _identity(manifest, shard.world_size, config=config, draft_config=draft_config),
             "max_sequence_tokens": config.context, "prefill_chunk_size": config.prefill_chunk_size,

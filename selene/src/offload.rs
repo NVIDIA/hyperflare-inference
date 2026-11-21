@@ -27,6 +27,36 @@ pub trait CopierFactory {
     ) -> Result<Box<dyn crate::PageCopier>>;
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvCompression {
+    Gpu,
+    Cpu,
+    #[default]
+    Off,
+}
+
+impl std::str::FromStr for KvCompression {
+    type Err = &'static str;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "gpu" => Ok(Self::Gpu),
+            "cpu" => Ok(Self::Cpu),
+            "off" => Ok(Self::Off),
+            _ => Err("expected gpu, cpu or off"),
+        }
+    }
+}
+
+impl std::fmt::Display for KvCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+            Self::Off => "off",
+        })
+    }
+}
+
 /// Offload settings as the command line and configuration file supply them.
 /// `None` selects the default: no memory store and no disk store until the
 /// isolation measurements in `docs/prefix-cache-offload.md` enable derived
@@ -34,6 +64,8 @@ pub trait CopierFactory {
 /// staged transport.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrefixCacheOffload {
+    pub gpu_mirror_duty: Option<u8>,
+    pub compression: KvCompression,
     /// Host retention budget shared by registered checkpoints and ordinary CPU inputs.
     /// Zero selects no memory retention.
     pub memory_bytes: Option<u64>,
@@ -81,7 +113,7 @@ impl PrefixCacheOffload {
             .checked_add(intake)
             .ok_or("prefix cache host memory overflows the device budget")?;
         let pinned = memory - input_memory_bytes(memory, inputs);
-        let mapped = if disk || self.pool.is_some() {
+        let mapped = if disk || self.pool.is_some() || self.compression != KvCompression::Off {
             pinned + intake
         } else {
             (pinned + intake).div_ceil(ranks.max(1) as u64)
@@ -182,6 +214,9 @@ pub struct Resolved {
 /// turns into a store: registered pools, the scanned record directory, and
 /// every rank's geometry and CUDA context.
 pub struct Prepared {
+    pub reserved_copiers: Option<std::sync::Arc<dyn CopierFactory + Send + Sync>>,
+    pub codec_workspace_error: Option<String>,
+    pub compression: KvCompression,
     pub inputs: Option<input::InputStore>,
     pub disk_budget: std::sync::Arc<input::DiskBudget>,
     pub resolved: Resolved,
@@ -389,7 +424,7 @@ pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
     core: &std::path::Path,
     identity: [u8; 32],
-    geometry: Vec<CacheGeometry>,
+    mut geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
     max_active: usize,
     input_staging: u64,
@@ -400,6 +435,10 @@ pub fn prepare_with_inputs(
         return Ok(Preparation::None("disabled".to_owned()));
     }
     let _ = core;
+    for rank in &mut geometry {
+        rank.placement = options.compression;
+        rank.gpu_mirror_duty = options.gpu_mirror_duty;
+    }
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
         (None, _) => geometry::fingerprint(&geometry),
@@ -467,7 +506,10 @@ pub fn prepare_with_inputs(
             let bytes = (checkpoint_memory / layout.page_record_bytes + intake as u64)
                 * layout.page_record_bytes;
             // Shared records must be readable by the CPU.
-            let pool = if directory.is_none() && options.pool.is_none() {
+            let pool = if directory.is_none()
+                && options.pool.is_none()
+                && options.compression == KvCompression::Off
+            {
                 slab::SlabPool::sized_by_rank(&layout, bytes, intake, &contexts, registrar)?
             } else {
                 let mut pool = slab::SlabPool::sized(&layout, bytes, intake)?;
@@ -496,6 +538,9 @@ pub fn prepare_with_inputs(
         inputs.retain_directory(guard.clone());
     }
     Ok(Preparation::Store(Box::new(Prepared {
+        reserved_copiers: None,
+        codec_workspace_error: None,
+        compression: options.compression,
         inputs,
         drain_on_shutdown: options.drain_on_shutdown,
         max_age: options.max_age,
@@ -537,6 +582,9 @@ fn free_space(path: &std::path::Path) -> Result<u64> {
 /// transfer threads on every rank's context.
 pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn HostStore>> {
     let Prepared {
+        reserved_copiers,
+        codec_workspace_error: _,
+        compression: _,
         inputs: _,
         drain_on_shutdown,
         max_age,
@@ -554,6 +602,9 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         shards,
         pool,
     } = prepared;
+    let factory = reserved_copiers
+        .as_deref()
+        .map_or(factory, |f| f as &dyn CopierFactory);
     if let Some(pool) = &pool {
         pool.start_copies(&contexts, geometry.clone(), factory)?;
     }
@@ -715,6 +766,10 @@ impl Startup {
         if let Preparation::Store(store) = &mut preparation
             && let Some(mut pool) = self.pool.take()
         {
+            let reserved = store.reserved_copiers.clone();
+            let factory = reserved
+                .as_deref()
+                .map_or(factory, |f| f as &dyn CopierFactory);
             pool.prepare_peer(store, factory)?;
             store.pool = Some(pool);
         }

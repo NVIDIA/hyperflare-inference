@@ -178,7 +178,8 @@ pub enum Operation {
 /// untouched until the job's reply arrives.
 #[derive(Debug)]
 pub enum Job {
-    /// Read an encoded record span. The caller verifies its page and row checksums.
+    /// Read at a block boundary into a block-aligned allocation holding at least
+    /// `align_up(span.length, 4096)` bytes. Only `span.length` bytes are required at EOF.
     #[cfg(unix)]
     ReadRecord {
         id: JobId,
@@ -202,6 +203,15 @@ pub enum Job {
         row: bool,
         sums: Option<SliceSums>,
         replication: Option<crate::record::Replication>,
+    },
+    /// Stored bytes for whole v4 pages, optionally followed by the complete row.
+    WritePacked {
+        id: JobId,
+        window: u32,
+        first: u32,
+        pages: u32,
+        row: bool,
+        bytes: Arc<[u8]>,
     },
     /// Write page records `first..first + buffers.len()` from `buffers`.
     WritePages {
@@ -525,17 +535,26 @@ impl Worker {
                     if let Some(gate) = &self.faults.read_gate {
                         gate.wait().map_err(Error::carrying)?;
                     }
-                    if !span.aligned() {
-                        use std::os::unix::fs::FileExt;
-                        // The caller owns this output span until the worker replies.
-                        let bytes = unsafe {
-                            std::slice::from_raw_parts_mut(span.address as *mut u8, span.length)
-                        };
-                        file.read_exact_at(bytes, span.offset)
-                            .map_err(|e| io_failure("read packed record", e))?;
-                        return Ok(span.length as u64);
+                    let required_end = span
+                        .offset
+                        .checked_add(span.length as u64)
+                        .ok_or_else(|| invalid("record read offset overflow"))?;
+                    let span = Span {
+                        length: span
+                            .length
+                            .checked_next_multiple_of(4096)
+                            .ok_or_else(|| invalid("record read length overflow"))?,
+                        ..span
+                    };
+                    let bytes =
+                        self.ring
+                            .transfer_until(&file, &[span], false, Some(required_end))?;
+                    #[cfg(any(test, feature = "test-support"))]
+                    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_DIRECT != 0
+                    {
+                        self.faults.trace(b'r');
                     }
-                    self.ring.transfer(&file, &[span], false)
+                    Ok(bytes)
                 })();
                 #[cfg(any(test, feature = "test-support"))]
                 self.faults.trace(b'R');
@@ -563,6 +582,12 @@ impl Worker {
                         let file = flare_eos::direct_update_file(&temporary, true)
                             .map_err(|e| io_failure("open record writer", e))?;
                         let bytes = self.ring.transfer(&file, &[span], true)?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_DIRECT
+                            != 0
+                        {
+                            self.faults.trace(b'w');
+                        }
                         (file, bytes)
                     } else {
                         use std::os::unix::fs::FileExt;
@@ -603,6 +628,19 @@ impl Worker {
                 Operation::Create,
                 0,
                 self.create(id, temporary, header, row, sums, replication),
+            ),
+            Job::WritePacked {
+                id,
+                window,
+                first,
+                pages,
+                row,
+                bytes,
+            } => reply(
+                id,
+                Operation::WritePages,
+                window,
+                self.write_packed(id, first, pages, row, &bytes),
             ),
             Job::WritePages {
                 id,
@@ -682,10 +720,23 @@ impl Worker {
         }
         check_tail_pages(&header)?;
         debug_assert!(replication.is_none_or(|r| !(r.pages || r.row) || header.ranks.len() > 1));
-        let detect = replication.is_none();
-        header.set_replication(replication.unwrap_or_default())?;
-        let file = flare_eos::direct_file(&temporary, true)
-            .map_err(|error| direct_open_failure("create record file", &temporary, error))?;
+        let detect = header.packed.is_none() && replication.is_none();
+        let file = if header.packed.is_some() {
+            if replication.is_some_and(|r| r.pages || r.row) || sums.is_some() {
+                return Err(invalid(
+                    "packed directories define their own checksums and replicas",
+                ));
+            }
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|e| io_failure("create packed record", e))?
+        } else {
+            header.set_replication(replication.unwrap_or_default())?;
+            flare_eos::direct_file(&temporary, true)
+                .map_err(|error| direct_open_failure("create record file", &temporary, error))?
+        };
         // Allocated blocks make every direct write an overwrite, which ext4 runs under a shared
         // inode lock, so the ring's writes overlap instead of serializing at queue depth one.
         // A sparse `set_len` would not: writes into holes still take the lock exclusively.
@@ -731,6 +782,44 @@ impl Worker {
         Ok(0)
     }
 
+    fn write_packed(
+        &mut self,
+        id: JobId,
+        first: u32,
+        pages: u32,
+        row: bool,
+        bytes: &[u8],
+    ) -> Result<u64> {
+        use std::io::{Seek, Write};
+        let writing = writing(&mut self.records, id)?;
+        let layout = writing
+            .header
+            .packed
+            .as_ref()
+            .ok_or_else(|| invalid("expected packed record"))?;
+        let end = first
+            .checked_add(pages)
+            .filter(|&n| n <= writing.header.tail_pages)
+            .ok_or_else(|| invalid("invalid packed page range"))?;
+        if row && (!writing.row_required || end != writing.header.tail_pages) {
+            return Err(invalid("invalid packed row window"));
+        }
+        let units = layout
+            .units(first as usize, pages as usize, row)
+            .ok_or_else(|| invalid("invalid packed unit range"))?;
+        crate::shared::packed::verify_units(units, bytes)?;
+        let offset = writing.header.page_segment + layout.page_offset(first as usize);
+        writing
+            .file
+            .seek(io::SeekFrom::Start(offset))
+            .and_then(|_| writing.file.write_all(bytes))
+            .map_err(|e| io_failure("write packed units", e))?;
+        writing.written[first as usize..end as usize].fill(true);
+        writing.row_written |= row;
+        writing.bytes += bytes.len() as u64;
+        Ok(bytes.len() as u64)
+    }
+
     /// Pages count as written, and their checksums are recorded, only after
     /// the transfer completed, so a failed write keeps `Commit` from renaming
     /// a record with an unwritten page into place.
@@ -738,6 +827,9 @@ impl Worker {
         #[cfg(any(test, feature = "test-support"))]
         self.faults.before_io().map_err(Error::carrying)?;
         let writing = writing(&mut self.records, id)?;
+        if writing.header.packed.is_some() {
+            return Err(invalid("v4 requires packed page units"));
+        }
         let pages = page_range(&writing.header, first, buffers.len())?;
         if writing.detect && !buffers.is_empty() && writing.replication.is_none_or(|r| r.pages) {
             let same = crate::record::identical(&writing.header.layout()?, buffers, None).pages;
@@ -782,6 +874,9 @@ impl Worker {
 
     fn write_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let writing = writing(&mut self.records, id)?;
+        if writing.header.packed.is_some() {
+            return Err(invalid("v4 requires packed row units"));
+        }
         if !writing.row_required {
             return Err(invalid("page-only record does not declare a row"));
         }
@@ -842,6 +937,22 @@ impl Worker {
                 writing.written.len(),
                 if missing_row { "its" } else { "no" }
             )));
+        }
+        if writing.header.packed.is_some() {
+            use std::io::{Seek, Write};
+            let metadata = writing.header.packed_metadata()?;
+            writing
+                .file
+                .rewind()
+                .and_then(|_| writing.file.write_all(&metadata))
+                .and_then(|_| {
+                    writing
+                        .file
+                        .set_len(writing.header.length(writing.row_required))
+                })
+                .map_err(|e| io_failure("finish packed record", e))?;
+            self.publish(&writing.file, &writing.temporary, path, sync)?;
+            return Ok(writing.bytes + metadata.len() as u64);
         }
         let checksum_bytes = writing.header.checksum_bytes() as usize;
         let encoded = writing.header.encode()?;
@@ -911,6 +1022,29 @@ impl Worker {
         if self.records.contains_key(&id) {
             return Err(invalid(format!("disk job {} is already open", id.0)));
         }
+        if expected.packed.is_some() {
+            let mut file = File::open(&path).map_err(|e| io_failure("open packed record", e))?;
+            let metadata = Header::read_metadata(&mut file)
+                .map_err(|e| io_failure("read packed directory", e))?;
+            let header = Header::decode(&metadata)?;
+            if header != expected {
+                return Err(invalid("packed record differs from indexed header"));
+            }
+            let bytes = metadata.len() as u64;
+            #[cfg(unix)]
+            let file = flare_eos::direct_file(&path, false)
+                .map_err(|e| direct_open_failure("open packed record", &path, e))?;
+            self.records.insert(
+                id,
+                Record::Reading(Reading {
+                    file,
+                    path,
+                    header: header.clone(),
+                    checksums: Vec::new(),
+                }),
+            );
+            return Ok((bytes, header));
+        }
         let file = flare_eos::direct_file(&path, false)
             .map_err(|error| direct_open_failure("open record file", &path, error))?;
         #[cfg(windows)]
@@ -964,6 +1098,25 @@ impl Worker {
 
     fn read_pages(&mut self, id: JobId, first: u32, buffers: &[usize]) -> Result<u64> {
         let reading = reading(&mut self.records, id)?;
+        if let Some(layout) = &reading.header.packed {
+            let range = page_range(&reading.header, first, buffers.len())?;
+            let mut moved = 0;
+            for (page, &addr) in range.zip(buffers) {
+                let at = layout.page_offset(page);
+                let length = (layout.page_offset(page + 1) - at) as usize;
+                // One page's packets fit its raw slot.
+                let dst = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, length) };
+                read_packed_at(
+                    &mut self.ring,
+                    &mut reading.file,
+                    reading.header.page_segment + at,
+                    dst,
+                )?;
+                crate::shared::packed::verify_units(layout.units(page, 1, false).unwrap(), dst)?;
+                moved += length as u64;
+            }
+            return Ok(moved);
+        }
         let page_bytes = reading.header.stored_page_bytes();
         let pages = page_range(&reading.header, first, buffers.len())?;
         let spans: Vec<Span> = pages
@@ -1005,6 +1158,26 @@ impl Worker {
 
     fn read_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let reading = reading(&mut self.records, id)?;
+        if let Some(layout) = &reading.header.packed {
+            let mut bytes = vec![0; layout.row_bytes() as usize];
+            read_packed_at(
+                &mut self.ring,
+                &mut reading.file,
+                reading.header.row_segment,
+                &mut bytes,
+            )?;
+            crate::shared::packed::verify_units(layout.units(0, 0, true).unwrap(), &bytes)?;
+            let width = reading.header.page_record_bytes() as usize;
+            if bytes.len().div_ceil(width) > buffers.len() {
+                return Err(invalid("packed row exceeds staging"));
+            }
+            for (chunk, addr) in bytes.chunks(width).zip(buffers) {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(chunk.as_ptr(), *addr as *mut u8, chunk.len());
+                }
+            }
+            return Ok(bytes.len() as u64);
+        }
         let (layout, mut spans) = row_spans(&reading.header, buffers, false)?;
         if reading.header.replication().row {
             spans.retain(|s| s.offset < reading.header.row_segment + layout.row_share(0));
@@ -1084,6 +1257,38 @@ fn reading(open: &mut HashMap<JobId, Record>, id: JobId) -> Result<&mut Reading>
             id.0
         ))),
         None => Err(invalid(format!("disk job {} names no open record", id.0))),
+    }
+}
+
+fn read_packed_at(ring: &mut Ring, file: &mut File, at: u64, dst: &mut [u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let prefix = (at % 4096) as usize;
+        let end = at
+            .checked_add(dst.len() as u64)
+            .ok_or_else(|| invalid("packed read overflow"))?;
+        let length = (prefix + dst.len()).next_multiple_of(4096);
+        let scratch = AlignedBuffer::new(length)?;
+        ring.transfer_until(
+            file,
+            &[Span {
+                address: scratch.address(),
+                offset: at - prefix as u64,
+                length,
+            }],
+            false,
+            Some(end),
+        )?;
+        dst.copy_from_slice(&scratch.as_slice()[prefix..prefix + dst.len()]);
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let _ = ring;
+        file.seek(SeekFrom::Start(at))
+            .and_then(|_| file.read_exact(dst))
+            .map_err(|e| io_failure("read packed unit", e))
     }
 }
 
@@ -1246,6 +1451,16 @@ impl Ring {
     /// completed, so the caller's buffers are quiescent whatever the outcome.
     /// An undrainable ring retains the call and its buffers through shutdown.
     fn transfer(&mut self, file: &File, spans: &[Span], write: bool) -> Result<u64> {
+        self.transfer_until(file, spans, write, None)
+    }
+
+    fn transfer_until(
+        &mut self,
+        file: &File,
+        spans: &[Span],
+        write: bool,
+        required_end: Option<u64>,
+    ) -> Result<u64> {
         if let Some(reason) = &self.broken {
             return Err(invalid(format!(
                 "disk thread ring failed earlier: {reason}"
@@ -1328,7 +1543,11 @@ impl Ring {
                             io::Error::from_raw_os_error(-result),
                         )
                     });
-                } else if result as u32 != chunk.length {
+                } else if (result as u64)
+                    < required_end.map_or(u64::from(chunk.length), |end| {
+                        end.saturating_sub(chunk.offset).min(chunk.length.into())
+                    })
+                {
                     failure.get_or_insert_with(|| {
                         invalid(format!(
                             "short direct {verb} of {result} bytes at file offset {}; {} were requested",
@@ -1336,7 +1555,7 @@ impl Ring {
                         ))
                     });
                 } else {
-                    moved += chunk.length as u64;
+                    moved += result as u64;
                 }
             }
         }
@@ -1737,6 +1956,37 @@ mod tests {
         io::{Seek, SeekFrom, Write as _},
         time::{Duration, Instant, SystemTime},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_final_read_accepts_only_a_complete_logical_window() {
+        let Some(directory) = test_directory("packed-final-window") else {
+            return;
+        };
+        let path = directory.join("row");
+        let file_bytes: Vec<_> = (0..7180).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &file_bytes).unwrap();
+        let file = Arc::new(flare_eos::direct_file(&path, false).unwrap());
+        let thread = DiskThread::start("packed-final-window").unwrap();
+        let output = AlignedBuffer::new(4096).unwrap();
+        let required = file_bytes.len() - 4096;
+        for length in [required, required + 1] {
+            thread
+                .submit(Job::ReadRecord {
+                    id: JobId(1),
+                    file: file.clone(),
+                    span: Span {
+                        address: output.address(),
+                        offset: 4096,
+                        length,
+                    },
+                })
+                .unwrap();
+            let result = wait(&thread, 1).pop().unwrap().result;
+            assert_eq!(result.is_ok(), length == required, "{result:?}");
+        }
+        assert_eq!(&output.as_slice()[..required], &file_bytes[4096..]);
+    }
 
     #[cfg(unix)]
     #[test]

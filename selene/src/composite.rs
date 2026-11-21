@@ -265,6 +265,10 @@ impl CompositeStore {
             };
             slots += node.tail_pages;
             let row = position + 1 == chain.nodes.len();
+            // A cold packed unit needs the disk copier's directory to decode its bytes.
+            if node.location.header.packed.is_some() && !self.resident(key, node.tail_pages, row) {
+                return false;
+            }
             if let Some(memory) = self.memory.index().node(key) {
                 if memory.pinned()
                     && (memory.location.pages.len() != node.tail_pages
@@ -397,6 +401,7 @@ impl CompositeStore {
     /// The memory copy of a published checkpoint has landed or failed.
     fn memory_stored(
         &mut self,
+        source_released: bool,
         checkpoint: CheckpointId,
         key: PrefixKey,
         result: Result<u64>,
@@ -413,6 +418,7 @@ impl CompositeStore {
                 // The memory store removed its record.
                 self.stats.store_failed += 1;
                 events.push(StoreEvent::Stored {
+                    source_released,
                     checkpoint,
                     key,
                     result: Err(error),
@@ -427,6 +433,7 @@ impl CompositeStore {
             self.remove_copy(key);
             self.stats.store_failed += 1;
             events.push(StoreEvent::Stored {
+                source_released,
                 checkpoint,
                 key,
                 result: Err(invalid(
@@ -470,6 +477,7 @@ impl CompositeStore {
             self.remove_copy(key);
             self.stats.store_failed += 1;
             events.push(StoreEvent::Stored {
+                source_released,
                 checkpoint,
                 key,
                 result: Err(error),
@@ -511,6 +519,7 @@ impl CompositeStore {
         );
         self.outbound.insert(key, outbound);
         events.push(StoreEvent::Stored {
+            source_released,
             checkpoint,
             key,
             result: Ok(bytes),
@@ -525,6 +534,18 @@ impl CompositeStore {
         temporary: PathBuf,
         path: PathBuf,
     ) -> Result<JobId> {
+        if let Some(held) = self.memory.record(&key).and_then(|r| r.packed.clone()) {
+            let r = self.memory.record(&key).unwrap();
+            let pool = self.memory.pool();
+            let pages = pool.addresses(&r.pages);
+            let row = r.row.as_ref().map(|s| pool.addresses(s));
+            header = header.with_packed(held.offer.clone())?;
+            let id = self.disk.next_job();
+            self.staged()?
+                .write_packed_from(id, header, temporary, path, held, pages, row)?;
+            self.jobs.insert(id, DiskJob::Write(key));
+            return Ok(id);
+        }
         let (pages, row) = self.slot_addresses(&key)?;
         header.set_replication(self.memory.record(&key).unwrap().replication)?;
         let sums = self.memory.announced_sums(&key).map(|s| (*s).clone());
@@ -1002,6 +1023,13 @@ impl CompositeStore {
                     inbound.disk_started = None;
                     inbound.disk_bytes = 0;
                 }
+                if let Some(layout) = self
+                    .disk
+                    .record(&node)
+                    .and_then(|r| r.header.packed.clone())
+                {
+                    self.memory.packed_read(&node, &layout);
+                }
                 // The copy is complete: a durable resident, pinned for the upload.
                 let pinned = self
                     .memory
@@ -1071,6 +1099,10 @@ impl CompositeStore {
 }
 
 impl HostStore for CompositeStore {
+    fn set_codec_peer(&mut self, peer: crate::codec_copy::PeerCapability) {
+        self.memory.set_codec_peer(peer.clone());
+        self.disk.set_codec_peer(peer);
+    }
     fn reused(&mut self, key: PrefixKey) {
         self.memory.reused(key);
         self.disk.reused(key);
@@ -1361,10 +1393,11 @@ impl HostStore for CompositeStore {
         for event in memory_events.drain(..) {
             match event {
                 StoreEvent::Stored {
+                    source_released,
                     checkpoint,
                     key,
                     result,
-                } => self.memory_stored(checkpoint, key, result, events),
+                } => self.memory_stored(source_released, checkpoint, key, result, events),
                 StoreEvent::Fetched { key, result } => self.memory_fetched(key, result, events),
                 other => events.push(other),
             }
@@ -1449,6 +1482,21 @@ impl HostStore for CompositeStore {
             slots_total: memory.slots_total,
             intake_slots: memory.intake_slots,
             memory_bytes: memory.memory_bytes,
+            codec_pending_bytes: memory.codec_pending_bytes,
+            codec_oldest_ns: memory.codec_oldest_ns,
+            codec_pin_ns: memory.codec_pin_ns,
+            codec_pin_buckets: memory.codec_pin_buckets,
+            codec_retired_bytes: memory.codec_retired_bytes + disk.codec_retired_bytes,
+            backstop: memory.backstop + disk.backstop,
+            codec_mirrored_original_bytes: memory.codec_mirrored_original_bytes
+                + disk.codec_mirrored_original_bytes,
+            codec_fallback_events: std::array::from_fn(|i| {
+                memory.codec_fallback_events[i] + disk.codec_fallback_events[i]
+            }),
+            codec_fallback_bytes: std::array::from_fn(|i| {
+                memory.codec_fallback_bytes[i] + disk.codec_fallback_bytes[i]
+            }),
+            codec_skipped_mirrors: memory.codec_skipped_mirrors,
             disk_records: disk.disk_records,
             disk_bytes: disk.disk_bytes,
             row_refills: disk.row_refills,
@@ -1478,6 +1526,7 @@ impl HostStore for CompositeStore {
             rows_thinned: std::array::from_fn(|i| disk.rows_thinned[i] + memory.rows_thinned[i]),
             expired: std::array::from_fn(|i| disk.expired[i] + memory.expired[i]),
             held: std::array::from_fn(|i| self.stats.held[i] + disk.held[i]),
+            disk_scan_dropped: disk.disk_scan_dropped,
             dropped: std::array::from_fn(|i| self.stats.dropped[i] + disk.dropped[i]),
             progress: disk.progress + memory.progress + self.stats.progress,
             ..self.stats
@@ -1514,6 +1563,10 @@ impl HostStore for CompositeStore {
 
 impl crate::store::TierStore for CompositeStore {
     fn drain_on_shutdown(&mut self) {
+        self.memory.abandon_backstops();
+        if let Ok(staged) = self.staged() {
+            staged.abandon_backstops();
+        }
         self.disk.preserve_committed = true;
         let timeout = std::mem::take(&mut self.drain_on_shutdown);
         if timeout.is_zero() {
@@ -1877,7 +1930,7 @@ mod tests {
     ) -> (MemoryRecord, u64) {
         let (record, bytes) = copy_landed(store, checkpoint, parent, seed);
         let mut events = Vec::new();
-        store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut events);
+        store.memory_stored(false, checkpoint.id, checkpoint.key, Ok(bytes), &mut events);
         store.spill(checkpoint.key);
         assert!(matches!(
             events.as_slice(),
@@ -1950,7 +2003,13 @@ mod tests {
             let contents = record_bytes(&store, &record);
             expected_pages.push(contents[0].clone());
             expected_row = contents[1].clone();
-            store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut Vec::new());
+            store.memory_stored(
+                false,
+                checkpoint.id,
+                checkpoint.key,
+                Ok(bytes),
+                &mut Vec::new(),
+            );
             checkpoints.push(checkpoint);
         }
         assert_eq!(store.memory.index().nodes().filter(|n| n.row).count(), 8);
@@ -2100,7 +2159,13 @@ mod tests {
             }
             let (_, bytes) =
                 copy_landed(&mut store, &checkpoint, checkpoint.parent(), u64::from(turn));
-            store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut Vec::new());
+            store.memory_stored(
+                false,
+                checkpoint.id,
+                checkpoint.key,
+                Ok(bytes),
+                &mut Vec::new(),
+            );
             checkpoints.push(checkpoint);
         }
         assert!(
@@ -2150,7 +2215,13 @@ mod tests {
             }
             let (_, bytes) =
                 copy_landed(&mut store, &checkpoint, checkpoint.parent(), u64::from(turn));
-            store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut Vec::new());
+            store.memory_stored(
+                false,
+                checkpoint.id,
+                checkpoint.key,
+                Ok(bytes),
+                &mut Vec::new(),
+            );
             checkpoints.push(checkpoint.key);
         }
         assert!(store.memory.record(&checkpoints[1]).unwrap().row.is_some());
@@ -2369,7 +2440,7 @@ mod tests {
         store.disk.index_mut().pin(&root.key).unwrap();
         let (record, bytes) = copy_landed(&mut store, &anchor, anchor.parent(), 2);
         let expected = record_bytes(&store, &record);
-        store.memory_stored(anchor.id, anchor.key, Ok(bytes), &mut Vec::new());
+        store.memory_stored(false, anchor.id, anchor.key, Ok(bytes), &mut Vec::new());
         anchor.capture_role = crate::CaptureRole::Anchor;
         assert_eq!(store.store(&anchor).unwrap(), StoreOutcome::Present);
         assert_eq!(store.store(&deep).unwrap(), StoreOutcome::Queued);
@@ -2380,7 +2451,7 @@ mod tests {
         assert_eq!(store.store(&deep).unwrap(), StoreOutcome::Present);
         store.disk.index_mut().pin(&deep.key).unwrap();
         let (_, bytes) = copy_landed(&mut store, &next, next.parent(), 3);
-        store.memory_stored(next.id, next.key, Ok(bytes), &mut Vec::new());
+        store.memory_stored(false, next.id, next.key, Ok(bytes), &mut Vec::new());
         assert!(store.memory.record(&anchor.key).unwrap().row.is_some());
 
         for capture in [&anchor, &deep, &next] {
@@ -2454,12 +2525,12 @@ mod tests {
         store.disk.index_mut().pin(&root.key).unwrap();
         let (record, bytes) = copy_landed(&mut store, parent, parent.parent(), 2);
         let expected = record_bytes(&store, &record);
-        store.memory_stored(parent.id, parent.key, Ok(bytes), &mut Vec::new());
+        store.memory_stored(false, parent.id, parent.key, Ok(bytes), &mut Vec::new());
         store.spill(parent.key).unwrap();
         assert!(store.parked[&parent.key].writing);
         store.disk.index_mut().pin(&parent.key).unwrap();
         let (_, bytes) = copy_landed(&mut store, child, child.parent(), 3);
-        store.memory_stored(child.id, child.key, Ok(bytes), &mut Vec::new());
+        store.memory_stored(false, child.id, child.key, Ok(bytes), &mut Vec::new());
         assert_eq!(store.disk.index()[&parent.key].pins(), 1);
         assert!(store.memory.record(&parent.key).unwrap().row.is_some());
         assert_eq!(store.stats().rows_thinned, [0, 0]);
@@ -2910,11 +2981,12 @@ mod tests {
         let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
         let (record, bytes) = copy_landed(&mut store, &root, None, 1);
         let mut events = Vec::new();
-        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.memory_stored(false, root.id, root.key, Ok(bytes), &mut events);
         store.spill(root.key);
         match &events[..] {
             [
                 StoreEvent::Stored {
+                    source_released,
                     checkpoint,
                     key,
                     result,
@@ -3006,7 +3078,7 @@ mod tests {
         );
         let missing = full.key_at(1000).unwrap();
         let (_, bytes) = copy_landed(&mut store, &child, Some(missing), 3);
-        store.memory_stored(child.id, child.key, Ok(bytes), &mut events);
+        store.memory_stored(false, child.id, child.key, Ok(bytes), &mut events);
         assert_eq!(stored(&events), [(child.key, false)]);
         events.clear();
         assert!(!store.memory.index().contains(&child.key));
@@ -3026,6 +3098,7 @@ mod tests {
         );
         store.disk.index_mut().pin(&root.key).unwrap();
         store.memory_stored(
+            false,
             child.id,
             child.key,
             Err(invalid("copy engine fault")),
@@ -3081,7 +3154,7 @@ mod tests {
         fs::create_dir(&blocked).unwrap();
         let (_, bytes) = copy_landed(&mut store, &root, None, 1);
         let mut events = Vec::new();
-        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.memory_stored(false, root.id, root.key, Ok(bytes), &mut events);
         store.spill(root.key);
         assert_eq!(stored(&events), [(root.key, true)]);
         events.clear();
@@ -3129,7 +3202,7 @@ mod tests {
         // The child's copy lands without a parent to extend: it fails too.
         let record = landed(&mut store, child.key, child.bucket, 10, 2);
         assert_eq!(record.pages.len(), 10);
-        store.memory_stored(child.id, child.key, Ok(bytes), &mut events);
+        store.memory_stored(false, child.id, child.key, Ok(bytes), &mut events);
         assert_eq!(stored(&events), [(child.key, false)]);
         assert!(!store.memory.index().contains(&child.key));
         assert!(store.outbound.is_empty());
@@ -3496,7 +3569,7 @@ mod tests {
         written(&mut store, &second, None, 2);
         assert_eq!(store.disk.used(), file_bytes(10) + file_bytes(20));
         let (_, bytes) = copy_landed(&mut store, &third, None, 3);
-        store.memory_stored(third.id, third.key, Ok(bytes), &mut events);
+        store.memory_stored(false, third.id, third.key, Ok(bytes), &mut events);
         store.spill(third.key);
         assert_eq!(stored(&events), [(third.key, true)]);
         events.clear();
@@ -3511,7 +3584,7 @@ mod tests {
         // A pinned memory copy outlives its file until the pin is released.
         store.memory.pin_record(&second.key).unwrap();
         let (_, bytes) = copy_landed(&mut store, &fourth, None, 4);
-        store.memory_stored(fourth.id, fourth.key, Ok(bytes), &mut events);
+        store.memory_stored(false, fourth.id, fourth.key, Ok(bytes), &mut events);
         store.spill(fourth.key);
         assert_eq!(stored(&events), [(fourth.key, true)]);
         events.clear();
@@ -3702,7 +3775,7 @@ mod tests {
         let (record, bytes) = copy_landed(&mut store, &root, None, 1);
         let expected = record_bytes(&store, &record);
         let mut events = Vec::new();
-        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.memory_stored(false, root.id, root.key, Ok(bytes), &mut events);
         let staging = store
             .memory
             .pool()
@@ -3854,7 +3927,7 @@ mod tests {
         let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
         let (_, bytes) = copy_landed(&mut store, &root, None, 1);
         let mut events = Vec::new();
-        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.memory_stored(false, root.id, root.key, Ok(bytes), &mut events);
         store.spill(root.key);
         assert!(!store.outbound.is_empty());
         store.close().unwrap();
@@ -3978,7 +4051,7 @@ mod tests {
         store.announce_to(announcer.clone());
         let (_, bytes) = copy_landed(&mut store, &root, None, 1);
         let mut events = Vec::new();
-        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.memory_stored(false, root.id, root.key, Ok(bytes), &mut events);
         poll_until(&mut store, &mut events, |store| {
             let _ = announcer.take_batch(100);
             store.memory.announced_sums(&root.key).is_some()
@@ -4038,7 +4111,7 @@ mod tests {
         // A copy-out is not durable until its file commits.
         store.memory.mark_volatile(&root.key);
         let mut events = Vec::new();
-        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.memory_stored(false, root.id, root.key, Ok(bytes), &mut events);
         assert!(matches!(
             events.as_slice(),
             [StoreEvent::Stored { result: Ok(_), .. }]
@@ -4095,7 +4168,7 @@ mod tests {
             let root = checkpoint(&mut ids, &full, 640, None, pages(0..10), 10, StateSlotId(1));
             let (_, bytes) = copy_landed(&mut store, &root, None, 1);
             store.memory.mark_volatile(&root.key);
-            store.memory_stored(root.id, root.key, Ok(bytes), &mut Vec::new());
+            store.memory_stored(false, root.id, root.key, Ok(bytes), &mut Vec::new());
             if durable {
                 store.spill(root.key);
                 poll_until(&mut store, &mut Vec::new(), |s| s.outbound.is_empty());
@@ -4427,7 +4500,7 @@ mod tests {
         store.disk.index_mut().pin(&root.key).unwrap();
         let (_, bytes) = copy_landed(&mut store, &child, Some(root.key), 2);
         store.memory.mark_volatile(&child.key);
-        store.memory_stored(child.id, child.key, Ok(bytes), &mut Vec::new());
+        store.memory_stored(false, child.id, child.key, Ok(bytes), &mut Vec::new());
         assert!(!store.parked[&child.key].reserved);
         assert!(store.memory.remove_record(&root.key).is_err());
         assert_eq!(store.lookup(&full, 0, u64::MAX).unwrap().key, child.key);
@@ -4726,7 +4799,7 @@ mod tests {
             }
             let (_, bytes) = copy_landed(&mut store, record, parent, 1);
             store.memory.mark_volatile(&record.key);
-            store.memory_stored(record.id, record.key, Ok(bytes), &mut Vec::new());
+            store.memory_stored(false, record.id, record.key, Ok(bytes), &mut Vec::new());
         }
         assert!(store.parked.len() == 2);
         store.drain_on_shutdown = Duration::MAX;
@@ -4954,7 +5027,7 @@ mod tests {
             }
             store.memory.mark_volatile(&record.key);
             let mut events = Vec::new();
-            store.memory_stored(record.id, record.key, Ok(bytes), &mut events);
+            store.memory_stored(false, record.id, record.key, Ok(bytes), &mut events);
             assert!(matches!(
                 events.as_slice(),
                 [StoreEvent::Stored { result: Ok(_), .. }]

@@ -473,7 +473,7 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     let st = engine.st.clone();
     let (tx, rx) = mpsc::channel::<wire::ClientMessage>(OUTBOUND);
     let open = wire::OpenSession {
-        codec: Some(crate::shared::packed::raw_reader()),
+        codec: Some(engine.codec_caps(dial.as_ref().is_some_and(|d| d.may_use_rdma()))),
         manager_incarnation: hello.manager_incarnation,
         instance_id: st.instance_id.to_vec(),
         scope: Some(super::codec::scope_to(&st.scope)),

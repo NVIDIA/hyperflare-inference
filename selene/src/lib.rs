@@ -19,6 +19,7 @@
 //! holdings at publication and move retained records down the eviction cascade.
 
 pub mod levels;
+pub mod codec_copy;
 pub mod composite;
 pub mod copier;
 pub mod disk;
@@ -28,6 +29,7 @@ pub mod geometry;
 pub use shared::index;
 pub mod input;
 pub mod memory;
+mod memory_packed;
 pub mod offload;
 pub mod plan;
 pub mod pool;
