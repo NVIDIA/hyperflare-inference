@@ -701,7 +701,8 @@ uv sync --locked --extra prepare --extra test --extra sm103-reference
 
 `--sm103-preparation PATH` reads a version-1 JSON object with `placements`,
 `host_lane_clusters`, optional `execution` (`"reference"`, the only supported
-SM103 execution mode), optional `context`, and optional `prefill_staging`. Each
+SM103 execution mode), optional `context`, optional `prefill_staging`, and
+optional `dynamic_mover` (mutually exclusive with `prefill_staging`). Each
 placement is keyed by `layers.N.ffn` or `mtp.N.ffn` and contains `experts`,
 `host`, and `hbm`; the two arrays give canonical expert IDs in physical row
 order. Supply all 40 target layers and, when MTP is enabled, all three draft
@@ -737,6 +738,36 @@ stage only when the preceding invocation's distinct host demand reaches
 Preparation clears the demand history after capture, before export. Changing
 this setting changes `RebuildManifest.sm103_preparation_json`, so use ordinary
 export rather than `--reuse-weights` across different staging configurations.
+
+An optional `dynamic_mover` object enables GPU-side dynamic expert migration
+through indirection-aware MegaMoE, an inline routing predictor inside the
+per-layer enter kernel, and an 8-SM 1D-TMA persistent mover exported through
+`Execution.persistent_worker`:
+
+```json
+"dynamic_mover": {
+  "worker_sm_count": 8,
+  "spare_slots": 2,
+  "queue_capacity": 1024,
+  "decay_shift": 4,
+  "promote_threshold": 384,
+  "hysteresis": 64,
+  "cooldown_steps": 2,
+  "max_enqueues": 2,
+  "max_predict_rows": 64
+}
+```
+
+With `dynamic_mover`, each tiered target layer stores only its movable
+`placement.host` experts in mapped host memory (matching a static split's
+`~131.7 GiB` host footprint for DeepSeek V4.1 Flash so `189 GiB` RAM-resident
+Engram tables fit alongside host experts on a 494 GiB Grace host), while
+`placement.hbm \ placement.host` experts remain pinned HBM-only and are never
+evicted. HBM holds `len(hbm) + spare_slots` physical slots per tiered layer.
+Dedicated host lanes are disabled (`host_lane_clusters = 0`) because
+the worker green context reserves `worker_sm_count` SMs (for example, 8 worker
+SMs and 144 compute SMs on a 152-SM GB300). Changing `dynamic_mover` changes
+`RebuildManifest.sm103_preparation_json` and requires ordinary export.
 
 The explicit configuration admits one local SM103 GPU and expanded native
 expert scales without changing the recipe's ordinary TP selection. Planning

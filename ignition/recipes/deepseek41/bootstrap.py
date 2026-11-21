@@ -424,12 +424,22 @@ def _prepare_reference_rank(snapshot, config, *, rank, group, progress=None, cor
     with core_storage.transient():
         before_weights = allocated_tensor_bytes(device)
         with phase(progress, "Load reference model and tiered experts"):
+            compute_sm_count = 0
+            if config.sm103.dynamic_mover is not None:
+                import deep_gemm
+                from ignition.components.sm103_expert_mover import query_green_context_compute_sms
+
+                _, compute_sm_count = query_green_context_compute_sms(
+                    device.index, config.sm103.dynamic_mover.worker_sm_count
+                )
+                deep_gemm.set_num_sms(compute_sm_count)
             parameters = ReferenceParameters(checkpoint)
             parameters.load_ordinary(device)
             experts = ReferenceExpertPreparation.load(checkpoint, dict(config.sm103.placements),
                 target_rows=target_rows, draft_rows=draft_rows, storage=core_storage,
                 kernel_cache=config.kernel_cache, session=session,
-                host_lane_clusters=config.sm103.host_lane_clusters, dspark=dspark_loaded)
+                host_lane_clusters=config.sm103.host_lane_clusters, dspark=dspark_loaded,
+                dynamic_mover=config.sm103.dynamic_mover, compute_sm_count=compute_sm_count)
             sequence = torch.zeros(1, dtype=torch.int64, device=device)
             frame = torch.zeros(1, dtype=torch.int32, device=device)
             delivery = ReferenceEngramDelivery.from_checkpoint(checkpoint, parameters.config.gpt,
@@ -544,10 +554,13 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
-        expert_rows, row_buffers = megamoe_row_storage(
-            (index, experts.weights[f"layers.{index}.ffn"], f"weights.layers[{index}]")
-            for index in range(len(model.model.layers))
-            if experts.weights[f"layers.{index}.ffn"].host_tier is not None)
+        if experts.mover is not None:
+            expert_rows, row_buffers = None, {}
+        else:
+            expert_rows, row_buffers = megamoe_row_storage(
+                (index, experts.weights[f"layers.{index}.ffn"], f"weights.layers[{index}]")
+                for index in range(len(model.model.layers))
+                if experts.weights[f"layers.{index}.ffn"].host_tier is not None)
         buffers.update(row_buffers)
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
@@ -702,11 +715,68 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
         stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
         arena.release_preparation()
         release_unused()
+        # DeepGEMM lazily allocates per-stream barrier/workspace tensors on first use and
+        # asserts CaptureStatus::None. Because capture_forwards warms on a separate stream,
+        # seed the capture stream once here in persistent storage before graph capture.
+        import deep_gemm as _dg
+        _h = int(model.cfg.hidden_size)
+        _hc = int(getattr(model.cfg, "hc_mult", 4))
+        _e = 64
+        _k = 1
+        with core_storage.transient():
+            _x = torch.zeros((1, _h), dtype=torch.bfloat16, device=device)
+            _res = torch.zeros((1, _hc, _h), dtype=torch.bfloat16, device=device)
+            _pm = torch.zeros((1, _hc, 1), dtype=torch.float32, device=device)
+            _cm = torch.zeros((1, _hc, _hc), dtype=torch.float32, device=device)
+            _fn = torch.zeros((_hc * (_hc + 2), _hc * _h), dtype=torch.float32, device=device)
+            _ms = torch.zeros((3,), dtype=torch.float32, device=device)
+            _mb = torch.zeros((_hc * (_hc + 2),), dtype=torch.float32, device=device)
+            _nw = torch.ones((_h,), dtype=torch.bfloat16, device=device)
+            _nres = torch.empty_like(_res)
+            _npm = torch.empty_like(_pm)
+            _ncm = torch.empty_like(_cm)
+            _y = torch.empty_like(_x)
+            _gw = torch.zeros((_e, _h), dtype=torch.bfloat16, device=device)
+            _gids = torch.empty((1, _k), dtype=torch.int64, device=device)
+            _gprob = torch.empty((1, _k), dtype=torch.float32, device=device)
+            _ks = torch.zeros((1,), dtype=torch.int32, device=device)
+            _ke = torch.zeros((1,), dtype=torch.int32, device=device)
+            _sblk = torch.zeros((1, 4), dtype=torch.int32, device=device)
+        with torch.cuda.stream(stream):
+            if hasattr(_dg, "mega_mhc"):
+                _dg.mega_mhc(
+                    _x, _res, None, _pm, _cm,
+                    fn=_fn, mix_scales=_ms, mix_bases=_mb, hc_mult=_hc,
+                    hc_norm_eps=1e-20, hc_pre_eps=1e-6, hc_post_scale=2.0,
+                    sinkhorn_eps=1e-6, num_sinkhorn_iters=20,
+                    rmsnorm_weight=_nw, rmsnorm_eps=1e-20, rmsnorm_scale=1.0,
+                    new_residual=_nres, new_prev_mix=None, new_post_mix=_npm,
+                    new_comb_res_mix=_ncm, y_bf16=_y,
+                )
+            if hasattr(_dg, "bf16_mega_gate"):
+                _dg.bf16_mega_gate(
+                    _x, _gw, num_topk=_k, use_shared_as_routed=False,
+                    num_shared_experts=0, routed_scaling_factor=1.0,
+                    ep_rank=0, scoring_func="sqrtsoftplus", out=(_gids, _gprob),
+                )
+            if hasattr(_dg, "get_sparse_mqa_logits_metadata"):
+                _dg.get_sparse_mqa_logits_metadata(
+                    _ks, _ke, 0, _sblk, torch.float8_e4m3fn, 16,
+                )
+        stream.synchronize()
+        del (_x, _res, _pm, _cm, _fn, _ms, _mb, _nw, _nres, _npm, _ncm, _y,
+             _gw, _gids, _gprob, _ks, _ke, _sblk)
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=None, coordinator=None, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=core_storage,
             compile_kinds=("prefill", "decode", "resume", "speculative", "vision"))
+        persistent_worker = None
+        if experts.mover is not None:
+            persistent_worker = experts.mover.capture_worker_graph(
+                name="sm103_expert_mover", retain_graphs=config.retain_graphs, stream=stream
+            )
+            buffers[experts.mover.control_buffer_name] = experts.mover.control_region.device_view
     finally:
         if feature_pool is not None:
             feature_pool.materialize()
@@ -715,6 +785,8 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
     torch.cuda.synchronize(device)
     for stager in expert_stagers.values():
         stager.decision.zero_()
+    if experts.mover is not None:
+        experts.mover.reset_runtime_state()
     torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
     release_unused()
@@ -781,13 +853,14 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
     if vision_state is not None:
         disposable.append(vision_state.arena)
     prepared = PreparedModel(rebuild_weights=declare_reference_weights(model), expert_rows=expert_rows,
+        persistent_worker=persistent_worker,
         device=config.devices[0], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*storage_ranges(disposable), *completion.zero_ranges()),
         export_events=delivery.export_events(),
         embedding_catalog=delivery.resident_catalog(),
         core_data=delivery,
-        resources=(model, experts, delivery, history, pool, requests, inputs, admission, commands,
+        resources=(model, experts, experts.mover, delivery, history, pool, requests, inputs, admission, commands,
             forwards, compiled, stream, graph_pool, session, rng, proposal_generation, proposal_offset,
             confidence, vision_state, vision_inputs, vision_prefill, feature_pool),
         close_resources=())
