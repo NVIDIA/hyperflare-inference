@@ -19,7 +19,7 @@ from ignition.preparation.qwen38 import (
     MODEL_ID,
     REVISION,
     TEXT_PREFIX,
-    TRANSFORMERS_REVISION,
+    TRANSFORMERS_VERSION,
 )
 from ignition.reference.qwen38_decoder import (
     CanonicalTextReference,
@@ -222,7 +222,7 @@ def test_complete_canonical_text_prefill_then_decode(manifest, case, record_prop
         {
             "model_id": MODEL_ID,
             "revision": REVISION,
-            "transformers_revision": TRANSFORMERS_REVISION,
+            "transformers_version": TRANSFORMERS_VERSION,
             "text": text,
             "input_ids": inputs,
             "teacher_tokens": teacher_tokens,

@@ -15,7 +15,7 @@ from safetensors import safe_open
 from b12x.preparation import PreparationSession
 
 from ignition.preparation import inspect_qwen38_checkpoint
-from ignition.preparation.qwen38 import TRANSFORMERS_REVISION
+from ignition.preparation.qwen38 import TRANSFORMERS_VERSION
 from ignition.preparation.compilation import ForwardTracer, compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
 from ignition.recipes.qwen38 import create_model_tree
@@ -152,7 +152,7 @@ def main():
     report = {
         "component": "Qwen layer 0 attention hyperconnection",
         "snapshot": str(args.snapshot.resolve()),
-        "transformers_revision": TRANSFORMERS_REVISION,
+        "transformers_version": TRANSFORMERS_VERSION,
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "device": torch.cuda.get_device_name(0),
