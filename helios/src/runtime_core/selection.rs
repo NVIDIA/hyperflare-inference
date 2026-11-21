@@ -189,6 +189,7 @@ impl LoadOptions {
         }
         let selected_token_capacity = verification_token_limit.map_or(token_capacity, |budget| token_capacity.min(budget as u64));
         let widths: Vec<_> = widths.into_iter().filter(|_| enabled).collect();
+        let multi_rank = cores.len() > 1;
         let mut rank_catalog = None;
         let mut rank_tuning_catalog = None;
         for (rank, core) in cores.iter_mut().enumerate() {
@@ -245,6 +246,19 @@ impl LoadOptions {
             for graph in &execution.tuning_graphs {
                 if graph.name.is_empty() || !names.insert(graph.name.clone()) {
                     return Err(invalid("duplicate or unnamed startup tuning graph"));
+                }
+            }
+            if execution.persistent_workers.len() > 1 {
+                return Err(invalid("at most one persistent worker is supported per rank"));
+            }
+            if !execution.persistent_workers.is_empty() && multi_rank {
+                return Err(invalid(
+                    "persistent workers are only supported on single-rank cores",
+                ));
+            }
+            for worker in &execution.persistent_workers {
+                if worker.graph.is_empty() || !names.insert(worker.graph.clone()) {
+                    return Err(invalid("duplicate or unnamed persistent worker graph"));
                 }
             }
             let resources: HashSet<_> = core.graphs.iter().map(|g| g.name.clone()).collect();
@@ -338,7 +352,9 @@ impl LoadOptions {
             }
             rank_catalog = Some(catalog);
             let selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.as_str())
-                .chain(execution.tuning_graphs.iter().map(|g| g.name.as_str())).collect();
+                .chain(execution.tuning_graphs.iter().map(|g| g.name.as_str()))
+                .chain(execution.persistent_workers.iter().map(|w| w.graph.as_str()))
+                .collect();
             core.graphs.retain(|g| selected.contains(g.name.as_str()));
             prune_kernels(core)?;
         }
@@ -547,6 +563,102 @@ mod tests {
             assert!(LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
                 .select(&mut cores, &mut config()).is_err());
         }
+    }
+
+    #[test]
+    fn selected_graphs_retain_persistent_worker_and_reject_multi_rank_or_multiple_workers() {
+        let worker_core = || {
+            let mut core = core();
+            let function = core.graphs.last().unwrap().functions[0];
+            core.graphs.push(Graph {
+                name: "worker_loop".into(),
+                flags: 0,
+                resource: "worker_loop".into(),
+                node_count: 1,
+                edge_count: 0,
+                functions: vec![function],
+            });
+            core.execution.as_mut().unwrap().persistent_workers = vec![wire::PersistentWorker {
+                worker_sm_count: 8,
+                graph: "worker_loop".into(),
+                stop_flag: Some(wire::Reference {
+                    allocation: "worker_ctrl".into(),
+                    offset: 0,
+                }),
+            }];
+            core
+        };
+        let mut single = [worker_core()];
+        LoadOptions {
+            max_concurrency: Some(1),
+            mtp_draft_tokens: Some(0),
+            ..Default::default()
+        }
+        .select(&mut single, &mut config())
+        .unwrap();
+        assert!(single[0].graphs.iter().any(|g| g.name == "worker_loop"));
+        assert_eq!(
+            single[0]
+                .execution
+                .as_ref()
+                .unwrap()
+                .persistent_workers
+                .len(),
+            1
+        );
+        assert_eq!(
+            single[0].execution.as_ref().unwrap().persistent_workers[0].worker_sm_count,
+            8
+        );
+
+        // Multi-rank persistent-worker cores must fail selection explicitly.
+        let mut multi = [worker_core(), worker_core()];
+        let multi_err = LoadOptions {
+            max_concurrency: Some(1),
+            mtp_draft_tokens: Some(0),
+            ..Default::default()
+        }
+        .select(&mut multi, &mut config())
+        .unwrap_err()
+        .to_string();
+        assert!(multi_err.contains("single-rank"), "{multi_err}");
+
+        // Multiple persistent workers on one rank must fail selection explicitly.
+        let mut two_workers = [worker_core()];
+        let function = two_workers[0].graphs.last().unwrap().functions[0];
+        two_workers[0].graphs.push(Graph {
+            name: "worker_loop_2".into(),
+            flags: 0,
+            resource: "worker_loop_2".into(),
+            node_count: 1,
+            edge_count: 0,
+            functions: vec![function],
+        });
+        two_workers[0]
+            .execution
+            .as_mut()
+            .unwrap()
+            .persistent_workers
+            .push(wire::PersistentWorker {
+                worker_sm_count: 8,
+                graph: "worker_loop_2".into(),
+                stop_flag: Some(wire::Reference {
+                    allocation: "worker_ctrl".into(),
+                    offset: 4,
+                }),
+            });
+        let multi_worker_err = LoadOptions {
+            max_concurrency: Some(1),
+            mtp_draft_tokens: Some(0),
+            ..Default::default()
+        }
+        .select(&mut two_workers, &mut config())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            multi_worker_err.contains("at most one persistent worker"),
+            "{multi_worker_err}"
+        );
     }
 
     fn config() -> Value {

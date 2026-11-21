@@ -146,6 +146,13 @@ impl ThreadedExecutor {
         if ranks.is_empty() {
             return Err(invalid("tensor parallelism requires at least two ranks"));
         }
+        if !manifest.persistent_workers.is_empty()
+            || ranks.iter().any(|rank| !rank.persistent_workers.is_empty())
+        {
+            return Err(invalid(
+                "persistent workers are only supported on single-rank cores",
+            ));
+        }
         for rank in &ranks {
             rank.validate()?;
             if !same_layout(&manifest, rank) {
@@ -589,6 +596,14 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
         (Some(a), Some(b)) if !a.same_layout(b) => return false,
         (Some(_), None) | (None, Some(_)) => return false,
         _ => {}
+    }
+    if a.persistent_workers.len() != b.persistent_workers.len()
+        || a.persistent_workers
+            .iter()
+            .zip(&b.persistent_workers)
+            .any(|(a, b)| a.worker_sm_count != b.worker_sm_count || a.graph != b.graph)
+    {
+        return false;
     }
     a.completion_token_capacity == b.completion_token_capacity
         && a.max_active == b.max_active

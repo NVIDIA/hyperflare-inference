@@ -110,6 +110,23 @@ fn roce_spec(
     Ok(spec)
 }
 
+fn validate_persistent_worker_topology(
+    cores: &[Core],
+    cluster: Option<&ClusterRank>,
+) -> Result<()> {
+    let has_worker = cores.iter().any(|core| {
+        core.execution
+            .as_ref()
+            .is_some_and(|execution| !execution.persistent_workers.is_empty())
+    });
+    if has_worker && (cores.len() > 1 || cluster.is_some()) {
+        return Err(invalid(
+            "persistent workers are only supported on single-rank cores",
+        ));
+    }
+    Ok(())
+}
+
 /// The cluster an authorized core's ranks form: (world, export id), or None
 /// when every rank runs on one host.
 pub fn core_cluster(core: &AuthorizedCore) -> Option<(usize, String)> {
@@ -355,6 +372,7 @@ impl NativeModel {
             core.validate()?;
             Files::validate(&files, core)?;
         }
+        validate_persistent_worker_topology(&cores, cluster.as_ref())?;
         let roce = transports
             .into_iter()
             .zip(&cores)
@@ -1592,5 +1610,54 @@ mod identity_tests {
             }
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn persistent_worker_topology_rejects_multi_rank_and_cluster_cores() {
+        let worker_core = || Core {
+            resources: std::collections::HashMap::new(),
+            events: vec![],
+            architecture: [10, 3],
+            allocations: vec![],
+            modules: vec![],
+            functions: vec![],
+            graphs: vec![],
+            reservations: vec![],
+            execution: Some(protobuf::wire::Execution {
+                persistent_workers: vec![protobuf::wire::PersistentWorker {
+                    worker_sm_count: 8,
+                    graph: "worker_loop".into(),
+                    stop_flag: Some(protobuf::wire::Reference {
+                        allocation: "worker_ctrl".into(),
+                        offset: 0,
+                    }),
+                }],
+                ..Default::default()
+            }),
+            context: super::super::format::Context::default(),
+        };
+        let plain_core = || Core {
+            execution: Some(protobuf::wire::Execution::default()),
+            ..worker_core()
+        };
+        let cluster = ClusterRank {
+            world: 2,
+            rank: 0,
+            export_id: "cluster-export".into(),
+        };
+
+        validate_persistent_worker_topology(&[worker_core()], None).unwrap();
+        validate_persistent_worker_topology(&[plain_core(), plain_core()], None).unwrap();
+        validate_persistent_worker_topology(&[plain_core()], Some(&cluster)).unwrap();
+
+        let multi_err = validate_persistent_worker_topology(&[worker_core(), worker_core()], None)
+            .unwrap_err()
+            .to_string();
+        assert!(multi_err.contains("single-rank"), "{multi_err}");
+
+        let cluster_err = validate_persistent_worker_topology(&[worker_core()], Some(&cluster))
+            .unwrap_err()
+            .to_string();
+        assert!(cluster_err.contains("single-rank"), "{cluster_err}");
     }
 }

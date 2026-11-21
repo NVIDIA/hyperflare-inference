@@ -585,6 +585,32 @@ then rebased onto the live addresses and validated, and the server starts
 from this reconstructed contract. `flare run CORE` in
 `flare-cli/src/main.rs` starts the shared server directly from the typed contract.
 
+When a single-rank core declares an entry in `Execution.persistent_workers`
+(repeated field 8; at most one entry is currently accepted, and multi-rank or
+multi-host cluster cores declaring a persistent worker are rejected),
+`NativeResources` resolves the CUDA driver Green Context entrypoints optionally
+at driver load (failing load explicitly only when a core requires them on an
+unsupported driver), retains the device's primary context, partitions device
+SMs with `cuDevSmResourceSplit` into two explicit structured SM resource groups
+(a worker green context aligned to the device's co-scheduled SM alignment and a
+compute green context preserving co-scheduled SM alignment for multi-CTA
+cluster launches), applies the core's recorded CUDA context limits and cache
+configuration to the primary context and both green contexts, and opens
+non-blocking streams for each. All modules, kernels, and graph executables are
+loaded, instantiated under their partition's green context (clamping
+cooperative grids to that partition's SM count), and uploaded on their
+partition's non-blocking stream before the persistent worker starts; the
+executor launches the worker graph once on its worker stream only after startup
+completes, while compute graphs replay on the compute green context. Shutdown
+drains compute and copy streams first, writes `1u32` (release) to the
+mapped-host `stop_flag` reference, and polls `cuStreamQuery` on the worker
+stream against a bounded drain timeout with context save/restore (returning
+`ExecutionError::Drain` and retaining GPU resources on timeout). Resource
+teardown stops any still-running worker, synchronizes the primary context, and
+only after context synchronization succeeds destroys worker and compute
+streams, executables, modules, mappings, green contexts, virtual-address
+reservations, and the primary context.
+
 Before CUDA initialization or serving worker threads, Flare restricts
 `CUDA_VISIBLE_DEVICES` to `--gpus`, resolving indices within an inherited mask.
 When omitted, the list contains the first N visible GPUs for the core's N
