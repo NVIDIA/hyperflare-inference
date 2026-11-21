@@ -657,7 +657,8 @@ def _fake_dense_out_workspace(source, weight, out, workspace, plan_handle):
 
 
 LOW_LATENCY_FP8_COMPONENT = "flare.sm103.low_latency_fp8"
-LOW_LATENCY_FP8_MAX_ROWS = 8
+LOW_LATENCY_FP8_MAX_ROWS = 64
+_LOW_LATENCY_GEMM_MAX_ROWS = 8
 
 
 @triton.jit
@@ -665,16 +666,48 @@ def _deepgemm_sf_to_f8_128x4(
     Src, Dst, src_stride_col,
     M: tl.constexpr,
     K_TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     tile_k = tl.program_id(0) * BLOCK_K + tl.arange(0, BLOCK_K)
     mask_k = tile_k < K_TILES
-    for r in tl.static_range(M):
-        val = tl.load(Src + r + tile_k * src_stride_col, mask=mask_k, other=0)
-        tl.store(Dst + tile_k * 128 + r * 4, val, mask=mask_k)
+    if M <= 8:
+        for r in tl.static_range(M):
+            val = tl.load(Src + r + tile_k * src_stride_col, mask=mask_k, other=0)
+            tl.store(Dst + tile_k * 128 + r * 4, val, mask=mask_k)
+    else:
+        r = tl.arange(0, BLOCK_M)
+        mask = (r[:, None] < M) & mask_k[None, :]
+        val = tl.load(Src + r[:, None] + tile_k[None, :] * src_stride_col, mask=mask, other=0)
+        dst_off = tile_k[None, :] * 128 + (r[:, None] % 32) * 4 + (r[:, None] // 32)
+        tl.store(Dst + dst_off, val, mask=mask)
 
 
-_NATIVE_JITS.add(_deepgemm_sf_to_f8_128x4)
+@triton.jit
+def _quantize_bf16_to_f8_128x4(
+    X, YFp8, YSf, x_stride_m,
+    H: tl.constexpr,
+):
+    m = tl.program_id(0).to(tl.int64)
+    kt = tl.program_id(1).to(tl.int64)
+    g = tl.arange(0, 4)
+    e = tl.arange(0, 32)
+    col = kt * 128 + g[:, None] * 32 + e[None, :]
+    xf = tl.load(X + m * x_stride_m + col).to(tl.float32)
+    amax = tl.max(tl.abs(xf), axis=1)
+    raw_sf = tl.maximum(amax * (1.0 / 448.0), 1e-30)
+    bits = raw_sf.to(tl.int32, bitcast=True)
+    exp_u8 = ((bits + 0x7FFFFF) >> 23) & 0xFF
+    scale_f = (exp_u8 << 23).to(tl.float32, bitcast=True)
+    q = (xf / scale_f[:, None]).to(tl.float8e4nv)
+    tl.store(YFp8 + m * H + col, q)
+    shifts = tl.arange(0, 4) * 8
+    packed = tl.sum(exp_u8 << shifts, axis=0)
+    dst_off = kt * 128 + (m % 32) * 4 + (m // 32)
+    tl.store(YSf + dst_off, packed)
+
+
+_NATIVE_JITS.update((_deepgemm_sf_to_f8_128x4, _quantize_bf16_to_f8_128x4))
 
 
 @torch.no_grad()
@@ -693,12 +726,16 @@ class LowLatencyFP8Query:
     rows: int
     in_features: int
     out_features: int
+    pre_swizzled_input: bool = False
+    bf16_input: bool = False
 
     def __post_init__(self):
         if (type(self.rows) is not int or not 1 <= self.rows <= LOW_LATENCY_FP8_MAX_ROWS
                 or type(self.in_features) is not int or self.in_features <= 0 or self.in_features % 128
-                or type(self.out_features) is not int or self.out_features <= 0 or self.out_features % 128):
-            raise ValueError("SM103 low-latency FP8 projection requires 1..8 rows and 128-aligned N, K")
+                or type(self.out_features) is not int or self.out_features <= 0 or self.out_features % 128
+                or type(self.pre_swizzled_input) is not bool or type(self.bf16_input) is not bool):
+            raise ValueError(
+                f"SM103 low-latency FP8 projection requires 1..{LOW_LATENCY_FP8_MAX_ROWS} rows and 128-aligned N, K")
 
 
 @lru_cache(maxsize=None)
@@ -709,25 +746,44 @@ def _low_latency_fp8_tactics(query: LowLatencyFP8Query) -> tuple:
     b = torch.empty((1,), dtype=torch.float8_e4m3fn, device=target).expand(k, n)
     sf = torch.empty((1,), dtype=torch.uint8, device=target)
     out = torch.empty((rows, n), dtype=torch.bfloat16, device="meta")
-    valid = tuple(_mxfp8_runner(_LOW_LATENCY_BACKEND, target).get_valid_tactics(
-        [a, b, sf, sf, torch.bfloat16, out, None], None))
-    if n >= 16384:
-        preferred = ((128, 5, 1, 1), (128, 6, 1, 1), (128, 4, 1, 1))
-        curated = [t for t in valid if t[2] == 1 and t[3] == 1 and t[0] in (128, 256) and t[1] in (3, 4, 5, 6)]
-    elif n >= 4096:
-        preferred = ((128, 6, 1, 2), (128, 8, 1, 2), (256, 5, 1, 2))
-        curated = [t for t in valid if t[2] == 1 and t[3] in (1, 2) and t[0] in (128, 256) and t[1] in (5, 6, 8, 9)]
-    else:
-        preferred = ((128, 6, 1, 8), (640, 2, 1, 8), (128, 7, 1, 8), (128, 5, 1, 4))
-        curated = [t for t in valid if t[2] == 1 and t[3] in (4, 8) and t[0] in (128, 256, 640) and t[1] in (2, 4, 5, 6, 7)]
-    ordered = [t for t in preferred if t in valid] + [t for t in curated if t not in preferred]
-    return tuple(dict.fromkeys(ordered)) or valid
+    candidates = []
+    if rows <= _LOW_LATENCY_GEMM_MAX_ROWS:
+        valid = tuple(_mxfp8_runner(_LOW_LATENCY_BACKEND, target).get_valid_tactics(
+            [a, b, sf, sf, torch.bfloat16, out, None], None))
+        if n >= 16384:
+            preferred = ((128, 5, 1, 1), (128, 6, 1, 1), (128, 4, 1, 1))
+            curated = [t for t in valid if t[2] == 1 and t[3] == 1 and t[0] in (128, 256) and t[1] in (3, 4, 5, 6)]
+        elif n >= 4096:
+            preferred = ((128, 6, 1, 2), (128, 8, 1, 2), (256, 5, 1, 2))
+            curated = [t for t in valid if t[2] == 1 and t[3] in (1, 2) and t[0] in (128, 256) and t[1] in (5, 6, 8, 9)]
+        else:
+            preferred = ((128, 6, 1, 8), (640, 2, 1, 8), (128, 7, 1, 8), (128, 5, 1, 4))
+            curated = [t for t in valid if t[2] == 1 and t[3] in (4, 8) and t[0] in (128, 256, 640) and t[1] in (2, 4, 5, 6, 7)]
+        ordered = [t for t in preferred if t in valid] + [t for t in curated if t not in preferred]
+        for t in (ordered or valid):
+            candidates.append((_LOW_LATENCY_BACKEND, t))
+    inps = [a, b, sf, sf, torch.bfloat16, out, sf]
+    cute_valid = tuple(_mxfp8_runner("cute-dsl", target).get_valid_tactics(inps, None))
+    cute_curated = [
+        t for t in cute_valid
+        if t[4] == 1 and t[2] and t[0][0] == 128 and t[0][1] in (8, 16, 32, 64) and t[1] in ((1, 1), (2, 1))
+        and not t[3]
+    ]
+    for t in cute_curated:
+        candidates.append(("cute-dsl", t))
+    if rows > _LOW_LATENCY_GEMM_MAX_ROWS and n % 32 == 0:
+        cutlass_valid = tuple(_mxfp8_runner("cutlass", target).get_valid_tactics(inps, None))
+        for t in cutlass_valid[:10]:
+            candidates.append(("cutlass", t))
+    candidates.append(("deep_gemm", None))
+    return tuple(dict.fromkeys(candidates))
 
 
 LOW_LATENCY_FP8_CONTRACT = native_contract(
     component_id=LOW_LATENCY_FP8_COMPONENT,
     query_type=LowLatencyFP8Query,
     tactics=_low_latency_fp8_tactics,
+    semantic_version=3,
 )
 
 
@@ -735,74 +791,150 @@ LOW_LATENCY_FP8_CONTRACT = native_contract(
 def compile_low_latency_fp8_swizzle(payload, ordinal):
     query = LowLatencyFP8Query(**payload["query"])
     k_tiles = query.in_features // 128
-    block_k = triton.next_power_of_2(k_tiles)
+    block_m = triton.next_power_of_2(query.rows)
+    block_k = min(64, triton.next_power_of_2(k_tiles))
+    grid = (triton.cdiv(k_tiles, block_k), 1, 1)
     with torch.cuda.device(ordinal):
         return (_deepgemm_sf_to_f8_128x4.warmup(
             torch.int32, torch.int32, 16,
-            query.rows, k_tiles, block_k,
-            grid=(1, 1, 1), num_warps=4,
+            query.rows, k_tiles, block_m, block_k,
+            grid=grid, num_warps=4,
+        ),)
+
+
+@program_cache(scope="preparation")
+def compile_low_latency_fp8_bf16_quant(payload, ordinal):
+    query = LowLatencyFP8Query(**payload["query"])
+    k_tiles = query.in_features // 128
+    with torch.cuda.device(ordinal):
+        return (_quantize_bf16_to_f8_128x4.warmup(
+            torch.bfloat16, torch.float8_e4m3fn, torch.int32, query.in_features,
+            H=query.in_features,
+            grid=(query.rows, k_tiles, 1), num_warps=4,
         ),)
 
 
 class PreparedLowLatencyFP8:
     def __init__(self, query: LowLatencyFP8Query, tactic, device):
         self.query = query
-        self.tactic = tactic
+        self.backend, self.tactic = tactic
         self.device = torch.device(device)
         self.k_tiles = query.in_features // 128
-        self.block_k = triton.next_power_of_2(self.k_tiles)
-        self.swizzle, = load_programs(compile_low_latency_fp8_swizzle(
-            dict(query=LOW_LATENCY_FP8_CONTRACT.encode_query(query)), self.device.index))
-        self.runner = _mxfp8_runner(_LOW_LATENCY_BACKEND, self.device)
+        self.block_m = triton.next_power_of_2(query.rows)
+        self.block_k = min(64, triton.next_power_of_2(self.k_tiles))
+        self.grid = (triton.cdiv(self.k_tiles, self.block_k), 1, 1)
+        self.needs_workspace = self.backend in ("cute-dsl", "cutlass")
+        if self.backend == "deep_gemm":
+            self.swizzle = None
+            self.bf16_quant = None
+            self.runner = None
+        else:
+            encoded = dict(query=LOW_LATENCY_FP8_CONTRACT.encode_query(query))
+            self.swizzle, = load_programs(compile_low_latency_fp8_swizzle(encoded, self.device.index))
+            self.bf16_quant = (load_programs(compile_low_latency_fp8_bf16_quant(encoded, self.device.index))[0]
+                               if query.bf16_input else None)
+            self.runner = _mxfp8_runner(self.backend, self.device)
 
-    def run(self, x_fp8, x_sf, weight, weight_sf_f8, out, sf_scratch):
-        self.swizzle[(1, 1, 1)](
-            x_sf, sf_scratch, x_sf.stride(1),
-            self.query.rows, self.k_tiles, self.block_k,
-        )
+    def run(self, x_fp8, x_sf, weight, weight_sf_f8, weight_sf_dg, out, sf_scratch, workspace):
+        if self.backend == "deep_gemm":
+            import deep_gemm
+
+            deep_gemm.fp8_gemm_nt((x_fp8, x_sf), (weight, weight_sf_dg), out, recipe=(1, 1, 32))
+            return
+        if x_sf.dtype == torch.uint8 and x_sf.ndim == 1:
+            sf_f8 = x_sf
+        else:
+            self.swizzle[self.grid](
+                x_sf, sf_scratch, x_sf.stride(1),
+                self.query.rows, self.k_tiles, self.block_m, self.block_k,
+            )
+            sf_f8 = sf_scratch.view(torch.uint8)
+        ws = workspace if self.needs_workspace else None
         self.runner(
-            inputs=[x_fp8, weight.T, sf_scratch.view(torch.uint8), weight_sf_f8, torch.bfloat16, out, None],
+            inputs=[x_fp8, weight.T, sf_f8, weight_sf_f8, torch.bfloat16, out, ws],
+            tactic=self.tactic,
+        )
+
+    def run_bf16(self, x_bf16, weight, weight_sf_f8, x_fp8, sf_scratch, out, workspace):
+        self.bf16_quant[(self.query.rows, self.k_tiles, 1)](
+            x_bf16, x_fp8, sf_scratch, x_bf16.stride(0), self.query.in_features,
+        )
+        ws = workspace if self.needs_workspace else None
+        self.runner(
+            inputs=[x_fp8, weight.T, sf_scratch.view(torch.uint8), weight_sf_f8, torch.bfloat16, out, ws],
             tactic=self.tactic,
         )
 
 
 def low_latency_fp8_plan(query: LowLatencyFP8Query, device) -> Plan:
     resolved = torch.device(device)
+
+    def jobs(tactic, detected):
+        if tactic[0] == "deep_gemm":
+            return ()
+        encoded = dict(query=LOW_LATENCY_FP8_CONTRACT.encode_query(query))
+        out = [CompileJob.create(
+            "ignition.components.sm103_projection:compile_low_latency_fp8_swizzle",
+            encoded, detected.ordinal)]
+        if query.bf16_input:
+            out.append(CompileJob.create(
+                "ignition.components.sm103_projection:compile_low_latency_fp8_bf16_quant",
+                encoded, detected.ordinal))
+        return tuple(out)
+
     return native_plan(
         contract=LOW_LATENCY_FP8_CONTRACT,
         query=query,
         device=resolved,
         scratch_bytes=lambda tactic: 0,
-        compile_jobs=lambda tactic, detected: (CompileJob.create(
-            "ignition.components.sm103_projection:compile_low_latency_fp8_swizzle",
-            dict(query=LOW_LATENCY_FP8_CONTRACT.encode_query(query)), detected.ordinal),),
+        compile_jobs=jobs,
         materialize=lambda tactic: PreparedLowLatencyFP8(query, tactic, resolved),
     )
 
 
-@torch.library.custom_op("flare::sm103_low_latency_fp8", mutates_args=("out", "sf_scratch"))
+@torch.library.custom_op("flare::sm103_low_latency_fp8", mutates_args=("out", "sf_scratch", "workspace"))
 def _low_latency_fp8(
-    x_fp8: torch.Tensor, x_sf: torch.Tensor, weight: torch.Tensor, weight_sf_f8: torch.Tensor,
-    out: torch.Tensor, sf_scratch: torch.Tensor, plan_handle: int,
+    x_fp8: torch.Tensor, x_sf: torch.Tensor, weight: torch.Tensor,
+    weight_sf_f8: torch.Tensor, weight_sf_dg: torch.Tensor,
+    out: torch.Tensor, sf_scratch: torch.Tensor | None,
+    workspace: torch.Tensor | None, plan_handle: int,
 ) -> None:
     require_prepared(plan_from_handle(plan_handle), LOW_LATENCY_FP8_COMPONENT, x_fp8.device).run(
-        x_fp8, x_sf, weight, weight_sf_f8, out, sf_scratch)
+        x_fp8, x_sf, weight, weight_sf_f8, weight_sf_dg, out, sf_scratch, workspace)
 
 
 @_low_latency_fp8.register_fake
-def _fake_low_latency_fp8(x_fp8, x_sf, weight, weight_sf_f8, out, sf_scratch, plan_handle):
+def _fake_low_latency_fp8(x_fp8, x_sf, weight, weight_sf_f8, weight_sf_dg, out, sf_scratch, workspace, plan_handle):
+    pass
+
+
+@torch.library.custom_op("flare::sm103_low_latency_fp8_bf16", mutates_args=("x_fp8", "sf_scratch", "out", "workspace"))
+def _low_latency_fp8_bf16(
+    x_bf16: torch.Tensor, weight: torch.Tensor, weight_sf_f8: torch.Tensor,
+    x_fp8: torch.Tensor, sf_scratch: torch.Tensor, out: torch.Tensor,
+    workspace: torch.Tensor | None, plan_handle: int,
+) -> None:
+    require_prepared(plan_from_handle(plan_handle), LOW_LATENCY_FP8_COMPONENT, x_bf16.device).run_bf16(
+        x_bf16, weight, weight_sf_f8, x_fp8, sf_scratch, out, workspace)
+
+
+@_low_latency_fp8_bf16.register_fake
+def _fake_low_latency_fp8_bf16(x_bf16, weight, weight_sf_f8, x_fp8, sf_scratch, out, workspace, plan_handle):
     pass
 
 
 class LowLatencyFP8Linear(nn.Module):
-    """Wrap a DeepInfer FP8 ReplicatedLinear to run FlashInfer low-latency GEMM for M <= 8."""
+    """Wrap a DeepInfer FP8 ReplicatedLinear to run tuned SM103 FlashInfer GEMMs for M <= 64."""
 
-    def __init__(self, base, rows_list, *, session, name: str):
+    def __init__(self, base, rows_list, *, session, name: str,
+                 pre_swizzled_input: bool = False, bf16_input: bool = False):
         super().__init__()
         self.base = base
         self.input_size = base.input_size
         self.output_size = base.output_size
         self.use_fp32_output = base.use_fp32_output
+        self.pre_swizzled_input = pre_swizzled_input
+        self.bf16_input = bf16_input
         device = base.weight.device
         sf_f8 = persistent_copy(deepgemm_weight_sf_to_f8_128x4(
             base.weight.sf, self.output_size, self.input_size))
@@ -811,28 +943,71 @@ class LowLatencyFP8Linear(nn.Module):
         self._plans = {}
         requests = []
         for rows in sorted({r for r in rows_list if 1 <= r <= LOW_LATENCY_FP8_MAX_ROWS}):
-            query = LowLatencyFP8Query(rows, self.input_size, self.output_size)
+            query = LowLatencyFP8Query(
+                rows, self.input_size, self.output_size,
+                pre_swizzled_input=pre_swizzled_input, bf16_input=bf16_input,
+            )
             op_plan = low_latency_fp8_plan(query, device)
             self._plans[rows] = op_plan
 
             def make_prepare(rows=rows, k=self.input_size, n=self.output_size):
                 def prepare(state):
-                    aligned_m = ((rows * 4 + 15) // 16) * 16 // 4
-                    x_fp8 = torch.zeros((rows, k), dtype=torch.float8_e4m3fn, device=device)
-                    x_sf = torch.empty_strided((rows, k // 128), (1, aligned_m), dtype=torch.int32, device=device)
-                    x_sf.fill_(0x7F7F7F7F)
-                    out = torch.empty((rows, n), dtype=torch.bfloat16, device=device)
-                    sf_scratch = torch.empty((128 * (k // 128),), dtype=torch.int32, device=device)
+                    from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
 
-                    def produce():
-                        x_fp8.zero_()
+                    out = torch.empty((rows, n), dtype=torch.bfloat16, device=device)
+                    workspace = (torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
+                                 if state.needs_workspace else None)
+                    if bf16_input:
+                        x_bf16 = torch.zeros((rows, k), dtype=torch.bfloat16, device=device)
+                        if state.backend == "deep_gemm":
+                            from deepinfer.model_executor.layers.linear import cast_fp8
+
+                            def run_dg():
+                                xf, xs = cast_fp8(x_bf16)
+                                state.run(xf, xs, base.weight, self.weight_sf_f8, base.weight.sf,
+                                          out, None, workspace)
+
+                            return PreparedCall(
+                                run=run_dg,
+                                produce=x_bf16.zero_,
+                                output=out,
+                                owners=(base.weight, base.weight.sf, self.weight_sf_f8),
+                            )
+                        x_fp8 = torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device)
+                        sf_scratch = torch.empty((128 * (k // 128),), dtype=torch.int32, device=device)
+                        return PreparedCall(
+                            run=lambda: state.run_bf16(x_bf16, base.weight, self.weight_sf_f8,
+                                                       x_fp8, sf_scratch, out, workspace),
+                            produce=x_bf16.zero_,
+                            output=out,
+                            owners=(base.weight, base.weight.sf, self.weight_sf_f8),
+                        )
+
+                    x_fp8 = torch.zeros((rows, k), dtype=torch.float8_e4m3fn, device=device)
+                    if pre_swizzled_input and state.backend != "deep_gemm":
+                        x_sf = torch.full((128 * (k // 128) * 4,), 0x7F, dtype=torch.uint8, device=device)
+                        sf_scratch = None
+
+                        def produce():
+                            x_fp8.zero_()
+                            x_sf.fill_(0x7F)
+                    else:
+                        aligned_m = ((rows * 4 + 15) // 16) * 16 // 4
+                        x_sf = torch.empty_strided((rows, k // 128), (1, aligned_m), dtype=torch.int32, device=device)
                         x_sf.fill_(0x7F7F7F7F)
+                        sf_scratch = (None if state.backend == "deep_gemm"
+                                      else torch.empty((128 * (k // 128),), dtype=torch.int32, device=device))
+
+                        def produce():
+                            x_fp8.zero_()
+                            x_sf.fill_(0x7F7F7F7F)
 
                     return PreparedCall(
-                        run=lambda: state.run(x_fp8, x_sf, base.weight, self.weight_sf_f8, out, sf_scratch),
+                        run=lambda: state.run(x_fp8, x_sf, base.weight, self.weight_sf_f8, base.weight.sf,
+                                              out, sf_scratch, workspace),
                         produce=produce,
                         output=out,
-                        owners=(base.weight, self.weight_sf_f8),
+                        owners=(base.weight, base.weight.sf, self.weight_sf_f8),
                     )
                 return prepare
 
@@ -840,6 +1015,14 @@ class LowLatencyFP8Linear(nn.Module):
             requests.append(op_plan.request(name=f"{name}.m{rows}", prepare_call=prep, benchmark_call=prep))
         if requests:
             declare(session, tuple(requests))
+
+    def prefers_f8_128x4_scales(self, rows: int) -> bool:
+        """Whether this projection executes a FlashInfer MXFP8 kernel for ``rows``."""
+        op_plan = self._plans.get(rows)
+        if op_plan is None:
+            return False
+        state = require_prepared(op_plan, LOW_LATENCY_FP8_COMPONENT, self.base.weight.device)
+        return state.backend != "deep_gemm"
 
     @property
     def weight(self):
@@ -855,16 +1038,39 @@ class LowLatencyFP8Linear(nn.Module):
                 rows = x.shape[0] if x.ndim == 2 else 0
             else:
                 rows = x[0].shape[0] if x[0].ndim == 2 else 0
-            plan = self._plans.get(rows)
-            if plan is not None:
+            op_plan = self._plans.get(rows)
+            if op_plan is not None:
+                state = require_prepared(op_plan, LOW_LATENCY_FP8_COMPONENT, self.base.weight.device)
                 if isinstance(x, torch.Tensor):
+                    if (state.backend != "deep_gemm" and self.bf16_input
+                            and x.dtype == torch.bfloat16 and x.stride(1) == 1):
+                        x_fp8 = torch.empty((rows, self.input_size), dtype=torch.float8_e4m3fn, device=x.device)
+                        sf_scratch = torch.empty((128 * (self.input_size // 128),), dtype=torch.int32, device=x.device)
+                        out = torch.empty((rows, self.output_size), dtype=torch.bfloat16, device=x.device)
+                        workspace = None
+                        if state.needs_workspace:
+                            from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+                            workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=x.device)
+                        _low_latency_fp8_bf16(x, self.base.weight, self.weight_sf_f8,
+                                              x_fp8, sf_scratch, out, workspace, op_plan.handle)
+                        return out
                     from deepinfer.model_executor.layers.linear import cast_fp8
                     x_fp8, x_sf = cast_fp8(x)
                 else:
                     x_fp8, x_sf = x
-                if x_fp8.is_contiguous() and x_sf.dtype == torch.int32 and x_sf.stride(0) == 1:
+                pre_swizzled = x_sf.dtype == torch.uint8 and x_sf.ndim == 1
+                if state.backend == "deep_gemm":
+                    if not pre_swizzled:
+                        return self.base((x_fp8, x_sf), out_acc=None)
+                elif x_fp8.is_contiguous() and (pre_swizzled or (x_sf.dtype == torch.int32 and x_sf.stride(0) == 1)):
                     out = torch.empty((rows, self.output_size), dtype=torch.bfloat16, device=x_fp8.device)
-                    sf_scratch = torch.empty((128 * (self.input_size // 128),), dtype=torch.int32, device=x_fp8.device)
-                    _low_latency_fp8(x_fp8, x_sf, self.base.weight, self.weight_sf_f8, out, sf_scratch, plan.handle)
+                    sf_scratch = None if pre_swizzled else torch.empty(
+                        (128 * (self.input_size // 128),), dtype=torch.int32, device=x_fp8.device)
+                    workspace = None
+                    if state.needs_workspace:
+                        from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+                        workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=x_fp8.device)
+                    _low_latency_fp8(x_fp8, x_sf, self.base.weight, self.weight_sf_f8, self.base.weight.sf,
+                                     out, sf_scratch, workspace, op_plan.handle)
                     return out
         return self.base(x, out_acc=out_acc)

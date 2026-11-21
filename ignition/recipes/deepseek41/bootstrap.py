@@ -480,18 +480,20 @@ def _prepare_reference_rank(snapshot, config, *, rank, group, progress=None, cor
     return _assemble_reference_prepared_model(model, config=config, metadata_path=metadata_path,
         snapshot_name=snapshot.name, identity=identity, session=session, core_storage=core_storage,
         sequence=sequence, frame=frame, weights_bytes=weights_bytes, tier_bytes=tier_bytes,
-        has_vision=model_config.vision is not None, progress=progress)
+        has_vision=model_config.vision is not None, progress=progress,
+        compute_sm_count=compute_sm_count)
 
 
 def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot_name, identity,
                                        session, core_storage, sequence, frame, weights_bytes,
-                                       tier_bytes, has_vision=True, progress=None):
+                                       tier_bytes, has_vision=True, progress=None,
+                                       compute_sm_count=0):
     from ignition.components.speculation import SpeculativeRngState
     from ignition.preparation.compilation import _OPTIONS as _COMPILE_OPTIONS
     from ignition.preparation.tensor_metadata import record_numeric_tensor
     from .reference_cache import ReferenceCacheLayout, ReferenceCacheStorage, ReferenceCacheTransaction
     from .reference_engram import ReferenceEngramHistory
-    from .reference_generation import ReferenceGeneration
+    from .reference_generation import ReferenceGeneration, ReferencePrefill
     from .reference_model import declare_reference_weights
     from .reference_resume import ReferenceResume
     from .reference_speculation import ReferenceSpeculation
@@ -500,22 +502,35 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
     device = torch.device("cuda", config.devices[0])
     shard = TensorParallelShard(0, 1)
     experts, delivery = model.experts, model.delivery
+    if compute_sm_count == 0 and experts.mover is not None:
+        from ignition.components.sm103_expert_mover import query_green_context_compute_sms
+
+        _, compute_sm_count = query_green_context_compute_sms(
+            device.index, experts.mover.worker_sm_count
+        )
     dspark_loaded = config.dspark and config.draft_tokens > 0
     modes = serving_modes(config.dspark, config.mtp_only)
 
     transient = contextlib.ExitStack()
     transient.enter_context(core_storage.transient())
     _bind_reference_draft_heads(model, config)
+    from ignition.components.sm103_projection import LOW_LATENCY_FP8_MAX_ROWS
+
     target_small_rows = sorted({
-        *(r for r in config.batch_capacities if r <= 8),
-        *(b for b, _ in config.speculative_shapes if b <= 8),
-        *(t for _, _, t in config.packed_speculative_depth_shapes if t <= 8),
+        *(r for r in config.batch_capacities if r <= LOW_LATENCY_FP8_MAX_ROWS),
+        *(b for b, _ in config.speculative_shapes if b <= LOW_LATENCY_FP8_MAX_ROWS),
+        *(t for _, _, t in config.packed_speculative_depth_shapes if t <= LOW_LATENCY_FP8_MAX_ROWS),
     })
     draft_small_rows = sorted({
-        b * (w - 1) for b, w, _ in config.packed_speculative_depth_shapes if 1 <= b * (w - 1) <= 8
+        b * (w - 1) for b, w, _ in config.packed_speculative_depth_shapes
+        if 1 <= b * (w - 1) <= LOW_LATENCY_FP8_MAX_ROWS
     })
     model.bind_low_latency_fp8_projections(
         target_rows=target_small_rows, draft_rows=draft_small_rows, session=session)
+    sm103_decode_resources = model.bind_sm103_decode_optimizations(
+        target_rows=target_small_rows, draft_rows=draft_small_rows,
+        kernel_cache=config.kernel_cache, session=session,
+        stream_overlap=config.stream_overlap, compute_sm_count=compute_sm_count)
     with phase(progress, "Allocate reference model state"):
         verification_width = max(config.speculative_widths) if dspark_loaded else 1
         geometry = ReferenceCacheLayout.from_config(model.cfg, verification_width=verification_width,
@@ -600,10 +615,13 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
         model.bind_prefill_staging(expert_stagers, min_rows=1024 if staging is None else staging.min_rows)
 
     forwards, signatures = {}, {}
+    deferred_prefill = model.yoco_keep_tokens is not None
     count = (len(modes) * (len(config.prefill_capacities) + 4 * len(config.batch_capacities))
              + len(config.speculative_shapes) + len(config.packed_speculative_depth_shapes)
              + (len(config.batch_capacities) if False in modes else 0)
              + (len(PATCH_CAPACITIES) if vision_state is not None else 0))
+    if deferred_prefill:
+        count += len(modes) * len(config.prefill_capacities)
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)
     confidence = rng = proposal_generation = proposal_offset = None
@@ -638,6 +656,10 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
                         speculation_enabled=enabled)
                     fields = ((*forward_inputs, "vision_token_indices", "vision_feature_slot")
                               if mode == "prefill" and vision_state is not None else forward_inputs)
+                    if kind == "prefill" and deferred_prefill:
+                        add("terminal_" + name, forward, "terminal_prefill", rows, capacity, fields, enabled=enabled)
+                        forward = ReferencePrefill(model, batch_op, history, completion, frame, sequence,
+                            vision=vision_state, speculation_enabled=enabled)
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
 
         if config.dspark:
@@ -758,35 +780,38 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             _ks = torch.zeros((1,), dtype=torch.int32, device=device)
             _ke = torch.zeros((1,), dtype=torch.int32, device=device)
             _sblk = torch.zeros((1, 4), dtype=torch.int32, device=device)
-        with torch.cuda.stream(stream):
-            if hasattr(_dg, "mega_mhc"):
-                _dg.mega_mhc(
-                    _x, _res, None, _pm, _cm,
-                    fn=_fn, mix_scales=_ms, mix_bases=_mb, hc_mult=_hc,
-                    hc_norm_eps=1e-20, hc_pre_eps=1e-6, hc_post_scale=2.0,
-                    sinkhorn_eps=1e-6, num_sinkhorn_iters=20,
-                    rmsnorm_weight=_nw, rmsnorm_eps=1e-20, rmsnorm_scale=1.0,
-                    new_residual=_nres, new_prev_mix=None, new_post_mix=_npm,
-                    new_comb_res_mix=_ncm, y_bf16=_y,
-                )
-            if hasattr(_dg, "bf16_mega_gate"):
-                _dg.bf16_mega_gate(
-                    _x, _gw, num_topk=_k, use_shared_as_routed=False,
-                    num_shared_experts=0, routed_scaling_factor=1.0,
-                    ep_rank=0, scoring_func="sqrtsoftplus", out=(_gids, _gprob),
-                )
-            if hasattr(_dg, "get_sparse_mqa_logits_metadata"):
-                _dg.get_sparse_mqa_logits_metadata(
-                    _ks, _ke, 0, _sblk, torch.float8_e4m3fn, 16,
-                )
-        stream.synchronize()
+        seed_streams = (stream, *(r for r in sm103_decode_resources if isinstance(r, torch.cuda.Stream)))
+        for _seed_stream in seed_streams:
+            with torch.cuda.stream(_seed_stream):
+                if hasattr(_dg, "mega_mhc"):
+                    _dg.mega_mhc(
+                        _x, _res, None, _pm, _cm,
+                        fn=_fn, mix_scales=_ms, mix_bases=_mb, hc_mult=_hc,
+                        hc_norm_eps=1e-20, hc_pre_eps=1e-6, hc_post_scale=2.0,
+                        sinkhorn_eps=1e-6, num_sinkhorn_iters=20,
+                        rmsnorm_weight=_nw, rmsnorm_eps=1e-20, rmsnorm_scale=1.0,
+                        new_residual=_nres, new_prev_mix=None, new_post_mix=_npm,
+                        new_comb_res_mix=_ncm, y_bf16=_y,
+                    )
+                if _seed_stream is stream:
+                    if hasattr(_dg, "bf16_mega_gate"):
+                        _dg.bf16_mega_gate(
+                            _x, _gw, num_topk=_k, use_shared_as_routed=False,
+                            num_shared_experts=0, routed_scaling_factor=1.0,
+                            ep_rank=0, scoring_func="sqrtsoftplus", out=(_gids, _gprob),
+                        )
+                    if hasattr(_dg, "get_sparse_mqa_logits_metadata"):
+                        _dg.get_sparse_mqa_logits_metadata(
+                            _ks, _ke, 0, _sblk, torch.float8_e4m3fn, 16,
+                        )
+            _seed_stream.synchronize()
         del (_x, _res, _pm, _cm, _fn, _ms, _mb, _nw, _nres, _npm, _ncm, _y,
              _gw, _gids, _gprob, _ks, _ke, _sblk)
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=None, coordinator=None, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=core_storage, compile_options=compile_options,
-            compile_kinds=("prefill", "decode", "resume", "speculative", "vision"))
+            compile_kinds=("terminal_prefill", "prefill", "decode", "resume", "speculative", "vision"))
         persistent_worker = None
         if experts.mover is not None:
             persistent_worker = experts.mover.capture_worker_graph(
@@ -818,7 +843,8 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency,
             page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None, rows=1,
-            embedding_tables=range(len(delivery.sources)))}
+            embedding_tables=range(len(delivery.sources)),
+            terminal_prefill_min_tokens=model.yoco_keep_tokens)}
     staging_estimate = 0
     if config.sm103 is not None and config.sm103.prefill_staging is not None:
         from types import SimpleNamespace
@@ -882,7 +908,8 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
         core_data=delivery,
         resources=(model, experts, experts.mover, delivery, history, pool, requests, inputs, admission, commands,
             forwards, compiled, stream, graph_pool, session, rng, proposal_generation, proposal_offset,
-            confidence, vision_state, vision_inputs, vision_prefill, feature_pool),
+            confidence, vision_state, vision_inputs, vision_prefill, feature_pool,
+            *sm103_decode_resources),
         close_resources=())
     if confidence is not None:
         prepared.proposal_confidence = confidence.host_view

@@ -352,7 +352,7 @@ class ReferenceModel(nn.Module):
         self.stage_min_rows = min_rows
 
     def bind_low_latency_fp8_projections(self, *, target_rows, draft_rows=(), session):
-        """Wrap eligible FP8 attention projections with SM103 low-latency GEMMs for M <= 8."""
+        """Wrap eligible FP8 attention and draft projections with tuned SM103 GEMMs for M <= 64."""
         from deepinfer.model_executor.layers.linear import ReplicatedLinear
         from ignition.components.sm103_projection import (
             LOW_LATENCY_FP8_MAX_ROWS, LowLatencyFP8Linear, is_sm103,
@@ -363,29 +363,230 @@ class ReferenceModel(nn.Module):
         small_target = tuple(sorted({r for r in target_rows if 1 <= r <= LOW_LATENCY_FP8_MAX_ROWS}))
         small_draft = tuple(sorted({r for r in draft_rows if 1 <= r <= LOW_LATENCY_FP8_MAX_ROWS}))
 
+        def wrap_linear(owner, attr, rows, full_name, *, pre_swizzled_input=False, bf16_input=False):
+            mod = getattr(owner, attr, None)
+            if (isinstance(mod, ReplicatedLinear)
+                    and mod.weight.dtype == torch.float8_e4m3fn
+                    and mod.bias is None and not mod.use_fp32_output
+                    and mod.input_size % 128 == 0 and mod.output_size % 128 == 0):
+                setattr(owner, attr, LowLatencyFP8Linear(
+                    mod, rows, session=session, name=full_name,
+                    pre_swizzled_input=pre_swizzled_input, bf16_input=bf16_input,
+                ))
+
         def wrap_attention(attn, rows, prefix):
             if not rows:
                 return
-            for attr in ("q_a_kv_swa_proj", "q_a_kv_proj", "kv_swa_proj", "q_b_proj", "out_proj"):
-                mod = getattr(attn, attr, None)
-                if (isinstance(mod, ReplicatedLinear)
-                        and mod.weight.dtype == torch.float8_e4m3fn
-                        and mod.bias is None and not mod.use_fp32_output
-                        and mod.input_size % 128 == 0 and mod.output_size % 128 == 0):
-                    setattr(attn, attr, LowLatencyFP8Linear(mod, rows, session=session, name=f"{prefix}.{attr}"))
+            for attr, pre_swz, bf16_in in (
+                ("q_a_kv_swa_proj", True, False),
+                ("q_a_kv_proj", True, False),
+                ("kv_swa_proj", True, True),
+                ("q_b_proj", True, False),
+                ("out_proj", False, False),
+            ):
+                wrap_linear(attn, attr, rows, f"{prefix}.{attr}",
+                            pre_swizzled_input=pre_swz, bf16_input=bf16_in)
 
         for index, layer in enumerate(self.model.layers):
             wrap_attention(layer.self_attn, small_target, f"layers.{index}.attn")
-        if self.draft is not None and small_draft:
-            for index, layer in enumerate(self.draft.layers):
-                wrap_attention(layer.self_attn, small_draft, f"mtp.{index}.attn")
+            if layer.engram is not None and small_target:
+                wrap_linear(layer.engram, "fused_kv_projection", small_target,
+                            f"layers.{index}.engram.fused_kv_projection", pre_swizzled_input=False)
+        if self.draft is not None:
+            if small_target:
+                wrap_linear(self.draft, "projection", small_target, "mtp.projection",
+                            pre_swizzled_input=True, bf16_input=True)
+                wrap_linear(self.draft, "main_kv_proj", small_target, "mtp.main_kv_proj",
+                            pre_swizzled_input=True, bf16_input=False)
+            if small_draft:
+                for index, layer in enumerate(self.draft.layers):
+                    wrap_attention(layer.self_attn, small_draft, f"mtp.{index}.attn")
 
-    def forward(self, caches, metadata, hidden_states=None, *, speculation_enabled=True):
+    def bind_sm103_decode_optimizations(self, *, target_rows, draft_rows=(), kernel_cache,
+                                        session, stream_overlap: bool = True, compute_sm_count: int = 0):
+        """Bind SM103 direct F8_128x4 norms, fused decode attention, and overlapped mHC seams.
+
+        Returns non-picklable lifetime owners (auxiliary CUDA streams and shared workspaces)
+        for the caller to retain in ``PreparedModel.resources``.
+        """
+        from deepinfer.model_executor.layers.layernorm import RMSNorm
+        from ignition.components.mega_attention import (
+            MEGA_ATTENTION_MAX_ROWS, MegaAttentionDecoder, MegaAttentionWorkspace,
+        )
+        from ignition.components.sm103_mhc_overlap import (
+            MHC_SEAM_MAX_ROWS, FastRMSNormF8, bind_indexer_kv_overlap,
+            bind_mhc_overlap_layer, bind_swa_kv_overlap,
+        )
+        from ignition.components.sm103_projection import is_sm103
+        from ignition.components.sm103_router import SM103RouterWorkspace, supports_sm103_router
+
+        device = self.lm_head.weight.device
+        if not is_sm103(device):
+            return ()
+        resources = []
+        small_target = tuple(sorted({r for r in target_rows if 1 <= r <= MHC_SEAM_MAX_ROWS}))
+        small_draft = tuple(sorted({r for r in draft_rows if 1 <= r <= MHC_SEAM_MAX_ROWS}))
+        attn_rows = tuple(r for r in small_target if r <= MEGA_ATTENTION_MAX_ROWS)
+        yoco_boundary = self.model.yoco_boundary_layer_idx
+        skip_yoco_boundary_attn = (self.yoco_keep_tokens is not None and yoco_boundary is not None)
+
+        def wrap_rmsnorm(owner, norm_attr, consumer, rows, full_name, *, return_bf16=False):
+            norm = getattr(owner, norm_attr, None)
+            if (rows and isinstance(norm, RMSNorm) and norm.use_fp8
+                    and norm.weight.dtype == torch.bfloat16 and norm.weight.numel() % 128 == 0
+                    and consumer is not None and hasattr(consumer, "prefers_f8_128x4_scales")):
+                setattr(owner, norm_attr, FastRMSNormF8(
+                    norm, consumer, rows, session=session, name=full_name, return_bf16=return_bf16))
+
+        for index, layer in enumerate(self.model.layers):
+            wrap_rmsnorm(layer.self_attn, "q_a_norm", getattr(layer.self_attn, "q_b_proj", None),
+                         small_target, f"layers.{index}.attn.q_a_norm")
+            if (index == 0 or layer.engram is not None or not stream_overlap
+                    or (skip_yoco_boundary_attn and index == yoco_boundary)):
+                attn_consumer = (getattr(layer.self_attn, "q_a_kv_swa_proj", None)
+                                 or getattr(layer.self_attn, "q_a_kv_proj", None))
+                wrap_rmsnorm(layer, "attn_layernorm", attn_consumer, small_target,
+                             f"layers.{index}.attn_layernorm", return_bf16=True)
+        if self.draft is not None:
+            wrap_rmsnorm(self.draft, "projection_norm", getattr(self.draft, "main_kv_proj", None),
+                         small_target, "mtp.projection_norm")
+            for index, layer in enumerate(self.draft.layers):
+                wrap_rmsnorm(layer.self_attn, "q_a_norm", getattr(layer.self_attn, "q_b_proj", None),
+                             small_draft, f"mtp.{index}.attn.q_a_norm")
+                if index == 0 or not stream_overlap:
+                    attn_consumer = (getattr(layer.self_attn, "q_a_kv_swa_proj", None)
+                                     or getattr(layer.self_attn, "q_a_kv_proj", None))
+                    wrap_rmsnorm(layer, "attn_layernorm", attn_consumer, small_draft,
+                                 f"mtp.{index}.attn_layernorm", return_bf16=True)
+
+        if attn_rows and kernel_cache is not None:
+            workspace = MegaAttentionWorkspace(
+                max(attn_rows), device=device, compute_sm_count=compute_sm_count)
+            resources.append(workspace)
+            for index, layer in enumerate(self.model.layers):
+                attn = layer.self_attn
+                if not (getattr(attn, "use_swa", False) and getattr(attn, "has_packed_kv", False)
+                        and getattr(attn, "is_sparse", False)
+                        and getattr(attn, "use_fused_norm_rope_attn_rope_cast", False)
+                        and not getattr(attn, "use_q_b_norm", True)
+                        and attn.num_heads == 64 and attn.qk_head_dim == 512
+                        and attn.qk_rope_head_dim == 64 and attn.n_wv_group == 8
+                        and not attn.rotary_emb.is_neox_style
+                        and attn.rotary_emb.cos_sin_cache.dtype == torch.float32
+                        and attn.attn_sink_params is not None
+                        and attn.attn_sink_params.dtype == torch.float32):
+                    continue
+                decoder = MegaAttentionDecoder(
+                    attn_rows, scale=attn.softmax_scale, workspace=workspace,
+                    kernel_cache=kernel_cache, session=session,
+                    name=f"layers.{index}.mega_attn", compressed=True,
+                    swa_width=attn.window_size, comp_width=attn.layer_cfg.get("index_topk", 512),
+                    token_interleaved=True, compute_sm_count=compute_sm_count,
+                )
+                resources.append(decoder)
+                attn._decode_attention = _BoundMegaDecodeAttention(attn, decoder)
+
+        if kernel_cache is not None and (small_target or small_draft):
+            router_layers = []
+            for index, layer in enumerate(self.model.layers):
+                mlp = layer.mlp
+                if hasattr(mlp, "bind_sm103_router") and small_target:
+                    first_op = next(iter(mlp.operations.values()))
+                    g = first_op.workspace.geometry
+                    if supports_sm103_router(int(mlp.weight.shape[0]), int(g.hidden), int(g.top_k)):
+                        router_layers.append((mlp, small_target, f"layers.{index}.router"))
+            if self.draft is not None and small_draft:
+                for index, layer in enumerate(self.draft.layers):
+                    mlp = layer.mlp
+                    if hasattr(mlp, "bind_sm103_router"):
+                        first_op = next(iter(mlp.operations.values()))
+                        g = first_op.workspace.geometry
+                        if supports_sm103_router(int(mlp.weight.shape[0]), int(g.hidden), int(g.top_k)):
+                            router_layers.append((mlp, small_draft, f"mtp.{index}.router"))
+            if router_layers:
+                max_router_rows = max(max(rows) for _, rows, _ in router_layers)
+                max_router_experts = max(int(mlp.weight.shape[0]) for mlp, _, _ in router_layers)
+                router_ws = SM103RouterWorkspace(
+                    max_rows=max_router_rows, max_experts=max_router_experts, device=device,
+                )
+                resources.append(router_ws)
+                for mlp, rows, rname in router_layers:
+                    plans = mlp.bind_sm103_router(
+                        rows, workspace=router_ws, kernel_cache=kernel_cache,
+                        session=session, name=rname,
+                    )
+                    resources.extend(plans)
+
+        if stream_overlap and (small_target or small_draft):
+            aux_stream = torch.cuda.Stream(device=device)
+            aux_kv_stream = torch.cuda.Stream(device=device)
+            resources.extend((aux_stream, aux_kv_stream))
+            num_layers = len(self.model.layers)
+            for index, layer in enumerate(self.model.layers):
+                allow_attn = (index > 0 and layer.engram is None
+                              and not (skip_yoco_boundary_attn and index == yoco_boundary))
+                join_after = (index == num_layers - 1 or (yoco_boundary is not None and index == yoco_boundary - 1))
+                bind_mhc_overlap_layer(
+                    layer, small_target, aux_stream=aux_stream, session=session,
+                    name=f"layers.{index}", allow_attn_overlap=allow_attn,
+                    allow_ffn_overlap=True, join_after_forward=join_after, is_draft=False,
+                )
+                bind_swa_kv_overlap(layer.self_attn, small_target, aux_stream=aux_stream, is_draft=False)
+                bind_indexer_kv_overlap(layer.self_attn, small_target, aux_kv_stream=aux_kv_stream)
+            if self.draft is not None and small_draft:
+                draft_count = len(self.draft.layers)
+                for index, layer in enumerate(self.draft.layers):
+                    bind_mhc_overlap_layer(
+                        layer, small_draft, aux_stream=aux_stream, session=session,
+                        name=f"mtp.{index}", allow_attn_overlap=(index > 0),
+                        allow_ffn_overlap=True, join_after_forward=(index == draft_count - 1),
+                        is_draft=True,
+                    )
+                    bind_swa_kv_overlap(layer.self_attn, small_draft, aux_stream=aux_stream, is_draft=True)
+        return tuple(resources)
+
+    def forward(self, caches, metadata, hidden_states=None, *, speculation_enabled=True, terminal=True):
         from deepinfer.model_executor.models.deepseek_vl import DeepseekVLForCausalLM
 
         if hidden_states is None and metadata.is_prompt:
             hidden_states = DeepseekVLForCausalLM.get_input_embeddings(self, metadata)
-        dflash = self.draft if speculation_enabled else None
+        dflash = self.draft if speculation_enabled and terminal else None
         return self.model(caches, metadata, hidden_states=hidden_states, dflash=dflash,
-                          expert_stagers=self.expert_stagers,
+                          terminal=terminal, expert_stagers=self.expert_stagers,
                           stage_min_rows=self.stage_min_rows)
+
+
+class _BoundMegaDecodeAttention:
+    """Picklable decode-attention dispatcher for token-interleaved SM103 MegaAttention."""
+
+    def __init__(self, attn, decoder):
+        self.attn = attn
+        self.decoder = decoder
+
+    def __call__(self, q_b, kv_ca_index, kv_swa_index, kv_cache, input_metadata):
+        attn = self.attn
+        decoder = self.decoder
+        rows = q_b.shape[0]
+        if (decoder.supports(rows) and q_b.ndim == 3
+                and q_b.stride(1) == 512 and q_b.stride(2) == 1
+                and q_b.stride(0) >= 64 * 512 and q_b.stride(0) % 8 == 0
+                and kv_swa_index is not None and kv_ca_index is not None
+                and kv_cache.swa_cache is not None and kv_cache.ca_cache is not None
+                and kv_swa_index.shape[1] == decoder.swa_width
+                and kv_ca_index.shape[1] == decoder.comp_width
+                and kv_cache.swa_cache.shape[-1] == 528 and kv_cache.ca_cache.shape[-1] == 288):
+            cache_lens = getattr(input_metadata, "_mega_attn_comp_lens", None)
+            if cache_lens is None:
+                cache_lens = {}
+                input_metadata._mega_attn_comp_lens = cache_lens
+            comp_lens = cache_lens.get(attn.ratio_key)
+            if comp_lens is None:
+                klen = input_metadata.klen[attn.ratio_key]
+                comp_lens = torch.where(klen > 0, decoder.comp_width, 0).to(torch.int32)
+                cache_lens[attn.ratio_key] = comp_lens
+            return decoder(
+                q_b, input_metadata.positions, attn.rotary_emb.cos_sin_cache,
+                attn.attn_sink_params, kv_cache.swa_cache.squeeze(2), kv_swa_index,
+                kv_cache.ca_cache.squeeze(2), kv_ca_index, comp_lens,
+            )
+        return type(attn)._decode_attention(attn, q_b, kv_ca_index, kv_swa_index, kv_cache, input_metadata)

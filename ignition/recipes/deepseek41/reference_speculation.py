@@ -199,12 +199,19 @@ class ReferenceSpeculation:
                 valid = valid & active[:, None] & (first.starts > 0)[:, None]
                 if self.allocator is not None:
                     priors = torch.cat((prior[:, None], drafts[:, :-1]), dim=1) if depth > 1 else prior[:, None]
-                    markov_embs = self.model.draft.markov_w1(priors.reshape(-1)).view(self.rows, depth, -1)
-                    draft_hidden_3d = draft_hidden.view(self.rows, depth, -1)
-                    for index in range(depth):
-                        confidences.append(self.model.draft.confidence_head(
-                            draft_hidden_3d[:, index].contiguous(),
-                            markov_embs[:, index].contiguous(), step_i=index))
+                    markov_embs = self.model.draft.markov_w1(priors.reshape(-1))
+                    temps = self.model.draft.confidence_head.temperature[:depth]
+                    if len(set(temps)) == 1:
+                        confidence = self.model.draft.confidence_head(
+                            draft_hidden.contiguous(), markov_embs, step_i=0).view(self.rows, depth)
+                    else:
+                        markov_3d = markov_embs.view(self.rows, depth, -1)
+                        draft_hidden_3d = draft_hidden.view(self.rows, depth, -1)
+                        for index in range(depth):
+                            confidences.append(self.model.draft.confidence_head(
+                                draft_hidden_3d[:, index].contiguous(),
+                                markov_3d[:, index].contiguous(), step_i=index))
+                        confidence = torch.stack(confidences, 1)
             else:
                 sampled = torch.empty(self.rows, dtype=torch.int32, device=pending.device)
                 row_valid = torch.empty(self.rows, dtype=torch.bool, device=pending.device)
@@ -234,17 +241,24 @@ class ReferenceSpeculation:
                 finished = ((slots >= 0) & (slots < state.capacity)
                     & (b.row_generations[:self.rows] == state.generation[safe]) & (state.status[safe] == 2))
                 submitted = (torch.arange(self.rows, device=pending.device) < b.live_rows) & ~finished
-                confidence = torch.stack(confidences, 1)
+                if self.markov_proposals is None:
+                    confidence = torch.stack(confidences, 1)
                 source_valid = active & valid.all(1)
                 confidence = confidence.masked_fill(~submitted[:, None], 0.)
                 self.confidence_output.index_copy_(0, self.frame.long(), torch.nn.functional.pad(confidence,
                     (0, self.confidence_output.shape[2] - depth, 0, state.capacity - self.rows)).unsqueeze(0))
                 admitted = self.allocator(confidence, slots, submitted, source_valid,
                     self.prefix_limits[:self.rows], b.query_lengths[:self.rows])
-                b.query_lengths[:self.rows].copy_(torch.where(admitted, b.query_lengths[:self.rows], 0))
-                validation, present = self.batch.validate()
-                self.batch.begin(validation, present=present)
-                limits = torch.where(admitted, b.query_lengths[:self.rows], 0)
+                new_lengths = torch.where(admitted, b.query_lengths[:self.rows], 0)
+                b.query_lengths[:self.rows].copy_(new_lengths)
+                # Prefix limits, pages, state rows, duplicates, and pending tokens were already validated
+                # above; the only newly rejected rows are active rows that prefix allocation failed to admit.
+                rejected_row = active & (~admitted | (new_lengths <= 0) | (new_lengths > width))
+                slot_ids = torch.arange(state.capacity, device=pending.device)
+                bad_slots = present & ((slot_ids[:, None] == slots[None, :]) & rejected_row[None, :]).any(1)
+                state.status.copy_(torch.where(bad_slots, 2, state.status))
+                state.error_code.copy_(torch.where(bad_slots, 32, state.error_code))
+                limits = torch.where(admitted & active, new_lengths, 0)
         else:
             offered = saved = None
             base_logits = torch.zeros((self.rows, 0, state.vocab_size), dtype=torch.float32, device=pending.device)

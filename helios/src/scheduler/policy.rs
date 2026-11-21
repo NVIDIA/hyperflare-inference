@@ -136,8 +136,23 @@ impl RequestScheduler {
             return false;
         }
         if smaller.kind == GraphKind::Speculative {
-            let short = short();
-            let long = long();
+            let mut short = short();
+            let mut long = long();
+            let active = smaller.mask.count_ones() as usize;
+            if active > 0 {
+                if smaller.packed_token_capacity != 0 {
+                    let cap = smaller.packed_token_capacity.saturating_sub(active - 1);
+                    for length in &mut short {
+                        *length = (*length).min(cap);
+                    }
+                }
+                if larger.packed_token_capacity != 0 {
+                    let cap = larger.packed_token_capacity.saturating_sub(active - 1);
+                    for length in &mut long {
+                        *length = (*length).min(cap);
+                    }
+                }
+            }
             let gpu = self.gpu_prefix_allocation(smaller.batch, smaller.draft_tokens, smaller.capacity,
                 smaller.packed_token_capacity);
             if gpu && smaller.packed_token_capacity != larger.packed_token_capacity

@@ -1,0 +1,11 @@
+The csrc/ and include/ directories are unchanged ds41 W1 attention sources
+from chronarion/dsv41 commit f8cd311caf3328ed6f4bb158a7c12811e32a06f8:
+https://github.com/chronarion/dsv41/tree/f8cd311caf3328ed6f4bb158a7c12811e32a06f8/kernels/vendor/ds41/w1-attn
+
+The upstream vendor identifies Garner McCloud's dgx-station-recipes,
+deepseek-v4.1-flash recipe, commit 8043a68, as its source. LICENSE.ds41 and
+NOTICE.upstream retain its license and attribution. These are the fused
+SM103 decode-attention kernels selected by DerpSeek's exact profile.
+
+Flare's Python binding builds the extension during model preparation against
+the installed Torch ABI. The carried CUDA implementation is unchanged.

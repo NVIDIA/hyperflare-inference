@@ -116,6 +116,47 @@ class ReferenceExperts(nn.Module):
             if tensor is not None:
                 record_numeric_tensor(tensor)
         self.scaling = float(scaling)
+        self._sm103_router_handles = {}
+        self._sm103_router_part_buf = None
+
+    def bind_sm103_router(self, rows, *, workspace, kernel_cache, session, name):
+        """Bind the high-occupancy SM103 BF16 router for supported decode row counts."""
+        from ignition.components.sm103_router import (
+            declare_sm103_router_plans, supports_sm103_router,
+        )
+
+        first = next(iter(self.operations.values()))
+        g = first.workspace.geometry
+        experts = int(self.weight.shape[0])
+        if (self.placement.shape not in ((experts, 1), (experts,))
+                or not supports_sm103_router(experts, int(g.hidden), int(g.top_k))):
+            return ()
+        eligible = tuple(sorted(r for r in rows if r in self.operations))
+        if not eligible:
+            return ()
+        plans, handles = declare_sm103_router_plans(
+            eligible, experts=experts, hidden=int(g.hidden), top_k=int(g.top_k),
+            workspace=workspace, kernel_cache=kernel_cache, device=self.weight.device,
+            session=session, name=name,
+        )
+        self._sm103_router_handles = handles
+        self._sm103_router_part_buf = workspace.part_buf
+        return plans
+
+    def _run_gate(self, hidden_states_bf16, valid, image_mask, ids, probabilities, *, routes=None):
+        handle = self._sm103_router_handles.get(hidden_states_bf16.shape[0])
+        if handle is not None and self._sm103_router_part_buf is not None:
+            from ignition.components.sm103_router import run_sm103_router
+
+            run_sm103_router(
+                hidden_states_bf16, self.weight, self.bias, self.image_bias,
+                valid, image_mask, self.placement, self._sm103_router_part_buf,
+                ids, probabilities, self.scaling, handle, routes=routes,
+            )
+            return
+        _gate(hidden_states_bf16, self.weight, self.bias, self.image_bias,
+              valid, image_mask, self.placement, self.counts,
+              ids, probabilities, self.scaling)
 
     def _operation(self, rows):
         if rows not in self.operations:
@@ -137,9 +178,8 @@ class ReferenceExperts(nn.Module):
         image_mask = getattr(input_metadata, "images_seq_mask", None)
         if image_mask is not None and self.image_bias is None:
             raise ValueError("image routing requires the checkpoint image bias")
-        _gate(hidden_states_bf16, self.weight, self.bias, self.image_bias,
-              input_metadata.valid_token_mask, image_mask, self.placement, self.counts,
-              ids, probabilities, self.scaling)
+        self._run_gate(hidden_states_bf16, input_metadata.valid_token_mask,
+                       image_mask, ids, probabilities)
         return op.encoded(hidden_states_bf16, hidden_states, staged=expert_stage)
 
 

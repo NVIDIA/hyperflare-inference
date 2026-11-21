@@ -5,7 +5,7 @@
 
 import torch
 
-from ignition.components.sampling import PreparedSampling
+from ignition.components.sampling import PreparedCompletion, PreparedSampling
 from ignition.components.state import save_hidden
 from ignition.recipes.deepseek41.reference_metadata import ReferenceDecodeMetadata, ReferencePrefillMetadata
 
@@ -93,3 +93,55 @@ class ReferenceGeneration:
         self.sampling.run(logits)
         if observe:
             return hidden, logits
+
+
+class ReferencePrefill:
+    """Consume one non-terminal prompt chunk without decoder queries or sampling."""
+
+    def __init__(self, model, batch, history, completion, frame, sequence, *, vision=None,
+                 speculation_enabled=True):
+        if batch.shard.world_size != 1 or batch.mode != "prefill" or batch.verification_width != 1:
+            raise ValueError("reference non-terminal prefill requires one GPU and prefill batching")
+        if batch.requests.vocab_size != model.cfg.vocab_size:
+            raise ValueError("reference prefill vocabulary differs from request storage")
+        if type(speculation_enabled) is not bool:
+            raise TypeError("speculation_enabled must be a boolean")
+        if getattr(model, "yoco_keep_tokens", None) is None:
+            raise ValueError("reference non-terminal prefill requires a YOCO consumer boundary")
+        self.model, self.batch, self.history = model, batch, history
+        self.vision = vision
+        if self.vision is not None and (
+                vision.requests is not batch.requests or vision.inputs is not batch.inputs
+                or vision.token_base != model.cfg.vocab_size
+                or batch.input_vocabulary != vision.token_base + 4
+                or batch.validate_prefill != vision.validate_prefill):
+            raise ValueError("reference image prefill requires validated shared image storage")
+        self.pool = batch.pool
+        self.caches = self.pool.cache_views()
+        self.metadata = ReferencePrefillMetadata(model.cfg, self.pool.geometry)
+        b, rows = batch.inputs, batch.rows
+        self.completion = PreparedCompletion(batch.requests, b.row_slot_ids[:rows],
+            b.row_generations[:rows], b.live_rows, completion, frame, sequence,
+            draft_context_lag=0 if speculation_enabled else None)
+        self.completion.prepare()
+        batch.functional()
+
+    def __call__(self):
+        validation, present = self.batch.validate()
+        packed = self.batch.begin(validation, present=present)
+        images = ((packed.token_ids >= self.vision.token_base) & (packed.positions >= 0)
+                  if self.vision is not None else None)
+        prepared = self.history(packed, images_seq_mask=images)
+        metadata = self.metadata(packed, ngram_token_ids=prepared.ngrams, images_seq_mask=images)
+        embedding = None
+        if self.vision is not None:
+            embedding = self.model.model.embed_tokens(metadata.input_ids)
+            self.vision.inject(packed, embedding)
+        self.model(self.caches, metadata, hidden_states=embedding,
+                   speculation_enabled=False, terminal=False)
+        live = packed.lengths > 0
+        self.history.commit(packed, packed.lengths, prepared)
+        self.batch.finish(packed)
+        save_hidden((packed.starts + packed.lengths)[:, None], self.pool.reserved_region("consumed_tokens"),
+                    packed.state_rows, live)
+        self.completion()
