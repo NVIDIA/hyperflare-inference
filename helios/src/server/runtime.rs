@@ -555,6 +555,10 @@ impl ModelRuntime {
             .engram
             .as_ref()
             .map(|binding| binding.shared.stats());
+        metrics.persistent_worker = manifest
+            .persistent_worker
+            .as_ref()
+            .and_then(crate::execution::PersistentWorkerDescriptor::reader);
         let metrics = Arc::new(metrics);
         metrics.scheduler_trace.configure(&manifest.graphs);
         let worker_metrics = metrics.clone();
@@ -800,6 +804,9 @@ impl ModelRuntime {
     }
     pub(super) fn metrics_handle(&self) -> Arc<super::metrics::Metrics> {
         self.metrics.clone()
+    }
+    pub fn persistent_worker_snapshot(&self) -> Option<crate::execution::PersistentWorkerSnapshot> {
+        self.metrics.persistent_worker_snapshot()
     }
     pub fn wait(&self, timeout: std::time::Duration) -> bool {
         let finished = self.finished.0.lock().unwrap_or_else(|e| e.into_inner());

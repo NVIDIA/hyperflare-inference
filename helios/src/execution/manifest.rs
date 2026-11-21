@@ -229,6 +229,102 @@ impl std::fmt::Debug for CollectiveHealth {
     }
 }
 
+/// Lifecycle state of a persistent worker graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core", feature = "server"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core", feature = "server"),
+    serde(rename_all = "snake_case")
+)]
+pub enum WorkerState {
+    /// Worker resources are bound and ready; the worker graph has not been launched.
+    Idle,
+    /// Worker graph was launched once on `worker_stream` and is active.
+    Running,
+    /// Stop flag was signaled and `worker_stream` is draining.
+    Draining,
+    /// Worker either never launched or observed `stop_flag == 1` and drained cleanly.
+    Stopped,
+    /// `worker_stream` failed to drain; GPU resources must remain retained until process exit.
+    FailedDrain,
+}
+
+impl WorkerState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::FailedDrain => "failed_drain",
+        }
+    }
+
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Running => 1,
+            Self::Draining => 2,
+            Self::Stopped => 3,
+            Self::FailedDrain => 4,
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Running,
+            2 => Self::Draining,
+            3 => Self::Stopped,
+            _ => Self::FailedDrain,
+        }
+    }
+}
+
+/// Lock-free telemetry snapshot from a prepared persistent worker graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core", feature = "server"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+pub struct PersistentWorkerSnapshot {
+    pub name: String,
+    pub worker_sm_count: u32,
+    pub state: WorkerState,
+    pub counters: Vec<u64>,
+}
+
+/// Read-only lock-free handle for sampling persistent worker telemetry from metrics, HTTP, or TUI threads.
+#[derive(Clone)]
+pub struct PersistentWorkerReader {
+    snapshot: std::sync::Arc<dyn Fn() -> PersistentWorkerSnapshot + Send + Sync>,
+}
+
+impl PersistentWorkerReader {
+    pub fn new(
+        snapshot: std::sync::Arc<dyn Fn() -> PersistentWorkerSnapshot + Send + Sync>,
+    ) -> Self {
+        Self { snapshot }
+    }
+
+    pub fn snapshot(&self) -> PersistentWorkerSnapshot {
+        (self.snapshot)()
+    }
+}
+
+impl std::fmt::Debug for PersistentWorkerReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PersistentWorkerReader")
+    }
+}
+
 /// Lifecycle hooks shared between a manifest and its owning `NativeResources` for launching,
 /// draining, and reading mapped-host counters from a prepared persistent worker graph.
 #[derive(Clone)]
@@ -236,6 +332,7 @@ pub struct PersistentWorkerControl {
     start: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
     stop: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
     metrics: std::sync::Arc<dyn Fn() -> Option<Vec<u64>> + Send + Sync>,
+    snapshot: std::sync::Arc<dyn Fn() -> PersistentWorkerSnapshot + Send + Sync>,
 }
 
 impl PersistentWorkerControl {
@@ -243,11 +340,13 @@ impl PersistentWorkerControl {
         start: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
         stop: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
         metrics: std::sync::Arc<dyn Fn() -> Option<Vec<u64>> + Send + Sync>,
+        snapshot: std::sync::Arc<dyn Fn() -> PersistentWorkerSnapshot + Send + Sync>,
     ) -> Self {
         Self {
             start,
             stop,
             metrics,
+            snapshot,
         }
     }
 
@@ -261,6 +360,14 @@ impl PersistentWorkerControl {
 
     pub fn metrics(&self) -> Option<Vec<u64>> {
         (self.metrics)()
+    }
+
+    pub fn snapshot(&self) -> PersistentWorkerSnapshot {
+        (self.snapshot)()
+    }
+
+    pub fn reader(&self) -> PersistentWorkerReader {
+        PersistentWorkerReader::new(std::sync::Arc::clone(&self.snapshot))
     }
 }
 
@@ -295,6 +402,16 @@ pub struct PersistentWorkerDescriptor {
     pub metrics_address: usize,
     /// Shared lifecycle controller bound by `NativeResources`.
     pub control: Option<PersistentWorkerControl>,
+}
+
+impl PersistentWorkerDescriptor {
+    pub fn snapshot(&self) -> Option<PersistentWorkerSnapshot> {
+        self.control.as_ref().map(PersistentWorkerControl::snapshot)
+    }
+
+    pub fn reader(&self) -> Option<PersistentWorkerReader> {
+        self.control.as_ref().map(PersistentWorkerControl::reader)
+    }
 }
 
 #[derive(Clone, Debug)]

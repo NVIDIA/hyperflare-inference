@@ -30,6 +30,7 @@ mod inspect;
 mod launch;
 #[cfg(unix)]
 mod orbit;
+mod parallax;
 mod trust;
 #[cfg(windows)]
 use flare::windows;
@@ -74,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli::Command::Download(args) => return hub::run_download(args),
         cli::Command::Inspect(args) => return inspect::run(args),
         cli::Command::Models(args) => return cache_commands::run(args),
+        cli::Command::Parallax(args) => return parallax::run(args),
         cli::Command::HardwareRevision { gpu_count } => {
             let devices: Vec<_> = (0..gpu_count).collect();
             environment::configure(&devices)?;

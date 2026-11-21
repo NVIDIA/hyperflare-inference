@@ -1180,6 +1180,8 @@ impl NativeResources {
                     (0, 0)
                 };
                 self.persistent_worker = Some(persistent_worker::PersistentWorkerRuntime::new(
+                    worker.graph.clone(),
+                    partition.worker_sm_count,
                     self.driver.clone(),
                     partition.worker_context,
                     partition.worker_stream,
@@ -1283,6 +1285,15 @@ impl NativeResources {
         self.persistent_worker.as_ref().map(|worker| worker.state())
     }
 
+    /// Lock-free telemetry snapshot from the rank's persistent worker, if declared.
+    pub fn persistent_worker_snapshot(
+        &self,
+    ) -> Option<crate::execution::PersistentWorkerSnapshot> {
+        self.persistent_worker
+            .as_ref()
+            .map(|worker| worker.snapshot())
+    }
+
     /// Non-blocking worker stream handle created inside the worker green context, if present.
     pub fn worker_stream(&self) -> Option<usize> {
         self.green_partition
@@ -1335,7 +1346,10 @@ impl NativeResources {
 
     /// Copy an allocation after the caller has drained every replay that uses it.
     pub fn download(&self, name: &str) -> Result<Vec<u8>> {
-        if self.persistent_worker_state() == Some(WorkerState::Running) {
+        if matches!(
+            self.persistent_worker_state(),
+            Some(WorkerState::Running | WorkerState::Draining)
+        ) {
             return Err(invalid(
                 "cannot synchronize primary context while persistent worker is running",
             ));
@@ -1358,7 +1372,10 @@ impl NativeResources {
 
     /// Replace allocation contents after draining replay on the owned context.
     pub fn upload(&self, name: &str, bytes: &[u8]) -> Result<()> {
-        if self.persistent_worker_state() == Some(WorkerState::Running) {
+        if matches!(
+            self.persistent_worker_state(),
+            Some(WorkerState::Running | WorkerState::Draining)
+        ) {
             return Err(invalid(
                 "cannot synchronize primary context while persistent worker is running",
             ));
@@ -1421,6 +1438,9 @@ impl NativeResources {
             }
             for module in self.modules.drain(..).rev() {
                 (self.driver.module_unload)(module);
+            }
+            if let Some(worker) = &self.persistent_worker {
+                worker.invalidate_metrics();
             }
             for (_, allocation) in std::mem::take(&mut self.allocations) {
                 if allocation.nbytes == 0 {

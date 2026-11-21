@@ -132,6 +132,7 @@ flare orbit cores [--cluster NAME]     what each node's cache holds
 flare orbit ls | dashboard [--cluster NAME]  groups on the cluster's nodes; their live metrics
 flare trust revoke FINGERPRINT [--trust-store PATH]
 flare models list | inspect | download | downloads | select | remove | gc   manage the prepared-model cache
+flare parallax [--url URL] [--interval-ms MS] [--json | --plain]  monitor live Parallax / persistent worker telemetry
 ```
 
 [Local model management](#local-model-management) specifies the `flare models`

@@ -8,8 +8,11 @@
 
 use std::ffi::c_uint;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+pub use crate::execution::WorkerState;
+use crate::execution::{PersistentWorkerControl, PersistentWorkerSnapshot};
 
 use super::driver::{
     CU_DEV_RESOURCE_TYPE_SM, CU_GREEN_CTX_DEFAULT_STREAM, CU_STREAM_NON_BLOCKING, DevResource,
@@ -229,34 +232,46 @@ impl GreenContextPartition {
     }
 }
 
-/// Lifecycle state of a persistent worker graph.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkerState {
-    /// Worker resources are bound and ready; the worker graph has not been launched.
-    Idle,
-    /// Worker graph was launched once on `worker_stream` and is active.
-    Running,
-    /// Worker either never launched or observed `stop_flag == 1` and drained cleanly.
-    Stopped,
-    /// `worker_stream` failed to drain; GPU resources must remain retained until process exit.
-    FailedDrain,
+/// Lock-free atomic read of a mapped-host `u64` counter array without GPU synchronization.
+///
+/// Returns an empty vector when the range is absent, unaligned, or would overflow address bounds.
+///
+/// # Safety
+/// When `metrics_count > 0` and `metrics_address != 0`, `metrics_address` must point to
+/// `metrics_count` live, 8-byte-aligned host-readable `u64` words.
+unsafe fn read_mapped_counters(metrics_address: usize, metrics_count: usize) -> Vec<u64> {
+    if metrics_count == 0
+        || metrics_address == 0
+        || metrics_address % std::mem::align_of::<u64>() != 0
+    {
+        return Vec::new();
+    }
+    let Some(bytes) = metrics_count.checked_mul(std::mem::size_of::<u64>()) else {
+        return Vec::new();
+    };
+    if metrics_address.checked_add(bytes).is_none() {
+        return Vec::new();
+    }
+    let mut values = Vec::with_capacity(metrics_count);
+    for index in 0..metrics_count {
+        let ptr = (metrics_address + index * std::mem::size_of::<u64>()) as *mut u64;
+        // SAFETY: Validated mapped-host range aligned to 8 bytes and retained through teardown.
+        values.push(unsafe { AtomicU64::from_ptr(ptr).load(Ordering::Acquire) });
+    }
+    values
 }
 
-/// Deterministic state machine governing start, stop, atomic flag updates, and metrics reads.
+/// Deterministic state machine governing start, stop, and atomic stop-flag updates.
 struct PersistentWorkerMachine {
     state: WorkerState,
     stop_flag_address: usize,
-    metrics_address: usize,
-    metrics_count: usize,
 }
 
 impl PersistentWorkerMachine {
-    fn new(stop_flag_address: usize, metrics_address: usize, metrics_count: usize) -> Self {
+    fn new(stop_flag_address: usize) -> Self {
         Self {
             state: WorkerState::Idle,
             stop_flag_address,
-            metrics_address,
-            metrics_count,
         }
     }
 
@@ -284,6 +299,7 @@ impl PersistentWorkerMachine {
                 Ok(())
             }
             WorkerState::Running => Ok(()),
+            WorkerState::Draining => Err(invalid("persistent worker is draining")),
             WorkerState::Stopped => Err(invalid("persistent worker has already been stopped")),
             WorkerState::FailedDrain => Err(Error::execution(
                 ExecutionError::Drain,
@@ -298,13 +314,23 @@ impl PersistentWorkerMachine {
     ///
     /// # Safety
     /// `stop_flag_address` must point to live, 4-byte-aligned, host-writable memory.
+    #[cfg(test)]
     unsafe fn stop(&mut self, sync: impl FnOnce() -> Result<()>) -> Result<()> {
+        unsafe { self.stop_with_hook(|| {}, sync) }
+    }
+
+    unsafe fn stop_with_hook(
+        &mut self,
+        on_draining: impl FnOnce(),
+        sync: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         match self.state {
             WorkerState::Idle => {
                 self.state = WorkerState::Stopped;
                 Ok(())
             }
             WorkerState::Running => {
+                on_draining();
                 // SAFETY: Validated mapped-host address aligned to 4 bytes and retained through drain.
                 unsafe {
                     AtomicU32::from_ptr(self.stop_flag_address as *mut u32)
@@ -321,6 +347,7 @@ impl PersistentWorkerMachine {
                     }
                 }
             }
+            WorkerState::Draining => Err(invalid("persistent worker is already draining")),
             WorkerState::Stopped => Ok(()),
             WorkerState::FailedDrain => Err(Error::execution(
                 ExecutionError::Drain,
@@ -328,42 +355,35 @@ impl PersistentWorkerMachine {
             )),
         }
     }
-
-    /// Read the optional `u64` counter array from mapped-host memory without a D2H copy.
-    ///
-    /// # Safety
-    /// When `metrics_count > 0`, `metrics_address` must point to `metrics_count` live,
-    /// 8-byte-aligned host-readable `u64` words.
-    unsafe fn metrics(&self) -> Option<Vec<u64>> {
-        if self.metrics_count == 0 || self.metrics_address == 0 {
-            return None;
-        }
-        let mut values = Vec::with_capacity(self.metrics_count);
-        for index in 0..self.metrics_count {
-            let ptr = (self.metrics_address + index * std::mem::size_of::<u64>()) as *mut u64;
-            // SAFETY: Validated mapped-host range aligned to 8 bytes and retained through drain.
-            values.push(unsafe { AtomicU64::from_ptr(ptr).load(Ordering::Acquire) });
-        }
-        Some(values)
-    }
 }
 
 /// Thread-safe runtime controller shared between `NativeResources` and `ExecutionManifest`.
 pub(super) struct PersistentWorkerRuntime {
+    name: String,
+    worker_sm_count: u32,
     driver: Arc<Driver>,
     context: Handle,
     worker_stream: Handle,
     worker_graph: Handle,
+    metrics_address: usize,
+    metrics_count: usize,
+    metrics_live: RwLock<bool>,
+    atomic_state: AtomicU8,
     machine: Mutex<PersistentWorkerMachine>,
 }
 
-// SAFETY: All state transitions and CUDA driver calls are serialized by `self.machine`,
-// and every driver operation saves and restores the calling thread's CUDA context.
+// SAFETY: State transitions and CUDA driver calls are serialized by `self.machine`, every driver
+// operation saves and restores the calling thread's CUDA context, and telemetry reads hold a
+// shared `metrics_live` read guard while reading validated mapped-host memory so teardown waits
+// for active readers before unmapping allocations.
 unsafe impl Send for PersistentWorkerRuntime {}
 unsafe impl Sync for PersistentWorkerRuntime {}
 
 impl PersistentWorkerRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
+        name: String,
+        worker_sm_count: u32,
         driver: Arc<Driver>,
         context: Handle,
         worker_stream: Handle,
@@ -373,15 +393,17 @@ impl PersistentWorkerRuntime {
         metrics_count: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
+            name,
+            worker_sm_count,
             driver,
             context,
             worker_stream,
             worker_graph,
-            machine: Mutex::new(PersistentWorkerMachine::new(
-                stop_flag_address,
-                metrics_address,
-                metrics_count,
-            )),
+            metrics_address,
+            metrics_count,
+            metrics_live: RwLock::new(metrics_count > 0 && metrics_address != 0),
+            atomic_state: AtomicU8::new(WorkerState::Idle.to_u8()),
+            machine: Mutex::new(PersistentWorkerMachine::new(stop_flag_address)),
         })
     }
 
@@ -407,7 +429,7 @@ impl PersistentWorkerRuntime {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         // SAFETY: Mapped-host stop flag remains owned by `NativeResources` through teardown.
-        unsafe {
+        let result = unsafe {
             machine.start(|| {
                 self.with_context(|| {
                     self.driver.check(
@@ -416,7 +438,10 @@ impl PersistentWorkerRuntime {
                     )
                 })
             })
-        }
+        };
+        self.atomic_state
+            .store(machine.state().to_u8(), Ordering::Release);
+        result
     }
 
     pub(super) fn stop(&self) -> Result<()> {
@@ -425,43 +450,88 @@ impl PersistentWorkerRuntime {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         // SAFETY: Mapped-host stop flag remains owned by `NativeResources` through teardown.
-        unsafe {
-            machine.stop(|| {
-                self.with_context(|| {
-                    self.driver.check(
-                        "cuStreamSynchronize(persistent_worker)",
-                        (self.driver.stream_sync)(self.worker_stream),
-                    )
-                })
-            })
-        }
+        let result = unsafe {
+            machine.stop_with_hook(
+                || {
+                    self.atomic_state
+                        .store(WorkerState::Draining.to_u8(), Ordering::Release);
+                },
+                || {
+                    self.with_context(|| {
+                        self.driver.check(
+                            "cuStreamSynchronize(persistent_worker)",
+                            (self.driver.stream_sync)(self.worker_stream),
+                        )
+                    })
+                },
+            )
+        };
+        self.atomic_state
+            .store(machine.state().to_u8(), Ordering::Release);
+        result
     }
 
+    /// Lock-free read of the worker lifecycle state.
     pub(super) fn state(&self) -> WorkerState {
-        let machine = self
-            .machine
-            .lock()
+        WorkerState::from_u8(self.atomic_state.load(Ordering::Acquire))
+    }
+
+    /// Atomic read of the mapped-host counter array (empty when absent or unmapped).
+    pub(super) fn read_metrics(&self) -> Vec<u64> {
+        let live = self
+            .metrics_live
+            .read()
             .unwrap_or_else(|poison| poison.into_inner());
-        machine.state()
+        if !*live {
+            return Vec::new();
+        }
+        // SAFETY: Holding the shared `metrics_live` read guard prevents teardown from unmapping
+        // the validated mapped-host metrics range while counters are read.
+        unsafe { read_mapped_counters(self.metrics_address, self.metrics_count) }
     }
 
     pub(super) fn metrics(&self) -> Option<Vec<u64>> {
-        let machine = self
-            .machine
-            .lock()
+        let live = self
+            .metrics_live
+            .read()
             .unwrap_or_else(|poison| poison.into_inner());
-        // SAFETY: Mapped-host metrics range remains owned by `NativeResources` through teardown.
-        unsafe { machine.metrics() }
+        if !*live {
+            return None;
+        }
+        // SAFETY: Holding the shared `metrics_live` read guard prevents teardown from unmapping
+        // the validated mapped-host metrics range while counters are read.
+        Some(unsafe { read_mapped_counters(self.metrics_address, self.metrics_count) })
     }
 
-    pub(super) fn control(self: &Arc<Self>) -> crate::execution::PersistentWorkerControl {
+    /// Telemetry snapshot without blocking on lifecycle mutexes or GPU streams.
+    pub(super) fn snapshot(&self) -> PersistentWorkerSnapshot {
+        PersistentWorkerSnapshot {
+            name: self.name.clone(),
+            worker_sm_count: self.worker_sm_count,
+            state: self.state(),
+            counters: self.read_metrics(),
+        }
+    }
+
+    /// Drain active counter readers and prevent future reads before mapped-host allocations unmap.
+    pub(super) fn invalidate_metrics(&self) {
+        let mut live = self
+            .metrics_live
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *live = false;
+    }
+
+    pub(super) fn control(self: &Arc<Self>) -> PersistentWorkerControl {
         let start_handle = Arc::clone(self);
         let stop_handle = Arc::clone(self);
         let metrics_handle = Arc::clone(self);
-        crate::execution::PersistentWorkerControl::new(
+        let snapshot_handle = Arc::clone(self);
+        PersistentWorkerControl::new(
             Arc::new(move || start_handle.start()),
             Arc::new(move || stop_handle.stop()),
             Arc::new(move || metrics_handle.metrics()),
+            Arc::new(move || snapshot_handle.snapshot()),
         )
     }
 }
@@ -474,11 +544,7 @@ mod tests {
     fn lifecycle_start_is_idempotent_and_stop_signals_flag_once() {
         let flag = AtomicU32::new(7);
         let metrics = [AtomicU64::new(11), AtomicU64::new(29)];
-        let mut machine = PersistentWorkerMachine::new(
-            (&flag as *const AtomicU32) as usize,
-            metrics.as_ptr() as usize,
-            metrics.len(),
-        );
+        let mut machine = PersistentWorkerMachine::new((&flag as *const AtomicU32) as usize);
         assert_eq!(machine.state(), WorkerState::Idle);
         let mut launches = 0usize;
         let mut syncs = 0usize;
@@ -499,7 +565,10 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(launches, 1);
-            assert_eq!(machine.metrics().unwrap(), vec![11, 29]);
+            assert_eq!(
+                read_mapped_counters(metrics.as_ptr() as usize, metrics.len()),
+                vec![11, 29]
+            );
 
             // Stop stores 1u32 before syncing and transitions to Stopped.
             machine
@@ -529,7 +598,7 @@ mod tests {
     #[test]
     fn stop_before_start_transitions_without_cuda_sync() {
         let flag = AtomicU32::new(0);
-        let mut machine = PersistentWorkerMachine::new((&flag as *const AtomicU32) as usize, 0, 0);
+        let mut machine = PersistentWorkerMachine::new((&flag as *const AtomicU32) as usize);
         let mut syncs = 0usize;
         unsafe {
             machine
@@ -540,14 +609,14 @@ mod tests {
                 .unwrap();
             assert_eq!(syncs, 0);
             assert_eq!(machine.state(), WorkerState::Stopped);
-            assert!(machine.metrics().is_none());
+            assert!(read_mapped_counters(0, 0).is_empty());
         }
     }
 
     #[test]
     fn launch_failure_leaves_worker_idle_and_drain_failure_is_sticky() {
         let flag = AtomicU32::new(9);
-        let mut machine = PersistentWorkerMachine::new((&flag as *const AtomicU32) as usize, 0, 0);
+        let mut machine = PersistentWorkerMachine::new((&flag as *const AtomicU32) as usize);
         unsafe {
             assert!(
                 machine
@@ -571,6 +640,75 @@ mod tests {
             // Subsequent stop and start both surface FailedDrain without re-invoking callbacks.
             assert!(machine.stop(|| Ok(())).is_err());
             assert!(machine.start(|| Ok(())).is_err());
+        }
+    }
+
+    #[test]
+    fn lock_free_read_mapped_counters_enforces_bounds_alignment_and_values() {
+        let counters = [
+            AtomicU64::new(10),
+            AtomicU64::new(2048),
+            AtomicU64::new(3),
+            AtomicU64::new(7),
+            AtomicU64::new((5u64 << 32) | 42),
+            AtomicU64::new(950),
+            AtomicU64::new(50),
+            AtomicU64::new(18),
+        ];
+        let base = counters.as_ptr() as usize;
+        unsafe {
+            assert_eq!(
+                read_mapped_counters(base, counters.len()),
+                vec![10, 2048, 3, 7, (5u64 << 32) | 42, 950, 50, 18]
+            );
+            assert_eq!(read_mapped_counters(base, 3), vec![10, 2048, 3]);
+            // Zero count, null address, unaligned address, and overflow all return empty safely.
+            assert!(read_mapped_counters(base, 0).is_empty());
+            assert!(read_mapped_counters(0, 4).is_empty());
+            assert!(read_mapped_counters(base + 1, 1).is_empty());
+            assert!(read_mapped_counters(usize::MAX - 7, 2).is_empty());
+        }
+
+        // Concurrent atomic store is observed without any lock or GPU sync.
+        counters[0].store(99, Ordering::Release);
+        counters[5].store(1024, Ordering::Release);
+        unsafe {
+            let read = read_mapped_counters(base, counters.len());
+            assert_eq!(read[0], 99);
+            assert_eq!(read[5], 1024);
+        }
+    }
+
+    #[test]
+    fn stop_hook_publishes_draining_before_stream_sync() {
+        let flag = AtomicU32::new(0);
+        let observed = AtomicU8::new(WorkerState::Idle.to_u8());
+        let mut machine = PersistentWorkerMachine::new((&flag as *const AtomicU32) as usize);
+        unsafe {
+            machine.start(|| Ok(())).unwrap();
+            observed.store(machine.state().to_u8(), Ordering::Release);
+            assert_eq!(
+                WorkerState::from_u8(observed.load(Ordering::Acquire)),
+                WorkerState::Running
+            );
+            machine
+                .stop_with_hook(
+                    || observed.store(WorkerState::Draining.to_u8(), Ordering::Release),
+                    || {
+                        assert_eq!(
+                            WorkerState::from_u8(observed.load(Ordering::Acquire)),
+                            WorkerState::Draining
+                        );
+                        assert_eq!(flag.load(Ordering::Acquire), 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            observed.store(machine.state().to_u8(), Ordering::Release);
+            assert_eq!(
+                WorkerState::from_u8(observed.load(Ordering::Acquire)),
+                WorkerState::Stopped
+            );
         }
     }
 
