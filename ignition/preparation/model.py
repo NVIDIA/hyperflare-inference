@@ -22,7 +22,7 @@ class PreparedModel(PreparedExecution):
     """
 
     def __init__(self, *, server_config, memory_report, session, close_resources=(), graph_resources=(), core_data=None,
-                 forwards=None, embedding_catalog=None, rebuild_weights=None, expert_rows=None,
+                 forwards=None, embedding_catalog=None, rebuild_weights=None,
                  benchmark_state=None, benchmark_pool=None, benchmark_requests=None, benchmark_rounds=None,
                  benchmark_prefills=None, benchmark_observers=None, **kwargs):
         registry = getattr(session, "_startup_collectives", None)
@@ -45,7 +45,6 @@ class PreparedModel(PreparedExecution):
         self.session = session
         self.core_data = core_data
         self.rebuild_weights = rebuild_weights
-        self.expert_rows = expert_rows
         self.forwards = None if forwards is None else MappingProxyType(dict(forwards))
         self.benchmark_state = None if benchmark_state is None else MappingProxyType(dict(benchmark_state))
         self.benchmark_pool = benchmark_pool
@@ -69,12 +68,6 @@ class PreparedModel(PreparedExecution):
         self.closed = False
         self._startup_undrained = False
         self._preparation_thread = get_ident()
-
-    def export_manifest(self):
-        manifest = super().export_manifest()
-        if self.expert_rows is not None:
-            manifest["expert_rows"] = self.expert_rows
-        return manifest
 
     def manifest(self, *, all_variants=False):
         """Expose the serving width to diagnostics and the complete catalog to export."""
@@ -170,7 +163,6 @@ class PreparedModel(PreparedExecution):
         for resource in self._close_resources:
             resource.close()
         self.rebuild_weights = None
-        self.expert_rows = None
         self._resources = ()
         self._buffers = MappingProxyType({})
         self._graphs = MappingProxyType({})

@@ -65,18 +65,18 @@ def register_catalog(monkeypatch):
     return register
 
 
-@pytest.mark.parametrize("drafts", [3, 5, 7])
-def test_catalog_records_each_runtime_draft_depth_and_width_one_continuations(register_catalog, drafts):
-    config = PreparationConfig(speculative_widths=tuple(range(1, drafts + 2)))
+def test_default_catalog_contains_only_packed_rounds_and_width_one_continuations(register_catalog):
+    config = PreparationConfig()
+    assert (config.max_active, config.prefill_chunk_size, config.draft_tokens,
+            config.speculative_token_capacity) == (32, 4096, 5, 128)
     records, buffers, storage, constructed, hosts = register_catalog(config)
     capacities = defaultdict(list)
     for name, forward, signature in records:
         assert signature.speculation_enabled
         if "speculative_prefix_limits" in signature.inputs:
-            capacities[signature.batch_capacity, signature.token_capacity].append(signature.packed_token_capacity)
-            assert signature.token_capacity == signature.draft_tokens + 1
-            assert signature.confidence_width == signature.draft_tokens
-            assert forward.source.width == forward.target.width == signature.token_capacity
+            capacities[signature.batch_capacity].append(signature.packed_token_capacity)
+            assert signature.token_capacity == 6 and signature.draft_tokens == 5
+            assert signature.confidence_width == 5
             assert "query_lengths" not in signature.inputs
             assert "speculative_prefix_limits" in signature.inputs
             assert forward.prefix_limits is buffers["speculative_prefix_limits"]
@@ -84,24 +84,21 @@ def test_catalog_records_each_runtime_draft_depth_and_width_one_continuations(re
             assert signature.kind == "speculative" and signature.token_capacity == 1
             assert "query_lengths" in signature.inputs
             assert signature.packed_token_capacity == signature.batch_capacity
-    assert {(batch, width, tokens) for (batch, width), values in capacities.items()
-            for tokens in values} == set(config.packed_speculative_depth_shapes)
+    assert {(batch, tokens) for batch, values in capacities.items() for tokens in values} == set(config.packed_speculative_shapes)
     assert sum(map(len, capacities.values())) == 64
-    for (batch, width), physical in capacities.items():
-        assert min(physical) >= batch + 1
-        assert max(physical) == min(128, batch * width)
+    assert sorted(capacities[1]) == [2, 3, 4, 5, 6]
+    for batch, physical in capacities.items():
+        assert min(physical) == batch + 1
+        assert max(physical) == min(128, batch * 6)
     assert len(records) == 70
     assert len({name for name, _, _ in records}) == len(records)
     targets = [round for round in constructed if not round.options.get("generate_proposals", True)]
-    assert {(round.batch, round.width, round.options["target_token_capacity"])
-            for round in targets} == set(config.packed_speculative_depth_shapes)
+    assert {(round.batch, round.options["target_token_capacity"]) for round in targets} == set(config.packed_speculative_shapes)
     assert {s.batch_capacity for _, _, s in records if s.kind == "speculative"} == {1, 2, 4, 8, 16, 32}
     assert all(not name.startswith(("proposal", "verification")) for name, _, _ in records)
     proposals = [round for round in constructed if round.options.get("proposal_only")]
-    assert len(proposals) == 6 * drafts and all(round.prepared for round in proposals)
-    assert {(round.batch, round.width) for round in proposals} == {
-        (batch, depth + 1) for batch in config.batch_capacities for depth in range(1, drafts + 1)}
-    assert hosts == [("proposal_confidence", (2, 32, drafts), torch.float32)]
+    assert len(proposals) == 6 and all(round.width == 6 and round.prepared for round in proposals)
+    assert hosts == [("proposal_confidence", (2, 32, 5), torch.float32)]
     assert storage is None
 
 

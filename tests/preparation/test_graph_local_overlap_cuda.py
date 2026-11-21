@@ -12,6 +12,7 @@ import triton
 from tests.preparation import test_graph_local_scratch_cuda as serial
 from ignition.components.projection_overlap import _join
 from ignition.preparation.aot import aot_forward
+from ignition.preparation.compilation import _OPTIONS
 
 
 pytestmark = pytest.mark.skipif(
@@ -142,7 +143,8 @@ def _has_independent_finishes(graph):
 @torch.no_grad()
 def test_asymmetric_branches_remain_independent_after_capture(compiled):
     forward = AsymmetricForward()
-    artifact = aot_forward(forward) if compiled else None
+    artifact = (aot_forward(forward, options={**_OPTIONS, "reorder_for_peak_memory": False})
+                if compiled else None)
 
     def run():
         artifact(forward) if compiled else forward()

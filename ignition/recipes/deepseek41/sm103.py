@@ -169,7 +169,7 @@ class SM103Config:
         ranks = {1: RankCosts(spec_row, ref_page, graph_bytes)}
         plain = {1: RankCosts(plain_row, ref_page, graph_bytes)}
         recipe_updates = dict(ranks=ranks, plain_ranks=plain, verification_rows=0,
-                              expert_scale_compression=None)
+                              expert_scale_compression=None, packed_speculative_depths=True)
         if self.context is not None:
             recipe_updates["context"] = self.context
         return (replace(recipe, **recipe_updates),

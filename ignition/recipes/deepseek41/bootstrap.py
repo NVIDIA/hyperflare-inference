@@ -226,7 +226,12 @@ class PreparationConfig(BasePreparationConfig):
 
     @property
     def packed_speculative_shapes(self):
-        return tuple(sorted({(batch, tokens) for batch, _, tokens in self.packed_speculative_depth_shapes}))
+        if self.sm103 is not None:
+            return tuple(sorted({(batch, tokens) for batch, _, tokens in self.packed_speculative_depth_shapes}))
+        from ignition.components.capacity import packed_speculative_shapes
+
+        return packed_speculative_shapes(self.max_active, max(self.speculative_widths),
+            self.speculative_token_capacity, self.speculative_graph_budget) if self.draft_tokens else ()
 
     @property
     def packed_speculative_depth_shapes(self):
@@ -261,6 +266,7 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
 
     confidence = None
     if config.draft_tokens:
+        from ignition.components.capacity import proposal_shapes
         from ignition.components.packed_speculation import PreparedPackedSpeculativeRound
 
         slots = config.request_capacity
@@ -270,31 +276,33 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
         buffers["speculative_prefix_limits"] = prefix_limits
         packed_inputs = tuple(field for field in forward_inputs if field != "query_lengths")
         packed_inputs += ("speculative_prefix_limits",)
-        proposal_shapes = {(batch, width - 1) for batch, width, _ in config.packed_speculative_depth_shapes}
+        packed_batches = {batch for batch, _ in config.packed_speculative_shapes}
         proposals = {}
-        for batch, depth in sorted(proposal_shapes, reverse=True):
+        for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
+            if batch not in packed_batches:
+                continue
             name = f"proposal{batch}x{depth + 1}"
             source = PreparedParallelDraftRound(speculation, batch, depth + 1, name,
                 proposal_only=True)
             source.prepare()
-            proposals[batch, depth] = source
+            proposals[batch] = source
     for batch, _ in reversed(config.speculative_shapes):
         name = f"speculative{batch}x1"
         forward = PreparedParallelDraftRound(speculation, batch, 1, name)
         forward.prepare()
         add(name, forward, "speculative", batch, 1, forward_inputs, enabled=True)
-    for batch, logical_width, packed_tokens in sorted(config.packed_speculative_depth_shapes,
-            key=lambda shape: (shape[2], shape[0], shape[1]), reverse=True):
-        depth = logical_width - 1
+    for batch, packed_tokens in sorted(config.packed_speculative_shapes,
+            key=lambda shape: (shape[1], shape[0]), reverse=True):
+        logical_width = max(config.speculative_widths)
         target_name = f"verification{batch}x{logical_width}-tokens{packed_tokens}"
         target = PreparedParallelDraftRound(speculation, batch, logical_width, target_name,
             generate_proposals=False, target_token_capacity=packed_tokens)
         target.prepare()
-        name = f"packed-speculative{batch}x{logical_width}-drafts{depth}-tokens{packed_tokens}"
-        forward = PreparedPackedSpeculativeRound(proposals[batch, depth], target, prefix_limits, confidence.device_view,
+        name = f"packed-speculative{batch}x{logical_width}-drafts{config.draft_tokens}-tokens{packed_tokens}"
+        forward = PreparedPackedSpeculativeRound(proposals[batch], target, prefix_limits, confidence.device_view,
             name=name)
         add(name, forward, "speculative", batch, logical_width, packed_inputs,
-            enabled=True, packed_tokens=packed_tokens, draft_tokens=depth)
+            enabled=True, packed_tokens=packed_tokens, draft_tokens=config.draft_tokens)
     return confidence
 
 
@@ -463,8 +471,8 @@ def _prepare_reference_rank(snapshot, config, *, rank, group, progress=None, cor
 def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot_name, identity,
                                        session, core_storage, sequence, frame, weights_bytes,
                                        tier_bytes, has_vision=True, progress=None):
-    from ignition.components.expert_row_storage import megamoe_row_storage
     from ignition.components.speculation import SpeculativeRngState
+    from ignition.preparation.compilation import _OPTIONS as _COMPILE_OPTIONS
     from ignition.preparation.tensor_metadata import record_numeric_tensor
     from .reference_cache import ReferenceCacheLayout, ReferenceCacheStorage, ReferenceCacheTransaction
     from .reference_engram import ReferenceEngramHistory
@@ -544,11 +552,6 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
-        expert_rows, row_buffers = megamoe_row_storage(
-            (index, experts.weights[f"layers.{index}.ffn"], f"weights.layers[{index}]")
-            for index in range(len(model.model.layers))
-            if experts.weights[f"layers.{index}.ffn"].host_tier is not None)
-        buffers.update(row_buffers)
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
 
@@ -702,10 +705,15 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
         stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
         arena.release_preparation()
         release_unused()
+        # Prefill cold-expert staging forks large staging planes onto auxiliary
+        # streams; disabling Inductor peak-memory reordering keeps the fork ahead
+        # of smaller main-stream work while retaining storage reuse.
+        compile_options = ({**_COMPILE_OPTIONS, "reorder_for_peak_memory": False}
+                           if expert_stagers else None)
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=None, coordinator=None, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
-            materialize=materialize, warmup_storage=core_storage,
+            materialize=materialize, warmup_storage=core_storage, compile_options=compile_options,
             compile_kinds=("prefill", "decode", "resume", "speculative", "vision"))
     finally:
         if feature_pool is not None:
@@ -780,7 +788,7 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
     disposable = [delivery.buffers()]
     if vision_state is not None:
         disposable.append(vision_state.arena)
-    prepared = PreparedModel(rebuild_weights=declare_reference_weights(model), expert_rows=expert_rows,
+    prepared = PreparedModel(rebuild_weights=declare_reference_weights(model),
         device=config.devices[0], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*storage_ranges(disposable), *completion.zero_ranges()),
@@ -934,7 +942,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     modes = serving_modes(config.dspark, config.mtp_only)
     count = (len(modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                            + 4 * len(config.batch_capacities))
-             + len(config.speculative_shapes) + len(config.packed_speculative_depth_shapes)
+             + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
              + (len(config.batch_capacities) if False in modes else 0))
     count += len(PATCH_CAPACITIES) if vision_state is not None else 0
     catalog_bytes = {}
@@ -1116,9 +1124,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             speculative_fixed_width=config.speculative_fixed_width)
         memory.update(speculative_shapes=config.speculative_shapes,
             packed_speculative_shapes=config.packed_speculative_shapes,
-            packed_speculative_depth_shapes=config.packed_speculative_depth_shapes,
             speculative_graph_budget=config.speculative_graph_budget,
-            packed_speculative_graphs=len(config.packed_speculative_depth_shapes))
+            packed_speculative_graphs=len(config.packed_speculative_shapes))
     disposable = [tables.buffers()]
     if vision_state is not None:
         disposable.append(vision_state.arena)

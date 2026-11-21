@@ -310,6 +310,13 @@ def test_reference_execution_configuration_and_planning_costs(options, snapshot,
     assert recipe.ranks[1].page_bytes == expected_page == 113_920
     assert recipe.verification_rows == 0
     assert recipe.context == 262144
+    assert not RECIPE.packed_speculative_depths
+    assert recipe.packed_speculative_depths
+    tp_cfg = PreparationConfig(speculative_widths=tuple(range(1, 9)), speculative_graph_budget=12)
+    assert len(tp_cfg.packed_speculative_shapes) == 12
+    sm103_cfg = PreparationConfig(devices=(0,), sm103=reference, kernel_cache=tmp_path,
+                                  speculative_widths=tuple(range(1, 9)), speculative_graph_budget=48)
+    assert len(sm103_cfg.packed_speculative_depth_shapes) == 48
     gpu = planning.Gpu(0, "GB300", "GPU-gb300", 256 << 30, 250 << 30, (10, 3))
     plan = planning.plan(recipe, checkpoint, (gpu,), selected=(0,), concurrency=16,
                          reserve_bytes=0, speculation=recipe.speculation, prefill_chunk=8192)

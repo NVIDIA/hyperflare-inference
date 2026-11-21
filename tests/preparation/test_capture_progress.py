@@ -140,15 +140,13 @@ def test_complete_deepseek_catalog_is_rendered_without_losing_shapes(deepseek_ca
         elif not cells[0] and rows:
             for index, value in enumerate(cells):
                 rows[-1][index] += value
-    packed = [row for row in rows if row[0] == "speculative" and row[3] != "1"]
-    assert {(int(row[2]), int(row[5])) for row in packed} == {
-        (batch, depth) for batch in (1, 2, 4, 8, 16, 32) for depth in range(1, 6)}
+    packed = [row for row in rows if row[0] == "speculative" and row[3] == "6"]
+    assert {int(row[2]) for row in packed} == {1, 2, 4, 8, 16, 32}
     for row in packed:
         _, mode, batch, width, tokens, drafts, prompt, count = row
         expected = sorted(s.packed_token_capacity for s in deepseek_catalog
-            if s.kind == "speculative" and s.token_capacity == int(width) and s.batch_capacity == int(batch))
-        assert (mode, prompt) == ("on", "-")
-        assert int(width) == int(drafts) + 1
+            if s.kind == "speculative" and s.token_capacity == 6 and s.batch_capacity == int(batch))
+        assert (mode, width, drafts, prompt) == ("on", "6", "5", "-")
         assert [int(value) for value in tokens.split(",")] == expected
         assert int(count) == len(expected)
     assert sum(int(row[-1]) for row in packed) == 64

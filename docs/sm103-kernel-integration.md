@@ -94,7 +94,7 @@ Adapt these boundaries while retaining the reference computation:
 
 | Boundary | Required Flare binding |
 | --- | --- |
-| Checkpoint and expert storage | Load the CSF checkpoint without requantizing weights. Preserve canonical expert identities and bind physical HBM/Grace rows through explicit `Execution.expert_rows` storage declarations. |
+| Checkpoint and expert storage | Load the CSF checkpoint without requantizing weights. Preserve canonical expert identities and bind physical HBM/Grace rows through prepared MegaMoE tier storage and its canonical-to-physical map. |
 | Inputs and cache state | Construct fixed-capacity metadata from declared token, position, page-table and request-state inputs. Include sliding-window rollback history, compressor and indexer state, shared cache aliases and inactive-row destinations. |
 | Engram delivery | Bind the reference's embedding consumers to declared native delivery buffers and readiness events, preserving hash geometry and scale layout. |
 | Vision | Prepare the reference encoder and projector with the checkpoint's image processing, patch ordering and rotary geometry. Bind image features through Flare's existing vision graph and frontend contracts. |

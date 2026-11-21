@@ -42,11 +42,15 @@ before the session's capture guard forbids further kernel resolution.
 
 ## Complete-forward compilation and capture
 
-Compiled forwards retain memory-pool planning and storage reuse, but disable
-Inductor's peak-memory operation reordering. That pass can move independent
-main-stream work before an opaque auxiliary-stream launch, turning a prepared
-fork into serial execution. Validate captured dependencies as well as outputs
-and temporary lifetimes when changing branch scheduling.
+Compiled forwards retain Inductor memory-pool planning, storage reuse, and
+default peak-memory operation reordering. Callers with asymmetric
+auxiliary-stream forks whose staging allocations exceed main-stream temporaries
+(such as SM103 prefill cold-expert staging) pass
+`compile_options={**_OPTIONS, 'reorder_for_peak_memory': False}` to
+`capture_forwards` so Inductor does not move independent main-stream work ahead
+of the opaque stream launch and serialize the fork. Validate captured
+dependencies as well as outputs and temporary lifetimes when changing branch
+scheduling.
 
 - **Compile complete prepared forwards.** Use
   [capture_forwards](../ignition/preparation/capture.py), which restores compiled

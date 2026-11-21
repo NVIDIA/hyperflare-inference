@@ -501,9 +501,9 @@ width-one graphs; ordinary graphs serve `--mtp-draft-tokens 0`.
 The [model preparation guide](model-preparation.md#deepseek-v41-flash) defines
 the packed capacity selection. The row cap bounds target work and storage;
 raising it permits longer aggregate prefixes at larger batches. The independent
-graph budget controls catalog density across each eligible batch and draft depth
-up to its maximum physical extent. Width-one and ordinary graphs do not consume
-that budget. Budgets below the required coverage count fail during planning;
+graph budget controls catalog density between each batch's smallest wider round
+and its maximum physical extent. Width-one and ordinary graphs do not consume
+that budget. Budgets below the required endpoint count fail during planning;
 budgets above the number of distinct valid capacities capture every capacity.
 In export/conversion examples, `CACHE_ENTRY` is the directory path printed by
 `ignition export`. For eight requests with five drafts each, this example limits
@@ -516,10 +516,10 @@ physical target capacity to 24 rows while retaining six-token per-request prefix
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors
 ```
 
-Packed cores require a captured draft depth within the requested runtime limit,
-or `--mtp-draft-tokens 0` for ordinary execution. A single-depth core cannot
-select a smaller positive depth. DeepSeek V4.1 preparation includes lower-depth
-rounds for runtime comparison. Native serving uses all captured
+Packed cores require adaptive execution at their captured draft depth, or
+`--mtp-draft-tokens 0` for ordinary execution; SM103 `--sm103-preparation`
+exports also budget lower positive draft depths so `--mtp-draft-tokens N` can
+select captured depths up to `N` without re-export. Native serving uses all captured
 packed capacities by default. Prefer `--mtp-max-verification-token-budget N` to
 retain every captured capacity at or below a ceiling. This example limits the
 24-row core above to at most 16 target rows per round:
