@@ -369,9 +369,10 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
     } else {
         v
     };
-    if flag(definition, "strict", false)? {
+    let strict = flag(definition, "strict", false)?;
+    if strict && (custom || protocol == Protocol::Messages) {
         return Err(unsupported(
-            "strict tool schemas require constrained tool generation",
+            "strict tool schemas are supported only on Chat Completions and Responses function tools",
         ));
     }
     let grammar = if custom && present(v, "format") && v["format"]["type"] != "text" {
@@ -418,6 +419,7 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
             .into(),
         parameters,
         declared_parameters: custom || declared.is_some(),
+        strict,
         custom,
         grammar,
     })

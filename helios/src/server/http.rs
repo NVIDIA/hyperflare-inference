@@ -243,10 +243,12 @@ pub(super) async fn generate(
         } else {
             None
         };
+        let strict_validators = request::compile_strict_validators(&prepare_state.grammar, &decoded.request)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         let mut prepared = Vec::with_capacity(size);
         for index in 0..size {
             prepared.push(
-                request::prepare_inference_cached(
+                request::prepare_validated_inference(
                     &prepare_state.frontend,
                     prepare_state.images.as_deref(),
                     &prepare_state.grammar,
@@ -267,10 +269,10 @@ pub(super) async fn generate(
                 })?,
             );
         }
-        Ok((decoded, prepared, extra, tool_grammars))
+        Ok((decoded, prepared, extra, tool_grammars, strict_validators))
     })
     .await;
-    let (decoded, prepared, extra, tool_grammars) = match preparation {
+    let (decoded, prepared, extra, tool_grammars, strict_validators) = match preparation {
         Ok(Ok(v)) => v,
         Ok(Err((status, message))) => return error(protocol, status, message),
         Err(e) => return error(protocol, StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -376,6 +378,7 @@ pub(super) async fn generate(
             decoded.echo && decoded.request.options.logprobs.is_some(), echo_chars);
     }
     encoder.set_tool_grammars(tool_grammars);
+    encoder.set_strict_validators(strict_validators);
     encoder.set_continuous_usage(continuous_usage);
     let streaming = decoded.stream;
     let stream_state = state.clone();
