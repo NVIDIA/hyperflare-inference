@@ -31,6 +31,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen"] }
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
+crc32fast = "1.5"
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64", "alloc"] }
 
 [target.'cfg(windows)'.dependencies]

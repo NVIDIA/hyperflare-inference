@@ -58,26 +58,16 @@ pub fn permits_holding(caps: Option<&CodecCaps>, packed: bool, profiles: &[Vec<u
     (!packed && profiles.is_empty()) || permits(caps, profiles)
 }
 
-const fn crc_table() -> [u32; 256] {
-    let mut result = [0; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut x = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            x = (x >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(x & 1));
-            j += 1;
-        }
-        result[i] = x;
-        i += 1;
-    }
-    result
-}
 pub fn crc32(bytes: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = crc_table();
-    !bytes
-        .iter()
-        .fold(u32::MAX, |v, b| (v >> 8) ^ TABLE[((v as u8) ^ b) as usize])
+    crc32fast::hash(bytes)
+}
+
+pub fn crc32_chunks(chunks: &[&[u8]]) -> u32 {
+    let mut hash = crc32fast::Hasher::new();
+    for chunk in chunks {
+        hash.update(chunk);
+    }
+    hash.finalize()
 }
 
 /// Directory on disk, protected as one length-delimited blob.
