@@ -53,11 +53,12 @@ class ResidualState:
 
 class PreparedLayer(torch.nn.Module):
     def __init__(self, layer, weights, text, pool, metadata, reduction, reduction_dtype, *, mode, tokens,
-                 session, workspace, name, examples=None):
+                 session, workspace, name, examples=None, cache_layer=None):
         super().__init__()
         self.layer, self.weights, self.text, self.mode = layer, weights, text, mode
         self.reduction, self.reduction_dtype = reduction, reduction_dtype
-        self.attention = PreparedAttention(layer, weights.attention, text, LayerCache.of(pool, layer), metadata,
+        cache_layer = layer if cache_layer is None else cache_layer
+        self.attention = PreparedAttention(layer, weights.attention, text, LayerCache.of(pool, cache_layer), metadata,
             mode=mode, tokens=tokens, session=session, workspace=workspace, name=name + ".attention", examples=examples,
             tuning_page_count=((int(pool.memory_capacity[0].item()) - 1) * pool.ring_row_pages + pool.geometry.ring // 128
                                if text.local(layer) else int(pool.memory_capacity[1].item())))
@@ -66,18 +67,18 @@ class PreparedLayer(torch.nn.Module):
             return declaration_tensor(examples, "inkling.mlp." + role, shape, dtype, device)
         source = example("source", (tokens, text.hidden))
         logits = example("router_logits", (tokens, text.experts), torch.float32)
-        self.router_projection = UnquantizedProjection(example("router_source", source.shape, torch.float32),
+        self.router_dtype = weights.router.dtype
+        self.router_projection = UnquantizedProjection(example("router_source", source.shape, self.router_dtype),
             weights.router, logits, session=session, name=name + ".router").functional(session=session)
         routes = RouterScratch.allocate(tokens, device, experts=text.experts, top_k=text.experts_per_token)
         self.router = PreparedRouter(logits, routes, session=session, name=name + ".routing", score_func="sigmoid",
             renormalize=True, routed_scaling_factor=text.route_scale, correction_bias=weights.correction,
             num_valid_tokens=metadata.live_counts[:1]).functional(session=session)
-        self.experts = PreparedRoutedExperts(source, weights.experts, routes.ids, routes.weights,
-            example("partial", source.shape), session=session, name=name + ".experts", workspace=workspace,
-            activation_mode="a4" if mode == "prefill" else "a16").functional(session=session)
+        self.experts = self._build_experts(source, weights, routes, tokens=tokens, mode=mode,
+            session=session, workspace=workspace, name=name, example=example)
         self.attention_convolution = PreparedCausalConvolution(weights.attention_convolution,
-            pool.history(layer, "attention_convolution"))
-        self.mlp_convolution = PreparedCausalConvolution(weights.mlp_convolution, pool.history(layer, "mlp_convolution"))
+            pool.history(cache_layer, "attention_convolution"))
+        self.mlp_convolution = PreparedCausalConvolution(weights.mlp_convolution, pool.history(cache_layer, "mlp_convolution"))
         blocks = (layer + text.residual_block - 1) // text.residual_block
         self.input_mix = (None if weights.attention_query is None else PreparedResidualMix(source,
             weights.attention_query, weights.input_norms, sources=blocks + 1, eps=text.eps,
@@ -88,6 +89,12 @@ class PreparedLayer(torch.nn.Module):
         self.mlp_mix = PreparedResidualMix(source, weights.mlp_query, (weights.mlp_norm,),
             sources=blocks + (2 if layer % text.residual_block == 0 else 1), eps=text.eps,
             session=session, name=name + ".mlp_input", addend=layer % text.residual_block != 0, examples=examples)
+
+    def _build_experts(self, source, weights, routes, *, tokens, mode, session, workspace, name, example):
+        del tokens
+        return PreparedRoutedExperts(source, weights.experts, routes.ids, routes.weights,
+            example("partial", source.shape), session=session, name=name + ".experts", workspace=workspace,
+            activation_mode="a4" if mode == "prefill" else "a16").functional(session=session)
 
     def forward(self, state, metadata):
         w, t, m = self.weights, self.text, metadata

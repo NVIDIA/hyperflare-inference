@@ -9,7 +9,7 @@ import torch
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.embedding import PreparedEmbedding
-from ignition.components.linear import UnquantizedProjection
+from ignition.components.linear import UnquantizedProjection, prepare_projection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.recurrent_proposal import PreparedRecurrentProposalHead
@@ -233,10 +233,13 @@ class PreparedDraft:
             for i, layer in enumerate(weights.draft.layers)]
         self.norm = norm(scratch.accumulator, weights.draft.norm, scratch.hidden,
             eps=d.text["rms_norm_eps"], session=session, name=name + ".norm")
-        self.head = UnquantizedProjection(scratch.hidden, weights.head, scratch.local_logits,
-            session=session, name=name + ".head").functional(session=session)
+        draft_head = getattr(weights.draft, "draft_head", None)
+        head_weight = draft_head if draft_head is not None else weights.head
+        self.head = prepare_projection(scratch.hidden, head_weight, scratch.local_logits,
+            session=session, name=name + ".head", workspace=workspace).functional(session=session)
         self.recurrent = PreparedRecurrentProposalHead(weights.draft.recurrent,
-            torch.zeros(metadata.lengths.numel(), dtype=torch.int64, device=device), session=session, name=name + ".recurrent")
+            torch.zeros(metadata.lengths.numel(), dtype=torch.int64, device=device),
+            session=session, name=name + ".recurrent", workspace=workspace)
 
     def release_outputs(self):
         return self

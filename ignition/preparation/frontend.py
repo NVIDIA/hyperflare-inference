@@ -100,7 +100,8 @@ def image_settings(config, model, profile):
         if not isinstance(image, dict) or set(image) != set(expected):
             raise ValueError("unsupported padded-grid image processor fields")
         _expected(image, expected, "padded-grid image processor")
-        _expected(model, {"model_type": "inkling2"}, "padded-grid model configuration")
+        if model.get("model_type") not in ("inkling2", "inkling2_loop"):
+            raise ValueError("unsupported padded-grid model configuration model_type")
         _expected(model["vision_config"], {"native_patch_size": 20, "adapter_merge_size": 2,
             "posemb_grid_size": 32, "temporal_patch_size": 2}, "padded-grid vision configuration")
         return {"padded_grid": {}}

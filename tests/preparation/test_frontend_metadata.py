@@ -21,7 +21,7 @@ from ignition.recipes.declaration import SamplingDefaults, SamplingRange
 @pytest.mark.parametrize("recipe", recipes(), ids=lambda recipe: recipe.name)
 def test_default_mode_uses_manually_declared_model_card_sampling(recipe):
     qwen = recipe.name in ("qwen38", "qwen38_dense")
-    expected = dict(seed=0, temperature=1., top_p=1. if recipe.name in ("deepseek41", "kimi3", "inkling2") else .95,
+    expected = dict(seed=0, temperature=1., top_p=1. if recipe.name in ("deepseek41", "kimi3", "inkling2", "inkling2_mini") else .95,
         top_k=20 if qwen else 64 if recipe.name == "gemma4" else -1, min_p=0., repetition_penalty=1., presence_penalty=0., frequency_penalty=0.)
     if qwen:
         expected["ranges"] = {"temperature": {"min": .7, "max": 1.}, "top_p": {"min": .8, "max": .95},
@@ -123,9 +123,11 @@ def test_glm_image_profile_validates_checkpoint_structure():
             image_settings(changed, model, "glm")
 
 
-def test_padded_grid_image_profile_validates_processor_and_vision_configs():
+@pytest.mark.parametrize("model_type", ["inkling2", "inkling2_loop"])
+def test_padded_grid_image_profile_validates_processor_and_vision_configs(model_type):
     fixture = json.loads((Path(__file__).parents[1] / "frontend/inkling2_images.json").read_text())
     processor, model = fixture["processor"], fixture["model"]
+    model["model_type"] = model_type
     assert image_settings(processor, model, "padded_grid") == {"padded_grid": {}}
     for key, value in (("size", {"height": 32, "width": 32}), ("image_mean", [0.48145466, 0.4578275, 0.40821073]),
                        ("rescale_factor", 1.), ("do_convert_rgb", 1), ("do_resize", True)):
