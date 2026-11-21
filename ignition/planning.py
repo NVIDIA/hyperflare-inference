@@ -261,6 +261,10 @@ class Plan:
             if self.world_size != ladder["world_size"] or any(
                     tuple(gpu.capability) != tuple(ladder["compute_capability"]) for gpu in self.gpus):
                 raise UsageError("collective ladder does not match selected TP size or GPU compute capability")
+            # A context group's gathers match the ladder against the group's size and reductions against the
+            # TP size, so gather buckets serve only a context group that spans every rank.
+            if ladder["all_gather"] is not None and self.context_parallel_size not in (None, self.world_size):
+                raise UsageError("collective ladder gathers do not match the context group size")
         if self.force_moe_decode_a16:
             intermediate = self.recipe.moe_decode_a16_intermediate_width
             if intermediate is None:

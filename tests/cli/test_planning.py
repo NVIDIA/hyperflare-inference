@@ -897,6 +897,26 @@ def test_collective_ladder_plan_and_rebuild_round_trip():
                 collective_tuning="runtime", collective_ladder=ladder)
 
 
+def test_collective_ladder_gathers_require_a_context_group_of_the_tensor_parallel_size():
+    from ignition.preparation.collective_ladder import load
+    from ignition.recipes.glm_dsa.recipe import RECIPE as glm_dsa
+
+    # Eight-rank gathers run only the barrier kernel.
+    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json") | {"world_size": 8, "all_gather": {
+        "min_bytes": 16, "buckets": [{"max_bytes": 16384, "implementation": "gather_selected_barrier",
+                                      "threads": 128, "blocks": 8, "profiles": {"barrier": [8]}}]}}
+    gpus = tuple(gpu(i, 95) for i in range(8))
+    whole = planning.plan(glm_dsa, glm_dsa.checkpoints[0], gpus, selected=tuple(range(8)), concurrency=16,
+                          reserve_bytes=0, speculation=None)
+    assert replace(whole, collective_tuning="runtime", collective_ladder=ladder).collective_ladder == ladder
+    grouped = planning.plan(glm_dsa, glm_dsa.checkpoints[0], gpus, selected=tuple(range(8)), concurrency=16,
+                            reserve_bytes=0, speculation=None, context_parallel_size=4)
+    reductions = ladder | {"all_gather": None}
+    assert replace(grouped, collective_tuning="runtime", collective_ladder=reductions).collective_ladder == reductions
+    with pytest.raises(UsageError, match="collective ladder gathers do not match the context group size"):
+        replace(grouped, collective_tuning="runtime", collective_ladder=ladder)
+
+
 def test_moe_decode_a16_geometry_and_rebuild_metadata(monkeypatch):
     from types import SimpleNamespace
     from google.protobuf import json_format
