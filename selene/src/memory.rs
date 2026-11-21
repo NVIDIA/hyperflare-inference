@@ -2763,7 +2763,7 @@ mod tests {
     #[test]
     fn a_held_same_page_message_ahead_of_an_unheld_anchor_is_the_parent() {
         // The Anchor X is not held. The Message M shares X's page, is held, and is
-        // nearer. No ancestor is skipped for being page-less: M is the only held key.
+        // nearer: M is the only held key.
         let mut core = store_core(64, 8, false);
         let full = history(1200, 1);
         let mut message = published(&full, 330, None, 0, 1);

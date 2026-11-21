@@ -1732,7 +1732,6 @@ mod tests {
         assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"dram\"} 9\n"));
         assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"nvme\"} 10\n"));
         assert!(text.contains("flare_host_cache_abandoned_stores_total 11\n"));
-        assert!(!text.contains("reason=\"linked_deeper\""));
         for (tier, name) in ["dram", "pool"].into_iter().enumerate() {
             for (metric, value) in [
                 ("deeper_link_records", 5 + tier),

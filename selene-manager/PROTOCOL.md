@@ -830,10 +830,12 @@ writer                          manager
   the writer until `FenceAck{put_id}` or process exit.
 - For a record not already indexed, `PutBegin.ancestor_keys` walks the local
   chain, listing each record's nearer offered ancestors before its local parent
-  and ending with the root's offered ancestors.
-  The entire list is strictly descending by consumed tokens and contains at
-  most `MAX_CHAIN_NODES` (4,096) keys. The manager chooses the first ready
-  ancestor whose pages it holds, including a page-only ancestor. `PutAccept`
+  and ending with the root's offered ancestors. An offered ancestor is a GPU
+  checkpoint on the record's parent chain that the producer has already
+  published to its host tiers, whether or not any tier stored it.
+  The writer sends a strictly descending list of at most `MAX_CHAIN_NODES`
+  (4,096) keys; the manager considers at most the first 4096 keys and chooses
+  the first ready ancestor whose pages it holds, including a page-only ancestor. `PutAccept`
   names that parent and its chain-relative end page as `first_page`.
   The writer sends the remaining pages and the accepted endpoint row, if any.
   If no ancestor is held, the manager selects no parent and `first_page = 0`, and the writer sends the

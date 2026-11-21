@@ -3459,8 +3459,8 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
 #[test]
 fn a_publication_lists_a_same_page_prompt_end_ahead_of_its_anchor() {
     // The Anchor at 70 tokens, the prompt-end Endpoint at 100 and the terminal at 101
-    // all lie on one page. No ancestor is skipped for being page-less: a host tier that
-    // holds only the prompt-end, or only the Anchor, links under what it holds.
+    // all lie on one page. A host tier that holds only the prompt-end, or only the
+    // Anchor, links under what it holds.
     let (mut scheduler, handle) = prefill_to_publication_boundary(100, 70);
     let history = history(100);
     retain_prompt(&mut scheduler, 3);

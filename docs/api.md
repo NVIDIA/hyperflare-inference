@@ -370,7 +370,9 @@ up to 256 ancestors per publication. A pool put offers up to 4096 candidates,
 including local parents and the nearer ancestors offered along the chain.
 
 For these four counters, `dram` counts copies started from the GPU and
-`pool` counts puts the manager stored. Pool root counters cover local roots
+`pool` counts puts the manager stored. `pool` is the shared manager, not this
+process's local disk tier, which other `flare_host_cache_` families label
+`nvme`. Pool root counters cover local roots
 that the manager also stored as roots. A `Present` outcome and
 a disk-only store's local writes contribute zero. The gauge
 `flare_host_cache_parked_records` counts complete DRAM copies awaiting disk

@@ -260,8 +260,9 @@ stores, so the whole list is offered. Each tier chooses its parent in one place
 (the DRAM store's ready ancestor, the disk store's first ancestor that accepts
 children), and that choice also decides whether an Endpoint keeps its row, so an
 Endpoint covered by a row on its page is always stored under the record that
-covers it. A publication waits for the first known offered ancestor that is still
-copying out. A put to the manager offers up to 4096 ancestors, nearest first.
+covers it. In a standalone DRAM store, a publication waits for the first known
+offered ancestor that is still copying out; inside a composite store the DRAM
+tier is flat and the disk index chooses the parent. A put to the manager offers up to 4096 ancestors, nearest first.
 Each record offers any ancestors nearer than its local parent before that parent,
 and the local root offers its remaining ancestors. The manager links the record under the
 nearest ready candidate. The writer sends only the pages after that ancestor.
