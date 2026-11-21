@@ -149,6 +149,21 @@ def test_native_lock_methods_are_not_rebound_in_worker():
         restored.lock.acquire
 
 
+@pytest.mark.parametrize('operator', [torch.ops.aten, torch.ops.aten.add, torch.ops.aten.add.Tensor])
+def test_retained_torch_operator_bindings_are_process_local(operator):
+    restored = loads(dumps(SimpleNamespace(operator=operator)))
+    with pytest.raises(RuntimeError, match='process-local resource Torch operator binding'):
+        restored.operator(torch.ones(1), torch.ones(1))
+    assert torch.equal(torch.ops.aten.add.Tensor(torch.ones(1), torch.ones(1)), torch.full((1,), 2.))
+
+
+def test_importable_native_module_remains_available_to_workers():
+    import math
+
+    restored = loads(dumps(SimpleNamespace(module=math)))
+    assert restored.module.sqrt(9) == 3
+
+
 def test_selected_plan_metadata_survives_without_registering_a_worker_plan():
     from b12x.preparation.types import Plan, plan_from_handle, require_prepared
 

@@ -14,8 +14,9 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::execution::{
-    BufferDescriptor, TunedBinding, TuningGraphDescriptor, Dtype, ExecutionManifest, ExecutionWorker, GraphDescriptor, GraphKind,
-    InputBinding, OwnedUpload, SamplingMode,
+    BufferDescriptor, Dtype, ExecutionManifest, ExecutionWorker, GraphDescriptor, GraphKind,
+    InputBinding, OwnedUpload, PersistentWorkerDescriptor, SamplingMode, TunedBinding,
+    TuningGraphDescriptor,
 };
 use crate::lifetime::OwnerLease;
 #[cfg(feature = "qualification")]
@@ -248,6 +249,48 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
             status_buffer: field!(graph, "status_buffer", String),
         });
     }
+    let persistent_worker = match value.get_item("persistent_worker") {
+        Ok(pw) if !pw.is_none() => {
+            let stop_flag_buffer = field!(pw, "stop_flag_buffer", String);
+            let stop_flag_offset = field!(pw, "stop_flag_offset", usize);
+            let stop_buf = buffers
+                .iter()
+                .find(|b| b.name == stop_flag_buffer)
+                .ok_or_else(|| PyValueError::new_err("persistent_worker stop_flag_buffer is not a registered buffer"))?;
+            let metrics_count = field!(pw, "metrics_count", u32);
+            let (metrics_buffer, metrics_offset, metrics_address) = if metrics_count > 0 {
+                let name = field!(pw, "metrics_buffer", String);
+                let offset = field!(pw, "metrics_offset", usize);
+                let buf = buffers
+                    .iter()
+                    .find(|b| b.name == name)
+                    .ok_or_else(|| PyValueError::new_err("persistent_worker metrics_buffer is not a registered buffer"))?;
+                (Some(name), offset, buf.address.saturating_add(offset))
+            } else {
+                (None, 0, 0)
+            };
+            Some(PersistentWorkerDescriptor {
+                worker_sm_count: field!(pw, "worker_sm_count", u32),
+                graph: field!(pw, "graph", String),
+                handle: pw
+                    .get_item("handle")
+                    .ok()
+                    .and_then(|v| v.extract::<usize>().ok())
+                    .unwrap_or(0),
+                stop_flag_buffer,
+                stop_flag_offset,
+                stop_flag_address: stop_buf.address.saturating_add(stop_flag_offset),
+                metrics_buffer,
+                metrics_offset,
+                metrics_count,
+                metrics_address,
+                control: None,
+            })
+        }
+        Ok(_) => None,
+        Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyError>(value.py()) => None,
+        Err(error) => return Err(error),
+    };
     Ok(ExecutionManifest {
         collectives: None,
         engram: crate::embedding_tables::binding(value)?,
@@ -266,6 +309,7 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
         buffers,
         graphs,
         tuning_graphs,
+        persistent_worker,
     })
 }
 

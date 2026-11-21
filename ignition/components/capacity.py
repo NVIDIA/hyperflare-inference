@@ -136,6 +136,48 @@ def proposal_shapes(concurrency, drafts):
     return tuple((batch, drafts) for batch in batch_capacities(concurrency))
 
 
+def packed_speculative_depth_shapes(concurrency, widths, token_capacity=None, graph_budget=64):
+    """Budget complete rounds across prepared draft depths and physical rows.
+
+    Every positive depth retains its largest target capacity at every eligible
+    batch. The maximum depth also retains the smallest positive packed capacity.
+    Further graphs refine relative row gaps, including the width-one continuation
+    as the lower boundary. The budget counts complete rounds across all depths.
+    """
+    speculative_shapes(concurrency, widths, token_capacity)
+    capacity = speculative_token_capacity(concurrency, widths[-1], token_capacity)
+    shapes, intervals, total = set(), [], 0
+
+    def interval(batch, width, lower, upper):
+        if upper - lower > 1:
+            heapq.heappush(intervals, (-Fraction(upper, lower), batch, width, lower, upper))
+
+    for batch in batch_capacities(concurrency):
+        for width in widths[1:]:
+            upper = min(capacity, batch * width)
+            if upper <= batch:
+                continue
+            shapes.add((batch, width, upper))
+            total += upper - batch
+            lower = batch
+            if width == widths[-1]:
+                lower += 1
+                shapes.add((batch, width, lower))
+            interval(batch, width, lower, upper)
+    if type(graph_budget) is not int or graph_budget < len(shapes):
+        raise ValueError(f"speculative graph budget must be an integer of at least {len(shapes)} "
+                         "to cover every draft depth and eligible batch")
+    while len(shapes) < min(graph_budget, total):
+        _, batch, width, lower, upper = heapq.heappop(intervals)
+        root = isqrt(lower * upper)
+        middle = min((value for value in (root, root + 1) if lower < value < upper),
+                     key=lambda value: (max(Fraction(value, lower), Fraction(upper, value)), value))
+        shapes.add((batch, width, middle))
+        interval(batch, width, lower, middle)
+        interval(batch, width, middle, upper)
+    return tuple(sorted(shapes))
+
+
 def mixed_shapes(concurrency, chunk_size, widths=(1,), token_capacity=None):
     """Cover prompt lengths and verification depths without their Cartesian product.
 

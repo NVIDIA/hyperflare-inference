@@ -1044,6 +1044,8 @@ mod tests {
             reservations: vec![],
             execution: Some(wire::Execution {
                 tuning_graphs: vec![],
+                expert_rows: None,
+                persistent_worker: None,
                 abi_version: 9,
                 completion_token_capacity: 0,
                 max_active: 32,
