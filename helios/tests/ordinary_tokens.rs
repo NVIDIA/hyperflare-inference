@@ -21,7 +21,7 @@
 //! template rejects and the (slot, spelling) pairs it renders differently around the spelled
 //! word; a slot or pair outside those lists that is skipped fails the test. A tokenizer whose
 //! pre-tokenizer is Metaspace (it prepends a space) would tokenize a region re-encoded without the
-//! added vocabulary differently from the first pass; none of the seven tokenizers tested here uses
+//! added vocabulary differently from the first pass; none of the eight tokenizers tested here uses
 //! one, and the tokenizers listed in docs/TODO.txt are unread.
 
 #[path = "support/templates.rs"]
@@ -419,6 +419,12 @@ fn check_native(variable: &str, contract: &str, expected: (&[&str], &[(&str, &st
 #[ignore = "requires FLARE_GLM_TEST_SNAPSHOT with the GLM-5.3 tokenizer and FLARE_TEST_TEMPLATE_DIR"]
 fn glm53_ordinary_tokens() {
     check("FLARE_GLM_TEST_SNAPSHOT", "glm53", "chat_template", "glm53", (&[], &[("multi", "</think>")]));
+}
+
+#[test]
+#[ignore = "requires FLARE_GLM_DSA_TEST_SNAPSHOT with the GLM MoE DSA tokenizer and FLARE_TEST_TEMPLATE_DIR"]
+fn glm_dsa_ordinary_tokens() {
+    check("FLARE_GLM_DSA_TEST_SNAPSHOT", "glm_dsa", "chat_template", "glm_dsa", (&[], &[("multi", "</think>")]));
 }
 
 #[test]

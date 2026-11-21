@@ -83,7 +83,5 @@ class ContinuationPool(PagedStateStorage):
         Context-parallel prefill reads earlier positions from the ranks that own them.
         """
         names = [name for name in self.pages if name.startswith("layer") and name.endswith(".latent")]
-        regions = {region.address: region for region in storage.dynamic_regions}
-        addresses = storage.peer_storage.share_regions(group, [regions[self.pages[name].data_ptr()] for name in names])
-        return {int(name.split(".")[0].removeprefix("layer")): torch.tensor(pointers, dtype=torch.int64,
-                device=self.backing.device) for name, pointers in zip(names, addresses, strict=True)}
+        return {int(name.split(".")[0].removeprefix("layer")): pointers
+                for name, pointers in super().share_pages(storage, group, names).items()}

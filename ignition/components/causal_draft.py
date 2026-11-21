@@ -32,7 +32,7 @@ class PreparedCausalDraftRound:
         self.rows = torch.arange(b, device=device)
         self.metadata = Metadata.allocate(b * w, b, blocks, device, samples=b * w)
         self.validator = PreparedBatch(o.inputs, o.requests, Metadata.allocate(b, b, blocks, device),
-            mode="decode", shard=o.weights.shard, pool=o.pool, verification_width=w)
+            mode="decode", shard=o.weights.shard, pool=o.pool, verification_width=w, page_tokens=o.page_tokens)
         self.validation = PreparedAllReduce(self.validator.validation_input, self.validator.validation_sum,
             runtime=o.collectives["runtime"], coordinator=o.collectives["coordinator"],
             session=o.session, name=name + ".validation").functional(session=o.session)

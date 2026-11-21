@@ -656,6 +656,121 @@ directory under `<kernel_cache>/b12x` (by default `~/.cache/flare/kernels/b12x/p
 That discards every cached tuning selection kept there, and the next export tunes
 again.
 
+## GLM 5.3
+
+The `glm-5.3` recipe (`ignition/recipes/glm_dsa`) prepares
+`local-inference-lab/GLM-5.3-NVFP4-CSF`, the 744B `GlmMoeDsaForCausalLM`
+checkpoint, for eight SM120 or SM121 GPUs on one host. The checkpoint is a
+`lil-nvfp4-csf-checkpoint/1` container, and Ignition reads its `metadata/` and
+`tensors/` directories without restoring the source shards. Routed experts of
+decoder layers 3 through 77 are NVFP4 with CSF block scales, which stay
+compressed on the device and run with BF16 activations in every graph.
+Attention, dense MLPs, the embedding, routers, shared experts, and the
+vocabulary head are BF16. Projection formats follow the stored tensors and are
+checked against the checkpoint's ModelOpt exclusions.
+
+Every layer runs latent attention over the positions a DeepSeek Sparse
+Attention (DSA) indexer selects. Twenty-one layers own an indexer and select up
+to 2,048 earlier positions for each query, and every other layer attends the
+selection of the nearest preceding indexer layer. Each rank holds identical
+low-rank input projections and indexer projections, and an eighth of the
+attention heads, dense MLP channels, and expert channels. The cache stores one
+656-byte latent record per position for each of the 78 layers (E4M3 latents,
+four FP32 group scales, and a BF16 rotary key) and one 132-byte index key per
+position for each indexer layer. The rotary rotation of queries, record keys,
+and index keys rounds the cosine, the sine, each product, and their sum to
+BF16, as the checkpoint's module does.
+
+The ranks share one copy of every context. Position `p`'s latent records and
+index keys live on rank `p mod 8`. A KV page covers 2,048 positions and costs
+each rank 14,010,368 bytes with the records of the multi-token prediction layer
+(decoder layer 78) and 13,808,640 without. Decode and verification select among
+the keys each rank owns: every rank packs its 2,048 highest-scoring positions
+as candidates, the ranks gather them, and each rank keeps its own candidates
+among the 2,048 highest of all. The ranks then gather every rank's absorbed
+query heads, attend the records each kept, and combine the partial results by
+their log-sum-exp. Prefill selects and attends with a rank's own heads over two
+slabs indexed by global position. A layer that owns an indexer copies every
+earlier position's index key into the key slab from the rank that owns it,
+through CUDA IPC, and writes the chunk's own keys directly. Every layer copies
+the latent records of the earlier positions its rows selected into the record
+slab the same way. `--dcp-size 4` forms two groups of four consecutive ranks:
+each group holds a complete copy of every context, attends it with its own
+ranks' heads, and exchanges nothing outside the group. A page then covers 1,024
+positions at the same bytes, 13,682 bytes for each position on each rank with
+the draft layer. `--no-context-parallel` keeps every record on every rank,
+where a page covers 256 positions.
+
+Decode and verification fuse each tensor-parallel reduction with the residual
+addition and the normalization that follows it. The fused reduction rounds the
+ranks' sum to BF16 before it adds the residual, as a prefill forward does. Its
+normalization multiplies by the weight before its one rounding, and a prefill
+forward rounds before the weight. A forward of more than eight rows reduces in
+slices of near-equal length and at most eight rows, because b12x's eight-rank
+fused reduction uses its owner-staged transport through eight rows and a slower
+pull beyond them. A decode or verification forward selects sixteen rows at a
+time, the most b12x's fused decode indexer takes in one launch. A longer call
+launches twice for each row. Prefill graphs of at least 512 rows reduce through
+the copy-engine ring all-reduce (`create_dma_all_reduce_runtime` in
+`ignition/preparation/collectives.py`). Through 256 rows, each layer's shared
+expert runs on an auxiliary stream beside routing and the routed experts, and
+`--no-stream-overlap` serializes it.
+
+The checkpoint's multi-token prediction layer, decoder layer 78, is the learned
+drafter: one decoder layer with its own latent records and index keys, which
+joins the embedding of a token with the final hidden state of the position
+before it and proposes one token per pass. The recipe stores the draft record
+of sequence position `q` in cache slot `q + 1`, the slot of the token that
+completes it, so the draft cache shares the target's page tables and advances
+with it. Prefill and every round rewrite the draft records of consumed
+positions from the target's hidden states. In a round, the first proposal
+selects the positions every later proposal attends, as the checkpoint's
+`index_share_for_mtp_iteration` declares, and each later proposal joins the
+draft layer's own normalized output. The draft layer's BF16 experts and the
+proposal vocabulary head are quantized to NVFP4 while loading, and verification
+uses the BF16 head. The default is three draft tokens and the maximum seven.
+`--no-mtp` prepares neither the draft layer nor its cache regions.
+
+`BatchedUnquantizedProjection` multiplies per-head matrix stacks through cuBLAS.
+The recipe passes it `[heads, rows, width]` stacks, gathering them from the
+`[rows, heads, width]` buffers of the surrounding operators when a graph has
+more than one row: cuBLAS reads past a stack whose head matrices interleave,
+which faults when the stack ends a core storage mapping.
+
+Qualified on eight RTX PRO 6000 Blackwell GPUs (SM120) with three draft tokens,
+`--dcp-size 4`, and FlashInfer 1d76585b: export, native serving through
+`flare run`, prefix reuse, and prompts through 128,000 tokens. Teacher-forced
+top-20 log probabilities were compared with a vLLM deployment of the same
+checkpoint at the eight positions after each of ten prompts of 19 through
+120,024 tokens, each position conditioned on that deployment's most likely
+tokens (`/v1/completions` with token-ID prompts, temperature 1, seed 0). In
+three recordings of one core, the most likely token agreed at 77, 78, and 78 of
+80 positions, and six of the seven disagreements are in the prompt of 30,025
+tokens. Two runs of that deployment agreed at 79 of 80. Two recordings of the
+core agree with each other at 77 through 79 of 80, the spread across fresh runs
+that [logprobs-design.md](logprobs-design.md) requires an accuracy comparison to
+use. Two 200-token generations through speculative rounds, from two prompts
+whose continuation is nearly certain (a count from 1 and a list of squares),
+reproduced that deployment's tokens exactly. Over 63 generated positions after
+each of four of the ten prompts, of 19 through 30,025 tokens, the log
+probabilities a server reported during generation and those of its own prefill
+of the same tokens agreed on the most likely token at 240 through 247 of 252
+positions in four runs. `tests/recipes/test_glm_dsa_records_cuda.py` compares
+the record writer with b12x's reference packing, the candidate and selection
+kernels with the references in `ignition/reference/glm_dsa.py`, the key pull
+with the shared key writer, and the record pull with the record writer, and it
+checks the writes that torch's access analysis infers for the candidate kernels
+and the key pull, three of the kernels a compiled forward wraps.
+`tests/recipes/test_glm_dsa_weights_cuda.py` loads a written checkpoint for one
+of eight ranks and compares its partitioned projections with the stored tensors.
+Not qualified: comparison with the Transformers checkpoint, the complete
+checkpoint with every rank sharing each context (an eight-layer truncation of
+the checkpoint exports and serves in that mode), grammar-constrained speculative
+requests, `--no-context-parallel` with the draft layer, and SM121. With
+`--dcp-size 4`, `flare run` does not allocate a KV cache of about 45 GiB per GPU
+for an eight-layer truncation of the checkpoint, and it allocates 10 GiB per GPU
+for the complete checkpoint. [docs/TODO.txt](TODO.txt) records the open cause.
+
 ## DeepSeek V4.1 Flash
 
 The `deepseek-v4.1-flash` alias selects `deepseek-ai/DeepSeek-V4.1-Flash-1017`
@@ -1621,7 +1736,8 @@ top-p 0.95, and top-k 64.
 Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
 target-token capacity is the larger of padded concurrency and draft count plus
 one, giving six rows at its default settings. Muse Spark declares 32 packed
-target-token rows for seven DFlash2 drafts at concurrency four. Other recipes
+target-token rows for seven DFlash2 drafts at concurrency four. GLM 5.3 defaults
+to 16 concurrent requests and declares 64 target-token rows. Other recipes
 default to 32 concurrent requests, with speculative recipes declaring 128 target-token rows independently
 of concurrency.
 Explicit flags and configuration override these defaults; a core's capacities
@@ -1630,14 +1746,16 @@ selected GPUs.
 
 | Recipe | Draft tokens | Verification layout | Speculative graphs at default concurrency | Maximum drafts at batch 32 |
 |---|---:|---|---:|---:|
-| Qwen3.8 Flash, GLM 5.3 | 5 | Rectangular | 34 | 3 |
+| Qwen3.8 Flash, GLM 5.3 Flash | 5 | Rectangular | 34 | 3 |
 | Step-5 | 3 | Rectangular | 24 | 3 |
+| GLM 5.3 | 3 | Rectangular | 20 at concurrency 16 | Not prepared at default concurrency |
 | DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
 | DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, Qwen3.8 27B | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
 | Gemma 4 | 5 | Rectangular | 10 at concurrency 4 | Not prepared at default concurrency |
 | Muse Spark | 7 | Packed | 49 packed + 3 width-one at concurrency 4 | Not prepared above concurrency 4 |
 
-The 128-row rectangular catalogs cover full draft depth through batch 16.
+The 128-row rectangular catalogs cover full draft depth through batch 16, as
+does GLM 5.3's 64-row catalog for its three drafts.
 Gemma 4's six-row default covers five drafts at batch 1 and two at batch 2,
 with width-one execution at batch 4. The counts include
 width-one speculative graphs and exclude ordinary decode, prefill, maintenance,

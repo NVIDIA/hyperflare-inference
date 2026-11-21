@@ -62,6 +62,16 @@ class PagedStateStorage(StateStorage):
     def last_hidden(self):
         return self.region("last_hidden")
 
+    def share_pages(self, storage, group, names):
+        """Every rank's address of each named page pool, [world] int64 per name, mapped through CUDA IPC.
+
+        Context-parallel prefill reads earlier positions from the ranks that own them.
+        """
+        regions = {region.address: region for region in storage.dynamic_regions}
+        addresses = storage.peer_storage.share_regions(group, [regions[self.pages[name].data_ptr()] for name in names])
+        return {name: torch.tensor(pointers, dtype=torch.int64, device=self.backing.device)
+                for name, pointers in zip(names, addresses, strict=True)}
+
     def partial_pages(self):
         return self.pages.items()
 

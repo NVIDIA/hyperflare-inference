@@ -25,6 +25,7 @@ def recipes() -> tuple[Recipe, ...]:
     from .deepseek41.recipe import RECIPE as deepseek41
     from .gemma4.recipe import RECIPE as gemma4
     from .glm53.recipe import RECIPE as glm53
+    from .glm_dsa.recipe import RECIPE as glm_dsa
     from .qwen38.recipe import RECIPE as qwen38
     from .qwen38_dense.recipe import RECIPE as qwen38_dense
     from .mimo_v2.recipe import RECIPE as mimo_v2
@@ -36,7 +37,7 @@ def recipes() -> tuple[Recipe, ...]:
     from .muse_spark.recipe import RECIPE as muse_spark
     from .inkling2.recipe import RECIPE as inkling2
 
-    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, mimo_v2, kimi3, kimi31, step5, nemotron_h, minimax_m3, gemma4, muse_spark, inkling2
+    return qwen38, qwen38_dense, glm53, glm_dsa, deepseek41, deepseek4, mimo_v2, kimi3, kimi31, step5, nemotron_h, minimax_m3, gemma4, muse_spark, inkling2
 
 
 def snapshot_directory(hub_cache: Path, checkpoint: Checkpoint) -> Path:
@@ -61,7 +62,10 @@ def _csf_container(snapshot: Path):
     if not path.is_file():
         return None
     value = json.loads(path.read_text())
-    return value if isinstance(value, dict) and value.get("schema") == "lil-mxfp4-csf-checkpoint/1" else None
+    from ignition.preparation.csf_checkpoint import FORMATS
+
+    schema = value.get("schema") if isinstance(value, dict) else None
+    return value if isinstance(schema, str) and schema in FORMATS else None
 
 
 def _csf_stored_bytes(container, snapshot):

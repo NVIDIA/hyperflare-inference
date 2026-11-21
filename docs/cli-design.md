@@ -456,7 +456,7 @@ explicit flags take precedence.
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for packed recipes |
 | `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. GPU confidence allocation requires adaptive selection; host-allocated ragged programs support fixed selection. | Adaptive |
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
-| `--no-context-parallel` | Keep each rank's attention context whole instead of sharding each page's context across tensor-parallel ranks, which caches fewer tokens. Applies to recipes that declare context-parallel page costs (GLM 5.3, Kimi K3, and Kimi K3.1 Pro); other recipes reject it. | Context sharding where the recipe declares it |
+| `--no-context-parallel` | Keep each rank's attention context whole instead of sharding each page's context across tensor-parallel ranks, which caches fewer tokens. Applies to recipes that declare context-parallel page costs (GLM 5.3, GLM 5.3 Flash, Kimi K3, and Kimi K3.1 Pro); other recipes reject it. | Context sharding where the recipe declares it |
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
 | `--autotune-effort off\|default\|audit` | Kernel search effort. Off uses heuristics without races; default races the candidates that pass each kernel family's performance exclusions; audit lifts those exclusions and races every legal candidate, to check that the default search prunes no winners. Overrides `[preparation] autotune_effort`. | Default |
 | `--joint-tuning` | Jointly select DeepSeek V4.1 QKV projection, query normalization, and query expansion plans by timing complete prepared layers across every prefill, decode, packed verification, and draft shape. Requires MXFP8 query normalization and autotuning enabled. Command line only. | off |
@@ -483,11 +483,13 @@ recorded in the plan and the exported graph catalog; it changes graph scheduling
 not kernel selection, so its cores share tuned kernels with overlapped ones.
 
 Gemma 4 defaults to four concurrent requests and six speculative target-token
-rows, and Muse Spark to four concurrent requests and 32 target-token rows. Other
-recipes default to 32 concurrent requests and 128 target-token rows.
-Qwen3.8 Flash and GLM 5.3 use rectangular catalogs covering five
+rows, Muse Spark to four concurrent requests and 32 target-token rows, and GLM
+5.3 to 16 concurrent requests and 64 target-token rows. Other recipes default
+to 32 concurrent requests and 128 target-token rows.
+Qwen3.8 Flash and GLM 5.3 Flash use rectangular catalogs covering five
 drafts through batch 16 and three at batch 32. Step-5's rectangular catalog
-covers its full three-draft depth at batch 32. Qwen3.8 27B, DeepSeek V4/V4.1,
+covers its full three-draft depth at batch 32, and GLM 5.3's covers its
+three-draft depth at batch 16. Qwen3.8 27B, DeepSeek V4/V4.1,
 MiMo V2.6 Pro, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, MiniMax M3.1, and Muse
 Spark use packed catalogs with a default
 budget of 64 round graphs plus width-one continuations. Each recipe selects

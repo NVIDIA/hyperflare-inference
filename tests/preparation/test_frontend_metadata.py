@@ -26,7 +26,7 @@ def test_default_mode_uses_manually_declared_model_card_sampling(recipe):
     if qwen:
         expected["ranges"] = {"temperature": {"min": .7, "max": 1.}, "top_p": {"min": .8, "max": .95},
                               "presence_penalty": {"min": 0., "max": 2.}}
-    elif recipe.name == "glm53":
+    elif recipe.name in ("glm53", "glm_dsa"):
         expected["ranges"] = {"temperature": {"min": .95, "max": 1.}, "top_p": {"min": .95, "max": 1.}}
     elif recipe.name == "kimi3":
         expected["ranges"] = {"top_p": {"min": .95, "max": 1.}}

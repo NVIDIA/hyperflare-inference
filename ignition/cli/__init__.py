@@ -241,9 +241,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--tuning-gpus", metavar="LIST",
                           help="local GPUs for kernel tuning, starting with --gpus and followed by complete"
                                " TP replicas; serving TP size is unchanged (default: serving GPUs)")
-    advanced.add_argument("--dcp-size", type=int, choices=(8, 16), metavar="N",
-                          help="decode context-parallel ranks per group; Kimi K3.1 TP16 supports 16 or 8"
-                               " (default: tensor-parallel size)")
+    advanced.add_argument("--dcp-size", type=int, choices=(4, 8, 16), metavar="N",
+                          help="context-parallel ranks per group, 16 or 8 for Kimi K3.1 TP16 and 8 or 4 for"
+                               " GLM 5.3 TP8 (default: tensor-parallel size)")
     advanced.add_argument("--no-context-parallel", action="store_true",
                           help="keep each rank's attention context whole instead of sharding it across"
                                " tensor-parallel ranks; fewer cached tokens (default: the recipe's)")

@@ -14,12 +14,18 @@ from pathlib import Path
 from transformers import AutoProcessor, AutoTokenizer
 from PIL import Image
 
+from ignition.preparation.frontend import annotated_template_asset
 from ignition.recipes.glm53.frontend import chat_template_asset
 
 
-def generate(snapshot):
+def generate(snapshot, recipe="glm53", *, images=True):
     tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
-    source = chat_template_asset(snapshot)["text"]
+    if recipe == "glm53":
+        source = chat_template_asset(snapshot)["text"]
+    else:
+        # Another GLM recipe annotates its checkpoint's own template with its own patch.
+        patch = Path(__file__).resolve().parents[2] / f"ignition/recipes/{recipe}/assets/chat_template.patch.json"
+        source = annotated_template_asset(tokenizer.get_chat_template().encode(), patch)["text"]
     tokenizer.chat_template = source.replace("{%- mark -%}", "")
     tool = {"type": "function", "function": {"name": "lookup", "parameters": {
         "type": "object", "properties": {"city": {"type": "string"}, "count": {"type": "integer"}}}}}
@@ -56,7 +62,7 @@ def generate(snapshot):
             suffix_starts[index] = min(suffix_starts[index + 1], offsets[index][0])
         boundaries = sorted({index for position in positions for index in range(1, len(offsets))
             if prefix_ends[index] <= position <= suffix_starts[index]})
-        body = {"model": "glm53", "messages": copy.deepcopy(messages), "chat_template_kwargs": options}
+        body = {"model": recipe, "messages": copy.deepcopy(messages), "chat_template_kwargs": options}
         if wire_strings:
             for message in body["messages"]:
                 for call in message.get("tool_calls", []):
@@ -93,6 +99,9 @@ def generate(snapshot):
         {"continue_final_message": "reasoning_content"})
     add("empty_assistant_continuation", [system, user, {"role": "assistant", "content": "", "reasoning_content": ""}],
         {"continue_final_message": True})
+    if not images:
+        # A text-only checkpoint ships no processor.
+        return {"cases": cases, "image_cases": []}
     processor = AutoProcessor.from_pretrained(snapshot, local_files_only=True)
     processor.chat_template = tokenizer.chat_template
     image_cases = []
@@ -109,7 +118,7 @@ def generate(snapshot):
         messages = [system, {"role": "user", "content": canonical}]
         rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         reference = processor(text=rendered, images=images, return_tensors="pt")
-        image_cases.append({"body": {"model": "glm53", "messages": [system, {"role": "user", "content": content}]},
+        image_cases.append({"body": {"model": recipe, "messages": [system, {"role": "user", "content": content}]},
             "token_ids": reference.input_ids[0].tolist(),
             "grid_thw": reference.image_grid_thw.tolist()})
     return {"cases": cases, "image_cases": image_cases}
@@ -119,5 +128,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--recipe", default="glm53", help="recipe whose template patch annotates the checkpoint template")
+    parser.add_argument("--text-only", action="store_true", help="omit image cases for a checkpoint without a processor")
     args = parser.parse_args()
-    args.output.write_text(json.dumps(generate(args.snapshot), ensure_ascii=False))
+    args.output.write_text(json.dumps(generate(args.snapshot, args.recipe, images=not args.text_only), ensure_ascii=False))

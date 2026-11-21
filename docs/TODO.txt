@@ -1,3 +1,87 @@
+[ ] Reduce GLM 5.3 (ignition/recipes/glm_dsa) decode launches. A one-row
+    decode graph has 3,234 nodes on the complete checkpoint, about 40 for each
+    of the 78 layers, and its GPU time tracks that count. Per layer, the two
+    latent normalizations, the rotary rotation, and the record write are
+    separate launches, as are the query rotation and its concatenation. A
+    graph of more than one row also copies the per-head stacks on both sides
+    of the two batched projections. In a four-row round of an eight-layer
+    truncation, 91 of 819 nodes fill a tensor and 58 copy memory, most of them
+    inside the shared collective, selection, and sparse-attention components.
+    Remove the entry when one launch writes a layer's record from the fused
+    input projection and one assembles its absorbed query, with outputs
+    compared against the separate operators.
+
+[ ] Reduce more than eight rows in one fused reduction on eight ranks. b12x's
+    fused add and RMSNorm reductions use their owner-staged transport for two
+    through eight rows of eight ranks and a pull beyond them, whose time grows
+    with every row (43 us against 16 us at eight rows on SM120).
+    ignition/recipes/glm_dsa/decoder.py therefore reduces slices of near-equal
+    length and at most eight rows, four launches for a 32-row forward. Remove
+    the slices when b12x stages longer inputs, and check Step-5 on eight ranks,
+    whose decoder calls the same reductions unsliced.
+
+[ ] Find why `flare run` cannot allocate a large KV cache for GLM 5.3 with
+    four-rank context groups (--dcp-size 4). On an eight-layer truncation of
+    the checkpoint with about 45 GiB of KV pages per GPU, cuMemSetAccess
+    returned CUDA_ERROR_OUT_OF_MEMORY while mapping one rank's latent pages for
+    its group. An allocation of 10 GiB per GPU succeeded, as did 45 GiB with
+    all eight ranks sharing each context. Remove the entry when the cause is
+    known and `flare run` allocates about 45 GiB of KV pages per GPU with
+    --dcp-size 4.
+
+[ ] Measure GLM 5.3 draft acceptance and round cost on the frozen speculative
+    workload that docs/mtp-design.md specifies. In two runs of llm_decode_bench
+    0.4.29, the decode benchmark of the llm-inference-bench project (30-second
+    cells at one to eight concurrent requests and contexts of 0 to 128k
+    tokens), against `flare run` with --dcp-size 4 on eight RTX PRO 6000
+    Blackwell GPUs, rounds of three drafts accepted 60% and 59% of the drafts
+    they offered.
+
+[ ] Give BatchedUnquantizedProjection disjoint matrix stacks in every recipe.
+    Called with [rows, heads, width] buffers transposed to [heads, rows,
+    width], as ignition/recipes/glm53/mla.py does for query absorption, it
+    hands cuBLAS head matrices that interleave, and cuBLAS reads far past the
+    operand: beyond 80 KB after a 16 KB operand at two rows. The read faults
+    (Xid 31 on every rank) when the operand ends a core storage mapping.
+    ignition/recipes/glm_dsa/attention.py gathers disjoint stacks instead.
+
+[ ] Repair or remove ignition/recipes/step5/speculative.py. It passes a
+    `buffers` argument and a two-argument context handler that
+    PreparedCausalDraftRound does not accept, and the `owner` it hands
+    PreparedCausalDraftRound supplies no page_tokens, which the round's
+    validator reads.
+
+[ ] Measure a GLM 5.3 rank's fixed memory against the unmeasured 8 GiB estimate
+    of what a rank holds beyond pages, state rows, and weights (_SCRATCH_BYTES
+    in ignition/recipes/glm_dsa/recipe.py), and compare full-model output with
+    the Transformers checkpoint.
+
+[ ] Decide GLM 5.3's latent normalization epsilon. Transformers constructs
+    q_a_layernorm and kv_a_layernorm with 1e-6, which the recipe reads from the
+    canonical modules, but vLLM's DeepSeek V3.2 attention passes the
+    configuration's rms_norm_eps, 1e-5.
+
+[ ] Keep cache slot zero out of the GLM 5.3 draft layer's selection. The draft
+    layer stores the record of sequence position q in slot q + 1, so slot zero
+    holds no position, but the feedback of a sequence's first token writes an
+    index key there and the indexer scores it. `first_record=1` removes the
+    slot after the cut at 2,048 positions (ContextShards.merged_records and
+    local_records in ignition/recipes/glm_dsa/dcp.py), so in a longer context
+    the slot can take the place of a real position. Only draft proposals read
+    that selection. The shared sparse indexer and b12x's DSA indexer take no
+    first position, and no key loses against every other key, because the head
+    weights can be negative. Remove the entry when a draft selection over more
+    than 2,048 positions holds 2,048 real positions whatever slot zero scores,
+    with a test that gives slot zero the highest score.
+
+[ ] Decide how GLM 5.3 (ignition/recipes/glm_dsa) runs routed experts that
+    store plain NVFP4 block scales. GlmDsaWeightLoader.load_experts prepares
+    CSF experts with the loader's activation mode, A16 by default, and plain
+    NVFP4 experts with A4, the mode of their storage declaration. The pinned
+    checkpoint stores CSF scales, so no export has run the plain branch. Remove
+    the entry when an export of a checkpoint with plain NVFP4 experts is
+    compared with a reference, or the loader rejects that storage.
+
 [ ] Compare Inkling 2 effort-zero generation with the canonical target using
     the static NVFP4 checkpoint. Native TP4 emits analysis in content_text and
     violates exact-output prompts; a long-prefix lookup also intermittently

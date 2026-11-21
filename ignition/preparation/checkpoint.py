@@ -354,10 +354,10 @@ def inspect_indexed_checkpoint(snapshot: str | Path) -> IndexedCheckpoint:
     container = snapshot / "manifest.json"
     if container.is_file():
         description = _parse_json(container.read_bytes(), "manifest.json")
-        if description.get("schema") == "lil-mxfp4-csf-checkpoint/1":
-            from .csf_checkpoint import inspect_mxfp4_csf
+        from .csf_checkpoint import FORMATS, inspect_csf
 
-            return inspect_mxfp4_csf(snapshot, description)
+        if isinstance(description.get("schema"), str) and description["schema"] in FORMATS:
+            return inspect_csf(snapshot, description)
     if not (snapshot / "model.safetensors.index.json").exists() and (
             (snapshot / "model.safetensors").is_file() or remote is not None and "model.safetensors" in remote.files):
         shard, tensors = _read_header(snapshot / "model.safetensors", "model.safetensors")
