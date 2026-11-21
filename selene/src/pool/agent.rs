@@ -634,6 +634,7 @@ impl Agent {
         };
         let (tx, rx) = mpsc::channel::<wire::RankClientMessage>(256);
         let attach = wire::RankAttach {
+            codec: Some(crate::shared::packed::raw_reader()),
             manager_incarnation: hello.manager_incarnation,
             instance_id: bound.instance_id.clone(),
             rank0_nonce: bound.rank0_nonce.clone(),
@@ -1009,7 +1010,7 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec,
+                spec: spec.clone(),
                 slot: None,
                 persisted: None,
             },
@@ -1090,7 +1091,7 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 1,
-                spec,
+                spec: spec.clone(),
                 slot,
                 persisted: None,
             },
@@ -1226,6 +1227,7 @@ impl Agent {
         }
         let shape = window.shape;
         let spec = wire::WindowSpec {
+            packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -1266,7 +1268,7 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec,
+                spec: spec.clone(),
                 slot: Some(slot),
                 persisted: None,
             },
@@ -1297,6 +1299,7 @@ impl Agent {
             return self.release_slot(slot);
         }
         let spec = wire::WindowSpec {
+            packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -1329,7 +1332,7 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec,
+                spec: spec.clone(),
                 slot: Some(slot),
                 persisted: None,
             },
@@ -1391,7 +1394,7 @@ impl Agent {
         let Some(win) = run.windows.get(&index) else {
             return;
         };
-        let (spec, slot) = (win.spec, win.slot);
+        let (spec, slot) = (win.spec.clone(), win.slot);
         let persisted = win.persisted.clone();
         let (count, row) = (spec.page_count as usize, spec.row);
         let over = run.failed.is_some() || run.cancelled;

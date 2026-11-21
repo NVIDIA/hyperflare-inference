@@ -525,6 +525,16 @@ impl Worker {
                     if let Some(gate) = &self.faults.read_gate {
                         gate.wait().map_err(Error::carrying)?;
                     }
+                    if !span.aligned() {
+                        use std::os::unix::fs::FileExt;
+                        // The caller owns this output span until the worker replies.
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts_mut(span.address as *mut u8, span.length)
+                        };
+                        file.read_exact_at(bytes, span.offset)
+                            .map_err(|e| io_failure("read packed record", e))?;
+                        return Ok(span.length as u64);
+                    }
                     self.ring.transfer(&file, &[span], false)
                 })();
                 #[cfg(any(test, feature = "test-support"))]
@@ -549,9 +559,27 @@ impl Worker {
                             self.faults.checkpoint("parent_write");
                         }
                     }
-                    let file = flare_eos::direct_update_file(&temporary, true)
-                        .map_err(|e| io_failure("open record writer", e))?;
-                    let bytes = self.ring.transfer(&file, &[span], true)?;
+                    let (file, bytes) = if span.aligned() {
+                        let file = flare_eos::direct_update_file(&temporary, true)
+                            .map_err(|e| io_failure("open record writer", e))?;
+                        let bytes = self.ring.transfer(&file, &[span], true)?;
+                        (file, bytes)
+                    } else {
+                        use std::os::unix::fs::FileExt;
+                        let file = OpenOptions::new()
+                            .create(true)
+                            .truncate(false)
+                            .write(true)
+                            .open(&temporary)
+                            .map_err(|e| io_failure("open packed record writer", e))?;
+                        // The caller retains immutable input until this job completes.
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(span.address as *const u8, span.length)
+                        };
+                        file.write_all_at(bytes, span.offset)
+                            .map_err(|e| io_failure("write packed record", e))?;
+                        (file, span.length as u64)
+                    };
                     if let Some((path, final_length)) = publish {
                         file.set_len(final_length)
                             .map_err(|e| io_failure("size record", e))?;
@@ -1144,6 +1172,11 @@ pub struct Span {
     pub address: usize,
     pub offset: u64,
     pub length: usize,
+}
+impl Span {
+    fn aligned(&self) -> bool {
+        aligned(self.address as u64) && aligned(self.offset) && aligned(self.length as u64)
+    }
 }
 
 /// A span piece of at most [`CHUNK_BYTES`], the unit the ring carries.

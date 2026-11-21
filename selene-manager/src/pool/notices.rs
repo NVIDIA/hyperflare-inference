@@ -18,12 +18,54 @@ impl Core {
         if session.need_resync {
             return Ok(());
         }
+        let codec = session.codec.clone();
         let (scope, source) = (session.scope, SourceId::Instance(session.instance));
         for notice in &batch.notices {
-            self.apply_notice(scope, source, notice_from(notice)?);
+            self.session_notice(scope, source, codec.as_ref(), notice_from(notice)?);
         }
         self.bound_hints(sid);
         Ok(())
+    }
+    fn session_notice(
+        &mut self,
+        scope: [u8; 32],
+        source: SourceId,
+        caps: Option<&v2::CodecCaps>,
+        notice: Notice,
+    ) {
+        let allowed = |e: &super::index::Entry| {
+            flare_selene::shared::packed::permits_holding(caps, e.packed, &e.required_profiles)
+        };
+        let notice = match notice {
+            Notice::Saved(e) if !allowed(&e) => Notice::Evicted {
+                key: e.key,
+                tier: e.tier,
+                heir: None,
+            },
+            Notice::Spilled { to, from_tier } if !allowed(&to) => {
+                self.apply_notice(
+                    scope,
+                    source,
+                    Notice::Evicted {
+                        key: to.key,
+                        tier: from_tier,
+                        heir: None,
+                    },
+                );
+                Notice::Evicted {
+                    key: to.key,
+                    tier: to.tier,
+                    heir: None,
+                }
+            }
+            Notice::Evicted { key, tier, heir } => Notice::Evicted {
+                key,
+                tier,
+                heir: heir.filter(allowed),
+            },
+            n => n,
+        };
+        self.apply_notice(scope, source, notice);
     }
     pub(super) fn apply_notice(&mut self, scope: [u8; 32], source: SourceId, notice: Notice) {
         let Some(state) = self.scopes.get_mut(&scope) else {
@@ -105,8 +147,14 @@ impl Core {
             return Err(Violation::new("snapshot chunk without Begin"));
         }
         let (scope, source) = (session.scope, SourceId::Instance(session.instance));
+        let codec = session.codec.clone();
         for entry in &chunk.entries {
-            self.apply_notice(scope, source, Notice::Saved(entry_from(entry)?));
+            self.session_notice(
+                scope,
+                source,
+                codec.as_ref(),
+                Notice::Saved(entry_from(entry)?),
+            );
         }
         self.bound_hints(sid);
         Ok(())

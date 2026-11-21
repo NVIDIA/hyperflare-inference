@@ -34,7 +34,7 @@ fn write(
     .unwrap();
     header.row_checksum = record::checksum(&vec![tokens as u8; 4096]);
     let mut bytes = vec![0; header.length_with_row() as usize];
-    bytes[..HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+    bytes[..record::HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
     for (page, &value) in values.iter().enumerate() {
         let at = header.page_segment as usize + page * 4096;
         bytes[at..at + 4096].fill(value);
@@ -101,6 +101,64 @@ fn rank_records_read_slices_rows_and_chain_spills_with_persisted_sums() {
         .unwrap();
     assert_eq!(sums.pages, vec![record::checksum(&vec![11; 4096])]);
     assert_ne!(sums.pages[0], record::checksum(&dst[..4096]));
+    drop(records);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_rank_reads_packed_bytes_into_a_physical_grant_and_checks_the_unit() {
+    use crate::shared::{
+        packed::crc32,
+        wire::{PackedOffer, PackedUnit},
+    };
+    let packet = include_bytes!("../../../tests/fixtures/codec/row.sgc");
+    let directory = std::env::temp_dir().join(format!("selene-rank-packed-{}", std::process::id()));
+    let lock = crate::testing::directory_lock(&directory).unwrap();
+    let geometry = vec![geometry(64, &[("kv", 4096)], 4096)];
+    let header = Header::new(
+        &geometry,
+        [1; 32],
+        [2; 16],
+        key(1),
+        None,
+        [3; 16],
+        0,
+        SystemTime::now(),
+    )
+    .unwrap()
+    .with_packed(PackedOffer {
+        first_page: 0,
+        units: vec![PackedUnit {
+            kind: 1,
+            representation: 1,
+            profile: vec![3; 32],
+            original_length: 4096,
+            stored_length: packet.len() as u64,
+            stored_crc: crc32(packet),
+            original_crc: 0xb2b29b40,
+            ..Default::default()
+        }],
+    })
+    .unwrap();
+    let path = directory.join(record::file_name(&header.key));
+    let mut bytes = header.packed_metadata().unwrap();
+    bytes.extend_from_slice(packet);
+    std::fs::write(&path, &bytes).unwrap();
+    let records = DeferredRecords::default();
+    records
+        .bind(directory.clone(), [1; 32], [2; 16], geometry, lock)
+        .unwrap();
+    let mut grant = vec![0; packet.len()];
+    records.read_packed(key(1), 0, 0, true, &mut grant).unwrap();
+    assert_eq!(grant, packet);
+    assert!(
+        records
+            .read_packed(key(1), 0, 0, true, &mut grant[1..])
+            .is_err()
+    );
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(path, bytes).unwrap();
+    assert!(records.read_packed(key(1), 0, 0, true, &mut grant).is_err());
     drop(records);
     std::fs::remove_dir_all(directory).unwrap();
 }

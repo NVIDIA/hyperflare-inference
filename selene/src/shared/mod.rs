@@ -13,6 +13,7 @@ pub mod frame;
 pub mod identity;
 pub mod index;
 pub mod limits;
+pub mod packed;
 pub mod rdma;
 pub mod record;
 pub mod region;

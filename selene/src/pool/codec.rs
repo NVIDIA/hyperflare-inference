@@ -46,6 +46,8 @@ pub(crate) fn level_from(level: i32) -> Option<Level> {
 
 pub(crate) fn entry_to(entry: &IndexEntry) -> wire::IndexEntry {
     wire::IndexEntry {
+        packed: false,
+        required_profiles: Vec::new(),
         key: Some(key_to(entry.key)),
         has_parent: entry.parent.is_some(),
         parent: entry.parent.map(key_to),

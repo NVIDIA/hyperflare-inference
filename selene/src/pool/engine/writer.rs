@@ -137,6 +137,7 @@ impl Engine {
             kind: wire::rank_fence::Kind::Put as i32,
             fence_id: id,
             records: vec![wire::Record {
+                packed: None,
                 key: Some(codec::key_to(put.key)),
                 first_page: 0,
                 pages,
@@ -179,6 +180,7 @@ impl Engine {
             return fail(self, "the put does not describe a consistent record");
         }
         self.emit(Out::PutBegin(wire::PutBegin {
+            packed: None,
             put_id: id,
             key: Some(codec::key_to(request.key)),
             chain_pages: request.chain_pages,
@@ -375,6 +377,7 @@ impl Engine {
             return;
         };
         let spec = wire::WindowSpec {
+            packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -425,11 +428,11 @@ impl Engine {
             return true;
         };
         let first = put.first_page + dest;
-        put.windows.insert(spec.index, (spec, dest));
+        put.windows.insert(spec.index, (spec.clone(), dest));
         let bytes = put.source.clone();
         let job = put.out.fill_host(
             FillOwner::Put(id),
-            spec,
+            spec.clone(),
             address,
             slot,
             self.ranks.as_ref(),
@@ -440,7 +443,7 @@ impl Engine {
                     .fill(first, spec.page_count, spec.row, dst)
             }),
         );
-        let fan_out = put.out.fan_out(self.ranks.as_mut(), spec);
+        let fan_out = put.out.fan_out(self.ranks.as_mut(), spec.clone());
         if !self.submit_fill(job) {
             let put = self.writer.puts.get_mut(&id).expect("present");
             put.out.jobs_outstanding -= 1;

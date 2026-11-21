@@ -218,6 +218,20 @@ impl Core {
         let Some(claim) = self.claims.get_mut(&key) else {
             return;
         };
+        if claim.windows[index].packed.is_some() {
+            let ranks = claim.mp.req.layout.world();
+            return self.deliver(
+                key,
+                index,
+                vec![
+                    SliceSums {
+                        pages: vec![],
+                        row: None
+                    };
+                    ranks
+                ],
+            );
+        }
         if claim.mp.req.layout.world() == 1 && claim.mp.src.layout.world() == 1 {
             return self.deliver(key, index, stated);
         }
@@ -268,6 +282,9 @@ impl Core {
         parts: Vec<(usize, SliceSums)>,
         slot: u32,
     ) {
+        let packed_source = matches!(owner, ChanOwner::Source(key) if self.claims.get(&key).and_then(|c|c.windows.get(index as usize)).is_some_and(|w|w.packed.is_some()));
+        let packed_put = packed_source
+            || matches!(owner, ChanOwner::Put(key) if self.puts.get(&key).is_some_and(|r|r.packed));
         let fields = match owner {
             ChanOwner::Source(key) => self.claims.get_mut(&key).and_then(|c| {
                 let w = c.windows.get_mut(index as usize)?;
@@ -300,7 +317,14 @@ impl Core {
         if *arrived {
             return;
         }
-        let sums = match accept_parts(stated, writers, parts, slot, pages, row) {
+        let sums = match accept_parts(
+            stated,
+            writers,
+            parts,
+            slot,
+            if packed_put { 0 } else { pages },
+            !packed_put && row,
+        ) {
             Ok(Some(sums)) => sums,
             Ok(None) => return,
             Err(()) => {
@@ -418,6 +442,7 @@ impl Core {
                 hub.push_window(
                     leg.ch.transfer,
                     channel::WindowOut {
+                        packed: spec.packed.clone(),
                         shape: super::claims::shape_for(&spec, &layout, rank),
                         page_xxh3: sums[rank].pages.clone(),
                         row_xxh3: sums[rank].row.unwrap_or(0),

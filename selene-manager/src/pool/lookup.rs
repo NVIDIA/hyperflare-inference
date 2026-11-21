@@ -214,6 +214,15 @@ impl Core {
                 ) else {
                     continue;
                 };
+                if walk.nodes.iter().any(|n| {
+                    !flare_selene::shared::packed::permits_holding(
+                        session.codec.as_ref(),
+                        n.packed,
+                        &n.required_profiles,
+                    )
+                }) {
+                    continue;
+                }
                 if source == SourceId::Manager
                     && level == v2::Level::HostDram
                     && walk
@@ -395,6 +404,8 @@ mod tests {
             index.upsert(
                 SourceId::Manager,
                 Entry {
+                    packed: false,
+                    required_profiles: Default::default(),
                     key,
                     parent,
                     bucket: [9; 16],

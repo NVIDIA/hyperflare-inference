@@ -7,7 +7,7 @@ use super::{Checksums, RankRecords};
 use crate::{
     CacheGeometry, Layout, PrefixKey, Result,
     geometry::invalid,
-    record::{self, HEADER_BYTES, Header},
+    record::{self, Header},
 };
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -29,6 +29,46 @@ struct Records {
 }
 
 impl DeferredRecords {
+    /// Copy the requested v4 units into an exclusively held physical grant.
+    pub fn read_packed(
+        &self,
+        key: PrefixKey,
+        first: u32,
+        pages: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<crate::shared::wire::PackedWindow> {
+        let records = self.0.lock().unwrap();
+        let (mut file, header) = records
+            .as_ref()
+            .ok_or_else(|| invalid("pool rank records are not initialized"))?
+            .header(key)?;
+        let layout = header
+            .packed
+            .as_ref()
+            .ok_or_else(|| invalid("expected a packed record"))?;
+        let units = layout
+            .units(first as usize, pages as usize, row)
+            .ok_or_else(|| invalid("invalid packed rank range"))?;
+        let offset = if pages == 0 && row {
+            header.row_segment
+        } else {
+            header.page_segment + layout.page_offset(first as usize)
+        };
+        if (row && layout.row_bytes() == 0)
+            || units.iter().map(|u| u.stored_length).sum::<u64>() != dst.len() as u64
+        {
+            return Err(invalid("packed rank destination length"));
+        }
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(dst))
+            .map_err(|e| record::io_failure("read packed unit bytes", e))?;
+        crate::shared::packed::verify_units(units, dst)?;
+        Ok(crate::shared::wire::PackedWindow {
+            units: units.to_vec(),
+        })
+    }
+
     pub fn bind(
         &self,
         directory: PathBuf,
@@ -54,8 +94,7 @@ impl Records {
         let path = self.directory.join(record::file_name(&key));
         let mut file =
             std::fs::File::open(path).map_err(|e| record::io_failure("open a rank record", e))?;
-        let mut block = [0; HEADER_BYTES];
-        file.read_exact(&mut block)
+        let block = Header::read_metadata(&mut file)
             .map_err(|e| record::io_failure("read a rank record header", e))?;
         let header = Header::decode(&block)?;
         if header.key != key
@@ -79,6 +118,11 @@ impl Records {
         dst: &mut [u8],
     ) -> Result<Checksums> {
         let (mut file, header) = self.header(key)?;
+        if header.packed.is_some() {
+            return Err(invalid(
+                "a packed rank record requires a packed destination",
+            ));
+        }
         let page_bytes = self.layout.page_record_bytes as usize;
         let length = pages as usize * page_bytes
             + if row {

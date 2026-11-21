@@ -50,6 +50,7 @@ pub(super) enum PutPhase {
 }
 
 pub(super) struct PutRec {
+    pub packed: bool,
     pub phase: PutPhase,
     pub link: Link,
     pub pending_windows: u32,
@@ -165,6 +166,8 @@ impl Core {
                 _ => Tier::Nvme,
             };
             Entry {
+                packed: entry.packed,
+                required_profiles: entry.required_profiles.clone(),
                 key: entry.key,
                 parent: entry.parent,
                 bucket: entry.bucket,
@@ -385,6 +388,18 @@ impl Core {
             self.put_refusal(sid, put_id, v2::Reason::Invalid, "page counts");
             return Ok(());
         };
+        if m.packed.as_ref().is_some_and(|offer| {
+            !flare_selene::shared::packed::permits_offer(session.codec.as_ref(), offer)
+        }) {
+            self.put_refusal(
+                sid,
+                put_id,
+                v2::Reason::Invalid,
+                "packed put requires a negotiated profile",
+            );
+            return Ok(());
+        }
+        let packed = m.packed.is_some();
         let pid = self.sessions[&sid].pid;
         let Some(link) = self.link_for(process, scope, pid, shm) else {
             self.put_refusal(
@@ -425,6 +440,7 @@ impl Core {
             chain_pages,
             published_tail_pages: tail_pages,
             capture_role: m.capture_role(),
+            packed: m.packed.clone(),
             child_paths: m.child_paths,
             descendant_row: m.descendant_row,
             next_child,
@@ -517,6 +533,7 @@ impl Core {
         self.puts.insert(
             key,
             PutRec {
+                packed,
                 phase: PutPhase::Open,
                 link,
                 pending_windows: 0,
@@ -590,6 +607,7 @@ impl Core {
                 self.send(
                     sid,
                     M::PutAccept(v2::PutAccept {
+                        packed: accept.packed,
                         put_id,
                         first_page: u64::from(accept.first_page),
                         has_parent: accept.parent.is_some(),
@@ -638,6 +656,7 @@ impl Core {
                 }
                 let legs = rec.legs.iter().map(|l| (l.ch.transfer, l.rank)).collect();
                 let spec = v2::WindowSpec {
+                    packed: grant.packed,
                     index: grant.index,
                     region: grant.region,
                     offset: grant.offset,
@@ -656,7 +675,7 @@ impl Core {
                 };
                 let message = M::PutGrant(v2::PutGrant {
                     put_id,
-                    window: Some(spec),
+                    window: Some(spec.clone()),
                 });
                 self.grant_windows(sid, message, legs, &layout, &[spec]);
             }
@@ -800,6 +819,9 @@ impl Core {
             return;
         };
         let mp = &mut rec.mp;
+        if rec.packed {
+            return self.put_window_filled(key, index, Vec::new(), None);
+        }
         if mp.layout.world() == 1 {
             let whole = stated.into_iter().next().unwrap();
             return self.put_window_filled(key, index, whole.pages, whole.row);
@@ -994,16 +1016,20 @@ impl Core {
         // The metadata must describe exactly the record that was accepted, in this
         // scope: its identity, geometry, key, parent and length.
         let descriptor = &self.scopes[&session.scope].valid.descriptor;
-        let valid = m.metadata.len() >= HEADER_BYTES
-            && Header::decode(&m.metadata).is_ok_and(|header| {
-                let (parent, first_page) = rec.accepted.unwrap_or((None, 0));
-                header.identity == descriptor.identity
-                    && header.fingerprint == descriptor.fingerprint
-                    && descriptor.matches(&header)
-                    && header.key == rec.key
-                    && header.parent == parent
-                    && u64::from(header.tail_pages) + u64::from(first_page) == rec.chain_pages
-            });
+        let valid = if rec.packed {
+            m.metadata.is_empty() && m.metadata_offset == 0
+        } else {
+            m.metadata.len() >= HEADER_BYTES
+                && Header::decode(&m.metadata).is_ok_and(|header| {
+                    let (parent, first_page) = rec.accepted.unwrap_or((None, 0));
+                    header.identity == descriptor.identity
+                        && header.fingerprint == descriptor.fingerprint
+                        && descriptor.matches(&header)
+                        && header.key == rec.key
+                        && header.parent == parent
+                        && u64::from(header.tail_pages) + u64::from(first_page) == rec.chain_pages
+                })
+        };
         if !valid {
             self.put_fail(
                 sid,
@@ -1016,7 +1042,7 @@ impl Core {
         // A multi-process writer's ranks cannot state whole-page checksums; the record keeps
         // the ones the manager computed over the assembled windows.
         let mut metadata = m.metadata.clone();
-        if rec.mp.layout.world() > 1 {
+        if !rec.packed && rec.mp.layout.world() > 1 {
             let mp = &rec.mp;
             let header = Header::decode(&metadata).expect("validated above");
             let pages: Option<Vec<u64>> = (0..header.tail_pages as usize)
@@ -1446,6 +1472,7 @@ mod tests {
         core.puts.insert(
             key,
             PutRec {
+                packed: false,
                 phase: PutPhase::Finished,
                 link: Link {
                     connection: 1,

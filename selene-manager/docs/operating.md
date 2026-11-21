@@ -409,3 +409,9 @@ requesting an export, and the instance falls back to an equivalent local
 copy or recomputes after draining. An occasional warning during restarts is
 expected; repeated warnings on a quiet pool warrant checking source sessions
 and record retention.
+
+### Upgrading a checkpoint root for codec envelopes
+
+Upgrade readers of a shared root before enabling a packed writer. Current readers accept raw v1–v3 and packed v4 together. Writers require a positive envelope acknowledgement. Rolling a root back to a pre-v4 manager deletes packed `.ckpt` files during the scan and can evict dependent cache entries. This causes cache loss. To keep the cache, roll back to an upgraded binary with compression off. Phase-one Flare mirrors remain raw.
+
+A packed record occupies one power-of-two arena extent. `selene_packed_arena_buddy_slack_bytes` reports the difference between the allocated capacity and stored lengths of resident packed records. Staging must fit the biggest indivisible physical row window. The on-disk file includes the header, directory and actual payload bytes. Write-back and shutdown preserve those bytes verbatim.
