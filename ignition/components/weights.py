@@ -1160,8 +1160,11 @@ class DirectWeightLoader:
         intermediate_range=None, swiglu_limit=None, swiglu_clamp_after_silu=False,
         scale_compression=None, scale_scratch=None,
     ):
-        """Quantize stacked BF16 expert shards once for NVFP4 W4A16 execution.
+        """Quantize BF16 expert shards once for NVFP4 W4A16 execution.
 
+        The checkpoint stores each projection stacked over experts as
+        `prefix.<projection>_proj.weight`, or one matrix per expert as
+        `prefix.<expert>.<projection>_proj.weight`.
         Gate and up share one global scale per expert shard; down has its own.
         Staging holds one expert. Zero intermediate channels align packed W4A16
         tiles without changing the live channels or their TP partition.
@@ -1176,10 +1179,17 @@ class DirectWeightLoader:
         sources = {}
         for projection in ("up", "gate", "down"):
             name = f"{prefix}.{projection}_proj.weight"
-            source = self._sources[name]
-            shape = ((num_experts, hidden_size, intermediate_size) if projection == "down"
-                     else (num_experts, intermediate_size, hidden_size))
-            if source.dtype != torch.bfloat16 or source.shape != shape:
+            shape = (hidden_size, intermediate_size) if projection == "down" else (intermediate_size, hidden_size)
+            if name in self._sources:
+                source = self._sources[name]
+                valid = source.dtype == torch.bfloat16 and tuple(source.shape) == (num_experts, *shape)
+            else:
+                name = f"{prefix}.<expert>.{projection}_proj.weight"
+                source = tuple(self._sources[f"{prefix}.{expert}.{projection}_proj.weight"]
+                               for expert in range(num_experts))
+                valid = bool(source) and all(expert.dtype == torch.bfloat16 and tuple(expert.shape[-2:]) == shape
+                                             for expert in source)
+            if not valid:
                 raise ValueError(f"{name}: storage disagrees with BF16 expert geometry")
             sources[projection] = source
         if hidden_size % 128:
@@ -1208,9 +1218,9 @@ class DirectWeightLoader:
         stream = torch.cuda.current_stream(self.device)
         stream.synchronize()
         for expert in range(num_experts):
-            self._copy(up_gate[:local], sources["up"][expert, first:last])
-            self._copy(up_gate[padded:padded + local], sources["gate"][expert, first:last])
-            self._copy(down_stage, sources["down"][expert, :, first:last])
+            self._copy(up_gate[:local], sources["up"][expert][first:last])
+            self._copy(up_gate[padded:padded + local], sources["gate"][expert][first:last])
+            self._copy(down_stage, sources["down"][expert][:, first:last])
             self._session.flush()
             down[:, :local].copy_(down_stage)
             for source, values, scales, gains in ((up_gate, w13, s13, g13), (down, w2, s2, g2)):
@@ -1775,6 +1785,37 @@ class DirectWeightLoader:
         for tensor in (*result.components, result.starts):
             record_numeric_tensor(tensor)
         return result
+
+
+def nvfp4_expert_scale_vectors(sources, prefixes):
+    """Collect each NVFP4 expert's global weight scales and reciprocal activation scales.
+
+    Returns the up/gate and down weight multipliers followed by the up/gate and
+    down activation reciprocals, one CPU FP32 element per expert prefix. Up and
+    gate share one packed weight, so their global weight scales must be equal.
+    Their shared activation scale is the larger of the two calibrations.
+    """
+    import torch
+
+    w13, w2, a1, a2 = [], [], [], []
+    for prefix in prefixes:
+        values = {}
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            for suffix in ("weight_scale_2", "input_scale"):
+                name = f"{prefix}.{projection}.{suffix}"
+                value = sources[name]
+                if (value.device.type != "cpu" or value.dtype != torch.float32 or value.numel() != 1
+                        or not bool((torch.isfinite(value) & (value > 0)).all())):
+                    raise ValueError(f"{name}: expected a finite positive FP32 scalar")
+                values[projection, suffix] = value.item()
+        if values["gate_proj", "weight_scale_2"] != values["up_proj", "weight_scale_2"]:
+            raise ValueError(f"{prefix}: gate/up weight global scales differ")
+        w13.append(values["up_proj", "weight_scale_2"])
+        w2.append(values["down_proj", "weight_scale_2"])
+        a1.append(max(values["gate_proj", "input_scale"], values["up_proj", "input_scale"]))
+        a2.append(values["down_proj", "input_scale"])
+    return (torch.tensor(w13, dtype=torch.float32), torch.tensor(w2, dtype=torch.float32),
+            torch.tensor(a1, dtype=torch.float32).reciprocal(), torch.tensor(a2, dtype=torch.float32).reciprocal())
 
 
 def _mxfp4_source_reuse(rows, columns, *, activation_mode, packing, n64_repack):

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from ignition.components.parallel import TensorParallelShard
 from ignition.planning import SUPPORTED_ARCHITECTURES, SUPPORTED_CAPABILITIES
 from ignition.components.weights import DirectWeightLoader, MLPWeights
+from ignition.components.weights import nvfp4_expert_scale_vectors as _expert_scales
 from ignition.preparation.checkpoint import IndexedCheckpoint
 from ignition.preparation.persistent import persistent_cat, allocated_tensor_bytes
 from ignition.preparation.rebuild_manifest import weight_container
@@ -297,27 +298,3 @@ def require_draft_experts_supported(quantization, *, sm103):
     if sm103 and expert_format(quantization, f"{TEXT_PREFIX}.layers.45.mlp.experts")[0] == "mxfp8":
         raise ValueError("the draft layer stores MXFP8 experts, which need SM120 or SM121;"
                          " prepare with --no-mtp on this GPU")
-
-
-def _expert_scales(sources, prefixes):
-    import torch
-
-    w13, w2, a1, a2 = [], [], [], []
-    for prefix in prefixes:
-        values = {}
-        for projection in ("gate_proj", "up_proj", "down_proj"):
-            for suffix in ("weight_scale_2", "input_scale"):
-                name = f"{prefix}.{projection}.{suffix}"
-                value = sources[name]
-                if (value.device.type != "cpu" or value.dtype != torch.float32 or value.numel() != 1
-                        or not bool((torch.isfinite(value) & (value > 0)).all())):
-                    raise ValueError(f"{name}: expected a finite positive FP32 scalar")
-                values[projection, suffix] = value.item()
-        if values["gate_proj", "weight_scale_2"] != values["up_proj", "weight_scale_2"]:
-            raise ValueError(f"{prefix}: gate/up weight global scales differ")
-        w13.append(values["up_proj", "weight_scale_2"])
-        w2.append(values["down_proj", "weight_scale_2"])
-        a1.append(max(values["gate_proj", "input_scale"], values["up_proj", "input_scale"]))
-        a2.append(values["down_proj", "input_scale"])
-    return (torch.tensor(w13, dtype=torch.float32), torch.tensor(w2, dtype=torch.float32),
-            torch.tensor(a1, dtype=torch.float32).reciprocal(), torch.tensor(a2, dtype=torch.float32).reciprocal())

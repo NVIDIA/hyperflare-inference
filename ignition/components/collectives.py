@@ -384,12 +384,13 @@ class PreparedAllReduceRMSNorm:
         self.output = self.residual = self.input_addend = self.group_weights = self.group_ids = None
         return self
 
-    def __call__(self, source, residual, *, input_addend=None, group_weights=None, group_ids=None):
-        output = self.output
-        if output is None:
-            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=source.device)
-        else:
+    def __call__(self, source, residual, *, output=None, input_addend=None, group_weights=None, group_ids=None):
+        """Return the normalized rows. A functional call writes them to `output` when the caller owns one."""
+        if self.output is not None:
+            output = self.output
             input_addend, group_weights, group_ids = self.input_addend, self.group_weights, self.group_ids
+        elif output is None:
+            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=source.device)
         _all_reduce_rmsnorm(source, residual, self.weight, output, self.handle, input_addend,
                            group_weights, group_ids)
         return output
