@@ -1475,7 +1475,7 @@ fn completion_refreshes_terminal_and_prompt_recency_after_other_requests_finish(
 #[test]
 fn cancellation_before_inference_and_preemption_preserve_checkpoint_demand_recency() {
     for preempted in [false, true] {
-        let mut scheduler = scheduler(1, 8, 4);
+        let mut scheduler = host_scheduler(1, 8, 4);
         let handle = scheduler.admit(spec(64, 4)).unwrap();
         init(&mut scheduler, 1);
         let step = scheduler.plan().unwrap();
@@ -1496,10 +1496,14 @@ fn cancellation_before_inference_and_preemption_preserve_checkpoint_demand_recen
             scheduler.finish(handle).unwrap();
         } else {
             scheduler.cancel(handle).unwrap();
+            // The setup request stopped after prefill; isolate the idle cancellation below.
+            let key = scheduler.cache().checkpoint(id).unwrap().prefix();
+            assert_eq!(scheduler.take_reused(), [key]);
             let handle = scheduler.admit(spec(64, 4)).unwrap();
             rank = scheduler.cache().checkpoint(id).unwrap().retention_rank();
             scheduler.cancel(handle).unwrap();
         }
+        assert!(scheduler.take_reused().is_empty());
         assert_eq!(
             scheduler.cache().checkpoint(id).unwrap().retention_rank(),
             rank
@@ -1510,7 +1514,7 @@ fn cancellation_before_inference_and_preemption_preserve_checkpoint_demand_recen
 #[test]
 fn completion_and_client_stop_refresh_the_retained_prefix_only_without_execution_errors() {
     for (failed, cancelled) in [(false, false), (false, true), (true, false), (true, true)] {
-        let mut scheduler = scheduler(1, 8, 4);
+        let mut scheduler = host_scheduler(1, 8, 4);
         let handle = scheduler.admit(spec(64, 4)).unwrap();
         init(&mut scheduler, 1);
         let step = scheduler.plan().unwrap();
@@ -1554,7 +1558,128 @@ fn completion_and_client_stop_refresh_the_retained_prefix_only_without_execution
             .retention_rank()
             .use_epoch;
         assert_eq!(completed_epoch > epoch, !failed);
+        let prefix_key = scheduler.cache().checkpoint(id).unwrap().prefix();
+        assert_eq!(scheduler.take_reused(), if failed { vec![] } else { vec![prefix_key] });
     }
+}
+
+#[test]
+fn completion_reused_notices_refresh_parent_and_terminal_without_earlier_ancestors() {
+    let mut scheduler = host_scheduler(2, 16, 6);
+    let grandparent = seed_checkpoint(&mut scheduler, 1);
+    let grandparent_key = scheduler.cache().checkpoint(grandparent).unwrap().prefix();
+    assert_eq!(scheduler.take_reused(), [grandparent_key]);
+
+    let long = scheduler.admit(spec(128, 2)).unwrap();
+    assert_eq!(scheduler.request(long).unwrap().prefix(), Some(grandparent));
+    init(&mut scheduler, 4);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Prefill);
+    scheduler.commit(&step, Fence(5)).unwrap();
+    scheduler.complete(Fence(5), &records(long, 5, 128, 1, 91, 1), Default::default()).unwrap();
+    retain_prompt(&mut scheduler, 6);
+    let parent = scheduler.request(long).unwrap().prefix().unwrap();
+    let parent_key = scheduler.cache().checkpoint(parent).unwrap().prefix();
+    assert!(scheduler.take_reused().is_empty());
+
+    let mut other = spec(64, 2);
+    other.prompt.fill(7);
+    let short = scheduler.admit(other).unwrap();
+    init(&mut scheduler, 7);
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(8)).unwrap();
+    scheduler.complete(Fence(8), &records(short, 8, 64, 1, 92, 1), Default::default()).unwrap();
+    retain_prompt(&mut scheduler, 9);
+    let short_parent = scheduler.request(short).unwrap().prefix().unwrap();
+    let short_parent_key = scheduler.cache().checkpoint(short_parent).unwrap().prefix();
+
+    let step = scheduler.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Decode);
+    scheduler.commit(&step, Fence(10)).unwrap();
+    let mut completions = records(long, 10, 129, 2, 94, 2);
+    completions[short.slot as usize] = CompletionRecord {
+        generation: short.generation as i64, submission_sequence: 10,
+        consumed_tokens: 65, generated_tokens: 2, token_id: 93, status: 2,
+        error_code: 0, reserved: 0, vector: None,
+    };
+    scheduler.complete(Fence(10), &completions, Default::default()).unwrap();
+    freeze(&mut scheduler, short, 11);
+    let short_terminal = scheduler.finish(short).unwrap().unwrap();
+    let short_key = scheduler.cache().checkpoint(short_terminal).unwrap().prefix();
+    freeze(&mut scheduler, long, 12);
+    let terminal = scheduler.finish(long).unwrap().unwrap();
+    let terminal_key = scheduler.cache().checkpoint(terminal).unwrap().prefix();
+    assert_eq!(scheduler.take_reused(), [short_parent_key, short_key, parent_key, terminal_key]);
+    assert!(scheduler.take_reused().is_empty());
+
+    // Reach the same terminal through a different prompt boundary. The retained
+    // terminal's parent, not this request's prompt, must receive the refresh.
+    let branch = scheduler.admit(spec(127, 3)).unwrap();
+    assert_eq!(scheduler.request(branch).unwrap().prefix(), Some(grandparent));
+    init(&mut scheduler, 13);
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(14)).unwrap();
+    scheduler.complete(Fence(14), &records(branch, 14, 127, 1, 127, 1), Default::default()).unwrap();
+    retain_prompt(&mut scheduler, 15);
+    assert_ne!(scheduler.request(branch).unwrap().prefix(), Some(parent));
+    for (fence, consumed, generated, token, status) in [(16, 128, 2, 91, 1), (17, 129, 3, 94, 2)] {
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(fence)).unwrap();
+        scheduler.complete(Fence(fence), &records(branch, fence, consumed, generated, token, status), Default::default()).unwrap();
+    }
+    freeze(&mut scheduler, branch, 18);
+    assert_eq!(scheduler.finish(branch).unwrap(), Some(terminal));
+    assert_eq!(scheduler.take_reused(), [parent_key, terminal_key]);
+}
+
+#[test]
+fn completion_refreshes_preserve_retirement_order_until_drained() {
+    // A page-aligned prompt still needs a snapshot to become a checkpoint.
+    // Stop after inference progress, without assuming there is a prefix to retain.
+    let mut page_only = host_scheduler(1, 8, 0);
+    let handle = page_only.admit(spec(64, 2)).unwrap();
+    init(&mut page_only, 1);
+    let step = page_only.plan().unwrap();
+    page_only.commit(&step, Fence(2)).unwrap();
+    page_only
+        .complete(
+            Fence(2),
+            &records(handle, 2, 64, 1, 90, 1),
+            Default::default(),
+        )
+        .unwrap();
+    assert!(page_only.request(handle).unwrap().prefix().is_none());
+    page_only.cancel(handle).unwrap();
+    assert!(page_only.take_reused().is_empty());
+
+    // Accumulate one delivery batch. Reclaim GPU storage between requests so
+    // five distinct keys can be refreshed with only two snapshot rows.
+    let mut scheduler = host_scheduler(1, 8, 2);
+    let mut expected = Vec::with_capacity(6);
+    for fill in [10u32, 11, 12, 13, 14, 13] {
+        let mut request = spec(64, 2);
+        request.prompt.fill(fill);
+        let handle = scheduler.admit(request).unwrap();
+        let base = scheduler.submitted.0 + 1;
+        init(&mut scheduler, base);
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(base + 1)).unwrap();
+        scheduler
+            .complete(
+                Fence(base + 1),
+                &records(handle, base + 1, 64, 1, 80 + i64::from(fill), 1),
+                Default::default(),
+            )
+            .unwrap();
+        retain_prompt(&mut scheduler, base + 2);
+        let id = scheduler.request(handle).unwrap().prefix().unwrap();
+        expected.push(scheduler.cache().checkpoint(id).unwrap().prefix());
+        scheduler.cancel(handle).unwrap();
+        scheduler.ensure_resources(8, 2).unwrap();
+    }
+    assert_eq!(expected[3], expected[5]);
+    assert_eq!(scheduler.take_reused(), expected);
+    assert!(scheduler.take_reused().is_empty());
 }
 
 #[test]
@@ -2611,7 +2736,9 @@ fn disabled_publication_tracking_keeps_gpu_reuse_without_allocating_a_notificati
         let checkpoint = seed_checkpoint(&mut scheduler, round * 3 + 1);
         assert_eq!(scheduler.stats().snapshot_publications, round + 1);
         assert_eq!(scheduler.publications.capacity(), 0);
+        assert_eq!(scheduler.reused.capacity(), 0);
         assert!(scheduler.take_publications().is_empty());
+        assert!(scheduler.take_reused().is_empty());
         let hit = scheduler.admit(spec(64, 2)).unwrap();
         let request = scheduler.request(hit).unwrap();
         assert_eq!(request.phase, RequestPhase::Restore);
