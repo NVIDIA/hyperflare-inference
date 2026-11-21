@@ -673,6 +673,9 @@ pub struct RequestScheduler {
     publications: Vec<CheckpointId>,
     offered_publications: BTreeSet<CheckpointId>,
     pending_reoffers: BTreeSet<CheckpointId>,
+    /// Completion refreshes, oldest first. Repeating a key moves it to the back;
+    /// inserting a distinct key beyond `2 * snapshots` drops the oldest entry.
+    reused: Vec<PrefixKey>,
     track_evictions: bool,
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
@@ -765,6 +768,7 @@ impl RequestScheduler {
             publications: Vec::new(),
             offered_publications: BTreeSet::new(),
             pending_reoffers: BTreeSet::new(),
+            reused: Vec::new(),
             track_evictions: false,
             evictions: Vec::new(),
             evictions_lost: false,
@@ -1799,6 +1803,26 @@ impl RequestScheduler {
             .into_iter()
             .filter_map(|id| self.publication(id))
             .collect()
+    }
+
+    /// Takes the pending completion refreshes, oldest first. Each key appears at
+    /// its most recent refresh position; overflow drops the oldest of `2 * snapshots` entries.
+    pub fn take_reused(&mut self) -> Vec<PrefixKey> {
+        std::mem::take(&mut self.reused)
+    }
+
+    fn record_reused(&mut self, key: PrefixKey) {
+        debug_assert!(self.track_publications);
+        let limit = (self.limits.snapshots as usize).saturating_mul(2);
+        if limit == 0 {
+            return;
+        }
+        if let Some(position) = self.reused.iter().position(|queued| *queued == key) {
+            self.reused.remove(position);
+        } else if self.reused.len() == limit {
+            self.reused.remove(0);
+        }
+        self.reused.push(key);
     }
 
     pub(crate) fn publication(&self, id: CheckpointId) -> Option<PublishedCheckpoint> {
@@ -2957,8 +2981,19 @@ impl RequestScheduler {
             let epoch = self.cache.new_use_epoch()?;
             self.cache.touch(id, epoch)?;
             // Duplicate publication can retain a different parent than the request's prefix.
-            if result.is_some() && let Some(parent) = self.cache.checkpoint(id)?.parent() {
+            let parent = if result.is_some() {
+                self.cache.checkpoint(id)?.parent()
+            } else {
+                None
+            };
+            if let Some(parent) = parent {
                 self.cache.touch(parent, epoch)?;
+            }
+            if self.track_publications {
+                if let Some(parent) = parent {
+                    self.record_reused(self.cache.checkpoint(parent)?.prefix());
+                }
+                self.record_reused(self.cache.checkpoint(id)?.prefix());
             }
         }
         let mut request = self.slots[handle.slot as usize].request.take().unwrap();
