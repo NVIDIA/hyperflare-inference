@@ -258,9 +258,9 @@ class PreparationConfig(BasePreparationConfig):
         return max(self.speculative_widths) if self.dspark else 1
 
 
-def deferred_prefill_enabled(config: PreparationConfig, sliding_window: int) -> bool:
+def deferred_prefill_enabled(config: PreparationConfig, sliding_window: int, *, decoder_start: int | None) -> bool:
     """Return whether preparation emits separate intermediate and terminal prefill graphs."""
-    return getattr(config, "sm103", None) is not None and config.prefill_chunk_size > sliding_window
+    return decoder_start is not None and config.prefill_chunk_size > sliding_window
 
 
 def _prepare_speculation_catalog(config, speculation, *, add, buffers,
@@ -950,7 +950,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
              + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
              + (len(config.batch_capacities) if False in modes else 0))
     count += len(PATCH_CAPACITIES) if vision_state is not None else 0
-    deferred_prefill = deferred_prefill_enabled(config, weights.config.text["sliding_window"])
+    deferred_prefill = deferred_prefill_enabled(
+        config, weights.config.text["sliding_window"], decoder_start=weights.config.decoder_start
+    )
     if deferred_prefill:
         count += len(modes) * len(config.prefill_capacities)
     catalog_bytes = {}

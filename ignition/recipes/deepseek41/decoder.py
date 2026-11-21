@@ -117,12 +117,16 @@ class PreparedDecoderBoundary:
             source_indices.metadata, pool, rotary, session=session, name=name + ".global_kv",
             indices=source_indices)
 
-    def __call__(self, incoming, pre_mix, metadata, indices, indexer):
-        suffix = self.packing.begin(metadata)
+    def produce_global_kv(self, incoming, pre_mix, metadata, indices, indexer):
         attn_mix = torch.zeros_like(pre_mix)
         residual, post, comb, normalized = self.mhc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
         self.global_kv(normalized, indexer, metadata, indices.compressed(self.global_kv.ratio))
-        return suffix, tuple(suffix.gather(value) for value in (residual, post, comb, normalized)), suffix.gather(attn_mix)
+        return (residual, post, comb, normalized), attn_mix
+
+    def __call__(self, incoming, pre_mix, metadata, indices, indexer):
+        suffix = self.packing.begin(metadata)
+        state, attn_mix = self.produce_global_kv(incoming, pre_mix, metadata, indices, indexer)
+        return suffix, tuple(suffix.gather(value) for value in state), suffix.gather(attn_mix)
 
 
 class PreparedLayer:
@@ -253,12 +257,14 @@ class PreparedDecoder:
         self.vision = vision if mode == "prefill" else None
         self.table_requests = PreparedTableRequests(tables, metadata, pool, session=session, name=name + ".table_requests")
         decoder_start = weights.config.decoder_start
+        self.decoder_start = decoder_start
         self.packing = None
-        if mode == "prefill" and metadata.positions.numel() > 128 and decoder_start is not None and scoring is None:
+        if mode == "prefill" and decoder_start is not None and scoring is None:
             if (any(layer.engram is not None for layer in weights.layers[decoder_start:])
                     or any(source.layer > decoder_start for source in weights.config.sources)):
                 raise ValueError("decoder suffix replay requires Engram and compressed KV sources before its boundary")
-            self.packing = PreparedDecoderSuffix(metadata)
+            if metadata.positions.numel() > 128:
+                self.packing = PreparedDecoderSuffix(metadata)
         self.output_metadata = metadata if self.packing is None else self.packing.metadata
         self.output_scratch = scratch if self.packing is None else Scratch.allocate(
             128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device)
@@ -350,7 +356,9 @@ class PreparedDecoder:
         self.scratch = self.metadata = self.output_scratch = self.output_metadata = None
         self.auxiliary = self.safe_tokens = self.head_hidden = self.local_logits = None
 
-    def __call__(self, metadata):
+    def __call__(self, metadata, *, terminal=True):
+        if not terminal and (self.mode != "prefill" or self.scoring is not None or self.decoder_start is None):
+            raise ValueError("non-terminal prefill requires an unscored prefill decoder with a global-KV boundary")
         source_metadata = metadata
         raw_history = self.table_requests(metadata)
         tokens = (metadata.token_ids.clamp(0, self.weights.embedding.shape[0] - 1)
@@ -366,9 +374,21 @@ class PreparedDecoder:
         selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
         staging = (None if self.staging_shape is None else torch.zeros(
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
-        auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
+        auxiliary = (None if not terminal else torch.zeros(
+            self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device))
         suffix, records = None, []
         for index, layer in enumerate(self.layers):
+            if not terminal and index == self.decoder_start:
+                if layer.boundary is not None:
+                    layer.boundary.produce_global_kv(incoming, pre_mix, metadata, indices,
+                                                     layer.attention.selectors[0])
+                else:
+                    attn_mix = torch.zeros_like(pre_mix)
+                    _, _, _, normalized = layer.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
+                    layer.attention.global_kv(normalized, layer.attention.selectors[0], metadata,
+                                              indices.compressed(layer.attention.global_kv.ratio))
+                self.table_requests.commit(source_metadata.lengths, raw_history, source_metadata)
+                return None, None, None, (staging, tuple(records), raw_history)
             boundary = None
             if layer.boundary is not None:
                 suffix, state, attn_mix = layer.boundary(incoming, pre_mix, metadata, indices,

@@ -345,8 +345,9 @@ stream. A copy stream waits for each production event, transfers the selected
 completion row, and records its completion event. A frame remains occupied
 until its transfer completes and its completion is consumed. Only decode and
 complete speculative generation may occupy both frames. Grammar-constrained
-work and host token stops require an empty window. Prefill, scored prefill,
-mixed, resume, vision, and state operations also drain the window before replay.
+work and host token stops require an empty window. Prefill, terminal prefill,
+scored prefill, mixed, resume, vision, and state operations also drain the
+window before replay.
 Scheduler dependencies additionally serialize host-fed pending tokens and
 committed cursors, history inputs, unknown or stale costs, and phase transitions.
 

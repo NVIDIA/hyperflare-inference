@@ -1255,3 +1255,101 @@ fn terminal_prefill_requires_its_own_timing_evidence() {
     assert_eq!(run_step(&mut scheduler).kind, GraphKind::Init);
     assert_eq!(scheduler.service_rates(scheduler.request(handle).unwrap()), (None, None));
 }
+
+#[test]
+fn non_terminal_scored_prefill_service_rates_use_scored_catalog_and_exclude_mixed() {
+    let mut scheduler = scheduler(16, false);
+    scheduler.scored_prefill_graphs(&[128, 512]).unwrap();
+    scheduler.mixed_graphs(&[(2, 1, 128)]).unwrap();
+    let mut graphs = super::tests::duration_graphs(4);
+    for graph in &mut graphs {
+        if graph.kind == GraphKind::Prefill {
+            graph.estimated_duration_ns = 1_000_000;
+        }
+    }
+    for capacity in [128, 512] {
+        let mut graph = graphs
+            .iter()
+            .find(|g| g.kind == GraphKind::Prefill && g.token_capacity == capacity)
+            .unwrap()
+            .clone();
+        graph.name = format!("scored_prefill{capacity}");
+        graph.kind = GraphKind::ScoredPrefill;
+        graph.estimated_duration_ns = 25_000_000;
+        graphs.push(graph);
+    }
+    let mut mixed = graphs
+        .iter()
+        .find(|g| g.kind == GraphKind::Decode && g.batch_capacity == 2)
+        .unwrap()
+        .clone();
+    mixed.name = "mixed2x1_p128".into();
+    mixed.kind = GraphKind::Mixed;
+    mixed.prefill_capacity = 128;
+    mixed.estimated_duration_ns = 500_000;
+    graphs.push(mixed);
+    scheduler.measured_graph_durations(&graphs).unwrap();
+
+    let mut scored = spec(None, 64, 1);
+    scored.prompt_logprobs = true;
+    let scored_handle = scheduler.admit(scored).unwrap();
+    let ordinary_handle = scheduler.admit(spec(None, 64, 1)).unwrap();
+    assert_eq!(run_step(&mut scheduler).kind, GraphKind::Init);
+
+    // Scored prompt requests cannot execute ordinary Prefill or Mixed graphs;
+    // their individually feasible rate must come from ScoredPrefill (65 / 25 ms).
+    assert_eq!(
+        scheduler.service_rates(scheduler.request(scored_handle).unwrap()),
+        (Some(65.0 / 25.0), None),
+    );
+    // Ordinary prompt requests can use the faster Mixed graph (65 / 0.5 ms).
+    assert_eq!(
+        scheduler.service_rates(scheduler.request(ordinary_handle).unwrap()),
+        (Some(65.0 / 0.5), None),
+    );
+}
+
+#[test]
+fn deferred_prefill_service_rates_exclude_mixed_while_awaiting_terminal_completion() {
+    let mut scheduler = terminal_scheduler();
+    scheduler.mixed_graphs(&[(2, 1, 128)]).unwrap();
+    let mut graphs = super::tests::duration_graphs(4);
+    for graph in &mut graphs {
+        if graph.kind == GraphKind::Prefill {
+            graph.estimated_duration_ns = 1_000_000;
+        }
+    }
+    let terminal: Vec<_> = graphs
+        .iter()
+        .filter(|g| g.kind == GraphKind::Prefill)
+        .cloned()
+        .map(|mut g| {
+            g.kind = GraphKind::TerminalPrefill;
+            g.estimated_duration_ns = 10_000_000;
+            g
+        })
+        .collect();
+    graphs.extend(terminal);
+    let mut mixed = graphs
+        .iter()
+        .find(|g| g.kind == GraphKind::Decode && g.batch_capacity == 2)
+        .unwrap()
+        .clone();
+    mixed.name = "mixed2x1_p128".into();
+    mixed.kind = GraphKind::Mixed;
+    mixed.prefill_capacity = 128;
+    mixed.estimated_duration_ns = 1_500_000;
+    graphs.push(mixed);
+    scheduler.measured_graph_durations(&graphs).unwrap();
+
+    let handle = scheduler.admit(spec(None, 600, 1)).unwrap();
+    assert_eq!(run_step(&mut scheduler).kind, GraphKind::Init);
+    let step = run_step(&mut scheduler);
+    assert_eq!(step.kind, GraphKind::Prefill);
+    assert!(scheduler.request(handle).unwrap().deferred_prefill_end.is_some());
+    // Remaining 129 tokens must complete in TerminalPrefill (130 / 10 ms), not Mixed.
+    assert_eq!(
+        scheduler.service_rates(scheduler.request(handle).unwrap()),
+        (Some(130.0 / 10.0), None),
+    );
+}

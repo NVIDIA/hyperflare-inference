@@ -1225,8 +1225,8 @@ submitted lane limits. Confidence producers declare `confidence_width` and write
 FP32 `[2, request_slots, draft_capacity]` completion frames.
 
 Host pending-token, grammar, history, stop, cost-discovery, and phase-transition
-dependencies serialize the affected program. Prefill, scored prefill, mixed,
-resume, vision, and state operations drain the queue. A copy stream transfers
+dependencies serialize the affected program. Prefill, terminal prefill, scored
+prefill, mixed, resume, vision, and state operations drain the queue. A copy stream transfers
 records behind production events; input staging and completion frames remain
 owned until their fences complete. Tensor-parallel retirement waits for all
 ranks, protecting frame reuse and cancellation cleanup.

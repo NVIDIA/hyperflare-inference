@@ -51,7 +51,7 @@ def _vision_buffers(recipe):
 
 
 def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completion_capacity=None,
-                     include_terminal_prefill=None):
+                     decoder_start=20):
     module = importlib.import_module(f"ignition.recipes.{recipe}.contract")
     bootstrap = importlib.import_module(f"ignition.recipes.{recipe}.bootstrap")
     options = {}
@@ -138,8 +138,10 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
                             (False,) if recipe == "deepseek41" else (None,)):
                 add(kind, batch, 1, enabled=enabled)
     emit_terminal = (
-        recipe == "deepseek41" and bootstrap.deferred_prefill_enabled(config, pool.config.text["sliding_window"])
-        if include_terminal_prefill is None else include_terminal_prefill
+        recipe == "deepseek41"
+        and bootstrap.deferred_prefill_enabled(
+            config, pool.config.text["sliding_window"], decoder_start=decoder_start
+        )
     )
     for tokens in getattr(config, "prefill_capacities", prefill_capacities(config.prefill_chunk_size)):
         for enabled in ((True, False) if recipe == "deepseek41" else (None,)):
@@ -320,43 +322,37 @@ def test_native_capacity_one_omits_survival_without_narrowing_state_row_storage(
 
 def test_deepseek_short_chunk_catalog_retains_complete_prefill_semantics():
     import flare_heliopause
+    from ignition.recipes.deepseek41 import bootstrap
 
-    _, contract, manifest = _recipe_metadata("deepseek41", config_options={"prefill_chunk_size": 128})
+    config, contract, manifest = _recipe_metadata("deepseek41", config_options={"prefill_chunk_size": 128})
+    assert not bootstrap.deferred_prefill_enabled(config, 128, decoder_start=20)
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    assert contract["version"] == 3
+    assert not any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])
+
+
+def test_deepseek_missing_decoder_boundary_retains_contract_v3_without_terminal_prefill():
+    import flare_heliopause
+    from ignition.recipes.deepseek41 import bootstrap
+
+    config, contract, manifest = _recipe_metadata(
+        "deepseek41", config_options={"prefill_chunk_size": 4096}, decoder_start=None
+    )
+    assert not bootstrap.deferred_prefill_enabled(config, 128, decoder_start=None)
     flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
     assert contract["version"] == 3
     assert not any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])
 
 
 @pytest.mark.parametrize("devices", [(0, 1, 2), (0, 1, 2, 3), (0, 1, 2, 3, 4, 5)])
-def test_deepseek_non_sm103_tp_layouts_retain_contract_v3_without_terminal_prefill(devices):
+def test_deepseek_terminal_prefill_catalog_validates_contract_v4(devices):
     import flare_heliopause
     from ignition.recipes.deepseek41 import bootstrap
 
     config, contract, manifest = _recipe_metadata(
         "deepseek41", config_options={"devices": devices, "prefill_chunk_size": 4096}
     )
-    assert getattr(config, "sm103", None) is None
-    assert not bootstrap.deferred_prefill_enabled(config, 128)
-    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
-    assert contract["version"] == 3
-    assert not any(graph["kind"] == "terminal_prefill" for graph in manifest["graphs"])
-
-
-def test_deepseek_terminal_prefill_catalog_validates_contract_v4():
-    import flare_heliopause
-    from ignition.recipes.deepseek41 import bootstrap
-
-    assert bootstrap.deferred_prefill_enabled(
-        SimpleNamespace(sm103=object(), prefill_chunk_size=4096), 128
-    )
-    assert not bootstrap.deferred_prefill_enabled(
-        SimpleNamespace(sm103=object(), prefill_chunk_size=128), 128
-    )
-    _, contract, manifest = _recipe_metadata(
-        "deepseek41",
-        config_options={"prefill_chunk_size": 4096},
-        include_terminal_prefill=True,
-    )
+    assert bootstrap.deferred_prefill_enabled(config, 128, decoder_start=20)
     flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
     assert contract["version"] == 4
     terminal = [graph for graph in contract["graphs"] if graph["kind"] == 14]

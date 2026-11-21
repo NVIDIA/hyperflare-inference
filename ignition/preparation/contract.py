@@ -70,6 +70,7 @@ def text_inputs(kind):
 
 def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, rows=1, embedding_tables=()):
     """Bind semantic uploads to the captured catalog; omitted transfers retain device bytes."""
+    has_terminal_prefill = any(signature.kind == "terminal_prefill" for signature in signatures.values())
     result = []
     for name, signature in signatures.items():
         kind = "prefill" if signature.kind == "terminal_prefill" else signature.kind
@@ -79,7 +80,12 @@ def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, r
         values = [selected[field] for field in signature.inputs if field in selected]
         states = [] if kind == "vision" else [dict(view=continuation, access=p.READ_WRITE)]
         if pending is not None and kind not in ("snapshot", "vision"):
-            states.append(dict(view=pending, access=p.WRITE if kind in ("init", "restore") else p.READ_WRITE))
+            access = (
+                p.WRITE if kind in ("init", "restore")
+                else p.READ if signature.kind == "prefill" and has_terminal_prefill
+                else p.READ_WRITE
+            )
+            states.append(dict(view=pending, access=access))
         result.append(dict(graph=name, kind=p.GraphOperation.Value(signature.kind.upper()), inputs=values, state=states,
             tuned_bindings=[],
             state_rows_per_request=signature.token_capacity if rows is None and kind == "speculative" else (rows or 1),

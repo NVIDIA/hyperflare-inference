@@ -46,7 +46,7 @@ as untimed and excluded from duration averages.
 
 Request rows identify the native slot and generation, keeping reused slots
 separate. Their ten-second history marks completion observations, not GPU start
-or end timestamps. Each cell shows the latest prefill, decode, speculative, or
+or end timestamps. Each cell shows the latest prefill, terminal prefill, decode, speculative, or
 vision completion in its interval; a completion of another graph kind is shown
 only when the cell contains none of those. Up/down arrows scroll requests.
 Every row shows `Request` (`slot.generation`), `Phase` (the scheduler's request

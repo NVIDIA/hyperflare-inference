@@ -18,8 +18,9 @@ only for decode rounds, and it estimates graph costs with a 7/8 moving average
 that reverts to unmeasured after 30 seconds. The duration estimates, funded
 refresh, and acceptance learning specified below describe Helios alone.
 
-The native catalog contains prefill, scored prefill, ordinary decode, complete
-speculative generation, mixed prefill/generation, vision, and state operations.
+The native catalog contains prefill, terminal prefill, scored prefill, ordinary
+decode, complete speculative generation, mixed prefill/generation, vision, and
+state operations.
 A complete speculative graph contains proposal generation, optional confidence
 and prefix allocation, target verification, and accepted-state commit. Proposal
 and verification are internal stages, not independently scheduled operations.
@@ -212,6 +213,30 @@ smaller prefill can win near a throughput knee because it imposes less waiting.
 Increasing a stream's output age raises its delivery value; it does not make
 inefficient operations mandatory at a fixed deadline.
 
+When a model contract declares `TERMINAL_PREFILL` graphs with a positive
+reconstruction minimum `terminal_prefill_min_tokens`, ordinary `PREFILL` graphs
+consume intermediate prompt chunks without guaranteeing complete continuation
+state, while `TERMINAL_PREFILL` graphs complete continuation state and sample at
+the prompt end (see [intermediate and terminal prefill](../helios/model-contract.md#intermediate-and-terminal-prefill)).
+Submitting an intermediate `PREFILL` chunk fixes the request's next completion
+boundary — the prompt end, a selected prefix-checkpoint cut, or a conditioned
+input-window limit — and shortens the intermediate chunk when necessary to
+reserve at least `terminal_prefill_min_tokens` actual prompt tokens for the
+terminal chunk. If an atomic input span prevents reserving that tail, a
+`TERMINAL_PREFILL` graph completes the span first so the short tail continues
+from complete state. Until a `TERMINAL_PREFILL` graph completes at the boundary,
+the request cannot publish a checkpoint, decode, resume, or enter a mixed graph;
+cancellation discards the incomplete state after its last-use fence drains.
+When the remaining work to the boundary fits within the largest prefill capacity
+and an intermediate chunk leaves a measured terminal tail of at least
+`terminal_prefill_min_tokens`, chunk selection scales the combined boundary
+value by `T_intermediate / (T_intermediate + T_terminal)` so every candidate
+compares over the same completion horizon while decode waiting remains bounded
+by the submitted graph's duration. Individually feasible prefill service rates
+price each request from the prefill catalog and operation it actually executes
+(`PREFILL`, `TERMINAL_PREFILL`, or `SCORED_PREFILL`), excluding `MIXED` graphs
+for scored-prompt requests and requests awaiting terminal completion.
+
 ## Prerequisites and completion
 
 Initialization, restore, vision execution, and intermediate snapshots enable
@@ -325,6 +350,12 @@ requests, less recently used requests, and smaller physical padding, in that
 order. Unknown graphs require an empty
 submission queue and completion feedback. A lone cold request consequently tries
 its largest useful prefill or speculation extent without a solo-request rule.
+On catalogs declaring `TERMINAL_PREFILL`, an unmeasured alternative shape whose
+participants all already have a measured candidate, while another active request
+has a measured candidate outside that cohort, is treated as optional discovery
+and runs only when funded refresh credit is ready so discovering an alternative
+prefill shape does not preempt unrelated measured service; catalogs without
+`TERMINAL_PREFILL` retain unrestricted discovery.
 
 Stale physical dispatches also require an empty queue and completion feedback,
 while retaining their measured costs for ranking. Commit rechecks freshness
@@ -442,8 +473,8 @@ Cancellation stops further selection immediately; pages and state slots remain
 owned through their last submitted fence.
 
 The transport has two frame slots. Only ordinary decode and complete speculative
-generation may occupy both. Prefill, scored prefill, mixed execution, resume,
-vision, and state operations drain the window. Unknown or stale costs, grammar,
+generation may occupy both. Prefill, terminal prefill, scored prefill, mixed
+execution, resume, vision, and state operations drain the window. Unknown or stale costs, grammar,
 host stops, host-fed pending tokens or committed cursors, history inputs, and
 phase transitions also require completion feedback. Dependency checks apply to the actual selected
 program. A finishing prefill exposes its decoder and checkpoint operation only

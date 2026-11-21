@@ -185,4 +185,7 @@ def test_terminal_prefill_preserves_inputs_and_declares_reconstruction_minimum()
     assert ordinary.terminal_prefill_min_tokens == 0
     assert terminal.terminal_prefill_min_tokens == 129
     assert ordinary.inputs == terminal.inputs
-    assert ordinary.state == terminal.state
+    ordinary_pending = next(state for state in ordinary.state if state.view.buffer == "request_pending_token")
+    terminal_pending = next(state for state in terminal.state if state.view.buffer == "request_pending_token")
+    assert ordinary_pending.access == p.READ
+    assert terminal_pending.access == p.READ_WRITE

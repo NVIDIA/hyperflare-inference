@@ -219,7 +219,7 @@ impl RequestScheduler {
                     continue;
                 };
                 let per_ms = 1e6 / ns as f64;
-                if prefill {
+                if prefill && !request.prompt_logprobs && request.deferred_prefill_end.is_none() {
                     let work = self.prefill_work(request, capacity);
                     if work > 0 {
                         let first =

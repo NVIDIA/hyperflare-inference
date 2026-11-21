@@ -666,3 +666,12 @@
     tests/components/test_reference_*_cuda.py,
     tests/preparation/test_reference_core_export_cuda.py). Close when both
     multi-GPU SM120/SM121 paths and SM103 CUDA suites pass on hardware.
+
+[ ] Qualify TERMINAL_PREFILL core export and native serving replay on GPUs.
+    Export a DeepSeek V4.1 core under model contract version 4, serve it through
+    `flare run`, and verify numerical agreement and continuation state across
+    multi-chunk prompt ends, prefix checkpoints, atomic image spans,
+    cancellation, and speculative generation, plus measured prefill latency
+    against complete prefill. CPU contract, scheduler, and decoder boundary
+    tests cover metadata and scheduling invariants only. Close when full-model
+    export and native serving replay pass on hardware.
