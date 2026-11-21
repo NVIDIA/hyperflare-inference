@@ -833,6 +833,26 @@ fn export_serving<'py>(
 mod tests {
     use super::*;
     #[test]
+    fn expert_row_export_retains_typed_canonical_storage_without_changing_graphs() {
+        let value = serde_json::json!({
+            "abi_version": 6, "buffers": [], "graphs": [],
+            "expert_rows": {"version": 1, "layers": [{"layer": 7, "experts": 3,
+                "host_experts": [1, 2], "hbm_experts": [0, 1], "mapping_buffer": "map",
+                "planes": [{"host_weight_view": "cold", "hbm_weight_view": "hot"}]}]}
+        });
+        let encoded = execution(&value, &[]).unwrap();
+        let catalog = encoded.expert_rows.unwrap();
+        assert_eq!(catalog.version, 1);
+        assert_eq!(catalog.layers[0].host_experts, [1, 2]);
+        assert_eq!(catalog.layers[0].hbm_experts, [0, 1]);
+        assert_eq!(catalog.layers[0].mapping_buffer, "map");
+        assert_eq!(catalog.layers[0].planes[0].hbm_weight_view, "hot");
+        assert!(encoded.graphs.is_empty());
+        assert!(execution(&serde_json::json!({"buffers": [], "graphs": []}), &[])
+            .unwrap().expert_rows.is_none());
+    }
+
+    #[test]
     fn startup_tuning_export_preserves_bindings_and_omits_process_handles() {
         let value = serde_json::json!({
             "abi_version": 6, "max_active": 1, "input_frame_bytes": 8, "buffers": [],

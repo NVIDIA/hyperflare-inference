@@ -44,6 +44,7 @@ def apply(configuration, gpus, b12x=()) -> None:
         "HF_HUB_CACHE": str(configuration.directory("hub_cache")),
         "B12X_COMPILE_CACHE_DIR": str(kernel_cache / "b12x"),
         "FLASHINFER_WORKSPACE_BASE": str(flashinfer_workspace(kernel_cache)),
+        "DG_JIT_CACHE_DIR": str(kernel_cache / "deepgemm"),
         "TRITON_CACHE_DIR": str(kernel_cache / "triton"),
         "TORCHINDUCTOR_CACHE_DIR": str(kernel_cache / "inductor"),
         **dict(b12x),

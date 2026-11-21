@@ -260,6 +260,8 @@ class Recipe:
     draft_head_quantizations: tuple[str, ...] = ()
     draft_body_quantizations: tuple[str, ...] = ()
     markov_head_quantizations: tuple[str, ...] = ()
+    # True when the recipe's packed speculative catalog budgets complete rounds across every draft depth.
+    packed_speculative_depths: bool = False
     # Supported (world_size, context_parallel_size) hybrid context-parallel topologies.
     hybrid_context_parallel: tuple[tuple[int, int], ...] = ()
     # Optional (max_bytes, max_pages) graph-memory credit for hybrid context-parallel topologies.

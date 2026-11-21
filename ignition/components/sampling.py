@@ -331,7 +331,7 @@ def _normalize_probs(Probability, Mass, V: tl.constexpr, BLOCK: tl.constexpr):
 @triton.jit
 def _write_completion(Records, Frame, Sequence, slot, epoch, consumed, generated,
                       token, status, error, active,
-                      RECORD_FIELDS: tl.constexpr, SLOTS: tl.constexpr = 4):
+                      RECORD_FIELDS: tl.constexpr, SLOTS: tl.constexpr = 4, DRAFT_CONTEXT_LAG: tl.constexpr = 1):
     fields = tl.arange(0, triton.next_power_of_2(RECORD_FIELDS))
     value = tl.full((triton.next_power_of_2(RECORD_FIELDS),), 0, tl.int64)
     value = tl.where(fields == 0, tl.where(active, epoch, 0), value)
@@ -343,7 +343,9 @@ def _write_completion(Records, Frame, Sequence, slot, epoch, consumed, generated
     value = tl.where(fields == 6, tl.where(active, error, 0), value)
     value = tl.where(fields == 8, (active & (token >= 0)).to(tl.int64), value)
     value = tl.where(fields == 12, -1, value)
-    value = tl.where(fields == 13, tl.where(active, tl.maximum(consumed - 1, 0), 0), value)
+    draft_consumed = (tl.where(active, tl.maximum(consumed - DRAFT_CONTEXT_LAG, 0), 0)
+                      if DRAFT_CONTEXT_LAG is not None else -1)
+    value = tl.where(fields == 13, draft_consumed, value)
     value = tl.where(fields == 15, 1, value)
     value = tl.where(fields >= 16, -1, value)
     value = tl.where(fields == 16, tl.where(active, token, -1), value)
@@ -355,7 +357,8 @@ def _write_completion(Records, Frame, Sequence, slot, epoch, consumed, generated
 def _complete(Maximum, Sampled, SampleValid, Mass, Slots, Epochs, Live, SampleEnabled, Generation, Consumed, Generated, Pending, Status, Error,
               Counter, Counts, Budget, Eos, EosCount, Records, Frame, Sequence,
               V: tl.constexpr, ROWS: tl.constexpr, CS: tl.constexpr,
-              RECORD_FIELDS: tl.constexpr, SAMPLE: tl.constexpr, SLOTS: tl.constexpr = 4):
+              RECORD_FIELDS: tl.constexpr, SAMPLE: tl.constexpr, SLOTS: tl.constexpr = 4,
+              DRAFT_CONTEXT_LAG: tl.constexpr = 1):
     slot = tl.program_id(0)
     rows = tl.arange(0, SLOTS)
     matches = (rows < ROWS) & (rows < tl.load(Live))
@@ -406,7 +409,7 @@ def _complete(Maximum, Sampled, SampleValid, Mass, Slots, Epochs, Live, SampleEn
             tl.store(Error + slot, code)
     consumed = tl.load(Consumed + slot * CS)
     _write_completion(Records, Frame, Sequence, slot, epoch, consumed, generated,
-                      token, state, code, matches_count > 0, RECORD_FIELDS, SLOTS)
+                      token, state, code, matches_count > 0, RECORD_FIELDS, SLOTS, DRAFT_CONTEXT_LAG)
 
 
 def _check_tensor(tensor, shape, dtype, device, name, *, contiguous=True):
@@ -424,7 +427,9 @@ class PreparedCompletion:
     """Record consumption and errors without vocabulary outputs or RNG work."""
 
     def __init__(self, state: DeviceRequestState, row_slot_ids, row_generations, live_rows,
-                 completion: CompletionOutputs, frame_index, submission_sequence):
+                 completion: CompletionOutputs, frame_index, submission_sequence, *, draft_context_lag=1):
+        if draft_context_lag is not None and (type(draft_context_lag) is not int or draft_context_lag < 0):
+            raise ValueError("draft_context_lag must be a nonnegative token count or None")
         records = completion.records
         rows, device = row_slot_ids.numel(), state.generation.device
         if device.type != "cuda" or not 1 <= rows <= state.capacity:
@@ -439,7 +444,8 @@ class PreparedCompletion:
             state.generation, state.consumed_tokens, state.generated_tokens, state.pending_token, state.status,
             state.error_code, state.rng_counter, state.histogram, state.max_new_tokens, state.eos_token_ids,
             state.eos_count, records, frame_index, submission_sequence,
-            state.vocab_size, rows, state.consumed_tokens.stride(0), fields, False, state.capacity)
+            state.vocab_size, rows, state.consumed_tokens.stride(0), fields, False, state.capacity,
+            draft_context_lag)
         self.capacity = state.capacity
         self._record = None
 
@@ -464,7 +470,9 @@ class PreparedSampling:
     offset=4*counter. CUDA's Philox subsequence is therefore zero regardless
     of packed row or physical slot. One word is drawn per generated token;
     the logical counter advances once. FlashInfer's temporary outputs remain
-    inside the captured graph. ``scratch_tensors``
+    inside the captured graph. ``draft_context_lag`` declares how many consumed
+    target tokens are absent from draft context; None declares no draft cache.
+    ``scratch_tensors``
     enumerates mutable storage retained through graph replay.
     """
 
@@ -479,7 +487,9 @@ class PreparedSampling:
 
     def __init__(self, logits, state: DeviceRequestState, row_slot_ids, row_generations, live_rows,
                  completion: CompletionOutputs, frame_index, submission_sequence, *, sample_enabled: torch.Tensor | None = None,
-                 workspace=None):
+                 workspace=None, draft_context_lag=1):
+        if draft_context_lag is not None and (type(draft_context_lag) is not int or draft_context_lag < 0):
+            raise ValueError("draft_context_lag must be a nonnegative token count or None")
         records = completion.records
         rows, vocab = logits.shape
         if not 1 <= rows <= state.capacity or vocab != state.vocab_size or logits.dtype not in (torch.float32, torch.bfloat16):
@@ -520,7 +530,7 @@ class PreparedSampling:
             state.generation, state.consumed_tokens, state.generated_tokens, state.pending_token, state.status,
             state.error_code, state.rng_counter, state.histogram, state.max_new_tokens,
             state.eos_token_ids, state.eos_count, records, frame_index, submission_sequence,
-            vocab, rows, state.consumed_tokens.stride(0), record_fields, True, state.capacity)
+            vocab, rows, state.consumed_tokens.stride(0), record_fields, True, state.capacity, draft_context_lag)
         self._logprob_args = (logits, completion, row_slot_ids, row_generations, live_rows, frame_index)
         self._prepared = False
         self.broadcast = None
@@ -537,7 +547,7 @@ class PreparedSampling:
         self.logprobs.prepare()
         self._scores = _compile(_scores, self._score_args, self._grid)
         self._complete = _compile(_complete, self._complete_args, (self.state.capacity, 1, 1))
-        self._record = _compile(_complete, (*self._complete_args[:-2], False, self.state.capacity), (self.state.capacity, 1, 1))
+        self._record = _compile(_complete, (*self._complete_args[:-3], False, self.state.capacity, self._complete_args[-1]), (self.state.capacity, 1, 1))
         self._metadata = _compile(_sampling_metadata, self._metadata_args, (self._rows, 1, 1))
         self._sanitize = _compile(_sanitize_scores, self._sanitize_args, self._grid)
         self._normalize = _compile(_normalize_probs, self._normalize_args, self._grid)

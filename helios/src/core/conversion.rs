@@ -2872,6 +2872,7 @@ fn rebuild_compatible(
         && a.local_checkpoint == b.local_checkpoint
         && a.expert_scale_compression == b.expert_scale_compression
         && a.online_mxfp8 == b.online_mxfp8
+        && a.sm103_preparation_json == b.sm103_preparation_json
         && (if a.online_mxfp8_scope.is_empty() { "all" } else { &a.online_mxfp8_scope })
             == (if b.online_mxfp8_scope.is_empty() { "all" } else { &b.online_mxfp8_scope })
         && a.language_model_only == b.language_model_only
@@ -7452,8 +7453,10 @@ mod tests {
 
         let mut legacy_json = serde_json::to_value(rebuild("same-code")).unwrap();
         legacy_json.as_object_mut().unwrap().remove("online_mxfp8_scope");
+        legacy_json.as_object_mut().unwrap().remove("sm103_preparation_json");
         let omitted_scope: runtime::RebuildManifest = serde_json::from_value(legacy_json).unwrap();
         assert!(omitted_scope.online_mxfp8_scope.is_empty());
+        assert!(omitted_scope.sm103_preparation_json.is_empty());
         let mut explicit_scope = omitted_scope.clone();
         explicit_scope.online_mxfp8_scope = "all".into();
         assert!(rebuild_compatible(&Some(omitted_scope), &Some(explicit_scope)));
@@ -7511,7 +7514,7 @@ mod tests {
             }
         }
 
-        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 10] = [
+        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 11] = [
             ("checkpoint-repository", |value| value.checkpoint_repository = "other/model".into()),
             ("checkpoint-revision", |value| value.checkpoint_revision = "other".into()),
             ("local-checkpoint", |value| value.local_checkpoint = true),
@@ -7520,6 +7523,7 @@ mod tests {
                 value.expert_scale_compression = Some("native".into())
             }),
             ("online-mxfp8", |value| value.online_mxfp8 = false),
+            ("sm103-preparation", |value| value.sm103_preparation_json = "{}".into()),
             ("online-mxfp8-scope", |value| value.online_mxfp8_scope = "kda-input".into()),
             ("draft-body-quantization", |value| {
                 value.speculation.as_mut().unwrap().draft_body_quantization = Some("mxfp8".into())

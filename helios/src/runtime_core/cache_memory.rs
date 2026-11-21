@@ -137,18 +137,20 @@ impl Layout {
                 let bytes = end - offset;
                 let mapped = bytes.min(row_end.saturating_sub(cursor));
                 if mapped > 0 {
+                    let plane_bytes = geometry.page_capacity * p.unit_bytes;
                     let first_row = (cursor / row_bytes).max(execution);
                     let last_row = (cursor + mapped)
                         .div_ceil(row_bytes)
                         .min(geometry.row_capacity);
                     for row in first_row..last_row {
                         let start = offset + (row * row_bytes).saturating_sub(cursor);
-                        let end = offset + ((row + 1) * row_bytes).min(cursor + mapped) - cursor;
-                        let range = &mut aliases[(row - execution) as usize];
-                        range.start = range.start.min((start / p.unit_bytes) as u32);
-                        range.end = range
-                            .end
-                            .max(end.div_ceil(p.unit_bytes).min(geometry.page_capacity) as u32);
+                        let end = (offset + ((row + 1) * row_bytes).min(cursor + mapped) - cursor)
+                            .min(plane_bytes);
+                        if start < end {
+                            let range = &mut aliases[(row - execution) as usize];
+                            range.start = range.start.min((start / p.unit_bytes) as u32);
+                            range.end = range.end.max(end.div_ceil(p.unit_bytes) as u32);
+                        }
                     }
                 }
                 chunks.push(Chunk {
@@ -182,8 +184,8 @@ impl Layout {
         if cursor < row_end {
             return Err(invalid("KV backing cannot cover continuation aliases"));
         }
-        for (snapshot, range) in aliases.iter_mut().enumerate() {
-            if (execution + snapshot as u64 + 1) * row_bytes <= fixed_bytes {
+        for range in &mut aliases {
+            if *range == (u32::MAX..0) {
                 *range = 0..0;
             } else if range.start >= range.end {
                 return Err(invalid("continuation alias lacks a KV conflict range"));
@@ -535,6 +537,24 @@ mod tests {
             assert_eq!(layout.aliases.len(), snapshots as usize);
             for (row, range) in layout.aliases.iter().enumerate() {
                 assert_eq!(range.is_empty(), row < 23);
+            }
+        }
+    }
+
+    #[test]
+    fn plane_granule_padding_backs_snapshots_without_kv_conflicts() {
+        let alignment = 2 << 20;
+        let geometry = geometry(256 << 10, &[64 << 10, 4 << 10], 1000, 8 + 16);
+        let layout = Layout::new(&geometry, 8, &[alignment; 2], alignment).unwrap();
+        assert_eq!(layout.aliases.len(), 16);
+        for (snapshot, range) in layout.aliases.iter().enumerate() {
+            let pages = conflicts(&layout, &geometry, 8 + snapshot as u64);
+            if pages.is_empty() {
+                assert_eq!(range, &(0..0));
+            } else {
+                assert!(range.start <= range.end && range.end <= 1000);
+                assert!((range.start as u64) <= *pages.first().unwrap());
+                assert!((range.end as u64) > *pages.last().unwrap());
             }
         }
     }

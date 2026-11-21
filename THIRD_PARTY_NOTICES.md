@@ -9,6 +9,41 @@ release. The public source repository includes the preparation tools and their
 dependency declarations. Model weights, datasets, prepared model cores, and
 container images are not included in the binary release.
 
+## DeepInfer reference preparation
+
+The DeepSeek V4.1 `"reference"` SM103 preparation path uses
+[DeepInfer](https://github.com/deepseek-ai/DeepInfer) (pinned in the optional
+`sm103-reference` extra), licensed under Apache-2.0, as an external preparation
+dependency. The captured attention metadata adapters in
+`ignition/recipes/deepseek41/reference_metadata.py` follow DeepInfer's native
+input builder's cache-indexing rules, expressed as tensor operations over
+Flare's packed requests. They add explicit inactive-row write masking and
+prepared-capacity validation. Prefill cache-load descriptors also follow the
+native builder, with zero-filled unused capacity for captured graphs. The
+request-history binding in `ignition/recipes/deepseek41/reference_engram.py`
+uses the reference vocabulary compression and native builder's n-gram/image
+boundary rules. Exported cores load in `flare run` without a Python or
+DeepInfer runtime dependency.
+
+## MegaMoE preparation kernels
+
+Ignition carries headers derived from DerpSeek's MegaMoE implementation in
+[megamoe_kernel](ignition/components/megamoe_kernel/NOTICE), with MIT license
+texts from DeepSeek, ds41, and DerpSeek. The optional `sm103-reference`
+preparation extra pins the DeepGEMM host binding used to compile them. Exported
+CUDA graphs retain the compiled kernels; the native CLI has no Python or
+DeepGEMM host dependency.
+The host-tier preparation launcher carries DeepGEMM host headers and adapted
+DeepJIT headers under their MIT licenses. It separates logical expert count
+from physical weight extents. Flare adds a preparation-time shared-first
+accumulation order to match DeepInfer's reference, retaining routed-first
+accumulation by default. This preserves expert contributions but can change
+final BF16 rounding through FP32 addition order.
+The input stager (`ignition/components/megamoe_kernel/inputs.py`) retains vLLM
+v0.32.0's Apache-2.0 Triton kernel (license text in
+`ignition/components/megamoe_kernel/LICENSE.vllm`), with a wrapper that selects
+MXFP8 and validates its buffers without importing vLLM.
+
 ## Native CLI release dependencies
 
 [third_party/rust/README.md](third_party/rust/README.md) groups the native Cargo

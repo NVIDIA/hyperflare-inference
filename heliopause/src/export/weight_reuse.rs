@@ -318,12 +318,13 @@ impl Source {
                 || previous.local_checkpoint != expected.local_checkpoint
                 || previous.tensor_parallel != expected.tensor_parallel
                 || previous.online_mxfp8 != expected.online_mxfp8
+                || previous.sm103_preparation_json != expected.sm103_preparation_json
                 || (if previous.online_mxfp8_scope.is_empty() { "all" } else { &previous.online_mxfp8_scope })
                     != (if expected.online_mxfp8_scope.is_empty() { "all" } else { &expected.online_mxfp8_scope })
                 || !same_draft_body_quantization(previous, &expected)
             {
                 return Err(invalid(
-                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and draft conversion settings",
+                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, expert placement, and draft conversion settings",
                 ));
             }
             return Ok(protection::verify(

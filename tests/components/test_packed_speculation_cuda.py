@@ -247,6 +247,7 @@ def _handoff(f, admitted):
 @pytest.mark.parametrize("depth,compiled,token_capacity", [
     (1, False, 12), (3, False, 12), (5, False, 12), (3, True, 12),
     (3, False, 5), (3, True, 7), (5, False, 13), (5, True, 13),
+    (7, True, 13), (7, True, 32),
 ])
 @torch.no_grad()
 def test_captured_packed_round_matches_prefix_oracle_state_rng_and_poison(depth, compiled, token_capacity):

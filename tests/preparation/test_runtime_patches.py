@@ -192,6 +192,22 @@ def test_direct_spawned_inductor_worker_installs_before_first_job():
     ''')
 
 
+def test_python_subprocess_env_preserves_sys_path_precedence():
+    _run('''
+        import os
+        import sys
+        from ignition import runtime_patches
+        from torch._inductor import utils as inductor_utils
+        from torch._inductor.compile_worker import subproc_pool
+
+        sys.path.insert(0, "/tmp/flare-overlay-site-packages")
+        runtime_patches.apply()
+        entries = subproc_pool.python_subprocess_env()["PYTHONPATH"].split(os.pathsep)
+        assert subproc_pool.python_subprocess_env is inductor_utils.python_subprocess_env
+        assert entries[0] == "/tmp/flare-overlay-site-packages"
+    ''')
+
+
 def test_b12x_offline_worker_installs_triton_fix_before_first_job():
     _run('''
         from ignition import runtime_patches
