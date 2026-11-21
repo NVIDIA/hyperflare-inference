@@ -15,18 +15,14 @@ from typing import NamedTuple
 
 import torch
 from b12x.attention import sparse_mla
-from b12x.preparation import PreparedCall
-from flashinfer.triton.norm import rms_norm
 
+from ignition.components.glm_mla_cache import store_glm_latent
 from ignition.components.linear import BatchedUnquantizedProjection, UnquantizedProjection, prepare_projection
 from ignition.components.rotary import PreparedRotaryAngles
 from ignition.components.sparse_mla import PreparedSparseMLA
 from ignition.preparation.examples import declaration_tensor
-from ignition.preparation.tuning import declare
 
 RECORD_BYTES = 656
-# The leading bytes of a record: E4M3 latent values and their FP32 group scales.
-LATENT_BYTES = 528
 PAGE_RECORDS = 64
 PAGE_TOKENS = 256
 TOPK = 2048
@@ -101,24 +97,6 @@ class Projected(NamedTuple):
     index_weights: torch.Tensor | None
 
 
-def write_records(latent_records, keys, slots, cache):
-    """Store each valid row's 528 latent bytes and BF16 rotated key as one 656-byte record.
-
-    Rows whose slot is negative write nothing. Every such row repeats the first
-    valid row's write, so duplicate indices carry identical bytes; with no valid
-    row, record zero is rewritten with its own contents.
-    """
-    rows = slots.shape[0]
-    records = cache.view(-1, RECORD_BYTES)
-    valid = slots >= 0
-    first = valid.to(torch.int32).argmax()
-    order = torch.where(valid, torch.arange(rows, device=slots.device), first)
-    target = slots[order].clamp(min=0)
-    payload = torch.cat((latent_records, keys.contiguous().view(torch.uint8).view(rows, 2 * ROTARY)), dim=1)[order]
-    payload = torch.where(valid.any(), payload, records[target])
-    records.index_copy_(0, target, payload)
-
-
 class PreparedAttention:
     """One rank's attention of one layer, before the output sum over ranks.
 
@@ -179,15 +157,6 @@ class PreparedAttention:
                 zeros(heads, rows, LATENT), major="n", session=session, name=f"{name}.absorb_query")
             self.expand = BatchedUnquantizedProjection(zeros(heads, rows, LATENT), weights["value"],
                 zeros(heads, rows, VALUE), major="n", session=session, name=f"{name}.expand_value")
-        # The b12x writer produces the 528 latent bytes of each record in packed staging rows.
-        latent = zeros(rows, LATENT)
-        staging = zeros(-(-rows // PAGE_RECORDS), PAGE_RECORDS, LATENT_BYTES, dtype=torch.uint8)
-        self.staging_pages = staging.shape[0]
-        self.writer_plan = sparse_mla.plan_cache_writer(latent, staging, metadata.token_slots[:rows])
-        slots = metadata.token_slots[:rows]
-        declare(session, (self.writer_plan.request(name=f"{name}.cache_write",
-            prepare_call=lambda state: PreparedCall(run=lambda: state.run(latent, staging, slots),
-                                                    owners=(latent, staging, slots))),))
         if cache_only:
             return
         selected = zeros(rows, TOPK, dtype=torch.int32)
@@ -220,14 +189,12 @@ class PreparedAttention:
         rows, heads, device = source.shape[0], self.heads, source.device
         projected = self.projections["input_proj"](source)
         residual = torch.empty((rows, QUERY_RANK), dtype=torch.bfloat16, device=device)
-        rms_norm(projected[:, :QUERY_RANK], self.weights["q_a_layernorm.weight"], residual, self.eps,
-                 round_before_weight=True)
+        self._store(projected, metadata, angles, query=residual)
         query = self.projections["q_b_proj"](residual).view(rows, heads, NOPE + ROTARY)
         self.angles.apply(query, angles)
         absorbed = torch.empty((rows, heads, LATENT + ROTARY), dtype=torch.bfloat16, device=device)
         absorbed[:, :, :LATENT].copy_(self.absorb(query[:, :, :NOPE].transpose(0, 1).contiguous()).transpose(0, 1))
         absorbed[:, :, LATENT:].copy_(query[:, :, NOPE:])
-        self._store(projected, metadata, angles)
         if not self.selects:
             return Projected(residual, absorbed, None, None)
         return Projected(residual, absorbed, projected[:, INPUT_WIDTH:INPUT_WIDTH + 128],
@@ -239,18 +206,9 @@ class PreparedAttention:
         self._store(projected, metadata, angles)
         return projected[:, INPUT_WIDTH:INPUT_WIDTH + 128] if self.selects else None
 
-    def _store(self, projected, metadata, angles):
-        rows, device = projected.shape[0], projected.device
-        latent = torch.empty((rows, LATENT), dtype=torch.bfloat16, device=device)
-        rms_norm(projected[:, QUERY_RANK:QUERY_RANK + LATENT], self.weights["kv_a_layernorm.weight"], latent,
-                 self.eps, round_before_weight=True)
-        key = projected[:, QUERY_RANK + LATENT:INPUT_WIDTH].contiguous()
-        self.angles.apply(key, angles)
-        slots = metadata.token_slots[:rows]
-        staging = torch.zeros((self.staging_pages, PAGE_RECORDS, LATENT_BYTES), dtype=torch.uint8, device=device)
-        packed = torch.where(slots >= 0, torch.arange(rows, device=device), -1)
-        sparse_mla.concat_and_cache_glm_next_mla(latent, staging, packed, plan=self.writer_plan)
-        write_records(staging.view(-1, LATENT_BYTES)[:rows], key, slots, self.cache)
+    def _store(self, projected, metadata, angles, *, query=None):
+        store_glm_latent(projected, self.weights.get("q_a_layernorm.weight"), self.weights["kv_a_layernorm.weight"],
+                         angles, metadata.token_slots[:projected.shape[0]], self.cache, self.eps, query=query)
 
     def attend(self, absorbed, selection: Selection, metadata):
         """Attend to the selected records and return this rank's partial hidden update."""

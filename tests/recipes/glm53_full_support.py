@@ -94,3 +94,12 @@ def row_errors(actual, expected):
     rows = (actual - expected).norm(dim=-1) / expected.norm(dim=-1)
     return dict(relative_l2=float((actual - expected).norm() / expected.norm()), median=float(rows.median()),
                 p99=float(rows.quantile(0.99)), maximum=float(rows.max()))
+
+def reference_index_key(source, weights):
+    """Apply checkpoint key normalization and move rotary pairs to the native layout."""
+    key = source.float()
+    centered = key - key.mean(-1, keepdim=True)
+    normalized = centered * torch.rsqrt(centered.square().mean(-1, keepdim=True) + 1e-6)
+    normalized = (normalized * weights["indexer.k_norm.weight"].float()
+                  + weights["indexer.k_norm.bias"].float()).bfloat16()
+    return torch.cat((normalized[:, 64:], normalized[:, :64]), -1)

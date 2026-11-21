@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
+from .glm53_full_support import reference_index_key
+
 
 @torch.inference_mode()
 def capture_rank(rank, rendezvous, snapshot, fixtures, destination):
@@ -171,29 +173,46 @@ def capture_rank(rank, rendezvous, snapshot, fixtures, destination):
                 return result
 
             layer._normalized = norm
-            from ignition.recipes.glm53_full import attention as attention_module
+            from flashinfer.triton.norm import rms_norm
 
-            native_norm = attention_module.rms_norm
-
-            def latent_norm(source, weight, output, *args, **kwargs):
-                result = native_norm(source, weight, output, *args, **kwargs)
-                if weight.data_ptr() == attention.weights["kv_a_layernorm.weight"].data_ptr():
-                    observed["latent_norm_input"] = source.cpu().clone()
-                    observed["latent_norm_output"] = output.cpu().clone()
-                return result
-
-            attention_module.rms_norm = latent_norm
-            store = attention_module.write_records
-
-            def write_records(staging, rotary, slots, cache):
-                result = store(staging, rotary, slots, cache)
-                observed["write_staging"] = staging.cpu().clone()
-                observed["write_rotary"] = rotary.cpu().clone()
-                observed["write_slots"] = slots.cpu().clone()
-                return result
-
-            attention_module.write_records = write_records
             rotate = op.layer.angles.apply
+            store_latent = attention._store
+
+            def capture_latent(projected, metadata, angles, *, query=None):
+                store_latent(projected, metadata, angles, query=query)
+                source = projected[:, 2048:2560]
+                reference = torch.empty_like(source, memory_format=torch.contiguous_format)
+                rms_norm(source, attention.weights["kv_a_layernorm.weight"], reference, attention.eps,
+                         round_before_weight=True)
+                observed["latent_norm_input"] = source.cpu().clone()
+                observed["reference_latent_norm"] = reference.cpu().clone()
+                rotary = projected[:, 2560:2624].clone()
+                observed["key_rotation_input"] = rotary.cpu().clone()
+                rotate(rotary, angles)
+                observed["reference_rotary_key"] = rotary.cpu().clone()
+                slots = metadata.token_slots[:projected.shape[0]]
+                observed["write_slots"] = slots.cpu().clone()
+                addressed = attention.cache.view(-1, 656).index_select(0, slots)
+                observed["key_rotation_output"] = addressed[:, 528:].contiguous().view(torch.bfloat16).cpu()
+
+            attention._store = capture_latent
+            store_index = layer.indexer.store
+
+            def capture_index(source, metadata, angles):
+                store_index(source, metadata, angles)
+                reference = reference_index_key(source, layer.indexer.weights)
+                observed["index_key_rotation_input"] = reference.cpu().clone()
+                rotate(reference, angles)
+                observed["index_key_rotation_output"] = reference.cpu().clone()
+                slots = metadata.token_slots[:source.shape[0]]
+                pages, offsets = slots // 64, slots % 64
+                rows = layer.indexer.cache[pages]
+                lanes = torch.arange(128, device=device)
+                observed["stored_index_bytes"] = rows.gather(1, offsets[:, None] * 128 + lanes).cpu()
+                observed["stored_index_scales"] = rows[:, 8192:].contiguous().view(torch.float32).gather(
+                    1, offsets[:, None]).flatten().cpu()
+
+            layer.indexer.store = capture_index
 
             def rotation(value, angles, **kwargs):
                 name = (
@@ -281,6 +300,7 @@ def capture_rank(rank, rendezvous, snapshot, fixtures, destination):
                     tag[0] = case
                     for index in range(2 if case.startswith("repeat-") else 1):
                         observed.clear()
+                        observed["reused_selection"] = state[1] is not None
                         ids = (
                             tokens[-1:] if index == 0 else torch.tensor([recursive], device=device)
                         )

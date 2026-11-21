@@ -114,7 +114,9 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
 
                 with patch.object(angles, "apply", capture):
                     selection = indexer(*arguments)
-                keys, scales = quantize_index(rotated[2], query=False)
+                key = support.reference_index_key(projected.index_key, weights)
+                apply(key, values)
+                keys, scales = quantize_index(key, query=False)
                 reference_keys[first:last].copy_(keys)
                 reference_scales[first:last].copy_(scales)
                 actual_keys = index_cache[:, :8192].contiguous().view(-1, 128)

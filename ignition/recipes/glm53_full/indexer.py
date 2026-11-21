@@ -17,7 +17,8 @@ so the common reordering leaves them unchanged.
 
 import torch
 
-from ignition.components.fp8_indexer import PreparedFP8Indexer, write_fp8_index_keys
+from ignition.components.fp8_indexer import PreparedFP8Indexer
+from ignition.components.glm_mla_cache import store_glm_index_key
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.rotary import PreparedRotaryAngles
 
@@ -132,12 +133,5 @@ class PreparedIndexer:
 
     def store(self, index_key, metadata, angles):
         """Normalize, rotate, and store this forward's index keys."""
-        rows = index_key.shape[0]
-        key = index_key.float()
-        centered = key - key.mean(-1, keepdim=True)
-        variance = centered.square().mean(-1, keepdim=True)
-        key = (centered * torch.rsqrt(variance + _K_NORM_EPS) * self.weights["indexer.k_norm.weight"].float()
-               + self.weights["indexer.k_norm.bias"].float()).to(torch.bfloat16)
-        key = torch.cat((key[:, 64:], key[:, :64]), dim=-1)
-        self.angles.apply(key, angles)
-        write_fp8_index_keys(key, metadata.token_slots[:rows], self.cache, hadamard=False, power_of_two=False)
+        store_glm_index_key(index_key, self.weights["indexer.k_norm.weight"], self.weights["indexer.k_norm.bias"],
+                            angles, metadata.token_slots[:index_key.shape[0]], self.cache, _K_NORM_EPS)

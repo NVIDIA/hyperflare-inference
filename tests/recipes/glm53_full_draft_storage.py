@@ -8,7 +8,7 @@ import math
 import torch
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.reference.glm_moe_dsa import CheckpointReader
-from ignition.reference.glm_moe_dsa_cache import encode_latent
+from ignition.reference.glm_moe_dsa_cache import encode_latent, quantize_index
 from ignition.reference.glm_moe_dsa_bounds import rms_norm_interval, rounded_bf16_interval
 from .glm53_full_draft_reference import check, gamma, UNIT
 
@@ -57,13 +57,13 @@ def verify_storage_and_probabilities(capture, snapshot, consumed):
         for step in range(2):
             data = payload["cases"]["repeat-0"][step]
             report = {"frequencies": frequency_check}
-            report["latent_normalization"] = check(
-                data["latent_norm_output"], rms_norm_interval(data["latent_norm_input"], norm, 1e-6)
+            report["reference_latent_normalization"] = check(
+                data["reference_latent_norm"], rms_norm_interval(data["latent_norm_input"], norm, 1e-6)
             )
-            expected = encode_latent(data["latent_norm_output"], data["write_rotary"])
-            staging = data["write_staging"]
+            expected = encode_latent(data["reference_latent_norm"], data["reference_rotary_key"])
+            record = data["cache"][consumed - 1 + step][None]
             report["scale_bytes_exact"] = {
-                "passed": torch.equal(expected[:, :528][:, 512:], staging[:, 512:])
+                "passed": torch.equal(expected[:, 512:528], record[:, 512:528])
             }
             scales = expected[:, 512:528].contiguous().view(torch.float32)
             inverse = scales.reciprocal()
@@ -71,7 +71,7 @@ def verify_storage_and_probabilities(capture, snapshot, consumed):
             for _ in range(2):
                 low = torch.nextafter(low, torch.full_like(low, -torch.inf))
                 high = torch.nextafter(high, torch.full_like(high, torch.inf))
-            source = data["latent_norm_output"].float().reshape(-1, 4, 128)
+            source = data["reference_latent_norm"].float().reshape(-1, 4, 128)
             endpoints = (
                 torch.stack((source * low[:, :, None], source * high[:, :, None]))
                 .clamp(-448, 448)
@@ -79,14 +79,21 @@ def verify_storage_and_probabilities(capture, snapshot, consumed):
                 .double()
             )
             actual = (
-                staging[:, :512].contiguous().view(torch.float8_e4m3fn).double().reshape_as(source)
+                record[:, :512].contiguous().view(torch.float8_e4m3fn).double().reshape_as(source)
             )
             report["latent_encoding"] = check(actual, (endpoints.amin(0), endpoints.amax(0)))
-            written = torch.cat((staging, data["write_rotary"].contiguous().view(torch.uint8)), -1)
-            report["addressed_record_exact"] = {
-                "passed": torch.equal(written, data["cache"][data["write_slots"].long()])
+            report["addressed_rotary_tail_exact"] = {
+                "passed": torch.equal(record[:, 528:], expected[:, 528:])
                 and int(data["write_slots"][0]) == consumed - 1 + step
             }
+            if data["reused_selection"]:
+                report["retained_selection_skips_index_writer"] = {"passed": "stored_index_bytes" not in data}
+            else:
+                index_bytes, index_scales = quantize_index(data["index_key_rotation_output"], query=False)
+                report["planar_index_record_exact"] = {
+                    "passed": torch.equal(data["stored_index_bytes"], index_bytes)
+                    and torch.equal(data["stored_index_scales"], index_scales)
+                }
             report["replicated_cache"] = {
                 "passed": torch.equal(data["cache"], native[0]["cases"]["repeat-0"][step]["cache"])
             }
@@ -107,14 +114,10 @@ def verify_storage_and_probabilities(capture, snapshot, consumed):
                 (trig_ref - 2.5 * UNIT * trig_ref.abs(), trig_ref + 2.5 * UNIT * trig_ref.abs()),
             )
             report["trigonometry"]["max_absolute_error"] = float(trig_error.max())
-            for name in (
-                "query_rotation",
-                "key_rotation",
-                "index_query_rotation",
-                "index_key_rotation",
-            ):
-                if name + "_input" not in data:
-                    continue
+            rotations = ["query_rotation", "key_rotation"]
+            if not data["reused_selection"]:
+                rotations.extend(("index_query_rotation", "index_key_rotation"))
+            for name in rotations:
                 source = data[name + "_input"].double()
                 actual = data[name + "_output"]
                 pairs = source[..., -64:].reshape(*source.shape[:-1], 32, 2)
@@ -130,13 +133,14 @@ def verify_storage_and_probabilities(capture, snapshot, consumed):
                     ),
                     -1,
                 ).flatten(-2)
-                report[name] = check(
+                measurement = "reference_index_key_rotation" if name == "index_key_rotation" else name
+                report[measurement] = check(
                     actual[..., -64:],
                     rounded_bf16_interval(
                         exact - gamma(3) * magnitude, exact + gamma(3) * magnitude
                     ),
                 )
-                report[name]["unchanged_unrotated"] = torch.equal(
+                report[measurement]["unchanged_unrotated"] = torch.equal(
                     actual[..., :-64], data[name + "_input"][..., :-64]
                 )
             for top_p, record in data["proposal_probabilities"].items():
