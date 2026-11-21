@@ -596,6 +596,13 @@
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
 
+[ ] Resolve the peer summation order in the fused PCIe all-reduce and RMSNorm
+    regression in tests/components/test_collective_rmsnorm_cuda.py. With FP32
+    inputs on four SM120 GPUs, staged pull sums from each local rank. Rounding
+    that sum to BF16 produced residuals up to 0.00390625 from the fixed-order
+    CPU reference. Check the required order at TP4 and TP8 and ensure that a
+    worker assertion releases peers waiting in replay or collective cleanup.
+
 [ ] Repair runtime collective-policy fixtures in tests/cli/test_planning.py.
     test_every_recipe_passes_collective_policy_to_preparation rewrites a TP4
     ladder to DeepSeek V4.1 TP3 or Muse Spark TP8; b12x rejects those gather
