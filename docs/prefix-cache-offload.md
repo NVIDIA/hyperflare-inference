@@ -71,7 +71,7 @@ resolves to zero, and no other tier is configured, that phase reports
 | > 0 | none | none | `MemoryStore`; retain checkpoints in host memory. |
 | 0 | enabled | none | `DiskStore`; stream through automatic intake. |
 | > 0 | enabled | none | `CompositeStore`; retain warm records, spill under pressure. |
-| 0 | none | enabled | Pool only; the manager's arena supplies intake, with no local slot pool. |
+| 0 | none | enabled | Ranks in one process capture through a registered host buffer. Separate rank processes only restore. |
 | > 0 | none | enabled | Warm memory, then pool on retirement. |
 | 0 | enabled | enabled | Local disk, then pool on retirement; automatic local intake. |
 | > 0 | enabled | enabled | Warm memory, then local disk, then pool on retirement. |
@@ -509,13 +509,14 @@ idle wait does not flush them. A default clean stop or crash loses these RAM-onl
 records whose file commits completed remain recoverable.
 
 `--prefix-cache-drain-on-shutdown[=DURATION]` saves DRAM-only records to
-local disk for a warm restart. It is off by default because larger DRAM tiers
-extend stop time. A bare flag drains until done; `=90s` limits new writes, and
+local disk for a warm restart, or to the pool when DRAM feeds the manager
+directly. It is off by default because larger DRAM tiers extend stop time.
+A bare flag drains until done. `=90s` limits the drain, and
 `=off` disables a configured drain. `[prefix_cache] drain_on_shutdown` accepts
 `"on"`, `"off"`, or a positive duration in ms, s, m, or h (bare numbers are seconds).
-Recent endpoints drain first, after their required ancestors; committed files
-are preserved. Limits and write failures do not fail shutdown; accepted transfers
-still drain before memory is released. Size a container's stop grace as Flare's
+When draining to disk, Flare writes recent endpoints first, after their
+required ancestors. Committed files survive a restart. On reaching a limit or
+a write failure, shutdown still drains accepted transfers before releasing memory. Size a container's stop grace as Flare's
 usual stop time plus DRAM bytes ÷ measured disk write rate.
 
 Host record expiry is off by default. Enable it with
@@ -1190,9 +1191,8 @@ same completion events the store produces.
   a local copy of the same endpoint after the pool's writes drain; otherwise
   the destination is discarded and the request recomputes.
 
-Loading attaches the pool to the local tiers, if any, as a `PooledStore`; with
-no memory or disk tier every restore comes from the pool. The pool has its own
-copier, a third set of rank threads that names the manager's shared-memory
+Loading attaches the pool to the local tiers through a `PooledStore`. The pool
+has its own copier, a set of rank threads that names the manager's shared-memory
 windows by host address, so the registrar for those regions refuses any
 registration whose device address differs from its host address. The manager's
 pool name, model identity, layout fingerprint and per-rank plane sizes define
@@ -1250,19 +1250,26 @@ under rank zero's holds, while the record links of section 2.14 mirror writes an
 restores. The pool link shares the record listener's launch token and address
 checks; deployments must secure the cluster fabric, since these links carry
 session secrets and transfer tokens in plaintext.
-Records reach the manager's store only when they cascade off the end of a
-local chain under pressure, and an instance's own records leave the manager's
-index when its session ends. A compacted page-only record cascades without a
-row and is stored only linked to an ancestor the manager holds; the manager
-refuses it as `INVALID` otherwise, and the instance drops the copy. Restarting with wiped local disks therefore
-restores nothing unless records had already cascaded to the manager. This holds
-on a single host too.
+Records reach the manager's store when they retire from the last local tier.
+The manager removes advertisements for instance-held records when the session
+ends. A compacted page-only record cascades without a row. The manager stores
+it when it can link it to a retained ancestor. Otherwise the manager refuses
+it as `INVALID` and the instance drops the copy. After a restart with wiped
+local disks, the manager can restore records it retained before shutdown.
 
-With a pool configured but no local memory or disk tier enabled, startup warns
-that the pool will receive no records from this instance. It can still restore
-records stored by other instances and serve cross-instance GPU exports. Enable
-`--prefix-cache-memory` and/or `--prefix-cache-disk` to let local records cascade
-to the manager.
+With only a pool configured and all ranks in one process, Flare registers a
+CPU-readable capture buffer. Its slot count is the larger of automatic intake
+and the largest GPU page capacity plus one row's slots, bounded by the host
+budget. All slots are available for capture. While the manager can accept
+records, each poll selects completed leaves for retirement, with up to four
+selected at once. If a capture has no resident ancestor, it copies the full
+GPU chain and offers its ancestors for linking at the manager. While the manager
+is unavailable, the buffer retains records under the normal DRAM eviction policy.
+With separate rank processes, a pool without a local disk tier only restores.
+
+When DRAM feeds the pool directly, the shutdown drain continues copying,
+checksumming and retiring records until they finish or the configured time
+expires. Pool close cancels unfinished puts before the host copier closes.
 
 ## 3. Components and required test coverage
 

@@ -1384,6 +1384,7 @@ impl Drop for Announce {
 }
 
 pub struct MemoryStore {
+    pass_through: bool,
     // Dropped first: the checksum thread reads slots the core frees.
     announce: Option<Announce>,
     core: Core,
@@ -1397,20 +1398,21 @@ pub struct MemoryStore {
 impl MemoryStore {
     /// A standalone store whose index mirrors the GPU checkpoint tree.
     pub fn new(identity: [u8; 32], pool: SlabPool, transfers: SharedCopier) -> Result<Self> {
-        Self::open(identity, pool, transfers, false)
+        Self::open(identity, pool, transfers, false, false)
     }
 
     /// A store inside a composite: every node is a root and the composite's
     /// disk index owns parent links.
     pub fn new_flat(identity: [u8; 32], pool: SlabPool, transfers: SharedCopier) -> Result<Self> {
-        Self::open(identity, pool, transfers, true)
+        Self::open(identity, pool, transfers, true, false)
     }
 
-    fn open(
+    pub(crate) fn open(
         identity: [u8; 32],
         pool: SlabPool,
         transfers: SharedCopier,
         flat: bool,
+        pass_through: bool,
     ) -> Result<Self> {
         let layout = transfers
             .lock()
@@ -1421,6 +1423,7 @@ impl MemoryStore {
             return Err(invalid("slot size disagrees with the record layout"));
         }
         Ok(Self {
+            pass_through,
             core: Core::new(identity, pool, layout, flat),
             announce: None,
             transfers,
@@ -1892,8 +1895,12 @@ impl HostStore for MemoryStore {
             }
             self.flush_announcements(&|_, parent| parent, &|_| None);
             if self.core.spill {
-                self.core
-                    .retire_for(self.reserve(2 * self.core.pool.intake_slots()));
+                let target = if self.pass_through {
+                    self.pool().slot_count()
+                } else {
+                    2 * self.pool().intake_slots()
+                };
+                self.core.retire_for(self.reserve(target));
             }
         }
         Ok(())
@@ -1931,6 +1938,16 @@ impl HostStore for MemoryStore {
 }
 
 impl crate::store::TierStore for MemoryStore {
+    fn begin_pool_drain(&mut self) -> Option<(usize, u64)> {
+        self.pass_through = true;
+        let core = &self.core;
+        let record_bytes = |pages: usize, row: bool| {
+            pages as u64 * core.layout.page_record_bytes + u64::from(row) * core.layout.row_record_bytes
+        };
+        let resident: u64 = core.index.nodes().map(|node| record_bytes(node.tail_pages, node.row)).sum();
+        let deferred: u64 = core.deferred.iter().map(|(_, copy)| record_bytes(copy.tail_pages, true)).sum();
+        Some((core.index.len() + core.deferred.len(), resident + deferred))
+    }
     fn announce_to(&mut self, announcer: Announcer) {
         if let Err(error) = self.announce_records(announcer) {
             eprintln!("warning: host memory records will not be shared: {error}");
@@ -4186,6 +4203,81 @@ mod tests {
         core.set_spill(true);
         assert!(core.retire_for(2 * core.layout.record_slots(2, true)));
         assert_eq!(core.held.len(), 2);
+    }
+
+    #[test]
+    fn pass_through_retires_each_leaf_once_across_poll_batches() {
+        use crate::store::TierStore;
+
+        for pass_through in [false, true] {
+            let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+            let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+            let intake = crate::offload::intake_slots(&layout(), 1);
+            let reserve = if pass_through { 0 } else { intake };
+            let pool = SlabPool::new(PAGE, 3 * intake, reserve).unwrap();
+            let mut store = MemoryStore::open(IDENTITY, pool, copier, false, pass_through).unwrap();
+            store.announce_to(Announcer::new(Arc::new(tokio::sync::Notify::new())));
+            let mut leaves = HashSet::new();
+            for salt in 1..=7 {
+                let h = history(2 * PT, salt);
+                let root = published(&h, PT, None, 0, salt);
+                assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+                if salt == 7 {
+                    let child = published(&h, 2 * PT, Some(PT), 0, 8);
+                    assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+                    leaves.insert(child.key);
+                } else {
+                    leaves.insert(root.key);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while store.core.announced.len() != 8 {
+                assert!(Instant::now() < deadline);
+                store.poll(&mut Vec::new()).unwrap();
+            }
+            store.set_spill(true);
+            for count in [4, 3] {
+                store.poll(&mut Vec::new()).unwrap();
+                let offers = store.take_retiring();
+                assert_eq!(offers.len(), if pass_through { count } else { 0 });
+                store.poll(&mut Vec::new()).unwrap();
+                assert!(store.take_retiring().is_empty());
+                for offer in offers {
+                    assert!(leaves.remove(&offer.key));
+                    store.retired(offer.key, PoolTier::Dram, Retirement::Moved);
+                }
+            }
+            assert_eq!(store.index().len(), if pass_through { 0 } else { 8 });
+            store.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn full_capture_buffer_retries_without_ownership_except_for_a_copying_parent() {
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let pool = SlabPool::new(PAGE, 3, 0).unwrap();
+        let mut store = MemoryStore::open(IDENTITY, pool, copier, false, true).unwrap();
+        let h = history(3 * PT, 1);
+        let root = published(&h, 2 * PT, None, 0, 1);
+        let other = published(&history(PT, 2), PT, None, 0, 2);
+        let mut child = published(&h, 2 * PT + 1, Some(2 * PT), 0, 3);
+        child.capture_role = crate::CaptureRole::Anchor;
+        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.pool().free_slots(), 0);
+        assert_eq!(store.store(&other).unwrap(), StoreOutcome::Retry(StoreReason::Slabs));
+        assert_eq!(store.stats().store_skipped, 1);
+        assert_eq!(store.stats().outbound_in_flight, 1);
+        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.stats().outbound_in_flight, 2);
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(events.as_slice(), [
+            StoreEvent::Stored { checkpoint, result: Ok(_), .. },
+            StoreEvent::Deferred { checkpoint: deferred, reason: StoreReason::Slabs },
+        ] if *checkpoint == root.id && *deferred == child.id));
+        assert_eq!(store.stats().outbound_in_flight, 0);
+        store.close().unwrap();
     }
 
     #[test]

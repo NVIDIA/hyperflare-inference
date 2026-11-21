@@ -377,6 +377,10 @@ pub trait HostStore {
 pub trait TierStore: HostStore {
     /// Persist optional host records before pool teardown, retaining transfer owners.
     fn drain_on_shutdown(&mut self) {}
+    /// Switch direct DRAM retention to pass-through and count resident and deferred captures.
+    fn begin_pool_drain(&mut self) -> Option<(usize, u64)> {
+        None
+    }
     /// Announce what this store's tiers hold, now and as they change, through
     /// `announcer`, and serve them as exports. Nothing is recorded before this.
     fn announce_to(&mut self, _announcer: Announcer) {}

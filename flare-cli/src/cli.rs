@@ -970,7 +970,7 @@ pub struct ServingOptions {
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_disk_limit: Option<u64>,
 
-    /// Drain DRAM to local disk at shutdown, optionally for 90s or 2m; off disables [default: prefix_cache.drain_on_shutdown, else off].
+    /// Drain DRAM to local disk or the pool at shutdown. Use 90s or 2m to limit the drain, or off to disable it [default: prefix_cache.drain_on_shutdown, else off].
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "on",
         value_name = "DURATION|on|off", value_parser = parse_drain_on_shutdown, help_heading = "Prefix cache options")]
     pub prefix_cache_drain_on_shutdown: Option<std::time::Duration>,
@@ -980,8 +980,8 @@ pub struct ServingOptions {
     pub prefix_cache_max_age: Option<std::time::Duration>,
 
     /// Share prefix checkpoints at `unix:PATH`, plain TCP `HOST:PORT`, or TLS `tls:HOST:PORT`.
-    /// Storing records in the pool requires --prefix-cache-memory and/or --prefix-cache-disk;
-    /// restores from other instances remain available without a local host tier [default: not shared].
+    /// Without a local tier, ranks in one process send records through a capture buffer.
+    /// Across rank processes, a pool without a local tier only restores [default: not shared].
     #[arg(long, value_name = "ADDRESS", value_parser = parse_pool_address,
         help_heading = "Prefix cache options")]
     pub prefix_cache_pool: Option<String>,

@@ -80,6 +80,9 @@ impl crate::store::TierStore for Tiers {
             tiers.drain_on_shutdown();
         }
     }
+    fn begin_pool_drain(&mut self) -> Option<(usize, u64)> {
+        self.0.as_mut()?.begin_pool_drain()
+    }
     fn announce_to(&mut self, announcer: crate::pool::Announcer) {
         if let Some(tiers) = &mut self.0 {
             tiers.announce_to(announcer);

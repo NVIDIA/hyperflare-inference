@@ -2835,6 +2835,30 @@ mod ranks;
 #[path = "client/tls.rs"]
 mod tls;
 
+#[derive(Default)]
+struct Copiers(std::cell::RefCell<Vec<GpuMemory>>);
+impl flare_selene::offload::CopierFactory for Copiers {
+    fn mapped(
+        &self,
+        _: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+        _: &SlabPool,
+    ) -> Result<flare_selene::SharedCopier> {
+        let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry)?;
+        self.0.borrow_mut().push(gpu);
+        Ok(copier)
+    }
+    fn unmapped(
+        &self,
+        _: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+    ) -> Result<Box<dyn flare_selene::PageCopier>> {
+        let (copier, gpu) = SimulatedGpu::new(&geometry)?;
+        self.0.borrow_mut().push(gpu);
+        Ok(Box::new(copier))
+    }
+}
+
 #[test]
 fn offload_startup_and_restore_cover_every_tier_combination() {
     use flare_selene::{
@@ -2842,7 +2866,6 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
         offload::*,
         pool::{Budget, PoolBuilder, PoolOptions},
     };
-    use std::cell::RefCell;
 
     // With one rank, the split mapping has the ordinary record layout.
     struct OneRank(CountingRegistrar);
@@ -2875,29 +2898,6 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                 requests[0].2 / PAGE,
                 0,
             )?)))
-        }
-    }
-    #[derive(Default)]
-    struct Copiers(RefCell<Vec<GpuMemory>>);
-    impl CopierFactory for Copiers {
-        fn mapped(
-            &self,
-            _: &[(usize, i32)],
-            geometry: Vec<CacheGeometry>,
-            _: &SlabPool,
-        ) -> Result<flare_selene::SharedCopier> {
-            let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry)?;
-            self.0.borrow_mut().push(gpu);
-            Ok(copier)
-        }
-        fn unmapped(
-            &self,
-            _: &[(usize, i32)],
-            geometry: Vec<CacheGeometry>,
-        ) -> Result<Box<dyn flare_selene::PageCopier>> {
-            let (copier, gpu) = SimulatedGpu::new(&geometry)?;
-            self.0.borrow_mut().push(gpu);
-            Ok(Box::new(copier))
         }
     }
 
@@ -2972,18 +2972,21 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                     panic!("{name}: disabled")
                 };
                 assert_eq!(prepared.warm_bytes, options.memory_bytes.unwrap());
-                assert_eq!(prepared.memory_pool.is_some(), warm || disk);
+                let capture = !warm && !disk && pooled;
+                let slots = if capture {
+                    (geometry[0].page_capacity as usize + prepared.layout.row_slots()).max(intake_slots(&prepared.layout, 8))
+                } else {
+                    intake_slots(&prepared.layout, 8) + usize::from(warm) * 512
+                };
+                assert!(prepared.memory_pool.is_some());
                 if let Some(pool) = &prepared.memory_pool {
-                    assert_eq!(
-                        pool.slot_count(),
-                        intake_slots(&prepared.layout, 8) + usize::from(warm) * 512
-                    );
+                    assert_eq!(pool.slot_count(), slots);
                     assert_eq!(pool.rank_parts().is_some(), warm && !disk && !pooled);
                 }
                 // The manager's two regions are separate from the local shared mapping.
                 assert_eq!(
                     registrar.0.calls.lock().unwrap().len(),
-                    usize::from(pooled) * 2 + usize::from(disk || (warm && pooled))
+                    usize::from(pooled) * 2 + usize::from(disk || pooled)
                 );
                 startup.attach(preparation, &factory).unwrap();
                 let mut store =
@@ -2995,7 +2998,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                     0
                 };
                 assert_eq!(stats.slots_used, 0, "{name}");
-                assert_eq!(stats.slots_total, intake + usize::from(warm) * 512, "{name}");
+                assert_eq!(stats.slots_total, slots, "{name}");
                 assert_eq!(stats.intake_slots, intake, "{name}");
                 let salt = 1 + u32::from(warm) * 4 + u32::from(disk) * 2 + u32::from(pooled);
                 let (checkpoint, history) = publication(&factory.0.borrow()[0], salt, 2);
@@ -3144,5 +3147,208 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                 std::fs::remove_dir_all(directory).unwrap();
             }
         }
+    }
+}
+
+fn prepared_pool_store(
+    manager: &Manager,
+    uuid: u8,
+    warm_slots: usize,
+    drain: Duration,
+) -> (Box<dyn HostStore>, GpuMemory, GpuMemory) {
+    use flare_selene::offload::{PrefixCacheOffload, Startup, open, prepare};
+    use flare_selene::pool::{Budget, PoolBuilder, PoolOptions};
+
+    let mut geometry = geo();
+    geometry[0].page_capacity = 1024;
+    let pool = PoolOptions { address: manager.address(), ca: None };
+    let options = PrefixCacheOffload {
+        pool: Some(pool.clone()),
+        memory_bytes: Some((warm_slots * PAGE) as u64),
+        drain_on_shutdown: drain,
+        ..Default::default()
+    };
+    let mut startup = Startup::default();
+    startup.start_pool(PoolBuilder {
+        options: &pool,
+        identity: [7; 32],
+        geometry: &geometry,
+        gpu_uuids: vec![[uuid; 16]],
+        registration_context: 0,
+        budget: Budget { host: Ok(u64::MAX), devices: vec![(u64::MAX, false)] },
+        peers: None,
+        disk: false,
+    }, Arc::new(OkRegistrar), Ok).unwrap();
+    let prepared = prepare(&options, "unused".as_ref(), [7; 32], geometry, vec![(0, 0)], &OkRegistrar).unwrap();
+    let factory = Copiers::default();
+    startup.attach(prepared, &factory).unwrap();
+    let mut store = open(startup.binding(0).unwrap().take().unwrap(), &factory).unwrap();
+    let mut memories = factory.0.into_inner().into_iter();
+    let restore = memories.next().unwrap();
+    let capture = memories.next().unwrap_or_else(|| restore.clone());
+    // A ready lookup ensures that a cold miss is an answer from a connected manager.
+    let history = salted(0);
+    wait("ready pool session", || {
+        let ticket = store.begin_lookup(&history).unwrap();
+        wait("lookup response", || !matches!(ticket.state(), LookupState::Pending));
+        matches!(ticket.state(), LookupState::Ready(_))
+    });
+    (store, capture, restore)
+}
+
+fn manager_records(manager: &Manager) -> usize {
+    manager.metrics().lines()
+        .filter(|line| line.starts_with("selene_records{"))
+        .map(|line| line.split_whitespace().last().unwrap().parse::<usize>().unwrap())
+        .sum()
+}
+
+#[test]
+fn pool_only_cold_restore_after_producer_exit() {
+    let mut manager = Manager::dram_only(8 << 20);
+    manager.run();
+    let (mut producer, capture, _) = prepared_pool_store(&manager, 1, 0, Duration::ZERO);
+    let (checkpoint, history) = publication(&capture, 2, 8);
+    assert_eq!(producer.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+    drive(producer.as_mut(), "manager retention during serving", |_| manager_records(&manager) == 1);
+    producer.close().unwrap();
+    drop(producer);
+    drop(capture);
+    manager.wait(|manager| manager.gauge("pool_sessions") == 0);
+
+    let (mut reader, _, restored) = prepared_pool_store(&manager, 2, 0, Duration::ZERO);
+    let lookup = reader.begin_lookup(&history).unwrap();
+    wait("cold pool lookup", || !matches!(lookup.state(), LookupState::Pending));
+    let hit = reader.lookup_for(Some(&lookup), &history, 0, u64::MAX).unwrap();
+    assert_eq!(hit.key, checkpoint.key);
+    let pages: Vec<_> = (10..18).map(PageId).collect();
+    reader.fetch(hit, flare_selene::InboundTicket {
+        key: checkpoint.key,
+        pages: pages.clone(),
+        slot: StateSlotId(1),
+    }).unwrap();
+    flare_selene::testing::poll_until(reader.as_mut(), Instant::now() + Duration::from_secs(5),
+        |event| matches!(event, StoreEvent::Fetched { key, result: Ok(n) }
+            if *key == checkpoint.key && *n == (8 * PAGE + ROW) as u64));
+    for (i, page) in pages.iter().enumerate() {
+        assert_eq!(restored.pages.lock().unwrap()[&page.0], salted_page(2, i));
+    }
+    assert_eq!(restored.rows.lock().unwrap()[&1], salted_row(2));
+    reader.close().unwrap();
+}
+
+#[test]
+fn pool_drain_finishes_copies_and_checksum_announcements() {
+    for warm in [0, 512] {
+        for drain in [Duration::ZERO, Duration::from_secs(3)] {
+            for copy_pending in [false, true] {
+                let mut manager = Manager::dram_only(8 << 20);
+                manager.run();
+                let (mut store, gpu, _) = prepared_pool_store(&manager, 1, warm, drain);
+                let (parent, _) = publication(&gpu, 1, 4);
+                assert_eq!(store.store(&parent).unwrap(), StoreOutcome::Queued);
+                let records = if copy_pending {
+                    let (mut child, _) = publication(&gpu, 1, 8);
+                    child.ancestors = vec![parent.key];
+                    child.tail_pages = 4;
+                    child.id = CheckpointId::new(2);
+                    assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+                    assert_eq!(store.stats().outbound_in_flight, 2);
+                    2
+                } else {
+                    // Copy completion submits the checksum job. A later poll must collect it.
+                    let mut events = Vec::new();
+                    store.poll(&mut events).unwrap();
+                    assert!(matches!(events.as_slice(), [StoreEvent::Stored { key, result: Ok(_), .. }] if *key == parent.key));
+                    assert_eq!(store.stats().outbound_in_flight, 0);
+                    1
+                };
+                assert_eq!(manager_records(&manager), 0);
+                store.close().unwrap();
+                drop(store);
+                assert_eq!(manager_records(&manager), if drain.is_zero() { 0 } else { records },
+                    "warm={warm} drain={drain:?} copy_pending={copy_pending}");
+            }
+        }
+    }
+}
+
+#[test]
+fn pool_drain_resumes_the_leaf_after_its_ancestor_put() {
+    for warm in [0, 16] {
+        for drain in [Duration::ZERO, Duration::from_secs(3)] {
+            let mut manager = Manager::dram_only(8 << 20);
+            manager.run();
+            let (mut store, gpu, _) = prepared_pool_store(&manager, 1, warm, drain);
+            let (mut parent, _) = publication(&gpu, 1, 4);
+            parent.capture_role = flare_selene::CaptureRole::Anchor;
+            let (mut child, history) = publication(&gpu, 1, 8);
+            child.ancestors = vec![parent.key];
+            child.tail_pages = 4;
+            child.id = CheckpointId::new(2);
+            assert_eq!(store.store(&parent).unwrap(), StoreOutcome::Queued);
+            assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+            drive(store.as_mut(), "leaf retirement", |store| store.stats().retirement_pinned_bytes != 0);
+            // No model poll can consume the parent's acknowledgement or start the leaf here.
+            manager.wait(|manager| manager_records(manager) == 1);
+            assert_eq!(store.stats().retirement_paths, 0);
+            store.close().unwrap();
+            drop(store);
+            assert_eq!(manager_records(&manager), if drain.is_zero() { 1 } else { 2 });
+            if !drain.is_zero() {
+                let mut reader = instance(&manager, 2);
+                reader.ready();
+                let leaf = stored_candidate(&reader, &history, child.key);
+                assert_eq!(leaf.plan.nodes.iter().map(|node| node.key).collect::<Vec<_>>(), [parent.key, child.key]);
+                reader.client.close().unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn pool_drain_deadline_cancels_a_blocked_put_after_gpu_completion() {
+    // Two 4 MiB windows fill both disk staging slots. The last row cannot be sent before one write finishes.
+    let pages = 1024u32;
+    for warm in [0, pages as usize + 1] {
+        let mut manager = Manager::with_storage(4096, 64 << 20);
+        let (gate, entered, release) = selene_manager::disk::IoGate::new();
+        manager.config.faults.io_gate = Some(gate);
+        manager.run();
+        let timeout = Duration::from_millis(35);
+        let (mut store, _, _) = prepared_pool_store(&manager, 1, warm, timeout);
+        let end = pages as u64 * PT;
+        let blocked = flare_selene::testing::checkpoint(
+            &mut flare_selene::testing::Ids::new(), &history_of(end as u32), end, None,
+            (0..pages).map(PageId).collect(), pages as usize, StateSlotId(1),
+        );
+        assert_eq!(store.store(&blocked).unwrap(), StoreOutcome::Queued);
+        let mut first_events = Vec::new();
+        wait("put blocked in the manager disk worker", || {
+            store.poll(&mut first_events).unwrap();
+            entered.try_recv().is_ok()
+        });
+        assert!(first_events.iter().any(|event| matches!(event, StoreEvent::Stored {
+            checkpoint, result: Ok(_), ..
+        } if *checkpoint == blocked.id)));
+        assert_eq!(store.stats().outbound_in_flight, 0);
+        assert_eq!(manager_records(&manager), 0);
+        let (closed, wait_close) = std::sync::mpsc::channel();
+        let unblocked = thread::spawn(move || {
+            let in_time = wait_close.recv_timeout(Duration::from_secs(3)).is_ok();
+            release.send(()).unwrap();
+            in_time
+        });
+        let started = Instant::now();
+        store.close().unwrap();
+        assert!(started.elapsed() >= timeout);
+        drop(store);
+        // The control socket closes asynchronously. Keep the first write blocked until cancellation reaches storage.
+        manager.wait(|manager| manager.gauge("pool_sessions") == 0 && manager.gauge("cancels_total") == 1);
+        let _ = closed.send(());
+        assert!(unblocked.join().unwrap(), "close did not cancel the unfinished manager put");
+        manager.wait(|manager| manager.gauge("pool_puts_open") == 0
+            && manager.gauge("leases") == 0 && manager.gauge("cleanup_records") == 0);
+        assert_eq!(manager_records(&manager), 0);
     }
 }

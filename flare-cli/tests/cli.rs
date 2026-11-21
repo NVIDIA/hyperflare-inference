@@ -120,6 +120,10 @@ fn help_exits_successfully_before_accessing_files() {
             assert!(help.contains("--no-mtp-adaptive-verification"), "{help}");
             assert!(help.contains("--mtp-adaptive-verification-alpha"), "{help}");
             assert!(help.contains("--prefix-cache-pool-ca"), "{help}");
+            let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("ranks in one process send records through a capture buffer"), "{help}");
+            assert!(words.contains("Across rank processes, a pool without a local tier only restores"), "{help}");
+            assert!(words.contains("Drain DRAM to local disk or the pool"), "{help}");
             assert!(help.contains("--host"), "{help}");
             assert!(help.contains("--port"), "{help}");
             assert!(help.contains("--served-model-name"), "{help}");
