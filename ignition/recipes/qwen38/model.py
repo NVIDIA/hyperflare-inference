@@ -6,12 +6,11 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 from typing import TYPE_CHECKING
 
 from ignition.preparation.checkpoint import CheckpointError, CheckpointManifest
-from .checkpoint_schema import TRANSFORMERS_REVISION
+from .checkpoint_schema import require_transformers_version
 
 if TYPE_CHECKING:
     from transformers import Qwen4ExpForConditionalGeneration
@@ -24,10 +23,7 @@ def create_model_tree(manifest: CheckpointManifest) -> Qwen4ExpForConditionalGen
     methods. Quantized weights and prepared forwards must be attached before
     execution; Transformers' generic ModelOpt checkpoint loader is unsupported.
     """
-    distribution = importlib.metadata.distribution("transformers")
-    provenance = json.loads(distribution.read_text("direct_url.json") or "{}")
-    if provenance.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_REVISION:
-        raise RuntimeError(f"Qwen preparation requires Transformers {TRANSFORMERS_REVISION}")
+    require_transformers_version("Qwen preparation")
     raw = (manifest.snapshot / "config.json").read_bytes()
     if hashlib.sha256(raw).hexdigest() != manifest.metadata_sha256["config.json"]:
         raise CheckpointError("config.json changed after checkpoint inspection")

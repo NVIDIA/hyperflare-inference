@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
-import importlib.metadata
 import json
 import math
 import re
@@ -34,7 +33,7 @@ from ignition.preparation.qwen38 import (
     FRONTEND_SHA256,
     MODEL_ID,
     REVISION,
-    TRANSFORMERS_REVISION,
+    require_transformers_version,
 )
 
 from .provenance import digest, write_json
@@ -221,9 +220,9 @@ def prepare(args):
     import tokenizers
     from transformers import AutoTokenizer
 
-    origin = json.loads(importlib.metadata.distribution("transformers").read_text("direct_url.json") or "{}")
-    if origin.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_REVISION or tokenizers.__version__ != "0.23.2":
-        raise ValueError("corpus generation requires the pinned Transformers/tokenizers versions")
+    require_transformers_version("corpus generation")
+    if tokenizers.__version__ != "0.23.2":
+        raise ValueError("corpus generation requires tokenizers 0.23.2")
     assets = {**FRONTEND_SHA256, "config.json": CONFIG_SHA256}
     for name, expected in assets.items():
         if digest(args.snapshot / name) != expected:

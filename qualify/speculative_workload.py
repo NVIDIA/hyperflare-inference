@@ -13,7 +13,6 @@ import argparse
 from collections import Counter
 from copy import deepcopy
 import hashlib
-import importlib.metadata
 import json
 from pathlib import Path
 import struct
@@ -22,7 +21,7 @@ import subprocess
 from qualify.provenance import digest, write_json
 from ignition.preparation.qwen38 import (
     CONFIG_SHA256, FRONTEND_SHA256, GENERATION_SHA256, INDEX_SHA256,
-    MODEL_ID, REVISION, TRANSFORMERS_REVISION,
+    MODEL_ID, REVISION, require_transformers_version,
 )
 
 
@@ -366,10 +365,7 @@ def generate(snapshot, output, native_frontend, baseline_fixture):
 
     snapshot, output = Path(snapshot).resolve(), Path(output).resolve()
     native_frontend, baseline_fixture = Path(native_frontend).resolve(), Path(baseline_fixture).resolve()
-    distribution = importlib.metadata.distribution("transformers")
-    origin = json.loads(distribution.read_text("direct_url.json") or "{}")
-    if origin.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_REVISION:
-        raise ValueError("pinned Transformers source is required")
+    require_transformers_version("workload generation")
     for name, expected_hash in ASSETS.items():
         if digest(snapshot / name) != expected_hash:
             raise ValueError(f"checkpoint asset fingerprint mismatch: {name}")

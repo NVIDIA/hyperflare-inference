@@ -13,10 +13,7 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
-from ignition.preparation.qwen38 import FRONTEND_SHA256, MODEL_ID, REVISION, TRANSFORMERS_REVISION
-
-
-TRANSFORMERS_COMMIT = TRANSFORMERS_REVISION
+from ignition.preparation.qwen38 import FRONTEND_SHA256, MODEL_ID, REVISION, TRANSFORMERS_VERSION, require_transformers_version
 
 
 def chat_cases():
@@ -80,10 +77,7 @@ def chat_cases():
 
 
 def generate(snapshot: Path) -> dict:
-    distribution = importlib.metadata.distribution("transformers")
-    provenance = json.loads(distribution.read_text("direct_url.json") or "{}")
-    if provenance.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_COMMIT:
-        raise RuntimeError(f"fixture generation requires Transformers {TRANSFORMERS_COMMIT}")
+    require_transformers_version("fixture generation")
     assets = {}
     for name, expected in FRONTEND_SHA256.items():
         actual = hashlib.sha256((snapshot / name).read_bytes()).hexdigest()
@@ -127,7 +121,7 @@ def generate(snapshot: Path) -> dict:
     for skip in (False, True):
         decode_cases.append({"name": f"special_only_{skip}", "token_ids": ids, "skip_special_tokens": skip,
             "text": tokenizer.decode(ids, skip_special_tokens=skip, clean_up_tokenization_spaces=False)})
-    return {"model_id": MODEL_ID, "revision": REVISION, "transformers_commit": TRANSFORMERS_COMMIT,
+    return {"model_id": MODEL_ID, "revision": REVISION, "transformers_version": TRANSFORMERS_VERSION,
         "tokenizers_version": importlib.metadata.version("tokenizers"), "assets": assets,
         "cases": cases, "encode_cases": encode_cases, "decode_cases": decode_cases}
 
