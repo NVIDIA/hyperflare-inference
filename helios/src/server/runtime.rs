@@ -2394,6 +2394,9 @@ impl<'a> Worker<'a> {
         if self.scheduler.take_evictions_lost() {
             store.evictions_lost();
         }
+        for key in self.scheduler.take_reused() {
+            store.reused(key);
+        }
         if released {
             for incoming in self
                 .pending

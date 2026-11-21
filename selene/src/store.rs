@@ -271,7 +271,8 @@ pub trait HostStore {
     /// Copy a published checkpoint. Only Queued promises an event and retains
     /// its GPU copy-out pin until Stored or Deferred.
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
-    /// A request reused this GPU checkpoint: refresh any retained host record.
+    /// Refresh the indexed host record for a GPU checkpoint used at admission
+    /// or refreshed on request completion. An absent key needs no copy-out.
     fn reused(&mut self, _key: PrefixKey) {}
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
