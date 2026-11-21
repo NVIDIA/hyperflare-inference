@@ -250,7 +250,7 @@ class PreparedDecoder:
             stream = workspace.auxiliary_stream
             self.stream_handle = stream.cuda_stream
             # Narrower reads leave more memory bandwidth for attention and the feed-forward reduction at three rows.
-            output_programs, following_programs = (16, 24) if tokens == 3 else (32, 64)
+            output_programs, following_programs = (12, 24) if tokens == 3 else (32, 64)
             if tokens <= 8:
                 for layer, source in zip(self.layers, weights.layers, strict=True):
                     layer.output_prefetch = PreparedWeightPrefetch([source.attention["o_proj"]], output_programs, stream)
