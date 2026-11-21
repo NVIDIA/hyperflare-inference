@@ -249,8 +249,8 @@ class PreparedDecoder:
         if overlap and small_tp8_decode:
             stream = workspace.auxiliary_stream
             self.stream_handle = stream.cuda_stream
-            # Narrower reads leave more memory bandwidth for attention and the feed-forward reduction at three rows.
-            output_programs, following_programs = (12, 24) if tokens == 3 else (32, 64)
+            # Narrower reads leave more memory bandwidth for attention and the feed-forward reduction at three and four rows.
+            output_programs, following_programs = (12, 24) if tokens in (3, 4) else (32, 64)
             if tokens <= 8:
                 for layer, source in zip(self.layers, weights.layers, strict=True):
                     layer.output_prefetch = PreparedWeightPrefetch([source.attention["o_proj"]], output_programs, stream)
