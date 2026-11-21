@@ -686,6 +686,140 @@ expansion buffers reused by serial expert layers. Planning conservatively estima
 `--expert-scale-compression native` preserves native scales. MLA arithmetic defaults
 to BF16; `--mla-compute-mode auto` lets b12x select arithmetic while preserving
 packed KV storage.
+
+### Experimental GB300 (`SM103`) TP1 reference preparation
+
+The experimental GB300 (`SM103`) TP1 path exports DeepSeek V4.1 using the
+`"reference"` execution mode with MegaMoE tiered HBM/Grace expert placement,
+native Engram table delivery, and the complete DeepInfer target, DFlash draft,
+and vision model computation. Install the optional preparation dependencies
+pinned in `pyproject.toml` with:
+
+```sh
+uv sync --locked --extra prepare --extra test --extra sm103-reference
+```
+
+`--sm103-preparation PATH` reads a version-1 JSON object with `placements`,
+`host_lane_clusters`, optional `execution` (`"reference"`, the only supported
+SM103 execution mode), optional `context`, optional `prefill_staging`, and
+optional `dynamic_mover` (mutually exclusive with `prefill_staging`). Each
+placement is keyed by `layers.N.ffn` or `mtp.N.ffn` and contains `experts`,
+`host`, and `hbm`; the two arrays give canonical expert IDs in physical row
+order. Supply all 40 target layers and, when MTP is enabled, all three draft
+layers. Unknown fields, duplicate keys, missing experts, and repeated IDs
+within a tier are rejected. Both tiers may contain the same expert; the initial
+canonical-to-physical map selects the HBM copy.
+
+Optional `"context"` overrides the prepared sequence capacity (for example
+`262144`) without changing checkpoint metadata; `--prompt-logprobs` and
+`--joint-tuning` are rejected because the reference forward owns its attention
+and sparse indexer. When the maximum prefill chunk exceeds `144` tokens,
+`"reference"` enables Context-Encoder-Decoder (CED) consumer compaction
+(`yoco_keep_tokens = 144`) within ordinary `prefill` graphs on model contract 3:
+the 20 Context Encoder layers (`0..19`) populate the YOCO KV cache across the
+full chunk, and the 20 consumer layers (`20..39`) execute on the compacted
+suffix (`<= 144` tokens). Exported cores load in `flare run` without a Python
+or DeepInfer runtime dependency.
+
+An optional `prefill_staging` object prepares temporary cold-expert prefetch on
+SM103 `"reference"` preparations:
+
+```json
+"prefill_staging": {"min_rows": 1024, "min_cold_experts": 8}
+```
+
+Omission disables staging. Target prefill layers qualify by their prepared row
+count; when `yoco_keep_tokens < min_rows`, staging attaches only to Context
+Encoder layers (`0..19`) and leaves the compacted consumer suffix (`20..39`) on
+direct-host execution. Two auxiliary streams start copies ahead of consuming
+layers, skip HBM-resident duplicates by inspecting the live canonical map, and
+stage only when the preceding invocation's distinct host demand reaches
+`min_cold_experts`. Decode and MTP graphs do not use this prefill mechanism.
+Preparation clears the demand history after capture, before export. Changing
+this setting changes `RebuildManifest.sm103_preparation_json`, so use ordinary
+export rather than `--reuse-weights` across different staging configurations.
+
+An optional `dynamic_mover` object enables GPU-side dynamic expert migration
+through indirection-aware MegaMoE, an inline routing predictor inside the
+per-layer enter kernel, and an 8-SM 1D-TMA persistent mover exported through
+`Execution.persistent_worker`:
+
+```json
+"dynamic_mover": {
+  "worker_sm_count": 8,
+  "spare_slots": 2,
+  "queue_capacity": 1024,
+  "decay_shift": 4,
+  "promote_threshold": 384,
+  "hysteresis": 64,
+  "cooldown_steps": 2,
+  "max_enqueues": 2,
+  "max_predict_rows": 64
+}
+```
+
+With `dynamic_mover`, each tiered target layer stores only its movable
+`placement.host` experts in mapped host memory (matching a static split's
+`~131.7 GiB` host footprint for DeepSeek V4.1 Flash so `189 GiB` RAM-resident
+Engram tables fit alongside host experts on a 494 GiB Grace host), while
+`placement.hbm \ placement.host` experts remain pinned HBM-only and are never
+evicted. HBM holds `len(hbm) + spare_slots` physical slots per tiered layer.
+Dedicated host lanes are disabled (`host_lane_clusters = 0`) because
+the worker green context reserves `worker_sm_count` SMs (for example, 8 worker
+SMs and 144 compute SMs on a 152-SM GB300). Changing `dynamic_mover` changes
+`RebuildManifest.sm103_preparation_json` and requires ordinary export.
+
+The explicit configuration admits one local SM103 GPU and expanded native
+expert scales without changing the recipe's ordinary TP selection. Planning
+counts physical expert copies at their expanded native size, estimates other
+device weights from checkpoint headers, and checks host memory for mapped
+expert weights plus 8 GiB of preparation headroom. This path requires a local
+checkpoint or an already downloaded checkpoint because placement sizing reads
+tensor headers. Use `ignition export` followed by release `flare run`;
+`debug-serve` and multi-host preparation reject `--sm103-preparation`.
+
+Run the miniature end-to-end SM103 export and fresh-process `flare run` check
+on an assigned SM103 GPU with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest -q tests/preparation/test_reference_core_export_cuda.py
+```
+
+Run the persistent native text regression against an idle release server
+running an exported SM103 core with `--mtp-adaptive-verification` (using
+`--mtp-draft-tokens 7` for concurrency one or `--mtp-draft-tokens 3` for
+concurrency sixteen):
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 FLARE_DEEPSEEK41_SM103_TEST_URL=http://127.0.0.1:8000 \
+  .venv/bin/python -m pytest -q tests/server/test_deepseek41_sm103.py
+```
+
+`ignition.components.megamoe_weights.load_mxfp4_planes` loads packed MXFP4
+weights and expands CSF scales once into native UE8M0 bytes, while
+`pack_mxfp4_planes` applies DeepGEMM's gate/up interleave and scale layout
+without requantizing weights. The recipe accepts a `mxfp4_csf` quantization
+declaration with format version 1 and `weight_scale_encoding: csf` alongside
+block-32 FP8 dense weights, UE8M0 scales, dynamic activations, and FP4 experts.
+`ignition.components.megamoe.PreparedMegaMoe` and
+`ignition.components.megamoe_tiers.MegaMoeHostTier` expose workspace mutations,
+host pointers, route counters, and tensor-map clone tables to complete-forward
+compilation. On an assigned SM103 GPU, run component checks with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest -q \
+  tests/components/test_megamoe_weights_cuda.py \
+  tests/components/test_megamoe_inputs_cuda.py \
+  tests/components/test_megamoe_cuda.py \
+  tests/components/test_megamoe_tiers_cuda.py \
+  tests/components/test_megamoe_loading_cuda.py
+```
+
+Set `FLARE_DEEPSEEK41_CSF_SNAPSHOT` to an indexed lossless-CSF checkpoint to
+include real checkpoint expert checks; without it, those cases skip. Multi-GPU
+(`TP2+`) composition and `--prompt-logprobs` are not supported on the
+`"reference"` SM103 path.
+
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses
@@ -710,41 +844,35 @@ or `audit`. It adds preparation time without changing the serving graph catalog.
 
 `--speculative-token-capacity` bounds physical target rows;
 `--speculative-graph-budget` independently controls the number of packed rounds.
-For each power-of-two request bucket `B`, the catalog retains capacities
-`B + 1` and `min(token_capacity, B * (draft_tokens + 1))` when that interval is
-nonempty. These endpoints preserve the smallest positive aggregate draft budget
-and full-width verification wherever it fits. Width-one continuations cover
-every request bucket independently and do not consume the packed graph budget.
+For each power-of-two request bucket `B` and every draft depth from one through
+the configured maximum, the catalog retains target capacity
+`min(token_capacity, B * (depth + 1))` when it exceeds `B`. The maximum depth
+also retains capacity `B + 1`. Width-one continuations cover every request bucket
+independently and do not consume the packed graph budget. Each combined round
+records its actual proposal depth, allowing `flare run --mtp-draft-tokens N`
+to select captured depths up to `N` without recapture or relabeling.
 
 Additional graphs refine the largest ratio between adjacent capacities across
-all buckets. Each refinement inserts the integer nearest the geometric midpoint
-that minimizes the larger resulting ratio. Equal ratios prefer smaller batches,
-then smaller capacities. Comparing ratios gives each batch the same relative
-resolution rather than assigning all graphs to the largest absolute row range.
+batch and depth pairs, with the width-one continuation as the lower boundary.
+Each refinement inserts the integer nearest the geometric midpoint that minimizes
+the larger resulting ratio. Equal ratios prefer smaller batches, then smaller
+depths and capacities. The budget covers all depths together, so retaining more
+depths leaves fewer graphs to refine physical row capacities.
 At a fixed row cap, increasing the graph budget adds one distinct graph at a
 time and preserves every graph already selected. Integer row capacities limit
 the available resolution: larger budgets saturate at every valid capacity.
-Budgets below the endpoint count fail before preparation; the default request
-and token capacities require at least 12 packed graphs.
-
-With seven drafts, 128 target rows, and a 64-graph budget, the catalog contains:
-
-| Captured request capacity | Packed graphs | Minimum / maximum target rows |
-|---|---:|---:|
-| 1 | 7 | 2 / 8 |
-| 2 | 10 | 3 / 16 |
-| 4 | 12 | 5 / 32 |
-| 8 | 12 | 9 / 64 |
-| 16 | 14 | 17 / 128 |
-| 32 | 9 | 33 / 128 |
+Budgets below the mandatory coverage count fail before preparation. With
+concurrency 32, seven drafts, and 128 target rows, at least 48 packed graphs
+are required. The default budget is 64.
 
 These 64 combined packed rounds and six width-one continuations are separate
 from ordinary decode, prefill, maintenance, and vision graphs. The persistent
 preparation catalog prints every selected capacity. At batch 32, the 128-row
-cap permits four target rows per request on average, while proposal generation
-still produces seven drafts per request. Raising the row cap permits longer
+cap permits four target rows per request on average; a seven-draft round still
+produces seven proposals per request. Raising the row cap permits longer
 aggregate verification prefixes; raising the graph budget improves resolution
 within that cap and increases capture and retained graph resources.
+Previously exported single-depth cores retain their original runtime choices.
 
 The host owns admission, cohort membership, and cache reservations. The captured
 round assigns prefixes from native proposal confidence and reports one terminal

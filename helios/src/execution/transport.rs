@@ -634,6 +634,15 @@ impl GraphExecutor {
         if self.startup_next != self.manifest.referenced_tuning_graphs().len() {
             return Err("startup tuning graphs have not completed".into());
         }
+        if let Some(worker) = self.manifest.persistent_worker.as_ref() {
+            let control = worker.control.as_ref().ok_or_else(|| {
+                Error::execution(
+                    ExecutionError::Manifest,
+                    "persistent worker requires green-context runtime control (export a core and serve with flare run)",
+                )
+            })?;
+            control.start()?;
+        }
         self.startup_ready = true;
         Ok(())
     }
@@ -1133,11 +1142,19 @@ impl GraphExecutor {
             .as_ref()
             .map_or(Ok(()), |e| e.drain())
             .map_err(Error::drain);
-        let drained = compute.is_ok() && copy.is_ok() && engram.is_ok();
+        let worker = self
+            .manifest
+            .persistent_worker
+            .as_ref()
+            .and_then(|worker| worker.control.as_ref())
+            .map_or(Ok(()), |control| control.stop())
+            .map_err(Error::drain);
+        let drained = compute.is_ok() && copy.is_ok() && engram.is_ok() && worker.is_ok();
         let error = compute
             .err()
             .or(copy.err())
             .or(engram.err())
+            .or(worker.err())
             .or(self.poison.take());
         if drained {
             drop(resources);

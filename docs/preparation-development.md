@@ -42,6 +42,12 @@ before the session's capture guard forbids further kernel resolution.
 
 ## Complete-forward compilation and capture
 
+Compiled forwards retain memory-pool planning and storage reuse, but disable
+Inductor's peak-memory operation reordering. That pass can move independent
+main-stream work before an opaque auxiliary-stream launch, turning a prepared
+fork into serial execution. Validate captured dependencies as well as outputs
+and temporary lifetimes when changing branch scheduling.
+
 - **Compile complete prepared forwards.** Use
   [capture_forwards](../ignition/preparation/capture.py), which restores compiled
   forwards before tracing and compiles missing variants with static shapes and
@@ -177,6 +183,11 @@ inside an opaque operator cannot participate in that planning.
 Tensors retained by constructors appear as external storage inputs to compilation.
 Their owners keep those allocations alive across graph variants.
 
+Cloned temporaries that opaque operations mutate retain an explicit materialization
+boundary during compilation. Their views address the clone's storage, including
+when its source is a slice with a nonzero offset. Folding such a clone into its
+source would invalidate the offsets used to reconstruct mutable operands.
+
 Constructors use example tensors to declare layouts and prepare kernels.
 The [declaration tensor helper](../ignition/preparation/examples.py) shares examples
 by semantic role, dtype, and device. Declare capacities from largest to smallest
@@ -241,6 +252,12 @@ without Inductor's lifetime planning. Native replay executes the captured work
 without Python calls or steady-state allocations.
 
 ## Physical cache backing and preparation memory
+
+On Linux, `CoreStorage` reserves a 2 TiB virtual device window per rank. Half
+serves the caching allocator; the other half covers persistent tensors,
+continuation rows, and KV pages, which can each reserve a full-device extent.
+This accommodates GB300 memory geometry without backing those virtual extents
+in full. Windows retains a 1 TiB window within its WDDM address constraints.
 
 - **Bound preparation cache backing by tuning and capture needs.** Keep virtual
   serving capacity separate from physical preparation backing. Back only the

@@ -1,0 +1,34 @@
+This directory carries MegaMoE headers derived from chronarion/derpseek,
+commit fd3f9981468ac5bf0cdf30392f5baf7d9c1c6db8:
+https://github.com/chronarion/derpseek/tree/fd3f9981468ac5bf0cdf30392f5baf7d9c1c6db8/engine/overlay/megamoe_fork
+
+DerpSeek adds direct host-memory expert reads and a separate scheduling lane.
+The headers derive from DeepSeek's DeepGEMM through Garner McCloud's ds41
+recipe and chronarion's dsv41 integration. The original header comments and
+license texts are retained in LICENSE.DeepGEMM, LICENSE.ds41 and LICENSE.DerpSeek.
+
+Flare's Python binding prepares a private include tree for kernel compilation
+before graph capture. Its host-tier kernel adds a preparation-time choice of
+shared-first accumulation to match DeepInfer's DeepGEMM reference. The default
+retains DerpSeek's routed-first order. Weight arithmetic and expert selection
+are unchanged by that choice; FP32 addition order can affect final BF16 rounding.
+
+inputs.py adapts vLLM v0.32.0's
+vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe.py (Apache-2.0,
+Copyright contributors to the vLLM project; full license text in LICENSE.vllm).
+The Triton kernel is unchanged.
+The Python wrapper imports Triton directly and fixes the declared activation
+format to dynamic MXFP8, removing its dependency on vLLM's QuantKey classes.
+It validates the tensor geometry, formats and devices before launching.
+
+The host/csrc preparation launcher and heuristics derive from
+vllm-project/DeepGEMM commit 1e1842a833699298f7afc02eefb2ed168fff6938.
+The MegaMoE launcher passes the selected accumulation order as a kernel template
+argument. The heuristics omit environment-selected debug printing. The
+host/include/deep_jit headers derive from that revision's DeepJIT submodule and
+retain its license in LICENSE.DeepJIT; Flare replaces environment-variable
+compiler/cache toggles with an explicit cache directory and fixed compilation
+options. Flare's host_bindings.cpp
+passes logical expert count independently of physical HBM tensor extents.
+The binding has a separate preparation runtime and uses the carried CUDA
+headers; it does not add a native serving dependency.

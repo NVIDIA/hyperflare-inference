@@ -17,6 +17,10 @@ ignition = "ignition.__main__:main"
 [project.optional-dependencies]
 test = ["pytest>=9,<10", "tiktoken>=0.12,<1"]
 api-test = ["pytest>=9,<10", "openai>=2,<3", "anthropic>=0.70,<1"]
+sm103-reference = [
+    "deep-gemm @ git+https://github.com/vllm-project/DeepGEMM.git@1e1842a833699298f7afc02eefb2ed168fff6938",
+    "deepinfer @ git+https://github.com/local-inference-lab/DeepInfer.git@0d8f05928995d866aeb155da1d55285daa358f8c",
+]
 prepare = [
     "cryptography>=46,<52",
     "torch==2.14.1+cu132",
@@ -46,10 +50,27 @@ torchvision = { index = "pytorch-cu132" }
 flare-heliopause = { path = "heliopause" }
 flashinfer-python = { git = "https://github.com/local-inference-lab/flashinfer.git", branch = "main" }
 
+[tool.uv.extra-build-dependencies]
+deep-gemm = ["torch==2.14.1+cu132", "packaging", "wheel"]
+deepinfer = ["torch==2.14.1+cu132", "numpy"]
+
+[tool.uv.extra-build-variables]
+deepinfer = { PYTHONPATH = "." }
+
+# DeepInfer's setup.py reads its upstream requirements.txt (pinning transformers==4.50.0,
+# huggingface_hub==0.36.2, tilelang==0.1.15 -> apache-tvm-ffi==0.1.12), which conflicts
+# with ignition[prepare]. Declare its minimal metadata so uv lock keeps prepare intact.
+[[tool.uv.dependency-metadata]]
+name = "deepinfer"
+version = "0.1.0"
+requires-dist = ["einops>=0.8"]
+
 [tool.setuptools.packages.find]
 include = ["ignition*"]
 
 [tool.setuptools.package-data]
+"ignition.components.megamoe_kernel" = ["host_bindings.cpp", "host/**/*.hpp", "host/**/*.h", "include/deep_gemm/impls/*.cuh", "include/deep_gemm/scheduler/*.cuh", "LICENSE.*", "NOTICE"]
+"ignition.components.sm103_mover_kernel" = ["mover_kernels.cu"]
 "ignition.preparation" = ["ladders/*.json"]
 "ignition.recipes.deepseek41" = ["assets/*"]
 "ignition.recipes.deepseek4" = ["assets/*"]
