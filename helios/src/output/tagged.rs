@@ -36,6 +36,10 @@ pub trait ToolDialect {
     const FUNCTION: Option<(&'static str, &'static str)> = None;
     const TOOL_ENDS_REASONING: bool = false;
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>>;
+    /// `None` means the apparent closing tag is text inside a JSON string.
+    fn parse_candidate(body: &str, tools: &[Value]) -> Result<Option<Vec<(String, String)>>> {
+        Self::parse(body, tools).map(Some)
+    }
     /// Whether text beginning with `OPEN` or the function opener starts a call
     /// rather than mentioning the tag in prose; `None` until more text decides.
     fn starts_call(_text: &str) -> Option<bool> {
@@ -206,6 +210,9 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
 pub struct TaggedTools<D: ToolDialect> {
     dialect: std::marker::PhantomData<D>,
     buffer: String,
+    search_from: usize,
+    in_json_string: bool,
+    escaped: bool,
     tools: Arc<[Value]>,
     index: usize,
 }
@@ -218,22 +225,35 @@ impl<D: ToolDialect> ToolCallParser for TaggedTools<D> {
         if self.buffer.len() > 1024 * 1024 {
             return Err("tool call exceeds the 1 MiB parser bound".into());
         }
-        let mut boundary = self
-            .buffer
-            .find(D::CLOSE)
-            .map(|at| (at, at + D::CLOSE.len()));
-        if let Some((_, close)) = D::FUNCTION {
-            if let Some(at) = self.buffer.find(close) {
-                if boundary.is_none_or(|(end, _)| at < end) {
-                    boundary = Some((at + close.len(), at + close.len()));
+        let calls = loop {
+            if self.in_json_string {
+                while self.search_from < self.buffer.len() {
+                    let b = self.buffer.as_bytes()[self.search_from];
+                    self.search_from += 1;
+                    if self.escaped { self.escaped = false; }
+                    else if b == b'\\' { self.escaped = true; }
+                    else if b == b'"' { self.in_json_string = false; break; }
                 }
+                if self.in_json_string { return Ok(Progress::default()); }
             }
-        }
-        let Some((end, consumed)) = boundary else {
-            return Ok(Progress::default());
+            let tail = &self.buffer[self.search_from..];
+            let mut candidate = tail.find(D::CLOSE).map(|at| (at, at + D::CLOSE.len()));
+            if let Some((_, close)) = D::FUNCTION
+                && let Some(at) = tail.find(close)
+                && candidate.is_none_or(|(end, _)| at < end)
+            {
+                candidate = Some((at + close.len(), at + close.len()));
+            }
+            let Some((end, consumed)) = candidate else { return Ok(Progress::default()); };
+            let end = self.search_from + end;
+            self.search_from += consumed;
+            if let Some(calls) = D::parse_candidate(&self.buffer[..end], &self.tools)? {
+                self.buffer.drain(..self.search_from);
+                self.search_from = 0;
+                break calls;
+            }
+            self.in_json_string = true;
         };
-        let calls = D::parse(&self.buffer[..end], &self.tools)?;
-        self.buffer.drain(..consumed);
         let events = calls
             .into_iter()
             .enumerate()
@@ -374,6 +394,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             tool: (config.start == OutputStart::ToolBody).then(|| TaggedTools {
                 dialect: std::marker::PhantomData,
                 buffer: String::new(),
+                search_from: 0, in_json_string: false, escaped: false,
                 tools: definitions,
                 index: 0,
             }),
@@ -687,6 +708,7 @@ impl<D: ToolDialect> TaggedOutput<D> {
                             self.tool = Some(TaggedTools {
                                 dialect: std::marker::PhantomData,
                                 buffer: String::new(),
+                                search_from: 0, in_json_string: false, escaped: false,
                                 tools: self.tools.clone(),
                                 index: self.calls,
                             });
@@ -764,6 +786,32 @@ fn partial_marker(text: &str, markers: &[&str]) -> usize {
         .max()
         .unwrap_or(0)
 }
+
+/// Parse a declared JSON container before interpreting tag text inside it.
+/// Raw strings and malformed non-strict values retain their dialect's fallback.
+pub(super) fn container_parameter<'a>(raw: &'a str, schema: Option<&Value>) -> std::result::Result<Option<(Value, &'a str)>, InJsonString> {
+    let first = raw.trim_start().as_bytes().first().copied();
+    let expected = match first { Some(b'[') => "array", Some(b'{') => "object", _ => return Ok(None) };
+    let kinds = schema.and_then(|s| s.get("type"));
+    if !kinds.is_some_and(|t| t.as_str() == Some(expected) || t.as_array().is_some_and(|a|
+        a.iter().any(|k| k.as_str() == Some(expected)) && !a.iter().any(|k| k.as_str() == Some("string")))) { return Ok(None); }
+    let mut stream = serde_json::Deserializer::from_str(raw).into_iter::<Value>();
+    match stream.next() {
+        Some(Ok(value)) => Ok(Some((value, raw[stream.byte_offset()..].trim_start()))),
+        Some(Err(e)) if e.is_eof() => {
+            let (mut quoted, mut escaped) = (false, false);
+            for b in raw.bytes() {
+                if escaped { escaped = false; }
+                else if quoted && b == b'\\' { escaped = true; }
+                else if b == b'"' { quoted = !quoted; }
+            }
+            if quoted { Err(InJsonString) } else { Ok(None) }
+        }
+        _ => Ok(None),
+    }
+}
+
+pub(super) struct InJsonString;
 
 pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
     // Tool schemas guide tag-to-JSON conversion; non-strict calls retain invalid values.

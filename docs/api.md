@@ -562,7 +562,7 @@ The response completes normally with the first call and usage: Chat uses
 Responses emits a completed response containing the first tool call.
 This applies to buffered and streamed requests. Combined with required mode, a
 successful response contains exactly one call. The limit is checked before
-validating the discarded call's name. Generation uses ordinary sampling.
+validating the discarded call's name. The call-count limit alone does not enable constrained sampling.
 Usage counts every generated token, including discarded output. Detection follows
 the HTTP reader's pace: a slow or paused client delays cancellation while the
 worker continues decoding. Cancellation is processed at submission boundaries;
@@ -580,7 +580,50 @@ Missing, duplicate, or unknown IDs leave that group in its supplied order.
 Results never move across another
 assistant message.
 
-Strict function schemas (`strict: true`) are rejected. Hosted search,
+Chat Completions and Responses accept `strict: true` for function tools when the
+core declares a DeepSeek DSML, Qwen/ChatML function-tag, GLM argument-tag or
+TMLv0 tool parser. Strict schemas must declare `"type": "object"` with
+`"additionalProperties": false` at the root and on every nested object, list
+every declared property in `"required"`, and use supported bounded JSON-schema
+keywords (`properties`, `required`, `additionalProperties`, `items`,
+`prefixItems`, `minItems`, `maxItems`, `enum`, `const`, `anyOf`, local `$ref`
+to `#`, `#/$defs/<name>`, or `#/definitions/<name>`, numeric bounds,
+`multipleOf`, `minLength`, `maxLength`, and `pattern`). Function-tag and GLM
+argument-tag syntaxes reject top-level properties that mix `"string"` with
+any non-string type, including `"null"`. `enum` and `const` may specify a
+compatible `type` but cannot be combined with other assertions. With an active
+strict tool, TMLv0 recognizes only declared tool names, including under
+`tool_choice: "auto"`.
+
+Object property names cannot contain `<`, `>`, or whitespace. Top-level property
+names also exclude control characters, `"`, `'`, `&`, `\`, and `｜`.
+Tag-delimited parsers reserve the following delimiters in top-level raw string
+parameters:
+
+| Tool syntax | Reserved delimiters |
+| --- | --- |
+| DeepSeek DSML | `｜DSML｜` |
+| Qwen function tags | `</parameter>`, `<parameter=`, `</function>`, `</tool_call>` |
+| GLM argument tags | `</arg_value>`, `</tool_call>` |
+
+Admission rejects `const`, `enum`, or `pattern` constraints that require a
+reserved delimiter in such a parameter. For open strings, the wire grammar
+excludes the delimiter during generation.
+
+Helios buffers a strict call until its arguments are complete and validated.
+Even in a streaming response the client does not receive partial strict arguments.
+An output limit or user stop omits a strict call that began but did not finish;
+EOS inside such a call produces an error. A required or named tool choice
+still fails if no qualifying call completed.
+An active strict function tool attaches a request grammar for the entire
+generation, including reasoning, prose, and tool calls. For as long as the
+request decodes, its MTP width is one and any decode batch containing it keeps
+one step in flight rather than two. This also applies when `tool_choice: "auto"`
+produces only prose. See the [native replay loop](core-design.md#native-replay-loop).
+Active strict tools on unsupported parsers, `strict: true` on custom or
+Messages tools, and invalid strict schemas return HTTP 400. Custom Lark
+answer grammars cannot be combined with active strict tools on DSML, Qwen
+function-tag, or GLM argument-tag parsers. Hosted search,
 computer execution, file stores, audio, and remote image downloads are unsupported. Images must be
 base64 PNG, JPEG, static WebP, or non-animated GIF data. Images are encoded sequentially into
 bounded feature windows. Chunked prefill consumes each window before its storage

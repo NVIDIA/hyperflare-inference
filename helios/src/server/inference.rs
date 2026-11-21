@@ -63,6 +63,7 @@ pub struct Tool {
     /// Whether the client declared `parameters`; `parameters` holds an empty
     /// object schema otherwise.
     pub declared_parameters: bool,
+    pub strict: bool,
     pub custom: bool,
     pub grammar: Option<ToolGrammar>,
 }
@@ -175,6 +176,12 @@ impl Request {
             {
                 return Err(
                     "tool names must be nonempty and unambiguous, with object schemas".into(),
+                );
+            }
+            if tool.strict && (tool.custom || !tool.declared_parameters) {
+                return Err(
+                    "strict function tools must declare an explicit object parameters schema"
+                        .into(),
                 );
             }
         }

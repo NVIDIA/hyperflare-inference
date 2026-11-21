@@ -28,6 +28,9 @@ impl ToolDialect for ArgumentTags {
     const CLOSE: &'static str = "</tool_call>";
 
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>> {
+        Self::parse_candidate(body, tools)?.ok_or_else(|| "incomplete JSON argument".into())
+    }
+    fn parse_candidate(body: &str, tools: &[Value]) -> Result<Option<Vec<(String, String)>>> {
         let body = body.trim();
         let split = body.find("<arg_key>").unwrap_or(body.len());
         let name = body[..split].trim();
@@ -39,6 +42,7 @@ impl ToolDialect for ArgumentTags {
             .iter()
             .filter_map(|tool| tool.get("function"))
             .find(|function| function.get("name").and_then(Value::as_str) == Some(name));
+        let strict = function.is_some_and(|f| f["strict"].as_bool() == Some(true));
         let properties = function
             .and_then(|function| function.get("parameters"))
             .and_then(|parameters| parameters.get("properties"))
@@ -59,21 +63,27 @@ impl ToolDialect for ArgumentTags {
                 .trim_start()
                 .strip_prefix("<arg_value>")
                 .ok_or("GLM argument requires a value tag")?;
+            let schema = properties.and_then(|p| p.get(key));
+            let Ok(container) = super::tagged::container_parameter(value, schema.filter(|_| strict)) else { return Ok(None); };
+            if let Some((parsed, remaining)) = container
+                && let Some(next) = remaining.strip_prefix("</arg_value>")
+            {
+                arguments.insert(key.to_owned(), parsed);
+                rest = next;
+                continue;
+            }
             let (value, tail) = value
                 .split_once("</arg_value>")
                 .ok_or("unterminated GLM argument value")?;
-            arguments.insert(
-                key.to_owned(),
-                parameter_value(value, properties.and_then(|p| p.get(key)))?,
-            );
+            arguments.insert(key.to_owned(), parameter_value(value, schema)?);
             rest = tail;
         }
-        Ok(vec![(
+        Ok(Some(vec![(
             name.to_owned(),
             serde_json::to_string(&arguments).map_err(|error| {
                 crate::FrontendError::Input(crate::Failure::caused_by(error.to_string(), error))
             })?,
-        )])
+        )]))
     }
     fn starts_call(text: &str) -> Option<bool> {
         // Calls continue with the function name and an argument key or closing tag;
