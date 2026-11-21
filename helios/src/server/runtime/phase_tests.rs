@@ -4018,13 +4018,14 @@ fn http_state(
     sender: mpsc::SyncSender<Vec<Incoming>>,
     api_key: Option<String>,
 ) -> Arc<super::super::HttpState> {
-    http_state_for(Fixture::new(), sender, api_key)
+    http_state_for(Fixture::new(), sender, api_key, &[])
 }
 
 fn http_state_for(
     mut fixture: Fixture,
     sender: mpsc::SyncSender<Vec<Incoming>>,
     api_key: Option<String>,
+    served_names: &[String],
 ) -> Arc<super::super::HttpState> {
     use super::super::HttpState;
     use tokio::sync::Semaphore;
@@ -4055,6 +4056,8 @@ fn http_state_for(
         metrics: fixture.metrics,
         input_store: None,
     });
+    let response_model =
+        super::super::models::response_name(model.config(), served_names).to_owned();
     Arc::new(HttpState {
         first_response: Arc::new(super::super::latency::FirstResponseSamples::default()),
         log_to_stderr: false,
@@ -4073,6 +4076,7 @@ fn http_state_for(
         thinking_token_budget: None,
         context_hint: String::new(),
         capacity_hint: String::new(),
+        response_model,
         started: std::time::Instant::now(),
         generated: Default::default(),
         accepting: Mutex::new(true),
@@ -4238,13 +4242,14 @@ async fn http_generation_request(
     tokio::task::JoinHandle<axum::response::Response>,
     Vec<Incoming>,
 ) {
-    let (response, incoming, _) = http_generation_request_observed(path, body).await;
+    let (response, incoming, _) = http_generation_request_observed(path, body, &[]).await;
     (response, incoming)
 }
 
 async fn http_generation_request_observed(
     path: &str,
     body: serde_json::Value,
+    served_names: &[String],
 ) -> (
     tokio::task::JoinHandle<axum::response::Response>,
     Vec<Incoming>,
@@ -4253,7 +4258,7 @@ async fn http_generation_request_observed(
     use super::super::http;
     use axum::{Extension, extract::State};
     let (sender, receiver) = mpsc::sync_channel(4);
-    let state = http_state(sender, None);
+    let state = http_state_for(Fixture::new(), sender, None, served_names);
     let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
     let request = axum::http::Request::builder()
         .method("POST")
@@ -4278,6 +4283,7 @@ async fn first_response_http_stream_excludes_pretext_failures_and_unpolled_bodie
         let (response, incoming, state) = http_generation_request_observed(
             "/v1/completions",
             serde_json::json!({"prompt":"a", "max_tokens":2, "stream":true}),
+            &[],
         ).await;
         let response = response.await.unwrap();
         incoming[0].notify_admission(Ok(()));
@@ -4302,6 +4308,7 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
         let (response, incoming, state) = http_generation_request_observed(
             "/v1/completions",
             serde_json::json!({"prompt":"a", "max_tokens":2, "stream":false}),
+            &[],
         ).await;
         incoming[0].notify_admission(Ok(()));
         incoming[0].emit_token(1);
@@ -4391,7 +4398,7 @@ async fn disabled_parallel_calls_complete_http_and_stop_decoding() {
                 "</parameter>", "</function>", "</tool_call>"]
                 .map(|text| fixture.frontend.tokenizer().token_to_id(text).unwrap());
             let (sender, receiver) = mpsc::sync_channel(4);
-            let state = http_state_for(fixture, sender, None);
+            let state = http_state_for(fixture, sender, None, &[]);
             let mut body = json!({"messages":[{"role":"user","content":"a"}],
                 "max_tokens":64, "stream":stream, "parallel_tool_calls":false,
                 "stream_options":{"include_usage":true},
@@ -4534,7 +4541,7 @@ async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() 
         let mut fixture = Fixture::new();
         fixture.config.limits.max_sequence_tokens = 4096;
         fixture.config.prepared_sequence_tokens = 4096;
-        let state = http_state_for(fixture, sender, None);
+        let state = http_state_for(fixture, sender, None, &[]);
         body["model"] = json!("qwen-worker-phases");
         body["stream"] = json!(true);
         let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
@@ -4618,7 +4625,7 @@ async fn http_operator_thinking_budget_defaults_and_request_overrides() {
         for explicit in [None, Some(3)] {
             let fixture = Fixture::reasoning();
             let (sender, receiver) = mpsc::sync_channel(4);
-            let mut state = http_state_for(fixture, sender, None);
+            let mut state = http_state_for(fixture, sender, None, &[]);
             Arc::get_mut(&mut state).unwrap().thinking_token_budget = Some(2);
             let mut body = json!({"model":"qwen-worker-phases", "max_tokens":8,
                 "max_output_tokens":8, "add_generation_prompt":true});
@@ -4770,6 +4777,62 @@ async fn http_stream_headers_precede_admission_and_late_failure_has_no_success_t
 }
 
 #[tokio::test]
+async fn responses_carry_the_first_non_empty_served_name() {
+    let aliased = vec![String::new(), "served-alias".to_owned()];
+    let (response, incoming, _state) = http_generation_request_observed(
+        "/v1/chat/completions",
+        serde_json::json!({"messages":[{"role":"user","content":"a"}], "max_tokens":4,
+            "stream":true, "return_token_ids":true}),
+        &aliased,
+    ).await;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+        .await.unwrap().unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    incoming[0].notify_admission(Ok(()));
+    incoming[0].observe_token(1);
+    incoming[0].emit_token(1);
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
+        reused_prompt_tokens: 0, reason: "stop", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let bytes = axum::body::to_bytes(response.into_body(), 131072).await.unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    let events = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|line| *line != "[DONE]")
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| event["model"] == "served-alias"));
+    // The token-id observation chunk carries the same name as the text chunks.
+    assert!(
+        events
+            .iter()
+            .any(|event| event["choices"][0]["token_ids"].is_array())
+    );
+
+    // An empty served name falls back to the loaded model's identifier.
+    let (response, incoming, state) = http_generation_request_observed(
+        "/v1/chat/completions",
+        serde_json::json!({"messages":[{"role":"user","content":"a"}], "max_tokens":2}),
+        &[String::new()],
+    ).await;
+    incoming[0].notify_admission(Ok(()));
+    incoming[0].emit_token(1);
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
+        reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let response = response.await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["model"].as_str(), Some(state.model.config().model_id.as_str()));
+}
+
+#[tokio::test]
 async fn request_ids_differ_across_server_starts() {
     let mut ids = vec![];
     for _ in 0..2 {
@@ -4799,7 +4862,7 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
             request["stop_token_sequences"] = serde_json::json!([[1, 2]]);
         }
         let (response, mut incoming, state) =
-            http_generation_request_observed("/v1/chat/completions", request).await;
+            http_generation_request_observed("/v1/chat/completions", request, &[]).await;
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
             .await
             .unwrap()
