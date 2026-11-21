@@ -70,6 +70,7 @@ include = ["ignition*"]
 
 [tool.setuptools.package-data]
 "ignition.components.megamoe_kernel" = ["host_bindings.cpp", "host/**/*.hpp", "host/**/*.h", "include/deep_gemm/impls/*.cuh", "include/deep_gemm/scheduler/*.cuh", "LICENSE.*", "NOTICE"]
+"ignition.components.sm103_mover_kernel" = ["mover_kernels.cu"]
 "ignition.preparation" = ["ladders/*.json"]
 "ignition.recipes.deepseek41" = ["assets/*"]
 "ignition.recipes.deepseek4" = ["assets/*"]
