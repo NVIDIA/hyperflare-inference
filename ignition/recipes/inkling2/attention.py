@@ -17,14 +17,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 
 from ignition.components.causal_convolution import PreparedCausalConvolution
 from ignition.components.head_gate import PreparedHeadGate
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.rms_norm import PreparedRMSNorm
-from ignition.components.state import gather_rows, scatter_rows
 from ignition.preparation.persistent import persistent_empty
+from ignition.preparation.triton import launch_triton, prepare_triton
 
 from .arithmetic import l2_clip, log_scaling
 from .pool import KV_DTYPE, PAGE_TOKENS
@@ -40,9 +42,11 @@ class Columns:
     streams: tuple[tuple[tuple[str, int], ...], ...]
 
     @classmethod
-    def of(cls, local, heads, kv_heads, dim, width):
+    def of(cls, local, heads, kv_heads, dim, width, separate_inputs=False):
         query = (("query", heads * dim), ("gate", heads * dim))
         relative = (("relative", heads * RELATIVE_RANK), ("sink", heads))
+        if local and separate_inputs:
+            return cls(((*query, *relative), (("key", kv_heads * dim),), (("value", kv_heads * dim),)))
         if local:
             return cls(((*query, ("key", kv_heads * dim), ("value", kv_heads * dim), *relative),))
         return cls(((*query, *relative), (("key", kv_heads * dim), ("key_lags", kv_heads * width)),
@@ -105,11 +109,11 @@ def fuse_projections(placed, columns: Columns, *, local):
     return tuple(fused)
 
 
-def attention_weights(placed, *, local, heads, kv_heads, dim, width):
+def attention_weights(placed, *, local, heads, kv_heads, dim, width, separate_inputs=False):
     """Serving attention tensors from one rank's placed checkpoint roles (`weights.checkpoint_layout`)."""
     from ignition.preparation.persistent import persistent_copy
 
-    columns = Columns.of(local, heads, kv_heads, dim, width)
+    columns = Columns.of(local, heads, kv_heads, dim, width, separate_inputs)
     projection = placed["relative_projection"]
     if local:
         key, value = placed["key_convolution"], placed["value_convolution"]
@@ -183,7 +187,8 @@ class PreparedAttention(torch.nn.Module):
         self.local = text.local(layer)
         self.heads, self.kv_heads, self.dim = weights.query_clip_scale.shape[0], cache.key.shape[2], text.head_dim
         self.window, self.ring = text.window, text.window + PAGE_TOKENS
-        self.columns = Columns.of(self.local, self.heads, self.kv_heads, self.dim, text.convolution_width)
+        self.columns = Columns.of(self.local, self.heads, self.kv_heads, self.dim, text.convolution_width,
+                                  separate_inputs=len(weights.projections) == 3)
         self.weights = weights
         self.key_convolution = PreparedCausalConvolution(weights.key_convolution, cache.key_history,
             dynamic_heads=0 if self.local else self.kv_heads)
@@ -224,6 +229,9 @@ class PreparedAttention(torch.nn.Module):
         slots = example("inkling.attention.slots", (tokens,), torch.int64)
         requests = metadata.lengths.numel()
         self.writer = None
+        self._stage_compiled = self._retain_compiled = None
+        self._stage_opts = self._retain_opts = None
+        self._stage_grid = self._retain_grid = None
         if self.local and mode in ("prefill", "verify"):
             self.staged_pages = -(-(self.window - 1 + metadata.max_query_tokens) // PAGE_TOKENS)
             count = requests * self.staged_pages
@@ -231,6 +239,38 @@ class PreparedAttention(torch.nn.Module):
             cache_value = example("inkling.attention.staged_value", (count, PAGE_TOKENS, self.kv_heads, self.dim), KV_DTYPE)
             pages = torch.arange(count, dtype=torch.int32, device=device).view(requests, self.staged_pages)
             self.staged_table = pages
+            cap = self.staged_pages * PAGE_TOKENS
+            row_elems = self.kv_heads * self.dim
+            block_e = triton.next_power_of_2(row_elems)
+            out_len = example("inkling.attention.staged_lengths", (requests,), torch.int32)
+            row_stride = cache.key_rings.stride(0)
+            if cache.value_rings.stride(0) != row_stride or cache.key_rings.stride(1) != 1 or cache.value_rings.stride(1) != 1:
+                raise ValueError("ring staging requires matching row strides and contiguous ring elements")
+            self._stage_opts = dict(
+                RING_LEN=self.ring, RING_ROW_STRIDE=row_stride, WINDOW=self.window, CAPACITY=cap,
+                ROW_ELEMS=row_elems, MAX_TOKENS=tokens, BLOCK_E=block_e, num_warps=4,
+            )
+            self._stage_grid = (requests, cap, 1)
+            self._stage_compiled = prepare_triton(
+                _stage_kv_kernel,
+                (cache.key_rings.view(KV_DTYPE), cache.value_rings.view(KV_DTYPE), key, value,
+                 metadata.state_rows, metadata.starts, metadata.lengths, metadata.query_start_loc,
+                 cache_key, cache_value, out_len),
+                self._stage_grid, **self._stage_opts,
+            ).compiled
+            retain_w = min(metadata.max_query_tokens, self.ring)
+            counts_ex = example("inkling.attention.retain_counts", (requests,), torch.int32)
+            self._retain_opts = dict(
+                RING_LEN=self.ring, RING_ROW_STRIDE=row_stride, ROW_ELEMS=row_elems, MAX_TOKENS=tokens,
+                BLOCK_E=block_e, num_warps=4,
+            )
+            self._retain_grid = (requests, retain_w, 1)
+            self._retain_compiled = prepare_triton(
+                _retain_kv_kernel,
+                (cache.key_rings.view(KV_DTYPE), cache.value_rings.view(KV_DTYPE), key, value,
+                 metadata.state_rows, metadata.starts, counts_ex, metadata.query_start_loc),
+                self._retain_grid, **self._retain_opts,
+            ).compiled
         else:
             cache_key, cache_value = cache.key, cache.value
             pages = (example("inkling.attention.ring_table", (requests, self.ring // PAGE_TOKENS), torch.int32)
@@ -301,18 +341,36 @@ class PreparedAttention(torch.nn.Module):
     def forward(self, streams, metadata):
         return self.attend(streams, metadata)[1]
 
+    def _stage_kv(self, key, value, m):
+        requests = m.lengths.numel()
+        count = requests * self.staged_pages
+        staged_key = torch.empty((count, PAGE_TOKENS, self.kv_heads, self.dim), dtype=KV_DTYPE, device=key.device)
+        staged_value = torch.empty((count, PAGE_TOKENS, self.kv_heads, self.dim), dtype=KV_DTYPE, device=key.device)
+        lengths = torch.empty((requests,), dtype=torch.int32, device=key.device)
+        launch_triton(
+            _stage_kv_kernel, self._stage_compiled,
+            (self.cache.key_rings.view(KV_DTYPE), self.cache.value_rings.view(KV_DTYPE), key, value,
+             m.state_rows, m.starts, m.lengths, m.query_start_loc, staged_key, staged_value, lengths),
+            self._stage_grid, **self._stage_opts,
+        )
+        return staged_key, staged_value, lengths
+
+    def _retain_kv(self, key, value, counts, m):
+        launch_triton(
+            _retain_kv_kernel, self._retain_compiled,
+            (self.cache.key_rings.view(KV_DTYPE), self.cache.value_rings.view(KV_DTYPE), key, value,
+             m.state_rows, m.starts, counts, m.query_start_loc),
+            self._retain_grid, **self._retain_opts,
+        )
+
     def _prefill(self, v, m):
         key, value = v["key"], v["value"]
         if self.local:
-            key_ring = _request_ring(self.cache.key_rings, key, m)
-            value_ring = _request_ring(self.cache.value_rings, value, m)
-            staged_key, staged = _stage(key_ring, key, m, window=self.window, pages=self.staged_pages)
-            staged_value, _ = _stage(value_ring, value, m, window=self.window, pages=self.staged_pages)
-            _retain(self.cache.key_rings, key_ring, key, m)
-            _retain(self.cache.value_rings, value_ring, value, m)
+            staged_key, staged_value, staged = self._stage_kv(key, value, m)
+            self._retain_kv(key, value, m.lengths, m)
             return self.attention(v["query"], sink=v["sink"], relative_bias_factors=v["relative"],
                                   relative_bias_projection=self.weights.relative_rows,
-                                  k_cache=staged_key, v_cache=staged_value, cache_seqlens=staged.reshape(1),
+                                  k_cache=staged_key, v_cache=staged_value, cache_seqlens=staged,
                                   page_table=self.staged_table, cu_seqlens_q=m.query_start_loc)
         self.writer(key, value, _page_slots(m))
         lengths = torch.where(m.lengths > 0, m.starts + m.lengths, 0).int()
@@ -337,10 +395,7 @@ class PreparedAttention(torch.nn.Module):
 
     def _verify(self, v, m):
         if self.local:
-            cache_key, lengths = stage_batch(self.cache.key_rings, v["key"], m,
-                                              window=self.window, pages=self.staged_pages)
-            cache_value, _ = stage_batch(self.cache.value_rings, v["value"], m,
-                                         window=self.window, pages=self.staged_pages)
+            cache_key, cache_value, lengths = self._stage_kv(v["key"], v["value"], m)
             pages = self.staged_table
             kwargs = dict(k_cache=cache_key, v_cache=cache_value)
         else:
@@ -356,83 +411,90 @@ class PreparedAttention(torch.nn.Module):
         self.key_convolution.commit(values["key_previous"], values["key_raw"], metadata, counts=counts)
         self.value_convolution.commit(values["value_previous"], values["value_raw"], metadata, counts=counts)
         if self.local:
-            retain_batch(self.cache.key_rings, values["key"], counts, metadata)
-            retain_batch(self.cache.value_rings, values["value"], counts, metadata)
+            self._retain_kv(values["key"], values["value"], counts.int(), metadata)
 
 
-def stage_batch(rings, values, m, *, window, pages):
-    rows, capacity = m.starts.numel(), pages * PAGE_TOKENS
-    ring = torch.empty((rows, rings.shape[1]), dtype=torch.uint8, device=rings.device)
-    gather_rows(rings, m.state_rows, ring)
-    ring = ring.view(KV_DTYPE).view(rows, -1, *values.shape[1:])
-    first = (m.starts - window + 1).clamp_min(0)
-    positions = first[:, None] + torch.arange(capacity, device=values.device)
-    previous = ring[torch.arange(rows, device=values.device)[:, None], positions.remainder(ring.shape[1])].to(values.dtype)
-    index = (m.query_start_loc[:-1, None] + positions - m.starts[:, None]).clamp(0, values.shape[0] - 1)
-    staged = torch.where((positions < m.starts[:, None])[:, :, None, None], previous, values[index])
-    lengths = torch.where(m.lengths > 0, m.starts - first + m.lengths, 0).int()
-    staged = torch.where((positions < (m.starts + m.lengths)[:, None])[:, :, None, None], staged, 0)
-    return staged.clamp(-448, 448).to(KV_DTYPE).view(rows * pages, PAGE_TOKENS, *values.shape[1:]), lengths
+@triton.jit
+def _stage_kv_kernel(
+    KeyRings, ValRings, KeyVals, ValVals,
+    StateRows, Starts, Lengths, QueryStartLoc,
+    OutKey, OutVal, OutLengths,
+    RING_LEN: tl.constexpr, RING_ROW_STRIDE: tl.constexpr, WINDOW: tl.constexpr, CAPACITY: tl.constexpr,
+    ROW_ELEMS: tl.constexpr, MAX_TOKENS: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """Fused K/V sliding-window staging: copies raw FP8 ring bytes directly without BF16 round-trip."""
+    b = tl.program_id(0).to(tl.int64)
+    j = tl.program_id(1).to(tl.int64)
+    start = tl.load(Starts + b).to(tl.int64)
+    length = tl.load(Lengths + b).to(tl.int64)
+    first = tl.maximum(start - WINDOW + 1, 0)
+    if j == 0:
+        out_len = tl.where(length > 0, start - first + length, 0).to(tl.int32)
+        tl.store(OutLengths + b, out_len)
+
+    pos = first + j
+    out_offset = (b * CAPACITY + j) * ROW_ELEMS
+    cols = tl.arange(0, BLOCK_E)
+    mask = cols < ROW_ELEMS
+
+    if length <= 0 or pos >= start + length:
+        z = tl.zeros((BLOCK_E,), dtype=tl.float8e4nv)
+        tl.store(OutKey + out_offset + cols, z, mask=mask)
+        tl.store(OutVal + out_offset + cols, z, mask=mask)
+    elif pos < start:
+        srow = tl.load(StateRows + b).to(tl.int64)
+        slot = pos % RING_LEN
+        ring_offset = srow * RING_ROW_STRIDE + slot * ROW_ELEMS
+        k = tl.load(KeyRings + ring_offset + cols, mask=mask)
+        v = tl.load(ValRings + ring_offset + cols, mask=mask)
+        tl.store(OutKey + out_offset + cols, k, mask=mask)
+        tl.store(OutVal + out_offset + cols, v, mask=mask)
+    else:
+        qstart = tl.load(QueryStartLoc + b).to(tl.int64)
+        idx = tl.minimum(tl.maximum(qstart + pos - start, 0), MAX_TOKENS - 1)
+        val_offset = idx * ROW_ELEMS
+        k_bf = tl.load(KeyVals + val_offset + cols, mask=mask, other=0.0).to(tl.float32)
+        v_bf = tl.load(ValVals + val_offset + cols, mask=mask, other=0.0).to(tl.float32)
+        k_fp8 = tl.minimum(tl.maximum(k_bf, -448.0), 448.0).to(tl.float8e4nv)
+        v_fp8 = tl.minimum(tl.maximum(v_bf, -448.0), 448.0).to(tl.float8e4nv)
+        tl.store(OutKey + out_offset + cols, k_fp8, mask=mask)
+        tl.store(OutVal + out_offset + cols, v_fp8, mask=mask)
 
 
-def retain_batch(rings, values, counts, m):
-    rows = m.starts.numel()
-    previous = torch.empty((rows, rings.shape[1]), dtype=torch.uint8, device=rings.device)
-    gather_rows(rings, m.state_rows, previous)
-    ring = previous.view(KV_DTYPE).view(rows, -1, *values.shape[1:])
-    capacity = ring.shape[1]
-    first = m.starts + counts - capacity
-    positions = first[:, None] + (torch.arange(capacity, device=values.device) - first[:, None]).remainder(capacity)
-    indices = (m.query_start_loc[:-1, None] + positions - m.starts[:, None]).clamp(0, values.shape[0] - 1)
-    current = values[indices].clamp(-448, 448)
-    keep = ((positions < m.starts[:, None]) | (positions < 0))[:, :, None, None]
-    retained = torch.where(keep, ring.to(values.dtype), current).to(KV_DTYPE)
-    scatter_rows(retained.view(torch.uint8).view(rows, -1), m.state_rows, rings, counts > 0)
+@triton.jit
+def _retain_kv_kernel(
+    KeyRings, ValRings, KeyVals, ValVals,
+    StateRows, Starts, Counts, QueryStartLoc,
+    RING_LEN: tl.constexpr, RING_ROW_STRIDE: tl.constexpr, ROW_ELEMS: tl.constexpr, MAX_TOKENS: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """Fused K/V sliding-window ring commit: writes only the newly accepted tail tokens in place."""
+    b = tl.program_id(0).to(tl.int64)
+    j = tl.program_id(1).to(tl.int64)
+    count = tl.load(Counts + b).to(tl.int64)
+    offset = tl.maximum(count - RING_LEN, 0)
+    k_idx = offset + j
+    if k_idx >= count:
+        return
+    start = tl.load(Starts + b).to(tl.int64)
+    srow = tl.load(StateRows + b).to(tl.int64)
+    qstart = tl.load(QueryStartLoc + b).to(tl.int64)
+    pos = start + k_idx
+    slot = pos % RING_LEN
+    tok_idx = tl.minimum(tl.maximum(qstart + k_idx, 0), MAX_TOKENS - 1)
+
+    cols = tl.arange(0, BLOCK_E)
+    mask = cols < ROW_ELEMS
+    k_bf = tl.load(KeyVals + tok_idx * ROW_ELEMS + cols, mask=mask, other=0.0).to(tl.float32)
+    v_bf = tl.load(ValVals + tok_idx * ROW_ELEMS + cols, mask=mask, other=0.0).to(tl.float32)
+    k_fp8 = tl.minimum(tl.maximum(k_bf, -448.0), 448.0).to(tl.float8e4nv)
+    v_fp8 = tl.minimum(tl.maximum(v_bf, -448.0), 448.0).to(tl.float8e4nv)
+    ring_offset = srow * RING_ROW_STRIDE + slot * ROW_ELEMS
+    tl.store(KeyRings + ring_offset + cols, k_fp8, mask=mask)
+    tl.store(ValRings + ring_offset + cols, v_fp8, mask=mask)
 
 
 def _page_slots(m):
     page = m.token_page_table.gather(1, (m.positions.clamp(min=0) // PAGE_TOKENS)[:, None]).squeeze(1)
     return torch.where((m.positions >= 0) & (page >= 0), page.long() * PAGE_TOKENS + m.positions % PAGE_TOKENS, -1)
-
-
-def _request_ring(rings, values, m):
-    """The prefill request's ring `[ring, kv_heads, dim]` (FP8), read from its continuation row of `rings`."""
-    ring = torch.empty((1, rings.shape[1]), dtype=torch.uint8, device=rings.device)
-    gather_rows(rings, m.state_rows[:1], ring)
-    return ring.view(KV_DTYPE).view(-1, *values.shape[1:])
-
-
-def _stage(ring, values, m, *, window, pages):
-    """One prefill request's preceding `window - 1` ring entries followed by its chunk, as FP8 pages.
-
-    `ring` is `_request_ring` of the request: position `p` occupies slot `p % ring`.
-    Staged index `i` is position `max(start - window + 1, 0) + i`; returns the staged
-    pages and the staged key count.
-    """
-    start, length = m.starts[0], m.lengths[0].long()
-    first = (start - window + 1).clamp_min(0)
-    positions = first + torch.arange(pages * PAGE_TOKENS, device=values.device)
-    previous = ring[positions.remainder(ring.shape[0])].to(values.dtype)
-    current = values[(positions - start).clamp(0, values.shape[0] - 1)]
-    staged = torch.where((positions < start)[:, None, None], previous, current)
-    staged = torch.where((positions < start + length)[:, None, None], staged, 0)
-    staged = staged.clamp(-448, 448).to(KV_DTYPE).view(pages, PAGE_TOKENS, *values.shape[1:])
-    return staged, (start - first + length).int()
-
-
-def _retain(rings, ring, values, m):
-    """Store the request's ring with the chunk's positions among its last `ring` positions.
-
-    Slot `s` holds the position `p` in `[end - ring, end)` with `p % ring == s`; slots
-    of positions before the chunk or before the sequence keep their bytes, and a
-    request without query rows stores nothing.
-    """
-    count = ring.shape[0]
-    start, length = m.starts[0], m.lengths[0].long()
-    first = start + length - count
-    positions = first + (torch.arange(count, device=values.device) - first).remainder(count)
-    current = values[(positions - start).clamp(0, values.shape[0] - 1)].clamp(-448, 448)
-    keep = ((positions < start) | (positions < 0))[:, None, None]
-    # E4M3 values round-trip exactly through BF16.
-    retained = torch.where(keep, ring.to(values.dtype), current).to(KV_DTYPE)
-    scatter_rows(retained.view(torch.uint8).view(1, -1), m.state_rows[:1], rings, m.lengths[:1] > 0)

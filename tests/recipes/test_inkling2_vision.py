@@ -23,10 +23,11 @@ CUDA = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                          reason="requires explicit GPU assignment and FLARE_RUN_CUDA_TESTS=1")
 
 
-def test_vision_geometry():
-    full = VisionScratch.allocate(256, "cpu")
+@pytest.mark.parametrize("hidden", [2304, 4608])
+def test_vision_geometry(hidden):
+    full = VisionScratch.allocate(256, "cpu", hidden=hidden)
     rows = full.rows(64)
-    expected = VisionScratch.allocate(64, "cpu")
+    expected = VisionScratch.allocate(64, "cpu", hidden=hidden)
     for field in fields(rows):
         actual = getattr(rows, field.name)
         assert actual.shape == getattr(expected, field.name).shape
@@ -34,7 +35,7 @@ def test_vision_geometry():
     metadata = VisionMetadata.allocate(64, 1, "cpu")
     assert rows.patches.shape == (64, 1200)
     assert rows.query.shape == (65, 16, 64)
-    assert rows.output.shape == (16, 4608)
+    assert rows.output.shape == (16, hidden)
     assert metadata.position_ids.shape == (65, 2)
     assert metadata.interpolation_indices.shape == (64, 4)
     with pytest.raises(ValueError):
@@ -58,8 +59,14 @@ def test_packed_vision_capacity_layout(capacity):
     assert metadata.position_ids.shape == (capacity + 1, 2)
 
 
-@pytest.fixture(scope="module")
-def manifest():
+@pytest.fixture(scope="module", params=["small", "mini"])
+def manifest(request):
+    if request.param == "mini":
+        path = os.environ.get("FLARE_INKLING2_MINI_SNAPSHOT")
+        if path is None:
+            pytest.skip("requires FLARE_INKLING2_MINI_SNAPSHOT")
+        from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+        return inspect_indexed_checkpoint(Path(path))
     snapshot = Path(os.environ.get("FLARE_INKLING2_SNAPSHOT", "/data/models/Inkling-2-Small-NVFP4"))
     if not snapshot.is_dir():
         pytest.skip("Inkling2 checkpoint is unavailable")
@@ -77,7 +84,8 @@ def _module(manifest):
     from transformers.models.inkling2.configuration_inkling2 import Inkling2VisionConfig
     from transformers.models.inkling2.modeling_inkling2 import Inkling2VisionModel
 
-    config = Inkling2VisionConfig.from_dict(json.loads((manifest.snapshot / "config.json").read_text())["vision_config"])
+    raw = json.loads((manifest.snapshot / "config.json").read_text())
+    config = Inkling2VisionConfig.from_dict(raw["vision_config"], text_hidden_size=raw["text_config"]["hidden_size"])
     config._attn_implementation = "eager"
     with torch.device("meta"):
         module = Inkling2VisionModel(config)
@@ -91,6 +99,17 @@ def _reference(manifest, weights, device):
     weights.bind(module)
     module.rotary_emb = Inkling2VisionRotaryEmbedding(module.config).to(device)
     return module
+
+
+def _weights(manifest, module, device):
+    if "model.llm.embed.weight" in manifest.tensors:
+        from ignition.components.parallel import TensorParallelShard
+        from ignition.recipes.inkling2.mini_weights import MiniWeightLoader
+        context = MiniWeightLoader(manifest, device, shard=TensorParallelShard(0, 1))
+    else:
+        context = DirectWeightLoader(manifest, device, prefixes=("model.vision_tower.",))
+    with context as loader:
+        return VisionWeights.load(module, loader)
 
 
 def _input(width, height, variant):
@@ -127,6 +146,53 @@ def _relative(actual, expected):
     return float((actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12))
 
 
+@CUDA
+@torch.no_grad()
+def test_mini_vllm_image_features(manifest):
+    if "model.llm.embed.weight" not in manifest.tensors:
+        pytest.skip("requires the Mini checkpoint")
+    path = os.environ.get("FLARE_INKLING2_MINI_VISION_REFERENCE")
+    if path is None:
+        pytest.skip("requires independent vLLM vision fixtures")
+    from b12x.preparation import PreparationSession
+    from PIL import Image
+    from safetensors.torch import load_file
+    from transformers.models.inkling2.image_processing_inkling2 import Inkling2ImageProcessor
+
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    tensors = load_file(path)
+    module = _module(manifest)
+    weights = _weights(manifest, module, device)
+    reference = _reference(manifest, weights, device)
+    scratch = VisionScratch.allocate(1024, device, hidden=2304)
+    metadata = VisionMetadata.allocate(1024, 1, device)
+    pixels = torch.zeros((1024, 1200), dtype=torch.float32, device=device)
+    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+        prepared = PreparedVision(module, scratch, metadata, weights, session=session)
+        prepared.functional(session=session)
+        session.freeze()
+        for key in sorted(name.removesuffix(".image") for name in tensors if name.endswith(".image")):
+            picture = Image.fromarray(tensors[f"{key}.image"].numpy())
+            inputs = Inkling2ImageProcessor()(images=[picture], return_tensors="pt")
+            count = _upload(inputs, pixels, metadata)
+            live = torch.arange(1024, device=device) < count
+            actual = prepared(torch.where(live[:, None], pixels, 0).bfloat16(), metadata)[:count // 4]
+            expected = tensors[f"{key}.features"].to(device)
+            canonical = reference(inputs.pixel_values.to(device), inputs.image_grid_thw).pooler_output
+            reference.config._attn_implementation = "sdpa"
+            alternate = reference(inputs.pixel_values.to(device), inputs.image_grid_thw).pooler_output
+            reference.config._attn_implementation = "eager"
+            canonical_spread = _relative(alternate, canonical)
+            reference_spread = _relative(expected, canonical)
+            error = _relative(actual, expected)
+            print(dict(image=key, relative_l2=error, canonical_backend_relative_l2=canonical_spread,
+                       reference_backend_relative_l2=reference_spread))
+            assert torch.isfinite(actual).all()
+            assert _relative(actual, canonical) < canonical_spread + .03
+            assert error < reference_spread + .03
+
+
 def _check_packed_checkpoint_weights(manifest, weights):
     from safetensors import safe_open
 
@@ -134,6 +200,8 @@ def _check_packed_checkpoint_weights(manifest, weights):
         packed = weights.parameters[f"layers.0.self_attn.qkv.{attribute}"]
         for role, actual in zip(("q", "k", "v"), packed.chunk(3, dim=0), strict=True):
             name = f"model.vision_tower.layers.0.self_attn.{role}_proj.{attribute}"
+            if "model.llm.embed.weight" in manifest.tensors:
+                name = name.replace("model.vision_tower.", "model.visual.backbone.")
             with safe_open(str(manifest.snapshot / manifest.tensors[name].shard), framework="pt", device="cpu") as reader:
                 expected = reader.get_tensor(name)
             torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
@@ -175,9 +243,8 @@ def test_checkpoint_vision_native_replay(manifest, capacity, compiler):
     torch.cuda.set_device(device)
     torch.backends.cuda.matmul.allow_tf32 = False
     module = _module(manifest)
-    with DirectWeightLoader(manifest, device, prefixes=("model.vision_tower.",)) as loader:
-        weights = VisionWeights.load(module, loader)
-    assert sum(t.nbytes for t in weights.parameters.values()) == 655386624
+    weights = _weights(manifest, module, device)
+    assert sum(t.nbytes for t in weights.parameters.values()) == 617637888 + 8192 * module.config.text_hidden_size
     _check_packed_checkpoint_weights(manifest, weights)
     assert not any("_proj." in path and path.rsplit(".", 2)[-2] in ("q_proj", "k_proj", "v_proj")
                    for path in weights.parameters)
@@ -187,7 +254,7 @@ def test_checkpoint_vision_native_replay(manifest, capacity, compiler):
         for role in ("q", "k", "v"):
             original = getattr(reference.layers[index].self_attn, f"{role}_proj").weight
             assert original.untyped_storage()._cdata == packed.untyped_storage()._cdata
-    scratch = VisionScratch.allocate(capacity, device)
+    scratch = VisionScratch.allocate(capacity, device, hidden=module.config.text_hidden_size)
     metadata = VisionMetadata.allocate(capacity, 1, device)
     pixels = torch.zeros((capacity, 1200), dtype=torch.float32, device=device)
     with PreparationSession(device=device, autotune=True, compile_workers=0) as session:
@@ -269,9 +336,8 @@ def test_generation_publishes_features_and_rejects_invalid_uploads(manifest, com
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     module = _module(manifest)
-    with DirectWeightLoader(manifest, device, prefixes=("model.vision_tower.",)) as loader:
-        weights = VisionWeights.load(module, loader)
-    scratch = VisionScratch.allocate(64, device)
+    weights = _weights(manifest, module, device)
+    scratch = VisionScratch.allocate(64, device, hidden=module.config.text_hidden_size)
     metadata = VisionMetadata.allocate(64, 1, device)
     inputs = VisionInputs.allocate(device)
     requests = DeviceRequestState.allocate(device, vocab_size=201024, capacity=2)
@@ -279,7 +345,8 @@ def test_generation_publishes_features_and_rejects_invalid_uploads(manifest, com
                            row_slot_ids=torch.ones(1, dtype=torch.int32, device=device),
                            row_generations=torch.full((1,), 7, dtype=torch.int64, device=device))
     prefill = PrefillVisionInputs.allocate(3, device)
-    state = VisionState(batch, prefill, requests, image_token=200051, features=64, hidden=4608, image_slots=1)
+    state = VisionState(batch, prefill, requests, image_token=200051, features=64,
+                        hidden=module.config.text_hidden_size, image_slots=1)
     completion = CompletionOutputs.allocate((2, 2, 32), device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
@@ -345,7 +412,7 @@ def test_generation_publishes_features_and_rejects_invalid_uploads(manifest, com
             batch.token_ids.copy_(torch.tensor([7, 200051, 200051], device=device))
             prefill.vision_token_indices.copy_(torch.tensor([-1, 0, offset - 1], device=device))
             assert state.validate_prefill(batch.token_ids, torch.tensor([3], device=device))
-            embedding = torch.ones((3, 4608), dtype=torch.bfloat16, device=device)
+            embedding = torch.ones((3, module.config.text_hidden_size), dtype=torch.bfloat16, device=device)
             state.inject(batch, embedding)
             assert (embedding[0] == 1).all()
             torch.testing.assert_close(embedding[1], state.arena[0, 0], rtol=0, atol=0)
