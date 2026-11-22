@@ -75,6 +75,13 @@ enum State {
     Closed,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum AnswerState {
+    Empty,
+    HeaderWithoutContent,
+    Emitted,
+}
+
 /// The parser start after a prompt, from the last framing control token in it.
 pub(crate) fn prompt_start(prompt: &[u32], control_tokens: &[(u32, String)]) -> OutputStart {
     let marker = prompt.iter().rev().find_map(|id| {
@@ -94,6 +101,7 @@ pub(crate) fn prompt_start(prompt: &[u32], control_tokens: &[(u32, String)]) -> 
 
 pub struct TmlOutput {
     state: State,
+    answer: AnswerState,
     /// Escaped generated text with framing markers inserted only for control tokens.
     buffer: String,
     name: Option<String>,
@@ -128,6 +136,7 @@ fn first(buffer: &str, markers: &[&'static str]) -> Option<(usize, &'static str)
 impl TmlOutput {
     pub fn new(config: OutputConfig, control_tokens: Vec<(u32, String)>) -> Self {
         Self {
+            answer: AnswerState::Empty,
             state: match config.start {
                 OutputStart::RecipientHeader => State::Header { model: true },
                 OutputStart::RecipientFrame => State::Frame,
@@ -207,6 +216,7 @@ impl TmlOutput {
         if kind == Body::Thinking {
             events.push(Event::Reasoning(text));
         } else {
+            self.answer = AnswerState::Emitted;
             self.spans.push(Some(start..start + text.len()));
             events.push(Event::Content(text));
         }
@@ -269,6 +279,13 @@ impl TmlOutput {
                     };
                     let name = unescape(&self.buffer[..at]);
                     self.buffer.drain(..at + marker.len());
+                    if model
+                        && at > 0
+                        && matches!(marker, END | TURN_END)
+                        && self.answer == AnswerState::Empty
+                    {
+                        self.answer = AnswerState::HeaderWithoutContent;
+                    }
                     self.state = match marker {
                         MODEL => State::Header { model: true },
                         USER | SYSTEM | TOOL => State::Header { model: false },
@@ -315,11 +332,12 @@ impl TmlOutput {
 
     /// A registered invocation, or its payload as visible text when TMLv0 rejects it.
     fn call_or_text(&mut self, body: &str, start: usize) -> Vec<Event> {
-        if let Some(events) = self.call(body) {
-            return events;
-        }
         if body.is_empty() {
             return vec![];
+        }
+        self.answer = AnswerState::Emitted;
+        if let Some(events) = self.call(body) {
+            return events;
         }
         self.spans.push(Some(start..start + body.len()));
         vec![Event::Content(body.to_owned())]
@@ -378,6 +396,9 @@ impl TmlOutput {
         // An unterminated header carries no content.
         self.buffer.clear();
         self.state = State::Closed;
+        if cause == Termination::Eos && self.answer == AnswerState::HeaderWithoutContent {
+            return Err("TML model header closed without a content kind and the turn produced no answer or tool call".into());
+        }
         Ok(events)
     }
 }
@@ -563,6 +584,73 @@ mod tests {
             assert_eq!(run(frame, &open, cause), Parsed::default());
         }
         assert_eq!(run(frame, &[MODEL, "lookup"], Termination::Eos), Parsed::default());
+    }
+
+    #[test]
+    fn nonempty_model_header_closed_without_a_content_kind_fails_at_eos() {
+        for fragmented in [false, true] {
+            for deliver_turn_end in [false, true] {
+                let mut p = parser(OutputStart::RecipientFrame);
+                let mut events = vec![];
+                for piece in [MODEL, THINK, "Inspect the branch.", END, MODEL,
+                              r#"bash"description":"Inspect branch"}}"#, END] {
+                    if CONTROL_MARKERS.contains(&piece) {
+                        events.extend(feed(&mut p, piece, fragmented).unwrap());
+                    } else {
+                        events.extend(p.push(Input::Text(piece)).unwrap());
+                    }
+                }
+                if deliver_turn_end {
+                    events.extend(feed(&mut p, TURN_END, fragmented).unwrap());
+                }
+                assert_eq!(events, vec![Event::Reasoning("Inspect the branch.".into())]);
+                let error = p.finish(Termination::Eos).unwrap_err();
+                assert!(error.to_string().contains("without a content kind"), "{error}");
+            }
+            let mut p = parser(OutputStart::RecipientFrame);
+            let mut events = vec![];
+            for piece in [MODEL, THINK, "Inspect the branch.", END, MODEL,
+                          r#"bash"description":"Inspect branch"}}"#, TURN_END] {
+                if CONTROL_MARKERS.contains(&piece) {
+                    events.extend(feed(&mut p, piece, fragmented).unwrap());
+                } else {
+                    events.extend(p.push(Input::Text(piece)).unwrap());
+                }
+            }
+            assert_eq!(events, vec![Event::Reasoning("Inspect the branch.".into())]);
+            let error = p.finish(Termination::Eos).unwrap_err();
+            assert!(error.to_string().contains("without a content kind"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_closed_untyped_header_allows_visible_content_and_completed_calls() {
+        let frame = OutputStart::RecipientFrame;
+        let header = [MODEL, "untyped", END];
+        let answer = [MODEL, TEXT, "done", END];
+        let call = [MODEL, "lookup", JSON_CALL, r#"{"name":"lookup","args":{}}"#, END];
+        let invalid_call = [MODEL, JSON_CALL, "invalid JSON", END];
+        for valid in [&answer[..], &call[..], &invalid_call[..]] {
+            let expected = run(frame, valid, Termination::Eos);
+            for order in [[&header[..], valid], [valid, &header[..]]] {
+                assert_eq!(run(frame, &order.concat(), Termination::Eos), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_model_headers_other_roles_and_external_stops_keep_their_termination() {
+        let frame = OutputStart::RecipientFrame;
+        for pieces in [vec![MODEL, END], vec![USER, "name", END], vec![TOOL, "lookup", END],
+                       vec![SYSTEM, "name", END]] {
+            assert_eq!(run(frame, &pieces, Termination::Eos), Parsed::default());
+        }
+        for cause in [Termination::OutputLimit, Termination::UserStop, Termination::Cancelled,
+                      Termination::ExecutionError] {
+            assert_eq!(run(frame, &[MODEL, "untyped", END], cause), Parsed::default());
+        }
+        assert_eq!(run(frame, &[MODEL, THINK, "t", END, TURN_END], Termination::Eos),
+                   ("t".into(), String::new(), vec![]));
     }
 
     #[test]
