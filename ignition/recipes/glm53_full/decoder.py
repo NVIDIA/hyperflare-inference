@@ -91,7 +91,8 @@ class PreparedMoE:
             operator.functional(session=session)
         return self
 
-    def __call__(self, source, projections=None):
+    def contributions(self, source, projections=None):
+        """Return rank-local routed and shared updates before their BF16 sum."""
         logits = self.router_projection(source) if projections is None else projections[0]
         routes = self.routing(logits)
         if self.unquantized:
@@ -101,7 +102,10 @@ class PreparedMoE:
         else:
             routed = self.experts(source, routes.ids, routes.weights)
         shared = self.shared(source) if projections is None else self.shared.from_gate_up(projections[1])
-        return torch.add(routed, shared)
+        return routed, shared
+
+    def __call__(self, source, projections=None):
+        return torch.add(*self.contributions(source, projections))
 
 
 class PreparedLayer:
@@ -109,9 +113,10 @@ class PreparedLayer:
 
     def __init__(self, config, index, weights: LayerWeights, pool: ContinuationPool, metadata: AttentionMetadata,
                  angles: PreparedRotaryAngles, *, rows, heads, mode, runtime, coordinator, session, name, workspace,
-                 buffers: ExampleBuffers, cache_only=False, weight_first=False):
+                 buffers: ExampleBuffers, cache_only=False, weight_first=False, following_norm=None):
         self.attention_norm = self.moe_projection = None
-        self.use_weight_first = False
+        self.use_weight_first = self.use_feed_forward_norm = False
+        self.feed_forward_norm = None
         self.index, self.selects, self.eps, self.norms = index, config.selects(index), config.norm_eps, weights.norms
         self.following_prefetch = self.output_prefetch = None
         cache, index_cache = pool.latent(index), pool.index(index)
@@ -156,6 +161,22 @@ class PreparedLayer:
         self.mlp_reduce = PreparedAllReduce(buffers("layer.part", rows, HIDDEN), buffers("layer.sum", rows, HIDDEN),
             runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.mlp_reduce")
 
+        if following_norm is not None and PreparedAllReduceRMSNorm.fits(runtime, source):
+            self.feed_forward_norm = PreparedAllReduceRMSNorm(
+                buffers("layer.part", rows, HIDDEN), source, following_norm, buffers("layer.norm", rows, HIDDEN),
+                input_addend=buffers("mlp.output", rows, HIDDEN) if isinstance(self.mlp, PreparedMoE) else None,
+                runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.mlp_reduce_norm",
+                eps=self.eps, reduction_dtype=torch.bfloat16, round_before_weight=True, reduction_order="shard_owner",
+                trigger_dependents=not config.selects(index + 1))
+            register_finalizer(session, self._select_feed_forward_norm)
+
+    def _select_feed_forward_norm(self):
+        from b12x.preparation.types import require_prepared
+
+        query = require_prepared(self.mlp_reduce.plan, "comm.pcie").query
+        self.use_feed_forward_norm = (query.surface == "PCIeTwoShotBF16.all_reduce"
+                                      and query.call.get("payload_schedule") != "pairwise")
+
     def _select_weight_first(self):
         from b12x.preparation.types import require_prepared
 
@@ -166,7 +187,7 @@ class PreparedLayer:
                                  and query.call.get("payload_schedule") != "pairwise")
 
     def functional(self, *, session):
-        for operator in (self.attention, self.indexer, self.attention_reduce, self.attention_norm, self.mlp, self.mlp_reduce):
+        for operator in (self.attention, self.indexer, self.attention_reduce, self.attention_norm, self.mlp, self.mlp_reduce, self.feed_forward_norm):
             if operator is not None:
                 operator.functional(session=session)
         return self
@@ -182,9 +203,11 @@ class PreparedLayer:
         if self.indexer is not None:
             self.indexer.store(key, metadata, angles)
 
-    def attention_part(self, hidden, metadata, angles, selection, *, reuse_selection=False):
+    def attention_part(self, hidden, metadata, angles, selection, *, reuse_selection=False, normalized=None):
         """This rank's part of the attention update, and the selection the layer attended to."""
-        projected = self.attention.project(self._normalized(hidden, "input_layernorm"), metadata, angles)
+        if normalized is None:
+            normalized = self._normalized(hidden, "input_layernorm")
+        projected = self.attention.project(normalized, metadata, angles)
         if self.indexer is not None and not reuse_selection:
             selection = self.indexer(projected.query_residual, projected.index_key, projected.index_weights,
                                      metadata, angles)
@@ -196,20 +219,37 @@ class PreparedLayer:
         """This rank's part of the MLP update."""
         return self.mlp(self._normalized(hidden, "post_attention_layernorm"))
 
-    def __call__(self, hidden, metadata, angles, selection: Selection | None, *, reuse_selection=False, prefetch_sums=None):
+    def forward_layer(self, hidden, metadata, angles, selection, *, normalized=None, reuse_selection=False,
+                      prefetch_sums=None, prepare_next=False):
         if prefetch_sums is not None and self.output_prefetch is not None:
             self.output_prefetch(hidden, prefetch_sums)
-        part, selection = self.attention_part(hidden, metadata, angles, selection, reuse_selection=reuse_selection)
+        part, selection = self.attention_part(hidden, metadata, angles, selection, normalized=normalized,
+                                              reuse_selection=reuse_selection)
+        projections = None
         if self.use_weight_first:
             hidden = hidden.clone()
-            normalized = self.attention_norm(part, hidden)
-            local = self.mlp(normalized, self.moe_projection(normalized))
+            source = self.attention_norm(part, hidden)
+            projections = self.moe_projection(source)
         else:
             hidden = torch.add(hidden, self.attention_reduce(part))
-            local = self.mlp_part(hidden)
+            source = self._normalized(hidden, "post_attention_layernorm")
+        fuse = prepare_next and self.use_feed_forward_norm
+        addend = None
+        if fuse and isinstance(self.mlp, PreparedMoE):
+            local, addend = self.mlp.contributions(source, projections)
+        else:
+            local = self.mlp(source) if projections is None else self.mlp(source, projections)
         if prefetch_sums is not None and self.following_prefetch is not None:
             self.following_prefetch(local, prefetch_sums)
-        return torch.add(hidden, self.mlp_reduce(local)), selection
+        if fuse:
+            next_input = self.feed_forward_norm(local, hidden, input_addend=addend)
+            return hidden, selection, next_input
+        return torch.add(hidden, self.mlp_reduce(local)), selection, None
+
+    def __call__(self, hidden, metadata, angles, selection: Selection | None, *, reuse_selection=False, prefetch_sums=None):
+        hidden, selection, _ = self.forward_layer(hidden, metadata, angles, selection, reuse_selection=reuse_selection,
+                                                  prefetch_sums=prefetch_sums)
+        return hidden, selection
 
 
 class PreparedDecoder:
@@ -244,7 +284,9 @@ class PreparedDecoder:
         self.layers = tuple(PreparedLayer(config, index, layer, pool, example, self.angles, rows=tokens,
             heads=config.raw["num_attention_heads"] // shard.world_size, mode=mode, runtime=runtime,
             coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
-            buffers=buffers, weight_first=weight_first)
+            buffers=buffers, weight_first=weight_first,
+            following_norm=(weights.layers[index+1].norms["input_layernorm"]
+                            if weight_first and tokens == 4 and index+1 < len(weights.layers) else None))
             for index, layer in enumerate(weights.layers))
         self.stream_handle = None
         if overlap and small_tp8_decode:
@@ -296,8 +338,10 @@ class PreparedDecoder:
         angles = self.angles(metadata.positions)
         selection = None
         sums = None if self.stream_handle is None else torch.empty(64, dtype=torch.int64, device=hidden.device)
+        normalized_input = None
         for layer in self.layers:
-            hidden, selection = layer(hidden, placement, angles, selection, prefetch_sums=sums)
+            hidden, selection, normalized_input = layer.forward_layer(
+                hidden, placement, angles, selection, normalized=normalized_input, prefetch_sums=sums, prepare_next=True)
             if observe is not None:
                 observe(layer.index, hidden, selection)
         if sums is not None:

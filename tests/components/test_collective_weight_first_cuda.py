@@ -39,9 +39,10 @@ def _rank(rank, world, rendezvous):
                         coordinator=coordinator, compile_workers=8, autotune_effort="off") as session:
                     weight = torch.linspace(.37, 1.31, 6144, dtype=torch.bfloat16, device=device)
                     calls = []
-                    for rows in (1, 2, 3, 6, 8, 13, 16):
+                    for rows in (1, 2, 3, 4, 6, 8, 13, 16):
                         src = torch.zeros((rows, 6144), device=device, dtype=torch.bfloat16)
                         residual, normalized, summed = (torch.zeros_like(src) for _ in range(3))
+                        addend = torch.zeros_like(src) if rows == 4 else None
                         transport = runtime._bf16_twoshot
                         query = twoshot.query_from_runtime(transport, surface="PCIeTwoShotBF16.all_reduce",
                                                           call={"inp": src, "out": summed})
@@ -53,22 +54,22 @@ def _rank(rank, world, rendezvous):
                         fused = PreparedAllReduceRMSNorm(src, residual, weight, normalized, eps=1e-5,
                             runtime=runtime, session=session, coordinator=coordinator, name=f"fused.{rows}",
                             reduction_dtype=torch.bfloat16, round_before_weight=True,
-                            reduction_order="shard_owner", trigger_dependents=True)
-                        calls.append((src, summed, residual, normalized, plain, fused))
+                            reduction_order="shard_owner", trigger_dependents=True, input_addend=addend)
+                        calls.append((src, summed, residual, normalized, plain, fused, addend))
                     session.tune(show_progress=False)
                     if rank == 0:
                         print("Prepared the two-shot control and fused reductions", flush=True)
                     stream = torch.cuda.Stream(device=device)
-                    for src, summed, residual, normalized, plain, fused in calls:
+                    for src, summed, residual, normalized, plain, fused, addend in calls:
                         state = require_prepared(fused.plan, "comm.pcie", device)
                         assert state.query.call["trigger_dependents"] and state.query.call["mode"] == "stage_pull"
-                        transport.all_reduce(src, summed, plan=plain)
+                        transport.all_reduce(src if addend is None else torch.add(src, addend), summed, plan=plain)
                         fused(src, residual)
                         torch.cuda.synchronize()
                         graph = torch.cuda.CUDAGraph()
                         stream.wait_stream(torch.cuda.current_stream())
                         with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(graph, stream=stream):
-                            transport.all_reduce(src, summed, plan=plain)
+                            transport.all_reduce(src if addend is None else torch.add(src, addend), summed, plan=plain)
                             fused(src, residual)
                         graphs.append(graph)
                         if rank == 0:
@@ -76,7 +77,7 @@ def _rank(rank, world, rendezvous):
                     session.freeze()
                     failures = []
                     for iteration in range(3):
-                        for graph, (src, summed, residual, normalized, plain, _) in zip(graphs, calls, strict=True):
+                        for graph, (src, summed, residual, normalized, plain, _, addend) in zip(graphs, calls, strict=True):
                             generator = torch.Generator().manual_seed(1740 + src.shape[0] + 3 * iteration)
                             inputs = torch.randn((world, *src.shape), generator=generator).bfloat16()
                             pattern = (2.**24, 1., -(2.**24), 1., 1., 1., 1., 1.)
@@ -84,6 +85,11 @@ def _rank(rank, world, rendezvous):
                                 inputs[peer, :, ::4] = pattern[(peer + iteration) % world]
                             initial = torch.randn(src.shape, generator=generator).bfloat16()
                             src.copy_(inputs[rank])
+                            if addend is not None:
+                                shares = torch.randn(inputs.shape, generator=generator).bfloat16()
+                                shares[:, :, ::4] = 0
+                                addend.copy_(shares[rank])
+                                inputs = inputs + shares
                             residual.copy_(initial)
                             normalized.fill_(float("nan"))
                             expected = torch.empty_like(initial).flatten()
@@ -99,6 +105,20 @@ def _rank(rank, world, rendezvous):
                             torch.cuda.synchronize()
                             try:
                                 torch.testing.assert_close(summed.cpu(), expected, rtol=0, atol=0)
+                                if addend is not None:
+                                    local_order = torch.zeros(src.shape)
+                                    duplicated = torch.empty_like(expected).flatten()
+                                    for peer in range(world):
+                                        local_order += inputs[(rank + peer) % world].float()
+                                    for owner in range(world):
+                                        begin, end = owner * shard_size, min((owner+1)*shard_size, src.numel())
+                                        value = torch.zeros(end-begin)
+                                        for step in range(world):
+                                            peer = (owner+step) % world
+                                            value += (inputs[peer] + shares[peer]).flatten()[begin:end].float()
+                                        duplicated[begin:end] = value
+                                    assert not torch.equal(summed.cpu(), local_order.bfloat16())
+                                    assert not torch.equal(summed.cpu(), duplicated.view_as(expected))
                                 expected_residual = initial + expected
                                 torch.testing.assert_close(residual.cpu(), expected_residual, rtol=0, atol=0)
                                 lower, upper = rms_norm_interval(expected_residual, weight.cpu(), 1e-5)
