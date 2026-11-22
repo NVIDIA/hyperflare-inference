@@ -208,6 +208,11 @@ pub struct PrefixCheckpointCache {
     completed: Fence,
     next_id: u64,
     clock: u64,
+    /// Ready and unready checkpoints and their tail pages, kept as `nodes` changes so
+    /// `stats` does not scan it. The runtime loop reads stats on every pass.
+    ready_checkpoints: usize,
+    unready_checkpoints: usize,
+    tail_pages: usize,
 }
 
 impl PrefixCheckpointCache {
@@ -233,7 +238,30 @@ impl PrefixCheckpointCache {
             completed: Fence(0),
             next_id: 1,
             clock: 0,
+            ready_checkpoints: 0,
+            unready_checkpoints: 0,
+            tail_pages: 0,
         })
+    }
+
+    /// Add a checkpoint entering `nodes` to the counts `stats` reports.
+    fn count(&mut self, node: &Checkpoint) {
+        if node.ready {
+            self.ready_checkpoints += 1;
+        } else {
+            self.unready_checkpoints += 1;
+        }
+        self.tail_pages += node.tail_pages.len();
+    }
+
+    /// Remove a checkpoint leaving `nodes` from the counts `stats` reports.
+    fn uncount(&mut self, node: &Checkpoint) {
+        if node.ready {
+            self.ready_checkpoints -= 1;
+        } else {
+            self.unready_checkpoints -= 1;
+        }
+        self.tail_pages -= node.tail_pages.len();
     }
 
     pub fn completed(&self) -> Fence {
@@ -434,6 +462,7 @@ impl PrefixCheckpointCache {
             node.last_use = node.last_use.max(proposal.ready_after);
         }
         self.prefixes.insert(prefix, id);
+        self.count(&node);
         self.nodes.insert(id, node);
         Ok(PublishResult::Created { id, ready })
     }
@@ -518,6 +547,7 @@ impl PrefixCheckpointCache {
 
     fn retire_leaf(&mut self, id: CheckpointId) -> RetiredResources {
         let node = self.nodes.remove(&id).unwrap();
+        self.uncount(&node);
         self.prefixes.remove(&node.prefix);
         if let Some(parent) = node.parent {
             self.nodes.get_mut(&parent).unwrap().child_count -= 1;
@@ -536,6 +566,9 @@ impl PrefixCheckpointCache {
 
     fn compact_ancestor(&mut self, id: CheckpointId) -> RetiredResources {
         let node = self.nodes.remove(&id).unwrap();
+        // The ancestor leaves the counts, while its pages stay cached in its heir.
+        self.uncount(&node);
+        self.tail_pages += node.tail_pages.len();
         let child = self
             .nodes
             .values_mut()
@@ -715,6 +748,8 @@ impl PrefixCheckpointCache {
                 update.published.push(node.id);
             }
         }
+        self.unready_checkpoints -= update.published.len();
+        self.ready_checkpoints += update.published.len();
         self.retirement.retain(|record| {
             if record.retire_after > completed {
                 return true;
@@ -731,10 +766,21 @@ impl PrefixCheckpointCache {
     }
 
     pub fn stats(&self) -> CacheStats {
+        // Tests check the kept counts against a full scan on every read.
+        #[cfg(test)]
+        assert_eq!(
+            (self.ready_checkpoints, self.unready_checkpoints, self.tail_pages),
+            (
+                self.nodes.values().filter(|node| node.ready).count(),
+                self.nodes.values().filter(|node| !node.ready).count(),
+                self.nodes.values().map(|node| node.tail_pages.len()).sum::<usize>(),
+            ),
+            "cache counts drifted from the checkpoints they count"
+        );
         CacheStats {
-            published_checkpoints: self.nodes.values().filter(|node| node.ready).count(),
-            pending_checkpoints: self.nodes.values().filter(|node| !node.ready).count(),
-            cached_pages: self.nodes.values().map(|node| node.tail_pages.len()).sum(),
+            published_checkpoints: self.ready_checkpoints,
+            pending_checkpoints: self.unready_checkpoints,
+            cached_pages: self.tail_pages,
             retired_pages: self
                 .retirement
                 .iter()
