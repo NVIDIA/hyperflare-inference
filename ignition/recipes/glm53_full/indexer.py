@@ -16,9 +16,10 @@ so the common reordering leaves them unchanged.
 """
 
 import torch
+from b12x.attention import dsa_indexer
 
-from ignition.components.fp8_indexer import PreparedFP8Indexer
-from ignition.components.glm_mla_cache import store_glm_index_key
+from ignition.components.glm_mla_cache import quantize_glm_index_query, store_glm_index_key
+from ignition.components.indexer import PreparedSparseIndexer
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.rotary import PreparedRotaryAngles
 from ignition.components.sparse_record_order import ordered_sparse_records
@@ -97,21 +98,22 @@ class PreparedIndexer:
             if count in self.selectors:
                 continue
             pages = buffers("indexer.pages", 1 if mode == "prefill" else count, width, dtype=torch.int32)
-            self.selectors[count] = PreparedFP8Indexer(
-                query[start:end].view(count, INDEX_HEADS, INDEX_WIDTH),
+            caps = dsa_indexer.Caps(device=device, num_q_heads=INDEX_HEADS, max_q_rows=count,
+                max_page_table_width=width, topk=TOPK, mode=mode,
+                supertile_k=min(131072, width * 64) if mode == "prefill" else 0)
+            self.selectors[count] = PreparedSparseIndexer(
+                buffers("indexer.q_fp8", count, INDEX_HEADS, INDEX_WIDTH, dtype=torch.float8_e4m3fn),
                 buffers("indexer.weights", count, INDEX_HEADS, dtype=torch.float32), cache,
                 pages.expand(count, -1) if mode == "prefill" else pages,
                 buffers("indexer.lengths", count, dtype=torch.int32), None,
-                buffers("indexer.selected", count, TOPK, dtype=torch.int32), mode=mode, session=session,
-                name=f"{name}.select{count}", workspace=workspace, topk=TOPK, prefill_records_per_call=131072,
-                head_weight_scale=1.0, hadamard=False, key_power_of_two=False)
+                buffers("indexer.selected", count, TOPK, dtype=torch.int32), caps=caps,
+                session=session, name=f"{name}.select{count}", workspace=workspace)
 
     def rebind_pages(self, cache):
         """Write and select through a replacement index page pool."""
         self.cache = cache
         for selector in self.selectors.values():
-            selector.cache = cache
-            selector.selection.rebind_cache(cache)
+            selector.rebind_cache(cache)
 
     def functional(self, *, session):
         if self.projection is not None:
@@ -123,20 +125,27 @@ class PreparedIndexer:
     def __call__(self, query_residual, index_key, index_weights, metadata, angles):
         """Store this forward's index keys and select each row's records."""
         rows, device = query_residual.shape[0], query_residual.device
-        query = self.projection(query_residual).view(rows, INDEX_HEADS, INDEX_WIDTH)
-        query = torch.cat((query[:, :, 64:], query[:, :, :64]), dim=-1)
-        self.angles.apply(query, angles)
+        query = self.projection(query_residual)
+        q_fp8 = torch.empty((rows, INDEX_HEADS, INDEX_WIDTH), dtype=torch.float8_e4m3fn, device=device)
+        scaled_weights = torch.empty((rows, INDEX_HEADS), dtype=torch.float32, device=device)
+        quantize_glm_index_query(query, angles, index_weights, q_fp8, scaled_weights)
         self.store(index_key, metadata, angles)
-        head_weights = index_weights * (INDEX_HEADS ** -0.5)
         positions = metadata.positions[:rows]
-        visible = (positions + 1).clamp(min=0).to(torch.int32)
+        visible = (metadata.visible[:rows] if metadata.visible is not None
+                   else (positions + 1).clamp(min=0).to(torch.int32))
         tables, row_pages = metadata.index_tables if metadata.index_tables is not None else index_tables(
             metadata.block_table, metadata.requests[:rows])
+        row_pages = row_pages[:rows]
+        if len(self.bounds) == 1:
+            pages = tables[:1].expand(rows, -1) if self.mode == "prefill" else (
+                row_pages if row_pages.is_contiguous() else row_pages.contiguous())
+            logical = self.selectors[rows](q_fp8, scaled_weights, pages, visible, None, cache=self.cache)
+            return selected_records(logical, positions, row_pages)
         logical = torch.empty((rows, TOPK), dtype=torch.int32, device=device)
         for start, end in self.bounds:
             count = end - start
             pages = tables[:1].expand(count, -1) if self.mode == "prefill" else row_pages[start:end].contiguous()
-            logical[start:end].copy_(self.selectors[count](query[start:end], head_weights[start:end], pages,
+            logical[start:end].copy_(self.selectors[count](q_fp8[start:end], scaled_weights[start:end], pages,
                                                            visible[start:end], None, cache=self.cache))
         return selected_records(logical, positions, row_pages)
 

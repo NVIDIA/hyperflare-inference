@@ -94,6 +94,10 @@ def verify_storage_and_probabilities(capture, snapshot, consumed):
                     "passed": torch.equal(data["stored_index_bytes"], index_bytes)
                     and torch.equal(data["stored_index_scales"], index_scales)
                 }
+                query_bytes, _ = quantize_index(data["index_query_rotation_output"], query=True)
+                report["index_query_bytes_exact"] = {
+                    "passed": torch.equal(data["stored_index_query_bytes"].view(torch.uint8), query_bytes)
+                }
             report["replicated_cache"] = {
                 "passed": torch.equal(data["cache"], native[0]["cases"]["repeat-0"][step]["cache"])
             }
@@ -133,7 +137,11 @@ def verify_storage_and_probabilities(capture, snapshot, consumed):
                     ),
                     -1,
                 ).flatten(-2)
-                measurement = "reference_index_key_rotation" if name == "index_key_rotation" else name
+                measurement = (
+                    f"reference_{name}"
+                    if name in ("index_key_rotation", "index_query_rotation")
+                    else name
+                )
                 report[measurement] = check(
                     actual[..., -64:],
                     rounded_bf16_interval(

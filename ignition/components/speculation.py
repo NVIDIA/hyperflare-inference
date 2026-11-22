@@ -42,6 +42,7 @@ DRAFT_RNG_DOMAIN = 0x4D54505F44524146
 # them over many programs instead of one serial program per row.
 VOCABULARY_SLICES = 128
 _SCORE_BLOCK = 4096
+_PROBABILITY_BLOCK = 4096
 
 
 @triton.jit
@@ -158,6 +159,62 @@ def _mask_invalid_scores(Scores, Valid, V: tl.constexpr, BLOCK: tl.constexpr):
     inside = token < V
     val = tl.where(token == 0, 0., -float("inf"))
     tl.store(Scores + pid0.to(tl.int64) * V + token, val, mask=inside)
+
+
+@triton.jit
+def _probability_block_masses(Probabilities, Limits, Masses,
+                              V: tl.constexpr, COLUMNS: tl.constexpr,
+                              BLOCKS: tl.constexpr, BLOCK: tl.constexpr,
+                              LIMITED: tl.constexpr, LIMIT_OFFSET: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    if LIMITED:
+        batch_row = row // COLUMNS
+        col = row % COLUMNS
+        limit = tl.load(Limits + batch_row)
+        if col >= limit - LIMIT_OFFSET:
+            tl.store(Masses + row * BLOCKS + block, 1.0 if block == 0 else 0.0)
+            return
+    token = block * BLOCK + tl.arange(0, BLOCK)
+    mask = token < V
+    val = tl.load(Probabilities + row * V + token, mask=mask, other=0.0)
+    entry_ok = (val == val) & (val >= 0.0) & (val < float("inf"))
+    all_ok = tl.min(tl.where(mask, entry_ok.to(tl.int32), 1), axis=0)
+    mass = tl.sum(tl.where(mask, val, 0.0), axis=0)
+    tl.store(Masses + row * BLOCKS + block, tl.where(all_ok != 0, mass, float("nan")))
+
+
+@triton.jit
+def _probability_row_valid(Masses, Valid, COLUMNS: tl.constexpr,
+                           BLOCKS: tl.constexpr, REDUCE: tl.constexpr):
+    batch_row = tl.program_id(0).to(tl.int64)
+    valid = tl.load(Valid + batch_row).to(tl.int1)
+    parts = tl.arange(0, REDUCE)
+    part_mask = parts < BLOCKS
+    for col in range(COLUMNS):
+        row = batch_row * COLUMNS + col
+        vals = tl.load(Masses + row * BLOCKS + parts, mask=part_mask, other=0.0)
+        ok_parts = tl.min(tl.where(part_mask, (vals == vals).to(tl.int32), 1), axis=0)
+        mass = tl.sum(tl.where(part_mask, vals, 0.0), axis=0)
+        col_ok = (ok_parts != 0) & (mass == mass) & (mass < float("inf")) & (tl.abs(mass - 1.0) <= 1e-4)
+        valid = valid & col_ok
+    tl.store(Valid + batch_row, valid)
+
+
+def _check_probability_rows(probabilities: torch.Tensor, valid: torch.Tensor,
+                            masses: torch.Tensor, token_limits: torch.Tensor | None,
+                            *, limit_offset: int) -> None:
+    batch, columns, vocab = probabilities.shape
+    if columns == 0:
+        return
+    blocks = masses.shape[1]
+    reduce = triton.next_power_of_2(blocks)
+    limits_arg = valid if token_limits is None else token_limits
+    torch.library.wrap_triton(_probability_block_masses)[(batch * columns, blocks)](
+        probabilities, limits_arg, masses, vocab, columns, blocks, _PROBABILITY_BLOCK,
+        token_limits is not None, limit_offset, enable_fp_fusion=False)
+    torch.library.wrap_triton(_probability_row_valid)[(batch,)](
+        masses, valid, columns, blocks, reduce, enable_fp_fusion=False)
 
 
 def _sliced(values: torch.Tensor) -> torch.Tensor:
@@ -449,8 +506,11 @@ class PreparedStochasticVerification:
 
     @staticmethod
     def scratch_layout(batch, width, vocab):
+        blocks = triton.cdiv(vocab, _PROBABILITY_BLOCK)
         return dict(safe_draft_probs=((batch, width - 1, vocab), torch.float32),
             safe_target_probs=((batch, width, vocab), torch.float32),
+            draft_masses=((batch * (width - 1), blocks), torch.float32),
+            target_masses=((batch * width, blocks), torch.float32),
             safe_ids=((batch, width - 1), torch.int32), seed_bits=((batch,), torch.int64),
             offset=((batch,), torch.int64), independent_accepted=((batch,), torch.int32),
             emitted_drafts=((batch,), torch.int32))
@@ -578,15 +638,24 @@ class PreparedStochasticVerification:
             valid = live & (draft_valid | ~draft_used).all(-1) & (target_valid | ~target_used).all(-1)
             valid &= (((drafts >= 0) & (drafts < self.state.vocab_size)) | ~draft_used).all(-1)
             valid &= (token_limits >= 1) & (token_limits <= target_probs.shape[1])
-            draft_probs = torch.where(draft_used[:, :, None], draft_probs, dummy)
-            target_probs = torch.where(target_used[:, :, None], target_probs, dummy)
             ids = torch.where(draft_used, drafts, 0)
-        for probabilities in (draft_probs, target_probs):
-            slices = _sliced(probabilities)
-            entries = (torch.isfinite(slices) & (slices >= 0)).all(-1).all(-1)
-            mass = slices.sum(-1).sum(-1)
-            valid &= (entries & torch.isfinite(mass) & ((mass - 1).abs() <= 1e-4)).all(-1)
-        out.valid.copy_(valid)
+        if target_probs.device.type == "cuda":
+            out.valid.copy_(valid)
+            _check_probability_rows(draft_source, out.valid, scratch["draft_masses"],
+                                    token_limits, limit_offset=1)
+            _check_probability_rows(target_source, out.valid, scratch["target_masses"],
+                                    token_limits, limit_offset=0)
+            valid = out.valid
+        else:
+            if token_limits is not None:
+                draft_probs = torch.where(draft_used[:, :, None], draft_probs, dummy)
+                target_probs = torch.where(target_used[:, :, None], target_probs, dummy)
+            for probabilities in (draft_probs, target_probs):
+                slices = _sliced(probabilities)
+                entries = (torch.isfinite(slices) & (slices >= 0)).all(-1).all(-1)
+                mass = slices.sum(-1).sum(-1)
+                valid &= (entries & torch.isfinite(mass) & ((mass - 1).abs() <= 1e-4)).all(-1)
+            out.valid.copy_(valid)
         if disjoint or functional:
             self.probability_masks[0].run_disjoint(draft_source, scratch["safe_draft_probs"],
                 out.valid, token_limits, dummy)

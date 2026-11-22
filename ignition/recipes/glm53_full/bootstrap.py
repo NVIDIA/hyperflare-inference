@@ -28,7 +28,7 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
-                                              create_all_reduce_runtime)
+                                              create_all_reduce_runtime, create_result_broadcast_runtime)
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
 from ignition.preparation.host_memory import release_unused
@@ -37,7 +37,6 @@ from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
-from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
 from .attention import PAGE_TOKENS, ExampleBuffers
@@ -166,6 +165,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             max_tokens=max(config.prefill_chunk_size, round_tokens), hidden_size=model.hidden, ipc=ipc)
         vocabulary_collective = create_all_gather_runtime(group, device, max_rows=round_tokens,
             columns=weights.head.shape[0] * shard.world_size, ipc=ipc)
+        result_collective = None
+        if config.mtp:
+            from ignition.components.draft_sampling import PreparedDraftDistribution
+            from ignition.components.speculation import SpeculativeAcceptance
+
+            result_layouts = (SpeculativeAcceptance.broadcast_layout(slots, max(config.speculative_widths)),)
+            if max(config.speculative_widths) > 1:
+                result_layouts += (PreparedDraftDistribution.broadcast_layout(slots),)
+            result_collective = create_result_broadcast_runtime(group, device, layouts=result_layouts, ipc=ipc)
         identity = tuning_identity(model, headers, shard.world_size)
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning,
@@ -222,7 +230,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         if config.mtp:
             speculation = SimpleNamespace(weights=weights, pool=pool, inputs=inputs, requests=requests,
                 scratch=SimpleNamespace(rows=lambda tokens, rows: None), draft_scratch=None, session=session,
-                workspace=arena, collectives=collectives, overlap=config.stream_overlap, completion=completion, frame=frame,
+                workspace=arena, collectives=collectives, result_runtime=result_collective,
+                overlap=config.stream_overlap, completion=completion, frame=frame,
                 sequence=sequence, rng=SpeculativeRngState.allocate(device, capacity=slots),
                 offset=torch.zeros(slots, dtype=torch.int64, device=device),
                 generation=torch.zeros(slots, dtype=torch.int64, device=device), page_tokens=PAGE_TOKENS)
@@ -324,4 +333,5 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=completion.zero_ranges(),
         resources=(weights, pool, requests, inputs, admission, commands, forwards, compiled, stream, graph_pool,
-                   session, coordinator, collective, vocabulary_collective, speculation))
+                   session, coordinator, collective, vocabulary_collective, result_collective, speculation),
+        close_resources=tuple(c for c in (result_collective, vocabulary_collective, collective) if c is not None))

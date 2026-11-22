@@ -44,8 +44,9 @@ def attention_metadata(metadata: Metadata) -> AttentionMetadata:
     position = positions.clamp(min=0)
     pages = metadata.page_table[metadata.requests, position // PAGE_TOKENS].long()
     slots = torch.where(live, pages * PAGE_TOKENS + position % PAGE_TOKENS, -1)
+    visible = (positions + 1).clamp(min=0).to(torch.int32)
     return AttentionMetadata(positions, slots, metadata.requests, metadata.page_table,
-                             index_tables(metadata.page_table, metadata.requests))
+                             index_tables(metadata.page_table, metadata.requests), visible)
 
 
 class PreparedMoE:
@@ -126,9 +127,10 @@ class PreparedLayer:
 
     def __init__(self, config, index, weights: LayerWeights, pool: ContinuationPool, metadata: AttentionMetadata,
                  angles: PreparedRotaryAngles, *, rows, heads, mode, runtime, coordinator, session, name, workspace,
-                 buffers: ExampleBuffers, cache_only=False, weight_first=False, following_norm=None):
+                 buffers: ExampleBuffers, cache_only=False, weight_first=False, fuse_reductions=False,
+                 following_norm=None, trigger_following=None):
         self.attention_norm = self.moe_projection = None
-        self.use_weight_first = self.use_feed_forward_norm = False
+        self.use_attention_norm = self.use_weight_first = self.use_feed_forward_norm = False
         self.feed_forward_norm = None
         self.index, self.selects, self.eps, self.norms = index, config.selects(index), config.norm_eps, weights.norms
         self.following_prefetch = self.output_prefetch = None
@@ -158,29 +160,34 @@ class PreparedLayer:
             self.mlp = PreparedMLP(source, weights.mlp, buffers("mlp.gate_up", rows, 2 * local),
                 buffers("mlp.intermediate", rows, local), buffers("mlp.output", rows, HIDDEN), session=session,
                 name=f"{name}.mlp", workspace=workspace)
-        if (weight_first and isinstance(weights.mlp, MoEWeights) and not isinstance(weights.mlp.experts, BF16Experts)
-                and PreparedWeightFirstProjection.fits(source, weights.mlp.router, weights.mlp.shared.gate_up)
-                and tuple(weights.mlp.router.shape) == (256, HIDDEN)
-                and tuple(weights.mlp.shared.gate_up.shape) == (512, HIDDEN)
-                and PreparedAllReduceRMSNorm.fits(runtime, source)):
+        weight_first_moe = (weight_first and isinstance(weights.mlp, MoEWeights)
+                            and not isinstance(weights.mlp.experts, BF16Experts)
+                            and PreparedWeightFirstProjection.fits(source, weights.mlp.router, weights.mlp.shared.gate_up)
+                            and tuple(weights.mlp.router.shape) == (256, HIDDEN)
+                            and tuple(weights.mlp.shared.gate_up.shape) == (512, HIDDEN))
+        fused_fits = PreparedAllReduceRMSNorm.fits(
+            runtime, source, round_before_weight=True, reduction_order="shard_owner")
+        if (fuse_reductions or weight_first_moe) and fused_fits:
             self.attention_norm = PreparedAllReduceRMSNorm(buffers("layer.part", rows, HIDDEN), source,
                 weights.norms["post_attention_layernorm"], buffers("layer.norm", rows, HIDDEN),
                 runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.attention_reduce_norm",
                 eps=self.eps, reduction_dtype=torch.bfloat16, round_before_weight=True, reduction_order="shard_owner",
-                trigger_dependents=True)
-            self.moe_projection = PreparedWeightFirstProjection(source, weights.mlp.router, weights.mlp.shared.gate_up,
-                                                                 session=session, name=f"{name}.moe.input_projections")
+                trigger_dependents=weight_first_moe)
+            if weight_first_moe:
+                self.moe_projection = PreparedWeightFirstProjection(source, weights.mlp.router, weights.mlp.shared.gate_up,
+                                                                     session=session, name=f"{name}.moe.input_projections")
             register_finalizer(session, self._select_weight_first)
         self.mlp_reduce = PreparedAllReduce(buffers("layer.part", rows, HIDDEN), buffers("layer.sum", rows, HIDDEN),
             runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.mlp_reduce")
 
-        if following_norm is not None and PreparedAllReduceRMSNorm.fits(runtime, source):
+        if following_norm is not None and fused_fits:
+            trigger = (not config.selects(index + 1)) if trigger_following is None else bool(trigger_following)
             self.feed_forward_norm = PreparedAllReduceRMSNorm(
                 buffers("layer.part", rows, HIDDEN), source, following_norm, buffers("layer.norm", rows, HIDDEN),
                 input_addend=buffers("mlp.output", rows, HIDDEN) if isinstance(self.mlp, PreparedMoE) else None,
                 runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.mlp_reduce_norm",
                 eps=self.eps, reduction_dtype=torch.bfloat16, round_before_weight=True, reduction_order="shard_owner",
-                trigger_dependents=not config.selects(index + 1))
+                trigger_dependents=trigger)
             register_finalizer(session, self._select_feed_forward_norm)
 
     def _select_feed_forward_norm(self):
@@ -196,8 +203,10 @@ class PreparedLayer:
         # Different transports can accumulate BF16 rank contributions in a different order.
         # The fused producer uses the shard owner's two-shot order.
         query = require_prepared(self.attention_reduce.plan, "comm.pcie").query
-        self.use_weight_first = (query.surface == "PCIeTwoShotBF16.all_reduce"
-                                 and query.call.get("payload_schedule") != "pairwise")
+        enabled = (query.surface == "PCIeTwoShotBF16.all_reduce"
+                   and query.call.get("payload_schedule") != "pairwise")
+        self.use_attention_norm = enabled
+        self.use_weight_first = enabled and self.moe_projection is not None
 
     def functional(self, *, session):
         for operator in (self.attention, self.indexer, self.attention_reduce, self.attention_norm, self.mlp, self.mlp_reduce, self.feed_forward_norm):
@@ -239,10 +248,11 @@ class PreparedLayer:
         part, selection = self.attention_part(hidden, metadata, angles, selection, normalized=normalized,
                                               reuse_selection=reuse_selection)
         projections = None
-        if self.use_weight_first:
+        if self.use_attention_norm:
             hidden = hidden.clone()
             source = self.attention_norm(part, hidden)
-            projections = self.moe_projection(source)
+            if self.use_weight_first:
+                projections = self.moe_projection(source)
         else:
             hidden = torch.add(hidden, self.attention_reduce(part))
             source = self._normalized(hidden, "post_attention_layernorm")
@@ -294,12 +304,23 @@ class PreparedDecoder:
         small_tp8_decode = (mode == "decode" and tokens <= 64 and shard.world_size == 8
                             and device.type == "cuda" and torch.cuda.get_device_capability(device) == (12, 0))
         weight_first = small_tp8_decode and tokens <= 16 and getattr(session, "collective_tuning", "static") == "static"
+        layer_count = len(weights.layers)
+
+        def layer_following_norm(index):
+            if not weight_first:
+                return None
+            if index + 1 < layer_count:
+                return weights.layers[index + 1].norms["input_layernorm"]
+            if self.feeds_draft or samples == tokens:
+                return weights.norm
+            return None
+
         self.layers = tuple(PreparedLayer(config, index, layer, pool, example, self.angles, rows=tokens,
             heads=config.raw["num_attention_heads"] // shard.world_size, mode=mode, runtime=runtime,
             coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
-            buffers=buffers, weight_first=weight_first,
-            following_norm=(weights.layers[index+1].norms["input_layernorm"]
-                            if weight_first and tokens == 4 and index+1 < len(weights.layers) else None))
+            buffers=buffers, weight_first=weight_first, fuse_reductions=weight_first,
+            following_norm=layer_following_norm(index),
+            trigger_following=(not config.selects(index + 1)) if index + 1 < layer_count else False)
             for index, layer in enumerate(weights.layers))
         self.stream_handle = None
         if overlap and small_tp8_decode:
@@ -360,11 +381,17 @@ class PreparedDecoder:
         if sums is not None:
             join_weight_prefetch(hidden, sums, self.stream_handle)
         if self.feeds_draft:
-            every = torch.empty_like(hidden)
-            rms_norm(hidden, self.weights.norm, every, self.eps, round_before_weight=True)
+            if normalized_input is not None:
+                every = normalized_input
+            else:
+                every = torch.empty_like(hidden)
+                rms_norm(hidden, self.weights.norm, every, self.eps, round_before_weight=True)
             normalized = every[metadata.sample_indices]
             return normalized, self.head(normalized), (embedded, every, saved), None
-        sampled = hidden[metadata.sample_indices]
-        normalized = torch.empty_like(sampled)
-        rms_norm(sampled, self.weights.norm, normalized, self.eps, round_before_weight=True)
+        if normalized_input is not None:
+            normalized = normalized_input[metadata.sample_indices]
+        else:
+            sampled = hidden[metadata.sample_indices]
+            normalized = torch.empty_like(sampled)
+            rms_norm(sampled, self.weights.norm, normalized, self.eps, round_before_weight=True)
         return normalized, self.head(normalized), None, None

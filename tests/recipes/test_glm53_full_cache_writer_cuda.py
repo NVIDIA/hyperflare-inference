@@ -195,3 +195,44 @@ def test_captured_writers_preserve_bf16_and_fp8_rounding_boundaries():
         expected[page, offset * 128:(offset + 1) * 128] = keys[row]
         expected[page, 8192:].view(torch.float32)[offset] = scales[row]
     assert torch.equal(index.cpu(), expected)
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires FLARE_RUN_CUDA_TESTS=1")
+@torch.inference_mode()
+def test_captured_query_rotation_and_index_query_quantization_match_reference():
+    from ignition.components.glm_mla_cache import prepare_glm_mla_query, quantize_glm_index_query
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(20261122)
+    rows, heads = 4, 8
+    positions = torch.tensor([0, 7, 255, -1], dtype=torch.int64, device=device)
+    rot = PreparedRotaryAngles(positions, rotary_frequencies(1_000_000.0, device))
+    angles = rot()
+    query = torch.randn((rows, heads, 256), dtype=torch.bfloat16, device=device)
+    q_nope = torch.empty((heads, rows, 192), dtype=torch.bfloat16, device=device)
+    absorbed = torch.full((rows, heads, 576), 9.0, dtype=torch.bfloat16, device=device)
+    prepare_glm_mla_query(query, angles, q_nope, absorbed)
+
+    expected_nope = query[:, :, :192].transpose(0, 1).contiguous()
+    expected_rotary = query[:, :, 192:].clone()
+    rot.apply(expected_rotary, angles)
+    assert torch.equal(q_nope, expected_nope)
+    assert torch.equal(absorbed[:, :, 512:], expected_rotary)
+    assert (absorbed[:, :, :512] == 9.0).all()
+
+    index_query = torch.randn((rows, 32, 128), dtype=torch.bfloat16, device=device)
+    index_query[0].zero_()
+    index_query[1, 0, 0] = 448.0 * 1.0625
+    q_fp8 = torch.empty((rows, 32, 128), dtype=torch.float8_e4m3fn, device=device)
+    weights = torch.randn((rows, 32), dtype=torch.float32, device=device)
+    scaled_weights = torch.empty((rows, 32), dtype=torch.float32, device=device)
+    quantize_glm_index_query(index_query, angles, weights, q_fp8, scaled_weights)
+
+    ref_rotated = torch.cat((index_query[:, :, 64:], index_query[:, :, :64]), dim=-1)
+    rot.apply(ref_rotated, angles)
+    ref_fp8, ref_scales = quantize_index(ref_rotated.reshape(-1, 128).cpu(), query=True)
+    ref_scaled_weights = ((weights.cpu() * (32 ** -0.5)) * (32 ** 0.5)) * ref_scales.view(rows, 32) * 0.015625
+    assert torch.equal(q_fp8.cpu().view(torch.uint8), ref_fp8.view(rows, 32, 128))
+    torch.testing.assert_close(scaled_weights.cpu(), ref_scaled_weights, rtol=1e-6, atol=1e-6)
+
+

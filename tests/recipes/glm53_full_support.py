@@ -103,3 +103,9 @@ def reference_index_key(source, weights):
     normalized = (normalized * weights["indexer.k_norm.weight"].float()
                   + weights["indexer.k_norm.bias"].float()).bfloat16()
     return torch.cat((normalized[:, 64:], normalized[:, :64]), -1)
+
+
+def reference_index_query(query_residual, weights):
+    """Project and reorder BF16 index queries independently before rotary embedding."""
+    projected = (query_residual.float() @ weights["indexer.wq_b"].float().T).bfloat16().view(-1, 32, 128)
+    return torch.cat((projected[:, :, 64:], projected[:, :, :64]), -1)

@@ -31,6 +31,10 @@ def _within(actual, bounds):
 
 @torch.no_grad()
 def test_compiled_weight_first_router_preserves_expert_selection():
+    from b12x import gemm
+
+    if not hasattr(gemm, "weight_first_projection"):
+        pytest.skip("requires b12x weight_first_projection")
     config = GlmMoeDsaConfig.from_pretrained(support.SNAPSHOT, local_files_only=True)
     device = torch.device("cuda:0")
     if torch.cuda.get_device_capability(device) != (12, 0):

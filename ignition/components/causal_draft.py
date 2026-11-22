@@ -24,6 +24,7 @@ class PreparedCausalDraftRound:
         self.blocks = o.inputs.page_tables.shape[1]
         self.draft_context_lag = draft_context_lag
         self.collectives, self.session, self.name = o.collectives, o.session, name
+        self.result_runtime = getattr(o, "result_runtime", None)
         self.inputs, self.requests, self.pool = o.inputs, o.requests, o.pool
         self.completion, self.frame, self.sequence = o.completion, o.frame, o.sequence
         self.rng, self.draft_offset, self.draft_generation = o.rng, o.offset, o.generation
@@ -82,7 +83,7 @@ class PreparedCausalDraftRound:
         verify.prepare()
         from ignition.components.parallel_draft import prepare_sampling_broadcasts
         prepare_sampling_broadcasts(proposals, verify, collectives=self.collectives, session=self.session,
-                                    name=self.name)
+                                    name=self.name, result_runtime=self.result_runtime)
         commit = PreparedSpeculativeCommit(self.requests, verify.output, self.candidates,
             self.inputs.row_slot_ids[:b], self.inputs.row_generations[:b], self.inputs.live_rows, self.completion, self.frame,
             self.sequence, logits=self.decoder.scratch.logits.view(b, w, -1), rng=self.rng, token_limits=self.inputs.query_lengths[:b], draft_context_lag=self.draft_context_lag)

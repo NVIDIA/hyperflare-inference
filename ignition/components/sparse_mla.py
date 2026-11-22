@@ -4,6 +4,8 @@
 
 """Prepared paged latent-cache writes and sparse attention with shared scratch."""
 
+import inspect
+
 import torch
 from b12x.attention import sparse_mla
 from b12x.preparation import PreparedCall, plan_from_handle
@@ -11,13 +13,19 @@ from b12x.preparation import PreparedCall, plan_from_handle
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
 
+_SUPPORTS_BOUND_OUT = "out" in inspect.signature(sparse_mla.run).parameters
+
 
 @torch.library.custom_op("flare::sparse_mla", mutates_args=("output", "lse", "scratch"))
 def _attend(query: torch.Tensor, cache: torch.Tensor, selected: torch.Tensor,
             lengths: torch.Tensor, selected_lengths: torch.Tensor, sink: torch.Tensor | None,
-            output: torch.Tensor, lse: torch.Tensor | None, scratch: torch.Tensor, handle: int) -> None:
+            output: torch.Tensor, lse: torch.Tensor | None, scratch: torch.Tensor,
+            handle: int, direct_output: bool = False) -> None:
     binding = sparse_mla.bind(plan_from_handle(handle), scratch=scratch, q=query, kv_cache=cache,
         selected_indices=selected, cache_lengths=lengths, selected_lengths=selected_lengths, attention_sink=sink)
+    if direct_output:
+        sparse_mla.run(binding, out=output)
+        return
     result = sparse_mla.run(binding)
     if isinstance(result, tuple):
         output.copy_(result[0])
@@ -28,7 +36,8 @@ def _attend(query: torch.Tensor, cache: torch.Tensor, selected: torch.Tensor,
 
 
 @_attend.register_fake
-def _fake_attend(query, cache, selected, lengths, selected_lengths, sink, output, lse, scratch, handle):
+def _fake_attend(query, cache, selected, lengths, selected_lengths, sink, output, lse, scratch,
+                 handle, direct_output=False):
     pass
 
 
@@ -79,6 +88,10 @@ class PreparedSparseMLA:
                                 or lse.device != query.device):
             raise ValueError("sparse MLA LSE output requires FP32 [rows,heads] on the query device")
         self.output, self.lse = output, lse
+        expected_head_major = (caps.v_head_dim, caps.max_q_rows * caps.v_head_dim, 1)
+        layout_matches = (output.stride() == expected_head_major if caps.head_major_output else output.is_contiguous())
+        self.direct_output = (_SUPPORTS_BOUND_OUT and caps.mode == "decode" and not caps.return_lse
+                              and layout_matches and output.data_ptr() % 16 == 0)
         self.plan = sparse_mla.plan(caps)
         self.inputs = {"q": query, "kv_cache": cache, "selected_indices": selected,
             "cache_lengths": cache_lengths, "selected_lengths": selected_lengths, "attention_sink": attention_sink}
@@ -87,8 +100,10 @@ class PreparedSparseMLA:
             storage = planned_scratch(state.scratch_specs(), workspace)
             runtime = state.bind(scratch=storage, q=query, kv_cache=cache, selected_indices=selected,
                 cache_seqlens_int32=cache_lengths, nsa_cache_seqlens_int32=selected_lengths)
-            return PreparedCall(run=lambda: state.run(runtime, kv_cache=cache, attention_sink=attention_sink),
-                                owners=prime_owners(workspace, storage, runtime))
+            run = ((lambda: state.run(runtime, kv_cache=cache, attention_sink=attention_sink, out=output))
+                   if self.direct_output else
+                   (lambda: state.run(runtime, kv_cache=cache, attention_sink=attention_sink)))
+            return PreparedCall(run=run, owners=prime_owners(workspace, storage, runtime))
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare),))
 
@@ -122,12 +137,17 @@ class PreparedSparseMLA:
     def __call__(self, query=None, selected=None, cache_lengths=None, selected_lengths=None, *, cache=None):
         if self.output is None:
             shape, stride, dtype = self.output_layout
-            output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device)
+            if not self.direct_output:
+                output.zero_()
             lse = torch.empty_strided(*self.lse_layout, dtype=torch.float32, device=query.device).zero_() if self.return_lse else None
             scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
             _attend(query, self.inputs["kv_cache"] if cache is None else cache, selected, cache_lengths,
-                    selected_lengths, self.inputs["attention_sink"], output, lse, scratch, self.plan.handle)
+                    selected_lengths, self.inputs["attention_sink"], output, lse, scratch,
+                    self.plan.handle, self.direct_output)
             return (output, lse) if self.return_lse else output
+        if self.direct_output:
+            return sparse_mla.run(self.binding, out=self.output)
         result = sparse_mla.run(self.binding)
         if isinstance(result, tuple):
             self.output.copy_(result[0])

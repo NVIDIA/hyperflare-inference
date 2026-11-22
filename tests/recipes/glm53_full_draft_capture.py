@@ -174,8 +174,42 @@ def capture_rank(rank, rendezvous, snapshot, fixtures, destination):
 
             layer._normalized = norm
             from flashinfer.triton.norm import rms_norm
+            from ignition.recipes.glm53_full import attention as attention_module
+            from ignition.recipes.glm53_full import indexer as indexer_module
 
             rotate = op.layer.angles.apply
+            compute_angles = op.layer.angles
+
+            def capture_angles(positions):
+                values = compute_angles(positions)
+                observed["rotary_values"] = values.cpu().clone()
+                return values
+
+            capture_angles.frequencies = compute_angles.frequencies
+            capture_angles.apply = compute_angles.apply
+            op.layer.angles = capture_angles
+            prepare_query = attention_module.prepare_glm_mla_query
+
+            def capture_query(query, angles, q_nope, absorbed):
+                observed["query_rotation_input"] = query.cpu().clone()
+                prepare_query(query, angles, q_nope, absorbed)
+                observed["query_rotation_output"] = torch.cat(
+                    (q_nope.transpose(0, 1), absorbed[:, :, 512:]), dim=-1
+                ).cpu().clone()
+
+            attention_module.prepare_glm_mla_query = capture_query
+            quantize_query = indexer_module.quantize_glm_index_query
+
+            def capture_index_query(query, angles, weights, q_out, scaled_weights):
+                quantize_query(query, angles, weights, q_out, scaled_weights)
+                raw = query.view(-1, 32, 128)
+                reordered = torch.cat((raw[:, :, 64:], raw[:, :, :64]), dim=-1)
+                observed["index_query_rotation_input"] = reordered.cpu().clone()
+                rotate(reordered, angles)
+                observed["index_query_rotation_output"] = reordered.cpu().clone()
+                observed["stored_index_query_bytes"] = q_out.view(torch.uint8).cpu().clone()
+
+            indexer_module.quantize_glm_index_query = capture_index_query
             store_latent = attention._store
 
             def capture_latent(projected, metadata, angles, *, query=None):

@@ -94,3 +94,68 @@ def store_glm_index_key(keys, weights, bias, angles, slots, cache, eps):
     torch.library.wrap_triton(_normalize_and_store_index)[(keys.shape[0],)](
         keys, weights, bias, angles, slots, cache,
         keys.stride(0), cache.stride(0), cache.shape[0] * 64, EPS=eps, num_warps=4)
+
+
+@triton.jit
+def _prepare_mla_query(query, angles, q_nope, absorbed,
+                       query_row_stride, query_head_stride,
+                       absorbed_row_stride, absorbed_head_stride, rows):
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    source = query + row * query_row_stride + head * query_head_stride
+    col = tl.arange(0, 256)
+    mask = col < 192
+    nope = tl.load(source + col, mask=mask, other=0.0)
+    tl.store(q_nope + (head * rows + row) * 192 + col, nope, mask=mask)
+    pair = 2 * tl.arange(0, 32)
+    cos = tl.load(angles + row * 64 + pair)
+    sin = tl.load(angles + row * 64 + pair + 1)
+    a = tl.load(source + 192 + pair).to(tl.float32)
+    b = tl.load(source + 192 + pair + 1).to(tl.float32)
+    rotated = absorbed + row * absorbed_row_stride + head * absorbed_head_stride + 512 + pair
+    tl.store(rotated, (a * cos - b * sin).to(tl.bfloat16))
+    tl.store(rotated + 1, (a * sin + b * cos).to(tl.bfloat16))
+
+
+def prepare_glm_mla_query(query, angles, q_nope, absorbed):
+    """Pack head-major unrotated query columns and write rotated query tails into absorbed queries."""
+    rows, heads, _ = query.shape
+    torch.library.wrap_triton(_prepare_mla_query)[(rows, heads)](
+        query, angles, q_nope, absorbed,
+        query.stride(0), query.stride(1), absorbed.stride(0), absorbed.stride(1), rows,
+        num_warps=4)
+
+
+@triton.jit
+def _quantize_index_query(query, angles, weights, q_out, scaled_weights,
+                          query_row_stride, weight_row_stride):
+    idx = tl.program_id(0).to(tl.int64)
+    row = idx // 32
+    head = idx % 32
+    dim = tl.arange(0, 128)
+    x = tl.load(query + row * query_row_stride + head * 128 + dim).to(tl.float32)
+    partner = tl.gather(x, dim ^ 1, axis=0)
+    cos = tl.load(angles + row * 64 + (dim & 62))
+    sin = tl.load(angles + row * 64 + (dim & 62) + 1)
+    even = (dim & 1) == 0
+    a = tl.where(even, x, partner)
+    b = tl.where(even, partner, x)
+    rotated = tl.where(even, a * cos - b * sin, a * sin + b * cos).to(tl.bfloat16).to(tl.float32)
+    values = tl.where(dim < 64, rotated, x)
+    absmax = tl.maximum(tl.max(tl.abs(values), axis=0), 1e-4)
+    scale = tl.exp2(tl.ceil(tl.log2(tl.div_rn(absmax, 448.0))))
+    inv_scale = tl.div_rn(1.0, scale)
+    quantized = tl.minimum(tl.maximum(values * inv_scale, -448.0), 448.0)
+    tl.store(q_out.to(tl.pointer_type(tl.float8e4nv)) + idx * 128 + (dim ^ 64), quantized)
+    w = tl.load(weights + row * weight_row_stride + head).to(tl.float32)
+    w = ((w * 0.1767766952966369) * 5.656854249492381) * scale * 0.015625
+    tl.store(scaled_weights + idx, w)
+
+
+def quantize_glm_index_query(query, angles, weights, q_out, scaled_weights):
+    """Swap, rotate, and FP8-quantize 32-head GLM index queries while scaling FP32 head weights."""
+    rows = query.shape[0]
+    torch.library.wrap_triton(_quantize_index_query)[(rows * 32,)](
+        query, angles, weights, q_out, scaled_weights,
+        query.stride(0), weights.stride(0), num_warps=1)
+

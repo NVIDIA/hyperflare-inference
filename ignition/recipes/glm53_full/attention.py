@@ -16,7 +16,7 @@ from typing import NamedTuple
 import torch
 from b12x.attention import sparse_mla
 
-from ignition.components.glm_mla_cache import store_glm_latent
+from ignition.components.glm_mla_cache import prepare_glm_mla_query, store_glm_latent
 from ignition.components.linear import BatchedUnquantizedProjection, UnquantizedProjection, prepare_projection
 from ignition.components.rotary import PreparedRotaryAngles
 from ignition.components.sparse_mla import PreparedSparseMLA
@@ -53,6 +53,7 @@ class AttentionMetadata:
     requests: torch.Tensor
     block_table: torch.Tensor
     index_tables: tuple[torch.Tensor, torch.Tensor] | None = None
+    visible: torch.Tensor | None = None
 
     @classmethod
     def allocate(cls, tokens, sequences, blocks, device):
@@ -137,7 +138,9 @@ class PreparedAttention:
 
         projected, residual = zeros(rows, width), zeros(rows, QUERY_RANK)
         query, absorbed = zeros(rows, heads, NOPE + ROTARY), zeros(rows, heads, LATENT + ROTARY)
-        attended, expanded = zeros(rows, heads, LATENT), zeros(rows, heads, VALUE)
+        q_nope = zeros(heads, rows, NOPE)
+        attended = zeros(heads, rows, LATENT).transpose(0, 1) if mode == "decode" else zeros(rows, heads, LATENT)
+        expanded = zeros(rows, heads, VALUE)
         self.projections = {
             "input_proj": prepare_projection(source, weights["input_proj"], projected,
                 session=session, name=f"{name}.input_proj", workspace=workspace)}
@@ -152,7 +155,7 @@ class PreparedAttention:
                     session=session, name=f"{name}.q_b_proj", workspace=workspace),
                 "o_proj": prepare_projection(expanded.view(rows, -1), weights["o_proj"], zeros(rows, 6144),
                     session=session, name=f"{name}.o_proj", workspace=workspace)})
-            self.absorb = BatchedUnquantizedProjection(query[:, :, :NOPE].transpose(0, 1), weights["key"],
+            self.absorb = BatchedUnquantizedProjection(q_nope, weights["key"],
                 absorbed[:, :, :LATENT].transpose(0, 1), major="n", session=session, name=f"{name}.absorb_query")
             self.expand = BatchedUnquantizedProjection(attended.transpose(0, 1), weights["value"],
                 expanded.transpose(0, 1), major="n", session=session, name=f"{name}.expand_value")
@@ -165,6 +168,7 @@ class PreparedAttention:
             max_kv_rows=max(cache.shape[0], 4 * (max_cache_pages or 0)) * PAGE_RECORDS,
             kv_dtype=torch.uint8, head_dim=LATENT + ROTARY, v_head_dim=LATENT, page_size=PAGE_RECORDS,
             model_type=sparse_mla.ModelType.GLM_NSA, cache_record_bytes=RECORD_BYTES,
+            head_major_output=(mode == "decode"),
             mode="decode" if mode == "decode" else "extend")
         self.attention = PreparedSparseMLA(absorbed, cache, selected, visible, lengths, attended, caps=caps,
             session=session, name=f"{name}.attention", workspace=workspace)
@@ -190,10 +194,10 @@ class PreparedAttention:
         residual = torch.empty((rows, QUERY_RANK), dtype=torch.bfloat16, device=device)
         self._store(projected, metadata, angles, query=residual)
         query = self.projections["q_b_proj"](residual).view(rows, heads, NOPE + ROTARY)
-        self.angles.apply(query, angles)
+        q_nope = torch.empty((heads, rows, NOPE), dtype=torch.bfloat16, device=device)
         absorbed = torch.empty((rows, heads, LATENT + ROTARY), dtype=torch.bfloat16, device=device)
-        self.absorb(query[:, :, :NOPE].transpose(0, 1), output=absorbed[:, :, :LATENT].transpose(0, 1))
-        absorbed[:, :, LATENT:].copy_(query[:, :, NOPE:])
+        prepare_glm_mla_query(query, angles, q_nope, absorbed)
+        self.absorb(q_nope, output=absorbed[:, :, :LATENT].transpose(0, 1))
         if not self.selects:
             return Projected(residual, absorbed, None, None)
         return Projected(residual, absorbed, projected[:, INPUT_WIDTH:INPUT_WIDTH + 128],
@@ -212,7 +216,8 @@ class PreparedAttention:
     def attend(self, absorbed, selection: Selection, metadata):
         """Attend to the selected records and return this rank's partial hidden update."""
         rows = absorbed.shape[0]
-        visible = (metadata.positions[:rows] + 1).to(torch.int32)
+        visible = (metadata.visible[:rows] if metadata.visible is not None
+                   else (metadata.positions[:rows] + 1).clamp(min=0).to(torch.int32))
         attended = self.attention(absorbed, selection.records, visible, selection.lengths, cache=self.cache)
         expanded = self.expand(attended.transpose(0, 1)).transpose(0, 1)
         return self.projections["o_proj"](expanded.reshape(rows, -1))

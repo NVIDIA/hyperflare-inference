@@ -31,7 +31,6 @@ their own latent records. Accepted context rebuilds the committed index keys.
 import torch
 from flashinfer.triton.norm import rms_norm
 
-from ignition.components.collectives import PreparedAllReduce
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.paged_batch import Metadata
@@ -41,15 +40,18 @@ from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .attention import PAGE_TOKENS, AttentionMetadata, ExampleBuffers, Selection, rotary_frequencies
 from .decoder import HIDDEN, VOCABULARY, PreparedLayer
+from .indexer import index_tables
 
 
-def draft_placement(positions, requests, page_table):
+def draft_placement(positions, requests, page_table, *, with_index_tables=False):
     """Records of draft rows: each live row's slot follows from its request's pages and its draft position."""
     live = positions >= 0
     position = positions.clamp(min=0)
     pages = page_table[requests, position // PAGE_TOKENS].long()
     slots = torch.where(live, pages * PAGE_TOKENS + position % PAGE_TOKENS, -1)
-    return AttentionMetadata(positions, slots, requests, page_table)
+    visible = (positions + 1).clamp(min=0).to(torch.int32)
+    tables = index_tables(page_table, requests) if with_index_tables else None
+    return AttentionMetadata(positions, slots, requests, page_table, tables, visible)
 
 
 class PreparedDraftLayer:
@@ -78,7 +80,8 @@ class PreparedDraftLayer:
 
     def __call__(self, embedded, previous, positions, requests, page_table, selection=None):
         """Store draft records and, for proposal rows, return hidden states and the attended records."""
-        placement = draft_placement(positions, requests, page_table)
+        need_tables = not self.cache_only and selection is None and self.layer.selects
+        placement = draft_placement(positions, requests, page_table, with_index_tables=need_tables)
         embedded = embedded.masked_fill((positions == 0)[:, None], 0)
         joined = torch.empty((embedded.shape[0], 2 * HIDDEN), dtype=torch.bfloat16, device=embedded.device)
         rms_norm(embedded, self.draft.embedding_norm, joined[:, :HIDDEN], self.eps, round_before_weight=True)
@@ -176,7 +179,8 @@ class PreparedProposals:
         if selection is not None:
             selection = Selection(torch.where(proposing[:, None], selection.records, -1),
                                   torch.where(proposing, selection.lengths, 0))
-        hidden, selection = self.layer(embedded, previous, positions, requests, self.inputs.page_tables[slots], selection)
+        hidden, selection = self.layer(
+            embedded, previous, positions, requests, self.inputs.page_tables[slots], selection)
         normalized = torch.empty_like(hidden)
         rms_norm(hidden, self.weights.draft.head_norm, normalized, self.eps, round_before_weight=True)
         return self.head(normalized), (normalized, selection if self.share_indices else None)

@@ -4,13 +4,32 @@
 """Warm resident projection weights on a prepared CUDA stream."""
 
 import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _prefetch_weight_l2(words, word_count, sums, BLOCK: tl.constexpr, UNROLL: tl.constexpr):
+    block = tl.program_id(0)
+    grid = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK)
+    partial = tl.full((BLOCK,), 0, tl.int64)
+    for base in range(block * BLOCK * UNROLL, word_count, grid * BLOCK * UNROLL):
+        for step in tl.static_range(UNROLL):
+            indices = base + step * BLOCK + lanes
+            partial += tl.load(words + indices, mask=indices < word_count, other=0)
+    # Storing one sum per block keeps every weight read live.
+    tl.store(sums + block, tl.sum(partial, axis=0))
+
+
+def prefetch_weight_l2(words: torch.Tensor, sums: torch.Tensor, programs: int) -> None:
+    """Read a contiguous int64 view; the caller supplies one int64 slot per block."""
+    _prefetch_weight_l2[(programs,)](words, words.numel(), sums, BLOCK=2048, UNROLL=8, num_warps=16)
 
 
 @torch.library.custom_op("flare::prefetch_weights", mutates_args=("sums",))
 def _prefetch(anchor: torch.Tensor, weights: list[torch.Tensor], sums: torch.Tensor,
               programs: int, stream: int) -> None:
-    from flashinfer.triton.weight_prefetch import prefetch_weight_l2
-
     auxiliary = torch.cuda.ExternalStream(stream, device=anchor.device)
     auxiliary.wait_stream(torch.cuda.current_stream(anchor.device))
     with torch.cuda.stream(auxiliary):

@@ -16,6 +16,8 @@ class PreparedWeightFirstProjection:
     @staticmethod
     def fits(source, first, second):
         """The kernel reads complete, aligned BF16 rows from both resident matrices."""
+        if not hasattr(gemm, "weight_first_projection"):
+            return False
         matrices = (source, first, second)
         if any(not isinstance(t, torch.Tensor) or t.ndim != 2 or t.device.type != "cuda" or t.device != source.device
                or t.dtype != torch.bfloat16 or not t.is_contiguous() or t.data_ptr() % 16 for t in matrices):

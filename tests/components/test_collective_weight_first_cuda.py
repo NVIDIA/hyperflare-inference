@@ -138,4 +138,9 @@ def _rank(rank, world, rendezvous):
 @pytest.mark.skipif(os.getenv("FLARE_RUN_TP_CUDA_TESTS") != "1" or torch.cuda.device_count() < 8,
                     reason="requires eight assigned PCIe GPUs")
 def test_two_shot_shard_order_and_round_before_scale(tmp_path):
+    import inspect
+    from b12x.comm.pcie._oneshot_preparation import _fused_semantics
+
+    if "reduction_order" not in inspect.signature(_fused_semantics).parameters:
+        pytest.skip("requires b12x shard_owner fused oneshot RMSNorm")
     mp.spawn(_rank, args=(8, (tmp_path / "collective").as_uri()), nprocs=8, join=True)

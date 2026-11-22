@@ -4,7 +4,6 @@
 """GLM 5.3 prepared top-2048 selection against the Transformers indexer's ranking of every position."""
 
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -125,18 +124,11 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
             projected = attention.project(source[first:last], metadata, values)
             arguments = (projected.query_residual, projected.index_key, projected.index_weights, metadata, values)
             if verify_fp8:
-                rotated = {}
-                apply = angles.apply
-
-                def capture(tensor, *args):
-                    result = apply(tensor, *args)
-                    rotated[tensor.ndim] = tensor.clone()
-                    return result
-
-                with patch.object(angles, "apply", capture):
-                    selection = indexer(*arguments)
+                selection = indexer(*arguments)
+                query_ref = support.reference_index_query(projected.query_residual, weights)
+                angles.apply(query_ref, values)
                 key = support.reference_index_key(projected.index_key, weights)
-                apply(key, values)
+                angles.apply(key, values)
                 keys, scales = quantize_index(key, query=False)
                 reference_keys[first:last].copy_(keys)
                 reference_scales[first:last].copy_(scales)
@@ -145,7 +137,7 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
                 assert torch.equal(actual_keys[slots], keys) and torch.equal(actual_scales[slots], scales)
                 for start in range(0, last - first, 16):
                     subset = slice(start, min(start + 16, last - first))
-                    scores, allowance = index_score_interval(rotated[3][subset], projected.index_weights[subset],
+                    scores, allowance = index_score_interval(query_ref[subset], projected.index_weights[subset],
                                                              reference_keys[:last], reference_scales[:last])
                     records = logical_records(selection.records[subset])
                     lengths = selection.lengths[subset]
