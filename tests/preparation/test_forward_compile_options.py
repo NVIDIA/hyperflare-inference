@@ -30,7 +30,8 @@ def _loaded_backend():
     from torch._dynamo.guards import GuardManagerWrapper
 
     backend = aot.StorageBackend.__new__(aot.StorageBackend)
-    backend.artifact = SimpleNamespace(_flare_graph=object())
+    backend.artifact = SimpleNamespace(_flare_graph=object(),
+                                      inner_fn=SimpleNamespace(compiled_fn=SimpleNamespace()))
     backend._serialized_artifact = b"portable backend"
     return SimpleNamespace(compiled_fn=backend, signature=signature(lambda forward: None),
         runtime_env=SimpleNamespace(closure=()), guards_state=b"portable guards",
@@ -256,3 +257,43 @@ def test_prepare_many_recompiles_a_materialized_forward_that_no_longer_binds(cac
     assert executed == ['execute'] * 2
     assert result['example'].cache_hit is False
     assert (tmp_path / 'example.bin').read_bytes() == b'recompiled'
+
+
+def test_default_compile_options_preserve_peak_memory_reordering_and_capture_scopes_overrides(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from ignition.preparation import capture
+
+    assert 'reorder_for_peak_memory' not in aot._OPTIONS
+    seen = []
+    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
+    for name, value in {
+        'current_stream': lambda device: stream,
+        'stream': lambda s: nullcontext(),
+        'CUDAGraph': lambda **kwargs: object(),
+        'graph': lambda *args, **kwargs: nullcontext(),
+        'synchronize': lambda device: None,
+        'mem_get_info': lambda device: (1024, 2048),
+        'memory_allocated': lambda device: 0,
+        'memory_reserved': lambda device: 0,
+    }.items():
+        monkeypatch.setattr(capture.torch.cuda, name, value)
+    monkeypatch.setattr(capture, '_warmup_stream', lambda device: stream)
+    monkeypatch.setattr(capture, '_seed_warmup_workspaces', lambda s, device: None)
+    monkeypatch.setattr(capture.torch.distributed, 'is_initialized', lambda: False)
+
+    class FakeCache:
+        def __init__(self, *, options=None, **kwargs):
+            seen.append(options)
+        def prepare_many(self, forwards, signatures, **kwargs):
+            return {}
+
+    monkeypatch.setattr(capture, 'ForwardCache', FakeCache)
+    session = SimpleNamespace(namespace=SimpleNamespace(to_dict=lambda: {}), capture=nullcontext, autotune=False)
+    override = {**aot._OPTIONS, 'reorder_for_peak_memory': False}
+    capture.capture_forwards({}, {}, session=session, device='cpu', stream=stream, pool=None,
+                             compile_decoder=True, compile_options=override)
+    capture.capture_forwards({}, {}, session=session, device='cpu', stream=stream, pool=None,
+                             compile_decoder=True)
+    assert seen == [override, None]
+    assert 'reorder_for_peak_memory' not in aot._OPTIONS

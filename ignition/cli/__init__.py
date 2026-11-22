@@ -217,6 +217,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " kernel tuning (default: see MODEL --help)")
     from .config import AUTOTUNE_EFFORTS
 
+    advanced.add_argument("--sm103-preparation", type=Path,
+                          help="JSON file of explicit HBM/Grace expert rows and prepared attention libraries"
+                               " (DeepSeek V4.1 TP1 export; experimental)")
     advanced.add_argument("--autotune-effort", choices=AUTOTUNE_EFFORTS,
                           help="kernel search effort: off uses heuristics without races; default races"
                                " the pruned candidate set; audit lifts the performance exclusions to"

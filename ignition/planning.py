@@ -13,6 +13,10 @@ no physical memory. Active requests need at least 8,192 tokens each.
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ignition.recipes.deepseek41.sm103 import SM103Config
 
 from ignition.errors import CapacityError, UsageError
 from ignition.preparation.tuning_replicas import TuningReplica
@@ -182,6 +186,7 @@ class Plan:
     stream_overlap: bool = True
     mixed_prefill: bool = False
     prompt_logprobs: bool = False
+    sm103: "SM103Config | None" = None
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
     roce_ring: bool = False
@@ -389,6 +394,7 @@ class Plan:
             "stream_overlap": self.stream_overlap,
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
+            "sm103_preparation": None if self.sm103 is None else self.sm103.to_dict(),
             "expert_scale_compression": self.expert_scale_compression,
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
@@ -492,11 +498,18 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
             and speculation.graph_budget is None and recipe.speculation is not None):
         speculation = replace(speculation, graph_budget=recipe.speculation.graph_budget)
     if speculation is not None and speculation.graph_budget is not None:
-        from ignition.components.capacity import packed_speculative_shapes
+        from ignition.components.capacity import (
+            packed_speculative_depth_shapes,
+            packed_speculative_shapes,
+        )
 
         try:
-            packed_speculative_shapes(concurrency, speculation.draft_tokens + 1,
-                                      speculation.token_capacity, speculation.graph_budget)
+            if recipe.packed_speculative_depths:
+                packed_speculative_depth_shapes(concurrency, speculation.widths,
+                                                speculation.token_capacity, speculation.graph_budget)
+            else:
+                packed_speculative_shapes(concurrency, speculation.draft_tokens + 1,
+                                          speculation.token_capacity, speculation.graph_budget)
         except ValueError as error:
             raise UsageError(f"--speculative-graph-budget: {error}") from error
     # Language-only plans prepare no vision encoder, so no image feature slots.

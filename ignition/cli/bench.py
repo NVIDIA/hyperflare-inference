@@ -172,7 +172,7 @@ def run(args):
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
         language_model_only=args.language_model_only or model.recipe.name == "qwen38_dense",
-        mla_compute_mode=args.mla_compute_mode)
+        mla_compute_mode=args.mla_compute_mode, sm103_preparation=args.sm103_preparation)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(
         batches=settings.batches, contexts=settings.contexts, width=settings.width,
         prefill_chunk=plan.prefill_chunk if settings.prefill else 0, speculation_study=settings.speculation_study,
@@ -262,7 +262,8 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             print(f"Measured {counts}", file=sys.stderr, flush=True)
 
     torch.cuda.set_device(0)
-    storage = CoreStorage(world=plan.world_size)
+    window = None if plan.sm103 is None else plan.sm103.device_window()
+    storage = CoreStorage(world=plan.world_size, device_window=window)
     try:
         with storage:
             prepared = prepare_recipe(model.recipe.prepare, snapshot, plan, compile_forwards=compile_forwards,

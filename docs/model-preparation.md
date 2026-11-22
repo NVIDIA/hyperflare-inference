@@ -974,6 +974,118 @@ Use a fresh weight export when first enabling this option: the Markov head's
 stored vocabulary partition changes. Qualified: complete-model serving at TP4
 with one concurrent request. Not qualified: higher concurrency.
 
+### Experimental GB300 (`SM103`) TP1 reference preparation
+
+The experimental GB300 (`SM103`) TP1 path exports DeepSeek V4.1 using the
+`"reference"` execution mode with MegaMoE tiered HBM/Grace expert placement,
+native Engram table delivery, and the complete DeepInfer target, DFlash draft,
+and vision model computation. Install the optional preparation dependencies
+pinned in `pyproject.toml` with:
+
+```sh
+uv sync --locked --extra prepare --extra test --extra sm103-reference
+```
+
+`--sm103-preparation PATH` reads a version-1 JSON object with `placements`,
+`host_lane_clusters`, optional `execution` (`"reference"`, the only supported
+SM103 execution mode), optional `context`, and optional `prefill_staging`. Each
+placement is keyed by `layers.N.ffn` or `mtp.N.ffn` and contains `experts`,
+`host`, and `hbm`; the two arrays give canonical expert IDs in physical row
+order. Supply all 40 target layers and, when MTP is enabled, all three draft
+layers. Unknown fields, duplicate keys, missing experts, and repeated IDs
+within a tier are rejected. Both tiers may contain the same expert; the initial
+canonical-to-physical map selects the HBM copy.
+
+Optional `"context"` overrides the prepared sequence capacity (for example
+`262144`) without changing checkpoint metadata; `--prompt-logprobs` and
+`--joint-tuning` are rejected because the reference forward owns its attention
+and sparse indexer. When the maximum prefill chunk exceeds `144` tokens,
+`"reference"` enables Context-Encoder-Decoder (CED) consumer compaction
+(`yoco_keep_tokens = 144`) within ordinary `prefill` graphs on model contract 3:
+the 20 Context Encoder layers (`0..19`) populate the YOCO KV cache across the
+full chunk, and the 20 consumer layers (`20..39`) execute on the compacted
+suffix (`<= 144` tokens). Exported cores load in `flare run` without a Python
+or DeepInfer runtime dependency.
+
+An optional `prefill_staging` object prepares temporary cold-expert prefetch on
+SM103 `"reference"` preparations:
+
+```json
+"prefill_staging": {"min_rows": 1024, "min_cold_experts": 8}
+```
+
+Omission disables staging. Target prefill layers qualify by their prepared row
+count; when `yoco_keep_tokens < min_rows`, staging attaches only to Context
+Encoder layers (`0..19`) and leaves the compacted consumer suffix (`20..39`) on
+direct-host execution. Two auxiliary streams start copies ahead of consuming
+layers, skip HBM-resident duplicates by inspecting the live canonical map, and
+stage only when the preceding invocation's distinct host demand reaches
+`min_cold_experts`. Decode and MTP graphs do not use this prefill mechanism.
+Preparation clears the demand history after capture, before export. Changing
+this setting changes `RebuildManifest.sm103_preparation_json`, so use ordinary
+export rather than `--reuse-weights` across different staging configurations.
+
+The explicit configuration admits one local SM103 GPU and expanded native
+expert scales without changing the recipe's ordinary TP selection. Planning
+counts physical expert copies at their expanded native size, estimates other
+device weights from checkpoint headers, and checks host memory for mapped
+expert weights plus 8 GiB of preparation headroom. This path requires a local
+checkpoint or an already downloaded checkpoint because placement sizing reads
+tensor headers. Use `ignition export` followed by release `flare run`;
+`debug-serve` and multi-host preparation reject `--sm103-preparation`.
+
+Run the miniature end-to-end SM103 export and fresh-process `flare run` check
+on an assigned SM103 GPU with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest -q tests/preparation/test_reference_core_export_cuda.py
+```
+
+Run the persistent native text regression against an idle release server
+running an exported SM103 core with `--mtp-adaptive-verification` (using
+`--mtp-draft-tokens 7` for concurrency one or `--mtp-draft-tokens 3` for
+concurrency sixteen):
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 FLARE_DEEPSEEK41_SM103_TEST_URL=http://127.0.0.1:8000 \
+  .venv/bin/python -m pytest -q tests/server/test_deepseek41_sm103.py
+```
+
+`ignition.components.megamoe_weights.load_mxfp4_planes` loads packed MXFP4
+weights and expands CSF scales once into native UE8M0 bytes, while
+`pack_mxfp4_planes` applies DeepGEMM's gate/up interleave and scale layout
+without requantizing weights. The recipe accepts a `mxfp4_csf` quantization
+declaration with format version 1 and `weight_scale_encoding: csf` alongside
+block-32 FP8 dense weights, UE8M0 scales, dynamic activations, and FP4 experts.
+`ignition.components.megamoe.PreparedMegaMoe` and
+`ignition.components.megamoe_tiers.MegaMoeHostTier` expose workspace mutations,
+host pointers, route counters, and tensor-map clone tables to complete-forward
+compilation. On an assigned SM103 GPU, run component checks with:
+
+```sh
+FLARE_RUN_CUDA_TESTS=1 .venv/bin/python -m pytest -q \
+  tests/components/test_megamoe_weights_cuda.py \
+  tests/components/test_megamoe_inputs_cuda.py \
+  tests/components/test_megamoe_cuda.py \
+  tests/components/test_megamoe_tiers_cuda.py \
+  tests/components/test_megamoe_loading_cuda.py
+```
+
+Set `FLARE_DEEPSEEK41_CSF_SNAPSHOT` to an indexed lossless-CSF checkpoint to
+include real checkpoint expert checks; without it, those cases skip. Multi-GPU
+(`TP2+`) composition and `--prompt-logprobs` are not supported on the
+`"reference"` SM103 path.
+
+When `--sm103-preparation` is active with positive DSpark draft depth,
+`--speculative-graph-budget` distributes packed speculative rounds across every
+prepared draft depth from `1` through the configured maximum so `flare run
+--mtp-draft-tokens N` can select captured depths up to `N` without re-export.
+Each `(batch, depth)` retains its maximum physical target capacity when it
+exceeds `batch`, and the maximum depth retains `batch + 1`; concurrency 32,
+seven drafts, and 128 target rows require at least 48 packed graphs. Ordinary
+TP3, TP4, and TP6 DeepSeek V4.1 exports retain single-depth packed budgeting
+described above.
+
 ## DeepSeek V4 Flash
 
 DeepSeek V4 Flash uses `local-inference-lab/DeepSeek-V4-Flash-Vision-Exp-lossless-CSF`, including its

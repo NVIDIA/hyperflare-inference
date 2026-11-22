@@ -9,6 +9,35 @@ release. The public source repository includes the preparation tools and their
 dependency declarations. Model weights, datasets, prepared model cores, and
 container images are not included in the binary release.
 
+## DeepInfer reference preparation
+
+The DeepSeek V4.1 `"reference"` SM103 preparation path uses
+[DeepInfer](https://github.com/deepseek-ai/DeepInfer) (pinned in the optional
+`sm103-reference` extra), licensed under Apache-2.0, as an external preparation
+dependency. The captured attention metadata adapters in
+`ignition/recipes/deepseek41/reference_metadata.py` follow DeepInfer's native
+input builder's cache-indexing rules, expressed as tensor operations over
+Flare's packed requests. They add explicit inactive-row write masking and
+prepared-capacity validation. Prefill cache-load descriptors also follow the
+native builder, with zero-filled unused capacity for captured graphs. The
+request-history binding in `ignition/recipes/deepseek41/reference_engram.py`
+uses the reference vocabulary compression and native builder's n-gram/image
+boundary rules. Exported cores load in `flare run` without a Python or
+DeepInfer runtime dependency.
+
+## MegaMoE preparation kernels
+
+The optional `sm103-reference` preparation extra pins the DeepGEMM fork
+([local-inference-lab/DeepGEMM](https://github.com/local-inference-lab/DeepGEMM),
+MIT license with DerpSeek/ds41 tiered MegaMoE extensions) as an external
+preparation dependency, parallel to `local-inference-lab/DeepInfer`. Exported
+CUDA graphs retain the compiled kernels; the native CLI has no Python or
+DeepGEMM dependency.
+The input stager (`ignition/components/megamoe_kernel/inputs.py`) retains vLLM
+v0.32.0's Apache-2.0 Triton kernel (license text in
+`ignition/components/megamoe_kernel/LICENSE.vllm`), with a wrapper that selects
+MXFP8 and validates its buffers without importing vLLM.
+
 ## Native CLI release dependencies
 
 [third_party/rust/README.md](third_party/rust/README.md) groups the native Cargo

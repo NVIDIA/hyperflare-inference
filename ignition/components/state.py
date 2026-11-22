@@ -33,7 +33,9 @@ class StateLayout:
     rotary_region: str | None = field(default=None, kw_only=True)
 
     @classmethod
-    def from_specs(cls, specifications, *, rotary_region=None):
+    def from_specs(cls, specifications, *, alignment=256, rotary_region=None):
+        if type(alignment) is not int or alignment < 256 or alignment & (alignment - 1):
+            raise ValueError("state alignment must be a power of two of at least 256 bytes")
         regions, names, offset = [], set(), 0
         for name, shape, dtype in specifications:
             if not isinstance(name, str) or not name or name in names:
@@ -43,7 +45,7 @@ class StateLayout:
                 raise ValueError("state region extents must be positive integers")
             if not isinstance(dtype, torch.dtype):
                 raise TypeError("state regions require a tensor dtype")
-            offset = (offset + 255) // 256 * 256
+            offset = (offset + alignment - 1) // alignment * alignment
             region = StateRegion(name, offset, shape, dtype)
             regions.append(region)
             names.add(name)
@@ -52,7 +54,8 @@ class StateLayout:
             raise ValueError("state storage requires at least one region")
         if rotary_region is not None and rotary_region not in names:
             raise ValueError("declared rotary region is not in the layout")
-        return cls(tuple(regions), (offset + 255) // 256 * 256, rotary_region=rotary_region)
+        return cls(tuple(regions), (offset + alignment - 1) // alignment * alignment,
+                   rotary_region=rotary_region)
 
     def region(self, name):
         for region in self.regions:

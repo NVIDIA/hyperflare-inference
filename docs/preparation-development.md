@@ -42,6 +42,16 @@ before the session's capture guard forbids further kernel resolution.
 
 ## Complete-forward compilation and capture
 
+Compiled forwards retain Inductor memory-pool planning, storage reuse, and
+default peak-memory operation reordering. Callers with asymmetric
+auxiliary-stream forks whose staging allocations exceed main-stream temporaries
+(such as SM103 prefill cold-expert staging) pass
+`compile_options={**_OPTIONS, 'reorder_for_peak_memory': False}` to
+`capture_forwards` so Inductor does not move independent main-stream work ahead
+of the opaque stream launch and serialize the fork. Validate captured
+dependencies as well as outputs and temporary lifetimes when changing branch
+scheduling.
+
 - **Compile complete prepared forwards.** Use
   [capture_forwards](../ignition/preparation/capture.py), which restores compiled
   forwards before tracing and compiles missing variants with static shapes and
@@ -177,6 +187,11 @@ inside an opaque operator cannot participate in that planning.
 Tensors retained by constructors appear as external storage inputs to compilation.
 Their owners keep those allocations alive across graph variants.
 
+Cloned temporaries that opaque operations mutate retain an explicit materialization
+boundary during compilation. Their views address the clone's storage, including
+when its source is a slice with a nonzero offset. Folding such a clone into its
+source would invalidate the offsets used to reconstruct mutable operands.
+
 Constructors use example tensors to declare layouts and prepare kernels.
 The [declaration tensor helper](../ignition/preparation/examples.py) shares examples
 by semantic role, dtype, and device. Declare capacities from largest to smallest
@@ -241,6 +256,14 @@ without Inductor's lifetime planning. Native replay executes the captured work
 without Python calls or steady-state allocations.
 
 ## Physical cache backing and preparation memory
+
+`CoreStorage` reserves a 1 TiB virtual device window per rank by default across
+Linux and Windows. SM103 `"reference"` TP1 preparation passes an explicit 2 TiB
+Linux `device_window=(CoreStorage.DEVICE_BASE, 2 << 40)` through
+`SM103Config.device_window()` so the second half covers persistent tensors,
+continuation rows, and KV pages, which can each reserve a full-device extent on
+a 288 GiB GB300 GPU without backing those virtual extents in full. All other
+recipes and TP layouts retain the default 1 TiB window.
 
 - **Bound preparation cache backing by tuning and capture needs.** Keep virtual
   serving capacity separate from physical preparation backing. Back only the

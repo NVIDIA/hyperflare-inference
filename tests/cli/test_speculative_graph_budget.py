@@ -120,6 +120,27 @@ def test_planning_rejects_graph_budget_below_required_endpoints():
                   speculation=replace(settings, graph_budget=12)).speculation.graph_budget == 12
 
 
+def test_planning_rejects_deepseek41_depth_graph_budget_below_recipe_minimum():
+    from tests.cli.test_planning import derive, gpu
+
+    recipe = resolve("deepseek-v4.1-flash").recipe
+    assert not recipe.packed_speculative_depths
+    devices = tuple(gpu(i, 140) for i in range(4))
+    tp4_small = selected("--mtp-draft-tokens", "7", "--speculative-graph-budget", "11")
+    with pytest.raises(UsageError, match="--speculative-graph-budget: .*at least 12"):
+        derive(model=recipe, gpus=devices, concurrency=32, speculation=tp4_small)
+    assert derive(model=recipe, gpus=devices, concurrency=32,
+                  speculation=replace(tp4_small, graph_budget=12)).speculation.graph_budget == 12
+
+    sm103_recipe = replace(recipe, packed_speculative_depths=True)
+    too_small = selected("--mtp-draft-tokens", "7", "--speculative-token-capacity", "16",
+                         "--speculative-graph-budget", "8")
+    with pytest.raises(UsageError, match="--speculative-graph-budget: .*at least 32"):
+        derive(model=sm103_recipe, gpus=devices, concurrency=16, speculation=too_small)
+    assert derive(model=sm103_recipe, gpus=devices, concurrency=16,
+                  speculation=replace(too_small, graph_budget=32)).speculation.graph_budget == 32
+
+
 @pytest.mark.parametrize("budget", [0, -1, True, 1.5])
 def test_speculation_declaration_validates_graph_budget_type_and_range(budget):
     with pytest.raises(ValueError, match="positive integer"):

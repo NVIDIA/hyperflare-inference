@@ -12,6 +12,7 @@ import triton
 from tests.preparation import test_graph_local_scratch_cuda as serial
 from ignition.components.projection_overlap import _join
 from ignition.preparation.aot import aot_forward
+from ignition.preparation.compilation import _OPTIONS
 
 
 pytestmark = pytest.mark.skipif(
@@ -74,6 +75,107 @@ class Forward:
         tail_workspace = torch.empty_like(source)
         serial._prepared_out(self.source, self.output[0, :1], tail, tail_workspace, 8)
         self.output[2].copy_(tail)
+
+
+class AsymmetricForward:
+    def __init__(self):
+        self.source = torch.full((1 << 18,), .25, device="cuda")
+        self.zero = torch.zeros(1, device="cuda")
+        self.side_output = torch.empty_like(self.source)
+        self.main_output = torch.empty(128, device="cuda")
+        self.stream = torch.cuda.Stream()
+        self.stream_handle = self.stream.cuda_stream
+
+    def __call__(self):
+        source, workspace = torch.empty_like(self.source), torch.empty_like(self.source)
+        serial._prepared_out(self.source, self.zero, source, workspace, 1)
+        side, scratch = torch.empty_like(source), torch.empty_like(source)
+        _start(source, self.zero, side, scratch, 2, self.stream_handle)
+        main, main_workspace = torch.empty_like(self.main_output), torch.empty_like(self.main_output)
+        serial._prepared_out(self.source[:128], self.zero, main, main_workspace, 4)
+        _join(source, main, [side], scratch, self.stream_handle)
+        self.side_output.copy_(side)
+        self.main_output.copy_(main)
+
+
+def _has_independent_finishes(graph):
+    from cuda.bindings import driver as cuda
+
+    def checked(result):
+        status, *values = result
+        assert status == cuda.CUresult.CUDA_SUCCESS
+        return values
+
+    handle = cuda.CUgraph(graph.raw_cuda_graph())
+    _, count = checked(cuda.cuGraphGetNodes(handle))
+    nodes, _ = checked(cuda.cuGraphGetNodes(handle, count))
+    *_, count = checked(cuda.cuGraphGetEdges(handle))
+    sources, destinations, _, _ = checked(cuda.cuGraphGetEdges(handle, count))
+    children = {int(node): set() for node in nodes}
+    for source, destination in zip(sources, destinations, strict=True):
+        children[int(source)].add(int(destination))
+    finishes = []
+    for node in nodes:
+        kind, = checked(cuda.cuGraphNodeGetType(node))
+        if kind != cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            continue
+        parameters, = checked(cuda.cuGraphKernelNodeGetParams(node))
+        name, = checked(cuda.cuFuncGetName(parameters.func))
+        if name == b"_finish":
+            finishes.append(int(node))
+    assert len(finishes) == 3
+
+    def descendants(node):
+        found, pending = set(), list(children[node])
+        while pending:
+            child = pending.pop()
+            if child not in found:
+                found.add(child)
+                pending.extend(children[child])
+        return found
+
+    reachable = {node: descendants(node) for node in finishes}
+    return any(right not in reachable[left] and left not in reachable[right]
+               for index, left in enumerate(finishes) for right in finishes[index + 1:])
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@torch.no_grad()
+def test_asymmetric_branches_remain_independent_after_capture(compiled):
+    forward = AsymmetricForward()
+    artifact = (aot_forward(forward, options={**_OPTIONS, "reorder_for_peak_memory": False})
+                if compiled else None)
+
+    def run():
+        artifact(forward) if compiled else forward()
+
+    run()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            run()
+        assert _has_independent_finishes(graph), "compilation serialized independent branches"
+        graph.instantiate()
+        for value in (.125, -.25, .5):
+            forward.source.fill_(value)
+            forward.side_output.fill_(float("nan"))
+            forward.main_output.fill_(float("nan"))
+            before = torch.cuda.memory_stats()
+            graph.replay()
+            torch.cuda.synchronize()
+            after = torch.cuda.memory_stats()
+            for counter in ("allocation.all.allocated", "allocation.all.freed",
+                            "segment.all.allocated", "segment.all.freed"):
+                assert before[counter] == after[counter]
+            torch.testing.assert_close(forward.side_output, forward.source * 2, rtol=0, atol=0)
+            torch.testing.assert_close(forward.main_output, forward.source[:128] * 4, rtol=0, atol=0)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.parametrize("compiled", [False, True])

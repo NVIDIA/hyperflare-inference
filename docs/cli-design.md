@@ -412,6 +412,7 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--reuse-weights` | Reuse the cached default version's weight hashes and mappings without reading live or cached weight payloads; requires matching checkpoint and prepared layouts. `export` only. | Off |
 | `--publisher-key PATH` | Public publisher profile authenticating the cached weight source; repeatable. `export` only. | Embedded profiles and the local development profile |
 | `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target printed with the exported entry path. Export validates the identifier; the value is not stored in the entry and does not change its cache location. `export` only. | Recipe `export_repository` when declared; otherwise no target is printed |
+| `--sm103-preparation PATH` | Experimental DeepSeek V4.1 TP1 export with explicit host/HBM expert rows (`"execution": "reference"`); see [SM103 preparation](model-preparation.md#experimental-gb300-sm103-tp1-reference-preparation). | Off |
 | `--official-source URL` | Published repository URL under the configured publisher namespace | `[publishing] official_source` |
 
 Normal export reuses matching cached weight payloads automatically after hashing
@@ -516,7 +517,9 @@ physical target capacity to 24 rows while retaining six-token per-request prefix
 ```
 
 Packed cores require adaptive execution at their captured draft depth, or
-`--mtp-draft-tokens 0` for ordinary execution. Native serving uses all captured
+`--mtp-draft-tokens 0` for ordinary execution; SM103 `--sm103-preparation`
+exports also budget lower positive draft depths so `--mtp-draft-tokens N` can
+select captured depths up to `N` without re-export. Native serving uses all captured
 packed capacities by default. Prefer `--mtp-max-verification-token-budget N` to
 retain every captured capacity at or below a ceiling. This example limits the
 24-row core above to at most 16 target rows per round:

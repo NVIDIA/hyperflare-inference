@@ -33,13 +33,17 @@ class PreparedMaintenance:
         page_tokens=PAGE_TOKENS,
         trailing_pages=(),
         trailing_tables=None,
+        excluded_regions=None,
     ):
         self.pool, self.commands, self.inputs, self.requests = pool, commands, inputs, requests
         self.page_tokens = page_tokens
         self.trailing_pages, self.trailing_tables = trailing_pages, trailing_tables
-        self.excluded_regions = (
-            () if draft_state else tuple(r.name for r in pool.layout.regions if r.name.startswith("draft"))
-        )
+        if excluded_regions is None:
+            self.excluded_regions = (
+                () if draft_state else tuple(r.name for r in pool.layout.regions if r.name.startswith("draft"))
+            )
+        else:
+            self.excluded_regions = tuple(excluded_regions)
         if mode == "snapshot":
             slots, epochs, count = inputs.row_slot_ids, inputs.row_generations, inputs.live_rows
         else:

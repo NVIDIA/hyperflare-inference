@@ -1,6 +1,13 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = "==3.12.*"
+
+[manifest]
+
+[[manifest.dependency-metadata]]
+name = "deepinfer"
+version = "0.1.0"
+requires-dist = ["einops>=0.8"]
 
 [[package]]
 name = "accelerate"
@@ -332,10 +339,10 @@ cusparse = [
     { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 nvcc = [
-    { name = "nvidia-cuda-crt", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "nvidia-cuda-nvcc", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "nvidia-cuda-runtime", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "nvidia-nvvm", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "nvidia-cuda-crt", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-nvcc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-nvvm", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
 ]
 nvjitlink = [
     { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
@@ -347,13 +354,26 @@ nvtx = [
     { name = "nvidia-nvtx", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 nvvm = [
-    { name = "nvidia-nvvm", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "nvidia-nvvm", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
 ]
 tileiras = [
-    { name = "nvidia-cuda-nvcc", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "nvidia-cuda-tileiras", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "nvidia-nvvm", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' or platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "nvidia-cuda-nvcc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-tileiras", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-nvvm", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+]
+
+[[package]]
+name = "deep-gemm"
+version = "2.8.2+local"
+source = { git = "https://github.com/local-inference-lab/DeepGEMM.git?rev=bf86b2b19c29a13b8aa18d8ea35972f2afdc485c#bf86b2b19c29a13b8aa18d8ea35972f2afdc485c" }
+
+[[package]]
+name = "deepinfer"
+version = "0.1.0"
+source = { git = "https://github.com/local-inference-lab/DeepInfer.git?rev=0d8f05928995d866aeb155da1d55285daa358f8c#0d8f05928995d866aeb155da1d55285daa358f8c" }
+dependencies = [
+    { name = "einops" },
 ]
 
 [[package]]
@@ -550,6 +570,10 @@ prepare = [
     { name = "torchvision" },
     { name = "transformers", extra = ["chat-template", "torch", "vision"] },
 ]
+sm103-reference = [
+    { name = "deep-gemm" },
+    { name = "deepinfer" },
+]
 test = [
     { name = "pytest" },
     { name = "tiktoken" },
@@ -562,6 +586,8 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'prepare'", specifier = ">=46,<52" },
     { name = "cuda-python", marker = "extra == 'prepare'", specifier = "==13.3.1" },
     { name = "cuda-tile", extras = ["tileiras"], marker = "extra == 'prepare'", specifier = "==1.6.0" },
+    { name = "deep-gemm", marker = "extra == 'sm103-reference'", git = "https://github.com/local-inference-lab/DeepGEMM.git?rev=bf86b2b19c29a13b8aa18d8ea35972f2afdc485c" },
+    { name = "deepinfer", marker = "extra == 'sm103-reference'", git = "https://github.com/local-inference-lab/DeepInfer.git?rev=0d8f05928995d866aeb155da1d55285daa358f8c" },
     { name = "flare-heliopause", marker = "extra == 'prepare'", directory = "heliopause" },
     { name = "flashinfer-python", extras = ["b12x"], marker = "extra == 'prepare'", git = "https://github.com/local-inference-lab/flashinfer.git?branch=main" },
     { name = "huggingface-hub", marker = "extra == 'prepare'", specifier = "==1.33.0" },
@@ -578,7 +604,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'prepare'", specifier = "==0.29.1+cu132", index = "https://download.pytorch.org/whl/cu132" },
     { name = "transformers", extras = ["torch", "vision", "chat-template"], marker = "extra == 'prepare'", specifier = "==5.23.0" },
 ]
-provides-extras = ["test", "api-test", "prepare"]
+provides-extras = ["test", "api-test", "sm103-reference", "prepare"]
 
 [[package]]
 name = "iniconfig"

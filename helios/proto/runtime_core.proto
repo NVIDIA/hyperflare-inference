@@ -118,6 +118,8 @@ message RebuildManifest {
   string online_mxfp8_scope = 30;
   // Preparation context group size; zero/absent retains full-TP context sharding when enabled.
   uint32 context_parallel_size = 31;
+  // Preparation-only reference operator libraries and physical expert row assignments.
+  string sm103_preparation_json = 32;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;

@@ -149,6 +149,46 @@ def test_native_lock_methods_are_not_rebound_in_worker():
         restored.lock.acquire
 
 
+@pytest.mark.parametrize('operator', [torch.ops.aten, torch.ops.aten.add, torch.ops.aten.add.Tensor])
+def test_retained_torch_operator_bindings_are_process_local(operator):
+    restored = loads(dumps(SimpleNamespace(operator=operator)))
+    with pytest.raises(RuntimeError, match='process-local resource Torch operator binding'):
+        restored.operator(torch.ones(1), torch.ones(1))
+    assert torch.equal(torch.ops.aten.add.Tensor(torch.ones(1), torch.ones(1)), torch.full((1,), 2.))
+
+
+def test_importable_native_module_remains_available_to_workers():
+    import math
+
+    restored = loads(dumps(SimpleNamespace(module=math)))
+    assert restored.module.sqrt(9) == 3
+
+
+def test_unimportable_native_extension_module_is_process_local():
+    import types
+    from importlib.machinery import ExtensionFileLoader, ModuleSpec
+
+    extension = types.ModuleType("flare_nonexistent_jit_ext")
+    extension.__spec__ = ModuleSpec("flare_nonexistent_jit_ext",
+                                    ExtensionFileLoader("flare_nonexistent_jit_ext", "/nonexistent/ext.so"))
+    restored = loads(dumps(SimpleNamespace(module=extension)))
+    with pytest.raises(RuntimeError, match="process-local resource native extension flare_nonexistent_jit_ext"):
+        restored.module.launch
+
+
+def test_metadata_preserves_custom_tensor_attributes_without_altering_plain_tensors():
+    plain = torch.empty(16, dtype=torch.float32)
+    annotated = torch.empty((16, 32), dtype=torch.float8_e4m3fn)
+    annotated.sf = torch.empty((16, 1), dtype=torch.int32)
+    restored = loads(dumps(SimpleNamespace(plain=plain, annotated=annotated)))
+    assert isinstance(restored.plain, FakeTensor)
+    assert isinstance(restored.annotated, FakeTensor)
+    assert not hasattr(restored.plain, "sf")
+    assert isinstance(restored.annotated.sf, FakeTensor)
+    assert tuple(restored.annotated.sf.shape) == (16, 1)
+    assert restored.annotated.sf.dtype == torch.int32
+
+
 def test_selected_plan_metadata_survives_without_registering_a_worker_plan():
     from b12x.preparation.types import Plan, plan_from_handle, require_prepared
 
