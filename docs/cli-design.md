@@ -885,10 +885,12 @@ flare run ORG/MODEL@gb202 --filename model.safetensors --gpus 0,1,2,3
 
 These examples use `ORG/MODEL` as a repository placeholder. Repositories contain
 prepared Flare cores, not source Transformers checkpoints. Hardware variants
-are separate Hugging Face revisions named `ga102`, `gb10`, `gb202`, and `gb300`. Automatic selection
-queries the selected GPUs' PCI device identifiers through NVML without initializing
-CUDA. GB10 selects `gb10`; known GB202 devices, including RTX PRO
-6000 Blackwell, select `gb202`; GB300 selects `gb300`; known GA102 devices select `ga102`. All selected GPUs must belong to the same family.
+are separate Hugging Face revisions named `ga102`, `gb10`, `gb202`, `gb203`, and `gb300`.
+Automatic selection queries the selected GPUs' PCI device identifiers through NVML without
+initializing CUDA. GB10 selects `gb10`; known GB202 devices, including RTX PRO 6000 Blackwell,
+select `gb202`; known GB203 devices, including RTX PRO 4500 Blackwell, select `gb203`; GB300
+selects `gb300`; known GA102 devices select `ga102`. All selected GPUs must belong to the same
+family.
 An unknown identifier or a driver unable to report it requires an explicit
 revision. GPU selection follows `CUDA_VISIBLE_DEVICES` for both commands.
 Revision detection runs in a short-lived process so NVML's worker threads cannot
@@ -899,9 +901,10 @@ An explicit GPU list must match the core's local rank count.
 
 An explicit `--revision` overrides `@revision` and hardware detection. It accepts
 a branch, tag, or commit, and permits downloading on a machine without NVIDIA
-hardware. For `gb10`, `gb202`, and `gb300`, the shared CLI and desktop downloader
-tries the corresponding `-tp1` revision if the initial revision lookup returns
-HTTP 404. Flare downloads from the resolved commit and records it under the
+hardware. For a detected platform revision that begins `gb` (`gb10`, `gb202`,
+`gb203`, `gb300`), the shared CLI and desktop downloader tries the corresponding
+`-tp1` revision if the initial revision lookup returns HTTP 404; `ga102` is not
+retried. Flare downloads from the resolved commit and records it under the
 requested revision for offline use. Flare excludes SHA-256 blob filenames and
 `*-data-NN-of-NN.safetensors` companions when selecting the primary; multiple
 primaries require `--filename`. Referenced companions resolve from the primary's
@@ -921,7 +924,7 @@ Both commands accept these download options:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `ga102`, `gb10`, `gb202`, or `gb300` |
+| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `ga102`, `gb10`, `gb202`, `gb203`, or `gb300` |
 | `--filename FILE` | Repository-relative prepared core filename | Sole primary `.safetensors` file |
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub access token (must exist and be non-empty when passed) | `HF_TOKEN`, then `$HF_TOKEN_PATH` / `$HF_HOME/token` / `~/.cache/huggingface/token` when present, otherwise unauthenticated |

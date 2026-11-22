@@ -35,8 +35,8 @@ pub struct Gpu {
     pub uuid: String,
     /// Product name, such as `NVIDIA GB300`.
     pub name: String,
-    /// Flare hardware revision: `gb10`, `gb202`, `gb300`, or `sm{major}{minor}` for any other
-    /// compute capability.
+    /// Flare hardware revision: a `PLATFORMS` name, or `sm{major}{minor}` for a compute
+    /// capability that identifies no platform.
     pub revision: String,
     /// Device memory in bytes. NVML reports no device memory for an integrated GPU that shares
     /// host memory (GB10); this field then holds the host's `MemTotal`.
@@ -219,15 +219,26 @@ pub fn enumerate() -> Result<Vec<Gpu>, Failure> {
     }
 }
 
-/// The Flare hardware revision of a compute capability: `gb10`, `gb202`, `gb300`, or
-/// `sm{major}{minor}`.
+/// The Flare hardware revision of a compute capability, for devices the PCI table does not list
+/// and cores that record no device identity.
 pub fn capability_revision(major: i32, minor: i32) -> String {
     match (major, minor) {
         (12, 1) => "gb10".into(),
         (12, 0) => "gb202".into(),
         (10, 3) => "gb300".into(),
+        (8, 6) => "ga102".into(),
         _ => format!("sm{major}{minor}"),
     }
+}
+
+/// The revision a core requires of its GPUs: the platform recorded in its signed device identity
+/// when that is one Flare names, otherwise the capability of the architecture it was prepared for
+/// (legacy cores record no device identity).
+pub fn core_revision(hardware: &str, major: i32, minor: i32) -> String {
+    if flare_helios::core::naming::PLATFORMS.contains(&hardware) {
+        return hardware.to_owned();
+    }
+    capability_revision(major, minor)
 }
 
 /// The `CUDA_VISIBLE_DEVICES` value that exposes exactly `uuids`, in that order.
@@ -295,30 +306,9 @@ fn text(buffer: &[u8]) -> String {
 }
 
 fn revision(pci_device_id: u32, major: c_int, minor: c_int) -> String {
-    if let Some(revision) = platform(pci_device_id) {
-        return revision.into();
-    }
-    match (major, minor) {
-        (12, 1) => "gb10".into(),
-        (12, 0) => "gb202".into(),
-        (10, 3) => "gb300".into(),
-        _ => format!("sm{major}{minor}"),
-    }
-}
-
-/// The PCI ID table of `crate::hardware`, which selects a revision before compute capability.
-fn platform(pci_id: u32) -> Option<&'static str> {
-    if pci_id & 0xffff != 0x10de {
-        return None;
-    }
-    match pci_id >> 16 {
-        device if flare_helios::core::naming::GB300_DEVICES.contains(&device) => Some("gb300"),
-        0x2e12 => Some("gb10"),
-        0x2b85 | 0x2b87 | 0x2b8c | 0x2bb1 | 0x2bb2 | 0x2bb3 | 0x2bb4 | 0x2bb5 | 0x2bb9 | 0x2bbc => {
-            Some("gb202")
-        }
-        _ => None,
-    }
+    flare_helios::core::naming::platform_from_pci(pci_device_id)
+        .map(str::to_owned)
+        .unwrap_or_else(|| capability_revision(major, minor))
 }
 
 /// Total and available host memory in bytes, which an integrated GPU allocates from.
@@ -354,6 +344,8 @@ mod tests {
         assert_eq!(revision(0x2e1210de, 12, 1), "gb10");
         assert_eq!(revision(0x2bb410de, 12, 0), "gb202");
         assert_eq!(revision(0x2b8510de, 9, 9), "gb202");
+        assert_eq!(revision(0x2c3110de, 12, 0), "gb203");
+        assert_eq!(revision(0x220410de, 8, 6), "ga102");
     }
 
     #[test]
@@ -365,6 +357,18 @@ mod tests {
         assert_eq!(revision(0x2bb41234, 9, 0), "sm90");
         assert_eq!(revision(0x233010de, 9, 0), "sm90");
         assert_eq!(revision(0x290110de, 10, 0), "sm100");
+    }
+
+    #[test]
+    fn a_core_requires_the_revision_its_device_identity_records() {
+        // Compute capability 12.0 covers both dies, so the signed identity decides.
+        assert_eq!(core_revision("gb203", 12, 0), "gb203");
+        assert_eq!(core_revision("gb202", 12, 0), "gb202");
+        assert_eq!(core_revision("ga102", 8, 6), "ga102");
+        // A legacy core records no device identity and keeps the capability fallback.
+        assert_eq!(core_revision("", 12, 0), "gb202");
+        assert_eq!(core_revision("", 8, 6), "ga102");
+        assert_eq!(core_revision("sm120", 9, 0), "sm90");
     }
 
     #[test]

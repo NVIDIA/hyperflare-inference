@@ -35,8 +35,8 @@ const GIB: f64 = (1u64 << 30) as f64;
 /// What a core needs from the pool.
 #[derive(Clone, Debug)]
 pub struct Needs {
-    /// The hardware revision every GPU of the group must have: `gb10`, `gb202`, `gb300`, or
-    /// `sm{major}{minor}`.
+    /// The hardware revision every GPU of the group must have: a `PLATFORMS` name, or
+    /// `sm{major}{minor}` for a core that records no device identity.
     pub revision: String,
     /// True for a multi-host core: one node per rank, one GPU each. False for a single-host
     /// tensor-parallel core: one node with one GPU per rank, run as one process.
