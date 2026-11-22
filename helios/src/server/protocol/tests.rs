@@ -1744,3 +1744,72 @@ fn requested_logprob_ids_require_enablement_and_validate_before_deduplication() 
             json!({"messages":[{"role":"user","content":"x"}],"max_tokens":1,"logprob_token_ids":ids}), false).is_err());
     }
 }
+
+#[test]
+fn failed_responses_apply_and_finish_keep_sequence_numbers_contiguous() {
+    let custom_tool = crate::server::inference::Tool {
+        name: "apply_patch".into(),
+        namespace: None,
+        description: "patch".into(),
+        parameters: json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}),
+        declared_parameters: true,
+        custom: true,
+        grammar: None,
+    };
+    let mut e = Encoder::new(
+        Protocol::Responses,
+        "seq_apply".into(),
+        "m".into(),
+        1,
+        1,
+        vec![PromptUsage { tokens: 4, image_tokens: 0 }],
+        vec![custom_tool.clone()],
+        ToolChoice::Auto,
+        true,
+        false,
+        json!({}),
+    );
+    let mut delivered = e.start();
+    delivered.extend(e.apply(0, vec![Event::Reasoning("plan".into())]).unwrap());
+    let err = e
+        .apply(
+            0,
+            vec![
+                Event::ToolBegin { index: 0, name: "apply_patch".into(), id: None },
+                Event::ToolArguments { index: 0, text: r#"{"patch":"bad"}"#.into() },
+                Event::ToolEnd { index: 0 },
+            ],
+        )
+        .unwrap_err();
+    delivered.push(e.failure(&err));
+    let seqs: Vec<u64> = delivered
+        .iter()
+        .map(|f| f.data["sequence_number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, (0..delivered.len() as u64).collect::<Vec<_>>());
+    assert_eq!(delivered.last().unwrap().event.as_deref(), Some("response.failed"));
+
+    let mut e = Encoder::new(
+        Protocol::Responses,
+        "seq_finish".into(),
+        "m".into(),
+        1,
+        1,
+        vec![PromptUsage { tokens: 4, image_tokens: 0 }],
+        vec![custom_tool],
+        ToolChoice::Required,
+        true,
+        false,
+        json!({}),
+    );
+    let mut delivered = e.start();
+    delivered.extend(e.apply(0, vec![Event::Reasoning("plan".into())]).unwrap());
+    let err = e.finish(0, Termination::Eos, 4, 0, None).unwrap_err();
+    delivered.push(e.failure(&err));
+    let seqs: Vec<u64> = delivered
+        .iter()
+        .map(|f| f.data["sequence_number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, (0..delivered.len() as u64).collect::<Vec<_>>());
+    assert_eq!(delivered.last().unwrap().event.as_deref(), Some("response.failed"));
+}

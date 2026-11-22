@@ -442,6 +442,14 @@ impl Encoder {
         Ok(frames)
     }
     pub fn apply(&mut self, index: usize, events: Vec<Event>) -> Result<Vec<Frame>> {
+        let start_sequence = self.sequence;
+        let result = self.apply_events(index, events);
+        if result.is_err() {
+            self.sequence = start_sequence;
+        }
+        result
+    }
+    fn apply_events(&mut self, index: usize, events: Vec<Event>) -> Result<Vec<Frame>> {
         let mut frames = vec![];
         let mut content_logprobs = Vec::new();
         for event in events {
@@ -529,6 +537,21 @@ impl Encoder {
         Ok(frames)
     }
     pub fn finish(
+        &mut self,
+        index: usize,
+        cause: Termination,
+        generated: u32,
+        cached: u64,
+        stop: Option<String>,
+    ) -> Result<Vec<Frame>> {
+        let start_sequence = self.sequence;
+        let result = self.finish_choice(index, cause, generated, cached, stop);
+        if result.is_err() {
+            self.sequence = start_sequence;
+        }
+        result
+    }
+    fn finish_choice(
         &mut self,
         index: usize,
         cause: Termination,
