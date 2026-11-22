@@ -189,7 +189,7 @@ fn memory_limited_gpu_cache(placement: KvCompression, fail: bool, has_layout: bo
     let integrated = model.ranks[0].integrated;
     let (other_device, other_host) = options
         .prefix_cache
-        .headroom_with_inputs(1, &layout, 1, false)
+        .headroom_with_inputs(1, &layout, 1, false, None)
         .unwrap();
     crate::offload::transfer::FAIL_MIRROR_RESERVATION.set(fail);
     unsafe {

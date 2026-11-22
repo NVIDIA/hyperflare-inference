@@ -748,7 +748,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--prefix-cache-memory SIZE` | Warm host memory for prefix checkpoints and prepared inputs, such as `16G`; `0` disables warm retention | `[prefix_cache] memory`, otherwise `0` |
 | `--prefix-cache-disk DIR` | Directory for prefix checkpoints and prepared inputs on disk | `[paths] prefix_cache`, otherwise disabled |
 | `--prefix-cache-disk-limit SIZE` | Disk retention limit, such as `100G`; `0` disables | `[prefix_cache] disk_limit`, otherwise 10% of free space |
-| `--prefix-cache-drain-on-shutdown[=DURATION\|on\|off]` | Drain host-memory records to local disk at shutdown, optionally bounded by a duration such as `90s` or `2m`; the bare flag means `on`, and a value requires `=` | `[prefix_cache] drain_on_shutdown`, otherwise `off` |
+| `--prefix-cache-drain-on-shutdown[=DURATION\|on\|off]` | Drain host-memory records to local disk or to the pool at shutdown, optionally bounded by a duration such as `90s` or `2m`; the bare flag means `on`, and a value requires `=` | `[prefix_cache] drain_on_shutdown`, otherwise `off` |
 | `--prefix-cache-max-age DURATION\|off` | Expire host records by time since last use | `[prefix_cache] max_age`, otherwise `off` |
 
 The table omits flags specified elsewhere: `--config`, the scheduler flags above,

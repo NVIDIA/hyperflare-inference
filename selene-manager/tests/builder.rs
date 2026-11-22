@@ -207,7 +207,7 @@ fn startup_wait_precedes_readiness_and_restart_never_registers_again() {
     assert_eq!(*registrar.drops.lock().unwrap(), 0);
     prepared.client.as_mut().unwrap().close().unwrap();
     assert_eq!(*registrar.drops.lock().unwrap(), 2);
-    let mut store = prepared.attach(None).unwrap();
+    let mut store = prepared.attach(None, Duration::ZERO).unwrap();
     let mut history = TestHistory::new([3; 32]);
     history.append(&[7; 128], &[]).unwrap();
     assert!(store.lookup(&history, 0, u64::MAX).is_none());

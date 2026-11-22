@@ -360,6 +360,23 @@ fn bytes(core: &Core, capacity: i32, units: u64) -> Result<u64> {
         })
 }
 
+/// Additional per-GPU cost above the capture buffer reserved before pool registration.
+fn capture_growth(
+    layout: &flare_selene::Layout,
+    pages: u64,
+    reserved: u64,
+    host_free: u64,
+    shared_ranks: u64,
+) -> Option<u64> {
+    let slots = pages.checked_add(layout.row_slots() as u64)?;
+    let extra = slots.checked_mul(layout.page_record_bytes)?.saturating_sub(reserved);
+    let host_share = if shared_ranks == 0 { 0 } else { extra.div_ceil(shared_ranks) };
+    if extra > host_free {
+        return None;
+    }
+    host_share.checked_add(extra.div_ceil(512))
+}
+
 fn capacities(
     cores: &[Core],
     available: &[u64],
@@ -367,6 +384,7 @@ fn capacities(
     width: u64,
     page_tokens: u64,
     page_limit: Option<PageLimit>,
+    capture_growth: impl Fn(usize, u64) -> Option<u64>,
 ) -> Result<(u64, u64, u64)> {
     if cores.len() != available.len()
         || cores.is_empty()
@@ -426,13 +444,17 @@ fn capacities(
         ));
     }
     let fits = |rows, pages| {
-        cores.iter().zip(available).all(|(p, &budget)| {
+        cores.iter().zip(available).enumerate().all(|(rank, (p, &budget))| {
             bytes(p, 0, rows)
                 .and_then(|n| {
                     n.checked_add(bytes(p, 1, pages)?)
                         .ok_or_else(|| invalid("cache footprint overflow"))
                 })
-                .is_ok_and(|n| n <= budget)
+                .is_ok_and(|device| {
+                    capture_growth(rank, pages)
+                        .and_then(|extra| device.checked_add(extra))
+                        .is_some_and(|total| total <= budget)
+                })
         })
     };
     for (rank, (core, &budget)) in cores.iter().zip(available).enumerate() {
@@ -564,6 +586,7 @@ impl NativeModel {
         let reserve = headroom(&self.server_config)?;
         let page_tokens = self.server_config["page_tokens"]
             .as_u64()
+            .filter(|&tokens| tokens != 0)
             .ok_or_else(|| invalid("model requires physical page geometry"))?;
         let mut contract: crate::model::PreparedContract =
             serde_json::from_value(self.server_config["model_contract"].clone())
@@ -609,6 +632,12 @@ impl NativeModel {
                 .find(|buffer| buffer.name == name)
                 .map(|buffer| buffer.nbytes)
         })?;
+        let context = self.server_config["max_sequence_tokens"]
+            .as_u64()
+            .ok_or_else(|| invalid("model requires a prepared context ceiling"))?;
+        let ceiling = page_ceiling(options.kv_cache_limit, context, active as u64, &contract)?;
+        let minimum_pages = ceiling.map_or(active as u64 * 8192u64.div_ceil(page_tokens), |limit| limit.minimum);
+        let capture = options.prefix_cache.pool_only() && self.cluster().is_none();
         let cfg = &options.prefix_cache;
         let compression_requested = cfg.compression != crate::offload::KvCompression::Off;
         let codec_layout = if compression_requested {
@@ -643,27 +672,28 @@ impl NativeModel {
         }
         let qualified =
             compression_requested && flare_selene::codec_copy::profile(&geometry).is_some();
-        let (offload_bytes, offload_host) = if cfg.enabled() {
+        let (offload_bytes, offload_host, tier_host) = if cfg.enabled() {
             let layout = flare_selene::Layout::new(&geometry)?;
             let staging = input_window;
-            let (device, host) = options.prefix_cache.headroom_with_inputs(
+            let (device, tier_host) = options.prefix_cache.headroom_with_inputs(
                 self.ranks.len(),
                 &layout,
                 active,
                 staging != 0,
+                capture.then_some(minimum_pages),
             )?;
             let index = if staging == 0 {
                 0
             } else {
                 flare_selene::input::INDEX_HEADROOM_BYTES
             };
-            let host = host
+            let host = tier_host
                 .checked_add(staging)
                 .and_then(|n| n.checked_add(index))
                 .ok_or_else(|| invalid("prepared input staging overflows host memory"))?;
-            (device, host)
+            (device, host, tier_host)
         } else {
-            (0, 0)
+            (0, 0, 0)
         };
         #[cfg(feature = "images")]
         let source_window = if input_window == 0 {
@@ -677,10 +707,6 @@ impl NativeModel {
             .checked_add(input_window)
             .and_then(|bytes| bytes.checked_add(source_window))
             .ok_or_else(|| invalid("CPU image input windows overflow host memory"))?;
-        let context = self.server_config["max_sequence_tokens"]
-            .as_u64()
-            .ok_or_else(|| invalid("model requires a prepared context ceiling"))?;
-        let ceiling = page_ceiling(options.kv_cache_limit, context, active as u64, &contract)?;
         let remaining = |live: crate::offload::transfer::CodecMemory| -> Result<_> {
             let host_future = host_future.saturating_add(live.backstop);
             // Charge at least the owned allocations. CUDA can also acquire context, module
@@ -784,7 +810,7 @@ impl NativeModel {
                 let (workers, live) =
                     crate::offload::transfer::Copiers::reserve(&contexts, &geometry, tiers)?;
                 let budget = remaining(live)?;
-                capacities(cores, &budget.0, active as u64, width, page_tokens, ceiling)?;
+                capacities(cores, &budget.0, active as u64, width, page_tokens, ceiling, |_, _| Some(0))?;
                 Ok::<_, crate::Error>((workers, budget))
             })
             .transpose();
@@ -841,10 +867,6 @@ impl NativeModel {
             None
         };
         if let Some(pool) = &options.prefix_cache.pool {
-            let minimum_pages = ceiling
-                .map_or(active as u64 * 8192u64.div_ceil(page_tokens), |limit| {
-                    limit.minimum
-                });
             let minimum = cores
                 .iter()
                 .map(|core| {
@@ -861,6 +883,7 @@ impl NativeModel {
                 width,
                 page_tokens,
                 ceiling,
+                |_, _| Some(0),
             )?;
             let host = flare_selene::offload::host_pool_budget(host_future)
                 .map_err(|error| error.to_string());
@@ -904,6 +927,12 @@ impl NativeModel {
                 *available = available.saturating_sub(charge);
             }
         }
+        let capture_layout = capture.then(|| flare_selene::Layout::new(&geometry)).transpose()?;
+        let host_growth = if capture {
+            flare_selene::offload::host_pool_budget(host_future)?
+        } else {
+            0
+        };
         let (local_rows, local_pages, _) = capacities(
             cores,
             &available,
@@ -911,6 +940,13 @@ impl NativeModel {
             width,
             page_tokens,
             ceiling,
+            |rank, pages| {
+                let Some(layout) = &capture_layout else {
+                    return Some(0);
+                };
+                let shared = if self.ranks[rank].integrated { integrated } else { 0 };
+                capture_growth(layout, pages, tier_host, host_growth, shared)
+            },
         )?;
         // Fewer pages only shrink KV, and fewer rows only the snapshot slots aliased into it, so
         // the smallest capacity any rank can back fits every rank. Snapshot rows need no
@@ -1652,13 +1688,13 @@ mod tests {
         ] {
             let available =
                 limited_budget(memory, 4 * gib, limit, HEADROOM_BYTES, false, 0).unwrap();
-            let before = capacities(&cores, &[available], 1, 1, 64, None).unwrap();
+            let before = capacities(&cores, &[available], 1, 1, 64, None, |_, _| Some(0)).unwrap();
             let budget = crate::offload::pool::Budget {
                 host: Ok(32 * gib),
                 devices: vec![(available, false)],
             };
             let charges = budget.charges(32 * gib, (32 * gib) / 512);
-            let after = capacities(&cores, &[available - charges[0]], 1, 1, 64, None).unwrap();
+            let after = capacities(&cores, &[available - charges[0]], 1, 1, 64, None, |_, _| Some(0)).unwrap();
             assert!(after.1 < before.1);
             assert!(after.1 >= 8192 / 64);
         }
@@ -1670,7 +1706,7 @@ mod tests {
         let mut previous = 0;
         for budget in [64 << 20, 128 << 20, 512 << 20] {
             let (rows, pages, snapshots) =
-                capacities(&cores, &[budget], 4, 1, 64, None).unwrap();
+                capacities(&cores, &[budget], 4, 1, 64, None, |_, _| Some(0)).unwrap();
             assert_eq!(rows, 5 + snapshots);
             assert_eq!(snapshots, pages.min(4096 - 5));
             assert!(snapshots > previous.max(4 * 8));
@@ -1679,12 +1715,26 @@ mod tests {
     }
 
     #[test]
+    fn pool_capture_growth_charges_mapping_and_shared_host_memory_and_bounds_pages() {
+        let layout = flare_selene::Layout::new(&[flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
+        let reserved = 131 * 4096;
+        assert_eq!(capture_growth(&layout, 130, reserved, 0, 1), Some(0));
+        assert_eq!(capture_growth(&layout, 131, reserved, 4096, 0), Some(8));
+        assert_eq!(capture_growth(&layout, 131, reserved, 4096, 2), Some(2056));
+        assert_eq!(capture_growth(&layout, 132, reserved, 4096, 2), None);
+        let cores = [core(4096, 4096, 1024)];
+        let (_, pages, _) = capacities(&cores, &[1 << 30], 1, 1, 64, None,
+            |_, pages| capture_growth(&layout, pages, reserved, 4096, 1)).unwrap();
+        assert_eq!(pages, 131);
+    }
+
+    #[test]
     fn lower_concurrency_and_verification_move_physical_budget_to_kv() {
         let p = [core(100 << 20, 2 << 20, 100000)];
         let budget = [80 << 30];
-        let full = capacities(&p, &budget, 32, 6, 64, None).unwrap();
-        let reduced = capacities(&p, &budget, 4, 6, 64, None).unwrap();
-        let target_only = capacities(&p, &budget, 4, 1, 64, None).unwrap();
+        let full = capacities(&p, &budget, 32, 6, 64, None, |_, _| Some(0)).unwrap();
+        let reduced = capacities(&p, &budget, 4, 6, 64, None, |_, _| Some(0)).unwrap();
+        let target_only = capacities(&p, &budget, 4, 1, 64, None, |_, _| Some(0)).unwrap();
         assert!(full.0 - full.2 > reduced.0 - reduced.2);
         assert!(reduced.0 - reduced.2 > target_only.0 - target_only.2);
         assert!(full.1 < reduced.1 && reduced.1 < target_only.1);
@@ -1694,21 +1744,21 @@ mod tests {
             assert!(used <= budget[0] && budget[0] - used < 2 << 20);
         }
         // Capture concurrency is deliberately absent from the allocation policy.
-        assert_eq!(reduced, capacities(&p, &budget, 4, 6, 64, None).unwrap());
+        assert_eq!(reduced, capacities(&p, &budget, 4, 6, 64, None, |_, _| Some(0)).unwrap());
     }
 
     #[test]
     fn ranks_share_capacities_and_respect_alignment_and_virtual_extents() {
         let p = [core(123456, 45678, 1000), core(246912, 91356, 1000)];
         let (rows, pages, snapshots) =
-            capacities(&p, &[256 << 20, 80 << 20], 4, 3, 256, None).unwrap();
+            capacities(&p, &[256 << 20, 80 << 20], 4, 3, 256, None, |_, _| Some(0)).unwrap();
         assert!(pages <= 1000);
         for (p, budget) in p.iter().zip([256 << 20, 80 << 20]) {
             assert!(bytes(p, 0, rows - snapshots).unwrap() + bytes(p, 1, pages).unwrap() <= budget);
         }
-        assert!(capacities(&p, &[256 << 20, 1 << 20], 4, 3, 256, None).is_err());
+        assert!(capacities(&p, &[256 << 20, 1 << 20], 4, 3, 256, None, |_, _| Some(0)).is_err());
         let (_, pages, _) =
-            capacities(&[core(1024, 1024, 1024)], &[1 << 30], 1, 1, 64, None).unwrap();
+            capacities(&[core(1024, 1024, 1024)], &[1 << 30], 1, 1, 64, None, |_, _| Some(0)).unwrap();
         assert_eq!(pages, 1024);
     }
 
@@ -1724,17 +1774,17 @@ mod tests {
         });
         for width in [1, 6] {
             let (rows, pages, snapshots) =
-                capacities(&cores, &[1 << 30, 1 << 30], 4, width, 64, limit).unwrap();
+                capacities(&cores, &[1 << 30, 1 << 30], 4, width, 64, limit, |_, _| Some(0)).unwrap();
             assert_eq!(pages, 16);
             assert_eq!(rows - snapshots, 1 + 4 * width);
             // A busy TP rank reduces the common pool. Context mode still starts with fewer
             // pages than a full context when the usable memory budget requires it.
             let (_, pages, _) =
-                capacities(&cores, &[1 << 30, 20 << 20], 4, width, 64, limit).unwrap();
+                capacities(&cores, &[1 << 30, 20 << 20], 4, width, 64, limit, |_, _| Some(0)).unwrap();
             assert!((4..16).contains(&pages));
         }
-        assert!(capacities(&cores, &[1 << 30, 1 << 20], 4, 6, 64, limit).is_err());
-        assert!(capacities(&cores, &[1 << 30, 20 << 20], 4, 6, 64, None).is_err());
+        assert!(capacities(&cores, &[1 << 30, 1 << 20], 4, 6, 64, limit, |_, _| Some(0)).is_err());
+        assert!(capacities(&cores, &[1 << 30, 20 << 20], 4, 6, 64, None, |_, _| Some(0)).is_err());
     }
 
     #[test]

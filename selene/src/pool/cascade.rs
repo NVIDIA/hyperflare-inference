@@ -208,7 +208,6 @@ impl Cascade {
     }
 
     /// Records waiting for a put or being written.
-    #[cfg(test)]
     pub(crate) fn in_progress(&self) -> usize {
         self.pending.len() + self.moving.len()
     }

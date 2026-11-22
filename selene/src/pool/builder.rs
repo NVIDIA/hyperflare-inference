@@ -268,14 +268,17 @@ impl PreparedPool {
     pub fn attach(
         self,
         local: Option<Box<dyn crate::store::TierStore>>,
+        drain_on_shutdown: std::time::Duration,
     ) -> Result<Box<dyn HostStore>> {
-        Ok(Box::new(PooledStore::new(
+        let mut store = PooledStore::new(
             super::local::Tiers::new(local),
             self.client
                 .ok_or("a pool rank agent cannot serve rank zero's store")?,
             self.identity,
             &self.layout,
-        )))
+        );
+        store.drain_on_shutdown = drain_on_shutdown;
+        Ok(Box::new(store))
     }
 }
 
