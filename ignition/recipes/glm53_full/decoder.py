@@ -17,6 +17,7 @@ from flashinfer.triton.norm import rms_norm
 from ignition.components.bf16_experts import PreparedBF16Experts
 from ignition.components.collectives import PreparedAllReduce, PreparedAllReduceRMSNorm
 from ignition.components.embedding import PreparedEmbedding
+from ignition.components.expert_overlap import ConcurrentSharedExpert
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import PreparedMLP
 from ignition.components.moe import PreparedRoutedExperts, PreparedRouter, RouterScratch
@@ -50,7 +51,8 @@ def attention_metadata(metadata: Metadata) -> AttentionMetadata:
 class PreparedMoE:
     """Sigmoid top-8 routing over 256 experts plus the shared expert, before the sum over ranks."""
 
-    def __init__(self, config, source, weights: MoEWeights, *, session, name, workspace, buffers: ExampleBuffers):
+    def __init__(self, config, source, weights: MoEWeights, *, session, name, workspace, buffers: ExampleBuffers,
+                 overlap_gate_up=False):
         raw = config.raw
         rows = source.shape[0]
         experts, top = raw["n_routed_experts"], raw["num_experts_per_tok"]
@@ -84,16 +86,24 @@ class PreparedMoE:
             self.experts = PreparedRoutedExperts(source, weights.experts, scratch.ids, scratch.weights,
                 buffers("moe.routed", rows, HIDDEN), session=session, name=f"{name}.experts", workspace=workspace,
                 router_plan=self.routing.plan)
+        self.concurrent_shared = None
+        if overlap_gate_up and workspace.overlap and not unquantized:
+            self.concurrent_shared = ConcurrentSharedExpert(self.shared, projected_gate_up=True,
+                parallel_plans=(self.routing.plan, self.experts.plan), session=session, workspace=workspace)
         self.unquantized = unquantized
 
     def functional(self, *, session):
         for operator in (self.router_projection, self.routing, self.shared, self.experts):
             operator.functional(session=session)
+        if self.concurrent_shared is not None:
+            self.concurrent_shared.functional(session=session)
         return self
 
     def contributions(self, source, projections=None):
         """Return rank-local routed and shared updates before their BF16 sum."""
         logits = self.router_projection(source) if projections is None else projections[0]
+        pending = (self.concurrent_shared.start(projections[1])
+                   if projections is not None and self.concurrent_shared is not None else None)
         routes = self.routing(logits)
         if self.unquantized:
             valid = torch.full((1,), source.shape[0], dtype=torch.int32, device=source.device)
@@ -101,7 +111,10 @@ class PreparedMoE:
             routed = (rows.float() * routes.weights[:, :, None]).sum(1).to(torch.bfloat16)
         else:
             routed = self.experts(source, routes.ids, routes.weights)
-        shared = self.shared(source) if projections is None else self.shared.from_gate_up(projections[1])
+        if pending is not None:
+            shared = self.concurrent_shared.finish(pending, routed)
+        else:
+            shared = self.shared(source) if projections is None else self.shared.from_gate_up(projections[1])
         return routed, shared
 
     def __call__(self, source, projections=None):
@@ -139,7 +152,7 @@ class PreparedLayer:
             runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.attention_reduce")
         if isinstance(weights.mlp, MoEWeights):
             self.mlp = PreparedMoE(config, source, weights.mlp, session=session, name=f"{name}.moe",
-                                   workspace=workspace, buffers=buffers)
+                                   workspace=workspace, buffers=buffers, overlap_gate_up=weight_first and rows == 4)
         else:
             local = weights.mlp.down.shape[1]
             self.mlp = PreparedMLP(source, weights.mlp, buffers("mlp.gate_up", rows, 2 * local),

@@ -63,14 +63,19 @@ def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
                 value, weights[index], scales[index], gains[index], None, output,
                 workspace, ("none", "multiplier", "reciprocal")[scale_kinds[index]], None, plans[index], "any")
 
-    gate_up, intermediate, projected = outputs[:3]
+    projected_gate = len(outputs) == 2
     with torch.cuda.stream(auxiliary):
-        project(source, 0, gate_up)
+        if projected_gate:
+            gate_up = source
+            intermediate, projected = outputs
+        else:
+            gate_up, intermediate, projected = outputs[:3]
+            project(source, 0, gate_up)
         if activation == "relu2":
             torch.ops.b12x.hyperconnection_relu2(gate_up, intermediate, plans[-1])
         else:
             torch.ops.b12x.hyperconnection_swiglu(gate_up, intermediate, limit, round_silu, plans[-1])
-        project(intermediate, 1, projected)
+        project(intermediate, 0 if projected_gate else 1, projected)
         if len(weights) == 3:
             project(source, 2, outputs[3])
 
@@ -144,6 +149,7 @@ class ConcurrentSharedExpert:
     Main-stream scratch occupies the arena prefix. MLP projections reuse one
     disjoint suffix, sized after autotuning. Explicit mutation operands keep the
     fork, join, and storage lifetimes ordered through forward compilation.
+    A projected gate/up input starts the fork at activation and needs only the down projection.
     An optional source projection computes a shared-expert gate on the same fork;
     the recipe applies its activation and combines outputs after ``finish``.
     With ``defer_launch``, ``start`` records the fork and ``finish`` enqueues the
@@ -154,7 +160,7 @@ class ConcurrentSharedExpert:
     """
 
     def __init__(self, mlp, *, parallel_plans, session, workspace: ScratchArena,
-                 gate_projection=None, defer_launch=False):
+                 gate_projection=None, defer_launch=False, projected_gate_up=False):
         from b12x.gemm.blockscaled._a16 import _weight_parts
         from ignition.components.block_fp8 import BlockFP8Projection
 
@@ -167,9 +173,13 @@ class ConcurrentSharedExpert:
         self.round_silu = getattr(mlp, "round_silu", True)
         self.mlp, self.parallel_plans, self.arena = mlp, tuple(parallel_plans), workspace
         self.defer_launch = bool(defer_launch)
-        self.projections = (mlp.up_projection, mlp.down_projection)
-        self.outputs = [mlp.up_projection.output, mlp.intermediate, mlp.down_projection.output]
+        self.projections = (mlp.down_projection,) if projected_gate_up else (mlp.up_projection, mlp.down_projection)
+        self.outputs = [mlp.intermediate, mlp.down_projection.output]
+        if not projected_gate_up:
+            self.outputs.insert(0, mlp.up_projection.output)
         if gate_projection is not None:
+            if projected_gate_up:
+                raise ValueError("a gate projection requires the unprojected expert input")
             self.projections += (gate_projection,)
             self.outputs.append(gate_projection.output)
         self.weights, self.scales, self.gains, self.scale_kinds = [], [], [], []
@@ -285,7 +295,7 @@ class ConcurrentSharedExpert:
                 self.scale_kinds, pending.outputs, pending.workspace, self.plans, self.activation,
                 self.limit, self.round_silu, self.stream_handle, self.launch_order,
                 pending.encoded, self.encoding_offsets, self.quantizers)
-            return pending.outputs[2]
+            return pending.outputs[1 if len(pending.outputs) == 2 else 2]
         _join_shared_expert(source, routed, self.weights, self.scales, self.gains, self.scale_kinds,
                            self.outputs, self.workspace, self.plans, self.activation, self.limit,
                            self.round_silu, self.stream_handle, self.launch_order,
