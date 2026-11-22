@@ -86,6 +86,15 @@ fn allowance(work: u64, fraction: f64) -> u64 {
     ((work as f64) * fraction).floor().min(u64::MAX as f64) as u64
 }
 
+/// Whether `work` tokens for `nanos` cost less per token than `best`; a tie prefers more work.
+fn cheaper(work: usize, nanos: u64, best: Option<(usize, u64)>) -> bool {
+    best.is_none_or(|(old_work, old_ns)| {
+        u128::from(nanos) * (old_work as u128) < u128::from(old_ns) * work as u128
+            || (u128::from(nanos) * old_work as u128 == u128::from(old_ns) * work as u128
+                && work > old_work)
+    })
+}
+
 impl LiveRequest {
     pub(super) fn checkpoint_anchor(&self) -> usize {
         self.message_boundaries
@@ -155,17 +164,48 @@ impl RequestScheduler {
             .fold(0usize, usize::saturating_add)
     }
 
-    fn interval_prefill_ns(
-        &self,
-        request: &LiveRequest,
-        mut start: usize,
-        end: usize,
-    ) -> Option<u64> {
+    /// Each prefill capacity this request can use, with its measured cost when one is known
+    /// and nonzero. Selection reads the costs once instead of once per chunk of every interval.
+    fn prefill_catalog_costs(&self, request: &LiveRequest) -> Vec<(usize, Option<u64>)> {
         let catalog = if request.prompt_logprobs {
             &self.scored_prefill_catalog
         } else {
             &self.prefill_catalog
         };
+        catalog
+            .iter()
+            .map(|&capacity| {
+                // Prefill dispatch retains measured costs after expiry; aging alone
+                // does not make its predicted work unknown.
+                let nanos = self
+                    .costs
+                    .duration(request.prefill_kind(), 1, capacity)
+                    .filter(|&nanos| nanos != 0);
+                (capacity, nanos)
+            })
+            .collect()
+    }
+
+    fn interval_prefill_ns(
+        request: &LiveRequest,
+        catalog: &[(usize, Option<u64>)],
+        mut start: usize,
+        end: usize,
+    ) -> Option<u64> {
+        // With every cost known, the capacity cheapest per token is chosen whole at each
+        // position whose chunk ends by the next window end, span start or interval end: a
+        // smaller one fits unchanged, and a larger one only does worse when cut short.
+        let stride = catalog
+            .iter()
+            .try_fold(None, |best, &(capacity, nanos)| {
+                let nanos = nanos?;
+                Some(if cheaper(capacity, nanos, best) {
+                    Some((capacity, nanos))
+                } else {
+                    best
+                })
+            })
+            .flatten();
         let mut total = 0u64;
         while start < end {
             let limit = request
@@ -177,8 +217,29 @@ impl RequestScheduler {
                 .min()
                 .unwrap_or(end)
                 .min(end);
+            if let Some((capacity, nanos)) = stride
+                && !request
+                    .prefill_spans
+                    .iter()
+                    .any(|span| span.start <= start && start < span.end)
+            {
+                let bound = request
+                    .prefill_spans
+                    .iter()
+                    .map(|span| span.start)
+                    .filter(|&span_start| start < span_start)
+                    .fold(limit, usize::min);
+                let chunks = (bound - start) / capacity;
+                if chunks > 0 {
+                    #[cfg(test)]
+                    tests::STRIDE_RUNS.set(tests::STRIDE_RUNS.get() + 1);
+                    total = total.checked_add(nanos.checked_mul(chunks as u64)?)?;
+                    start += chunks * capacity;
+                    continue;
+                }
+            }
             let mut best: Option<(usize, u64)> = None;
-            for &capacity in catalog {
+            for &(capacity, nanos) in catalog {
                 let mut through = start.saturating_add(capacity).min(limit);
                 if let Some(span) = request
                     .prefill_spans
@@ -191,18 +252,8 @@ impl RequestScheduler {
                 if work == 0 {
                     continue;
                 }
-                // Prefill dispatch retains measured costs after expiry; aging alone
-                // does not make its predicted work unknown.
-                let nanos = self
-                    .costs
-                    .duration(request.prefill_kind(), 1, capacity)
-                    .filter(|&nanos| nanos != 0)?;
-                if best.is_none_or(|(old_work, old_ns)| {
-                    u128::from(nanos) * (old_work as u128) < u128::from(old_ns) * work as u128
-                        || (u128::from(nanos) * old_work as u128
-                            == u128::from(old_ns) * work as u128
-                            && work > old_work)
-                }) {
+                let nanos = nanos?;
+                if cheaper(work, nanos, best) {
                     best = Some((work, nanos));
                 }
             }
@@ -242,6 +293,8 @@ impl RequestScheduler {
         request: &LiveRequest,
         quote_storage: bool,
     ) -> (CheckpointAccounting, bool, bool) {
+        #[cfg(test)]
+        tests::SELECTIONS.set(tests::SELECTIONS.get() + 1);
         let mut accounting = request.checkpoints.clone();
         if accounting
             .cuts
@@ -258,9 +311,10 @@ impl RequestScheduler {
             request.admission_reused_tokens as usize,
             request.prompt_tokens,
         ));
+        let catalog = self.prefill_catalog_costs(request);
         if accounting.initial_prefill_ns.is_none() {
             accounting.initial_prefill_ns =
-                self.interval_prefill_ns(request, baseline_start, baseline_end);
+                Self::interval_prefill_ns(request, &catalog, baseline_start, baseline_end);
         }
         if anchor > start {
             accounting.cuts.push(Cut {
@@ -290,6 +344,8 @@ impl RequestScheduler {
         if start < request.prompt_tokens && request.prompt_tokens != anchor {
             candidates.push((request.prompt_tokens, RetentionRole::Endpoint));
         }
+        // The interval between accepted cuts is shared by every candidate inside it.
+        let mut between: Option<((usize, usize), Option<u64>)> = None;
         for (endpoint, role) in candidates {
             let left = accounting
                 .cuts
@@ -308,14 +364,19 @@ impl RequestScheduler {
             let split = if endpoint == right {
                 Some(0)
             } else {
-                self.interval_prefill_ns(request, left, right)
-                    .zip(
-                        self.interval_prefill_ns(request, left, endpoint)
-                            .zip(self.interval_prefill_ns(request, endpoint, right)),
-                    )
-                    .map(|(whole, (before, after))| {
-                        before.saturating_add(after).saturating_sub(whole)
-                    })
+                let whole = match between {
+                    Some((interval, nanos)) if interval == (left, right) => nanos,
+                    _ => {
+                        let nanos = Self::interval_prefill_ns(request, &catalog, left, right);
+                        between = Some(((left, right), nanos));
+                        nanos
+                    }
+                };
+                whole.and_then(|whole| {
+                    let before = Self::interval_prefill_ns(request, &catalog, left, endpoint)?;
+                    let after = Self::interval_prefill_ns(request, &catalog, endpoint, right)?;
+                    Some(before.saturating_add(after).saturating_sub(whole))
+                })
             };
             let Some(split_ns) = split else {
                 unknown = true;
@@ -670,6 +731,13 @@ impl RequestScheduler {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Uncached checkpoint selections on this thread.
+        pub(super) static SELECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Runs of whole cheapest chunks the interval walk summed at once.
+        pub(super) static STRIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     fn measure(scheduler: &mut RequestScheduler, kind: GraphKind, tokens: usize, nanos: u64) {
         scheduler.costs.set_measured(
             &ScheduledStep {
@@ -696,6 +764,268 @@ mod tests {
             );
         }
         measure(scheduler, GraphKind::Snapshot, 1, 1);
+    }
+
+    /// The interval walk as it was before catalog costs were resolved once per selection.
+    fn reference_interval_prefill_ns(
+        scheduler: &RequestScheduler,
+        request: &LiveRequest,
+        mut start: usize,
+        end: usize,
+    ) -> Option<u64> {
+        let catalog = if request.prompt_logprobs {
+            &scheduler.scored_prefill_catalog
+        } else {
+            &scheduler.prefill_catalog
+        };
+        let mut total = 0u64;
+        while start < end {
+            let limit = request
+                .checkpoints
+                .window_ends
+                .iter()
+                .copied()
+                .filter(|&limit| start < limit)
+                .min()
+                .unwrap_or(end)
+                .min(end);
+            let mut best: Option<(usize, u64)> = None;
+            for &capacity in catalog {
+                let mut through = start.saturating_add(capacity).min(limit);
+                if let Some(span) = request
+                    .prefill_spans
+                    .iter()
+                    .find(|span| span.start < through && through < span.end)
+                {
+                    through = span.start;
+                }
+                let work = through.saturating_sub(start);
+                if work == 0 {
+                    continue;
+                }
+                let nanos = scheduler
+                    .costs
+                    .duration(request.prefill_kind(), 1, capacity)
+                    .filter(|&nanos| nanos != 0)?;
+                if best.is_none_or(|(old_work, old_ns)| {
+                    u128::from(nanos) * (old_work as u128) < u128::from(old_ns) * work as u128
+                        || (u128::from(nanos) * old_work as u128
+                            == u128::from(old_ns) * work as u128
+                            && work > old_work)
+                }) {
+                    best = Some((work, nanos));
+                }
+            }
+            let (work, nanos) = best?;
+            start += work;
+            total = total.checked_add(nanos)?;
+        }
+        Some(total)
+    }
+
+    /// Scored prefill and one mixed shape, which the shared duration fixture lacks.
+    fn extra_graphs() -> Vec<crate::execution::GraphDescriptor> {
+        let graph = |kind, batch, tokens, prefill| crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            draft_tokens: 0,
+            packed_token_capacity: 0,
+            name: format!("{kind:?}-{batch}-{tokens}-{prefill}"),
+            kind,
+            sampling_mode: crate::execution::SamplingMode::General,
+            handle: 1,
+            batch_capacity: batch,
+            token_capacity: tokens,
+            prefill_capacity: prefill,
+            estimated_duration_ns: 5_000,
+            input_bindings: vec![],
+        };
+        let mut graphs: Vec<_> = [128, 256, 512]
+            .into_iter()
+            .map(|tokens| graph(GraphKind::ScoredPrefill, 1, tokens, 0))
+            .collect();
+        graphs.push(graph(GraphKind::Mixed, 2, 1, 512));
+        graphs
+    }
+
+    fn walk_scheduler(scored: bool) -> RequestScheduler {
+        let template = super::super::tests::scheduler(2, 128, 16);
+        let mut scheduler = RequestScheduler::new(
+            [9; 32],
+            SchedulerLimits {
+                max_sequence_tokens: 16_384,
+                pages: 1024,
+                ..template.limits
+            },
+            template.capabilities.clone(),
+        )
+        .unwrap();
+        let mut graphs = super::super::tests::duration_graphs(2);
+        graphs.extend(extra_graphs());
+        scheduler.measured_graph_durations(&graphs).unwrap();
+        scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+        if scored {
+            scheduler.scored_prefill_graphs(&[128, 256, 512]).unwrap();
+        }
+        scheduler
+    }
+
+    #[test]
+    fn resolved_catalog_costs_walk_every_interval_as_the_lookups_did() {
+        let profiles: [(&str, &[(usize, u64)]); 6] = [
+            ("smallest cheapest", &[(128, 90_000), (256, 250_000), (512, 410_000)]),
+            ("middle cheapest", &[(128, 120_000), (256, 200_000), (512, 450_000)]),
+            ("ties take the largest", &[(128, 128_000), (256, 256_000), (512, 512_000)]),
+            ("largest cheapest", &[(128, 200_000), (256, 300_000), (512, 400_000)]),
+            ("one capacity unknown", &[(128, 90_000), (256, 0), (512, 410_000)]),
+            ("sums overflow", &[(128, u64::MAX / 16), (256, u64::MAX / 8), (512, u64::MAX / 4)]),
+        ];
+        // A span longer than the 128 and 256 strides, two adjacent spans, and a window
+        // ending at a span end. A span may be at most one chunk long.
+        let spans = [1000..1500, 2500..2600, 2600..2700, 4000..4100];
+        let windows = vec![1500, 3333, 5120];
+        let prompt = 6000;
+        let landmarks = [
+            0, 999, 1000, 1001, 1500, 2500, 2600, 2700, 3333, 4000, 4100, 5120, prompt,
+        ];
+        let mut intervals: Vec<(usize, usize)> = (0..prompt)
+            .step_by(97)
+            .flat_map(|start| (start..=prompt).step_by(113).map(move |end| (start, end)))
+            .collect();
+        for &mark in &landmarks {
+            for &other in &landmarks {
+                intervals.push((mark.min(other), mark.max(other)));
+            }
+            for offset in [1, 63, 128, 511, 512, 513, 1500] {
+                intervals.push((mark.saturating_sub(offset), mark));
+                intervals.push((mark, (mark + offset).min(prompt)));
+            }
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let a = (seed >> 33) as usize % (prompt + 1);
+            let b = (seed >> 11) as usize % (prompt + 1);
+            intervals.push((a.min(b), a.max(b)));
+        }
+        for scored in [false, true] {
+            let kind = if scored {
+                GraphKind::ScoredPrefill
+            } else {
+                GraphKind::Prefill
+            };
+            for (name, costs) in profiles {
+                let mut scheduler = walk_scheduler(scored);
+                for &(capacity, nanos) in costs {
+                    measure(&mut scheduler, kind, capacity, nanos);
+                }
+                let mut spec = super::super::tests::spec(prompt, 1);
+                spec.prompt_logprobs = scored;
+                let handle = scheduler.admit(spec).unwrap();
+                scheduler.set_prefill_spans(handle, &spans).unwrap();
+                scheduler.request_mut(handle).unwrap().checkpoints.window_ends = windows.clone();
+                let request = scheduler.request(handle).unwrap();
+                assert_eq!(request.prefill_kind(), kind);
+                let catalog = scheduler.prefill_catalog_costs(request);
+                STRIDE_RUNS.set(0);
+                let mut unknown = 0;
+                for &(start, end) in &intervals {
+                    let walked =
+                        RequestScheduler::interval_prefill_ns(request, &catalog, start, end);
+                    assert_eq!(
+                        walked,
+                        reference_interval_prefill_ns(&scheduler, request, start, end),
+                        "{name}, scored {scored}: {start}..{end}"
+                    );
+                    unknown += usize::from(walked.is_none());
+                }
+                // The shortcut ran wherever every cost is known; unknown or overflowing
+                // sums came back as None on both walks.
+                let known = !costs.iter().any(|&(_, nanos)| nanos == 0);
+                assert_eq!(STRIDE_RUNS.get() > 0, known, "{name}, scored {scored}");
+                let expect_unknown = name == "one capacity unknown" || name == "sums overflow";
+                if expect_unknown {
+                    assert!(unknown > 100, "{name}, scored {scored}: {unknown} unknown");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selections_over_long_agentic_prompts_look_costs_up_once_per_selection() {
+        let template = super::super::tests::scheduler(4, 128, 16);
+        let mut scheduler = RequestScheduler::new(
+            [9; 32],
+            SchedulerLimits {
+                max_sequence_tokens: 262_144,
+                prefill_chunk_size: 8192,
+                pages: 16_384,
+                ..template.limits
+            },
+            template.capabilities.clone(),
+        )
+        .unwrap();
+        let mut graphs = super::super::tests::duration_graphs(4);
+        graphs.extend(extra_graphs());
+        scheduler.measured_graph_durations(&graphs).unwrap();
+        scheduler.mixed_graphs(&[(2, 1, 512)]).unwrap();
+        linear_costs(&mut scheduler);
+        scheduler
+            .configure_policy(PolicyConfig {
+                checkpoint_extra_work_fraction: 0.05,
+                ..Default::default()
+            })
+            .unwrap();
+        // Four long agentic conversations in prefill, each with a boundary every 150 tokens.
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let mut spec = super::super::tests::spec(150_000, 1);
+            spec.message_boundaries = (150..150_000).step_by(150).collect();
+            handles.push(scheduler.admit(spec).unwrap());
+        }
+        let catalog = scheduler.prefill_catalog.len();
+        super::super::cost::ENTRY_LOOKUPS.set(0);
+        let started = std::time::Instant::now();
+        for &handle in &handles {
+            let request = scheduler.request(handle).unwrap();
+            std::hint::black_box(scheduler.checkpoint_cut(request));
+        }
+        let elapsed = started.elapsed();
+        let lookups = super::super::cost::ENTRY_LOOKUPS.get();
+        let started = std::time::Instant::now();
+        for &handle in &handles {
+            let request = scheduler.request(handle).unwrap();
+            std::hint::black_box(scheduler.estimated_checkpoint_cut(request));
+        }
+        println!(
+            "LONG_PROMPT_ESTIMATE requests=4 elapsed={:.2} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        println!(
+            "LONG_PROMPT_SELECTION requests=4 boundaries=999 catalog={catalog} \
+             lookups={lookups} elapsed={:.1} ms",
+            elapsed.as_secs_f64() * 1e3
+        );
+        // Each selection resolves the catalog once; the snapshot cost adds one more.
+        assert!(lookups <= handles.len() * (catalog + 4), "{lookups} cost lookups");
+        // Service rates price every prefill capacity and the mixed shape from one selection,
+        // with the work each capacity would take unchanged.
+        let request = scheduler.request(handles[0]).unwrap();
+        let cut = scheduler.estimated_checkpoint_cut(request);
+        let capacities = scheduler.prefill_catalog.iter().copied().chain([512]);
+        for capacity in capacities {
+            assert_eq!(
+                scheduler.prefill_work_through(request, capacity, cut),
+                scheduler.prefill_work(request, capacity),
+                "{capacity}"
+            );
+        }
+        assert!(scheduler.prefill_work(request, 512) > 0);
+        SELECTIONS.set(0);
+        std::hint::black_box(scheduler.service_rates(request));
+        assert_eq!(SELECTIONS.get(), 1);
     }
 
     #[test]

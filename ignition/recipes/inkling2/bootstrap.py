@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare Inkling 2 text, vision and complete DSpark generation graphs on four GPUs, on one host or across four hosts."""
+"""Prepare Inkling 2 text, vision and complete DSpark generation graphs."""
 
 import contextlib
 import hashlib
@@ -36,7 +36,7 @@ from ignition.preparation.tuning import RecordedPreparationSession, with_autotun
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
-from .config import WORLD_SIZE, ModelConfig
+from .config import ModelConfig
 from .contract import prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch
 from .weights import ModelWeights
@@ -63,15 +63,17 @@ class PreparationConfig(BasePreparationConfig):
     speculative_widths: tuple[int, ...] = tuple(range(1, 9))
     speculative_token_capacity: int | None = 128
     speculative_graph_budget: int = 64
+    draft_head_quantization: str | None = None
+    markov_head_quantization: str | None = None
     benchmark_selection: object | None = None
 
     def __post_init__(self):
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
-        if (not isinstance(self.devices, tuple) or len(self.devices) != WORLD_SIZE
-                or len(set(placements)) != WORLD_SIZE
-                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != WORLD_SIZE)
+        if (not isinstance(self.devices, tuple) or len(self.devices) not in (1, 4)
+                or len(set(placements)) != len(self.devices)
+                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
                 or any(type(d) is not int or d < 0 for d in self.devices)):
-            raise ValueError("Inkling 2 preparation requires four distinct GPUs")
+            raise ValueError("Inkling 2 preparation requires 1 or 4 distinct GPUs")
         validate_host_topology(self.roce_ring, self.roce_chain, self.hosts)
         request_capacity(self.max_active)
         if not 1 <= self.max_active <= 32:
@@ -91,6 +93,12 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.drafting and (not self.speculative_widths or not set(self.speculative_widths) <= set(range(1, 9))):
             raise ValueError("Inkling 2 verification widths must be in [1, 8]")
+        if self.draft_head_quantization not in (None, "nvfp4", "mxfp8"):
+            raise ValueError(f"unsupported DSpark draft head quantization: {self.draft_head_quantization!r}")
+        if self.markov_head_quantization not in (None, "nvfp4"):
+            raise ValueError(f"unsupported DSpark Markov head quantization: {self.markov_head_quantization!r}")
+        if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and not self.drafting:
+            raise ValueError("DSpark proposal head quantization requires drafting")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency) if self.vision else 0)
@@ -131,6 +139,8 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, hi
     log-probability channels are None without drafting.
     """
     slots, world = request_capacity(config.max_active), len(config.devices)
+    if world == 1:
+        return None, None, None, None
     tokens = max(config.prefill_chunk_size, config.decode_tokens)
     vocabulary_rows = max(config.decode_samples, slots)
     if coordinator.spans_hosts:
@@ -181,7 +191,7 @@ class InklingResume(PreparedResume):
 @with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     from .frontend import prepare as prepare_frontend, runtime_assets
-    from .recipe import RECIPE
+    from .recipe import RECIPE, MINI_RECIPE
 
     snapshot = Path(snapshot).resolve()
     world = len(config.devices)
@@ -195,13 +205,20 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         headers = [entry.header_sha256 for entry in manifest.shards]
         model = ModelConfig.load(snapshot)
         model.validate_shard(shard)
+        recipe = MINI_RECIPE if model.text.loop is not None else RECIPE
+        decoder_type = PreparedDecoder
+        if model.text.loop is not None:
+            from .mini_decoder import PreparedLoopDecoder
+            decoder_type = PreparedLoopDecoder
     # Continuation rows and pages hold the prepared layers only.
-    text = model.text if config.decoder_layers is None else model.text.prefix(config.decoder_layers)
+    text = (model.text if config.decoder_layers is None else model.text.prefix(config.decoder_layers)).cache_config
     if not text.global_layers:
         raise ValueError("a decoder-layer prefix must include a global-attention layer, whose K/V use pages")
     with phase(progress, "Load weights"):
         weights = ModelWeights.load(manifest, device, shard=shard, layers=config.decoder_layers,
-                                    progress=progress, drafting=config.drafting, vision=config.vision)
+                                    progress=progress, drafting=config.drafting, vision=config.vision,
+                                    draft_head_quantization=config.draft_head_quantization,
+                                    markov_head_quantization=config.markov_head_quantization)
         weights_bytes = torch.cuda.memory_allocated(device)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
@@ -237,15 +254,19 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         width = max((w for _, w, _ in config.speculative_round_shapes), default=1)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + width), device=device)
-        coordinator = CollectivePreparation(group)
+        coordinator = CollectivePreparation(group) if group is not None else None
         runtime, vocabulary_runtime, sampling_runtime, logprob_runtime = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
             hidden=text.hidden, local_vocabulary=weights.head.shape[0],
             draft_block=model.draft.block)
-        identity = hashlib.sha256(json.dumps({"text": model.text.__dict__ | {"local_layers": sorted(model.text.local_layers)},
+        identity_payload = {"text": model.text.__dict__ | {"local_layers": sorted(model.text.local_layers)},
             "quantization": model.quantization, "headers": headers, "world_size": world,
-            "decoder_layers": len(weights.layers), "contract": "inkling2.paged-text.v1"},
-            sort_keys=True, default=str).encode()).hexdigest()
+            "decoder_layers": len(weights.layers), "contract": "inkling2.paged-text.v1"}
+        if config.draft_head_quantization is not None:
+            identity_payload["draft_head_quantization"] = config.draft_head_quantization
+        if config.markov_head_quantization is not None:
+            identity_payload["markov_head_quantization"] = config.markov_head_quantization
+        identity = hashlib.sha256(json.dumps(identity_payload, sort_keys=True, default=str).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             tuning_replica=config.tuning_replica,
@@ -286,7 +307,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     speculation = None
     if config.drafting:
         from .dspark import SpeculativePreparation
-        speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, decoder=PreparedDecoder,
+        speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, decoder=decoder_type,
             completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
             collectives=collectives, draft_tokens=config.draft_tokens, sampling_runtime=sampling_runtime,
             logprob_runtime=logprob_runtime)
@@ -306,7 +327,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                     name = f"{mode}{capacity}" + (suffix if mode == "prefill" else "")
                     m = Metadata.allocate(capacity, rows, blocks, device)
                     storage = prefill_storage if mode == "prefill" else decode_storage
-                    decoder = PreparedDecoder(mode_weights, None, storage.rows(capacity, rows), m, pool,
+                    decoder = decoder_type(mode_weights, None, storage.rows(capacity, rows), m, pool,
                         mode=mode, session=session, workspace=arena, name=name, **collectives)
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and vision_state else None)
@@ -345,9 +366,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             from .vision_state import PreparedVisionGeneration
             raw = json.loads((snapshot / "config.json").read_text())
             with torch.device("meta"):
-                module = Inkling2VisionModel(Inkling2VisionConfig.from_dict(raw["vision_config"]))
+                module = Inkling2VisionModel(Inkling2VisionConfig.from_dict(
+                    raw["vision_config"], **(dict(text_hidden_size=model.text.hidden) if model.text.loop is not None else {})))
             name = f"vision{capacity}"
-            encoder = PreparedVision(module, VisionScratch.allocate(capacity, device),
+            encoder = PreparedVision(module, VisionScratch.allocate(capacity, device, hidden=model.text.hidden),
                 VisionMetadata.allocate(capacity, 1, device), weights.vision,
                 session=session, name=name, projection_workspace=arena, attention_workspace=arena)
             encoder.functional(session=session)
@@ -370,10 +392,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
     release_unused()
-    server_config = dict(identity=identity, model_id=RECIPE.served_model_name, max_sequence_tokens=config.context,
+    server_config = dict(identity=identity, model_id=recipe.served_model_name, max_sequence_tokens=config.context,
         prefill_chunk_size=config.prefill_chunk_size, pages=pages, state_rows=state_rows, snapshots=snapshots,
         page_tokens=PAGE_TOKENS, frontend=prepare_frontend(snapshot, vision=config.vision), assets=runtime_assets(snapshot),
-        sampling_defaults=RECIPE.sampling_defaults.as_dict(),
+        sampling_defaults=recipe.sampling_defaults.as_dict(),
         model_contract=prepare_contract(signatures, buffers, pool, vocabulary=vocabulary,
             image_slots=config.image_concurrency, vision=config.vision, drafting=config.drafting))
     if config.drafting:
@@ -392,8 +414,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         reserved_tensor_bytes=torch.cuda.memory_reserved(device), headroom_bytes=config.headroom_bytes,
         tuning=tuning, compiled_decoder=config.compile_decoder)
     # Each decoder layer's weights form one stable payload; vocabulary shards, norms and the output query share misc.
-    rebuild_weights = declare_weights(weights, components=("embedding", "embedding_norm", "final_norm", "output_query",
-                                                           "unembedding", "draft", "vision"))
+    components = ("embedding", "embedding_norm", "final_norm", "output_query", "unembedding", "draft", "vision")
+    if weights.cross_pass_queries_t is not None:
+        components = (*components, "cross_pass_queries_t")
+    rebuild_weights = declare_weights(weights, components=components)
     return PreparedModel(rebuild_weights=rebuild_weights, device=config.devices[rank], graphs=graphs, buffers=buffers,
         signatures={name: signatures[name] for name in graphs}, max_active=config.max_active, session=session,
         server_config=server_config, memory_report=memory,

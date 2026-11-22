@@ -16,6 +16,9 @@ use tokenizers::Tokenizer;
 
 use crate::{AdmissionError, Error, Failure, Result};
 
+#[cfg(feature = "server")]
+pub(crate) mod strict;
+
 const MAX_GRAMMAR_BYTES: usize = 262_144;
 const MAX_SCHEMA_NODES: usize = 8_192;
 const MAX_SCHEMA_DEPTH: usize = 64;
@@ -533,6 +536,14 @@ impl GrammarCompiler {
         format!("{terminal}: {text}\n{ending}{name}: {prefix}{name}_end\n")
     }
 
+    /// Compile a complete JSON byte language without sampling masks.
+    pub(crate) fn compile_json_schema_text(&self, schema: &Value) -> Result<TextGrammar> {
+        self.compile_text_grammar(
+            TopLevelGrammar::from_json_schema(schema.clone()),
+            "strict tool JSON schema",
+        )
+    }
+
     /// Compile a complete custom-tool input contract without sampling masks.
     pub(crate) fn compile_text(&self, syntax: &str, source: &str) -> Result<TextGrammar> {
         let grammar = match syntax {
@@ -550,11 +561,16 @@ impl GrammarCompiler {
                 ));
             }
         };
+        self.compile_text_grammar(grammar, "custom tool grammar")
+    }
+
+    fn compile_text_grammar(
+        &self,
+        grammar: TopLevelGrammar,
+        description: &'static str,
+    ) -> Result<TextGrammar> {
         let parser = self.factory.create_parser(grammar).map_err(|e| {
-            Error::admission(
-                AdmissionError::Grammar,
-                format!("invalid custom tool grammar: {e:#}"),
-            )
+            Error::admission(AdmissionError::Grammar, format!("invalid {description}: {e:#}"))
         })?;
         let mut matcher = Matcher::new(Ok(parser));
         let warnings = matcher.grammar_warnings();
@@ -562,12 +578,12 @@ impl GrammarCompiler {
             return Err(Error::admission(
                 AdmissionError::Grammar,
                 format!(
-                    "invalid custom tool grammar: {}",
+                    "invalid {description}: {}",
                     matcher.get_error().unwrap_or_else(|| warnings.join("; "))
                 ),
             ));
         }
-        Ok(TextGrammar { matcher })
+        Ok(TextGrammar { matcher, description })
     }
 
     fn compile(&self, grammar: TopLevelGrammar) -> Result<RequestGrammar> {
@@ -620,26 +636,32 @@ fn validate_lark(grammar: &str) -> Result<()> {
 
 pub(crate) struct TextGrammar {
     matcher: Matcher,
+    description: &'static str,
 }
 impl TextGrammar {
     pub fn validate(&self, text: &str) -> Result<()> {
+        let subject = match self.description {
+            "custom tool grammar" => "custom tool input",
+            "strict tool JSON schema" => "strict tool arguments",
+            description => description,
+        };
         let mut matcher = self.matcher.clone();
         let environment = matcher
             .tok_env()
-            .map_err(|e| format!("custom tool grammar: {e}"))?;
+            .map_err(|e| format!("{}: {e}", self.description))?;
         let trie = environment.tok_trie();
         // Greedy tokenization preserves the exact bytes, without checkpoint normalization.
         let tokens = trie.greedy_tokenize(text.as_bytes());
         if trie.decode_raw(&tokens) != text.as_bytes() {
-            return Err(
-                "custom tool input cannot be represented by the tokenizer byte trie".into(),
-            );
+            return Err(format!("{subject} cannot be represented by the tokenizer byte trie").into());
         }
         let consumed = matcher
             .try_consume_tokens(&tokens)
-            .map_err(|e| format!("custom tool input failed grammar validation: {e}"))?;
-        if consumed != tokens.len() || !matcher.is_accepting().map_err(|e| e.to_string())? {
-            return Err("custom tool input does not match its grammar".into());
+            .map_err(|e| format!("{subject} failed grammar validation: {e}"))?;
+        if consumed != tokens.len()
+            || !matcher.is_accepting().map_err(|e| format!("{subject} failed grammar validation: {e}"))?
+        {
+            return Err(format!("{subject} does not match its grammar").into());
         }
         Ok(())
     }
@@ -902,16 +924,16 @@ fn validate_schema_nodes(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    fn byte_tokenizer() -> Tokenizer {
+    pub(crate) fn byte_tokenizer() -> Tokenizer {
         byte_tokenizer_with(&[])
     }
 
     /// Adds non-special tokens from 258, as checkpoints declare reasoning delimiters.
-    fn byte_tokenizer_with(added: &[&str]) -> Tokenizer {
+    pub(crate) fn byte_tokenizer_with(added: &[&str]) -> Tokenizer {
         let mut vocab = serde_json::Map::new();
         let mut extra = 256;
         for byte in 0..=255_u32 {

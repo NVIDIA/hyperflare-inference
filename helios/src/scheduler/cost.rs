@@ -12,6 +12,12 @@ use crate::{
     execution::{ExecutionTiming, GraphDescriptor, GraphKind},
 };
 
+#[cfg(test)]
+thread_local! {
+    /// Cost-table lookups on this thread, for tests that bound planning work.
+    pub(super) static ENTRY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
     timing
         .gpu_ns
@@ -243,6 +249,8 @@ impl ActionCosts {
     }
 
     fn entry(&self, key: Key) -> Option<&Estimate> {
+        #[cfg(test)]
+        ENTRY_LOOKUPS.set(ENTRY_LOOKUPS.get() + 1);
         self.index.get(&key).map(|&index| &self.entries[index].1)
     }
 

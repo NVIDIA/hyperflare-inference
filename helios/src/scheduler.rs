@@ -1101,13 +1101,7 @@ impl RequestScheduler {
                 .iter()
                 .filter(|slot| slot.request.is_some())
                 .count(),
-            free_slots: self
-                .slots
-                .iter()
-                .filter(|slot| {
-                    slot.request.is_none() && !slot.retiring && slot.generation < i64::MAX as u64
-                })
-                .count(),
+            free_slots: self.free_slot_count(),
             retiring_slots: self.slots.iter().filter(|slot| slot.retiring).count(),
             free_pages: self.free_pages.len(),
             free_snapshots: self.free_snapshots.len(),
@@ -1138,6 +1132,15 @@ impl RequestScheduler {
     }
     pub fn free_snapshot_count(&self) -> usize {
         self.free_snapshots.len()
+    }
+    /// Slots a new request can take: empty, not retiring, with a generation left.
+    pub fn free_slot_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                slot.request.is_none() && !slot.retiring && slot.generation < i64::MAX as u64
+            })
+            .count()
     }
     /// Whether requests, transfers, or retirement fences may release admission resources.
     #[cfg(feature = "server")]

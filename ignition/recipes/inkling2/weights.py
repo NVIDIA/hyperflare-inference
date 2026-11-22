@@ -20,7 +20,7 @@ def scaled_query(query, hidden):
     return persistent_copy(query.float().reshape(-1, hidden) * hidden ** -0.5)
 
 
-@weight_container(('attention', 'experts', 'router', 'correction', 'attention_convolution', 'mlp_convolution', 'input_norms', 'mlp_norm', 'attention_query', 'mlp_query'))
+@weight_container(('attention', 'experts', 'router', 'correction', 'attention_convolution', 'mlp_convolution', 'input_norms', 'mlp_norm', 'attention_query', 'mlp_query', 'controllers', 'message_queries'))
 @dataclass(frozen=True)
 class LayerWeights:
     attention: AttentionWeights
@@ -33,6 +33,8 @@ class LayerWeights:
     mlp_norm: torch.Tensor
     attention_query: torch.Tensor | None
     mlp_query: torch.Tensor
+    controllers: object | None = None
+    message_queries: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,7 @@ class ModelWeights:
     allocated_bytes: int
     draft: object | None = None
     vision: object | None = None
+    cross_pass_queries_t: torch.Tensor | None = None
 
     @property
     def rank(self):
@@ -66,9 +69,14 @@ class ModelWeights:
         return self.embedding_norm
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None):
+    def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
+             draft_head_quantization=None, markov_head_quantization=None):
         before = torch.cuda.memory_allocated(device)
-        with InklingWeightLoader(manifest, device, shard=shard, progress=progress, vision=vision) as loader:
+        loader_type = InklingWeightLoader
+        if "model.llm.embed.weight" in manifest.tensors:
+            from .mini_weights import MiniWeightLoader
+            loader_type = MiniWeightLoader
+        with loader_type(manifest, device, shard=shard, progress=progress, vision=vision) as loader:
             c = loader.config
             count = c.text.layers if layers is None else layers
             if type(count) is not int or not 1 <= count <= c.text.layers:
@@ -94,14 +102,23 @@ class ModelWeights:
                 from .vision import VisionWeights
                 raw = json.loads((manifest.snapshot / "config.json").read_text())
                 with torch.device("meta"):
-                    module = Inkling2VisionModel(Inkling2VisionConfig.from_dict(raw["vision_config"]))
+                    module = Inkling2VisionModel(Inkling2VisionConfig.from_dict(
+                        raw["vision_config"], **(dict(text_hidden_size=c.text.hidden) if c.text.loop is not None else {})))
                 tower = VisionWeights.load(module, loader)
         draft = None
         if drafting:
             from .dspark_weights import DraftWeights
-            draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress)
+            draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress,
+                                      draft_head_quantization=draft_head_quantization,
+                                      markov_head_quantization=markov_head_quantization)
+        cross_pass_queries_t = None
+        if c.text.loop is not None and count >= c.text.loop.core_end:
+            core = range(c.text.loop.core_start, c.text.loop.core_end)
+            cross_pass_queries_t = persistent_copy(
+                torch.cat([loaded[i].message_queries for i in core], dim=0).t().contiguous()
+            )
         return cls(c, shard, loaded, embedding, embed_norm, norm, query, head,
-                   torch.cuda.memory_allocated(device) - before, draft, tower)
+                   torch.cuda.memory_allocated(device) - before, draft, tower, cross_pass_queries_t)
 
 
 class InklingWeightLoader(DirectWeightLoader):
@@ -158,7 +175,8 @@ class InklingWeightLoader(DirectWeightLoader):
                     extent=slice(k0 * c.convolution_width, k1 * c.convolution_width), temporary=True)
             norms = tuple(self.load_tensor(prefix + f".{n}_input_layernorm.weight") for n in ("q", "k", "v"))
         attention = attention_weights(placed, local=c.local(index), heads=q1 - q0, kv_heads=k1 - k0,
-                                      dim=c.head_dim, width=c.convolution_width)
+                                      dim=c.head_dim, width=c.convolution_width,
+                                      separate_inputs=c.loop is not None and c.loop.core_start <= index < c.loop.core_end)
         attention_query = None if index == 0 else scaled_query(
             self.load_tensor(prefix + ".attention_input.query"), c.hidden)
         return LayerWeights(attention, load_experts(self, index, shard=s),

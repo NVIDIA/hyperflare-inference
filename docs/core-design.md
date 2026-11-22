@@ -1667,19 +1667,22 @@ the contracts established by the preceding stages.
    kernels and dependencies before changing fusion, precision, or overlap.
 
 Structured output composes the answer grammar with the output protocol's
-reasoning and tool delimiters. The grammar constrains the answer, while tool
-payloads retain their normal parsing and validation. The native sampling mask
-and speculative grammar advancement apply to the complete composed grammar.
-`tool_choice=required` adds a prompt
-instruction and validates that the model produced a completed call to a declared
-tool. Generation uses ordinary sampling; an unsatisfied requirement fails the
-response. Named tool selection filters the available definitions to the selected
-tool without adding instructions or decoding constraints. Output validation
-requires a completed call to that tool and rejects other tool names; presentation
-omits ordinary answer text while preserving reasoning and tool arguments.
-`tool_choice=none` removes tools from the template. Strict function schemas are
-unsupported. See [the API contracts](api.md) for
-protocol mappings and streamed errors.
+reasoning and tool delimiters. An answer grammar constrains the answer, not
+ordinary function arguments. An active strict function tool constrains its call
+using the declared schema and the core's tool syntax. The output encoder holds
+the call until it has validated the complete arguments; a truncated strict call
+does not publish partial arguments. The composed request grammar is active for
+the entire generation: reasoning, prose, and tool calls. Until that request
+finishes decoding, its MTP width is one and the [native replay loop](#native-replay-loop)
+keeps one step in flight for any decode batch containing it. These constraints
+do not begin or end at a tool delimiter.
+`tool_choice=required` adds a prompt instruction and requires a completed call
+to a declared tool. Without a grammar it uses ordinary sampling. Named tool
+selection filters the definitions to that tool; it does not by itself enable a
+grammar. The encoder requires a completed call to the selected tool and rejects
+other tool names. It omits ordinary answer text but preserves reasoning and arguments.
+`tool_choice=none` removes tools from the template. See the [API contracts](api.md)
+for the accepted strict schema subset, parser formats, protocol mappings and streamed errors.
 
 Bounded top-k sampling and compact recurrent commit require separate component
 and full-graph measurements. They cannot weaken threshold-tie handling,
