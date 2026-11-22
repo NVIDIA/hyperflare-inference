@@ -50,15 +50,17 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, device):
+    def allocate(cls, patches, device, *, hidden=4608):
         if patches <= 0 or patches % 4:
             raise ValueError("Inkling2 vision patch capacity must be positive and divisible by four")
+        if hidden not in (2304, 4608):
+            raise ValueError("Inkling2 vision output must match the Mini or Small text width")
         def zeros(*shape):
             return torch.zeros(shape, dtype=torch.bfloat16, device=device)
         rows = patches + 1
         return cls(zeros(patches, 1200), zeros(patches, 1024), zeros(rows, 1024), zeros(rows, 3072),
                    zeros(rows, 1024), zeros(rows, 1024), zeros(rows, 4096),
-                   zeros(patches // 4, 4096), zeros(patches // 4, 4608))
+                   zeros(patches // 4, 4096), zeros(patches // 4, hidden))
 
     @property
     def query(self):
@@ -173,7 +175,7 @@ class PreparedVision:
         expected = dict(hidden_size=1024, intermediate_size=4096, num_hidden_layers=23,
                         num_attention_heads=16, patch_size=20, num_channels=3,
                         spatial_merge_size=2, posemb_grid_size=32,
-                        projection_hidden_dim=4096, text_hidden_size=4608, hidden_act="gelu")
+                        projection_hidden_dim=4096, text_hidden_size=scratch.output.shape[1], hidden_act="gelu")
         if any(getattr(module.config, key) != value for key, value in expected.items()):
             raise ValueError("Inkling2 vision geometry differs from the checkpoint contract")
         capacity = scratch.patches.shape[0]

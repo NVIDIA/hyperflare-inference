@@ -36,7 +36,10 @@ def _expert_scale_vectors(sources, prefixes):
 
 
 def load_experts(loader, layer_index, *, shard, a16_max_tokens=64):
-    """Load one layer's 384 packed experts with shared A4 and A16 weight storage."""
+    """Load one layer's routed experts in its checkpoint precision and layout."""
+    if f"model.llm.layers.{layer_index}.mlp.experts.w13_weight" in loader._sources:
+        from .mini_experts import load_experts as load_mini_experts
+        return load_mini_experts(loader, layer_index, shard=shard)
     if type(layer_index) is not int or not 0 <= layer_index < 48:
         raise ValueError("Inkling2 expert layer index must be in [0, 48)")
     prefixes = tuple(f"model.language_model.layers.{layer_index}.mlp.experts.{expert}" for expert in range(384))

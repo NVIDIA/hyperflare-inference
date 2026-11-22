@@ -581,6 +581,20 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         with phase(progress, "Prepare and tune kernels") as stage, core_storage.transient():
             tuning = session.tune(show_progress=progress is not None, console=stage.console)
 
+        # Release preparation examples and scratch arena before composition tuning so
+        # tight-memory configurations (e.g. online_mxfp8_scope="kda-input") keep ample
+        # driver-free VRAM for trial graph capture and forward compiler workers.
+        if speculation is not None:
+            speculation.release_examples()
+        examples.clear()
+        metadata.clear()
+        vision_storage.clear()
+        prefill_storage = decode_storage = scratch = decoder = batch = encoder = m = None
+        arena.release_preparation()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
         if decoder_buffers.row_tuning is not None and decoder_buffers.row_tuning.choices:
             with phase(progress, "Tune four-row reduction epilogues"), core_storage.transient():
                 tuning["row_reductions"] = decoder_buffers.row_tuning.tune(session)
@@ -589,18 +603,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             with phase(progress, "Tune sparse candidate compositions"), core_storage.transient():
                 tuning["candidate_compositions"] = context.selection_tuning.tune(session)
 
-        if speculation is not None:
-            speculation.release_examples()
-        examples.clear()
-        metadata.clear()
-        vision_storage.clear()
-        prefill_storage = decode_storage = scratch = decoder = batch = encoder = m = None
         if context is not None:
             context = replace(context, slab=None)
             if weights.config.dsa is not None:
                 context = replace(context, staged_records=None, index_records=None)
             collectives["context"] = context
-        arena.release_preparation()
+        gc.collect()
+        torch.cuda.empty_cache()
     except BaseException as error:
         try:
             deferred_pool.materialize()

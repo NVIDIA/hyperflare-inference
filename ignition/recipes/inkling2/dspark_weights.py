@@ -89,13 +89,15 @@ class RecurrentWeights:
     softcap: float = 30.
 
 
-def fold_recurrent_head(head, hidden_out, hidden_bias, *, chunk=4096):
+def fold_recurrent_head(head, hidden_out, hidden_bias, *, chunk=4096, temporary=False):
     """Fold the BF16 output map through the vocabulary head with FP64 products."""
     if (head.ndim != 2 or hidden_out.ndim != 2 or hidden_out.shape[0] != head.shape[1]
             or hidden_bias.shape != (head.shape[1],)
             or any(t.dtype != torch.bfloat16 or t.device != head.device for t in (head, hidden_out, hidden_bias))):
         raise ValueError("recurrent output folding requires compatible BF16 output and vocabulary matrices")
-    weight = persistent_empty((head.shape[0], hidden_out.shape[1]), torch.bfloat16, head.device)
+    shape = (head.shape[0], hidden_out.shape[1])
+    weight = (torch.empty(shape, dtype=torch.bfloat16, device=head.device) if temporary
+              else persistent_empty(shape, torch.bfloat16, head.device))
     bias = persistent_empty((head.shape[0],), torch.bfloat16, head.device)
     projection, offset = hidden_out.double(), hidden_bias.double()
     for start in range(0, head.shape[0], chunk):
@@ -106,7 +108,7 @@ def fold_recurrent_head(head, hidden_out, hidden_bias, *, chunk=4096):
     return weight, bias
 
 
-@weight_container(('alpha', 'mask_embedding', 'norm', 'layers', 'recurrent'))
+@weight_container(('alpha', 'mask_embedding', 'norm', 'layers', 'recurrent', 'draft_head'))
 @dataclass(frozen=True)
 class DraftWeights:
     alpha: torch.Tensor
@@ -114,9 +116,15 @@ class DraftWeights:
     norm: torch.Tensor
     layers: tuple[DraftLayerWeights, ...]
     recurrent: RecurrentWeights
+    draft_head: object | None = None
 
     @classmethod
-    def load(cls, snapshot, config, device, shard, *, target_head, progress=None):
+    def load(cls, snapshot, config, device, shard, *, target_head, progress=None,
+             draft_head_quantization=None, markov_head_quantization=None):
+        if draft_head_quantization not in (None, "nvfp4", "mxfp8"):
+            raise ValueError(f"unsupported DSpark draft head quantization: {draft_head_quantization!r}")
+        if markov_head_quantization not in (None, "nvfp4"):
+            raise ValueError(f"unsupported DSpark Markov head quantization: {markov_head_quantization!r}")
         snapshot = Path(snapshot)
         sidecar, tensors = _read_header(snapshot / "mtp.safetensors", "mtp.safetensors")
         manifest = DraftCheckpoint(snapshot, tensors, (sidecar,))
@@ -164,8 +172,17 @@ class DraftWeights:
                 raise ValueError("Inkling2 predecessor embedding must be a BF16 vocabulary by recurrent-rank matrix")
             hidden_out = loader.load_tensor("markov_head.hidden_out.weight", temporary=True)
             hidden_bias = vector("markov_head.hidden_out.bias", hidden)
-            head, head_bias = fold_recurrent_head(target_head, hidden_out, hidden_bias)
+            head, head_bias = fold_recurrent_head(
+                target_head, hidden_out, hidden_bias, temporary=markov_head_quantization is not None
+            )
+            if markov_head_quantization == "nvfp4":
+                from ignition.components.vocabulary import nvfp4_draft_head
+                head = nvfp4_draft_head(head)
             recurrent = RecurrentWeights(embedding, persistent_copy(state[:, :2 * rank].contiguous()),
                 persistent_copy(state[:, 2 * rank:].contiguous()), persistent_copy(vector("markov_head.rnn_proj.bias", 3 * rank).float()),
                 head, head_bias, vector("markov_head.dflare_norm.weight", hidden))
-            return cls(alpha, vector("mask_embed", hidden), vector("norm.weight", hidden), tuple(layers), recurrent)
+            draft_head = None
+            if draft_head_quantization is not None:
+                from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
+                draft_head = {"nvfp4": nvfp4_draft_head, "mxfp8": mxfp8_draft_head}[draft_head_quantization](target_head)
+            return cls(alpha, vector("mask_embed", hidden), vector("norm.weight", hidden), tuple(layers), recurrent, draft_head)

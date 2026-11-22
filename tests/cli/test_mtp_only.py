@@ -80,7 +80,7 @@ def test_serving_modes_select_before_graph_construction(enabled, mtp_only, expec
 def test_recipe_adapters_preserve_mtp_only_and_validate_direct_configs(monkeypatch, tmp_path, recipe, mtp_only):
     import huggingface_hub
 
-    name = "kimi3" if recipe.name == "kimi31" else recipe.name
+    name = {"kimi31": "kimi3", "inkling2_mini": "inkling2"}.get(recipe.name, recipe.name)
     bootstrap = import_module(f"ignition.recipes.{name}.bootstrap")
     world = recipe.tensor_parallel[0]
     devices = tuple(replace(gpu(i, 4096), total_bytes=4096 << 30) for i in range(world))

@@ -187,6 +187,9 @@ class CandidateSelectionTuning:
                         forward.retire_after_capture()
                     graphs.clear()
                     compiled.clear()
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
         if self.slot_groups:
             from .slot_tuning import tune_local_slots
 

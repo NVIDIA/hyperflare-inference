@@ -1358,12 +1358,12 @@ impl<'a> Worker<'a> {
                 incoming.poll_pool_lookup();
                 incoming.poll_restore_wait(now);
             }
-            let stats = self.scheduler.stats();
+            // Full scheduler stats would scan every cached checkpoint on each pass.
             let resources = (
                 self.scheduler.completed(),
-                stats.free_pages,
-                stats.free_snapshots,
-                stats.free_slots,
+                self.scheduler.free_page_count(),
+                self.scheduler.free_snapshot_count(),
+                self.scheduler.free_slot_count(),
             );
             let now = std::time::Instant::now();
             let eligible = |incoming: &Incoming| {
@@ -2632,12 +2632,11 @@ fn next_admission(
     parked: &VecDeque<(Incoming, Parked<'_>)>,
     pending: &VecDeque<Incoming>,
 ) -> Option<crate::scheduler::NextAdmission> {
-    let stats = scheduler.stats();
     let resources = (
         scheduler.completed(),
-        stats.free_pages,
-        stats.free_snapshots,
-        stats.free_slots,
+        scheduler.free_page_count(),
+        scheduler.free_snapshot_count(),
+        scheduler.free_slot_count(),
     );
     parked
         .iter()

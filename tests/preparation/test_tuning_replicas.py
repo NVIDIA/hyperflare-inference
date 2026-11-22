@@ -148,3 +148,29 @@ def test_preparation_only_tp_group_drains_and_joins_its_ranks():
         if process.is_alive():
             process.kill()
         process.join()
+
+
+def test_tuning_replica_resolves_shared_module_recipe_by_name():
+    from dataclasses import fields, replace
+    from ignition.planning import Plan
+    from ignition.preparation.tuning_replicas import _resolve_recipe
+    from ignition.recipes.inkling2.recipe import MINI_RECIPE, RECIPE
+    from tests.cli.test_planning import derive, gpu
+
+    assert _resolve_recipe(MINI_RECIPE.prepare, MINI_RECIPE.name) is MINI_RECIPE
+    assert _resolve_recipe(RECIPE.prepare, RECIPE.name) is RECIPE
+
+    gpus = tuple(gpu(i, 95) for i in range(4))
+    plan = replace(derive(model=MINI_RECIPE, gpus=gpus, selected=(0,), concurrency=8), tuning_gpus=gpus)
+    role = TuningReplica("/tmp/gloo", 0, 4, 1)
+    root = replace(plan, tuning_replica=role)
+    values = {field.name: getattr(root, field.name) for field in fields(root) if field.name != "recipe"}
+    values["checkpoint"] = replace(
+        plan.checkpoint,
+        scale_compressed_device_bytes=dict(plan.checkpoint.scale_compressed_device_bytes),
+    )
+    peer = dict(values, gpus=(gpus[1],), tuning_replica=replace(role, index=1))
+    reconstructed = Plan(recipe=_resolve_recipe(MINI_RECIPE.prepare, plan.recipe.name), **peer)
+    assert reconstructed.recipe is MINI_RECIPE
+    assert reconstructed.world_size == 1
+    assert reconstructed.costs == MINI_RECIPE.costs(1, reconstructed.speculation, reconstructed.checkpoint)

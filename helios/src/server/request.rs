@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::runtime::{Prompt, ReasoningCut};
+use super::{inference::ToolChoice, runtime::{Prompt, ReasoningCut}};
 use crate::{
     AdmissionError, Error, Failure, FrontendError, Result,
     frontend::{Frontend, images::ImageProcessor},
@@ -85,7 +85,48 @@ pub(super) fn prepare_inference(
     )
 }
 
+pub(super) fn compile_strict_validators(
+    compiler: &crate::grammar::GrammarCompiler,
+    request: &super::inference::Request,
+) -> Result<std::collections::HashMap<String, crate::grammar::TextGrammar>> {
+    use std::collections::{HashMap, hash_map::Entry};
+    let mut validators = HashMap::new();
+    for tool in request.tools.iter().filter(|tool| tool.strict) {
+        match validators.entry(tool.native_name()) {
+            Entry::Occupied(e) => return Err(format!("ambiguous strict tool name {:?}", e.key()).into()),
+            Entry::Vacant(e) => {
+                let validator = crate::grammar::strict::validate_strict_tool_schema(compiler, e.key(), &tool.parameters)?;
+                e.insert(validator);
+            }
+        }
+    }
+    if !validators.is_empty() {
+        for tool in request.tools.iter().filter(|tool| !tool.strict) {
+            let conflict = match &tool.namespace {
+                None => validators.contains_key(&tool.name),
+                Some(_) => validators.contains_key(&tool.native_name()),
+            };
+            if conflict { return Err(format!("ambiguous strict tool name {:?}", tool.native_name()).into()); }
+        }
+    }
+    Ok(validators)
+}
+
 pub(super) fn prepare_inference_cached(
+    frontend: &Frontend,
+    processor: Option<&ImageProcessor>,
+    compiler: &crate::grammar::GrammarCompiler,
+    config: &ModelConfig,
+    request: &super::inference::Request,
+    index: usize,
+    count_only: bool,
+    input_store: Option<&flare_selene::input::InputStore>,
+) -> Result<PreparedInference> {
+    compile_strict_validators(compiler, request)?;
+    prepare_validated_inference(frontend, processor, compiler, config, request, index, count_only, input_store)
+}
+
+pub(super) fn prepare_validated_inference(
     frontend: &Frontend,
     processor: Option<&ImageProcessor>,
     compiler: &crate::grammar::GrammarCompiler,
@@ -168,7 +209,7 @@ pub(super) fn prepare_inference_cached(
         (frontend.render_chat(&normalized, &options)?, String::new())
     };
     let images = describe_images(&rendered.image_sources, processor, input_store)?;
-    let output = if raw.is_some() {
+    let mut output = if raw.is_some() {
         None
     } else {
         Some(crate::model::prepare_output(
@@ -181,21 +222,75 @@ pub(super) fn prepare_inference_cached(
             compiler.delimiters(),
         )?)
     };
+    let active_tools: Vec<crate::grammar::strict::StrictToolSpec> =
+        if request.tool_choice != ToolChoice::None && request.tools.iter().any(|t| t.strict) {
+            request
+                .tools
+                .iter()
+                .filter(|tool| match &request.tool_choice {
+                    ToolChoice::Named(name) => tool.native_name() == *name,
+                    _ => true,
+                })
+                .map(|tool| crate::grammar::strict::StrictToolSpec {
+                    name: tool.native_name(),
+                    strict_schema: tool.strict.then_some(&tool.parameters),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let has_active_strict_tool = active_tools.iter().any(|t| t.strict_schema.is_some());
+    if has_active_strict_tool && raw.is_some() {
+        return Err("strict function tools are not supported on raw Completions".into());
+    }
     let envelope = output
         .as_ref()
         .and_then(crate::output::OutputPipeline::grammar_envelope);
-    let grammar = match &opts.constraint {
-        Some(Constraint::JsonObject) => Some(
-            compiler
-                .compile_json_schema_in(&serde_json::json!({"type":"object"}), envelope.as_ref())?,
-        ),
-        Some(Constraint::Json(schema)) => {
-            Some(compiler.compile_json_schema_in(schema, envelope.as_ref())?)
+    let grammar = if has_active_strict_tool {
+        use crate::grammar::strict::{AnswerConstraint, ToolGrammarPlan};
+        let answer_constraint = opts.constraint.as_ref().map(|c| match c {
+            Constraint::JsonObject => AnswerConstraint::JsonObject,
+            Constraint::Json(schema) => AnswerConstraint::Json(schema),
+            Constraint::Lark(source) => AnswerConstraint::Lark(source),
+        });
+        let dsml_token = output.as_ref().and_then(|o| {
+            let dsml_name = deepseek_recipe_core::special_tokens::SpecialToken::Dsml.default_str();
+            o.control_tokens
+                .iter()
+                .find(|(_, m)| m == dsml_name)
+                .cloned()
+        });
+        let plan = ToolGrammarPlan {
+            tools: active_tools,
+            syntax: config
+                .contract
+                .frontend
+                .tools
+                .as_ref()
+                .map(|t| (t.kind, t.wrapping_newlines as usize, t.tag_separator.clone())),
+            dsml_token,
+            allow_undeclared: request.tool_choice == ToolChoice::Auto,
+            require_call: matches!(
+                request.tool_choice,
+                ToolChoice::Required | ToolChoice::Named(_)
+            ),
+            single_call: !request.parallel_tool_calls,
+        };
+        Some(compiler.compile_presented_strict_tools(answer_constraint, envelope.as_ref(), &plan, output.as_mut().map(|o| &mut o.content))?)
+    } else {
+        match &opts.constraint {
+            Some(Constraint::JsonObject) => Some(compiler.compile_json_schema_in(
+                &serde_json::json!({"type":"object"}),
+                envelope.as_ref(),
+            )?),
+            Some(Constraint::Json(schema)) => {
+                Some(compiler.compile_json_schema_in(schema, envelope.as_ref())?)
+            }
+            Some(Constraint::Lark(source)) => {
+                Some(compiler.compile_lark_in(source, envelope.as_ref())?)
+            }
+            None => None,
         }
-        Some(Constraint::Lark(source)) => {
-            Some(compiler.compile_lark_in(source, envelope.as_ref())?)
-        }
-        None => None,
     };
     let mut message_boundaries = rendered.message_boundaries.clone();
     let crate::model::PreparedInput {
@@ -604,6 +699,73 @@ mod tests {
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         )
+    }
+
+    #[test]
+    fn ignored_strict_tools_still_require_compiler_admissible_schemas() {
+        use crate::server::inference::{Input, Options, Request, Tool};
+
+        let compiler = crate::grammar::GrammarCompiler::new(
+            &crate::grammar::tests::byte_tokenizer(),
+            320,
+            &[256, 257],
+            &[],
+        )
+        .unwrap();
+        let tool = |name: &str, parameters: Value| Tool {
+            name: name.into(),
+            namespace: None,
+            description: String::new(),
+            parameters,
+            declared_parameters: true,
+            strict: true,
+            custom: false,
+            grammar: None,
+        };
+        let selected = tool(
+            "selected",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false
+            }),
+        );
+        let invalid = tool(
+            "ignored",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer", "minimum": 5, "maximum": 1}
+                },
+                "required": ["n"],
+                "additionalProperties": false
+            }),
+        );
+
+        for tool_choice in [
+            ToolChoice::None,
+            ToolChoice::Named("selected".into()),
+        ] {
+            let mut request = Request {
+                input: Input::Conversation(Vec::new()),
+                checkpoint_hints: Vec::new(),
+                options: Options::default(),
+                tools: vec![selected.clone()],
+                tool_choice,
+                parallel_tool_calls: true,
+                choices: 1,
+            };
+            assert!(compile_strict_validators(&compiler, &request).is_ok());
+            request.tools.push(invalid.clone());
+            assert!(compile_strict_validators(&compiler, &request).is_err());
+            request.tools = vec![selected.clone(), selected.clone()];
+            assert!(compile_strict_validators(&compiler, &request).err().unwrap().to_string().contains("ambiguous strict tool name"));
+            for reverse in [false, true] {
+                let loose = Tool { strict: false, ..selected.clone() };
+                request.tools = vec![loose, selected.clone()];
+                if reverse { request.tools.reverse(); }
+                assert!(compile_strict_validators(&compiler, &request).err().unwrap().to_string().contains("ambiguous strict tool name"));
+            }
+        }
     }
 
     #[test]
