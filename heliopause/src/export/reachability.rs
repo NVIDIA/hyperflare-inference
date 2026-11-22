@@ -585,4 +585,65 @@ mod tests {
         typed.contents(&source, 0, &bytes).unwrap();
         assert!(typed.reached.is_empty());
     }
+
+    #[test]
+    fn persistent_worker_descriptors_retain_mapped_host_weight_planes_when_not_numeric() {
+        let mut host_planes = Vec::new();
+        for (idx, label) in ["gate_up", "gate_up_scales", "down", "down_scales"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut alloc = allocation(&format!("host-{label}"), 0x0c00_0000_0000 + idx as u64 * 0x10000);
+            alloc.memory = "mapped_host".into();
+            alloc.nbytes = 4096;
+            host_planes.push(alloc);
+        }
+        let mut layer_descs = allocation("layer_descs", 0x0800_0000_0000);
+        layer_descs.nbytes = 192;
+        let mut control = allocation("layer_control", 0x0800_0001_0000);
+        control.nbytes = (16 + 32) * 4;
+
+        let mut allocations = host_planes.clone();
+        allocations.push(layer_descs.clone());
+        allocations.push(control.clone());
+
+        // Pack LayerMoverDesc host_planes[0..4] at byte offsets 0..32.
+        let mut desc_bytes = vec![0u8; 192];
+        for (idx, plane) in host_planes.iter().enumerate() {
+            desc_bytes[idx * 8..(idx + 1) * 8].copy_from_slice(&plane.address.to_le_bytes());
+        }
+        // Pack MegaMoeDynamicHostTier control header host pointers at uint64[1..5] (offsets 8..40).
+        let mut ctrl_bytes = vec![0u8; (16 + 32) * 4];
+        ctrl_bytes[0..4].copy_from_slice(&0x4950_5244u32.to_le_bytes());
+        for (idx, plane) in host_planes.iter().enumerate() {
+            let off = 8 + idx * 8;
+            ctrl_bytes[off..off + 8].copy_from_slice(&plane.address.to_le_bytes());
+        }
+
+        // Omitting descriptor tensors from numeric ranges retains every mapped-host weight plane.
+        let mut worker_reach = Reachability::new(&allocations, &[], &[], &["layer_descs".into()]).unwrap();
+        worker_reach.contents(&layer_descs, 0, &desc_bytes).unwrap();
+        let mut serve_reach = Reachability::new(&allocations, &[], &[], &["layer_control".into()]).unwrap();
+        serve_reach.contents(&control, 0, &ctrl_bytes).unwrap();
+        for plane in &host_planes {
+            assert!(worker_reach.reached.contains(&plane.name), "worker descriptor missed {}", plane.name);
+            assert!(serve_reach.reached.contains(&plane.name), "indirection control missed {}", plane.name);
+        }
+
+        // Classifying those pointer-bearing descriptors as numeric drops every mapped-host weight plane.
+        let numeric = [
+            (layer_descs.address, layer_descs.address + layer_descs.nbytes),
+            (control.address, control.address + control.nbytes),
+        ];
+        let mut dropped_worker =
+            Reachability::new(&allocations, &numeric, &[], &["layer_descs".into()]).unwrap();
+        dropped_worker.contents(&layer_descs, 0, &desc_bytes).unwrap();
+        let mut dropped_serve =
+            Reachability::new(&allocations, &numeric, &[], &["layer_control".into()]).unwrap();
+        dropped_serve.contents(&control, 0, &ctrl_bytes).unwrap();
+        for plane in &host_planes {
+            assert!(!dropped_worker.reached.contains(&plane.name));
+            assert!(!dropped_serve.reached.contains(&plane.name));
+        }
+    }
 }

@@ -63,9 +63,17 @@ class MegaMoeWorkspace:
                 triton.cdiv(geometry.capacity, alignment) * alignment, geometry.top_k,
                 geometry.hidden, geometry.intermediate, geometry.shared_experts)
             g = self.geometry
-            nbytes, self.slice_inputs = self.library._C.get_symm_buffer_size_for_mega_moe(
-                1, g.experts, g.capacity, g.top_k, g.hidden, g.intermediate,
-                "fp8xfp4", "swiglu", g.shared_experts)
+            device_sms = torch.cuda.get_device_properties(device).multi_processor_count
+            prev_sms = self.library.get_num_sms()
+            if prev_sms != device_sms:
+                self.library.set_num_sms(device_sms)
+            try:
+                nbytes, self.slice_inputs = self.library._C.get_symm_buffer_size_for_mega_moe(
+                    1, g.experts, g.capacity, g.top_k, g.hidden, g.intermediate,
+                    "fp8xfp4", "swiglu", g.shared_experts)
+            finally:
+                if prev_sms != device_sms:
+                    self.library.set_num_sms(prev_sms)
             self.buffer = persistent_zeros((nbytes,), dtype=torch.int8, device=device)
             self.views = self.slice_inputs(self.buffer)
 
@@ -94,6 +102,9 @@ class MegaMoeQuery:
     host_rows: int = 0
     host_lane_clusters: int = 0
     host_shared_first: bool = False
+    indirection: bool = False
+    hbm_slots: int = 0
+    compute_sm_count: int = 0
 
     def __post_init__(self):
         object.__setattr__(self, "x_sf_stride", tuple(self.x_sf_stride))
@@ -158,48 +169,73 @@ CONTRACT = native_contract(component_id="flare.megamoe.tp1_mxfp8_mxfp4",
 class _State:
     def __init__(self, query, workspace):
         self.query, self.workspace = query, workspace
+        self.mover_binding = None
+        if query.indirection:
+            from ignition.components.sm103_mover_kernel import prepare as prepare_mover
+            self.mover_binding = prepare_mover(workspace.kernel_cache)
         self.stager = load_programs(compile_inputs(CONTRACT.encode_query(query), workspace.buffer.device.index))
 
-    def run(self, source, ids, probabilities, padding, matrices, output, buffer, control=None, descriptors=None):
+    def run(self, source, ids, probabilities, padding, matrices, output, buffer, control=None, descriptors=None,
+            live_slot_map=None, layer_epoch=None):
         q = self.query
         x, sf, out_ids, out_weights, _, shared_sf, *_ = self.workspace.slice_inputs(buffer)
         self.stager[(triton.cdiv(q.rows, 8 if q.rows >= 64 else 1), q.hidden // 128, 1)](
             source, x, sf, shared_sf if q.shared_experts else None,
             ids, probabilities, padding, out_ids, out_weights, *_stage_constants(q))
-        self.run_encoded(matrices, output, buffer, control, descriptors)
+        self.run_encoded(matrices, output, buffer, control, descriptors, live_slot_map, layer_epoch)
 
-    def run_encoded(self, matrices, output, buffer, control=None, descriptors=None):
+    def run_encoded(self, matrices, output, buffer, control=None, descriptors=None,
+                    live_slot_map=None, layer_epoch=None):
         q = self.query
         shared_gate = tuple(matrices[4:6]) if q.shared_experts else None
         shared_down = tuple(matrices[6:8]) if q.shared_experts else None
+        if q.indirection:
+            if live_slot_map is None or layer_epoch is None or control is None:
+                raise ValueError("indirection MegaMoE requires live_slot_map, layer_epoch and control buffers")
+            self.mover_binding.launch_layer_enter(live_slot_map, control, layer_epoch, q.experts)
         binding = SimpleNamespace(buffer=buffer, handle=SimpleNamespace(buffer_ptrs=[buffer.data_ptr()]),
             group=_LocalRank(), num_max_tokens_per_rank=q.capacity, num_experts=q.experts, num_topk=q.top_k)
-        self.workspace.library.fp8_fp4_mega_moe_tiered(
-            output, tuple(matrices[:2]), tuple(matrices[2:4]), binding,
-            shared_l1_weights=shared_gate, shared_l2_weights=shared_down,
-            control=control, host_rows=q.host_rows,
-            recipe=(1, 1, 32), activation="swiglu", activation_clamp=q.clamp,
-            fast_math=True, shared_first=q.host_shared_first)
+        device_sms = torch.cuda.get_device_properties(output.device).multi_processor_count
+        prev_sms = self.workspace.library.get_num_sms()
+        launch_sms = q.compute_sm_count if q.compute_sm_count > 0 else (prev_sms if prev_sms != device_sms else 0)
+        if prev_sms != device_sms:
+            self.workspace.library.set_num_sms(device_sms)
+        try:
+            self.workspace.library.fp8_fp4_mega_moe_tiered(
+                output, tuple(matrices[:2]), tuple(matrices[2:4]), binding,
+                shared_l1_weights=shared_gate, shared_l2_weights=shared_down,
+                control=control, host_rows=q.host_rows,
+                hbm_slots=q.hbm_slots if q.indirection else -1,
+                recipe=(1, 1, 32), activation="swiglu", activation_clamp=q.clamp,
+                fast_math=True, shared_first=q.host_shared_first,
+                num_sms=launch_sms)
+        finally:
+            if prev_sms != device_sms:
+                self.workspace.library.set_num_sms(prev_sms)
 
 
-@torch.library.custom_op("flare::megamoe", mutates_args=("output", "workspace", "control", "descriptors"))
+@torch.library.custom_op("flare::megamoe", mutates_args=("output", "workspace", "control", "descriptors", "layer_epoch"))
 def _run(source: torch.Tensor, ids: torch.Tensor, probabilities: torch.Tensor,
          padding: torch.Tensor, matrices: list[torch.Tensor], output: torch.Tensor,
-         workspace: torch.Tensor, control: torch.Tensor | None, descriptors: torch.Tensor | None, handle: int) -> None:
+         workspace: torch.Tensor, control: torch.Tensor | None, descriptors: torch.Tensor | None,
+         live_slot_map: torch.Tensor | None, layer_epoch: torch.Tensor | None, handle: int) -> None:
     plan = plan_from_handle(handle)
     require_prepared(plan, plan.component_id, source.device).run(
-        source, ids, probabilities, padding, matrices, output, workspace, control, descriptors)
+        source, ids, probabilities, padding, matrices, output, workspace, control, descriptors,
+        live_slot_map, layer_epoch)
 
 
 @_run.register_fake
-def _run_fake(source, ids, probabilities, padding, matrices, output, workspace, control, descriptors, handle):
+def _run_fake(source, ids, probabilities, padding, matrices, output, workspace, control, descriptors,
+              live_slot_map, layer_epoch, handle):
     pass
 
 
-@torch.library.custom_op("flare::megamoe_encoded", mutates_args=("output", "workspace", "control", "descriptors"))
+@torch.library.custom_op("flare::megamoe_encoded", mutates_args=("output", "workspace", "control", "descriptors", "layer_epoch"))
 def _run_encoded(source: torch.Tensor, encoded: list[torch.Tensor], matrices: list[torch.Tensor], output: torch.Tensor,
                  workspace: torch.Tensor, control: torch.Tensor | None,
-                 descriptors: torch.Tensor | None, handle: int) -> None:
+                 descriptors: torch.Tensor | None, live_slot_map: torch.Tensor | None,
+                 layer_epoch: torch.Tensor | None, handle: int) -> None:
     plan = plan_from_handle(handle)
     state = require_prepared(plan, plan.component_id, source.device)
     views = state.workspace.slice_inputs(workspace)
@@ -209,11 +245,12 @@ def _run_encoded(source: torch.Tensor, encoded: list[torch.Tensor], matrices: li
             or actual.stride() != expected.stride() or actual.dtype != expected.dtype
             for actual, expected in zip(encoded, views[:4])):
         raise ValueError("encoded MegaMoE inputs must alias the prepared activation, scale and route views")
-    state.run_encoded(matrices, output, workspace, control, descriptors)
+    state.run_encoded(matrices, output, workspace, control, descriptors, live_slot_map, layer_epoch)
 
 
 @_run_encoded.register_fake
-def _run_encoded_fake(source, encoded, matrices, output, workspace, control, descriptors, handle):
+def _run_encoded_fake(source, encoded, matrices, output, workspace, control, descriptors,
+                      live_slot_map, layer_epoch, handle):
     pass
 
 
@@ -222,7 +259,7 @@ class PreparedMegaMoe:
 
     def __init__(self, source, ids, probabilities, padding, routed, shared, *,
                  workspace: MegaMoeWorkspace, clamp: float, session, name, host_tier=None,
-                 host_shared_first: bool = False):
+                 host_shared_first: bool = False, compute_sm_count: int = 0):
         g = workspace.geometry
         rows = source.shape[0]
         _validate_inputs(source, ids, probabilities, padding, g, workspace.buffer.device, rows)
@@ -231,9 +268,13 @@ class PreparedMegaMoe:
         if (shared is not None) != bool(g.shared_experts):
             raise ValueError("MegaMoE shared weights must match the workspace geometry")
         host_rows = 0 if host_tier is None else host_tier.rows
+        indirection = bool(getattr(host_tier, "indirection", False))
+        hbm_slots = host_tier.hbm_slots if indirection else (g.experts - host_rows)
         if host_tier is not None and host_tier.geometry != g:
             raise ValueError("MegaMoE host tier must match the protocol workspace geometry")
-        _validate_weights(routed, g, shared=False, count=g.experts - host_rows)
+        if type(compute_sm_count) is not int or compute_sm_count < 0:
+            raise ValueError("MegaMoE compute_sm_count must be a nonnegative integer")
+        _validate_weights(routed, g, shared=False, count=hbm_slots)
         if shared is not None:
             _validate_weights(shared, g, shared=True)
         self.matrices = list((*routed.gate_up, *routed.down))
@@ -242,6 +283,8 @@ class PreparedMegaMoe:
         self.host_tier = host_tier
         self.control = None if host_tier is None else host_tier.control
         self.descriptors = None if host_tier is None else host_tier.descriptors
+        self.live_slot_map = host_tier.live_slot_map if indirection else None
+        self.layer_epoch = host_tier.layer_epoch if indirection else None
         if host_tier is not None:
             _validate_weights(host_tier.weights, g, shared=False, count=host_rows)
             self.matrices.extend(host_tier.device_views)
@@ -255,7 +298,9 @@ class PreparedMegaMoe:
         q = MegaMoeQuery(rows, g.experts, g.capacity, g.top_k, g.hidden, g.intermediate,
             g.shared_experts, tuple(workspace.views[1].stride()),
             tuple(workspace.views[5].stride()) if shared is not None else (0, 0), block_m, clamp,
-            host_rows, 0 if host_tier is None else host_tier.host_lane_clusters, host_shared_first)
+            host_rows, 0 if host_tier is None else host_tier.host_lane_clusters, host_shared_first,
+            indirection=indirection, hbm_slots=hbm_slots if indirection else 0,
+            compute_sm_count=compute_sm_count)
         self.workspace = workspace
         self.plan = native_plan(contract=CONTRACT, query=q, device=source.device,
             scratch_bytes=lambda tactic: 0,
@@ -269,8 +314,9 @@ class PreparedMegaMoe:
             source, ids, probabilities, padding = examples
             output = torch.empty_like(source)
             return PreparedCall(run=lambda: state.run(source, ids, probabilities, padding,
-                self.matrices, output, workspace.buffer, self.control, self.descriptors), output=output,
-                owners=(workspace, self.matrices))
+                self.matrices, output, workspace.buffer, self.control, self.descriptors,
+                self.live_slot_map, self.layer_epoch), output=output,
+                owners=(workspace, self.matrices, self.host_tier))
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare),))
         register_finalizer(session, examples.clear)
@@ -289,7 +335,8 @@ class PreparedMegaMoe:
             planes, control = stager.finish(pending, source)
             matrices = [*self.matrices[:-4], *planes]
         _run(source, ids, probabilities, padding, matrices, output,
-             self.workspace.buffer, control, self.descriptors, self.plan.handle)
+             self.workspace.buffer, control, self.descriptors,
+             self.live_slot_map, self.layer_epoch, self.plan.handle)
         if staged is not None:
             stager.observe(control)
         return output
@@ -321,7 +368,7 @@ class PreparedMegaMoe:
             planes, control = stager.finish(pending, source)
             matrices = [*self.matrices[:-4], *planes]
         _run_encoded(source, [*inputs, *routed], matrices, output, self.workspace.buffer,
-                     control, self.descriptors, self.plan.handle)
+                     control, self.descriptors, self.live_slot_map, self.layer_epoch, self.plan.handle)
         if staged is not None:
             stager.observe(control)
         return output
