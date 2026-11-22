@@ -17,6 +17,16 @@ from b12x.comm.pcie._island_rs_cute import (
     get_island_resnorm7168_launcher,
 )
 from b12x.comm.pcie._island_v4_mix import get_island_mix7168_launcher
+try:
+    from b12x.comm.pcie._island_v4_wide import (
+        get_island_mix7168_wide_launcher,
+        get_island_norm3584_wide_launcher,
+        get_island_resnorm7168_wide_launcher,
+    )
+except ImportError:
+    get_island_mix7168_wide_launcher = None
+    get_island_norm3584_wide_launcher = None
+    get_island_resnorm7168_wide_launcher = None
 from b12x.preparation import PreparedCall
 
 from ignition.components.collectives import _all_reduce
@@ -208,7 +218,7 @@ def _norm_rows(
     owner = layout.owner
     if (
         layout.width == 3584
-        and 1 <= layout.rows <= 32
+        and 1 <= layout.rows <= (64 if get_island_norm3584_wide_launcher is not None else 32)
         and out.shape == (layout.rows, 224)
         and source.is_contiguous()
         and out.is_contiguous()
@@ -218,9 +228,14 @@ def _norm_rows(
         and weight.data_ptr() % 16 == 0
         and begin.dtype == torch.int32
     ):
-        launcher = get_island_norm3584_launcher(
-            owner.rank, layout.rows, owner.device.index or 0, blocks=owner.blocks
-        )
+        if layout.rows <= 32:
+            launcher = get_island_norm3584_launcher(
+                owner.rank, layout.rows, owner.device.index or 0, blocks=owner.blocks
+            )
+        else:
+            launcher = get_island_norm3584_wide_launcher(
+                owner.rank, layout.rows, owner.device.index or 0, blocks=owner.blocks
+            )
         launcher(
             owner._slab_ptrs,
             source.data_ptr(),
@@ -290,10 +305,10 @@ def _mix_rows(
     ab = 2 if layout.rows <= 3 else (4 if layout.rows <= 20 else 8)
     if (
         layout.width == 7168
-        and 1 <= layout.rows <= 32
+        and 1 <= layout.rows <= (64 if get_island_mix7168_wide_launcher is not None else 32)
         and spec.mode in (ADD, REPLACE)
         and 0 <= spec.sources <= 8
-        and owner.blocks >= ab + layout.rows
+        and (layout.rows > 32 or owner.blocks >= ab + layout.rows)
         and source.is_contiguous()
         and source.data_ptr() % 16 == 0
         and add_tensor.is_contiguous()
@@ -317,17 +332,30 @@ def _mix_rows(
         and tap.stride(0) % 8 == 0
         and tap.data_ptr() % 16 == 0
     ):
-        launcher = get_island_mix7168_launcher(
-            owner.rank,
-            layout.rows,
-            spec.sources,
-            spec.write,
-            spec.mode,
-            mixture is not None,
-            has_addend,
-            owner.device.index or 0,
-            blocks=owner.blocks,
-        )
+        if layout.rows <= 32:
+            launcher = get_island_mix7168_launcher(
+                owner.rank,
+                layout.rows,
+                spec.sources,
+                spec.write,
+                spec.mode,
+                mixture is not None,
+                has_addend,
+                owner.device.index or 0,
+                blocks=owner.blocks,
+            )
+        else:
+            launcher = get_island_mix7168_wide_launcher(
+                owner.rank,
+                layout.rows,
+                spec.sources,
+                spec.write,
+                spec.mode,
+                mixture is not None,
+                has_addend,
+                owner.device.index or 0,
+                blocks=owner.blocks,
+            )
         launcher(
             owner._slab_ptrs,
             source.data_ptr(),
@@ -408,7 +436,7 @@ def _residual_norm_rows(
     owner = layout.owner
     if (
         layout.width == 7168
-        and 1 <= layout.rows <= 32
+        and 1 <= layout.rows <= (64 if get_island_resnorm7168_wide_launcher is not None else 32)
         and source.is_contiguous()
         and weight.is_contiguous()
         and residual.stride(1) == 1
@@ -423,9 +451,14 @@ def _residual_norm_rows(
         and residual_out.data_ptr() % 16 == 0
         and norm_out.data_ptr() % 16 == 0
     ):
-        launcher = get_island_resnorm7168_launcher(
-            owner.rank, layout.rows, owner.device.index or 0, blocks=owner.blocks
-        )
+        if layout.rows <= 32:
+            launcher = get_island_resnorm7168_launcher(
+                owner.rank, layout.rows, owner.device.index or 0, blocks=owner.blocks
+            )
+        else:
+            launcher = get_island_resnorm7168_wide_launcher(
+                owner.rank, layout.rows, owner.device.index or 0, blocks=owner.blocks
+            )
         launcher(
             owner._slab_ptrs,
             source.data_ptr(),
@@ -907,4 +940,10 @@ class RowReductionTuning:
                     graph.reset()
                 for forward in compiled.values():
                     forward.retire_after_capture()
+                graphs.clear()
+                compiled.clear()
+                fixture = None
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
         return report
