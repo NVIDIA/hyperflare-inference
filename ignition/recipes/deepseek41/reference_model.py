@@ -88,19 +88,80 @@ def declare_reference_weights(model):
 
 
 @dataclass(frozen=True)
+class DynamicExpertRowPlan:
+    """Internal row ordering and initial HBM slot assignment for one dynamic-mover layer.
+
+    Movable experts backed in mapped host memory occupy internal indices
+    ``0..len(host_experts)-1``. Pinned HBM-only experts (``hbm \\ host``) occupy
+    internal indices ``len(host_experts)..experts-1`` and initial HBM slots
+    ``0..len(pinned_experts)-1``, consuming zero host memory.
+    """
+
+    host_experts: tuple[int, ...]
+    pinned_experts: tuple[int, ...]
+    overlapped_hbm: tuple[int, ...]
+    internal_order: tuple[int, ...]
+    canonical_to_internal: tuple[int, ...]
+    initial_hbm_canonical: tuple[int, ...]
+    initial_hbm_internal: tuple[int, ...]
+    hbm_slots: int
+
+
+def plan_dynamic_expert_rows(placement, *, spare_slots: int) -> DynamicExpertRowPlan:
+    """Compute canonical-to-internal row order and initial HBM slot assignments."""
+    if not placement.host:
+        raise ValueError("dynamic expert row plan requires at least one host-backed expert")
+    if type(spare_slots) is not int or spare_slots < 1:
+        raise ValueError("dynamic expert row plan requires at least one spare HBM slot")
+    hbm_slots = len(placement.hbm) + spare_slots
+    if hbm_slots > placement.experts:
+        raise ValueError("dynamic expert row plan HBM slots exceed canonical expert count")
+    host_experts = placement.host
+    host_set = set(host_experts)
+    pinned_experts = tuple(e for e in placement.hbm if e not in host_set)
+    overlapped_hbm = tuple(e for e in placement.hbm if e in host_set)
+    internal_order = host_experts + pinned_experts
+    canonical_to_internal = [0] * placement.experts
+    for internal_idx, canonical in enumerate(internal_order):
+        canonical_to_internal[canonical] = internal_idx
+    initial_hbm_canonical = pinned_experts + overlapped_hbm
+    initial_hbm_internal = tuple(canonical_to_internal[e] for e in initial_hbm_canonical)
+    return DynamicExpertRowPlan(
+        host_experts=host_experts,
+        pinned_experts=pinned_experts,
+        overlapped_hbm=overlapped_hbm,
+        internal_order=internal_order,
+        canonical_to_internal=tuple(canonical_to_internal),
+        initial_hbm_canonical=initial_hbm_canonical,
+        initial_hbm_internal=initial_hbm_internal,
+        hbm_slots=hbm_slots,
+    )
+
+
+@dataclass(frozen=True)
 class ReferenceExpertPreparation:
     modules: dict
     weights: dict
+    mover: object | None = None
 
     @classmethod
     def load(cls, checkpoint, placements, *, target_rows, draft_rows=(), storage,
-             kernel_cache, session, host_lane_clusters=4, dspark=True):
+             kernel_cache, session, host_lane_clusters=4, dspark=True,
+             dynamic_mover=None, compute_sm_count=0):
         """Load all target/draft experts into explicit tiers using bounded batches.
 
         The caller owns the native storage context and retains this preparation
         until graph execution drains. Scale expansion preserves checkpoint bits;
         the prepared MegaMoE planes use native scales in both physical tiers.
         """
+        from ignition.components.megamoe_tiers import MegaMoeDynamicHostTier, MegaMoeLayerWeights
+        from ignition.components.megamoe_weights import (
+            allocate_mxfp4_weights, load_mxfp4_weights_into,
+            load_shared_fp8_planes, pack_shared_fp8_planes,
+        )
+        from ignition.components.sm103_expert_mover import SM103ExpertMoverRuntime
+        from ignition.preparation.persistent import persistent_copy
+
         model = ModelConfig.load(checkpoint.source.metadata_path)
         placements = dict(placements)
         required = [f"layers.{i}.ffn" for i in range(model.layers)]
@@ -112,6 +173,7 @@ class ReferenceExpertPreparation:
             raise ValueError("reference preparation requires row capacities for every enabled expert group")
         device = torch.device("cuda", storage.device)
         workspaces, modules, owners = {}, {}, {}
+        dynamic_layers = []
         for name in required:
             draft = name.startswith("mtp.")
             rows = tuple(draft_rows if draft else target_rows)
@@ -119,30 +181,101 @@ class ReferenceExpertPreparation:
             experts = model.draft.experts if draft else model.text["n_routed_experts"]
             if placement.experts != experts:
                 raise ValueError(f"reference placement differs from checkpoint expert count: {name}")
-            geometry = MegaMoeGeometry(placement.physical_rows, max(rows),
+            use_dynamic = dynamic_mover is not None and not draft and bool(placement.host)
+            physical_rows = experts if use_dynamic else placement.physical_rows
+            geometry = MegaMoeGeometry(physical_rows, max(rows),
                 model.draft.top_k if draft else model.text["num_experts_per_tok"],
                 model.text["hidden_size"], model.text["moe_intermediate_size"], model.text["n_shared_experts"])
             if geometry not in workspaces:
                 workspaces[geometry] = MegaMoeWorkspace(geometry, device=device, kernel_cache=kernel_cache)
-            layout = MegaMoeLayerLayout(workspaces[geometry], placement.host, placement.hbm,
-                                        storage, host_lane_clusters)
+            ws = workspaces[geometry]
             with DirectWeightLoader(checkpoint.source, device, prefixes=(name + ".",)) as loader:
-                weights = layout.load(loader, (f"{name}.experts.{i}" for i in range(experts)),
-                    shared_prefix=name + ".shared_experts", block_size=tuple(model.quantization["weight_block_size"]),
-                    projection_names=("w1", "w3", "w2"), name=name)
+                if use_dynamic:
+                    from ignition.components.megamoe_weights import MegaMoeWeights
+
+                    row_plan = plan_dynamic_expert_rows(placement, spare_slots=dynamic_mover.spare_slots)
+                    tier = MegaMoeDynamicHostTier(
+                        ws.geometry,
+                        hbm_slots=row_plan.hbm_slots,
+                        initial_hbm_experts=row_plan.initial_hbm_internal,
+                        storage=storage,
+                        name=name,
+                        host_experts=len(row_plan.host_experts),
+                    )
+                    load_mxfp4_weights_into(
+                        loader,
+                        [f"{name}.experts.{e}" for e in row_plan.host_experts],
+                        tier.cpu_weights,
+                        hidden_size=ws.geometry.hidden, intermediate_size=ws.geometry.intermediate,
+                        projection_names=("w1", "w3", "w2"), scale_name="scale",
+                    )
+                    routed = allocate_mxfp4_weights(
+                        row_plan.hbm_slots, ws.geometry.hidden, ws.geometry.intermediate, device=device
+                    )
+                    n_pinned = len(row_plan.pinned_experts)
+                    if n_pinned > 0:
+                        pinned_view = MegaMoeWeights(
+                            (routed.gate_up[0][:n_pinned], routed.gate_up[1][:n_pinned]),
+                            (routed.down[0][:n_pinned], routed.down[1][:n_pinned]),
+                        )
+                        load_mxfp4_weights_into(
+                            loader,
+                            [f"{name}.experts.{e}" for e in row_plan.pinned_experts],
+                            pinned_view,
+                            hidden_size=ws.geometry.hidden, intermediate_size=ws.geometry.intermediate,
+                            projection_names=("w1", "w3", "w2"), scale_name="scale",
+                        )
+                    for dst, src_cpu in zip((*routed.gate_up, *routed.down), tier.host_views):
+                        for offset, canonical in enumerate(row_plan.overlapped_hbm):
+                            dst[n_pinned + offset].copy_(src_cpu[row_plan.canonical_to_internal[canonical]].to(device))
+                        dst[len(placement.hbm):].zero_()
+                    shared = pack_shared_fp8_planes(load_shared_fp8_planes(
+                        loader, name + ".shared_experts",
+                        hidden_size=ws.geometry.hidden, intermediate_size=ws.geometry.intermediate,
+                        block_size=tuple(model.quantization["weight_block_size"]),
+                        projection_names=("w1", "w3", "w2"), scale_name="scale",
+                    ))
+                    expert_map = persistent_copy(
+                        torch.tensor(row_plan.canonical_to_internal, dtype=torch.int32, device=device)
+                    )
+                    record_numeric_tensor(expert_map)
+                    weights = MegaMoeLayerWeights(
+                        routed, shared, ws, tier, expert_map,
+                        row_plan.host_experts, row_plan.initial_hbm_canonical,
+                    )
+                    dynamic_layers.append((tier, routed))
+                else:
+                    layout = MegaMoeLayerLayout(ws, placement.host, placement.hbm,
+                                                storage, host_lane_clusters)
+                    weights = layout.load(loader, (f"{name}.experts.{i}" for i in range(experts)),
+                        shared_prefix=name + ".shared_experts", block_size=tuple(model.quantization["weight_block_size"]),
+                        projection_names=("w1", "w3", "w2"), name=name)
                 weight = loader.load_tensor(name + ".gate.weight")
                 bias = loader.load_tensor(name + ".gate.bias")
                 image_bias = loader.load_tensor(name + ".gate.bias_vl") if model.vision is not None else None
             owners[name] = weights
             modules[name] = ReferenceExperts.prepare(weights, rows, weight=weight, bias=bias, image_bias=image_bias,
                 scaling=model.text["routed_scaling_factor"], scoring_func=model.text["scoring_func"],
-                clamp=model.text["swiglu_limit"], session=session, name=name)
+                clamp=model.text["swiglu_limit"], session=session, name=name,
+                compute_sm_count=compute_sm_count)
             if modules[name].placement.data_ptr() != weights.expert_map.data_ptr():
                 raise RuntimeError(f"reference router placement lost its tier mapping alias: {name}")
-        return cls(modules, owners)
+        mover = None
+        if dynamic_layers:
+            mover = SM103ExpertMoverRuntime(
+                dynamic_layers,
+                storage=storage,
+                kernel_cache=kernel_cache,
+                worker_sm_count=dynamic_mover.worker_sm_count,
+                queue_capacity=dynamic_mover.queue_capacity,
+            )
+            mover.attach_predictors(dynamic_mover.predictor_config())
+        return cls(modules, owners, mover=mover)
 
     def close_host_regions(self):
         """Release mapped host weights after every reader and graph has drained."""
+        if self.mover is not None:
+            self.mover.close()
         for weights in self.weights.values():
             if weights.host_tier is not None:
                 for region in weights.host_tier.regions:
