@@ -1563,6 +1563,7 @@ impl GrammarCompiler {
             ));
         }
         let mut tool_rules = Vec::new();
+        let mut payload_refs = Vec::new();
         for (index, tool) in plan.tools.iter().enumerate() {
             let wrapper = match &tool.strict_schema {
                 Some(schema) => embed_schema_in_tml_wrapper(&tool.name, schema),
@@ -1582,6 +1583,7 @@ impl GrammarCompiler {
                 .remove(0);
             payload.name = Some(format!("payload_{index}"));
             subgrammars.push(payload);
+            payload_refs.push(format!("@payload_{index}"));
             rules.push_str(&format!(
                 "tool_{index}: {} {} @payload_{index} {end}\n",
                 self.marker(&tool.name),
@@ -1594,6 +1596,12 @@ impl GrammarCompiler {
                 "strict tool grammar requires at least one active tool",
             ));
         }
+        rules.push_str(&format!(
+            "tool_unnamed: {} ({}) {end}\n",
+            self.marker("<|content_invoke_tool_json|>"),
+            payload_refs.join(" | "),
+        ));
+        tool_rules.push("tool_unnamed".into());
         rules.push_str(&format!("tool: {}\n", tool_rules.join(" | ")));
         if plan.single_call {
             rules.push_str(&format!("tools: tool ({restart} thinking* answer)?\n"));
@@ -1603,9 +1611,11 @@ impl GrammarCompiler {
             ));
         }
         let ending = if plan.require_call {
-            "tools"
+            "tools".to_owned()
+        } else if plan.single_call {
+            format!("(answer ({restart} thinking* tool)? | tools)")
         } else {
-            "(answer | tools)"
+            format!("(answer ({restart} thinking* tool)* | tools)")
         };
         rules.push_str(&format!("tail: thinking* {ending}\n"));
         match recipient.start {
@@ -4121,6 +4131,16 @@ mod tests {
                 valid: "weather<|content_invoke_tool_json|>{\"name\":\"weather\",\"args\":{\"value\":2}}<|end_message|>",
                 invalid: "weather<|content_invoke_tool_json|>{\"name\":\"weather\",\"args\":{\"value\":4}}<|end_message|>",
             },
+            Case {
+                name: "TML_unnamed",
+                kind: ToolParserKind::TmlJson,
+                separator: "",
+                start: OutputStart::RecipientHeader,
+                controls: &CONTROL_MARKERS,
+                constraint: Constraint::NumericRange,
+                valid: "<|content_invoke_tool_json|>{\"name\":\"weather\",\"args\":{\"value\":2}}<|end_message|>",
+                invalid: "<|content_invoke_tool_json|>{\"name\":\"weather\",\"args\":{\"value\":4}}<|end_message|>",
+            },
         ];
 
         for case in cases {
@@ -4500,5 +4520,117 @@ mod tests {
             &"r".repeat(385),
             false,
         );
+    }
+
+    #[test]
+    fn strict_tml_grammar_allows_unnamed_headers_and_preamble_before_tools() {
+        use crate::model::contract::{ToolParser, ToolParserKind};
+        use crate::output::{
+            OutputConfig, OutputPipeline,
+            tagged::{OutputConfig as TaggedConfig, OutputStart},
+            tml::CONTROL_MARKERS,
+        };
+
+        let weather_schema = json!({
+            "type": "object",
+            "properties": {"value": {"type": "integer", "minimum": 1, "maximum": 3}},
+            "required": ["value"],
+            "additionalProperties": false
+        });
+        let lookup_schema = json!({
+            "type": "object",
+            "properties": {"query": {"type": "string", "minLength": 2}},
+            "required": ["query"],
+            "additionalProperties": false
+        });
+        let tokenizer = byte_tokenizer_with(&CONTROL_MARKERS);
+        let controls: Vec<_> = CONTROL_MARKERS
+            .iter()
+            .map(|marker| (tokenizer.token_to_id(marker).unwrap(), (*marker).to_owned()))
+            .collect();
+        let compiler = GrammarCompiler::new(&tokenizer, 320, &[256, 257], &controls).unwrap();
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.reasoning = None;
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::TmlJson,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        let config = OutputConfig {
+            syntax,
+            control_tokens: controls.clone(),
+            content: TaggedConfig {
+                structured: false,
+                start: OutputStart::RecipientHeader,
+                tools: vec![
+                    json!({"type":"function","function":{"name":"weather","parameters":weather_schema}}),
+                    json!({"type":"function","function":{"name":"lookup","parameters":lookup_schema}}),
+                ],
+            },
+        };
+        let envelope = OutputPipeline::grammar_envelope(&config).unwrap();
+        let encode = |wire: &str| {
+            let mut tokens = Vec::new();
+            let mut rest = wire;
+            while let Some((at, id, marker)) = controls
+                .iter()
+                .filter_map(|(id, marker)| {
+                    rest.find(marker).map(|at| (at, *id, marker.as_str()))
+                })
+                .min_by_key(|(at, _, _)| *at)
+            {
+                tokens.extend(rest[..at].bytes().map(u32::from));
+                tokens.push(id);
+                rest = &rest[at + marker.len()..];
+            }
+            tokens.extend(rest.bytes().map(u32::from));
+            tokens
+        };
+        let accepts = |single_call: bool, wire: &str| {
+            let plan = ToolGrammarPlan {
+                tools: vec![
+                    StrictToolSpec {
+                        name: "weather".into(),
+                        strict_schema: Some(&weather_schema),
+                    },
+                    StrictToolSpec {
+                        name: "lookup".into(),
+                        strict_schema: Some(&lookup_schema),
+                    },
+                ],
+                syntax: Some((ToolParserKind::TmlJson, 0, String::new())),
+                dsml_token: None,
+                allow_undeclared: false,
+                require_call: false,
+                single_call,
+            };
+            let mut g = compiler
+                .compile_with_strict_tools(None, Some(&envelope), &plan)
+                .unwrap();
+            encode(wire)
+                .into_iter()
+                .chain([256])
+                .all(|token| g.advance(token).is_ok())
+                && g.is_stopped()
+        };
+
+        // Multi-tool unnamed strict headers accept valid arguments for either tool
+        assert!(accepts(false, r#"<|content_invoke_tool_json|>{"name":"weather","args":{"value":2}}<|end_message|>"#));
+        assert!(accepts(false, r#"<|content_invoke_tool_json|>{"name":"lookup","args":{"query":"ok"}}<|end_message|>"#));
+        // Unnamed strict headers reject schema violations and undeclared tools
+        assert!(!accepts(false, r#"<|content_invoke_tool_json|>{"name":"weather","args":{"value":9}}<|end_message|>"#));
+        assert!(!accepts(false, r#"<|content_invoke_tool_json|>{"name":"lookup","args":{"query":"x"}}<|end_message|>"#));
+        assert!(!accepts(false, r#"<|content_invoke_tool_json|>{"name":"other","args":{}}<|end_message|>"#));
+        // Named strict headers reject header/body mismatch
+        assert!(!accepts(false, r#"weather<|content_invoke_tool_json|>{"name":"lookup","args":{"query":"ok"}}<|end_message|>"#));
+        // Visible preamble before unnamed strict tool calls is accepted; single_call caps at one tool
+        let preamble_one = r#"<|content_text|>Checking now.<|end_message|><|message_model|><|content_invoke_tool_json|>{"name":"weather","args":{"value":2}}<|end_message|>"#;
+        let preamble_two = r#"<|content_text|>Checking both.<|end_message|><|message_model|><|content_invoke_tool_json|>{"name":"weather","args":{"value":2}}<|end_message|><|message_model|><|content_invoke_tool_json|>{"name":"lookup","args":{"query":"ok"}}<|end_message|>"#;
+        let preamble_bad = r#"<|content_text|>Checking now.<|end_message|><|message_model|><|content_invoke_tool_json|>{"name":"weather","args":{"value":9}}<|end_message|>"#;
+        assert!(accepts(false, preamble_one));
+        assert!(accepts(false, preamble_two));
+        assert!(!accepts(false, preamble_bad));
+        assert!(accepts(true, preamble_one));
+        assert!(!accepts(true, preamble_two));
     }
 }
