@@ -50,16 +50,28 @@ def canonical(manifest):
 
 
 @torch.no_grad()
-def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mode="prefill", rotate=True, verify_fp8=False):
+def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mode="prefill", rotate=True, verify_fp8=False,
+                       permute_pages=False, decode_width=1):
     """Selections (as positions) and attention output of one rank; decode replays the trailing rows."""
     from ignition.recipes.glm53_full.attention import PAGE_TOKENS, AttentionMetadata, PreparedAttention, rotary_frequencies
     from ignition.recipes.glm53_full.config import ModelConfig
+    from ignition.components.paged_batch import Metadata
+    from ignition.recipes.glm53_full.decoder import attention_metadata
     from ignition.recipes.glm53_full.indexer import PreparedIndexer
     from ignition.recipes.glm53_full.weights import GlmWeightLoader
 
     device, rows = source.device, source.shape[0]
     config = ModelConfig.load(manifest.snapshot)
     pages = -(-rows // PAGE_TOKENS)
+    table = torch.arange(pages, dtype=torch.int32, device=device)
+    if permute_pages:
+        table = table.flip(0)
+    physical_to_logical_page = table.argsort()
+
+    def logical_records(records):
+        positive = records.long().clamp_min(0)
+        logical = physical_to_logical_page[positive // PAGE_TOKENS] * PAGE_TOKENS + positive % PAGE_TOKENS
+        return torch.where(records >= 0, logical, -1).int()
     with GlmWeightLoader(manifest, device, shard=shard, prefixes=(f"model.layers.{LAYER}.self_attn.",)) as loader:
         weights = loader.load_attention(LAYER)
     cache = torch.zeros((pages * 4, 64, 656), dtype=torch.uint8, device=device)
@@ -71,7 +83,7 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
             workload_schema="glm53-full-indexer-v1", numerical_policy="default") as session:
         session.register_scratch(arena)
         prepared = {}
-        for name, capacity in (("prefill", rows), ("decode", 1)):
+        for name, capacity in (("prefill", rows), ("decode", decode_width)):
             metadata = AttentionMetadata.allocate(capacity, 1, pages, device)
             angles = PreparedRotaryAngles(metadata.positions, frequencies)
             attention = PreparedAttention(weights, source[:capacity].clone(), metadata, cache, angles,
@@ -84,7 +96,8 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
             attention.functional(session=session)
             indexer.functional(session=session)
             angles.functional()
-            prepared[name] = (attention, indexer, angles, metadata)
+            placement = Metadata.allocate(capacity, 1, pages, device) if permute_pages else None
+            prepared[name] = (attention, indexer, angles, metadata, placement)
         session.tune()
         arena.release_preparation()
         cache.zero_()
@@ -95,11 +108,19 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
             reference_scales = torch.empty(rows, dtype=torch.float32, device=device)
 
         def run(name, first, last):
-            attention, indexer, angles, metadata = prepared[name]
+            attention, indexer, angles, metadata, placement = prepared[name]
             positions = torch.arange(first, last, device=device)
             metadata.positions.copy_(positions)
-            metadata.token_slots.copy_(positions)
-            metadata.block_table.copy_(torch.arange(pages, dtype=torch.int32, device=device))
+            slots = table[positions // PAGE_TOKENS].long() * PAGE_TOKENS + positions % PAGE_TOKENS
+            if placement is None:
+                metadata.token_slots.copy_(slots)
+                metadata.block_table.copy_(table)
+            else:
+                placement.positions.copy_(positions)
+                placement.requests.zero_()
+                placement.page_table.copy_(table)
+                metadata = attention_metadata(placement)
+                assert torch.equal(metadata.token_slots, slots)
             values = angles(metadata.positions if rotate else torch.zeros_like(metadata.positions))
             projected = attention.project(source[first:last], metadata, values)
             arguments = (projected.query_residual, projected.index_key, projected.index_weights, metadata, values)
@@ -121,12 +142,12 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
                 reference_scales[first:last].copy_(scales)
                 actual_keys = index_cache[:, :8192].contiguous().view(-1, 128)
                 actual_scales = index_cache[:, 8192:].contiguous().view(torch.float32).flatten()
-                assert torch.equal(actual_keys[first:last], keys) and torch.equal(actual_scales[first:last], scales)
+                assert torch.equal(actual_keys[slots], keys) and torch.equal(actual_scales[slots], scales)
                 for start in range(0, last - first, 16):
                     subset = slice(start, min(start + 16, last - first))
                     scores, allowance = index_score_interval(rotated[3][subset], projected.index_weights[subset],
                                                              reference_keys[:last], reference_scales[:last])
-                    records = selection.records[subset]
+                    records = logical_records(selection.records[subset])
                     lengths = selection.lengths[subset]
                     pos = metadata.positions[subset]
                     valid = valid_index_cutoff(records, lengths, pos, scores, allowance)
@@ -142,10 +163,11 @@ def prepared_selection(manifest, source, *, shard=TensorParallelShard(0, 1), mod
                         assert not valid_index_cutoff(future, lengths[-1:], pos[-1:], scores[-1:], allowance[-1:]).item()
             else:
                 selection = indexer(*arguments)
-            return selection, attention.attend(projected.absorbed, selection, metadata).float()
+            output = attention.attend(projected.absorbed, selection, metadata).float()
+            return selection._replace(records=logical_records(selection.records)), output
 
         selection, output = run("prefill", 0, rows)
-        decoded = [run("decode", row, row + 1) for row in range(rows - decode_rows, rows)] if mode == "decode" else []
+        decoded = [run("decode", row, row + decode_width) for row in range(rows - decode_rows, rows, decode_width)] if mode == "decode" else []
         session.freeze()
     return selection, output, decoded
 
@@ -222,3 +244,16 @@ def test_every_rank_selects_the_same_records(manifest, canonical):
     other, _, _ = prepared_selection(manifest, source, shard=TensorParallelShard(5, 8))
     assert torch.equal(first.lengths, other.lengths)
     assert torch.equal(first.records, other.records)
+
+
+@torch.no_grad()
+def test_four_verification_rows_with_permuted_checkpoint_pages(manifest, canonical):
+    source, expected, _, _ = canonical
+    _, _, decoded = prepared_selection(manifest, source, mode="decode", verify_fp8=True,
+                                       permute_pages=True, decode_width=4)
+    (selected, output), = decoded
+    assert selected.lengths.tolist() == [2048] * 4
+    assert (selected.records[:, 1:] > selected.records[:, :-1]).all()
+    assert (selected.records <= torch.arange(len(source)-4, len(source), device=source.device)[:, None]).all()
+    errors = support.row_errors(output, expected[-4:])
+    assert errors["relative_l2"] < 0.03, errors

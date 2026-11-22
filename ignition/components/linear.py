@@ -123,6 +123,12 @@ class BatchedUnquantizedProjection:
         if output is None:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        if (source.stride(2) != 1
+                or (source.shape[1] > 1 and source.stride(1) < source.shape[2])
+                or (source.shape[0] > 1 and source.shape[1] > 1
+                    and source.stride(0) < source.shape[1] * source.stride(1))):
+            # cuBLASLt's SM120 TMA batched GEMM kernels overread multi-row inputs whose batch slices interleave.
+            source = source.contiguous()
         _bmm_out(source, self.weight, output)
         return output
 

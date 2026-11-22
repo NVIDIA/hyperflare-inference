@@ -29,7 +29,7 @@ from ignition.components.weight_prefetch import PreparedWeightPrefetch, join_wei
 from ignition.preparation.tuning import register_finalizer
 
 from .attention import PAGE_TOKENS, AttentionMetadata, ExampleBuffers, PreparedAttention, Selection, rotary_frequencies
-from .indexer import PreparedIndexer
+from .indexer import PreparedIndexer, index_tables
 from .pool import ContinuationPool
 from .weights import BF16Experts, LayerWeights, ModelWeights, MoEWeights
 
@@ -43,7 +43,8 @@ def attention_metadata(metadata: Metadata) -> AttentionMetadata:
     position = positions.clamp(min=0)
     pages = metadata.page_table[metadata.requests, position // PAGE_TOKENS].long()
     slots = torch.where(live, pages * PAGE_TOKENS + position % PAGE_TOKENS, -1)
-    return AttentionMetadata(positions, slots, metadata.requests, metadata.page_table)
+    return AttentionMetadata(positions, slots, metadata.requests, metadata.page_table,
+                             index_tables(metadata.page_table, metadata.requests))
 
 
 class PreparedMoE:

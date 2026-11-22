@@ -52,6 +52,7 @@ class AttentionMetadata:
     token_slots: torch.Tensor
     requests: torch.Tensor
     block_table: torch.Tensor
+    index_tables: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @classmethod
     def allocate(cls, tokens, sequences, blocks, device):
@@ -151,12 +152,10 @@ class PreparedAttention:
                     session=session, name=f"{name}.q_b_proj", workspace=workspace),
                 "o_proj": prepare_projection(expanded.view(rows, -1), weights["o_proj"], zeros(rows, 6144),
                     session=session, name=f"{name}.o_proj", workspace=workspace)})
-            # Batched products take head-major contiguous operands; the forward copies between that order
-            # and the row-major order of the projections and the attention kernel.
-            self.absorb = BatchedUnquantizedProjection(zeros(heads, rows, NOPE), weights["key"],
-                zeros(heads, rows, LATENT), major="n", session=session, name=f"{name}.absorb_query")
-            self.expand = BatchedUnquantizedProjection(zeros(heads, rows, LATENT), weights["value"],
-                zeros(heads, rows, VALUE), major="n", session=session, name=f"{name}.expand_value")
+            self.absorb = BatchedUnquantizedProjection(query[:, :, :NOPE].transpose(0, 1), weights["key"],
+                absorbed[:, :, :LATENT].transpose(0, 1), major="n", session=session, name=f"{name}.absorb_query")
+            self.expand = BatchedUnquantizedProjection(attended.transpose(0, 1), weights["value"],
+                expanded.transpose(0, 1), major="n", session=session, name=f"{name}.expand_value")
         if cache_only:
             return
         selected = zeros(rows, TOPK, dtype=torch.int32)
@@ -193,7 +192,7 @@ class PreparedAttention:
         query = self.projections["q_b_proj"](residual).view(rows, heads, NOPE + ROTARY)
         self.angles.apply(query, angles)
         absorbed = torch.empty((rows, heads, LATENT + ROTARY), dtype=torch.bfloat16, device=device)
-        absorbed[:, :, :LATENT].copy_(self.absorb(query[:, :, :NOPE].transpose(0, 1).contiguous()).transpose(0, 1))
+        self.absorb(query[:, :, :NOPE].transpose(0, 1), output=absorbed[:, :, :LATENT].transpose(0, 1))
         absorbed[:, :, LATENT:].copy_(query[:, :, NOPE:])
         if not self.selects:
             return Projected(residual, absorbed, None, None)
@@ -215,5 +214,5 @@ class PreparedAttention:
         rows = absorbed.shape[0]
         visible = (metadata.positions[:rows] + 1).to(torch.int32)
         attended = self.attention(absorbed, selection.records, visible, selection.lengths, cache=self.cache)
-        expanded = self.expand(attended.transpose(0, 1).contiguous()).transpose(0, 1)
+        expanded = self.expand(attended.transpose(0, 1)).transpose(0, 1)
         return self.projections["o_proj"](expanded.reshape(rows, -1))

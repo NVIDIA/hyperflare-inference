@@ -21,6 +21,7 @@ from ignition.components.fp8_indexer import PreparedFP8Indexer
 from ignition.components.glm_mla_cache import store_glm_index_key
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.rotary import PreparedRotaryAngles
+from ignition.components.sparse_record_order import ordered_sparse_records
 
 from .attention import PAGE_RECORDS, QUERY_RANK, TOPK, AttentionMetadata, ExampleBuffers, Selection
 
@@ -36,6 +37,12 @@ def index_page_table(block_table):
     return torch.where(block_table[:, :, None] >= 0, pages, -1).flatten(1)
 
 
+def index_tables(block_table, requests):
+    """Expand model pages once and gather the index pages belonging to each packed row."""
+    tables = index_page_table(block_table)
+    return tables, tables[requests.long()]
+
+
 def selected_records(logical, positions, pages):
     """Map selected logical positions to physical records in ascending token order.
 
@@ -45,7 +52,9 @@ def selected_records(logical, positions, pages):
     independent of top-k enumeration and physical cache-page placement.
     Returns the records padded with -1 and the kept counts.
     """
-    live = (logical >= 0) & (logical <= positions[:, None])
+    if logical.is_cuda and logical.dtype == torch.int32 and 0 < logical.shape[1] <= TOPK:
+        return Selection(*ordered_sparse_records(logical, positions, pages, PAGE_RECORDS))
+    live = (logical >= 0) & (logical <= positions[:, None]) & (logical // PAGE_RECORDS < pages.shape[1])
     page = pages.gather(1, (logical.clamp(min=0) // PAGE_RECORDS).long().clamp(max=pages.shape[1] - 1))
     live &= page >= 0
     records = torch.where(live, page * PAGE_RECORDS + logical % PAGE_RECORDS, -1)
@@ -121,8 +130,8 @@ class PreparedIndexer:
         head_weights = index_weights * (INDEX_HEADS ** -0.5)
         positions = metadata.positions[:rows]
         visible = (positions + 1).clamp(min=0).to(torch.int32)
-        tables = index_page_table(metadata.block_table)
-        row_pages = tables[metadata.requests[:rows].long()]
+        tables, row_pages = metadata.index_tables if metadata.index_tables is not None else index_tables(
+            metadata.block_table, metadata.requests[:rows])
         logical = torch.empty((rows, TOPK), dtype=torch.int32, device=device)
         for start, end in self.bounds:
             count = end - start
