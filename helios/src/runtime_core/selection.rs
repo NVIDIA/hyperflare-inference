@@ -84,10 +84,6 @@ impl LoadOptions {
             if self.embedding_table_storage == Some(crate::engram::Storage::Ram) {
                 return Err(invalid("embedding table workers require disk storage"));
             }
-            #[cfg(unix)]
-            if workers != 1 {
-                return Err(invalid("parallel embedding disk workers require Windows"));
-            }
         }
         if self
             .embedding_table_cache_bytes
@@ -676,6 +672,14 @@ mod tests {
         };
         assert_eq!(single.embedding_workers(), 1);
         single.select(&mut [core()], &mut config()).unwrap();
+        for workers in [2, 4, 8] {
+            let options = LoadOptions {
+                embedding_table_workers: Some(workers),
+                ..Default::default()
+            };
+            options.select(&mut [core()], &mut config()).unwrap();
+            assert_eq!(options.embedding_workers(), workers);
+        }
         for workers in [0, 3, 5] {
             let options = LoadOptions {
                 embedding_table_workers: Some(workers),

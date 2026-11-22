@@ -762,7 +762,7 @@ favor shorter prefixes. Confidence observations and token acceptance remain
 unchanged. This serving option uses the core's captured graphs and does not enable
 adaptive verification when fixed-width selection is configured.
 
-`--embedding-table-workers 1|2|4|8` controls Windows disk-reader workers.
+`--embedding-table-workers 1|2|4|8` controls disk-reader workers.
 Workers share 128 I/O slots and 8 MiB of direct-read staging per embedding table.
 Windows defaults to four workers; other platforms default to one. Explicit worker
 counts override the default. Large gathers use scoped helper threads, whose startup
