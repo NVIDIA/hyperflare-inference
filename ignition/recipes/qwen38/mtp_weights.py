@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import importlib.metadata
 import json
 
 import torch
@@ -16,7 +15,7 @@ import torch
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.vocabulary import nvfp4_draft_head
 from ignition.preparation.checkpoint import CheckpointError, CheckpointManifest
-from .checkpoint_schema import TRANSFORMERS_REVISION
+from .checkpoint_schema import require_transformers_version
 from ignition.preparation.persistent import persistent_cat, allocated_tensor_bytes
 
 from .moe import QwenMoeWeights, SharedExpertWeights
@@ -84,10 +83,7 @@ class MTPWeightLoader(QwenWeightLoader):
 
 def create_mtp_modules(manifest: CheckpointManifest):
     """Create canonical HC/QSA parameter owners without a duplicate target model."""
-    distribution = importlib.metadata.distribution("transformers")
-    provenance = json.loads(distribution.read_text("direct_url.json") or "{}")
-    if provenance.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_REVISION:
-        raise RuntimeError(f"MTP preparation requires Transformers {TRANSFORMERS_REVISION}")
+    require_transformers_version("MTP preparation")
     raw = (manifest.snapshot / "config.json").read_bytes()
     if hashlib.sha256(raw).hexdigest() != manifest.metadata_sha256["config.json"]:
         raise CheckpointError("config.json changed after checkpoint inspection")

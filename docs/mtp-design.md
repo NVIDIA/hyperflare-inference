@@ -70,9 +70,8 @@ The [checkpoint manifest](../ignition/preparation/qwen38.py) validates MTP
 tensor geometry. Target loading excludes those tensors; the separate
 [MTP loader](../ignition/recipes/qwen38/mtp_weights.py) prepares their weights.
 
-The Transformers revision pinned in `pyproject.toml`,
-`1d9654e78a23fb167ef539cbd699dfbd3e4830cf`, ignores `mtp.*` checkpoint keys
-and has no MTP module. The [MTP recipe](../ignition/recipes/qwen38/mtp.py) composes
+Transformers 5.23.0, the release pinned in `pyproject.toml`, ignores `mtp.*`
+checkpoint keys and has no MTP module. The [MTP recipe](../ignition/recipes/qwen38/mtp.py) composes
 b12x operators for feedback, attention, expert execution, and output mixing.
 Feedback arithmetic is checked against `b12x.sequence.mtp_feedback.reference`;
 state alignment and graph replay are exercised by the recipe tests.
