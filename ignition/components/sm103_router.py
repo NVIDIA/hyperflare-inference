@@ -163,7 +163,7 @@ def declare_sm103_router_plans(rows_list, *, experts: int, hidden: int, top_k: i
                 return PreparedCall(
                     run=lambda: state.run(x, w, b, None, None, v, p, workspace.part_buf, ids, probs, None, 1.0),
                     output=ids,
-                    owners=(workspace, x, w, b, v, p, probs),
+                    owners=(workspace,),
                 )
             return prepare_call
 

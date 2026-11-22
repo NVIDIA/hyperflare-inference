@@ -428,7 +428,6 @@ class ReferenceModel(nn.Module):
         small_draft = tuple(sorted({r for r in draft_rows if 1 <= r <= MHC_SEAM_MAX_ROWS}))
         attn_rows = tuple(r for r in small_target if r <= MEGA_ATTENTION_MAX_ROWS)
         yoco_boundary = self.model.yoco_boundary_layer_idx
-        skip_yoco_boundary_attn = (self.yoco_keep_tokens is not None and yoco_boundary is not None)
 
         def wrap_rmsnorm(owner, norm_attr, consumer, rows, full_name, *, return_bf16=False):
             norm = getattr(owner, norm_attr, None)
@@ -441,8 +440,7 @@ class ReferenceModel(nn.Module):
         for index, layer in enumerate(self.model.layers):
             wrap_rmsnorm(layer.self_attn, "q_a_norm", getattr(layer.self_attn, "q_b_proj", None),
                          small_target, f"layers.{index}.attn.q_a_norm")
-            if (index == 0 or layer.engram is not None or not stream_overlap
-                    or (skip_yoco_boundary_attn and index == yoco_boundary)):
+            if index == 0 or layer.engram is not None or not stream_overlap:
                 attn_consumer = (getattr(layer.self_attn, "q_a_kv_swa_proj", None)
                                  or getattr(layer.self_attn, "q_a_kv_proj", None))
                 wrap_rmsnorm(layer, "attn_layernorm", attn_consumer, small_target,
@@ -520,11 +518,12 @@ class ReferenceModel(nn.Module):
         if stream_overlap and (small_target or small_draft):
             aux_stream = torch.cuda.Stream(device=device)
             aux_kv_stream = torch.cuda.Stream(device=device)
+            self._sm103_aux_stream = aux_stream
+            self._sm103_aux_kv_stream = aux_kv_stream
             resources.extend((aux_stream, aux_kv_stream))
             num_layers = len(self.model.layers)
             for index, layer in enumerate(self.model.layers):
-                allow_attn = (index > 0 and layer.engram is None
-                              and not (skip_yoco_boundary_attn and index == yoco_boundary))
+                allow_attn = index > 0 and layer.engram is None
                 join_after = (index == num_layers - 1 or (yoco_boundary is not None and index == yoco_boundary - 1))
                 bind_mhc_overlap_layer(
                     layer, small_target, aux_stream=aux_stream, session=session,

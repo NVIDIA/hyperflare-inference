@@ -381,3 +381,97 @@ def test_sm103_mhc_overlap_and_low_latency_fp8_projection(megamoe_core_storage):
     finally:
         gc.set_primary()
         gc.close()
+
+
+def test_sm103_cublaslt_gemm_nt_and_mhc_replay_under_green_context(megamoe_core_storage):
+    """Verify aux_kv_stream cublaslt_gemm_nt (under set_num_sms) and multi-call mega_mhc graph replay."""
+    _require_sm103()
+    import deep_gemm
+
+    device = torch.device("cuda", 0)
+    gc = _GreenCtxPair(0, worker_sm_count=8)
+    prev_sms = deep_gemm.get_num_sms()
+    try:
+        gc.set_primary()
+        deep_gemm.set_num_sms(gc.compute_sms)
+        gen = torch.Generator(device="cpu").manual_seed(20261124)
+
+        # 1. Verify cublaslt_gemm_nt across aux_kv_stream BF16/FP32 output shapes inside a 144-SM Green Context.
+        cap_stream = torch.cuda.Stream(device=device)
+        for out_dtype in (torch.bfloat16, torch.float32):
+            for m, n, k in ((8, 32, 5120), (8, 512, 5120), (8, 128, 512)):
+                a = (torch.randn((m, k), generator=gen) * 0.2).to(torch.bfloat16).to(device)
+                b = (torch.randn((n, k), generator=gen) * 0.2).to(torch.bfloat16).to(device)
+                out = torch.empty((m, n), dtype=out_dtype, device=device)
+                with torch.cuda.stream(cap_stream):
+                    deep_gemm.cublaslt_gemm_nt(a, b, out)
+                cap_stream.synchronize()
+
+                g = torch.cuda.CUDAGraph(keep_graph=True)
+                with torch.cuda.stream(cap_stream):
+                    with torch.cuda.graph(g, pool=megamoe_core_storage.graph_pool, stream=cap_stream):
+                        deep_gemm.cublaslt_gemm_nt(a, b, out)
+                g.instantiate()
+                out.zero_()
+                gc.launch_graph(int(g.raw_cuda_graph_exec()), worker=False)
+                gc.sync_compute()
+                gc.set_primary()
+
+                ref = (a.float() @ b.float().T).to(out_dtype)
+                torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=5e-2)
+
+        # 2. Verify multi-call shifted mega_mhc graph replay (matching aux_stream overlap layout where every
+        #    graph executes >= 2 mega_mhc calls per barrier) produces zero NaNs across 200 replays.
+        m, h, hc = 8, 5120, 4
+        x = (torch.randn((m, h), generator=gen) * 0.1).to(torch.bfloat16).to(device)
+        res = (torch.randn((m, hc, h), generator=gen) * 0.1).to(torch.bfloat16).to(device)
+        prev_mix = torch.full((m, hc, 1), 0.25, dtype=torch.float32, device=device)
+        post_mix = torch.full((m, hc, 1), 0.5, dtype=torch.float32, device=device)
+        comb = torch.eye(hc, dtype=torch.float32, device=device).unsqueeze(0).expand(m, hc, hc).contiguous()
+        fn = (torch.randn((hc * (hc + 2), hc * h), generator=gen) * 0.01).to(device)
+        scales = torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32, device=device)
+        bases = torch.zeros((hc * (hc + 2),), dtype=torch.float32, device=device)
+        w = torch.ones((h,), dtype=torch.bfloat16, device=device)
+        nres = torch.empty_like(res)
+        nprev = torch.empty_like(prev_mix)
+        npost = torch.empty_like(post_mix)
+        ncomb = torch.empty_like(comb)
+        y_bf16 = torch.empty((m, h), dtype=torch.bfloat16, device=device)
+        y_fp8 = torch.empty((m, h), dtype=torch.float8_e4m3fn, device=device)
+        y_sf = torch.empty((h // 128, ((m + 3) // 4) * 4), dtype=torch.int32, device=device).t()[:m]
+
+        with torch.cuda.stream(cap_stream):
+            deep_gemm.mega_mhc(
+                x, res, prev_mix, post_mix, comb,
+                fn, scales, bases, hc, 1e-20, 1e-6, 2.0, 1e-6, 20,
+                w, 1e-20, 1.0,
+                nres, nprev, npost, ncomb,
+                y_bf16=y_bf16, y_fp8=y_fp8, y_gemm_sf=y_sf,
+            )
+        cap_stream.synchronize()
+
+        nan_count = torch.zeros((1,), dtype=torch.int64, device=device)
+        mhc_graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.stream(cap_stream):
+            with torch.cuda.graph(mhc_graph, pool=megamoe_core_storage.graph_pool, stream=cap_stream):
+                for _ in range(2):
+                    deep_gemm.mega_mhc(
+                        x, res, prev_mix, post_mix, comb,
+                        fn, scales, bases, hc, 1e-20, 1e-6, 2.0, 1e-6, 20,
+                        w, 1e-20, 1.0,
+                        nres, nprev, npost, ncomb,
+                        y_bf16=y_bf16, y_fp8=y_fp8, y_gemm_sf=y_sf,
+                    )
+                nan_count += torch.isnan(y_bf16).sum()
+        mhc_graph.instantiate()
+        exec_h = int(mhc_graph.raw_cuda_graph_exec())
+        nan_count.zero_()
+        for _ in range(200):
+            gc.launch_graph(exec_h, worker=False)
+        gc.sync_compute()
+        gc.set_primary()
+        assert nan_count.item() == 0
+    finally:
+        deep_gemm.set_num_sms(prev_sms)
+        gc.set_primary()
+        gc.close()

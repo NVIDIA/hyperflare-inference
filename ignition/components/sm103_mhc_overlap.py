@@ -1057,7 +1057,7 @@ def _indexer_kv_prep_aux(
         phys_n = (cur_n + align - 1) // align * align
         cur_storage = torch.empty((rows, phys_n), dtype=cur_dtype, device=device)
         cur_out = cur_storage[:, :cur_n]
-        deep_gemm.bf16_gemm_nt(hidden_states_bf16, cur_weight, cur_out)
+        deep_gemm.cublaslt_gemm_nt(hidden_states_bf16, cur_weight, cur_out)
         if kv_dim > 0:
             projected_kv = cur_out[:, :kv_dim]
             index_weights_out.copy_(cur_out[:, kv_dim : kv_dim + index_weights_dim].bfloat16())
@@ -1072,7 +1072,7 @@ def _indexer_kv_prep_aux(
             sh_phys = (sh_n + sh_align - 1) // sh_align * sh_align
             sh_storage = torch.empty((rows, sh_phys), dtype=sh_dtype, device=device)
             projected_kv = sh_storage[:, :sh_n]
-            deep_gemm.bf16_gemm_nt(shared_hidden_bf16, shared_weight, projected_kv)
+            deep_gemm.cublaslt_gemm_nt(shared_hidden_bf16, shared_weight, projected_kv)
 
         if is_kv_source and projected_kv is not None and ca_cache is not None and pre_rope_kv_out is not None:
             if kv_compress_ratio == 1:
@@ -1107,7 +1107,7 @@ def _indexer_kv_prep_aux(
             k_phys = (k_n + k_align - 1) // k_align * k_align
             k_storage = torch.empty((pre_rope_kv_out.shape[0], k_phys), dtype=torch.bfloat16, device=device)
             index_k = k_storage[:, :k_n]
-            deep_gemm.bf16_gemm_nt(pre_rope_kv_out, k_proj_weight, index_k)
+            deep_gemm.cublaslt_gemm_nt(pre_rope_kv_out, k_proj_weight, index_k)
             fused_norm_rope_hadamard_cast_store_kvcache(
                 index_k,
                 norm_args=NormArgs(k_norm_weight, k_norm_eps),

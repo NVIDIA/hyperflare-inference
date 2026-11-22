@@ -780,9 +780,26 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             _ks = torch.zeros((1,), dtype=torch.int32, device=device)
             _ke = torch.zeros((1,), dtype=torch.int32, device=device)
             _sblk = torch.zeros((1, 4), dtype=torch.int32, device=device)
-        seed_streams = (stream, *(r for r in sm103_decode_resources if isinstance(r, torch.cuda.Stream)))
-        for _seed_stream in seed_streams:
-            with torch.cuda.stream(_seed_stream):
+            _cb = torch.zeros((32, _h), dtype=torch.bfloat16, device=device)
+            _cd = torch.empty((1, 32), dtype=torch.bfloat16, device=device)
+        from ignition.preparation.capture import _seed_warmup_workspaces, _warmup_pools, _warmup_stream
+
+        warm_stream = _warmup_stream(device)
+        _seed_warmup_workspaces(warm_stream, device)
+        warm_pool = _warmup_pools[torch.cuda.current_device() if device.index is None else device.index]
+        mhc_streams = tuple(
+            s for s in (stream, getattr(model, "_sm103_aux_stream", None)) if s is not None
+        )
+        cublaslt_streams = tuple(
+            s for s in (getattr(model, "_sm103_aux_kv_stream", None),) if s is not None
+        )
+        for _seed_stream in (*mhc_streams, warm_stream):
+            pool_ctx = (
+                torch.cuda.use_mem_pool(warm_pool, device=device)
+                if _seed_stream is warm_stream
+                else contextlib.nullcontext()
+            )
+            with pool_ctx, torch.cuda.stream(_seed_stream):
                 if hasattr(_dg, "mega_mhc"):
                     _dg.mega_mhc(
                         _x, _res, None, _pm, _cm,
@@ -793,7 +810,7 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
                         new_residual=_nres, new_prev_mix=None, new_post_mix=_npm,
                         new_comb_res_mix=_ncm, y_bf16=_y,
                     )
-                if _seed_stream is stream:
+                if _seed_stream in (stream, warm_stream):
                     if hasattr(_dg, "bf16_mega_gate"):
                         _dg.bf16_mega_gate(
                             _x, _gw, num_topk=_k, use_shared_as_routed=False,
@@ -805,8 +822,14 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
                             _ks, _ke, 0, _sblk, torch.float8_e4m3fn, 16,
                         )
             _seed_stream.synchronize()
+        for _seed_stream in cublaslt_streams:
+            with torch.cuda.stream(_seed_stream):
+                if hasattr(_dg, "cublaslt_gemm_nt"):
+                    _dg.cublaslt_gemm_nt(_x, _cb, _cd)
+            _seed_stream.synchronize()
         del (_x, _res, _pm, _cm, _fn, _ms, _mb, _nw, _nres, _npm, _ncm, _y,
-             _gw, _gids, _gprob, _ks, _ke, _sblk)
+             _gw, _gids, _gprob, _ks, _ke, _sblk, _cb, _cd)
+        torch.cuda.empty_cache()
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=None, coordinator=None, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
