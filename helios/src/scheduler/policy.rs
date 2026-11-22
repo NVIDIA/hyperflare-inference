@@ -330,7 +330,7 @@ impl RequestScheduler {
         self.prefill_work_through(request, capacity, self.estimated_checkpoint_cut(request))
     }
 
-    fn prefill_work_through(&self, request: &LiveRequest, capacity: usize, cut: Option<usize>) -> usize {
+    pub(super) fn prefill_work_through(&self, request: &LiveRequest, capacity: usize, cut: Option<usize>) -> usize {
         let start = request.consumed_tokens as usize;
         let mut end = cut
             .unwrap_or(request.prompt_tokens)
