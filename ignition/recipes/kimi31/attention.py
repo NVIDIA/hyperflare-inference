@@ -103,7 +103,7 @@ class PreparedDSA(PreparedMLAProjection):
             starts, pages = constants.starts[:rows + 1], constants.pages[:rows]
             part = dict(selector=selector, owners=owners, slots=slots, counts=counts, starts=starts, pages=pages)
             tuning = getattr(context, "selection_tuning", None)
-            if (mode in ("decode", "verify") and 1 <= rows <= 32 and self.shards.world in (4, 8, 16)
+            if (mode in ("decode", "verify") and 1 <= rows <= 64 and self.shards.world in (4, 8, 16)
                     and tuning is not None and selector is not None and tuning.supports_local_slots_rows(rows)):
                 from .local_slots import PreparedLocalSlots
 
@@ -154,8 +154,8 @@ class PreparedDSA(PreparedMLAProjection):
                     slots, counts, starts, caps=caps, scale=192 ** -.5, session=session,
                     name=name + ".attention", workspace=workspace, lse=lse,
                     kv_scale=constants.scale, q_scale=constants.scale)
-                lse_threads = 128 if self.shards.world == 8 else 512
-                lse_blocks = 64 if self.shards.world == 8 else 8
+                lse_threads = 128 if self.shards.world in (4, 8) else 512
+                lse_blocks = 64 if self.shards.world in (4, 8) else 8
                 part["combine"] = PreparedLseReduceScatter(partial, lse, self.attended,
                     runtime=context.heads, session=session, coordinator=context.coordinator, name=name + ".combine",
                     threads=lse_threads, block_limit=lse_blocks)

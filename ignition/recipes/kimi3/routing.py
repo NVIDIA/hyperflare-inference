@@ -17,7 +17,7 @@ from b12x.preparation import CollectiveRequirement, PreparedCall
 
 from ignition.preparation.tuning import declare, register_finalizer
 
-MAX_ROWS = 32
+MAX_ROWS = 64
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
