@@ -389,3 +389,90 @@ fn structured_output_grammars_constrain_frames() {
         assert_eq!(accepted, valid, "{text}");
     }
 }
+
+#[test]
+#[ignore = "requires FLARE_INKLING2_TEST_SNAPSHOT with an Inkling 2 tokenizer"]
+fn inkling_stress_untyped_closed_header_must_surface_failure() {
+    use crate::server::output::Decoder;
+    use crate::server::protocol::{Encoder, PromptUsage};
+
+    let inkling = Inkling::load(&golden());
+    let request = inkling.request(Protocol::Responses, json!({
+        "input":"Inspect the branch.",
+        "tools":[{"type":"function","name":"bash","parameters":{"type":"object"}}],
+        "tool_choice":"auto"
+    })).unwrap();
+    let prepared = prepare_inference(
+        &inkling.frontend, None, &inkling.compiler, &inkling.config, &request, 0, false,
+    ).unwrap();
+    let mut decoder = Decoder::<crate::output::OutputPipeline>::new(
+        &inkling.frontend, &inkling.config.eos_token_ids, prepared.output,
+    );
+    let mut encoder = Encoder::new(
+        Protocol::Responses, "stress".into(), inkling.config.model_id.clone(), 0, 1,
+        vec![PromptUsage { tokens: prepared.prompt.tokens.len(), image_tokens: 0 }],
+        request.tools, request.tool_choice, true, true, json!({}),
+    );
+
+    // A short valid reasoning frame, then the exact captured 18-token suffix.
+    let mut ids = vec![200001, 200008];
+    ids.extend(inkling.frontend.encode("Inspect the branch.", false).unwrap());
+    ids.push(END_MESSAGE);
+    ids.extend([
+        200001, 33131, 1, 70469, 1, 25, 1, 3960, 150309, 12, 68206, 155417,
+        152664, 1, 92, 92, END_MESSAGE, 200006,
+    ]);
+    let decoded: crate::Result<()> = (|| {
+        for id in ids {
+            let events = decoder.push(id)?;
+            assert!(events.iter().all(|e| matches!(e, Event::Reasoning(_))));
+            encoder.apply(0, events)?;
+        }
+        let last = decoder.finish(Termination::Eos)?;
+        assert!(last.iter().all(|e| matches!(e, Event::Reasoning(_))));
+        Ok(())
+    })();
+    let error = decoded.expect_err("malformed terminal header silently disposed of the action");
+    let terminal = encoder.failure(&error);
+    assert_eq!(terminal.event.as_deref(), Some("response.failed"));
+    assert_eq!(terminal.data["response"]["status"], "failed");
+}
+
+#[test]
+#[ignore = "requires FLARE_INKLING2_TEST_SNAPSHOT with an Inkling 2 tokenizer"]
+fn inkling_stress_custom_grammar_preamble_then_tool() {
+    let inkling = Inkling::load(&golden());
+    let preamble = "I'll start by exploring the workspace and the PR.";
+    let text = format!("<|message_model|><|content_text|>{preamble}<|end_message|>");
+    let call = concat!(
+        "<|message_model|>bash<|content_invoke_tool_json|>",
+        r#"{"name":"bash","args":{"command":"git status","description":"Inspect branch"}}"#,
+        "<|end_message|>",
+    );
+    let preamble_then_call = format!("{text}{call}");
+    let mut ids = inkling.frontend.encode(&preamble_then_call, false).unwrap();
+    ids.push(200006);
+    let fixture = json!({"output_ids":ids,"tools":["bash"],"finish":"eos"});
+    let (_, parsed_text, calls) = parse(&inkling, &fixture);
+    assert_eq!(parsed_text, preamble);
+    assert_eq!(calls, vec![("bash".to_owned(),
+        json!({"command":"git status","description":"Inspect branch"}))]);
+
+    let request = inkling.request(Protocol::Responses, json!({
+        "input":"Inspect the branch.",
+        "tools":[{"type":"function","name":"bash","parameters":{"type":"object"}}],
+        "tool_choice":"auto","grammar":"start: /(?s:.+)/"
+    })).unwrap();
+    let accepts = |frames: &str| {
+        let mut prepared = prepare_inference(
+            &inkling.frontend, None, &inkling.compiler, &inkling.config, &request, 0, false,
+        ).unwrap();
+        let grammar = prepared.prompt.grammar.as_mut().unwrap();
+        inkling.frontend.encode(frames, false).unwrap().into_iter().chain([200006])
+            .all(|id| grammar.advance(id).is_ok())
+    };
+    assert!(accepts(&text));
+    assert!(accepts(call));
+    assert!(accepts(&format!("{call}{text}")));
+    assert!(accepts(&preamble_then_call), "answer before a valid tool call rejected");
+}
