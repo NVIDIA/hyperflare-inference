@@ -133,6 +133,16 @@ reservations and the primary context. A failed worker drain follows the
 standard failed-drain invariant: the driver and GPU resources remain retained
 until process exit.
 
+Ignition declares persistent workers through `PersistentWorker` entries on
+`PreparedExecution` (and `PreparedModel`), exporting each `stop_flag` as an
+allocation-relative `Reference` inside a fixed `Memory::MappedHost` allocation
+and retaining both the `stop_flag` allocation and any non-numeric
+descriptor-referenced `Memory::MappedHost` allocations during reachability
+pruning. In-process Python execution (`GraphExecutor`,
+`serve_tensor_parallel_rank`, and `Server`) rejects persistent-worker manifests
+explicitly; persistent workers run only through exported cores served by
+`flare run`.
+
 Execution ABI numbers are descriptive metadata and do not gate loading or rank
 agreement. Every engine version loads the core layouts that earlier versions
 supported. The

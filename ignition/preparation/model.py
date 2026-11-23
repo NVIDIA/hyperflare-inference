@@ -99,6 +99,10 @@ class PreparedModel(PreparedExecution):
 
     def start_server(self, *, bind: str = "127.0.0.1:8000", template_defaults=None, peers=None, options=None):
         """Start in-process HTTP diagnostics with a qualification build of heliopause."""
+        if self.persistent_workers:
+            raise ValueError(
+                "persistent worker requires green-context runtime control (export a core and serve with flare run)"
+            )
         import flare_heliopause
 
         if not hasattr(flare_heliopause, "Server"):
@@ -167,6 +171,7 @@ class PreparedModel(PreparedExecution):
         self._buffers = MappingProxyType({})
         self._graphs = MappingProxyType({})
         self.serving_graphs = self.tuning_graphs = self.tuned_bindings = MappingProxyType({})
+        self.persistent_workers = ()
         self.forwards = None
         self.benchmark_state = self.benchmark_pool = self.benchmark_requests = self.benchmark_rounds = None
         self.benchmark_prefills = None

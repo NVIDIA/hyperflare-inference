@@ -3074,15 +3074,7 @@ pub(crate) fn capture_rank(
     let mut reach = Reachability::new(&allocations, &request.numeric, &request.inactive, &roots)?;
     if let Some(execution) = &request.execution {
         let execution = super::binding::execution(execution, &allocations)?;
-        for buffer in &execution.buffers {
-            reach.reference(
-                &buffer
-                    .reference
-                    .as_ref()
-                    .ok_or_else(|| invalid("execution buffer lacks allocation reference"))?
-                    .allocation,
-            )?;
-        }
+        reach.execution(&execution)?;
         output.index.ranks[0].execution = Some(execution);
     }
     let mut other_resources = Vec::new();
