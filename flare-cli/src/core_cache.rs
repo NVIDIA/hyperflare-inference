@@ -388,6 +388,7 @@ pub fn store_parallel<R: Read>(
             .open(partial)?;
         output.set_len(size)?;
         let parts = split_ranges(ranges, streams);
+        let worker_count = parts.len();
         let failed = AtomicBool::new(false);
         std::thread::scope(|scope| {
             let workers = parts
@@ -415,8 +416,17 @@ pub fn store_parallel<R: Read>(
                             }
                             Ok(())
                         })();
-                        if result.is_err() {
-                            failed.store(true, Ordering::Relaxed);
+                        if let Err(error) = &result {
+                            // Only the first failure is the cause; the others are the cascade
+                            // that closing every channel produces.
+                            if !failed.swap(true, Ordering::Relaxed) {
+                                eprintln!(
+                                    "[core cache] transfer worker {index} of {worker_count} failed first while \
+                                     writing {} range(s) totalling {} bytes of {name}: {error}",
+                                    part.len(),
+                                    part.iter().map(|(_, count)| count).sum::<u64>()
+                                );
+                            }
                         }
                         result
                     })

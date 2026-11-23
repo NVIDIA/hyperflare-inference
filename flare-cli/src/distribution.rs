@@ -915,9 +915,21 @@ fn receive_files(cache: &Path, plan: &Plan, relay: &Relay) -> Result<(), Failure
                             },
                         )?;
                         let mut bytes = [0; 8];
-                        socket.read_exact(&mut bytes)?;
+                        if let Err(error) = socket.read_exact(&mut bytes) {
+                            eprintln!(
+                                "[core receiver] stream {stream} received no length answer for the \
+                                 {} ranges it requested for file {index}: {error}",
+                                ranges.len()
+                            );
+                            return Err(error.into());
+                        }
                         let remaining = u64::from_le_bytes(bytes);
                         if remaining != cache::range_bytes(ranges) {
+                            eprintln!(
+                                "[core receiver] stream {stream} was told file {index} carries \
+                                 {remaining} bytes for the {} ranges it requested",
+                                ranges.len()
+                            );
                             return Err("core range length differs".into());
                         }
                         Ok(Payload {
@@ -948,6 +960,7 @@ impl Channels {
         let mut state = self.state.lock().unwrap();
         if state.0 {
             let _ = socket.shutdown(Shutdown::Both);
+            eprintln!("[core transfer] a channel opened after the transfer had already stopped");
             return Err("core transfer stopped".into());
         }
         state.1.push(socket.try_clone()?);
@@ -999,6 +1012,11 @@ impl Read for Payload<'_> {
 impl Drop for Payload<'_> {
     fn drop(&mut self) {
         if self.remaining != 0 {
+            eprintln!(
+                "[core receiver] a payload was released with {} of its bytes unread; every \
+                 channel of this transfer closes",
+                self.remaining
+            );
             self.channels.stop();
         }
     }
@@ -1102,7 +1120,12 @@ fn serve_source(
 ) -> Result<(), Failure> {
     configure(&socket, IO_TIMEOUT)?;
     let mut bytes = [0; 8];
-    socket.read_exact(&mut bytes)?;
+    if let Err(error) = socket.read_exact(&mut bytes) {
+        eprintln!(
+            "[core source] a channel closed before it named its destination rank and stream: {error}"
+        );
+        return Err(error.into());
+    }
     let rank = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
     let stream = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
     if rank == 0
@@ -1110,6 +1133,7 @@ fn serve_source(
         || stream >= streams
         || !slots.lock().unwrap().insert((rank, stream))
     {
+        eprintln!("[core source] rejected the channel for rank {rank} stream {stream}");
         return Err("invalid or duplicate core source channel".into());
     }
     // Receivers hash and publish each file before reusing channels for the next request.
@@ -1119,7 +1143,12 @@ fn serve_source(
         if socket.peek(&mut [0])? == 0 {
             return Ok(());
         }
-        let request: Request = read(&mut socket)?;
+        let request: Request = read(&mut socket).map_err(|error| {
+            eprintln!(
+                "[core source] rank {rank} stream {stream} lost its request frame: {error}"
+            );
+            error
+        })?;
         let spec = specs[rank]
             .get(request.file)
             .ok_or("core file index is out of bounds")?;
@@ -1132,11 +1161,36 @@ fn serve_source(
         }) {
             return Err("requested bytes are outside the rank's core ranges".into());
         }
-        socket.write_all(&cache::range_bytes(&request.ranges).to_le_bytes())?;
-        io::copy(
+        let expected = cache::range_bytes(&request.ranges);
+        socket.write_all(&expected.to_le_bytes()).map_err(|error| {
+            eprintln!(
+                "[core source] rank {rank} stream {stream} could not answer the request for \
+                 {} ranges of file {}, which needs {expected} bytes: {error}",
+                request.ranges.len(),
+                spec.name
+            );
+            error
+        })?;
+        let delivered = io::copy(
             &mut cache::RangeReader::new(&files[rank][request.file], &request.ranges),
             &mut socket,
-        )?;
+        )
+        .map_err(|error| {
+            eprintln!(
+                "[core source] rank {rank} stream {stream} stopped serving file {}, which needs \
+                 {expected} bytes from {} ranges: {error}",
+                spec.name,
+                request.ranges.len()
+            );
+            error
+        })?;
+        if delivered != expected {
+            eprintln!(
+                "[core source] rank {rank} stream {stream} delivered {delivered} of the \
+                 {expected} bytes requested for file {}",
+                spec.name
+            );
+        }
     }
 }
 
