@@ -3958,6 +3958,98 @@ fn fixed_host_cohort_competes_by_full_prefix_utility_within_the_row_budget() {
 }
 
 #[test]
+fn fixed_host_speculative_duration_ignores_unmeasured_same_width_sibling() {
+    let mut scheduler = engine(4, true);
+    scheduler.fixed_speculative_width(Some(8)).unwrap();
+    let mut graphs = super::tests::duration_graphs(4);
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind == GraphKind::Speculative
+            && graph.batch_capacity == 4
+            && graph.token_capacity == 8
+        {
+            0
+        } else {
+            10 * MS
+        };
+    }
+    graphs.push(crate::execution::GraphDescriptor {
+        tuned_bindings: vec![],
+        confidence_width: 0,
+        name: "speculative-b4-d7-w8-p5".into(),
+        kind: GraphKind::Speculative,
+        sampling_mode: SamplingMode::General,
+        draft_tokens: 7,
+        handle: 1,
+        batch_capacity: 4,
+        token_capacity: 8,
+        packed_token_capacity: 5,
+        prefill_capacity: 0,
+        estimated_duration_ns: MS,
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    let handles = fixed_host_requests(&mut scheduler, &[8, 2]);
+    // Request with 2 remaining tokens fits both measured p=5 and unmeasured p=32;
+    // the unmeasured sibling must not zero out the measured duration.
+    assert_eq!(
+        scheduler.speculative_duration(scheduler.request(handles[1]).unwrap(), 4, 8),
+        Some(MS)
+    );
+    // Request with 8 remaining tokens only fits unmeasured p=32, so it remains unmeasured.
+    assert_eq!(
+        scheduler.speculative_duration(scheduler.request(handles[0]).unwrap(), 4, 8),
+        Some(0)
+    );
+}
+
+#[test]
+fn continuation_candidate_ignores_unmeasured_full_speculative_sibling() {
+    let mut scheduler = engine(4, true);
+    let mut graphs = super::tests::duration_graphs(4);
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = match (graph.kind, graph.batch_capacity, graph.token_capacity) {
+            (GraphKind::Snapshot, 1, 1) => MS,
+            (GraphKind::Speculative, 4, 8) => 0,
+            _ => 10 * MS,
+        };
+    }
+    graphs.push(crate::execution::GraphDescriptor {
+        tuned_bindings: vec![],
+        confidence_width: 0,
+        name: "speculative-b4-d7-w8-p16".into(),
+        kind: GraphKind::Speculative,
+        sampling_mode: SamplingMode::General,
+        draft_tokens: 7,
+        handle: 1,
+        batch_capacity: 4,
+        token_capacity: 8,
+        packed_token_capacity: 16,
+        prefill_capacity: 0,
+        estimated_duration_ns: 2 * MS,
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    let prompt = add(&mut scheduler, 1, 64, 128);
+    initialize(&mut scheduler, prompt);
+    let prefill = step(&mut scheduler, 0);
+    assert_eq!(prefill.kind, GraphKind::Prefill);
+    assert_eq!(scheduler.request(prompt).unwrap().phase, RequestPhase::Snapshot);
+    assert_eq!(
+        scheduler.request(prompt).unwrap().boundary_capture.unwrap().resume,
+        RequestPhase::Decode
+    );
+    let (values, age_price, _) = scheduler.lane_values(0);
+    let mut candidates = Vec::new();
+    scheduler.candidates(&mut candidates, &values, age_price);
+    let snapshot = candidates
+        .iter()
+        .find(|candidate| candidate.kind == GraphKind::Snapshot)
+        .unwrap();
+    // Unmeasured full b4w8p32 must not collapse the continuation horizon to 0 ns.
+    assert_eq!(snapshot.rate.duration_ns, MS + 2 * MS);
+}
+
+#[test]
 #[ignore = "manual CPU scheduler planning measurement"]
 fn mixed_tail_planning_cpu_measurement() {
     use std::time::Instant;

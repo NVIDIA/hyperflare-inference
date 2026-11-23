@@ -424,7 +424,9 @@ when available. Host delays and queue wait do not enter graph estimates. An
 unmeasured candidate ranks ahead of every measured candidate; unmeasured
 candidates compete among themselves by expected useful value. Both
 unmeasured and stale physical dispatches require an empty queue and completion
-before another submission.
+before another submission. When multiple packed speculative shapes cover a
+`(batch, width)` duration lookup, Helios uses the minimum positive measured
+duration and returns zero only when every matching shape is unmeasured.
 
 Ordinary valid execution earns refresh credit at `0.002 / 0.998` times its
 measured duration, capped at 5 ms. Full credit permits a stale alternative to

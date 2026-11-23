@@ -336,7 +336,10 @@ middle pair when fewer than nine samples give an even count. An entry becomes st
 without a valid observation. Its measured cost remains available for selection
 and service-rate normalization. The first valid observation of a stale entry
 replaces its estimate directly; elapsed time alone never makes a measured graph
-unknown.
+unknown. When multiple packed speculative shapes cover a `(batch, width)` lookup
+for service-rate normalization or continuation pricing, Helios takes the minimum
+positive measured duration across matching shapes and returns zero only when
+every matching shape is unmeasured.
 
 The raw device observation is the maximum positive rank-local CUDA replay interval.
 When the prepared graphs expose frame-owned readiness timestamps, the cost sample

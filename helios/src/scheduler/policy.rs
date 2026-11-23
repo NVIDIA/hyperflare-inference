@@ -666,8 +666,11 @@ impl RequestScheduler {
         let mut best: Option<(u64, ValueRate)> = None;
         let mut consider = |following, batch, width, prefill| {
             let ns = if following == GraphKind::Speculative {
-                self.costs.duration(GraphKind::Speculative, batch, width).into_iter().chain(self.costs.packed_round_duration(batch, width)).min()
-            } else { self.costs.shape_duration(following, batch, width, prefill) };
+                // The full B x W graph is already included in the packed round aggregate.
+                self.costs.packed_round_duration(batch, width)
+            } else {
+                self.costs.shape_duration(following, batch, width, prefill)
+            };
             let Some(ns) = ns else {
                 return;
             };
