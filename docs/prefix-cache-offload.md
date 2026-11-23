@@ -680,13 +680,13 @@ disk-only store whose ranks each keep their own records; see
 
 The worker loop admits requests, completes executor frames, and publishes
 finished requests. `service_store` polls host completions, applies inbound and
-outbound results, delivers eviction notices, reports publications through
-`store`, and retries capacity refusals after host progress. The worker then
+outbound results, delivers eviction notices, refreshes checkpoint recency through
+`reused`, reports publications through `store`, and retries capacity refusals
+after host progress. The worker then
 plans and submits model work. Copy-out pins are taken before the next admission, so a
-checkpoint cannot be evicted between submission and its pin. A pooled store
-receives logical eviction notices, including compaction; the scheduler queues
-no notices for a store without a pool. Every store
-call from the worker returns without waiting.
+checkpoint cannot be evicted between submission and its pin. Only pooled stores
+receive logical eviction notices, including compaction. Any attached store can
+receive completion refreshes. Every store call from the worker returns without waiting.
 
 Admission consults the store after `plan_admission`: `lookup` runs above the
 GPU hit, the policy in section 2.10 decides whether to fetch, and
