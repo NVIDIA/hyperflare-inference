@@ -66,6 +66,7 @@ pub enum Kind {
 /// record. The window lies in one of the manager's regions.
 #[derive(Clone, Debug)]
 pub struct WindowOut {
+    pub packed: Option<flare_selene::shared::wire::PackedWindow>,
     pub shape: Shape,
     pub page_xxh3: Vec<u64>,
     pub row_xxh3: u64,
@@ -654,6 +655,42 @@ async fn send_windows(
             let _ = timeout(GOODBYE, conn.shutdown()).await;
             return Ok(());
         };
+        if window.packed.is_some() && rdma.is_some() {
+            return Err(invalid("packed windows require TCP"));
+        }
+        if let Some(manifest) = &window.packed {
+            let rank = entry
+                .slicing
+                .as_ref()
+                .filter(|(layout, _)| layout.world() > 1)
+                .map(|(_, r)| *r as u32);
+            let parts: Vec<_> = flare_selene::shared::packed::leg_units(manifest, rank).collect();
+            let mut shape = window.shape;
+            shape.length = parts.iter().map(|(_, u)| u.stored_length).sum();
+            let units = flare_selene::shared::wire::PackedWindow {
+                units: parts.iter().map(|(_, u)| (*u).clone()).collect(),
+            };
+            within(IO_TIMEOUT, "the instance stopped reading", async {
+                ToInstance::Window(Window::packed(shape, units)).write(conn).await?;
+                for (at, u) in parts {
+                    // The granted extent is held until this handler has fenced.
+                    let data = unsafe {
+                        inner
+                            .regions
+                            .bytes(window.region, window.offset + at, u.stored_length)?
+                    };
+                    conn.write_all(data).await?;
+                }
+                conn.flush().await
+            })
+            .await?;
+            inner.counters.add(0, shape.length);
+            let _ = inner.events.send(Event::Sent {
+                transfer,
+                index: shape.index,
+            });
+            continue;
+        }
         let slot = if let Some(channel) = rdma.as_mut() {
             let ToManager::Credit { offset, length } = within(
                 IO_TIMEOUT,
@@ -707,6 +744,7 @@ async fn send_windows(
             }
         };
         let frame = ToInstance::Window(Window {
+            packed: None,
             shape: window.shape,
             page_xxh3: window.page_xxh3,
             row_xxh3: window.row_xxh3,
@@ -985,6 +1023,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 2, true),
                     page_xxh3: vec![11, 12],
                     row_xxh3: 13,
@@ -995,6 +1034,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(1, 1, false),
                     page_xxh3: vec![21],
                     row_xxh3: 0,
@@ -1087,6 +1127,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: Shape {
                             length: 1 << 20,
                             page_count: 256,
@@ -1130,6 +1171,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: Shape {
                             length: 1 << 20,
                             page_count: 256,
@@ -1260,6 +1302,7 @@ mod tests {
                 hub.push_window(
                     transfer,
                     WindowOut {
+                        packed: Default::default(),
                         shape: rank_shape(&layout, rank, 0, 2, true),
                         page_xxh3: vec![1, 2],
                         row_xxh3: 3,
@@ -1451,6 +1494,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 1, false),
                     page_xxh3: vec![1],
                     row_xxh3: 0,
@@ -1690,6 +1734,7 @@ mod tests {
             hub.push_window(
                 transfer,
                 WindowOut {
+                    packed: Default::default(),
                     shape: shape(0, 1, false),
                     page_xxh3: vec![1],
                     row_xxh3: 0,

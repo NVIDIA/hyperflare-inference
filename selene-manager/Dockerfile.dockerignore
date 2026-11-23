@@ -13,6 +13,8 @@
 !selene/examples/**
 !selene/proto/
 !selene/proto/**
+!selene/native/
+!selene/native/**
 !selene-manager/
 !selene-manager/Cargo.toml
 !selene-manager/Cargo.lock
