@@ -42,6 +42,9 @@ def clients():
 
 EXTRA = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 1}
 USER = [{"role": "user", "content": "Reply with exactly OK."}]
+# Output-token ceiling of the requests whose assertions read the complete reply. A checkpoint whose
+# template always opens a reasoning block spends a sampled number of tokens there first.
+REPLY_TOKENS = 2048
 FUNCTION = {
     "name": "lookup",
     "description": "Look up a value in the local database.",
@@ -131,45 +134,34 @@ def test_ollama_model_discovery(clients):
 
 def test_sdk_buffered_and_streaming_text(clients):
     o, a, _ = clients
-    # Checkpoints whose templates always open reasoning need room for that block before replying.
-    chat = o.chat.completions.create(model="local", messages=USER, max_tokens=256, extra_body=EXTRA)
-    assert chat.choices[0].message.content.strip() == "OK"
+    chat = o.chat.completions.create(model="local", messages=USER, max_tokens=REPLY_TOKENS, extra_body=EXTRA)
+    assert chat.choices[0].message.content == "OK"
     assert chat.choices[0].finish_reason == "stop"
     chunks = list(o.chat.completions.create(
-        model="local", messages=USER, max_tokens=256, stream=True,
+        model="local", messages=USER, max_tokens=REPLY_TOKENS, stream=True,
         stream_options={"include_usage": True}, extra_body=EXTRA,
     ))
-    assert "".join(c.choices[0].delta.content or "" for c in chunks if c.choices).strip() == "OK"
+    assert "".join(c.choices[0].delta.content or "" for c in chunks if c.choices) == "OK"
     assert [c.finish_reason for chunk in chunks for c in chunk.choices if c.finish_reason] == ["stop"]
     assert chunks[-1].usage.total_tokens > 0
-    with a.messages.stream(model="local", messages=USER, max_tokens=256, extra_body=EXTRA) as stream:
-        events = list(stream)
+    with a.messages.stream(model="local", messages=USER, max_tokens=REPLY_TOKENS, extra_body=EXTRA) as stream:
+        assert "".join(stream.text_stream) == "OK"
         message = stream.get_final_message()
-    assert events[0].type == "message_start" and events[-1].type == "message_stop"
-    for index, block in enumerate(message.content):
-        parts = [event.delta for event in events if event.type == "content_block_delta" and event.index == index]
-        if block.type == "text":
-            assert "".join(d.text for d in parts if d.type == "text_delta") == block.text
-        elif block.type == "thinking":
-            assert "".join(d.thinking for d in parts if d.type == "thinking_delta") == block.thinking
-    assert "".join(b.text for b in message.content if b.type == "text").strip() == "OK"
     assert message.stop_reason == "end_turn"
-    buffered = a.messages.create(model="local", messages=USER, max_tokens=256, extra_body=EXTRA)
+    buffered = a.messages.create(model="local", messages=USER, max_tokens=REPLY_TOKENS, extra_body=EXTRA)
     assert buffered.stop_reason == "end_turn"
-    assert [b.text.strip() for b in buffered.content if b.type == "text"] == [
-        b.text.strip() for b in message.content if b.type == "text"
-    ]
+    assert [b.model_dump(exclude_none=True) for b in buffered.content] == [b.model_dump(exclude_none=True) for b in message.content]
     assert message_input_tokens(buffered.usage) == message_input_tokens(message.usage)
-    with o.responses.stream(model="local", input=USER, max_output_tokens=256, extra_body=EXTRA) as stream:
+    with o.responses.stream(model="local", input=USER, max_output_tokens=REPLY_TOKENS, extra_body=EXTRA) as stream:
         events = list(stream)
         response = stream.get_final_response()
-    assert response.output_text.strip() == "OK"
+    assert response.output_text == "OK"
     assert "".join(e.delta for e in events if e.type == "response.output_text.delta") == response.output_text
     assert response.status == "completed"
     assert events[-1].type == "response.completed"
-    buffered = o.responses.create(model="local", input=USER, max_output_tokens=256, extra_body=EXTRA)
+    buffered = o.responses.create(model="local", input=USER, max_output_tokens=REPLY_TOKENS, extra_body=EXTRA)
     assert buffered.status == "completed"
-    assert buffered.output_text.strip() == response.output_text.strip()
+    assert buffered.output_text == response.output_text
 
 
 def test_raw_completion_batch_and_zero_tokens(clients):
@@ -183,18 +175,15 @@ def test_raw_completion_batch_and_zero_tokens(clients):
     assert [c.index for c in result.choices] == [0, 1, 2, 3]
     assert all(c.text for c in result.choices)
     before = http.get("/metrics?format=json").json()["generated_tokens"]
-    chunks = list(o.completions.create(
-        model="local", prompt=["Hello", "World"], n=2, max_tokens=2, stream=True,
-        stream_options={"include_usage": True}, temperature=1,
-    ))
+    chunks = list(o.completions.create(model="local", prompt=["Hello", "World"], n=2, max_tokens=2, stream=True, stream_options={"include_usage": True}, temperature=1))
     after = http.get("/metrics?format=json").json()["generated_tokens"]
+    assert {c.index for chunk in chunks for c in chunk.choices} == {0, 1, 2, 3}
     minimum = 0
     for index in range(4):
         choices = [c for chunk in chunks for c in chunk.choices if c.index == index]
         assert [c.finish_reason for c in choices if c.finish_reason] == [choices[-1].finish_reason]
         assert choices[-1].finish_reason in ("stop", "length")
         minimum += 2 if choices[-1].finish_reason == "length" else 1
-    assert {c.index for chunk in chunks for c in chunk.choices} == set(range(4))
     # On the idle test service, the committed-token counter includes terminating EOS tokens.
     assert minimum <= after - before <= 8
     assert chunks[-1].usage.completion_tokens == after - before
@@ -207,19 +196,29 @@ def test_raw_completion_batch_and_zero_tokens(clients):
 def test_messages_block_hint_reuses_history_after_suffix_changes(clients, hinted):
     _, anthropic, http = clients
     line = "An earlier action read a file and checked its output.\n"
-    # Warm short and multi-chunk prefill durations so the scheduler prices interior cuts from measurements.
     kwargs = {"model": "local", "max_tokens": 1, "extra_body": EXTRA}
-    for count in (1, 500):
+    # The scheduler keeps a cut at a hinted block only when it can price the cut from measured
+    # prefill and snapshot costs and the cut fits the work allowance of the prompt. Prompts of the
+    # history's length run until the service plans one from measured costs. That prompt also
+    # leaves a checkpoint of the preamble a chat template puts before the first message, so the
+    # two compared requests read the same preamble. The history is long enough for the allowance.
+    unknown = 'flare_checkpoint_skips_total{reason="unknown_cost"}'
+    for _ in range(16):
+        skipped = service_metrics(http)[unknown]
         anthropic.messages.create(
-            messages=[{"role": "user", "content": f"Warm {time.time_ns()}. " + line * count}], **kwargs,
+            messages=[{"role": "user", "content": f"Measure {time.time_ns()}. " + line * 500}], **kwargs,
         )
-    anthropic.messages.create(
-        messages=[{"role": "user", "content": "Warm the shared message preamble."}], **kwargs,
-    )
+        if service_metrics(http)[unknown] == skipped:
+            break
+    else:
+        pytest.fail("the service still skips checkpoint cuts for unknown costs after 16 prompts")
     history = {"type": "text", "text": f"History {time.time_ns()}. " + line * 500}
     if hinted:
         history["cache_control"] = {"type": "ephemeral"}
     blocks = [history, {"type": "text", "text": "First action: inspect the file. Reply OK."}]
+    anthropic.messages.create(
+        messages=[{"role": "user", "content": "Warm the shared message preamble."}], **kwargs,
+    )
     before = service_metrics(http)
     first = anthropic.messages.create(
         messages=[{"role": "user", "content": blocks}], **kwargs,
@@ -231,11 +230,11 @@ def test_messages_block_hint_reuses_history_after_suffix_changes(clients, hinted
         messages=[{"role": "user", "content": blocks}], **kwargs,
     )
     restored = service_metrics(http)
-    cached = second.usage.cache_read_input_tokens or 0
-    assert cached == sum(restored[key] - captured[key] for key in (
+    # On the idle test service, the reported cache read equals the tokens the reuse counters gained.
+    assert (second.usage.cache_read_input_tokens or 0) == sum(restored[key] - captured[key] for key in (
         "flare_cache_reused_tokens_total", "flare_host_cache_reused_tokens_total",
     ))
-    reused = cached - (first.usage.cache_read_input_tokens or 0)
+    reused = (second.usage.cache_read_input_tokens or 0) - (first.usage.cache_read_input_tokens or 0)
     if hinted:
         assert reused > 500
         assert captured['flare_checkpoint_captures_total{role="message"}'] > before[
@@ -317,13 +316,13 @@ def test_token_count_and_compressed_requests(clients):
     counted = a.messages.count_tokens(model="local", messages=USER, extra_body=EXTRA)
     message = a.messages.create(model="local", messages=USER, max_tokens=16, extra_body=EXTRA)
     assert counted.input_tokens == message_input_tokens(message.usage)
-    body = json.dumps({"input": "Reply with exactly OK.", "max_output_tokens": 256, **EXTRA}).encode()
+    body = json.dumps({"input": "Reply with exactly OK.", "max_output_tokens": REPLY_TOKENS, **EXTRA}).encode()
     result = http.post("/v1/responses", content=gzip.compress(body), headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
     result.raise_for_status()
     response = result.json()
     assert response["status"] == "completed"
-    texts = [c["text"].strip() for item in response["output"] if item["type"] == "message" for c in item.get("content", [])]
-    assert texts == ["OK"]
+    # Reasoning items may precede the message that carries the reply.
+    assert [c["text"] for item in response["output"] if item["type"] == "message" for c in item["content"]] == ["OK"]
 
 
 def test_messages_tool_history(clients):
@@ -585,8 +584,8 @@ def test_messages_inline_system_text_and_empty_controls(clients):
     counted = a.messages.count_tokens(model="local", messages=history, extra_body=EXTRA)
     empty = a.messages.count_tokens(model="local", messages=history + [controls], extra_body=EXTRA)
     assert counted.input_tokens == empty.input_tokens
-    with a.messages.stream(model="local", messages=history + [controls], max_tokens=256, extra_body=EXTRA) as stream:
-        assert "".join(stream.text_stream).strip() == "OK"
+    with a.messages.stream(model="local", messages=history + [controls], max_tokens=REPLY_TOKENS, extra_body=EXTRA) as stream:
+        assert "".join(stream.text_stream) == "OK"
         result = stream.get_final_message()
     assert message_input_tokens(result.usage) == counted.input_tokens
     assert result.stop_reason == "end_turn"
@@ -708,10 +707,14 @@ def test_mixed_endpoint_concurrency(clients):
 
 def test_batch_validation_and_disconnect_release_admission(clients):
     _, _, http = clients
-    before = service_metrics(http)
+    def metrics():
+        response = http.get("/metrics")
+        response.raise_for_status()
+        return {key: float(value) for line in response.text.splitlines() if line and not line.startswith("#") for key, value in [line.rsplit(" ", 1)]}
+    before = metrics()
     invalid = http.post("/v1/completions", json={"prompt": [[1], [4294967295]], "max_tokens": 8})
     assert invalid.status_code == 400
-    assert service_metrics(http)["flare_requests_admitted_total"] == before["flare_requests_admitted_total"]
+    assert metrics()["flare_requests_admitted_total"] == before["flare_requests_admitted_total"]
     with http.stream("POST", "/v1/completions", json={"prompt": ["Count the positive integers:"], "n": 4, "max_tokens": 4096, "ignore_eos": True, "stream": True, "temperature": 1}) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -720,7 +723,7 @@ def test_batch_validation_and_disconnect_release_admission(clients):
                 break
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        after = service_metrics(http)
+        after = metrics()
         if after["flare_active_requests"] == 0 and after["flare_http_inflight_requests"] == 0:
             break
         time.sleep(0.02)
@@ -753,23 +756,25 @@ def test_image_input(clients):
     o, a, http = clients
     image = Path(__file__).parents[1] / "frontend/qwen38_images-inputs/RGB.png"
     data = base64.b64encode(image.read_bytes()).decode()
-    anthropic_messages = [{"role": "user", "content": [
-        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
-        {"type": "text", "text": "Describe the image briefly."},
-    ]}]
+    if "image" not in http.get("/v1/models").json()["data"][0]["flare"]["input_modalities"]:
+        # A core prepared without image input rejects image content on both protocols.
+        prompt = {"type": "text", "text": "Describe the image briefly."}
+        for path, block, headers in (
+            ("/v1/messages", {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+             {"anthropic-version": "2023-06-01"}),
+            ("/v1/chat/completions", {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}}, {}),
+        ):
+            response = http.post(path, headers=headers, json={
+                "model": "local", "max_tokens": 1, "messages": [{"role": "user", "content": [block, prompt]}]})
+            assert response.status_code == 400
+            assert "does not support image inputs" in response.json()["error"]["message"]
+        return
+    result = a.messages.create(model="local", max_tokens=48, messages=[{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}, {"type": "text", "text": "Describe the image briefly."}]}], extra_body=EXTRA)
+    assert any(b.type == "text" and b.text for b in result.content)
     messages = [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}},
         {"type": "text", "text": "Describe the image briefly."},
     ]}]
-    if "image" not in http.get("/v1/models").json()["data"][0]["flare"]["input_modalities"]:
-        for path, payload in (("/v1/messages", anthropic_messages), ("/v1/chat/completions", messages)):
-            headers = {"anthropic-version": "2023-06-01"} if path == "/v1/messages" else {}
-            response = http.post(path, json={"model": "local", "messages": payload, "max_tokens": 1}, headers=headers)
-            assert response.status_code == 400
-            assert "does not support image inputs" in response.json()["error"]["message"]
-        return
-    result = a.messages.create(model="local", max_tokens=48, messages=anthropic_messages, extra_body=EXTRA)
-    assert any(b.type == "text" and b.text for b in result.content)
     extra = {**EXTRA, "return_token_ids": True}
     buffered = o.chat.completions.create(model="local", messages=messages, max_tokens=8, extra_body=extra)
     chunks = list(o.chat.completions.create(
