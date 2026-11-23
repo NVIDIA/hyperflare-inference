@@ -166,7 +166,11 @@ impl ActionCosts {
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
             let nanos = estimate.nanos;
             for duration in self.packed_round_durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
-                *duration = Some(duration.map_or(nanos, |old| old.min(nanos)));
+                *duration = Some(match *duration {
+                    None | Some(0) => nanos,
+                    Some(old) if nanos == 0 => old,
+                    Some(old) => old.min(nanos),
+                });
             }
         }
     }
@@ -311,5 +315,40 @@ mod tests {
         let mut replays = ReplayTimes::default();
         assert_eq!(replays.observe(u64::MAX, true), u64::MAX);
         assert_eq!(replays.observe(u64::MAX - 1, true), u64::MAX);
+    }
+
+    #[test]
+    fn unmeasured_packed_sibling_does_not_zero_measured_round_duration() {
+        use super::{ActionCosts, Key};
+        use crate::execution::{GraphDescriptor, GraphKind, SamplingMode};
+
+        let make = |name: &str, drafts, width, packed| GraphDescriptor {
+            name: name.into(),
+            kind: GraphKind::Speculative,
+            sampling_mode: SamplingMode::General,
+            confidence_width: drafts,
+            draft_tokens: drafts,
+            handle: 1,
+            batch_capacity: 16,
+            token_capacity: width,
+            packed_token_capacity: packed,
+            prefill_capacity: 0,
+            estimated_duration_ns: 0,
+            input_bindings: vec![],
+            tuned_bindings: vec![],
+        };
+        let graphs = vec![
+            make("b16w4p64", 3, 4, 64),
+            make("b16w6p39", 5, 6, 39),
+        ];
+        let mut costs = ActionCosts::prepared(&graphs, 8).unwrap();
+        assert_eq!(costs.packed_round_duration(16, 4), Some(0));
+        let key = Key { drafts: 3, kind: GraphKind::Speculative, batch: 16, tokens: 4, prefill: 0, packed: 64 };
+        let index = costs.index[&key];
+        costs.entries[index].1.nanos = 24_000_000;
+        costs.refresh_packed_durations();
+        // Measured b16w4p64 must not be zeroed by unmeasured sibling b16w6p39.
+        assert_eq!(costs.packed_round_duration(16, 4), Some(24_000_000));
+        assert_eq!(costs.packed_round_duration(16, 6), Some(0));
     }
 }

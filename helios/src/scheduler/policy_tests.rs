@@ -4414,3 +4414,90 @@ fn fixed_host_prefixes_preserve_lengths_above_255() {
     assert_eq!(plan.lanes[0].tokens, 257);
     assert_eq!(plan.token_capacity, 257);
 }
+
+#[test]
+fn optional_prefill_discovery_does_not_block_larger_decode_batch_discovery() {
+    let mut s = cold_terminal_engine(4, true);
+    let decoders: Vec<_> = (1..=3).map(|id| add(&mut s, id, 64, 4096)).collect();
+    for handle in decoders {
+        let request = s.request_mut(handle).unwrap();
+        request.phase = RequestPhase::Decode;
+        request.consumed_tokens = 64;
+        request.scheduled_consumed = 64;
+        request.generated_tokens = 1;
+    }
+    // Measure batch-1 and batch-2 decode plus prefill, leaving batch-4 decode unmeasured.
+    for batch in [1usize, 2] {
+        for &width in &[1usize, 2, 4, 8] {
+            set_cost(&mut s, GraphKind::Speculative, batch, width, 10 * MS);
+        }
+    }
+    for &cap in &[256usize, 512] {
+        set_cost(&mut s, GraphKind::Prefill, 1, cap, 50 * MS);
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, cap, 150 * MS);
+    }
+    let prompt = add(&mut s, 4, 2048, 1);
+    initialize(&mut s, prompt);
+    // Exhaust refresh credit (simulating debt from an earlier terminal prefill probe).
+    s.refresh.credit_ns = -((200 * MS) as f64);
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Speculative);
+    assert_eq!(plan.batch_capacity, 4);
+    assert_eq!(plan.origin, PlanOrigin::Discovery);
+}
+
+#[test]
+fn gpu_confidence_calibration_corrects_overconfident_draft_forecasts() {
+    let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    let handle = add(&mut scheduler, 1, 64, 512);
+    ready(&mut scheduler, &[handle]);
+    // Feed repeated rounds where GPU confidence claims 0.95 per draft position but verification
+    // accepts only 1 draft (rejecting depth >= 1).
+    for _ in 0..32 {
+        let plan = scheduler.plan().unwrap();
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = 4;
+        scheduler.complete_packed_round(fence, &records, gpu_time(MS), &vec![vec![0.95; 15]; 2]).unwrap();
+    }
+    let request = scheduler.request(handle).unwrap();
+    let curve = scheduler.speculative_curve(request, false);
+    // Depth 0 was accepted every round (~1.0), whereas depth 1+ were always rejected despite
+    // raw confidence ~0.90+, so calibration must pull depth 1+ sharply below raw confidence.
+    assert!(curve[0] > 0.8, "depth 0 should remain high, got {:?}", &curve[..4]);
+    assert!(curve[1] < 0.25, "depth 1 should calibrate down toward realized rejections, got {:?}", &curve[..4]);
+    assert!(curve[2] <= curve[1], "calibrated curve must stay nonincreasing, got {:?}", &curve[..4]);
+}
+
+#[test]
+fn terminal_prefill_rebases_service_price_when_rate_drops_from_intermediate_prefill() {
+    let mut s = cold_terminal_engine(4, false);
+    for batch in [1usize, 2, 4] {
+        set_cost(&mut s, GraphKind::Decode, batch, 1, 10 * MS);
+    }
+    for &cap in &[128usize, 256, 512] {
+        set_cost(&mut s, GraphKind::Prefill, 1, cap, if cap == 512 { 10 * MS } else { 8 * MS });
+        set_cost(&mut s, GraphKind::TerminalPrefill, 1, cap, if cap == 512 { 100 * MS } else { 80 * MS });
+    }
+    let prompt = add(&mut s, 1, 641, 16);
+    initialize(&mut s, prompt);
+    // Run one fast intermediate Prefill chunk (512 tokens in 10 ms => 51.2 tok/ms).
+    let first = s.plan().unwrap();
+    assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    s.advance_to(s.now_ns + 10 * MS).unwrap();
+    complete_timed(&mut s, &first, fence, 0, true, gpu_time(10 * MS));
+    // Exactly 129 tokens (= terminal_prefill_min_tokens) remain, so only TerminalPrefill is legal
+    // (130 useful tokens in 80 ms => 1.625 tok/ms, >31x slower than intermediate Prefill).
+    // Rebased prefill_token price must preserve its normalized GPU-time share rather than
+    // remaining anchored to 51.2 tok/ms (~1.31).
+    let (values, _, scale) = s.lane_values(0);
+    let unscaled_prefill_price = values[prompt.slot as usize].prefill_token * scale.exp();
+    let expected = 1.0 + s.policy.token_fairness / (130.0 / 80.0);
+    assert!(
+        (unscaled_prefill_price - expected).abs() < 1e-6,
+        "terminal prefill price should rebase to terminal feasible rate: got {unscaled_prefill_price}, expected {expected}"
+    );
+}

@@ -91,7 +91,10 @@ sixty-fourth. It is one mean per position across all requests, so it follows
 whichever traffic ran most recently. A model whose graphs allocate prefix
 lengths on the GPU takes the value from the completed prefix probability of
 each lane in the round's confidence sidecar; a model with any such graph is
-treated this way for all its rounds. Every other model takes it from the
+treated this way for all its rounds, calibrated per depth by an online ratio of
+realized verification survival to predicted prefix confidence over offered,
+determined positions (capped at weight 64 so calibration follows traffic shifts
+without penalizing already calibrated drafters). Every other model takes it from the
 verification outcome: for each position a completed MTP round determined, the
 value is the reported survival, or one for an accepted position and zero for a
 rejected one. On this path only lanes whose request is live and whose status
@@ -235,7 +238,13 @@ compares over the same completion horizon while decode waiting remains bounded
 by the submitted graph's duration. Individually feasible prefill service rates
 price each request from the prefill catalog and operation it actually executes
 (`PREFILL`, `TERMINAL_PREFILL`, or `SCORED_PREFILL`), excluding `MIXED` graphs
-for scored-prompt requests and requests awaiting terminal completion.
+for scored-prompt requests and requests awaiting terminal completion. When a
+prefilling request's maximum feasible token rate drops across chunks (for
+example from a fast intermediate `PREFILL` chunk to a slower `TERMINAL_PREFILL`
+chunk or short tail), its stored token service price rescales downward-rate
+transitions to preserve its normalized GPU-time share. Optional-discovery
+gating on `TERMINAL_PREFILL` catalogs applies only to alternative prefill
+shapes so larger unmeasured decode batch capacities still discover immediately.
 
 ## Prerequisites and completion
 

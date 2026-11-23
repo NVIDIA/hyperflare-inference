@@ -476,10 +476,15 @@ impl RequestScheduler {
             }
             let service = self.projected_service(r);
             if let Some(rate) = tokens {
-                token_log[slot] = service
+                let mut price = service
                     .tokens
-                    .unwrap_or_else(|| ServicePrice::initial(rate / count as f64))
-                    .log_price(self.policy.token_fairness);
+                    .unwrap_or_else(|| ServicePrice::initial(rate / count as f64));
+                if r.consumed_tokens < r.prompt_tokens as u64 {
+                    if let Some(previous) = service.prefill_rate {
+                        price.rebase_downward(previous, rate);
+                    }
+                }
+                token_log[slot] = price.log_price(self.policy.token_fairness);
             }
             if let Some(reference) = references[slot].filter(|_| deliveries.is_some()) {
                 delivery_log[slot] = service
@@ -1262,11 +1267,12 @@ impl RequestScheduler {
         let measured_mask = candidates[..ordinary_count].iter()
             .filter(|c| c.rate.duration_ns != 0).fold(0, |mask, c| mask | c.mask);
         // Discovering a first usable operation must remain possible. On
-        // terminal-prefill catalogs, trying an alternative shape need not
-        // suspend unrelated measured service when every selected request
+        // terminal-prefill catalogs, trying an alternative prefill shape need
+        // not suspend unrelated measured service when every selected request
         // already has a measured way to make progress. Non-terminal cores keep
         // unrestricted discovery unchanged.
         let optional_discovery = |c: &Candidate| self.terminal_prefill_min_tokens != 0
+            && c.kind.is_prefill()
             && c.duration_ns == 0
             && c.mask & measured_mask == c.mask && measured_mask & !c.mask != 0;
         let ordinary = *candidates[..ordinary_count].iter()

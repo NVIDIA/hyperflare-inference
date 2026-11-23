@@ -8,6 +8,37 @@
 use super::{policy::{Candidate, bits}, utility::{LaneValue, ValueRate, best_cohort}, *};
 
 const POPULATION_WEIGHT: f32 = 1.0 / 64.0;
+const CALIBRATION_PRIOR_WEIGHT: f64 = 4.0;
+const CALIBRATION_MAX_WEIGHT: f64 = 64.0;
+
+#[derive(Clone, Copy)]
+struct DepthCalibration {
+    realized: f64,
+    predicted: f64,
+    weight: f64,
+}
+
+impl DepthCalibration {
+    fn new(prior: f64) -> Self {
+        Self { realized: prior, predicted: prior, weight: CALIBRATION_PRIOR_WEIGHT }
+    }
+
+    fn observe(&mut self, realized: f64, predicted: f64) {
+        debug_assert!(realized.is_finite() && (0.0..=1.0).contains(&realized));
+        debug_assert!(predicted.is_finite() && (0.0..=1.0).contains(&predicted));
+        self.weight = (self.weight + 1.0).min(CALIBRATION_MAX_WEIGHT);
+        self.realized += (realized - self.realized) / self.weight;
+        self.predicted += (predicted - self.predicted) / self.weight;
+    }
+
+    fn factor(self) -> f64 {
+        if self.predicted > 1e-6 {
+            (self.realized / self.predicted).clamp(0.0, 2.0)
+        } else {
+            1.0
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Forecast {
@@ -24,18 +55,32 @@ impl Forecast {
 pub(super) struct Forecasts {
     requests: [Option<Forecast>; REQUEST_LANES],
     pub(super) population: Vec<f32>,
+    calibration: Vec<DepthCalibration>,
 }
 
 impl Forecasts {
     pub(super) fn new(token_capacity: usize) -> Self {
-        Self { requests: std::array::from_fn(|_| None), population: (0..token_capacity - 1)
-            .map(|i| 0.5f32.powi(i as i32 + 1)).collect() }
+        let population: Vec<f32> = (0..token_capacity - 1)
+            .map(|i| 0.5f32.powi(i as i32 + 1)).collect();
+        let calibration = population.iter().map(|&p| DepthCalibration::new(f64::from(p))).collect();
+        Self { requests: std::array::from_fn(|_| None), population, calibration }
     }
 
     /// Moves the mean survival of the prefix at `depth` toward one observed value.
     pub(super) fn observe_population(&mut self, depth: usize, prefix: f32) {
         debug_assert!(prefix.is_finite() && (0.0..=1.0).contains(&prefix));
         self.population[depth] += POPULATION_WEIGHT * (prefix - self.population[depth]);
+    }
+
+    /// Calibrates raw GPU prefix confidence against realized verification outcomes at `depth`.
+    pub(super) fn observe_calibration(&mut self, depth: usize, realized: f64, predicted: f64) {
+        if let Some(entry) = self.calibration.get_mut(depth) {
+            entry.observe(realized, predicted);
+        }
+    }
+
+    pub(super) fn calibration_factor(&self, depth: usize) -> f64 {
+        self.calibration.get(depth).map_or(1.0, |entry| entry.factor())
     }
 }
 
@@ -84,8 +129,15 @@ impl RequestScheduler {
                 .filter(|forecast| forecast.request == request.handle)
                 .cloned().unwrap_or_else(|| Forecast::new(request.handle, &self.forecasts.population, request.generated_tokens));
             let mut bound = 1.0f64;
-            forecast.prefixes.iter().map(|estimate| {
-                bound = bound.min(if optimistic { estimate.upper(request.generated_tokens) } else { estimate.mean() });
+            forecast.prefixes.iter().enumerate().map(|(depth, estimate)| {
+                let mean = estimate.mean();
+                let calibrated = mean * self.forecasts.calibration_factor(depth);
+                let value = if optimistic {
+                    calibrated + (estimate.upper(request.generated_tokens) - mean)
+                } else {
+                    calibrated
+                };
+                bound = bound.min(value.clamp(0.0, 1.0));
                 bound
             }).collect()
         } else {
@@ -210,11 +262,12 @@ impl RequestScheduler {
         let length = self.speculative_tokens(request, width);
         self.costs.packed_round_shapes().filter(|shape| shape.batch == batch && shape.width == width
             && shape.drafts + 1 >= length && shape.tokens >= length)
-            .map(|shape| shape.nanos).min()
+            .map(|shape| shape.nanos)
+            .min_by_key(|&nanos| (nanos == 0, nanos))
     }
 
     pub(super) fn observe_packed_forecasts(&mut self, step: &ScheduledStep,
-        records: &[CompletionRecord], confidence: &[Vec<f32>]) {
+        records: &[CompletionRecord], confidence: &[Vec<f32>], survival: Option<&[Vec<f32>]>) {
         // A model that does not report GPU confidence feeds the population from host estimates instead.
         let gpu_confidence = self.gpu_confidence();
         for (row, lane) in step.lanes.iter().enumerate() {
@@ -226,11 +279,23 @@ impl RequestScheduler {
             let mut forecast = self.forecasts.requests[lane.request.slot as usize].take()
                 .filter(|forecast| forecast.request == lane.request)
                 .unwrap_or_else(|| Forecast::new(lane.request, &self.forecasts.population, generated));
+            let depth_limit = lane.tokens.saturating_sub(1).min(step.draft_tokens);
+            let mut predicted_prefixes = Vec::with_capacity(depth_limit);
             let mut prefix = 1.0f32;
-            for depth in 0..lane.tokens.saturating_sub(1).min(step.draft_tokens) {
+            for depth in 0..depth_limit {
                 prefix *= confidence[row][depth];
+                predicted_prefixes.push(prefix);
                 forecast.prefixes[depth].observe(f64::from(prefix), generated);
                 if gpu_confidence { self.forecasts.observe_population(depth, prefix); }
+            }
+            if gpu_confidence && vector.offered_drafts > 0 {
+                let offered = (vector.offered_drafts as usize).min(depth_limit);
+                let accepted = (vector.accepted_drafts as usize).min(offered);
+                let rejected = vector.emitted_count > vector.accepted_drafts;
+                let row_survival = survival.map(|rows| rows[lane.request.slot as usize].as_slice());
+                for (depth, realized) in speculation::observed_prefixes(offered, accepted, rejected, row_survival) {
+                    self.forecasts.observe_calibration(depth, realized, f64::from(predicted_prefixes[depth]));
+                }
             }
             self.forecasts.requests[lane.request.slot as usize] = Some(forecast);
         }

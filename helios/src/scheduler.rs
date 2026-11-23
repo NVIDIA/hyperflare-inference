@@ -2388,7 +2388,7 @@ impl RequestScheduler {
             return Err("invalid speculative round confidence sidecar".into());
         }
         let generated = self.complete_inner(fence, records, timing, survival)?;
-        self.observe_packed_forecasts(&step, records, confidence);
+        self.observe_packed_forecasts(&step, records, confidence, survival);
         Ok(generated)
     }
 

@@ -24,6 +24,17 @@ impl ServicePrice {
         coefficient.ln() + self.log_inverse_rate
     }
 
+    /// Rescales a stored physical price when a prefilling request's feasible rate
+    /// drops (for example across intermediate-to-terminal prefill or a short tail),
+    /// preserving its normalized GPU-time share `p * m`.
+    pub fn rebase_downward(&mut self, previous_rate: f64, current_rate: f64) {
+        debug_assert!(previous_rate.is_finite() && previous_rate > 0.0);
+        debug_assert!(current_rate.is_finite() && current_rate > 0.0);
+        if current_rate < previous_rate {
+            self.log_inverse_rate += (previous_rate / current_rate).ln();
+        }
+    }
+
     /// Integrate dp/dt = (f - p*y)/(m*tau) for physical service rate y.
     /// An unserved request's price grows linearly with occupied elapsed time.
     pub fn observe(

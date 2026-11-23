@@ -13,6 +13,7 @@ use crate::execution::ExecutionTiming;
 pub(super) struct ServiceAccounting {
     pub tokens: Option<ServicePrice>,
     pub deliveries: Option<ServicePrice>,
+    pub prefill_rate: Option<f64>,
     pending_delivery: Option<DeliveryObservation>,
 }
 
@@ -307,16 +308,26 @@ impl RequestScheduler {
             .enumerate()
             .filter_map(|(s, p)| p.map(|p| (s, p)))
         {
-            let service = &mut self.slots[participant.handle.slot as usize]
+            let request = self.slots[participant.handle.slot as usize]
                 .request
                 .as_mut()
-                .unwrap()
-                .accounting
-                .service;
+                .unwrap();
+            let prefill = request.consumed_tokens < request.prompt_tokens as u64;
+            let service = &mut request.accounting.service;
             if let Some(rate) = participant.token_rate {
-                service
+                let price = service
                     .tokens
                     .get_or_insert_with(|| ServicePrice::initial(rate / count as f64));
+                if prefill {
+                    if let Some(previous) = service.prefill_rate {
+                        price.rebase_downward(previous, rate);
+                    }
+                    service.prefill_rate = Some(rate);
+                } else {
+                    service.prefill_rate = None;
+                }
+            } else if !prefill {
+                service.prefill_rate = None;
             }
             if let Some(reference) = references[slot] {
                 service
