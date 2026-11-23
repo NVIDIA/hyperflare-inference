@@ -598,13 +598,21 @@ to `#`, `#/$defs/<name>`, or `#/definitions/<name>`, numeric bounds,
 argument-tag syntaxes reject top-level properties that mix `"string"` with
 any non-string type, including `"null"`. `enum` and `const` may specify a
 compatible `type` but cannot be combined with other assertions. Numeric `enum`
-and `const` literals and the values of `minimum`, `maximum`, `exclusiveMinimum`,
-and `exclusiveMaximum` are parsed at IEEE 754 binary64 precision and must have
-magnitude strictly below `2^53` (`9,007,199,254,740,992`, so integer literals
-lie in `[-9,007,199,254,740,991, 9,007,199,254,740,991]`; pass larger exact
-identifiers or higher-precision decimals as strings). With an active strict
-tool, TMLv0 recognizes only declared tool names, including under
-`tool_choice: "auto"`.
+and `const` literals are parsed at binary64 precision and must have magnitude
+strictly below `2^53`. Use strings for identifiers or decimal values that must
+be represented exactly.
+
+Range bounds (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`)
+are interpreted at binary64 precision. Above `2^53`, adjacent integers need not
+have distinct representations. For an `integer` property, `minimum: 9007199254740993`
+can admit `9007199254740992`. At the boundary, `exclusiveMinimum: 9007199254740992`
+can admit the endpoint itself because adding one rounds back to the same number.
+An inclusive `maximum: 9007199254740992` does distinguish the endpoint from
+the next integer. If exact enforcement of a large numeric bound matters, validate
+the tool arguments with exact arithmetic before executing the tool.
+
+With an active strict tool, TMLv0 recognizes only declared tool names,
+including under `tool_choice: "auto"`.
 
 Object property names cannot contain `<`, `>`, or whitespace. Top-level property
 names also exclude control characters, `"`, `'`, `&`, `\`, and `｜`.

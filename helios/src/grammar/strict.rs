@@ -173,24 +173,20 @@ const SUPPORTED_KEYS: &[&str] = &[
     "pattern",
 ];
 
-fn unsupported_strict_number(number: &serde_json::Number) -> bool {
+fn unsupported_strict_literal(value: &Value) -> bool {
     const LIMIT: u64 = 1 << 53;
 
-    if let Some(u) = number.as_u64() {
-        u >= LIMIT
-    } else if let Some(i) = number.as_i64() {
-        i.unsigned_abs() >= LIMIT
-    } else {
-        match number.as_f64() {
-            Some(f) => !f.is_finite() || f.abs() >= LIMIT as f64,
-            None => true,
-        }
-    }
-}
-
-fn unsupported_strict_literal(value: &Value) -> bool {
     match value {
-        Value::Number(number) => unsupported_strict_number(number),
+        Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                u >= LIMIT
+            } else if let Some(i) = n.as_i64() {
+                i.unsigned_abs() >= LIMIT
+            } else {
+                n.as_f64()
+                    .is_some_and(|f| !f.is_finite() || f.abs() >= LIMIT as f64)
+            }
+        }
         _ => false,
     }
 }
@@ -578,17 +574,11 @@ fn validate_strict_node(
 
     if kinds.contains(&"integer") || kinds.contains(&"number") {
         for kw in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
-            let Some(value) = obj.get(kw) else {
-                continue;
-            };
-            let Value::Number(number) = value else {
+            if let Some(v) = obj.get(kw)
+                && v.as_f64().is_none()
+            {
                 return Err(grammar_err(format!(
                     "strict tool {tool_name:?} schema {path}/{kw} must be a finite number"
-                )));
-            };
-            if unsupported_strict_number(number) {
-                return Err(grammar_err(format!(
-                    "strict tool {tool_name:?} schema {path}/{kw} contains a number outside the exact 53-bit integer range"
                 )));
             }
         }
@@ -3015,10 +3005,10 @@ mod tests {
     #[test]
     fn strict_bounds_do_not_round_integers_or_fractional_multiples() {
         let schema = json!({"type":"object","additionalProperties":false,"required":["n","step"],
-            "properties":{"n":{"type":"integer","maximum":9007199254740991u64},"step":{"type":"number","multipleOf":0.1}}});
+            "properties":{"n":{"type":"integer","maximum":9007199254740992u64},"step":{"type":"number","multipleOf":0.1}}});
         let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
-        let exact = r#"{"n":9007199254740991,"step":0.3}"#;
-        let rounded = r#"{"n":9007199254740992,"step":0.3}"#;
+        let exact = r#"{"n":9007199254740992,"step":0.3}"#;
+        let rounded = r#"{"n":9007199254740993,"step":0.3}"#;
         let fractional = r#"{"n":1,"step":1e-12}"#;
         let grammar = validate_strict_tool_schema(&compiler, "measure", &schema).unwrap();
         grammar.validate(exact).unwrap();
@@ -3895,83 +3885,16 @@ mod tests {
         ));
     }
 
-    fn strict_bound_schema(kind: &str, keyword: &str, raw_bound: &str) -> Value {
-        serde_json::from_str(&format!(
-            r#"{{"type":"object","properties":{{"n":{{"type":"{kind}","{keyword}":{raw_bound}}}}},"required":["n"],"additionalProperties":false}}"#
-        ))
-        .unwrap()
-    }
-
     #[test]
-    fn strict_numeric_bounds_reject_magnitude_at_or_above_two_to_53() {
+    fn strict_integer_maxima_preserve_large_inclusive_endpoints() {
         let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
-        for kind in ["number", "integer"] {
-            for keyword in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
-                for raw_bound in [
-                    "9007199254740992",
-                    "-9007199254740992",
-                    "9007199254740992.0",
-                    "-9007199254740992.0",
-                    "9007199254740993.0",
-                    "-9007199254740993.0",
-                    "9.007199254740992e15",
-                    "-9.007199254740992e15",
-                    "18446744073709551616",
-                    "-18446744073709551616",
-                ] {
-                    let schema = strict_bound_schema(kind, keyword, raw_bound);
-                    let error = validate_strict_tool_schema(&compiler, "f", &schema)
-                        .err()
-                        .unwrap_or_else(|| panic!("admitted {kind}/{keyword}: {raw_bound}"))
-                        .to_string();
-                    assert!(
-                        error.contains("exact 53-bit"),
-                        "{kind}/{keyword}: {raw_bound}: {error}"
-                    );
-                }
-            }
+        for maximum in [1_000_000_000_000_000_000u64, i64::MAX as u64] {
+            let schema = json!({"type":"object","additionalProperties":false,"required":["n"],
+                "properties":{"n":{"type":"integer","maximum":maximum}}});
+            let grammar = validate_strict_tool_schema(&compiler, "measure", &schema).unwrap();
+            grammar.validate(&json!({"n": maximum}).to_string()).unwrap();
+            assert!(grammar.validate(&json!({"n": maximum + 1}).to_string()).is_err());
         }
-    }
-
-    #[test]
-    fn strict_numeric_bounds_accept_two_to_53_minus_one() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
-        for kind in ["number", "integer"] {
-            for keyword in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
-                for raw_bound in [
-                    "9007199254740991",
-                    "-9007199254740991",
-                    "9007199254740991.0",
-                    "-9007199254740991.0",
-                    "9.007199254740991e15",
-                    "-9.007199254740991e15",
-                ] {
-                    let schema = strict_bound_schema(kind, keyword, raw_bound);
-                    validate_strict_tool_schema(&compiler, "f", &schema).unwrap_or_else(|error| {
-                        panic!("rejected {kind}/{keyword}: {raw_bound}: {error}")
-                    });
-                }
-            }
-        }
-        let pos_excl = json!({
-            "type": "object",
-            "properties": { "n": { "type": "integer", "exclusiveMinimum": 9007199254740991i64 } },
-            "required": ["n"],
-            "additionalProperties": false
-        });
-        let grammar = validate_strict_tool_schema(&compiler, "f", &pos_excl).unwrap();
-        assert!(grammar.validate(r#"{"n":9007199254740991}"#).is_err());
-        grammar.validate(r#"{"n":9007199254740992}"#).unwrap();
-
-        let neg_excl = json!({
-            "type": "object",
-            "properties": { "n": { "type": "integer", "exclusiveMaximum": -9007199254740991i64 } },
-            "required": ["n"],
-            "additionalProperties": false
-        });
-        let grammar = validate_strict_tool_schema(&compiler, "f", &neg_excl).unwrap();
-        assert!(grammar.validate(r#"{"n":-9007199254740991}"#).is_err());
-        grammar.validate(r#"{"n":-9007199254740992}"#).unwrap();
     }
 
     #[test]
