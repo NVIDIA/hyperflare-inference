@@ -57,14 +57,27 @@ fn validate_shards(table: &wire::EngramTable, world: usize) -> Result<()> {
     }
     if table.weights.is_some()
         || table.scales.is_some()
-        || table.request_buffer.is_empty()
-        || table.shards.len() != world
+        || (world > 1 && table.request_buffer.is_empty())
+        || world == 0
     {
         return Err(invalid("invalid partitioned embedding storage"));
     }
-    let mut end = 0;
-    for (rank, shard) in table.shards.iter().enumerate() {
-        if shard.rank as usize != rank || shard.first_row != end || shard.rows == 0 {
+    let mut end = 0u64;
+    let mut current_rank = 0usize;
+    let mut seen_current = false;
+    for shard in &table.shards {
+        let rank = shard.rank as usize;
+        if rank >= world || shard.first_row != end || shard.rows == 0 {
+            return Err(invalid(
+                "embedding partitions must cover table rows in rank order",
+            ));
+        }
+        if rank == current_rank {
+            seen_current = true;
+        } else if seen_current && rank == current_rank + 1 {
+            current_rank = rank;
+            seen_current = true;
+        } else {
             return Err(invalid(
                 "embedding partitions must cover table rows in rank order",
             ));
@@ -78,7 +91,7 @@ fn validate_shards(table: &wire::EngramTable, world: usize) -> Result<()> {
             return Err(invalid("missing embedding partition plane"));
         }
     }
-    if end != table.rows {
+    if !seen_current || current_rank + 1 != world || end != table.rows {
         return Err(invalid("embedding partitions must cover all table rows"));
     }
     Ok(())
@@ -173,29 +186,65 @@ pub(super) fn decode<F: super::payload::Files>(
         {
             return Err(invalid("invalid Engram hash geometry"));
         }
-        let (stored_rows, weights, scales) = if table.shards.is_empty() {
-            (table.rows, table.weights.clone(), table.scales.clone())
-        } else {
-            let shard = table
-                .shards
-                .get(rank)
-                .ok_or_else(|| invalid("embedding partition rank is absent"))?;
-            (shard.rows, shard.weights.clone(), shard.scales.clone())
-        };
-        let plane = |span: Option<wire::Span>, row_bytes: usize| -> Result<Plane> {
+        let single_plane = |span: Option<wire::Span>, rows: u64, row_bytes: usize| -> Result<Plane> {
             let span = span.ok_or_else(|| invalid("Engram table lacks a payload plane"))?;
-            if stored_rows.checked_mul(row_bytes as u64) != Some(span.nbytes) {
+            if rows.checked_mul(row_bytes as u64) != Some(span.nbytes) {
                 return Err(invalid("Engram payload geometry mismatch"));
             }
-            Ok(Plane {
-                file: archive.source_index(&span)?,
-                offset: archive.source(&span)?.1,
-                nbytes: usize::try_from(span.nbytes)
+            Ok(Plane::single(
+                archive.source_index(&span)?,
+                archive.source(&span)?.1,
+                usize::try_from(span.nbytes)
                     .map_err(|_| invalid("Engram plane exceeds host range"))?,
                 row_bytes,
-            })
+            ))
         };
-        let planes = [plane(weights, row_bytes)?, plane(scales, scale_bytes)?];
+        let planes = if table.shards.is_empty() {
+            [
+                single_plane(table.weights.clone(), table.rows, row_bytes)?,
+                single_plane(table.scales.clone(), table.rows, scale_bytes)?,
+            ]
+        } else {
+            let owned: Vec<&wire::EngramTableShard> = table
+                .shards
+                .iter()
+                .filter(|shard| shard.rank as usize == rank)
+                .collect();
+            if owned.is_empty() {
+                return Err(invalid("embedding partition rank is absent"));
+            }
+            if owned.len() == 1 {
+                let shard = owned[0];
+                [
+                    single_plane(shard.weights.clone(), shard.rows, row_bytes)?,
+                    single_plane(shard.scales.clone(), shard.rows, scale_bytes)?,
+                ]
+            } else {
+                let build_multi = |select: fn(&wire::EngramTableShard) -> Option<&wire::Span>,
+                                   elem_bytes: usize|
+                 -> Result<Plane> {
+                    let mut segments = Vec::with_capacity(owned.len());
+                    for shard in &owned {
+                        let span = select(shard)
+                            .ok_or_else(|| invalid("Engram table lacks a payload plane"))?;
+                        if shard.rows.checked_mul(elem_bytes as u64) != Some(span.nbytes) {
+                            return Err(invalid("Engram payload geometry mismatch"));
+                        }
+                        segments.push(crate::engram::PlaneSegment {
+                            file: archive.source_index(span)?,
+                            offset: archive.source(span)?.1,
+                            nbytes: usize::try_from(span.nbytes)
+                                .map_err(|_| invalid("Engram plane exceeds host range"))?,
+                        });
+                    }
+                    Plane::multi(segments, elem_bytes)
+                };
+                [
+                    build_multi(|s| s.weights.as_ref(), row_bytes)?,
+                    build_multi(|s| s.scales.as_ref(), scale_bytes)?,
+                ]
+            }
+        };
         for core in cores {
             if !core.events.contains(&table.ready_event) {
                 return Err(invalid("rank lacks Engram readiness event"));
@@ -384,5 +433,40 @@ mod tests {
             assert_eq!((planes[0].1.offset, planes[0].1.nbytes), (0, 32));
             assert_eq!((planes[1].1.offset, planes[1].1.nbytes), (32, 8));
         }
+    }
+
+    #[test]
+    fn multi_shard_single_rank_partitions_validate_contiguously() {
+        let table = wire::EngramTable {
+            rows: 40,
+            request_buffer: "req".into(),
+            shards: vec![
+                wire::EngramTableShard {
+                    rank: 0,
+                    first_row: 0,
+                    rows: 20,
+                    weights: Some(wire::Span { offset: 0, nbytes: 20 * 256, ..Default::default() }),
+                    scales: Some(wire::Span { offset: 20 * 256, nbytes: 20 * 8, ..Default::default() }),
+                },
+                wire::EngramTableShard {
+                    rank: 0,
+                    first_row: 20,
+                    rows: 20,
+                    weights: Some(wire::Span { offset: 20 * 264, nbytes: 20 * 256, ..Default::default() }),
+                    scales: Some(wire::Span { offset: 40 * 256 + 20 * 8, nbytes: 20 * 8, ..Default::default() }),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(validate_shards(&table, 1).is_ok());
+        assert!(validate_shards(&table, 2).is_err());
+
+        let mut gap = table.clone();
+        gap.shards[1].first_row = 21;
+        assert!(validate_shards(&gap, 1).is_err());
+
+        let mut short = table.clone();
+        short.shards[1].rows = 19;
+        assert!(validate_shards(&short, 1).is_err());
     }
 }

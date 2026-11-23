@@ -17,7 +17,8 @@ use crate::{
 };
 #[cfg(unix)]
 pub use prepared::{PlaneSource, PreparedTables, SourceSegment, TableSource};
-pub(crate) use reader::Plane;
+#[allow(unused_imports)]
+pub(crate) use reader::{Plane, PlaneSegment};
 #[cfg(feature = "server")]
 use std::fmt::Write;
 use std::{
@@ -413,7 +414,7 @@ impl Shared {
             );
             let (sender, receiver) = mpsc::sync_channel::<Job>(STAGING_FRAMES);
             let buffers = staging.clone();
-            let planes = table.planes;
+            let planes = table.planes.clone();
             let row_bytes = planes.iter().map(|p| p.row_bytes).sum::<usize>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stop = cancelled.clone();
@@ -739,8 +740,8 @@ mod tests {
     #[test]
     fn staging_budget_covers_two_payloads_and_ready_flags_per_table() {
         let table = Table {
-            planes: [Plane { file: 0, offset: 0, nbytes: 1024, row_bytes: 64 },
-                Plane { file: 0, offset: 1024, nbytes: 128, row_bytes: 8 }],
+            planes: [Plane::single(0, 0, 1024, 64),
+                Plane::single(0, 1024, 128, 8)],
             heads: 4, weights: "weights".into(), scales: "scales".into(),
             hashes: "hashes".into(), event: "ready".into(), request: None,
         };

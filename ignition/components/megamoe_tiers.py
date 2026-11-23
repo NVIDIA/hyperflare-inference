@@ -147,7 +147,8 @@ class MegaMoeDynamicHostTier:
 
     MAGIC_INDIR = 0x49505244  # "DRPI"
 
-    def __init__(self, geometry, *, hbm_slots, initial_hbm_experts, storage, name, host_experts=None):
+    def __init__(self, geometry, *, hbm_slots, initial_hbm_experts, storage, name, host_experts=None,
+                 host_lane_clusters=4):
         device = torch.device("cuda", storage.device)
         initial_hbm_experts = tuple(initial_hbm_experts)
         host_count = geometry.experts if host_experts is None else host_experts
@@ -155,6 +156,8 @@ class MegaMoeDynamicHostTier:
             raise ValueError("dynamic MegaMoE tier requires host_experts in [1, experts]")
         if (type(hbm_slots) is not int or not 2 <= hbm_slots <= geometry.experts):
             raise ValueError("dynamic MegaMoE tier requires hbm_slots in [2, experts]")
+        if type(host_lane_clusters) is not int or host_lane_clusters < 0:
+            raise ValueError("dynamic MegaMoE tier requires a nonnegative host_lane_clusters")
         if (not initial_hbm_experts or len(initial_hbm_experts) >= hbm_slots
                 or len(set(initial_hbm_experts)) != len(initial_hbm_experts)
                 or any(type(e) is not int or not 0 <= e < geometry.experts for e in initial_hbm_experts)):
@@ -165,11 +168,13 @@ class MegaMoeDynamicHostTier:
         properties = torch.cuda.get_device_properties(device)
         if (properties.major, properties.minor) != (10, 3):
             raise ValueError("the dynamic MegaMoE Grace tier requires SM103")
+        if host_lane_clusters >= properties.multi_processor_count // 2:
+            raise ValueError("dynamic MegaMoE host lane must leave at least one cluster for HBM work")
         self.geometry = geometry
         self.experts = geometry.experts
         self.rows = host_count
         self.hbm_slots = hbm_slots
-        self.host_lane_clusters = 0
+        self.host_lane_clusters = host_lane_clusters
         self.indirection = True
         self.predictor_binding = None
         self.regions, self.host_views, self.device_views = [], [], []
@@ -199,13 +204,14 @@ class MegaMoeDynamicHostTier:
         self.slot_owner = persistent_copy(torch.tensor(slot_owner, dtype=torch.int32, device=device))
         self.layer_epoch = persistent_zeros((1,), dtype=torch.int32, device=device)
         self.descriptors = persistent_zeros((160 * 4 * 128,), dtype=torch.uint8, device=device)
-        header = torch.zeros(16 + geometry.experts, dtype=torch.int32)
+        header = torch.zeros(16 + geometry.experts + 2, dtype=torch.int32)
         header[0] = self.MAGIC_INDIR
         header[1] = hbm_slots
+        header[10] = host_lane_clusters
         header[:16].view(torch.int64)[1:5] = torch.tensor([t.data_ptr() for t in self.device_views], dtype=torch.int64)
         header[:16].view(torch.int64)[6] = self.layer_epoch.data_ptr()
         header[:16].view(torch.int64)[7] = self.descriptors.data_ptr()
-        header[16:] = torch.tensor(slot_map, dtype=torch.int32)
+        header[16:16 + geometry.experts] = torch.tensor(slot_map, dtype=torch.int32)
         self.control = persistent_copy(header.to(device))
         # Omit self.control: it stores 64-bit device/host pointers that export_core must scan.
         for t in (self.live_slot_map, self.slot_owner, self.layer_epoch, self.descriptors):

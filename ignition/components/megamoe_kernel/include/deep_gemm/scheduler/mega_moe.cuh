@@ -343,15 +343,20 @@ struct MegaMoEScheduler {
     // host tasks are all claimed. Only in L1-first calls (fast dispatch, no ring wrap); otherwise the stock schedule.
     uint32_t drp_num_host = 0;
     uint32_t* drp_cnt = nullptr;     // [0] host L1 claims, [1] host L2 claims; zeroed with the stock counters
+    const int32_t* drp_slot_map = nullptr; // non-null in drp_indir mode: active_slot_map[0..kNumExpertsPerRank-1]
+    uint32_t drp_cold_mask = 0;      // per-lane bit i = 1 iff expert (i * 32 + lane_idx) is cold (< 0)
     bool drp_is_lane = false;
     uint32_t drp_h1 = 0, drp_h2 = 0; // host L1 / L2 task counts of this call (0: lane off)
+    uint32_t drp_hbm_l1 = 0, drp_hbm_l2 = 0; // non-host L1 / L2 task counts of this call
     uint32_t drp_state = 2;          // 0 host L1, 1 host L2, 2 HBM tasks
     uint32_t drp_lane_n = 0;         // lane clusters
-    CUTLASS_DEVICE void use_host_lane(const uint32_t num_host, uint32_t* cnt, const bool is_lane, const uint32_t lane_n) {
+    CUTLASS_DEVICE void use_host_lane(const uint32_t num_host, uint32_t* cnt, const bool is_lane, const uint32_t lane_n,
+                                      const int32_t* slot_map = nullptr) {
         drp_num_host = num_host;
         drp_cnt = cnt;
         drp_is_lane = is_lane;
         drp_lane_n = lane_n;
+        drp_slot_map = slot_map;
     }
 
     // Fair first wave (fast-dispatch calls): totals per task kind, and this scheduler's valid publishes so far
@@ -436,51 +441,86 @@ struct MegaMoEScheduler {
         num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
         // W6 L1-first (fast dispatch: no ring wrap possible): all routed L1 claims before any routed L2 claim
         if (fd_counts != nullptr and num_total_m_blocks <= kNumRingBlocks)
-            num_sched_l1_waves = num_total_l1_waves;
-        // Derpseek host lane: host rows come first in the pool, so their tasks are the first L1 / L2 task indices
+            num_sched_l1_waves = kNumSchedL1WavesDone - 1u;
+        // Derpseek host lane: static host-first rows (< drp_num_host) or dynamic drp_slot_map (< 0)
         drp_h1 = drp_h2 = 0;
+        drp_hbm_l1 = num_total_m_blocks * kNumL1Clusters;
+        drp_hbm_l2 = num_total_m_blocks * kNumL2Clusters;
         drp_state = 2;
-        if (drp_cnt != nullptr and drp_num_host != 0 and fd_counts != nullptr and num_total_m_blocks <= kNumRingBlocks) {
-            const uint32_t host_blocks = get_pool_block_offset(drp_num_host);
-            drp_h1 = host_blocks * kNumL1Clusters;
-            drp_h2 = host_blocks * kNumL2Clusters;
-            drp_state = (host_blocks != 0 and drp_is_lane) ? 0u : 2u;
+        drp_cold_mask = 0;
+        if (drp_cnt != nullptr and fd_counts != nullptr and num_total_m_blocks <= kNumRingBlocks) {
+            uint32_t host_blocks = 0;
+            if (drp_slot_map != nullptr) {
+                DG_STATIC_ASSERT(kNumExpertsPerLane <= 32, "drp_cold_mask requires kNumExpertsPerLane <= 32");
+                uint32_t lane_host_blocks = 0;
+                uint32_t cold_mask = 0;
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+                    const uint32_t expert_idx = i * 32 + ptx::get_lane_idx();
+                    if (expert_idx < kNumExpertsPerRank and __ldg(drp_slot_map + expert_idx) < 0) {
+                        cold_mask |= (1u << i);
+                        lane_host_blocks += math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+                    }
+                }
+                drp_cold_mask = cold_mask;
+                host_blocks = __reduce_add_sync(0xffffffff, lane_host_blocks);
+            } else if (drp_num_host != 0) {
+                host_blocks = get_pool_block_offset(drp_num_host);
+            }
+            if (host_blocks != 0) {
+                drp_h1 = host_blocks * kNumL1Clusters;
+                drp_h2 = host_blocks * kNumL2Clusters;
+                drp_hbm_l1 = (num_total_m_blocks - host_blocks) * kNumL1Clusters;
+                drp_hbm_l2 = (num_total_m_blocks - host_blocks) * kNumL2Clusters;
+                drp_state = drp_is_lane ? 0u : 2u;
+            }
         }
     }
 
+    // filter_mode: 0 = all experts (stock / static host-first), 1 = cold-only (drp_indir host lane), 2 = HBM-only (drp_indir)
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
                                         const uint32_t& task_idx,
                                         const uint32_t& num_clusters,
                                         const uint32_t& shape_n,
-                                        const uint32_t& shape_k) const {
+                                        const uint32_t& shape_k,
+                                        const uint32_t filter_mode = 0u) const {
         const uint32_t lane_idx = ptx::get_lane_idx();
         const uint32_t m_block_idx = task_idx / num_clusters;
         const uint32_t n_cluster_idx = task_idx % num_clusters;
 
         task_info_t result(block_phase, 0, 0, n_cluster_idx, m_block_idx, 0, shape_n, shape_k);
-        uint32_t block_offset = 0;
+        uint32_t filtered_offset = 0;
+        uint32_t pool_offset = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
-            // Reduce whether task fall in the expert
+            // Reduce whether task falls in the expert
             const uint32_t expert_idx = i * 32 + lane_idx;
             const uint32_t num_tokens = stored_num_tokens_per_expert[i];
             const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
-            const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
-            const uint32_t lane_pool_block_offset = block_offset + inclusive_num_m_blocks - num_m_blocks;
-            const bool is_owner = expert_idx < kNumExpertsPerRank and
-                m_block_idx >= lane_pool_block_offset and m_block_idx < lane_pool_block_offset + num_m_blocks;
+            const bool is_cold = (drp_cold_mask >> i) & 1u;
+            const bool include = (filter_mode == 0u) or (filter_mode == 1u ? is_cold : not is_cold);
+            const uint32_t filtered_blocks = include ? num_m_blocks : 0u;
+            const uint32_t inclusive_filtered = math::warp_inclusive_sum(filtered_blocks, lane_idx);
+            const uint32_t inclusive_pool = (filter_mode == 0u) ? inclusive_filtered : math::warp_inclusive_sum(num_m_blocks, lane_idx);
+            const uint32_t lane_filtered_offset = filtered_offset + inclusive_filtered - filtered_blocks;
+            const uint32_t lane_pool_offset = pool_offset + inclusive_pool - num_m_blocks;
+            const bool is_owner = expert_idx < kNumExpertsPerRank and include and
+                m_block_idx >= lane_filtered_offset and m_block_idx < lane_filtered_offset + filtered_blocks;
             const uint32_t owner_mask = __ballot_sync(0xffffffff, is_owner);
 
             // Exchange the expert info
             if (owner_mask) {
                 const uint32_t owner_lane_idx = static_cast<uint32_t>(__ffs(owner_mask) - 1);
-                const uint32_t owner_m_block_idx = m_block_idx - lane_pool_block_offset;
+                const uint32_t owner_m_block_idx = m_block_idx - lane_filtered_offset;
+                const uint32_t owner_pool_block_idx = lane_pool_offset + owner_m_block_idx;
                 const uint32_t owner_valid_m = cute::min(num_tokens - owner_m_block_idx * BLOCK_M, BLOCK_M);
                 result.local_expert_idx = ptx::exchange(expert_idx, owner_lane_idx);
                 result.m_block_idx = ptx::exchange(owner_m_block_idx, owner_lane_idx);
+                result.pool_block_idx = ptx::exchange(owner_pool_block_idx, owner_lane_idx);
                 result.valid_m = ptx::exchange(owner_valid_m, owner_lane_idx);
             }
-            block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
+            filtered_offset += ptx::exchange(inclusive_filtered, 31);
+            pool_offset += ptx::exchange(inclusive_pool, 31);
         }
         return result;
     }
@@ -493,10 +533,11 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE task_info_t get_next_task() {
+        const bool indir_lane = drp_slot_map != nullptr and drp_h1 != 0;
         if (drp_state == 0) {
             const uint32_t idx = get_next_task_idx(drp_cnt);
             if (idx < drp_h1)
-                return create_task(BlockPhase::Linear1, idx, kNumL1Clusters, L1_SHAPE_N, L1_SHAPE_K);
+                return create_task(BlockPhase::Linear1, idx, kNumL1Clusters, L1_SHAPE_N, L1_SHAPE_K, indir_lane ? 1u : 0u);
             drp_state = 1;
         }
         if (drp_state == 1) {
@@ -504,7 +545,7 @@ struct MegaMoEScheduler {
             // the L2 K blocks still wait for their L1 N blocks in the consumer (L2KBlockDependency)
             const uint32_t idx = get_next_task_idx(drp_cnt + 1);
             if (idx < drp_h2)
-                return create_task(BlockPhase::Linear2, idx, kNumL2Clusters, L2_SHAPE_N, L2_SHAPE_K);
+                return create_task(BlockPhase::Linear2, idx, kNumL2Clusters, L2_SHAPE_N, L2_SHAPE_K, indir_lane ? 1u : 0u);
             drp_state = 2;
         }
         while (true) {
@@ -513,17 +554,18 @@ struct MegaMoEScheduler {
                 -- num_sched_l1_waves;
 
                 // No more L1 tasks
-                const uint32_t l1_task_idx = drp_h1 + get_next_task_idx(workspace.get_l1_task_count_ptr());
-                if (l1_task_idx >= num_total_m_blocks * kNumL1Clusters) {
+                const uint32_t raw_l1 = get_next_task_idx(workspace.get_l1_task_count_ptr());
+                if (raw_l1 >= drp_hbm_l1) {
                     num_sched_l1_waves = kNumSchedL1WavesDone;
                     continue;
                 }
 
                 // Create task
-                return create_task(BlockPhase::Linear1, l1_task_idx, kNumL1Clusters, L1_SHAPE_N, L1_SHAPE_K);
+                return create_task(BlockPhase::Linear1, indir_lane ? raw_l1 : (drp_h1 + raw_l1),
+                                   kNumL1Clusters, L1_SHAPE_N, L1_SHAPE_K, indir_lane ? 2u : 0u);
             } else {
-                const uint32_t l2_task_idx = drp_h2 + get_next_task_idx(workspace.get_l2_task_count_ptr());
-                if (l2_task_idx >= num_total_m_blocks * kNumL2Clusters)
+                const uint32_t raw_l2 = get_next_task_idx(workspace.get_l2_task_count_ptr());
+                if (raw_l2 >= drp_hbm_l2)
                     break;
 
                 // The next task should be L1
@@ -531,19 +573,20 @@ struct MegaMoEScheduler {
                     num_sched_l1_waves = 1;
 
                 // Create task
-                auto task_info = create_task(BlockPhase::Linear2, l2_task_idx, kNumL2Clusters, L2_SHAPE_N, L2_SHAPE_K);
+                auto task_info = create_task(BlockPhase::Linear2, indir_lane ? raw_l2 : (drp_h2 + raw_l2),
+                                             kNumL2Clusters, L2_SHAPE_N, L2_SHAPE_K, indir_lane ? 2u : 0u);
 
                 // Wait until all required L1 tasks are fetched
-                const auto num_required_l1_tasks = (task_info.pool_block_idx + 1) * kNumL1Clusters;
+                const auto num_required_raw_l1 = (raw_l2 / kNumL2Clusters + 1) * kNumL1Clusters;
                 const uint64_t t0 = drp_now();
-                while (drp_h1 + ptx::ld_volatile(workspace.get_l1_task_count_ptr()) < num_required_l1_tasks) {
+                while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) < num_required_raw_l1) {
                     if (drp_now() - t0 > DRP_SPIN_NS) {
                         if (ptx::get_lane_idx() == 0)
                             printf("DERPSEEK MegaMoE stuck in the L2 claim-order wait: block %u pool block %u needs %u L1 "
-                                   "claims, have %u + %u (h1 %u h2 %u blocks %u waves %u lane %d state %u host claims %u %u)\n",
-                                   blockIdx.x, task_info.pool_block_idx, num_required_l1_tasks, drp_h1,
-                                   ptx::ld_volatile(workspace.get_l1_task_count_ptr()), drp_h1, drp_h2, num_total_m_blocks,
-                                   num_sched_l1_waves, (int) drp_is_lane, drp_state,
+                                   "claims, have %u (h1 %u h2 %u hbm1 %u hbm2 %u blocks %u waves %u lane %d state %u host claims %u %u)\n",
+                                   blockIdx.x, task_info.pool_block_idx, num_required_raw_l1,
+                                   ptx::ld_volatile(workspace.get_l1_task_count_ptr()), drp_h1, drp_h2, drp_hbm_l1, drp_hbm_l2,
+                                   num_total_m_blocks, num_sched_l1_waves, (int) drp_is_lane, drp_state,
                                    drp_cnt ? ptx::ld_volatile(drp_cnt) : 0u, drp_cnt ? ptx::ld_volatile(drp_cnt + 1) : 0u);
                         asm volatile("trap;");
                     }

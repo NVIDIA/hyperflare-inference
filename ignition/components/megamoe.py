@@ -183,18 +183,21 @@ class _State:
 
     def run(self, source, ids, probabilities, padding, matrices, output, buffer, control=None, descriptors=None,
             live_slot_map=None, layer_epoch=None, predictor_binding=None,
-            base_control=None, staged_mask=None, staged_min_cold=0):
+            base_control=None, staged_mask=None, staged_min_cold=0,
+            staged_req_seq=None, staged_queue_header=None):
         q = self.query
         x, sf, out_ids, out_weights, _, shared_sf, *_ = self.workspace.slice_inputs(buffer)
         self.stager[(triton.cdiv(q.rows, 8 if q.rows >= 64 else 1), q.hidden // 128, 1)](
             source, x, sf, shared_sf if q.shared_experts else None,
             ids, probabilities, padding, out_ids, out_weights, *_stage_constants(q))
         self.run_encoded(matrices, output, buffer, control, descriptors, live_slot_map, layer_epoch,
-                         predictor_binding, base_control, staged_mask, staged_min_cold)
+                         predictor_binding, base_control, staged_mask, staged_min_cold,
+                         staged_req_seq, staged_queue_header)
 
     def run_encoded(self, matrices, output, buffer, control=None, descriptors=None,
                     live_slot_map=None, layer_epoch=None, predictor_binding=None,
-                    base_control=None, staged_mask=None, staged_min_cold=0):
+                    base_control=None, staged_mask=None, staged_min_cold=0,
+                    staged_req_seq=None, staged_queue_header=None):
         q = self.query
         shared_gate = tuple(matrices[4:6]) if q.shared_experts else None
         shared_down = tuple(matrices[6:8]) if q.shared_experts else None
@@ -206,11 +209,19 @@ class _State:
                 if staged_mask is not None:
                     if base_control is None or len(matrices) < 4:
                         raise ValueError("staged indirection MegaMoE requires base_control and four staged planes")
-                    self.mover_binding.launch_layer_enter_staged(
-                        live_slot_map, base_control, control, layer_epoch, staged_mask,
-                        matrices[-4], matrices[-3], matrices[-2], matrices[-1],
-                        q.experts, q.host_rows, staged_min_cold,
-                    )
+                    if staged_req_seq is not None and staged_queue_header is not None:
+                        self.mover_binding.launch_layer_enter_staged_worker(
+                            live_slot_map, base_control, control, layer_epoch, staged_mask,
+                            matrices[-4], matrices[-3], matrices[-2], matrices[-1],
+                            q.experts, q.host_rows, staged_min_cold,
+                            staged_queue_header, staged_req_seq,
+                        )
+                    else:
+                        self.mover_binding.launch_layer_enter_staged(
+                            live_slot_map, base_control, control, layer_epoch, staged_mask,
+                            matrices[-4], matrices[-3], matrices[-2], matrices[-1],
+                            q.experts, q.host_rows, staged_min_cold,
+                        )
                 elif predictor_binding is not None:
                     self.mover_binding.launch_layer_enter_predict(
                         live_slot_map, control, layer_epoch, views[2], q.rows, q.top_k, q.experts,
@@ -251,18 +262,20 @@ def _run(source: torch.Tensor, ids: torch.Tensor, probabilities: torch.Tensor,
          workspace: torch.Tensor, control: torch.Tensor | None, descriptors: torch.Tensor | None,
          live_slot_map: torch.Tensor | None, layer_epoch: torch.Tensor | None, handle: int,
          base_control: torch.Tensor | None = None, staged_mask: torch.Tensor | None = None,
-         staged_min_cold: int = 0) -> None:
+         staged_min_cold: int = 0, staged_req_seq: torch.Tensor | None = None,
+         staged_queue_header: torch.Tensor | None = None) -> None:
     plan = plan_from_handle(handle)
     host_tier = _DYNAMIC_TIERS.get(handle)
     require_prepared(plan, plan.component_id, source.device).run(
         source, ids, probabilities, padding, matrices, output, workspace, control, descriptors,
         live_slot_map, layer_epoch, getattr(host_tier, "predictor_binding", None),
-        base_control, staged_mask, staged_min_cold)
+        base_control, staged_mask, staged_min_cold, staged_req_seq, staged_queue_header)
 
 
 @_run.register_fake
 def _run_fake(source, ids, probabilities, padding, matrices, output, workspace, control, descriptors,
-              live_slot_map, layer_epoch, handle, base_control=None, staged_mask=None, staged_min_cold=0):
+              live_slot_map, layer_epoch, handle, base_control=None, staged_mask=None, staged_min_cold=0,
+              staged_req_seq=None, staged_queue_header=None):
     pass
 
 
@@ -272,7 +285,8 @@ def _run_encoded(source: torch.Tensor, encoded: list[torch.Tensor], matrices: li
                  descriptors: torch.Tensor | None, live_slot_map: torch.Tensor | None,
                  layer_epoch: torch.Tensor | None, handle: int,
                  base_control: torch.Tensor | None = None, staged_mask: torch.Tensor | None = None,
-                 staged_min_cold: int = 0) -> None:
+                 staged_min_cold: int = 0, staged_req_seq: torch.Tensor | None = None,
+                 staged_queue_header: torch.Tensor | None = None) -> None:
     plan = plan_from_handle(handle)
     state = require_prepared(plan, plan.component_id, source.device)
     views = state.workspace.slice_inputs(workspace)
@@ -285,12 +299,13 @@ def _run_encoded(source: torch.Tensor, encoded: list[torch.Tensor], matrices: li
     host_tier = _DYNAMIC_TIERS.get(handle)
     state.run_encoded(matrices, output, workspace, control, descriptors, live_slot_map, layer_epoch,
                       getattr(host_tier, "predictor_binding", None),
-                      base_control, staged_mask, staged_min_cold)
+                      base_control, staged_mask, staged_min_cold, staged_req_seq, staged_queue_header)
 
 
 @_run_encoded.register_fake
 def _run_encoded_fake(source, encoded, matrices, output, workspace, control, descriptors,
-                      live_slot_map, layer_epoch, handle, base_control=None, staged_mask=None, staged_min_cold=0):
+                      live_slot_map, layer_epoch, handle, base_control=None, staged_mask=None, staged_min_cold=0,
+                      staged_req_seq=None, staged_queue_header=None):
     pass
 
 
@@ -370,6 +385,7 @@ class PreparedMegaMoe:
         output = torch.empty_like(source)
         matrices, control = self.matrices, self.control
         base_control, staged_mask, staged_min_cold = None, None, 0
+        staged_req_seq, staged_queue_header = None, None
         if staged is not None:
             if self.host_tier is None:
                 raise ValueError("expert staging requires a prepared host tier")
@@ -382,10 +398,12 @@ class PreparedMegaMoe:
                 base_control = self.control
                 staged_mask = pending.staged_mask
                 staged_min_cold = stager.query.min_cold
+                staged_req_seq = pending.req_seq
+                staged_queue_header = pending.worker_queue_header
         _run(source, ids, probabilities, padding, matrices, output,
              self.workspace.buffer, control, self.descriptors,
              self.live_slot_map, self.layer_epoch, self.plan.handle,
-             base_control, staged_mask, staged_min_cold)
+             base_control, staged_mask, staged_min_cold, staged_req_seq, staged_queue_header)
         if staged is not None:
             stager.observe(control)
         return output
@@ -411,6 +429,7 @@ class PreparedMegaMoe:
         routed = self.encoded_inputs()[2:4]
         matrices, control = self.matrices, self.control
         base_control, staged_mask, staged_min_cold = None, None, 0
+        staged_req_seq, staged_queue_header = None, None
         if staged is not None:
             stager, pending = staged
             if stager.tier is not self.host_tier:
@@ -421,9 +440,11 @@ class PreparedMegaMoe:
                 base_control = self.control
                 staged_mask = pending.staged_mask
                 staged_min_cold = stager.query.min_cold
+                staged_req_seq = pending.req_seq
+                staged_queue_header = pending.worker_queue_header
         _run_encoded(source, [*inputs, *routed], matrices, output, self.workspace.buffer,
                      control, self.descriptors, self.live_slot_map, self.layer_epoch, self.plan.handle,
-                     base_control, staged_mask, staged_min_cold)
+                     base_control, staged_mask, staged_min_cold, staged_req_seq, staged_queue_header)
         if staged is not None:
             stager.observe(control)
         return output

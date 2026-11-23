@@ -329,7 +329,7 @@ impl WorkerView {
                         format!("{live_hit} live"),
                         Style::default().fg(hit_color).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!(" · {cum_hit} cum"), Style::default().fg(CYAN)),
+                    Span::styled(format!(" · {cum_hit} total"), Style::default().fg(CYAN)),
                     Span::styled("   SWAPS ", Style::default().fg(MUTED)),
                     Span::styled(
                         format!("{}/s", rate(mover.swaps_per_sec)),
@@ -646,12 +646,12 @@ impl WorkerView {
                 Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" · ", Style::default().fg(MUTED)),
-            Span::styled(format!("{cum_now} cum "), Style::default().fg(CYAN)),
+            Span::styled(format!("{cum_now} total "), Style::default().fg(CYAN)),
         ]);
 
         let datasets = vec![
             Dataset::default()
-                .name("cum")
+                .name("total")
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(CYAN))
@@ -815,7 +815,7 @@ fn render_mover_header(
             hit_str,
             Style::default().fg(hit_color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" (cum {cum_str})"), Style::default().fg(CYAN)),
+        Span::styled(format!(" (total {cum_str})"), Style::default().fg(CYAN)),
         Span::styled("  ·  LAST ", Style::default().fg(MUTED)),
         Span::styled(last, Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
     ]);
@@ -877,7 +877,7 @@ fn render_mover_stats_card(frame: &mut Frame, area: Rect, mover: MoverTelemetry)
     let left_lines = vec![
         kv(
             "HBM Hit Rate",
-            format!("{live_hit} live  /  {cum_hit} cum"),
+            format!("{live_hit} live  /  {cum_hit} total"),
             hit_rate_color(mover.recent_hit_pct.or(mover.cumulative_hit_pct)),
         ),
         kv(

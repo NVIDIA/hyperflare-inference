@@ -241,6 +241,9 @@ sm103_router_topk_kernel(
     float4 b_reg = *reinterpret_cast<const float4*>(b_ptr + base);
 
     asm volatile("griddepcontrol.wait;" ::: "memory");
+    // Release dependent kernel (e.g. layer_enter_predict Dekker snapshot) to run its
+    // input-independent prologue concurrently with top-k reduction and normalization.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
     if (!is_valid) {
         if (warp == 0 && lane < TOPK) {

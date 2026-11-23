@@ -741,11 +741,13 @@ mod tests {
                     Shared::layout_fixture(
                         Index {
                             tables: vec![Table {
-                                planes: [256, 8].map(|row_bytes| Plane {
-                                    file: rank,
-                                    offset: rank as u64 * 4096,
-                                    nbytes: (100 + rank) * row_bytes,
-                                    row_bytes,
+                                planes: [256, 8].map(|row_bytes| {
+                                    Plane::single(
+                                        rank,
+                                        rank as u64 * 4096,
+                                        (100 + rank) * row_bytes,
+                                        row_bytes,
+                                    )
                                 }),
                                 heads: 24,
                                 weights: "weights".into(),
@@ -849,9 +851,8 @@ mod tests {
             for partitioned in [false, true] {
                 let groups: Vec<_> = (0..if partitioned { 4 } else { 1 }).map(|rank| {
                     Shared::layout_fixture(Index { tables: vec![Table {
-                        planes: [256, 8].map(|row_bytes| Plane {
-                            file: rank, offset: rank as u64 * 4096,
-                            nbytes: (100 + rank) * row_bytes, row_bytes,
+                        planes: [256, 8].map(|row_bytes| {
+                            Plane::single(rank, rank as u64 * 4096, (100 + rank) * row_bytes, row_bytes)
                         }),
                         heads: 24, weights: "weights".into(), scales: "scales".into(),
                         hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()),

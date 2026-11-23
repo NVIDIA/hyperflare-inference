@@ -225,18 +225,8 @@ mod tests {
                 .collect();
             std::fs::write(&path, &bytes).unwrap();
             let planes = [
-                Plane {
-                    file: 0,
-                    offset: first as u64,
-                    nbytes: rows * width,
-                    row_bytes: width,
-                },
-                Plane {
-                    file: 0,
-                    offset: second as u64,
-                    nbytes: rows * scale,
-                    row_bytes: scale,
-                },
+                Plane::single(0, first as u64, rows * width, width),
+                Plane::single(0, second as u64, rows * scale, scale),
             ];
             let ids: Vec<i64> = (0..1025)
                 .map(|i| {
@@ -319,12 +309,7 @@ mod tests {
         let rows = 2048;
         let width = 4109;
         let offset = 4093;
-        let planes = std::array::from_fn(|file| Plane {
-            file,
-            offset: offset as u64,
-            nbytes: rows * width,
-            row_bytes: width,
-        });
+        let planes = std::array::from_fn(|file| Plane::single(file, offset as u64, rows * width, width));
         let paths: Vec<_> = (0..2)
             .map(|file| {
                 std::env::temp_dir().join(format!(

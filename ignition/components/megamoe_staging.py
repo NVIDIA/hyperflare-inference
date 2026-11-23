@@ -230,10 +230,54 @@ def _join_dynamic_fake(consumer, sources, destinations, live_slot_map, staged_ma
     pass
 
 
+from pathlib import Path
+
+
+@torch.library.custom_op("flare::start_expert_stage_worker", mutates_args=("destinations", "staged_mask", "req_seq", "queue_header"))
+def _start_worker(anchor: torch.Tensor, destinations: list[torch.Tensor],
+                  staged_mask: torch.Tensor, req_seq: torch.Tensor,
+                  queue_header: torch.Tensor, layer_idx: int, num_host_experts: int,
+                  min_cold: int, kernel_cache: str) -> None:
+    from ignition.components.sm103_mover_kernel import prepare as prepare_mover
+
+    prepare_mover(Path(kernel_cache)).launch_stage_request(
+        queue_header,
+        layer_idx,
+        destinations[0],
+        destinations[1],
+        destinations[2],
+        destinations[3],
+        staged_mask,
+        req_seq,
+        num_host_experts,
+        min_cold,
+    )
+
+
+@_start_worker.register_fake
+def _start_worker_fake(anchor, destinations, staged_mask, req_seq, queue_header,
+                       layer_idx, num_host_experts, min_cold, kernel_cache):
+    pass
+
+
+@torch.library.custom_op("flare::join_expert_stage_worker", mutates_args=("destinations", "staged_mask", "req_seq"))
+def _join_worker(consumer: torch.Tensor, destinations: list[torch.Tensor],
+                 staged_mask: torch.Tensor, req_seq: torch.Tensor,
+                 queue_header: torch.Tensor) -> None:
+    pass
+
+
+@_join_worker.register_fake
+def _join_worker_fake(consumer, destinations, staged_mask, req_seq, queue_header):
+    pass
+
+
 @dataclass(frozen=True)
 class PendingExpertStage:
     planes: list[torch.Tensor]
     staged_mask: torch.Tensor | None = None
+    req_seq: torch.Tensor | None = None
+    worker_queue_header: torch.Tensor | None = None
 
 
 class PreparedExpertStage:
@@ -248,7 +292,8 @@ class PreparedExpertStage:
     capture stream for serial diagnosis. Stage scratch is forward-local.
     """
 
-    def __init__(self, tier, stream, mapping, host_experts, *, session, workspace, name, min_cold=8):
+    def __init__(self, tier, stream, mapping, host_experts, *, session, workspace, name, min_cold=8,
+                 worker_mover=None, layer_idx=None):
         host_experts = tuple(host_experts)
         if (mapping.dtype != torch.int32 or mapping.ndim != 1 or not mapping.is_contiguous()
                 or mapping.device != tier.control.device
@@ -259,6 +304,11 @@ class PreparedExpertStage:
             raise ValueError("expert staging requires canonical host IDs and a contiguous int32 residency map")
         self.tier, self.stream, self.mapping = tier, stream, mapping
         self.dynamic = bool(getattr(tier, "indirection", False))
+        self.worker_mover = worker_mover if self.dynamic else None
+        self.worker_layer_idx = layer_idx
+        self.worker_kernel_cache = str(worker_mover.kernel_cache) if self.worker_mover is not None else ""
+        if self.worker_mover is not None and (type(layer_idx) is not int or layer_idx < 0):
+            raise ValueError("worker-offloaded expert staging requires a nonnegative mover layer_idx")
         self.stream_handle = 0 if stream is None else stream.cuda_stream
         self.layouts = tuple((tuple(t.shape), t.stride(), t.dtype) for t in tier.device_views)
         self.sources = [t.as_strided((t.numel(),), (1,)).view(torch.uint8) for t in tier.device_views]
@@ -268,6 +318,9 @@ class PreparedExpertStage:
         self.query = q = StageQuery(
             tier.rows, tuple(t.numel() // (4 * tier.rows) for t in self.sources), min_cold, dynamic=self.dynamic
         )
+        if self.worker_mover is not None:
+            self.plan = None
+            return
         self.plan = native_plan(contract=CONTRACT, query=q, device=mapping.device,
             scratch_bytes=lambda tactic: sum((source.numel() + 255) // 256 * 256 for source in self.sources),
             compile_jobs=lambda tactic, device: (CompileJob.create(
@@ -311,6 +364,13 @@ class PreparedExpertStage:
 
     def start(self, anchor):
         planes = [torch.empty_like(source) for source in self.sources]
+        if self.worker_mover is not None:
+            staged_mask = torch.empty((self.tier.rows,), dtype=torch.int32, device=anchor.device)
+            req_seq = torch.empty((1,), dtype=torch.int32, device=anchor.device)
+            _start_worker(anchor, planes, staged_mask, req_seq, self.worker_mover.queue_header,
+                          self.worker_layer_idx, self.tier.rows, self.query.min_cold,
+                          self.worker_kernel_cache)
+            return PendingExpertStage(planes, staged_mask, req_seq, self.worker_mover.queue_header)
         if self.dynamic:
             staged_mask = torch.empty((self.tier.rows,), dtype=torch.int32, device=anchor.device)
             _start_dynamic(anchor, self.sources, planes, self.mapping, staged_mask, self.decision,
@@ -321,7 +381,9 @@ class PreparedExpertStage:
         return PendingExpertStage(planes)
 
     def finish(self, pending, consumer):
-        if self.dynamic:
+        if self.worker_mover is not None:
+            _join_worker(consumer, pending.planes, pending.staged_mask, pending.req_seq, pending.worker_queue_header)
+        elif self.dynamic:
             _join_dynamic(consumer, self.sources, pending.planes, self.mapping, pending.staged_mask,
                           self.decision, self.stream_handle)
         else:

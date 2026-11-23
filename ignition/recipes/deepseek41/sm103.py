@@ -42,7 +42,7 @@ class DynamicExpertMoverConfig:
     interval_steps: int = 8
     cooldown_steps: int = 16
     max_enqueues: int = 1
-    max_predict_rows: int = 256
+    max_predict_rows: int = 128
 
     def __post_init__(self):
         if any(type(v) is not int for v in vars(self).values()):

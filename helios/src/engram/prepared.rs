@@ -108,15 +108,13 @@ impl PreparedTables {
                         "embedding weight and scale planes have different row counts".into(),
                     );
                 }
-                planes.push(Plane {
-                    file: 0,
-                    offset: 0,
-                    nbytes,
-                    row_bytes: plane.row_bytes,
-                });
+                planes.push(Plane::single(0, 0, nbytes, plane.row_bytes));
             }
+            let [p0, p1] = planes
+                .try_into()
+                .map_err(|_| "embedding table requires two planes")?;
             tables.push(Table {
-                planes: [planes[0], planes[1]],
+                planes: [p0, p1],
                 heads: source.heads,
                 weights: source.weights.clone(),
                 scales: source.scales.clone(),
@@ -135,7 +133,7 @@ impl PreparedTables {
         let mut data = Vec::new();
         for (source, table) in sources.iter().zip(&index.tables) {
             let mut planes = Vec::new();
-            for (source, plane) in source.planes.iter().zip(table.planes) {
+            for (source, plane) in source.planes.iter().zip(&table.planes) {
                 let segments = source
                     .segments
                     .iter()
@@ -166,7 +164,7 @@ impl PreparedTables {
         let mut data = Vec::new();
         for (table, handles) in index.tables.iter().zip(descriptors.chunks_exact(2)) {
             let mut planes = Vec::new();
-            for (plane, descriptor) in table.planes.into_iter().zip(handles) {
+            for (plane, descriptor) in table.planes.iter().zip(handles) {
                 let owned = unsafe { libc::fcntl(*descriptor, libc::F_DUPFD_CLOEXEC, 0) };
                 if owned < 0 {
                     return Err(format!(

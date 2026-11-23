@@ -160,6 +160,7 @@ class ReferenceExpertPreparation:
                         storage=storage,
                         name=name,
                         host_experts=len(host_experts),
+                        host_lane_clusters=host_lane_clusters,
                     )
                     load_mxfp4_weights_into(
                         loader,

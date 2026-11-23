@@ -31,7 +31,7 @@ class PredictorConfig:
     interval_steps: int = 8
     cooldown_steps: int = 16
     max_enqueues: int = 1
-    max_predict_rows: int = 256
+    max_predict_rows: int = 128
 
     def __post_init__(self):
         if any(type(v) is not int for v in vars(self).values()):
@@ -166,6 +166,7 @@ class SM103ExpertMoverRuntime:
         self.worker_sm_count = worker_sm_count
         self.queue_capacity = queue_capacity
         self.control_buffer_name = control_buffer_name
+        self.kernel_cache = Path(kernel_cache)
         self.binding = prepare_mover(kernel_cache)
         with torch.cuda.device(self.device):
             self.binding.configure_persistent_mover()
@@ -174,7 +175,7 @@ class SM103ExpertMoverRuntime:
         hdr_bytes = self.binding.queue_header_bytes()
         req_bytes = self.binding.queue_request_bytes()
         pred_bytes = self.binding.predictor_state_bytes()
-        if desc_bytes != 192 or hdr_bytes != 128 or req_bytes != 16 or pred_bytes != 128:
+        if desc_bytes != 192 or hdr_bytes != 106944 or req_bytes != 16 or pred_bytes != 128:
             raise RuntimeError(
                 f"unexpected mover struct sizes: desc={desc_bytes}, hdr={hdr_bytes}, req={req_bytes}, pred={pred_bytes}"
             )
@@ -271,6 +272,12 @@ class SM103ExpertMoverRuntime:
             assert len(raw) == 76, len(raw)
             state = persistent_copy(
                 torch.tensor(list(raw) + [0] * (pred_bytes - len(raw)), dtype=torch.uint8, device=self.device)
+            )
+            # Bind predictor_state pointer inside LayerMoverDesc[layer_idx] at byte offset 136
+            # so the 8-SM persistent worker can run predictor scoring off the compute stream.
+            desc_off = layer_idx * 192 + 136
+            self.layer_descs[desc_off:desc_off + 8].copy_(
+                torch.tensor(list(struct.pack("<Q", int(state.data_ptr()))), dtype=torch.uint8, device=self.device)
             )
             # Omit state: it stores 64-bit pointers to scores, last_seen, born, and cooldown.
             for tensor in (scores, last_seen, born, cooldown):

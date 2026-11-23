@@ -553,12 +553,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         scheduler.use_local_counts(fd_counts, fd_ready);
     if (r1_flag)  // dsv41 R1: the scheduler's early-shared-weights wait spins on the router's flag too
         scheduler.use_r1(&w6c11->ready, &w6c11->r1_fallbacks);
-    // Derpseek host lane: control word 10 = lane clusters (the last ones; 0 = off), words 12-13 = host claim counters
-    if (drp_host and not drp_indir) {
-        const uint32_t drp_lane = cute::min(static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 10)), kNumSMs / 2 - 1);
-        if (drp_lane != 0)
-            scheduler.use_host_lane(drp_num_host, reinterpret_cast<uint32_t*>(cumulative_local_expert_recv_stats + 12),
-                                    blockIdx.x / 2 >= kNumSMs / 2 - drp_lane, drp_lane);
+    // Derpseek host lane: control word 10 = lane clusters (the last ones; 0 = off).
+    // Static mode puts host claim counters in words 12-13; drp_indir puts layer_epoch in 12-13,
+    // active_slot_map in 16..16+kNumExperts-1, and host claim counters in 16+kNumExperts..16+kNumExperts+1.
+    const uint32_t drp_lane = drp_host
+        ? cute::min(static_cast<uint32_t>(__ldg(cumulative_local_expert_recv_stats + 10)), kNumSMs / 2 - 1)
+        : 0u;
+    if (drp_host and drp_lane != 0) {
+        uint32_t* const drp_lane_cnt = drp_indir
+            ? reinterpret_cast<uint32_t*>(cumulative_local_expert_recv_stats + 16 + kNumExperts)
+            : reinterpret_cast<uint32_t*>(cumulative_local_expert_recv_stats + 12);
+        scheduler.use_host_lane(drp_num_host, drp_lane_cnt,
+                                blockIdx.x / 2 >= kNumSMs / 2 - drp_lane, drp_lane,
+                                drp_indir ? cumulative_local_expert_recv_stats + 16 : nullptr);
     }
 
     // MMA pipeline and TMA phases
@@ -966,9 +973,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_l2_task_count_ptr() = 0;
                 *workspace.get_shared_l1_task_count_ptr() = 0;
                 *workspace.get_shared_l2_task_count_ptr() = 0;
-                if (drp_host and not drp_indir) {   // Derpseek host lane claim counters
-                    cumulative_local_expert_recv_stats[12] = 0;
-                    cumulative_local_expert_recv_stats[13] = 0;
+                if (drp_host and drp_lane != 0) {   // Derpseek host lane claim counters
+                    if (drp_indir) {
+                        cumulative_local_expert_recv_stats[16 + kNumExperts] = 0;
+                        cumulative_local_expert_recv_stats[16 + kNumExperts + 1] = 0;
+                    } else {
+                        cumulative_local_expert_recv_stats[12] = 0;
+                        cumulative_local_expert_recv_stats[13] = 0;
+                    }
                 }
             }
             __syncwarp();

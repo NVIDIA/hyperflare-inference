@@ -48,6 +48,7 @@ for _container, _fields in (
     ('b12x.gemm.blockscaled._iq2_xs.BlockQuantLinearWeight', ('values', 'metadata')),
     ('ignition.components.megamoe_tiers.MegaMoeLayerWeights', ('routed', 'shared', 'host_tier')),
     ('ignition.components.megamoe_tiers.MegaMoeHostTier', ('weights',)),
+    ('ignition.components.megamoe_tiers.MegaMoeDynamicHostTier', ('weights',)),
 ):
     declare_container_fields(_container, _fields)
 

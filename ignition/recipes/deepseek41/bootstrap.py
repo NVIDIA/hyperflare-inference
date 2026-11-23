@@ -596,20 +596,30 @@ def _assemble_reference_prepared_model(model, *, config, metadata_path, snapshot
             stage_limit = (model.model.yoco_boundary_layer_idx
                            if model.yoco_keep_tokens is not None and model.yoco_keep_tokens < staging.min_rows
                            else len(model.model.layers))
+            mover_layer_indices = (
+                {tier: idx for idx, (tier, _) in enumerate(experts.mover.layers)}
+                if experts.mover is not None else {}
+            )
             for index in range(stage_limit):
                 expert = experts.weights[f"layers.{index}.ffn"]
                 host_experts = placements[f"layers.{index}.ffn"].host
                 if expert.host_tier is not None and expert.host_tier.rows >= staging.min_cold_experts:
+                    worker_mover = None
+                    mover_layer_idx = None
                     if getattr(expert.host_tier, "indirection", False):
                         stage_map = expert.host_tier.live_slot_map
                         stage_ids = range(expert.host_tier.rows)
+                        if expert.host_tier in mover_layer_indices:
+                            worker_mover = experts.mover
+                            mover_layer_idx = mover_layer_indices[expert.host_tier]
                     else:
                         stage_map = expert.expert_map
                         stage_ids = host_experts
                     expert_stagers[index] = PreparedExpertStage(
                         expert.host_tier, streams[len(expert_stagers) % 2],
                         stage_map, stage_ids, session=session, workspace=arena,
-                        name=f"prefill-stage-{index}", min_cold=staging.min_cold_experts)
+                        name=f"prefill-stage-{index}", min_cold=staging.min_cold_experts,
+                        worker_mover=worker_mover, layer_idx=mover_layer_idx)
             if not expert_stagers:
                 raise ValueError("prefill staging requires eligible target host experts")
         model.bind_prefill_staging(expert_stagers, min_rows=1024 if staging is None else staging.min_rows)

@@ -1321,12 +1321,27 @@ fn cached_engram(
     }
     Ok(engram.clone())
 }
+/// Maximum Engram weight plane bytes per companion shard file.
+/// Keeps every published Engram data shard comfortably below the 64 GB Hugging Face limit.
+const MAX_ENGRAM_SHARD_BYTES: u64 = 50 << 30;
+
 fn core_engram(
     engram: &wire::Engram,
     payload: &[FilePart],
     staging: &Path,
     deployment: &str,
     installed: &mut Vec<helios_core::core::export::PublishPayload>,
+) -> Result<helios_core::core::schema::wire::Engram> {
+    core_engram_with_limit(engram, payload, staging, deployment, installed, MAX_ENGRAM_SHARD_BYTES)
+}
+
+fn core_engram_with_limit(
+    engram: &wire::Engram,
+    payload: &[FilePart],
+    staging: &Path,
+    deployment: &str,
+    installed: &mut Vec<helios_core::core::export::PublishPayload>,
+    max_shard_bytes: u64,
 ) -> Result<helios_core::core::schema::wire::Engram> {
     use helios_core::core::schema::wire as pwire;
     let use_of = |id: &helios_core::core::PayloadId, nbytes: u64| pwire::PayloadUse {
@@ -1340,38 +1355,106 @@ fn core_engram(
     let mut tables = Vec::new();
     for (index, table) in engram.tables.iter().enumerate() {
         let (weights, scales, shards) = if table.shards.is_empty() {
-            let weights = payload_source(
-                payload,
-                table
-                    .weights
-                    .as_ref()
-                    .ok_or_else(|| invalid("engram table lacks weights"))?,
-                staging,
-                &format!("engram-{index}-w.payload"),
-            )?;
-            let scales = payload_source(
-                payload,
-                table
-                    .scales
-                    .as_ref()
-                    .ok_or_else(|| invalid("engram table lacks scales"))?,
-                staging,
-                &format!("engram-{index}-s.payload"),
-            )?;
-            for (plane, materialized) in [("weights", &weights), ("scales", &scales)] {
-                installed.push(helios_core::core::export::PublishPayload {
-                    role: pwire::PayloadRole::Weights,
-                    relative: format!("weights/engram-{index}-{plane}.safetensors"),
-                    source: materialized.2.clone(),
-                    id: materialized.0,
-                    tensor: None,
-                });
+            let weights_span = table
+                .weights
+                .as_ref()
+                .ok_or_else(|| invalid("engram table lacks weights"))?;
+            let scales_span = table
+                .scales
+                .as_ref()
+                .ok_or_else(|| invalid("engram table lacks scales"))?;
+            if weights_span.nbytes > max_shard_bytes && table.rows > 1 {
+                if weights_span.nbytes % table.rows != 0 || scales_span.nbytes % table.rows != 0 {
+                    return Err(invalid("engram plane bytes are not divisible by row count"));
+                }
+                let row_bytes = weights_span.nbytes / table.rows;
+                let scale_row_bytes = scales_span.nbytes / table.rows;
+                let max_rows_per_shard = (max_shard_bytes / row_bytes).max(1);
+                let shard_count = table.rows.div_ceil(max_rows_per_shard);
+                let rows_per_shard = table.rows.div_ceil(shard_count);
+                let mut shards = Vec::with_capacity(shard_count as usize);
+                let mut first_row = 0u64;
+                let mut position = 0usize;
+                while first_row < table.rows {
+                    let shard_rows = rows_per_shard.min(table.rows - first_row);
+                    let w_span = wire::Span {
+                        offset: weights_span
+                            .offset
+                            .checked_add(first_row * row_bytes)
+                            .ok_or_else(|| invalid("engram weight shard offset overflow"))?,
+                        nbytes: shard_rows * row_bytes,
+                        ..Default::default()
+                    };
+                    let s_span = wire::Span {
+                        offset: scales_span
+                            .offset
+                            .checked_add(first_row * scale_row_bytes)
+                            .ok_or_else(|| invalid("engram scale shard offset overflow"))?,
+                        nbytes: shard_rows * scale_row_bytes,
+                        ..Default::default()
+                    };
+                    let weights = payload_source(
+                        payload,
+                        &w_span,
+                        staging,
+                        &format!("engram-{index}-shard-{position}-w.payload"),
+                    )?;
+                    let scales = payload_source(
+                        payload,
+                        &s_span,
+                        staging,
+                        &format!("engram-{index}-shard-{position}-s.payload"),
+                    )?;
+                    for (plane, materialized) in [("weights", &weights), ("scales", &scales)] {
+                        installed.push(helios_core::core::export::PublishPayload {
+                            role: pwire::PayloadRole::Weights,
+                            relative: format!(
+                                "deployments/{deployment}/engram-{index}-shard-{position}-{plane}.safetensors"
+                            ),
+                            source: materialized.2.clone(),
+                            id: materialized.0,
+                            tensor: None,
+                        });
+                    }
+                    shards.push(pwire::EngramTableShard {
+                        rank: 0,
+                        first_row,
+                        rows: shard_rows,
+                        weights: Some(use_of(&weights.0, weights.1)),
+                        scales: Some(use_of(&scales.0, scales.1)),
+                    });
+                    first_row += shard_rows;
+                    position += 1;
+                }
+                (None, None, shards)
+            } else {
+                let weights = payload_source(
+                    payload,
+                    weights_span,
+                    staging,
+                    &format!("engram-{index}-w.payload"),
+                )?;
+                let scales = payload_source(
+                    payload,
+                    scales_span,
+                    staging,
+                    &format!("engram-{index}-s.payload"),
+                )?;
+                for (plane, materialized) in [("weights", &weights), ("scales", &scales)] {
+                    installed.push(helios_core::core::export::PublishPayload {
+                        role: pwire::PayloadRole::Weights,
+                        relative: format!("weights/engram-{index}-{plane}.safetensors"),
+                        source: materialized.2.clone(),
+                        id: materialized.0,
+                        tensor: None,
+                    });
+                }
+                (
+                    Some(use_of(&weights.0, weights.1)),
+                    Some(use_of(&scales.0, scales.1)),
+                    Vec::new(),
+                )
             }
-            (
-                Some(use_of(&weights.0, weights.1)),
-                Some(use_of(&scales.0, scales.1)),
-                Vec::new(),
-            )
         } else {
             if table.weights.is_some() || table.scales.is_some() {
                 return Err(invalid(
@@ -4064,6 +4147,91 @@ mod payload_export_tests {
             read_use(partitioned.shards[1].scales.as_ref().unwrap()),
             shard1_scales
         );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn core_engram_auto_shards_oversized_single_rank_table() {
+        let base = std::env::temp_dir().join(format!(
+            "flare-engram-autoshard-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let rows = 5usize;
+        let w_row = 16usize;
+        let s_row = 4usize;
+        let weights: Vec<u8> = (0..rows * w_row).map(|i| (i as u8).wrapping_mul(7)).collect();
+        let scales: Vec<u8> = (0..rows * s_row).map(|i| (i as u8).wrapping_mul(11)).collect();
+        let w_path = base.join("w.bin");
+        let s_path = base.join("s.bin");
+        fs::write(&w_path, &weights).unwrap();
+        fs::write(&s_path, &scales).unwrap();
+        let parts = [
+            FilePart {
+                offset: 0,
+                source: FileSource {
+                    path: w_path,
+                    offset: 0,
+                    nbytes: weights.len() as u64,
+                },
+            },
+            FilePart {
+                offset: weights.len() as u64,
+                source: FileSource {
+                    path: s_path,
+                    offset: 0,
+                    nbytes: scales.len() as u64,
+                },
+            },
+        ];
+        let engram = wire::Engram {
+            token_map: vec![0, 1],
+            pad_token_id: 0,
+            compressed_vocabulary: 2,
+            tables: vec![wire::EngramTable {
+                layer: 1,
+                rows: rows as u64,
+                embedding_width: w_row as u32,
+                scale_block: 4,
+                weights: Some(wire::Span { offset: 0, nbytes: weights.len() as u64, ..Default::default() }),
+                scales: Some(wire::Span { offset: weights.len() as u64, nbytes: scales.len() as u64, ..Default::default() }),
+                hash: None,
+                weight_buffer: "w".into(),
+                scale_buffer: "s".into(),
+                hash_buffer: "h".into(),
+                ready_event: "e".into(),
+                request_buffer: "r".into(),
+                encoding: 1,
+                global_scale: 1.0,
+                shards: vec![],
+            }],
+        };
+        let mut installed = Vec::new();
+        // Limit to 48 bytes -> 5 * 16 = 80 bytes splits into 2 balanced shards (3 rows + 2 rows).
+        let out = core_engram_with_limit(&engram, &parts, &base, "gb300-tp1", &mut installed, 48).unwrap();
+        let table = &out.tables[0];
+        assert!(table.weights.is_none() && table.scales.is_none());
+        assert_eq!(table.shards.len(), 2);
+        assert_eq!(
+            table.shards.iter().map(|s| (s.rank, s.first_row, s.rows)).collect::<Vec<_>>(),
+            vec![(0, 0, 3), (0, 3, 2)]
+        );
+        assert_eq!(installed.len(), 4);
+        let mut reassembled_w = Vec::new();
+        let mut reassembled_s = Vec::new();
+        for pos in 0..2 {
+            let w_pub = installed.iter().find(|p| p.relative == format!("deployments/gb300-tp1/engram-0-shard-{pos}-weights.safetensors")).unwrap();
+            let s_pub = installed.iter().find(|p| p.relative == format!("deployments/gb300-tp1/engram-0-shard-{pos}-scales.safetensors")).unwrap();
+            let mut wb = vec![0u8; w_pub.source.len() as usize];
+            w_pub.source.read_at(0, &mut wb).unwrap();
+            reassembled_w.extend_from_slice(&wb);
+            let mut sb = vec![0u8; s_pub.source.len() as usize];
+            s_pub.source.read_at(0, &mut sb).unwrap();
+            reassembled_s.extend_from_slice(&sb);
+        }
+        assert_eq!(reassembled_w, weights);
+        assert_eq!(reassembled_s, scales);
         let _ = fs::remove_dir_all(&base);
     }
 

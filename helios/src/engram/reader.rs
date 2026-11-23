@@ -32,20 +32,87 @@ const LOAD_CHUNK: usize = 4 << 20;
 const LOAD_READERS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlaneSegment {
+    pub file: usize,
+    pub offset: u64,
+    pub nbytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Plane {
     pub file: usize,
     pub offset: u64,
     pub nbytes: usize,
     pub row_bytes: usize,
+    pub segments: Vec<PlaneSegment>,
 }
 
 impl Plane {
-    pub(crate) fn resident_bytes(self) -> Result<usize> {
-        ((self.offset % BLOCK as u64) as usize)
-            .checked_add(self.nbytes)
+    pub(crate) fn single(file: usize, offset: u64, nbytes: usize, row_bytes: usize) -> Self {
+        Self {
+            file,
+            offset,
+            nbytes,
+            row_bytes,
+            segments: Vec::new(),
+        }
+    }
+
+    pub(crate) fn multi(segments: Vec<PlaneSegment>, row_bytes: usize) -> Result<Self> {
+        if segments.is_empty() || row_bytes == 0 {
+            return Err("multi-segment embedding plane requires nonempty segments".into());
+        }
+        let mut total = 0usize;
+        for segment in &segments {
+            if segment.nbytes == 0 || segment.nbytes % row_bytes != 0 {
+                return Err("multi-segment embedding shard is not row-aligned".into());
+            }
+            total = total
+                .checked_add(segment.nbytes)
+                .ok_or("multi-segment embedding plane exceeds host range")?;
+        }
+        let first = segments[0];
+        Ok(Self {
+            file: first.file,
+            offset: 0,
+            nbytes: total,
+            row_bytes,
+            segments,
+        })
+    }
+
+    pub(crate) fn resident_bytes(&self) -> Result<usize> {
+        let skip = if self.segments.is_empty() {
+            (self.offset % BLOCK as u64) as usize
+        } else {
+            0
+        };
+        skip.checked_add(self.nbytes)
             .and_then(|n| n.checked_add(BLOCK - 1))
             .map(|n| (n / BLOCK * BLOCK).max(BLOCK))
             .ok_or_else(|| "resident embedding allocation exceeds host range".into())
+    }
+
+    fn all_files_within(&self, count: usize) -> bool {
+        if self.segments.is_empty() {
+            self.file < count
+        } else {
+            self.segments.iter().all(|seg| seg.file < count)
+        }
+    }
+
+    fn locate_row(&self, id: usize) -> (usize, u64) {
+        let mut byte_pos = id * self.row_bytes;
+        if self.segments.is_empty() {
+            return (self.file, self.offset + byte_pos as u64);
+        }
+        for seg in &self.segments {
+            if byte_pos < seg.nbytes {
+                return (seg.file, seg.offset + byte_pos as u64);
+            }
+            byte_pos -= seg.nbytes;
+        }
+        unreachable!("validated row index exceeds plane segments")
     }
 }
 
@@ -165,7 +232,92 @@ fn seal_resident(file: &File) -> Result<()> {
 }
 
 impl Resident {
-    pub(super) fn load(file: &File, plane: Plane) -> Result<Self> {
+    pub(super) fn load_plane(files: &[Arc<File>], plane: &Plane) -> Result<Self> {
+        if plane.segments.is_empty() {
+            return Self::load(&files[plane.file], plane);
+        }
+        if plane.offset != 0 {
+            return Err("multi-segment embedding planes must start at offset zero".into());
+        }
+        Self::initialize(plane, |address, _, _| {
+            let mut destination = 0usize;
+            for seg in &plane.segments {
+                let file = &files[seg.file];
+                let seg_nbytes = seg.nbytes;
+                let seg_offset = seg.offset;
+                let end = destination
+                    .checked_add(seg_nbytes)
+                    .filter(|end| *end <= plane.nbytes)
+                    .ok_or("embedding plane segments exceed declared size")?;
+                let seg_base = address + destination;
+                std::thread::scope(|scope| -> Result<()> {
+                    let mut workers = Vec::new();
+                    for reader in 0..LOAD_READERS.min(seg_nbytes.div_ceil(LOAD_CHUNK)) {
+                        workers.push(
+                            std::thread::Builder::new()
+                                .name(format!("flare-table-loader-{reader}"))
+                                .spawn_scoped(scope, move || -> Result<()> {
+                                    let bounce = Aligned::new(LOAD_CHUNK + 2 * BLOCK)?;
+                                    for begin in (reader * LOAD_CHUNK..seg_nbytes)
+                                        .step_by(LOAD_READERS * LOAD_CHUNK)
+                                    {
+                                        let nbytes = LOAD_CHUNK.min(seg_nbytes - begin);
+                                        let source = seg_offset
+                                            .checked_add(begin as u64)
+                                            .ok_or("resident Engram segment offset exceeds range")?;
+                                        let skip = (source % BLOCK as u64) as usize;
+                                        let aligned_source = source - skip as u64;
+                                        let required = skip + nbytes;
+                                        let aligned_len = required.div_ceil(BLOCK) * BLOCK;
+                                        // SAFETY: `bounce` is BLOCK-aligned with length >= aligned_len,
+                                        // satisfying O_DIRECT alignment even for unaligned segment offsets.
+                                        let count = unsafe {
+                                            crate::os::read_at_raw(
+                                                file,
+                                                bounce.0 as *mut u8,
+                                                aligned_len,
+                                                aligned_source,
+                                            )
+                                        }
+                                        .map_err(|e| format!("resident Engram read at {aligned_source}: {e}"))?;
+                                        if count < required {
+                                            return Err(format!(
+                                                "resident Engram read at {aligned_source} returned {count}, requires {required} bytes"
+                                            )
+                                            .into());
+                                        }
+                                        // SAFETY: Each worker writes a disjoint slice of the mutable
+                                        // resident allocation before it is sealed read-only.
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                (bounce.0 + skip) as *const u8,
+                                                (seg_base + begin) as *mut u8,
+                                                nbytes,
+                                            );
+                                        }
+                                    }
+                                    Ok(())
+                                })
+                                .map_err(|e| format!("start resident Engram loader: {e}"))?,
+                        );
+                    }
+                    for worker in workers {
+                        worker
+                            .join()
+                            .map_err(|_| "resident Engram loader panicked")??;
+                    }
+                    Ok(())
+                })?;
+                destination = end;
+            }
+            if destination != plane.nbytes {
+                return Err("embedding plane segments do not fill their plane".into());
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn load(file: &File, plane: &Plane) -> Result<Self> {
         Self::initialize(plane, |address, extent, required| {
             let skip = (plane.offset % BLOCK as u64) as usize;
             let offset = plane.offset - skip as u64;
@@ -209,7 +361,7 @@ impl Resident {
     }
 
     #[cfg(unix)]
-    pub(super) fn load_segments(plane: Plane, segments: &[(File, u64, usize)]) -> Result<Self> {
+    pub(super) fn load_segments(plane: &Plane, segments: &[(File, u64, usize)]) -> Result<Self> {
         if plane.offset != 0 {
             return Err("assembled embedding planes must start at offset zero".into());
         }
@@ -251,10 +403,14 @@ impl Resident {
     }
 
     fn initialize(
-        plane: Plane,
+        plane: &Plane,
         fill: impl FnOnce(usize, usize, usize) -> Result<()>,
     ) -> Result<Self> {
-        let skip = (plane.offset % BLOCK as u64) as usize;
+        let skip = if plane.segments.is_empty() {
+            (plane.offset % BLOCK as u64) as usize
+        } else {
+            0
+        };
         let required = skip
             .checked_add(plane.nbytes)
             .ok_or("resident Engram plane exceeds host range")?;
@@ -307,12 +463,16 @@ impl Resident {
     }
 
     #[cfg(unix)]
-    pub(super) fn from_shared(file: File, plane: Plane) -> Result<Self> {
+    pub(super) fn from_shared(file: File, plane: &Plane) -> Result<Self> {
         let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
         if seals < 0 || seals & RESIDENT_SEALS != RESIDENT_SEALS {
             return Err("resident embedding table must have immutable size and contents".into());
         }
-        let skip = (plane.offset % BLOCK as u64) as usize;
+        let skip = if plane.segments.is_empty() {
+            (plane.offset % BLOCK as u64) as usize
+        } else {
+            0
+        };
         let extent = plane.resident_bytes()?;
         if file
             .metadata()
@@ -454,13 +614,13 @@ impl DiskReader {
                     output[destination..destination + plane.row_bytes].fill(0);
                     continue;
                 }
-                let source = plane.offset + id as u64 * plane.row_bytes as u64;
+                let (seg_file, source) = plane.locate_row(id as usize);
                 let mut copied = 0;
                 while copied < plane.row_bytes {
                     let address = source + copied as u64;
                     let nbytes = (plane.row_bytes - copied).min(BLOCK - address as usize % BLOCK);
                     self.fragments.push(Fragment {
-                        file: plane.file,
+                        file: seg_file,
                         source: address,
                         destination: destination + copied,
                         nbytes,
@@ -644,7 +804,7 @@ impl CachedReader {
         if ids.len() > self.max_rows {
             return Err("embedding gather exceeds the row cache workspace capacity".into());
         }
-        let [weights, scales] = planes.map(|plane| plane.row_bytes);
+        let [weights, scales] = [planes[0].row_bytes, planes[1].row_bytes];
         let scale_base = ids.len() * weights;
         self.requests.clear();
         self.miss_ids.clear();
@@ -721,9 +881,49 @@ enum Data {
     Cached(Box<CachedReader>),
 }
 
-fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
-    let data = data.bytes();
+const PARALLEL_GATHER_MIN_ROWS: usize = 2048;
+const PARALLEL_GATHER_MAX_WORKERS: usize = 16;
+
+fn gather_resident_slice(data: &[u8], row_bytes: usize, ids: &[i64], output: &mut [u8]) {
+    const PREFETCH_DISTANCE: usize = 16;
     for (row, &id) in ids.iter().enumerate() {
+        #[cfg(target_arch = "aarch64")]
+        if let Some(&ahead) = ids.get(row + PREFETCH_DISTANCE) {
+            if ahead >= 0 {
+                let ptr = unsafe { data.as_ptr().add(ahead as usize * row_bytes) };
+                unsafe {
+                    core::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags, readonly));
+                    if row_bytes > 64 {
+                        core::arch::asm!("prfm pldl1keep, [{ptr}, #64]", ptr = in(reg) ptr, options(nostack, preserves_flags, readonly));
+                    }
+                    if row_bytes > 128 {
+                        core::arch::asm!("prfm pldl1keep, [{ptr}, #128]", ptr = in(reg) ptr, options(nostack, preserves_flags, readonly));
+                    }
+                    if row_bytes > 192 {
+                        core::arch::asm!("prfm pldl1keep, [{ptr}, #192]", ptr = in(reg) ptr, options(nostack, preserves_flags, readonly));
+                    }
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Some(&ahead) = ids.get(row + PREFETCH_DISTANCE) {
+            if ahead >= 0 {
+                let ptr = unsafe { data.as_ptr().add(ahead as usize * row_bytes) };
+                unsafe {
+                    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                    _mm_prefetch(ptr.cast::<i8>(), _MM_HINT_T0);
+                    if row_bytes > 64 {
+                        _mm_prefetch(ptr.add(64).cast::<i8>(), _MM_HINT_T0);
+                    }
+                    if row_bytes > 128 {
+                        _mm_prefetch(ptr.add(128).cast::<i8>(), _MM_HINT_T0);
+                    }
+                    if row_bytes > 192 {
+                        _mm_prefetch(ptr.add(192).cast::<i8>(), _MM_HINT_T0);
+                    }
+                }
+            }
+        }
         let target = &mut output[row * row_bytes..(row + 1) * row_bytes];
         if id < 0 {
             target.fill(0);
@@ -732,6 +932,34 @@ fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut 
             target.copy_from_slice(&data[start..start + row_bytes]);
         }
     }
+}
+
+fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
+    let bytes = data.bytes();
+    if row_bytes == 0 || ids.len() < PARALLEL_GATHER_MIN_ROWS {
+        gather_resident_slice(bytes, row_bytes, ids, output);
+        return;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, PARALLEL_GATHER_MAX_WORKERS)
+        .min(ids.len() / (PARALLEL_GATHER_MIN_ROWS / 2));
+    if workers <= 1 {
+        gather_resident_slice(bytes, row_bytes, ids, output);
+        return;
+    }
+    let chunk_rows = ids.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (id_chunk, out_chunk) in ids
+            .chunks(chunk_rows)
+            .zip(output.chunks_mut(chunk_rows * row_bytes))
+        {
+            scope.spawn(move || {
+                gather_resident_slice(bytes, row_bytes, id_chunk, out_chunk);
+            });
+        }
+    });
 }
 pub(crate) struct Reader {
     data: Data,
@@ -771,18 +999,18 @@ impl Reader {
         if resident && cache_bytes != 0 {
             return Err("embedding row cache requires disk table storage".into());
         }
-        if planes.iter().any(|plane| plane.file >= files.len()) {
+        if planes.iter().any(|plane| !plane.all_files_within(files.len())) {
             return Err("embedding plane references an unknown file".into());
         }
         let data = if resident {
             Data::Ram([
-                Arc::new(Resident::load(&files[planes[0].file], planes[0])?),
-                Arc::new(Resident::load(&files[planes[1].file], planes[1])?),
+                Arc::new(Resident::load_plane(files, &planes[0])?),
+                Arc::new(Resident::load_plane(files, &planes[1])?),
             ])
         } else {
             let mut disk = DiskReader::from_files(files, stats.clone(), workers)?;
             if resident_scales {
-                disk.resident_scales = Some(Resident::load(&files[planes[1].file], planes[1])?);
+                disk.resident_scales = Some(Resident::load_plane(files, &planes[1])?);
                 stats.resident_scale_bytes.fetch_add(planes[1].resident_bytes()? as u64, Ordering::Relaxed);
             }
             if cache_bytes != 0 {
@@ -856,8 +1084,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let rows = 4097;
         let planes = [
-            Plane { file: 0, offset: 4093, nbytes: rows * weight_row_bytes, row_bytes: weight_row_bytes },
-            Plane { file: 1, offset: 4093, nbytes: rows * scale_row_bytes, row_bytes: scale_row_bytes },
+            Plane::single(0, 4093, rows * weight_row_bytes, weight_row_bytes),
+            Plane::single(1, 4093, rows * scale_row_bytes, scale_row_bytes),
         ];
         let row_bytes = weight_row_bytes + scale_row_bytes;
         let data: Vec<Vec<u8>> = planes.iter().map(|plane| {
@@ -1012,24 +1240,17 @@ mod tests {
             .collect();
         std::fs::write(&path, &bytes).unwrap();
         let planes = [
-            Plane {
-                file: 0,
-                offset: 0,
-                nbytes: second,
-                row_bytes: 256,
-            },
-            Plane {
-                file: 0,
-                offset: second as u64,
-                nbytes: rows * 8,
-                row_bytes: 8,
-            },
+            Plane::single(0, 0, second, 256),
+            Plane::single(0, second as u64, rows * 8, 8),
         ];
         let file = open_file(&path).unwrap();
-        let original = planes.map(|plane| Arc::new(Resident::load(&file, plane).unwrap()));
+        let original = [
+            Arc::new(Resident::load(&file, &planes[0]).unwrap()),
+            Arc::new(Resident::load(&file, &planes[1]).unwrap()),
+        ];
         let shared = std::array::from_fn(|i| {
             Arc::new(
-                Resident::from_shared(original[i].file.try_clone().unwrap(), planes[i]).unwrap(),
+                Resident::from_shared(original[i].file.try_clone().unwrap(), &planes[i]).unwrap(),
             )
         });
         std::fs::remove_file(path).unwrap();
@@ -1074,14 +1295,9 @@ mod tests {
             std::env::temp_dir().join(format!("helios-engram-shared-{}.bin", std::process::id()));
         let bytes: Vec<_> = (0..12345).map(|i| (i * 19 + i / 7) as u8).collect();
         std::fs::write(&path, &bytes).unwrap();
-        let plane = Plane {
-            file: 0,
-            offset: 97,
-            nbytes: 8192,
-            row_bytes: 128,
-        };
-        let original = Resident::load(&open_file(&path).unwrap(), plane).unwrap();
-        let peer = Resident::from_shared(original.file.try_clone().unwrap(), plane).unwrap();
+        let plane = Plane::single(0, 97, 8192, 128);
+        let original = Resident::load(&open_file(&path).unwrap(), &plane).unwrap();
+        let peer = Resident::from_shared(original.file.try_clone().unwrap(), &plane).unwrap();
         use std::os::unix::fs::MetadataExt;
         assert_eq!(
             original.file.metadata().unwrap().ino(),
@@ -1095,9 +1311,9 @@ mod tests {
         );
         let wrong = Plane {
             nbytes: plane.nbytes + BLOCK,
-            ..plane
+            ..plane.clone()
         };
-        assert!(Resident::from_shared(original.file.try_clone().unwrap(), wrong).is_err());
+        assert!(Resident::from_shared(original.file.try_clone().unwrap(), &wrong).is_err());
         std::fs::remove_file(path).unwrap();
         drop(original);
         assert_eq!(peer.bytes(), &bytes[97..97 + 8192]);
@@ -1115,21 +1331,11 @@ mod tests {
             .collect();
         std::fs::write(&path, &bytes).unwrap();
         let planes = [
-            Plane {
-                file: 0,
-                offset: first as u64,
-                nbytes: rows * 80,
-                row_bytes: 80,
-            },
-            Plane {
-                file: 0,
-                offset: second as u64,
-                nbytes: rows * 10,
-                row_bytes: 10,
-            },
+            Plane::single(0, first as u64, rows * 80, 80),
+            Plane::single(0, second as u64, rows * 10, 10),
         ];
         let file = open_file(&path).unwrap();
-        for plane in planes {
+        for plane in &planes {
             let data = Resident::load(&file, plane).unwrap();
             let begin = plane.offset as usize;
             assert_eq!(data.bytes(), &bytes[begin..begin + plane.nbytes]);
@@ -1141,7 +1347,7 @@ mod tests {
             .set_len((first + LOAD_CHUNK + 17) as u64)
             .unwrap();
         assert!(
-            Resident::load(&file, planes[0])
+            Resident::load(&file, &planes[0])
                 .err()
                 .unwrap()
                 .to_string()
@@ -1162,18 +1368,8 @@ mod tests {
             .collect();
         std::fs::write(&path, &bytes).unwrap();
         let planes = [
-            Plane {
-                file: 0,
-                offset: first as u64,
-                nbytes: rows * 80,
-                row_bytes: 80,
-            },
-            Plane {
-                file: 0,
-                offset: second as u64,
-                nbytes: rows * 10,
-                row_bytes: 10,
-            },
+            Plane::single(0, first as u64, rows * 80, 80),
+            Plane::single(0, second as u64, rows * 10, 10),
         ];
         let stats = Arc::new(Stats::default());
         let mut reader = Reader::open(&path, &planes, false, 65536, 32, stats.clone()).unwrap();
@@ -1231,18 +1427,8 @@ mod tests {
             .collect();
         std::fs::write(&path, &bytes).unwrap();
         let planes = [
-            Plane {
-                file: 0,
-                offset: first as u64,
-                nbytes: rows * 256,
-                row_bytes: 256,
-            },
-            Plane {
-                file: 0,
-                offset: second as u64,
-                nbytes: rows * 8,
-                row_bytes: 8,
-            },
+            Plane::single(0, first as u64, rows * 256, 256),
+            Plane::single(0, second as u64, rows * 8, 8),
         ];
         let ids: Vec<_> = (0..8192)
             .map(|i| {
@@ -1300,18 +1486,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("helios-engram-files-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let planes = [
-            Plane {
-                file: 0,
-                offset: 4093,
-                nbytes: 80 * 128,
-                row_bytes: 80,
-            },
-            Plane {
-                file: 1,
-                offset: 4093,
-                nbytes: 10 * 128,
-                row_bytes: 10,
-            },
+            Plane::single(0, 4093, 80 * 128, 80),
+            Plane::single(1, 4093, 10 * 128, 10),
         ];
         let mut files = Vec::new();
         for (i, plane) in planes.iter().enumerate() {
@@ -1337,6 +1513,121 @@ mod tests {
                 assert_eq!(&output[340..350], &[0; 10]);
                 assert_eq!(&output[350..360], &[2; 10]);
             }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn parallel_resident_gather_matches_sequential_with_padding_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "helios-engram-parallel-{}.bin",
+            std::process::id()
+        ));
+        let table_rows = 4096usize;
+        let w_bytes = 256usize;
+        let s_bytes = 8usize;
+        let total = table_rows * (w_bytes + s_bytes);
+        let bytes: Vec<u8> = (0..total).map(|i| ((i * 31) ^ (i >> 7)) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane::single(0, 0, table_rows * w_bytes, w_bytes),
+            Plane::single(0, (table_rows * w_bytes) as u64, table_rows * s_bytes, s_bytes),
+        ];
+        let mut reader =
+            Reader::open(&path, &planes, true, 0, 8197, Arc::default()).unwrap();
+        let ids: Vec<i64> = (0..8197)
+            .map(|i| if i % 17 == 0 { -1 } else { ((i * 131) % table_rows) as i64 })
+            .collect();
+        let mut expected = vec![0u8; ids.len() * (w_bytes + s_bytes)];
+        let mut base = 0usize;
+        for plane in &planes {
+            let src = &bytes[plane.offset as usize..plane.offset as usize + plane.nbytes];
+            gather_resident_slice(src, plane.row_bytes, &ids, &mut expected[base..base + ids.len() * plane.row_bytes]);
+            base += ids.len() * plane.row_bytes;
+        }
+        let mut actual = vec![0xa5u8; expected.len()];
+        reader.gather(&planes, &ids, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn multi_segment_plane_matches_single_plane_in_ram_disk_and_cached_modes() {
+        let root = std::env::temp_dir().join(format!("helios-engram-multiseg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let rows = 1025usize;
+        let split = 513usize;
+        let w_bytes = 256usize;
+        let s_bytes = 8usize;
+        let w_all: Vec<u8> = (0..rows * w_bytes).map(|i| ((i * 29 + 7) ^ (i >> 6)) as u8).collect();
+        let s_all: Vec<u8> = (0..rows * s_bytes).map(|i| ((i * 17 + 3) ^ (i >> 5)) as u8).collect();
+        let offsets = [4093usize, 137usize, 511usize, 4099usize];
+        let chunks = [
+            &w_all[..split * w_bytes],
+            &w_all[split * w_bytes..],
+            &s_all[..split * s_bytes],
+            &s_all[split * s_bytes..],
+        ];
+        let mut files = Vec::new();
+        for (i, (off, data)) in offsets.iter().zip(chunks).enumerate() {
+            let path = root.join(format!("seg-{i}.bin"));
+            let mut buf = vec![0x5a; *off];
+            buf.extend_from_slice(data);
+            std::fs::write(&path, &buf).unwrap();
+            files.push(Arc::new(open_file(&path).unwrap()));
+        }
+        let planes = [
+            Plane::multi(
+                vec![
+                    PlaneSegment { file: 0, offset: offsets[0] as u64, nbytes: chunks[0].len() },
+                    PlaneSegment { file: 1, offset: offsets[1] as u64, nbytes: chunks[1].len() },
+                ],
+                w_bytes,
+            )
+            .unwrap(),
+            Plane::multi(
+                vec![
+                    PlaneSegment { file: 2, offset: offsets[2] as u64, nbytes: chunks[2].len() },
+                    PlaneSegment { file: 3, offset: offsets[3] as u64, nbytes: chunks[3].len() },
+                ],
+                s_bytes,
+            )
+            .unwrap(),
+        ];
+        let ids: Vec<i64> = (0..257)
+            .map(|i| if i % 13 == 0 { -1 } else { ((i * 73 + split - 2) % rows) as i64 })
+            .collect();
+        let mut expected = Vec::new();
+        for (all, rb) in [(&w_all, w_bytes), (&s_all, s_bytes)] {
+            for &id in &ids {
+                if id < 0 {
+                    expected.extend(std::iter::repeat_n(0, rb));
+                } else {
+                    let pos = id as usize * rb;
+                    expected.extend_from_slice(&all[pos..pos + rb]);
+                }
+            }
+        }
+        for (resident, cache, res_scales) in [
+            (true, 0, false),
+            (false, 0, false),
+            (false, 0, true),
+            (false, 262144, true),
+        ] {
+            let mut reader = Reader::from_files(
+                &files,
+                &planes,
+                resident,
+                cache,
+                ids.len(),
+                Arc::default(),
+                1,
+                res_scales,
+            )
+            .unwrap();
+            let mut actual = vec![0xa5u8; expected.len()];
+            reader.gather(&planes, &ids, &mut actual).unwrap();
+            assert_eq!(actual, expected, "mismatch for resident={resident} cache={cache} res_scales={res_scales}");
         }
         std::fs::remove_dir_all(root).unwrap();
     }

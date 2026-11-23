@@ -38,7 +38,7 @@ void launch(torch::Tensor y, std::vector<std::optional<torch::Tensor>> acts,
     }
     if (control.has_value()) {
         TORCH_CHECK(control->scalar_type() == torch::kInt && control->is_contiguous());
-        TORCH_CHECK(control->numel() == 16 + experts);
+        TORCH_CHECK(control->numel() == 16 + experts || (hbm_slots > 0 && control->numel() == 16 + experts + 2));
         TORCH_CHECK(control->device() == y.device());
     }
     TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kBFloat16 && y.is_contiguous());
