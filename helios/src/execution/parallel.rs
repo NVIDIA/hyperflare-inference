@@ -119,6 +119,11 @@ impl TensorParallelExecutor {
         if world < 2 {
             return Err(invalid("tensor parallelism requires at least two ranks"));
         }
+        if !manifest.persistent_workers.is_empty() {
+            return Err(invalid(
+                "persistent workers are only supported on single-rank cores",
+            ));
+        }
         manifest.validate()?;
         wire::validate_completion_packet(&manifest)?;
         let expected = layout(&manifest);
@@ -522,6 +527,14 @@ pub unsafe fn serve_rank(
     rank: usize,
     world: usize,
 ) -> Shutdown {
+    if !manifest.persistent_workers.is_empty() {
+        return Shutdown {
+            drained: true,
+            error: Some(invalid(
+                "persistent workers are only supported on single-rank cores",
+            )),
+        };
+    }
     if let Err(error) = manifest.validate().and_then(|_| wire::validate_completion_packet(&manifest)) {
         return Shutdown { drained: true, error: Some(error) };
     }

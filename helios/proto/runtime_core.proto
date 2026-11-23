@@ -736,6 +736,13 @@ message Execution {
   repeated ExecutionGraph graphs = 5;
   repeated TuningGraph tuning_graphs = 6;
   uint32 completion_token_capacity = 7;
+  // Optional dedicated worker graphs launched once on partitioned CUDA green contexts.
+  repeated PersistentWorker persistent_workers = 8;
+}
+message PersistentWorker {
+  uint32 worker_sm_count = 1;
+  string graph = 2;
+  Reference stop_flag = 3;
 }
 message TuningGraph {
   string name = 1;

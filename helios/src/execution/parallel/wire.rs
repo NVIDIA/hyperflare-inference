@@ -238,6 +238,11 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
         number(&mut bytes, graph.outputs.len());
         for output in &graph.outputs { string(&mut bytes, output); }
     }
+    number(&mut bytes, manifest.persistent_workers.len());
+    for worker in &manifest.persistent_workers {
+        number(&mut bytes, worker.worker_sm_count as usize);
+        string(&mut bytes, &worker.graph);
+    }
     number(&mut bytes, usize::from(manifest.cache.is_some()));
     if let Some(cache) = &manifest.cache {
         for value in [cache.page_tokens, cache.page_capacity, cache.row_capacity] {

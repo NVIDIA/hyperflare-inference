@@ -266,6 +266,62 @@ fn normalize_execution(execution: &mut Option<wire::Execution>) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn validate_persistent_workers(core: &Core, execution: &wire::Execution) -> Result<()> {
+    if execution.persistent_workers.len() > 1 {
+        return Err(invalid(
+            "at most one persistent worker is supported per rank",
+        ));
+    }
+    let Some(worker) = execution.persistent_workers.first() else {
+        return Ok(());
+    };
+    if worker.worker_sm_count == 0 {
+        return Err(invalid(
+            "persistent worker requires a positive worker_sm_count",
+        ));
+    }
+    if worker.graph.is_empty() || !core.graphs.iter().any(|g| g.name == worker.graph) {
+        return Err(invalid(
+            "persistent worker references an unknown graph",
+        ));
+    }
+    if execution.graphs.iter().any(|g| g.name == worker.graph)
+        || execution
+            .tuning_graphs
+            .iter()
+            .any(|g| g.name == worker.graph)
+    {
+        return Err(invalid(
+            "persistent worker graph must be distinct from serving and tuning graphs",
+        ));
+    }
+    let stop_flag = worker
+        .stop_flag
+        .as_ref()
+        .ok_or_else(|| invalid("persistent worker requires a stop_flag reference"))?;
+    let stop_alloc = core
+        .allocations
+        .iter()
+        .find(|a| {
+            a.name == stop_flag.allocation
+                && matches!(a.memory, Memory::MappedHost)
+                && a.sizing.is_none()
+        })
+        .ok_or_else(|| {
+            invalid("persistent worker stop flag must reside in a mapped host allocation")
+        })?;
+    let stop_offset = size(stop_flag.offset)?;
+    let stop_end = stop_offset
+        .checked_add(4)
+        .ok_or_else(|| invalid("persistent worker stop flag offset overflow"))?;
+    if stop_offset % 4 != 0 || stop_end > stop_alloc.nbytes {
+        return Err(invalid(
+            "persistent worker stop flag offset must be 4-byte aligned and in bounds",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
     normalize_execution(&mut value.execution)?;
     let context = required(value.context, "CUDA context")?;
@@ -1428,5 +1484,142 @@ mod payload_tests {
         let core = payload_rank(&body, [12, 0], &placements).unwrap();
         let graph = &core.execution.unwrap().graphs[0];
         assert_eq!(graph.packed_token_capacity, 24);
+    }
+
+    #[test]
+    fn persistent_worker_validation_enforces_schema_bounds_and_cardinality() {
+        use prost::Message;
+        let base_core = |workers: Vec<wire::PersistentWorker>| {
+            let execution = wire::Execution {
+                abi_version: 6,
+                max_active: 1,
+                input_frame_bytes: 64,
+                graphs: vec![wire::ExecutionGraph {
+                    name: "serve".into(),
+                    kind: "decode".into(),
+                    sampling_mode: "general".into(),
+                    batch_capacity: 1,
+                    token_capacity: 1,
+                    ..Default::default()
+                }],
+                tuning_graphs: vec![wire::TuningGraph {
+                    name: "tune".into(),
+                    outputs: vec!["out".into()],
+                    status_buffer: "status".into(),
+                }],
+                persistent_workers: workers,
+                ..Default::default()
+            };
+            Core {
+                resources: HashMap::new(),
+                events: vec![],
+                architecture: [10, 3],
+                allocations: vec![
+                    Allocation {
+                        name: "device_buf".into(),
+                        nbytes: 4096,
+                        alignment: 256,
+                        file: None,
+                        data_spans: vec![],
+                        sources: vec![],
+                        relocations: vec![],
+                        address: None,
+                        memory: Memory::Device,
+                        sizing: None,
+                    },
+                    Allocation {
+                        name: "worker_ctrl".into(),
+                        nbytes: 4096,
+                        alignment: 4096,
+                        file: None,
+                        data_spans: vec![],
+                        sources: vec![],
+                        relocations: vec![],
+                        address: Some(0x2000_0000_0000),
+                        memory: Memory::MappedHost,
+                        sizing: None,
+                    },
+                ],
+                modules: vec![],
+                functions: vec![],
+                graphs: vec![
+                    Graph {
+                        name: "serve".into(),
+                        flags: 0,
+                        resource: "serve".into(),
+                        node_count: 1,
+                        edge_count: 0,
+                        functions: vec![],
+                    },
+                    Graph {
+                        name: "tune".into(),
+                        flags: 0,
+                        resource: "tune".into(),
+                        node_count: 1,
+                        edge_count: 0,
+                        functions: vec![],
+                    },
+                    Graph {
+                        name: "worker_launch".into(),
+                        flags: 0,
+                        resource: "worker_launch".into(),
+                        node_count: 1,
+                        edge_count: 0,
+                        functions: vec![],
+                    },
+                    Graph {
+                        name: "worker_launch_2".into(),
+                        flags: 0,
+                        resource: "worker_launch_2".into(),
+                        node_count: 1,
+                        edge_count: 0,
+                        functions: vec![],
+                    },
+                ],
+                reservations: vec![],
+                execution: Some(execution),
+                context: Context::default(),
+            }
+        };
+        let valid = wire::PersistentWorker {
+            worker_sm_count: 8,
+            graph: "worker_launch".into(),
+            stop_flag: Some(wire::Reference {
+                allocation: "worker_ctrl".into(),
+                offset: 0,
+            }),
+        };
+        // Round-trip through protobuf wire encoding.
+        let encoded = valid.encode_to_vec();
+        let decoded = wire::PersistentWorker::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, valid);
+        base_core(vec![decoded.clone()]).validate().unwrap();
+
+        // Declaring more than one persistent worker is rejected explicitly.
+        let mut second = decoded.clone();
+        second.graph = "worker_launch_2".into();
+        let err = base_core(vec![decoded.clone(), second])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most one persistent worker"), "{err}");
+
+        for mutation in 0..8 {
+            let mut bad = decoded.clone();
+            match mutation {
+                0 => bad.worker_sm_count = 0,
+                1 => bad.graph = "missing".into(),
+                2 => bad.graph = "serve".into(),
+                3 => bad.graph = "tune".into(),
+                4 => bad.stop_flag = None,
+                5 => bad.stop_flag.as_mut().unwrap().allocation = "device_buf".into(),
+                6 => bad.stop_flag.as_mut().unwrap().offset = 2,
+                _ => bad.stop_flag.as_mut().unwrap().offset = 4096,
+            }
+            assert!(
+                base_core(vec![bad]).validate().is_err(),
+                "expected mutation {mutation} to fail validation"
+            );
+        }
     }
 }
