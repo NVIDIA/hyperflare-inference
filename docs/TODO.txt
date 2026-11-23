@@ -812,3 +812,14 @@
     faulting launch was not identified. Close when the reference reads
     contiguous inputs, or the fault is reproduced and traced to another
     operand.
+
+[ ] Compare GLM 5.3 prefill time across plans of the sparse indexer's tiled
+    top-k. In the export from Flare 6510be0e with FlashInfer 35b5be28, the
+    4,096-token prefill graph launches the indexer's gather, scoring, and
+    tiled top-k kernels 256 times in each of the 21 selecting layers, and an
+    uncached 2,722-token prompt returned its first token after 1,003 ms on
+    eight RTX PRO 6000 GPUs. An export of the same checkpoint whose graph
+    launches those kernels 160 times per selecting layer returned it after
+    982 ms. Prefill time was not measured in isolation, and the two exports
+    differ in other kernel selections. Close when a paired prefill
+    measurement attributes the difference or shows none.
