@@ -7,7 +7,7 @@ import torch
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.draft_sampling import PreparedDraftDistribution
-from ignition.components.paged_batch import Metadata, PreparedBatch
+from ignition.components.paged_batch import PAGE_TOKENS, Metadata, PreparedBatch
 from ignition.components.speculation import (
     DRAFT_RNG_DOMAIN,
     PreparedSpeculativeCommit,
@@ -24,6 +24,7 @@ class PreparedCausalDraftRound:
         self.blocks = o.inputs.page_tables.shape[1]
         self.draft_context_lag = draft_context_lag
         self.collectives, self.session, self.name = o.collectives, o.session, name
+        self.result_runtime = getattr(o, "result_runtime", None)
         self.inputs, self.requests, self.pool = o.inputs, o.requests, o.pool
         self.completion, self.frame, self.sequence = o.completion, o.frame, o.sequence
         self.rng, self.draft_offset, self.draft_generation = o.rng, o.offset, o.generation
@@ -31,8 +32,10 @@ class PreparedCausalDraftRound:
         device, blocks = o.pool.backing.device, o.inputs.page_tables.shape[1]
         self.rows = torch.arange(b, device=device)
         self.metadata = Metadata.allocate(b * w, b, blocks, device, samples=b * w)
+        # An owner whose pages hold another token count than the paged default names it as `page_tokens`.
         self.validator = PreparedBatch(o.inputs, o.requests, Metadata.allocate(b, b, blocks, device),
-            mode="decode", shard=o.weights.shard, pool=o.pool, verification_width=w)
+            mode="decode", shard=o.weights.shard, pool=o.pool, verification_width=w,
+            page_tokens=getattr(o, "page_tokens", PAGE_TOKENS))
         self.validation = PreparedAllReduce(self.validator.validation_input, self.validator.validation_sum,
             runtime=o.collectives["runtime"], coordinator=o.collectives["coordinator"],
             session=o.session, name=name + ".validation").functional(session=o.session)
@@ -80,7 +83,7 @@ class PreparedCausalDraftRound:
         verify.prepare()
         from ignition.components.parallel_draft import prepare_sampling_broadcasts
         prepare_sampling_broadcasts(proposals, verify, collectives=self.collectives, session=self.session,
-                                    name=self.name)
+                                    name=self.name, result_runtime=self.result_runtime)
         commit = PreparedSpeculativeCommit(self.requests, verify.output, self.candidates,
             self.inputs.row_slot_ids[:b], self.inputs.row_generations[:b], self.inputs.live_rows, self.completion, self.frame,
             self.sequence, logits=self.decoder.scratch.logits.view(b, w, -1), rng=self.rng, token_limits=self.inputs.query_lengths[:b], draft_context_lag=self.draft_context_lag)

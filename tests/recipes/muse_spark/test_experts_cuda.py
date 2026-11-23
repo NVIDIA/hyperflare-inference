@@ -56,35 +56,51 @@ def test_route_finalizer_canonical_rounding(tokens, valid):
     torch.testing.assert_close(output, expected, rtol=.016, atol=.015625)
 
 
-def test_bf16_experts_raw_silu():
+@pytest.mark.parametrize("functional", [False, True])
+@pytest.mark.parametrize("tokens,valid,top_k", [(1, 1, 8), (17, 13, 2), (40, 35, 8)])
+def test_bf16_experts_raw_silu(tokens, valid, top_k, functional):
     from ignition.components.bf16_experts import PreparedBF16Experts
+    from ignition.preparation.compilation import compile_forward
     from ignition.preparation.scratch import GraphBufferPool
 
-    torch.manual_seed(171)
-    source = torch.randn((17, 128), device="cuda", dtype=torch.bfloat16)
-    gate_up = (torch.randn((4, 128, 128), device="cuda") * .05).bfloat16()
-    down = (torch.randn((4, 128, 64), device="cuda") * .05).bfloat16()
-    ids = torch.rand((17, 4), device="cuda").topk(2, dim=-1).indices.int()
-    weights = torch.rand((17, 2), device="cuda")
-    ids[13:] = -1
-    valid = torch.tensor([13], device="cuda", dtype=torch.int32)
-    output = torch.empty((17, 2, 128), device="cuda", dtype=torch.bfloat16)
-    prepared = PreparedBF16Experts(source, gate_up, down, ids, weights, output, valid,
-                                  buffers=GraphBufferPool("cuda").cursor())
+    torch.manual_seed(171 + tokens)
+    num_experts = 16 if top_k == 8 else 4
+    source = torch.randn((tokens, 128), device="cuda", dtype=torch.bfloat16)
+    gate_up = (torch.randn((num_experts, 512, 128), device="cuda") * .05).bfloat16()
+    down = (torch.randn((num_experts, 128, 256), device="cuda") * .05).bfloat16()
+    ids = torch.rand((tokens, num_experts), device="cuda").topk(top_k, dim=-1).indices.int()
+    weights = torch.rand((tokens, top_k), device="cuda")
+    ids[valid:] = -1
+    valid_count = torch.tensor([valid], device="cuda", dtype=torch.int32)
+    output = torch.empty((tokens, top_k, 128), device="cuda", dtype=torch.bfloat16)
+    prepared = PreparedBF16Experts(source, gate_up, down, ids, weights, output, valid_count,
+                                   buffers=GraphBufferPool("cuda").cursor())
+    if functional:
+        prepared.functional()
     expected = torch.zeros_like(output)
-    for token in range(13):
-        for route in range(2):
+    for token in range(valid):
+        for route in range(top_k):
             expert = ids[token, route].item()
             gate, up = torch.nn.functional.linear(source[token], gate_up[expert]).chunk(2)
             expected[token, route] = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, down[expert])
-    prepared()
+
+    def forward():
+        if functional:
+            output.copy_(prepared.run(source, ids, weights, valid_count))
+        else:
+            prepared()
+
+    forward()
     torch.testing.assert_close(output, expected, rtol=.025, atol=.002)
-    assert torch.count_nonzero(output[13:]) == 0
-    from ignition.preparation.compilation import compile_forward
-    run = compile_forward(prepared)
+    assert torch.count_nonzero(output[valid:]) == 0
+    run = compile_forward(forward)
     run()
+    output.fill_(float("nan"))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
     graph.replay()
     torch.testing.assert_close(output, expected, rtol=.025, atol=.002)
+    assert torch.count_nonzero(output[valid:]) == 0
+    graph.reset()
+

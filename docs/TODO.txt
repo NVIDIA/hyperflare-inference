@@ -596,6 +596,13 @@
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
 
+[ ] Resolve the peer summation order in the fused PCIe all-reduce and RMSNorm
+    regression in tests/components/test_collective_rmsnorm_cuda.py. With FP32
+    inputs on four SM120 GPUs, staged pull sums from each local rank. Rounding
+    that sum to BF16 produced residuals up to 0.00390625 from the fixed-order
+    CPU reference. Check the required order at TP4 and TP8 and ensure that a
+    worker assertion releases peers waiting in replay or collective cleanup.
+
 [ ] Repair runtime collective-policy fixtures in tests/cli/test_planning.py.
     test_every_recipe_passes_collective_policy_to_preparation rewrites a TP4
     ladder to DeepSeek V4.1 TP3 or Muse Spark TP8; b12x rejects those gather
@@ -675,3 +682,46 @@
     `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `ignition/components/linear.py`; SM103 execution is unqualified.
+
+[ ] Establish equal GLM 5.3 target distributions across decode capacities
+    before qualifying lossless speculation. On twelve TP8 checkpoint rows,
+    ordinary capacity one and verification capacity eight differ by up to
+    0.07361 in total variation at temperature one and top-p 0.95. Their
+    first differences occur in the layer-zero BF16 query projection.
+    Close when the executed target and proposal laws satisfy mtp-design.md.
+
+[ ] Pin FlashInfer to a revision containing logical-position tie breaking
+    in FP8 sparse selection and column-based split-K in the packed W4A16
+    expert kernel. The lockfile selects 598c8547, which has neither repair.
+    Close when a locked install passes the checkpoint cutoff and target-row
+    regressions and serves freshly exported plain and draft-enabled GLM 5.3
+    cores. See model-preparation.md, section GLM 5.3.
+
+[ ] Exercise Kimi K3 and K3.1 MLA key absorption and value expansion with
+    core-backed storage at eight decode rows. Their shared weight loader
+    (ignition/recipes/kimi3/weights.py) allocates separate contiguous
+    head-major weight stacks. The batched products in
+    ignition/recipes/kimi3/attention.py receive strided activation and output
+    views. Close when an export and replay on each recipe's supported rank
+    count validate these operands.
+
+[ ] Qualify GLM 5.3 serving above eight concurrent requests. The TP8
+    qualification in model-preparation.md covers eight. Close when a core
+    exported with a higher capacity passes the concurrent serving check.
+
+[ ] Reproduce the scheduler's numerical work allowance for an advisory
+    Messages block hint. On a GLM 5.3 TP8 core with measured prefill costs,
+    a 1132-token prompt restored its 1120-token hinted prefix after a suffix
+    change at extra-work fraction 1. Fraction 0 recorded a work-budget skip
+    and restored zero tokens. Aggregate metrics omit the request's reserved
+    work and per-cut costs. Close when those inputs independently predict the
+    admission threshold for the same prompt.
+
+[ ] Add `glm53_full` to the sampling-defaults table in docs/api.md and to the
+    speculative catalog description in docs/cli-design.md. Close when both
+    name the recipe.
+
+[ ] Include the GLM 5.3 draft layer's replicated tensors, about 0.18 GB per
+    rank, in the checkpoint's declared expansion bytes
+    (`ignition/recipes/glm53_full/recipe.py`). Close when the declared
+    expansion accounts for the replicated tensors in the loaded draft weights.

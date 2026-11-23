@@ -20,9 +20,13 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @pytest.mark.parametrize("functional", [False, True])
-@pytest.mark.parametrize("mode,rows,heads", [("decode", 2, 32), ("extend", 4096, 16)])
+@pytest.mark.parametrize("mode,rows,heads,head_major", [
+    ("decode", 2, 32, False),
+    ("decode", 4, 8, True),
+    ("extend", 4096, 16, False),
+])
 @torch.no_grad()
-def test_native_sparse_attention_rebinds_selected_arena(mode, rows, heads, functional):
+def test_native_sparse_attention_rebinds_selected_arena(mode, rows, heads, head_major, functional):
     device = torch.device("cuda:0")
     records = ((rows + 192 + 63) // 64) * 64
     source = torch.zeros((rows, 512), dtype=torch.bfloat16, device=device)
@@ -33,7 +37,8 @@ def test_native_sparse_attention_rebinds_selected_arena(mode, rows, heads, funct
     visible = min(rows, 2051)
     selected[:, :visible] = slots[:visible].to(torch.int32)
     lengths = torch.arange(1, rows + 1, dtype=torch.int32, device=device).clamp_max(2051)
-    output = torch.empty_like(query)
+    output = (torch.empty((heads, rows, 512), dtype=torch.bfloat16, device=device).transpose(0, 1)
+              if head_major else torch.empty_like(query))
     observed = torch.empty_like(query)
     arena = ScratchArena(device)
     worker = None
@@ -46,7 +51,7 @@ def test_native_sparse_attention_rebinds_selected_arena(mode, rows, heads, funct
             caps = sparse_mla.Caps(device=device, num_q_heads=heads, max_q_rows=rows, max_width=2051,
                 softmax_scale=256**-.5, max_batch=rows, max_kv_rows=records, kv_dtype=torch.uint8,
                 head_dim=512, v_head_dim=512, page_size=64, model_type=sparse_mla.ModelType.GLM_NEXT,
-                cache_record_bytes=528, mode=mode)
+                cache_record_bytes=528, head_major_output=head_major, mode=mode)
             attention = PreparedSparseMLA(query, cache, selected, lengths, lengths, output,
                 caps=caps, session=session, name="attention", workspace=arena)
             previous = arena.tensor

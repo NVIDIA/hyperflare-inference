@@ -431,9 +431,16 @@ class PreparedAllReduceRMSNorm:
     """
 
     @staticmethod
-    def fits(runtime, source):
+    def fits(runtime, source, *, round_before_weight=False, reduction_order="local", trigger_dependents=False):
+        import inspect
         from b12x.comm import pcie
 
+        if round_before_weight or reduction_order != "local" or trigger_dependents:
+            from b12x.comm.pcie._oneshot_preparation import _fused_semantics
+
+            params = inspect.signature(_fused_semantics).parameters
+            if not {"round_before_weight", "reduction_order", "trigger_dependents"} <= set(params):
+                return False
         if isinstance(source, WeightedGroupSource):
             from b12x.comm.pcie._oneshot_preparation import _grouped_inputs, _state
 
@@ -450,11 +457,13 @@ class PreparedAllReduceRMSNorm:
                 and 0 < source.numel() * source.element_size() <= runtime.max_size)
 
     def __init__(self, source, residual, weight, output, *, eps, runtime, session, coordinator, name,
-                 zero_centered=False, reduction_dtype=None, input_addend=None):
+                 zero_centered=False, reduction_dtype=None, input_addend=None, round_before_weight=False,
+                 reduction_order="local", trigger_dependents=False):
         import torch.distributed as dist
         from b12x.comm.pcie._oneshot_preparation import _prepare_fused_call
 
-        if not self.fits(runtime, source):
+        if not self.fits(runtime, source, round_before_weight=round_before_weight,
+                         reduction_order=reduction_order, trigger_dependents=trigger_dependents):
             raise ValueError("fused all-reduce RMSNorm requires a single-channel one-shot runtime within its capacity")
         self.runtime, self.residual, self.weight, self.output = runtime, residual, weight, output
         self.input_addend = input_addend
@@ -465,9 +474,14 @@ class PreparedAllReduceRMSNorm:
         self.group_id_limit = 0 if grouped is None else grouped.id_limit
         source = source if grouped is None else grouped.values
         self.eps, self.zero_centered, self.reduction_dtype = eps, zero_centered, reduction_dtype
+        extra_arguments = {}
+        if round_before_weight or reduction_order != "local" or trigger_dependents:
+            extra_arguments = dict(round_before_weight=round_before_weight,
+                                   reduction_order=reduction_order,
+                                   trigger_dependents=trigger_dependents)
         self.plan = runtime.plan(source, operation="all_reduce_fused_add_rms_norm", residual=residual,
             weight=weight, out=output, residual_out=residual, zero_centered=zero_centered, reduction_dtype=reduction_dtype,
-            input_addend=input_addend, **group_arguments)
+            input_addend=input_addend, **extra_arguments, **group_arguments)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: _prepare_fused_call(state, inp=source, residual=residual, weight=weight,

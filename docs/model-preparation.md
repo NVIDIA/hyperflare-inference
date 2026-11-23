@@ -163,7 +163,8 @@ available GPUs explicitly on shared hosts. `--gpus 2` means one rank on GPU 2;
 `--gpus 0,1` means two ranks on GPUs 0 and 1. With `CUDA_VISIBLE_DEVICES` set,
 indices refer to the exposed device list. Each tensor-parallel size requires a
 separately prepared core; a TP2 core cannot be loaded as TP1. Qualified end to
-end: Qwen at TP1 and TP2, and GLM at TP4. Not qualified: Qwen at TP4.
+end: Qwen at TP1 and TP2, GLM 5.3 Flash at TP4, and GLM 5.3 at TP8. Not
+qualified: Qwen at TP4.
 
 ## Preparation resources
 
@@ -736,6 +737,194 @@ correctness. To race again after changing a host's wiring, delete the `preparati
 directory under `<kernel_cache>/b12x` (by default `~/.cache/flare/kernels/b12x/preparation`).
 That discards every cached tuning selection kept there, and the next export tunes
 again.
+
+## GLM 5.3
+
+The `glm-5.3` alias of the `glm53_full` recipe prepares text generation,
+reasoning, and tool calls for `local-inference-lab/GLM-5.3-NVFP4` at revision
+`cca10d1586255195d3279785fc85577bfc1e9227`, a `GlmMoeDsaForCausalLM`
+checkpoint, on eight GPUs. It is a separate recipe from
+[GLM 5.3 Flash](#glm-53-flash): the model has 78 decoder layers of hidden
+size 6144, latent attention with rotary positions on every layer, 256 routed
+experts with one shared expert on layers 3 through 77, dense MLPs on layers 0
+through 2, and no recurrent layers, residual mixing, or vision tower. The
+logical context is 1,048,576 tokens; the default 4096-token prefill chunk
+controls graph execution size independently of that context.
+
+In 21 target layers, each token scores the index keys of its own request
+through its current position and keeps the highest-scoring 2048, or all
+visible positions if fewer. Subsequent layers reuse those positions until
+the next indexer. The indexer quantizes queries and keys to FP8. Its
+head-weight projection uses BF16 checkpoint weights and writes FP32 values.
+The indexer normalizes those values in FP32. Attention reads the selected
+records in ascending logical token order, independent of physical page
+placement. Selection is qualified on eight SM120 GPUs with the FlashInfer
+selector that breaks equal scores by increasing logical position at every
+top-k reduction (commit `661af16ee061af9d21056bbe3ca7db1f5f4bd2aa`).
+The 21 target indexers and the draft indexer passed independent FP8 score
+and cutoff checks on 60,081 prefill and decode rows per 2,722-token prompt.
+Four cutoff exchanges on the long checkpoint fixture fell within their
+individual FP32 accumulation bounds. A second prompt tokenized from the
+speculative decoding and runtime core design documents had exact sets
+throughout. At layer 6, quantizing the index keys and queries changed the
+attention update by 0.236% and 0.273% relative L2 over the 674 rows with
+more than 2048 visible tokens. The matched FP8 reference reproduced every
+selected position on those rows.
+
+Each cached token holds a 656-byte latent attention record per layer
+(512 FP8 latent values, four FP32 scales, and 64 BF16 rotary values) and a
+132-byte index key per indexer layer. Pages hold 256 tokens.
+
+To measure the cache tradeoff on another prompt, run
+`python -m ignition.reference.glm_moe_dsa` on the same snapshot, device,
+and JSON array of token IDs under the `token_ids` key. Use a separate
+output file for each `--cache-precision` setting. `bf16` keeps the latent
+cache in BF16, `fp8-latent` rounds the four latent groups at each write,
+and `fp8-latent-index` also quantizes index keys and queries. Keep
+`--expert-activation a16` for all three runs and set `--logit-rows` to
+the prompt length to retain every vocabulary row. These Transformers
+forwards use the same 64-row expert projections in every cache mode.
+With variable projection sizes, changing later tokens' expert assignments
+can change the reduction used for an earlier token. The fixed size keeps
+that effect out of the cache comparison.
+
+The checkpoint supplies NVFP4 weights for the routed experts in layers 3
+through 77 and BF16 weights for attention, shared experts, dense MLPs,
+embeddings, and the vocabulary head. Routed experts use BF16 activations.
+Eight ranks each hold eight of the 64 attention heads, an eighth of each
+expert's intermediate columns, and an eighth of the vocabulary head; the
+embeddings, normalization, low-rank attention inputs, routers, and indexer
+are replicated.
+
+Learned drafts use the checkpoint's draft layer, decoder layer 78, with its
+own indexer, attention record, and unquantized routed experts, and share the
+target's vocabulary head. A round verifies the pending token and up to five
+drafts by default, seven at most. `--no-mtp` omits the draft layer's
+weights, cache fields, and graphs.
+
+Weight prefetch is **implemented** for target decode and verification on
+eight SM120 GPUs. At up to 64 physical rows, each layer starts prefetching
+the following layer's packed attention input and query expansion weights
+just before its feed-forward all-reduce. The reads include the index query
+weights when the following layer selects sparse records. At up to eight
+rows, each layer also starts reading its own output projection before its
+attention input projections run. These reads warm L2 on a second CUDA
+stream. Projections can consume cache lines as they arrive.
+`--no-stream-overlap` disables both windows.
+
+At up to 16 physical rows, routed target layers can use CUDA Programmatic
+Dependent Launch when the statically prepared BF16 two-shot all-reduce sums
+each shard in cyclic rank order starting at its owner. The fused reduction
+retains that order and rounds the normalized activation to BF16 before
+multiplying by the learned scale. While the reduction is in flight, the
+dependent projection stages router and shared-expert weights. It waits
+for the activation before computing FP32 router logits and BF16 shared
+gate and up channels. Physical rows include padding at the captured batch
+and verification width.
+
+The published checkpoint's `model.safetensors.index.json` declares a
+`total_size` 27,799,760 bytes larger than its tensors, which checkpoint
+inspection rejects. Prepare from a directory that links every checkpoint
+file and replaces the index with one whose `total_size` equals the sum of
+its tensors' bytes, and pass that directory with the repository identity:
+
+```sh
+.venv/bin/ignition export /path/to/glm-5.3-view --gpus 0-7 \
+  --repo-id local-inference-lab/GLM-5.3-NVFP4
+flare run CACHE_ENTRY --host 127.0.0.1 --port 8000
+```
+
+Default capacities are eight concurrent requests and 128 speculative
+target-token rows, which capture verification of five drafts at batches 1,
+2, 4, and 8. The declared sampling ranges are temperature 0.95 to 1.0 and
+top-p 0.95 to 1.0, so requests cannot select greedy output; top-k is fixed
+off. Prompt log probabilities and images are not prepared. Requests with
+image content are rejected.
+
+Serving is qualified on eight RTX PRO 6000 Blackwell Max-Q GPUs (SM120,
+96 GB each) with the two FlashInfer kernel repairs identified in this
+section. Signed exports with and without learned drafts served through
+`flare run` at the default capacities. Each passed five GLM service tests
+and 93 shared protocol tests, and each reproduced the FP32 most-likely token
+on 16 growing prefixes from each of the 24-token `short.pt` and 2,722-token
+`long.pt` fixtures in `FLARE_GLM53_FULL_REFERENCE`. The draft-enabled
+core offered 1050 first-step and 810 second-step learned proposals during
+these checks. Independent arithmetic checks qualify the prepared first and
+recursive draft steps on fixed checkpoint inputs at prefix lengths 2048,
+2049, 2305, and 2561.
+[Draft arithmetic regression](../tests/recipes/test_glm53_full_draft_arithmetic_cuda.py).
+The checks cover cache writes, rotary arithmetic, attention, expert stages,
+normalization, all vocabulary logits, and actual proposal probabilities.
+Wrong preceding state, position, and selection each fail these checks.
+At a 2305-token prefix, changing the Transformers latent cache and index
+operands to matched FP8 changed first-step attention by 1.518% relative
+L2. Flare's attention differed from the BF16 reference by 2.155% and from
+the matched FP8 reference by 1.519%. Cache precision accounts for part of
+the difference. The arithmetic checks also account for query quantization,
+split partials stored in BF16, and the reduction on each stage's inputs.
+
+Target distribution qualification depends on physical decode capacity.
+With the packed expert kernel that assigns reduction boundaries by output
+column (FlashInfer commit `e3c7023a94a59e8951bb87c872a68e350bc33b19`),
+the prepared target produced bitwise-identical watched logits at capacity
+eight when future tokens, an unrelated request, an inactive row, or the
+watched row's slot changed at the start of four three-token intervals.
+The short fixture covers positions 21–23 and the long fixture covers
+254–256, 2,046–2,048, and 2,719–2,721. Ordinary and verification logits
+agreed at all twelve positions when both used capacity eight.
+Ordinary capacity one and verification capacity
+eight differed by up to 0.07225 in total variation before filtering and
+0.07361 with top-p 0.95 at temperature one. Before filtering, Flare's
+distance from BF16 was within the paired Transformers FP8-to-BF16 distance
+on seven of twelve ordinary rows and six of twelve verification rows.
+For every tested token the two widths first differed in one to three
+BF16 outputs of the layer-zero query projection on identical inputs. The
+widths subsequently routed those tokens to different experts. The target
+sampling distributions at these capacities are measurably different.
+
+Across all 2,722 positions of the long prefill fixture, median unfiltered
+total variation was 0.08266 for the independent matched FP8 reference
+versus BF16, 0.08391 for Flare versus BF16, and 0.08740 for Flare versus
+matched FP8. Flare's distance from BF16 was within the quantization
+distance on 1,333 positions. Individual distributions can differ sharply.
+Among the 1,516 positions with a CPU FP32 top-two logit margin of at least
+one, Flare disagreed with the FP32 most-likely token on 29 and the matched
+FP8 reference on 32. Reversing the last 674 input tokens left all 78 layer
+outputs and every vocabulary score bitwise identical through position 2,047
+in both the prepared prefill and the matched FP8 reference.
+
+The repository lockfile selects FlashInfer `598c8547be335bcd833254177ac18ccb2bf4dabc`.
+Local GLM 5.3 preparation with decode overlap uses the paired FlashInfer
+revision `f364798ac3093402e6acfb0782889019d1701f41`. It includes the
+logical-position tie rule, column-based expert reduction, attention weight
+reads, and the mixed FP32 and BF16 projection. With that revision checked
+out in `../flashinfer`, run these commands from the Flare repository before
+exporting the checkpoint.
+
+```sh
+uv sync --locked --extra prepare --extra test
+BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 \
+  uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e ../flashinfer
+```
+
+The signed plain core declared 59.662 GiB of fixed device allocations on
+seven ranks and 59.727 GiB on rank five. The draft-enabled core declared
+62.217 GiB on each rank. The resource baselines at the same capacities were
+the signed plain entry `gb202-tp8-202611201311` and draft-enabled entry
+`gb202-tp8-202611201338`. The increases were 18 MiB on seven plain ranks,
+84 MiB on plain rank five, and 12 MiB on each draft rank. These are
+complete export measurements. Both pairs of cores
+have identical cache geometry within each mode. End-to-end comparison with
+a separately running draft inference engine is unqualified.
+
+With the checkpoint's `index_share_for_mtp_iteration` setting enabled,
+the first proposal in a round selects sparse attention records for each
+request. Recursive proposals reuse the same physical records. A request
+that stops proposing contributes no further draft records. The target's
+accepted context rebuilds the committed draft keys before another round.
+Index sharing takes effect when the draft graphs are exported. Other rank
+counts, concurrency above eight, multi-host serving, and SM103 and SM121
+hardware are unqualified.
 
 ## DeepSeek V4.1 Flash
 
@@ -1900,7 +2089,8 @@ top-p 0.95, and top-k 64.
 Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
 target-token capacity is the larger of padded concurrency and draft count plus
 one, giving six rows at its default settings. Muse Spark declares 32 packed
-target-token rows for seven DFlash2 drafts at concurrency four. Other recipes
+target-token rows for seven DFlash2 drafts at concurrency four. GLM 5.3
+defaults to eight concurrent requests. Other recipes
 default to 32 concurrent requests, with speculative recipes declaring 128 target-token rows independently
 of concurrency.
 Explicit flags and configuration override these defaults; a core's capacities
@@ -1909,7 +2099,8 @@ selected GPUs.
 
 | Recipe | Draft tokens | Verification layout | Speculative graphs at default concurrency | Maximum drafts at batch 32 |
 |---|---:|---|---:|---:|
-| Qwen3.8 Flash, GLM 5.3 | 5 | Rectangular | 34 | 3 |
+| Qwen3.8 Flash, GLM 5.3 Flash | 5 | Rectangular | 34 | 3 |
+| GLM 5.3 | 5 | Rectangular | 24 at concurrency 8 | 3 |
 | Step-5 | 3 | Rectangular | 24 | 3 |
 | DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
 | DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, Qwen3.8 27B | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |

@@ -99,21 +99,18 @@ class PreparedMLP:
             self.gate_up = self.intermediate = self.output = None
         return self
 
-    def __call__(self, source):
+    def from_gate_up(self, gate_up):
+        """Apply SwiGLU and the down projection to the rank's projected gate and up channels."""
+        intermediate = self.intermediate
         if self._functional_layout is not None:
-            _, _, _, intermediate_shape, intermediate_stride, intermediate_dtype, _, _, _ = self._functional_layout
-            gate_up = self.up_projection(source)
-            intermediate = torch.empty_strided(intermediate_shape, intermediate_stride, dtype=intermediate_dtype,
-                                               device=source.device)
-            hyperconnection.run_swiglu(gate_up, limit=self.swiglu_limit,
-                                      round_silu=self.round_silu, out=intermediate,
-                                      plan=self.activation_plan)
-            return self.down_projection(intermediate)
-        self.up_projection(source)
-        hyperconnection.run_swiglu(self.gate_up, limit=self.swiglu_limit,
-                                  round_silu=self.round_silu, out=self.intermediate,
-                                  plan=self.activation_plan)
-        return self.down_projection(self.intermediate)
+            _, _, _, shape, stride, dtype, _, _, _ = self._functional_layout
+            intermediate = torch.empty_strided(shape, stride, dtype=dtype, device=gate_up.device)
+        hyperconnection.run_swiglu(gate_up, limit=self.swiglu_limit, round_silu=self.round_silu,
+                                  out=intermediate, plan=self.activation_plan)
+        return self.down_projection(intermediate)
+
+    def __call__(self, source):
+        return self.from_gate_up(self.up_projection(source))
 
 
 class PreparedUngatedMLP:

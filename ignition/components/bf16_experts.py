@@ -97,6 +97,56 @@ def _scatter_routes_kernel(
 
 
 @triton.jit
+def _bin_routes_small_kernel(
+    top_k_index,
+    num_valid_tokens,
+    expert_counts,
+    expert_tile_starts,
+    expert_tile_counts,
+    pair_ranks,
+    sorted_pair_ids,
+    tile_expert_ids,
+    TOP_K: tl.constexpr,
+    TOTAL_PAIRS: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    MAX_TILES: tl.constexpr,
+    MAX_PADDED_ROWS: tl.constexpr,
+    TILE_M: tl.constexpr,
+    PAIR_BLOCK: tl.constexpr,
+    CLEAR_BLOCK: tl.constexpr,
+):
+    clear_offs = tl.arange(0, CLEAR_BLOCK)
+    tl.store(sorted_pair_ids + clear_offs, -1, mask=clear_offs < MAX_PADDED_ROWS)
+    tl.store(tile_expert_ids + clear_offs, -1, mask=clear_offs < MAX_TILES)
+    experts = tl.arange(0, NUM_EXPERTS)
+    tl.store(expert_counts + experts, 0)
+    tl.debug_barrier()
+
+    pair_ids = tl.arange(0, PAIR_BLOCK)
+    valid_tokens = tl.load(num_valid_tokens).to(tl.int32)
+    valid_pairs = valid_tokens * TOP_K
+    mask = (pair_ids < TOTAL_PAIRS) & (pair_ids < valid_pairs)
+    expert = tl.load(top_k_index + pair_ids, mask=mask, other=0).to(tl.int32)
+    mask = mask & (expert >= 0) & (expert < NUM_EXPERTS)
+    ranks = tl.atomic_add(expert_counts + expert, 1, mask=mask)
+    tl.store(pair_ranks + pair_ids, ranks, mask=mask)
+    tl.debug_barrier()
+
+    counts = tl.load(expert_counts + experts).to(tl.int32)
+    tiles = (counts + TILE_M - 1) // TILE_M
+    starts = tl.cumsum(tiles, axis=0) - tiles
+    tl.store(expert_tile_starts + experts, starts)
+    tl.store(expert_tile_counts + experts, tiles)
+    tl.debug_barrier()
+
+    tile_start = tl.load(expert_tile_starts + expert, mask=mask, other=0).to(tl.int32)
+    dest = tile_start * TILE_M + ranks
+    tl.store(sorted_pair_ids + dest, pair_ids, mask=mask)
+    tile_idx = tile_start + (ranks // TILE_M)
+    tl.store(tile_expert_ids + tile_idx, expert, mask=mask)
+
+
+@triton.jit
 def _gelu_tanh(x):
     c = 0.7978845608028654
     k = 0.044715
@@ -280,33 +330,53 @@ class PreparedBF16Experts:
         pairs = tokens * top_k
         tile_m, tile_n, tile_k = 16, 64, 64
         tiles = min(pairs, triton.cdiv(pairs, tile_m) + count)
+        stage1_tile_n = 16 if tiles * triton.cdiv(inter, 64) < 128 and inter >= 16 else tile_n
         padded = tiles * tile_m
         counts, starts, tile_counts = scratch.counts, scratch.starts, scratch.tile_counts
         ranks, sorted_ids, tile_experts = scratch.ranks, scratch.sorted_ids, scratch.tile_experts
-        self.bins = (
-            prepare_triton(_init_bins_kernel, (counts, tile_experts, sorted_ids, count, tiles, padded, 256),
-                           (triton.cdiv(max(padded, tiles, count), 256), 1, 1)),
-            prepare_triton(_count_routes_kernel, (ids, valid_tokens, counts, ranks, top_k, pairs, 256, count),
-                           (triton.cdiv(pairs, 256), 1, 1)),
-            prepare_triton(_scan_experts_kernel, (counts, starts, tile_counts, count, tile_m), (1, 1, 1)),
-            prepare_triton(_scatter_routes_kernel,
-                           (ids, valid_tokens, ranks, starts, sorted_ids, tile_experts, top_k, pairs, tile_m, 256, count),
-                           (triton.cdiv(pairs, 256), 1, 1)),
+        if pairs <= 256 and max(padded, tiles) <= 1024:
+            self.bins = (
+                prepare_triton(
+                    _bin_routes_small_kernel,
+                    (ids, valid_tokens, counts, starts, tile_counts, ranks, sorted_ids, tile_experts,
+                     top_k, pairs, count, tiles, padded, tile_m,
+                     max(32, triton.next_power_of_2(pairs)),
+                     max(32, triton.next_power_of_2(max(padded, tiles)))),
+                    (1, 1, 1),
+                    num_warps=4,
+                ),
+            )
+        else:
+            self.bins = (
+                prepare_triton(_init_bins_kernel, (counts, tile_experts, sorted_ids, count, tiles, padded, 256),
+                               (triton.cdiv(max(padded, tiles, count), 256), 1, 1)),
+                prepare_triton(_count_routes_kernel, (ids, valid_tokens, counts, ranks, top_k, pairs, 256, count),
+                               (triton.cdiv(pairs, 256), 1, 1)),
+                prepare_triton(_scan_experts_kernel, (counts, starts, tile_counts, count, tile_m), (1, 1, 1)),
+                prepare_triton(_scatter_routes_kernel,
+                               (ids, valid_tokens, ranks, starts, sorted_ids, tile_experts, top_k, pairs, tile_m, 256, count),
+                               (triton.cdiv(pairs, 256), 1, 1)),
+            )
+        self._scratch_refs = dict(
+            source=source, ids=ids, weights=weights, valid_tokens=valid_tokens,
+            output=output, intermediate=self.intermediate, counts=counts,
+            tile_experts=tile_experts, sorted_ids=sorted_ids, ranks=ranks,
+            starts=starts, tile_counts=tile_counts,
         )
         self.first = prepare_triton(_moe_bf16_stage1_kernel,
             (source, gate_up, sorted_ids, tile_experts, self.intermediate,
-             top_k, hidden, inter, tile_m, tile_n, tile_k, True),
-            (tiles, triton.cdiv(inter, tile_n), 1), num_warps=4)
+             top_k, hidden, inter, tile_m, stage1_tile_n, tile_k, True),
+            (tiles, triton.cdiv(inter, stage1_tile_n), 1), num_warps=4)
         self.second = prepare_triton(_moe_bf16_stage2_kernel,
             (self.intermediate, down, weights, sorted_ids, tile_experts, output,
              hidden, inter, tile_m, tile_n, tile_k, True),
             (tiles, triton.cdiv(hidden, tile_n), 1), num_warps=4)
 
     def functional(self, *, session=None):
-        values = dict(source=self.first.args[0], ids=self.bins[1].args[0], weights=self.second.args[2],
-            valid_tokens=self.bins[1].args[1], output=self.output, intermediate=self.intermediate,
-            counts=self.bins[0].args[0], tile_experts=self.bins[0].args[1], sorted_ids=self.bins[0].args[2],
-            ranks=self.bins[1].args[3], starts=self.bins[2].args[1], tile_counts=self.bins[2].args[2])
+        if self._scratch_refs is None:
+            return self
+        values = self._scratch_refs
+        self._scratch_refs = None
         self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()}
         names = {id(value): name for name, value in values.items()}
         for operation in (*self.bins, self.first, self.second):
