@@ -159,8 +159,8 @@ pub fn geometry(page_tokens: u64, planes: &[(&str, u64)], row_bytes: u64) -> Cac
         })
         .collect();
     CacheGeometry {
-        codec_fields: Vec::new(),
         placement: Default::default(),
+        codec_fields: Vec::new(),
         snapshot_pages: Vec::new(),
         page_tokens,
         page_capacity: 4096,
@@ -540,5 +540,28 @@ impl crate::pool::HostPin for BytesPin {
             window.row,
             dst,
         )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Packet {
+    pub unit: crate::shared::wire::PackedUnit,
+    pub data: std::sync::Arc<[u8]>,
+}
+
+/// A stored share built with the manager's verified CPU codec.
+pub fn checkpoint_packet(
+    plan: &crate::shared::codec::Plan,
+    profile: &[u8; 32],
+    unit: crate::shared::wire::PackedUnit,
+    raw: &[u8],
+) -> Packet {
+    let packet = plan
+        .encode_verified(raw, &mut vec![0; raw.len()], None)
+        .unwrap();
+    let (unit, bytes) = crate::shared::packed::verified_unit(unit, profile, raw, packet);
+    Packet {
+        unit,
+        data: bytes.into_owned().into(),
     }
 }

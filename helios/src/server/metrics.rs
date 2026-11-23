@@ -293,6 +293,7 @@ pub(super) struct Metrics {
     host_deeper_link_pages: [AtomicU64; 2],
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 8],
+    codec_state: std::sync::OnceLock<(crate::offload::KvCompression, Option<&'static str>)>,
     host_refusal_drops: [AtomicU64; 5],
     pub(super) host_reoffer_calls: AtomicU64,
     pub(super) host_reoffer_present: AtomicU64,
@@ -547,9 +548,48 @@ impl Metrics {
         }
     }
 
-    /// Host prefix store counters and gauges, written from the model thread.
-    /// Lookups, hits, and reused tokens come from the scheduler, which applies
-    /// the fetch policy.
+    pub(super) fn configure_codec(
+        &self,
+        placement: crate::offload::KvCompression,
+        revision: Option<u32>,
+        geometry: &[flare_selene::CacheGeometry],
+        workspace_error: Option<&str>,
+        warn: impl FnOnce(String),
+    ) {
+        use crate::offload::KvCompression;
+        let failure = match (placement, workspace_error, revision) {
+            (KvCompression::Off, _, _) => None,
+            (_, Some(error), _) => Some(("workspace_unavailable", error.to_owned())),
+            (_, None, None) => Some((
+                "layout_missing",
+                "this core has no codec layout; export it with a Flare that writes one".into(),
+            )),
+            (_, None, Some(1)) => flare_selene::codec_copy::checked_profile(geometry)
+                .err()
+                .map(|detail| ("field_unqualified", detail)),
+            (_, None, Some(rev)) => Some((
+                "field_unqualified",
+                format!("unsupported codec layout revision {rev}"),
+            )),
+        };
+        let reason = if placement == KvCompression::Off {
+            Some("off")
+        } else {
+            failure.as_ref().map(|f| f.0)
+        };
+        if self.codec_state.set((placement, reason)).is_ok()
+            && let Some((_, detail)) = failure
+        {
+            if placement == KvCompression::Gpu && reason == Some("workspace_unavailable") {
+                warn(format!(
+                    "GPU checkpoint decode workspace unavailable ({detail}). Restoring packed checkpoints on the CPU."
+                ));
+            } else {
+                warn(format!("lossless KV compression ({placement}) is inactive: {detail}"));
+            }
+        }
+    }
+
     pub fn store(&self, stats: StoreStats) {
         for (gauge, value) in self
             .host_retirement_buckets
@@ -645,6 +685,33 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
+        use crate::offload::KvCompression;
+        let (requested, reason) = self
+            .codec_state
+            .get()
+            .copied()
+            .unwrap_or((KvCompression::Off, Some("off")));
+        text.push_str("# TYPE flare_kv_codec_active gauge\n");
+        for placement in [KvCompression::Cpu, KvCompression::Gpu, KvCompression::Off] {
+            let active = u8::from(if requested == KvCompression::Gpu && reason == Some("workspace_unavailable") {
+                placement == KvCompression::Cpu
+            } else {
+                placement == requested && reason.is_none()
+            });
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_active{{placement=\"{placement}\"}} {active}"
+            );
+        }
+        if let Some(reason) = reason {
+            let _ = writeln!(
+                text,
+                "flare_kv_codec_inactive_info{{placement=\"{requested}\",reason=\"{reason}\"}} 1"
+            );
+        }
+        if requested != KvCompression::Off {
+            crate::offload::transfer::codec_metrics(&mut text);
+        }
         for (tier, count) in ["gpu", "dram", "nvme"]
             .iter()
             .zip(&self.host_restores_by_tier)
@@ -1374,6 +1441,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_refusal_warns_and_exports_the_requested_placement_as_inactive() {
+        let metrics = Metrics::new(1, 64, 0, 1);
+        let mut warning = String::new();
+        metrics.configure_codec(
+            crate::offload::KvCompression::Gpu,
+            Some(1),
+            &[],
+            Some("rank 1: cudaMalloc failed"),
+            |message| warning = message,
+        );
+        assert!(warning.contains("rank 1: cudaMalloc failed"));
+        assert!(warning.contains("on the CPU"));
+        let text = metrics.render();
+        assert!(text.contains("flare_kv_codec_active{placement=\"gpu\"} 0\n"));
+        assert!(text.contains("flare_kv_codec_active{placement=\"cpu\"} 1\n"));
+        assert!(text.contains(
+            "flare_kv_codec_inactive_info{placement=\"gpu\",reason=\"workspace_unavailable\"} 1\n"
+        ));
+    }
+
+    #[test]
+    fn requested_codec_warns_on_missing_and_invalid_layouts() {
+        use crate::offload::KvCompression;
+        for placement in [KvCompression::Cpu, KvCompression::Gpu] {
+            let mut messages = Vec::new();
+            let g = flare_selene::testing::geometry(64, &[("kv", 4096)], 4096);
+            Metrics::new(1, 64, 0, 1).configure_codec(
+                placement,
+                None,
+                std::slice::from_ref(&g),
+                None,
+                |s| messages.push(s),
+            );
+            assert_eq!(
+                messages,
+                [format!(
+                    "lossless KV compression ({placement}) is inactive: this core has no codec layout; export it with a Flare that writes one"
+                )]
+            );
+            let mut g = g;
+            g.codec_fields.push(flare_selene::geometry::CodecField {
+                buffer: "kv".into(),
+                offset: 0,
+                length: 4096,
+                encoding: 999,
+            });
+            let mut warning = String::new();
+            Metrics::new(1, 64, 0, 1)
+                .configure_codec(placement, Some(1), &[g], None, |s| warning = s);
+            assert!(
+                warning.contains("rank 0: codec field kv at 0 has unsupported encoding 999"),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_activity_gauges_follow_the_effective_profile() {
+        use crate::offload::KvCompression::{Cpu, Gpu, Off};
+        let mut g = flare_selene::testing::geometry(64, &[("kv", 4096)], 4096);
+        for name in ["kv", "state"] {
+            g.codec_fields.push(flare_selene::geometry::CodecField {
+                buffer: name.into(),
+                offset: 0,
+                length: 4096,
+                encoding: 0,
+            });
+        }
+        for (placement, revision, reason) in [
+            (Gpu, None, Some("layout_missing")),
+            (Cpu, Some(2), Some("field_unqualified")),
+            (Off, None, Some("off")),
+            (Cpu, Some(1), None),
+            (Gpu, Some(1), None),
+        ] {
+            let metrics = Metrics::new(1, 64, 0, 1);
+            metrics.configure_codec(placement, revision, std::slice::from_ref(&g), None, |_| {
+                assert!(placement != Off && reason.is_some())
+            });
+            metrics.configure_codec(placement, revision, std::slice::from_ref(&g), None, |_| panic!("duplicate warning"));
+            let text = metrics.render();
+            assert_eq!(text.contains("flare_kv_codec_original_bytes_total{"), placement != Off);
+            if placement == Off {
+                assert!(text.lines().filter(|line| line.contains("flare_kv_codec_"))
+                    .all(|line| line.contains("flare_kv_codec_active") || line.contains("flare_kv_codec_inactive_info")));
+            }
+            for lane in [Cpu, Gpu, Off] {
+                let active = u8::from(placement == lane && reason.is_none());
+                assert!(text.contains(&format!(
+                    "flare_kv_codec_active{{placement=\"{lane}\"}} {active}\n"
+                )));
+            }
+            if let Some(reason) = reason {
+                assert!(text.contains(&format!("flare_kv_codec_inactive_info{{placement=\"{placement}\",reason=\"{reason}\"}} 1\n")));
+            } else {
+                assert!(!text.contains("flare_kv_codec_inactive_info{"));
+            }
+        }
+    }
+
+    #[test]
     fn checkpoint_metrics_report_capture_roles_rejection_reasons_work_and_reservations() {
         let metrics = Metrics::new(0, 0, 0, 16);
         metrics.scheduler(SchedulerStats {
@@ -1771,8 +1939,14 @@ mod tests {
         assert!(!text.contains("flare_host_cache_replay_tokens_total"));
         assert!(text.contains("# TYPE flare_host_cache_parked_records gauge\n"));
         assert!(text.contains("flare_host_cache_parked_records 2\n"));
-        for (i, reason) in ["invalid", "unlinked", "oversize", "budget", "inflight"].iter().enumerate() {
-            assert!(text.contains(&format!("flare_host_cache_pool_refusal_drops_total{{reason=\"{reason}\"}} {}\n", i + 1)));
+        for (i, reason) in ["invalid", "unlinked", "oversize", "budget", "inflight"]
+            .iter()
+            .enumerate()
+        {
+            assert!(text.contains(&format!(
+                "flare_host_cache_pool_refusal_drops_total{{reason=\"{reason}\"}} {}\n",
+                i + 1
+            )));
         }
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
             assert!(text.contains(&format!(

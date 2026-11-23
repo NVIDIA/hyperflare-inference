@@ -606,8 +606,8 @@ mod tests {
                     unit_bytes: unit,
                 })
                 .collect(),
-            codec_fields: Vec::new(),
             placement: Default::default(),
+            codec_fields: Vec::new(),
             snapshot_pages: Vec::new(),
         }
     }
@@ -1254,8 +1254,8 @@ mod tests {
                     unit_bytes: row_bytes,
                 },
                 planes,
-                codec_fields: Vec::new(),
                 placement: Default::default(),
+                codec_fields: Vec::new(),
                 snapshot_pages: Vec::new(),
             };
             let layout =

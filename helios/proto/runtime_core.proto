@@ -230,6 +230,17 @@ message CacheContract {
   uint64 page_tokens = 1;
   repeated HistoryRegion regions = 2;
   repeated PageTableView page_tables = 3;
+  CodecLayout codec_layout = 4;
+}
+message CodecLayout {
+  uint32 revision = 1;
+  repeated CodecField fields = 2;
+}
+message CodecField {
+  string buffer = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  uint32 encoding = 4;
 }
 message HistoryRegion {
   HistoryKind kind = 1;

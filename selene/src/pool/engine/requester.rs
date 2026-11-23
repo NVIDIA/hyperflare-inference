@@ -312,6 +312,7 @@ impl Engine {
         let id = granted.claim_id;
         // A grant for a claim this client no longer holds is never used; its
         // terminal message is answered with an immediate fence.
+        let caps = self.sess.as_ref().and_then(|s| s.codec.as_ref());
         let Some(claim) = self.requester.claims.get_mut(&id) else {
             return;
         };
@@ -325,15 +326,26 @@ impl Engine {
             } else {
                 "the grant names a data channel, which this session does not use"
             })
-        } else if granted.records.iter().any(|r| r.packed.is_some()) {
-            Err("packed grant to a raw-only restore worker")
         } else if !records_match(&claim.coverage.expected, &granted.records)
             || granted.total_pages != claim.total_pages
             || granted.row != claim.wants_row
         {
             Err("the granted records do not match the plan")
         } else {
-            Ok(())
+            claim.coverage.channel_rank = (via_channel && self.ranks.is_some()).then_some(0);
+            let geometry = &self.st.scope.geometry;
+            claim
+                .coverage
+                .select_packed(&granted.records, caps, geometry.page_tokens, || {
+                    geometry
+                        .ranks
+                        .iter()
+                        .map(|r| crate::record::RankSizes {
+                            planes: r.plane_bytes.clone(),
+                            row_bytes: r.row_bytes,
+                        })
+                        .collect()
+                })
         };
         match verdict {
             Err(why) => {
@@ -385,7 +397,13 @@ impl Engine {
 
     /// A window of a claim arrived over the data channel into `slot`: it is a
     /// shared window that lies in the instance's own staging.
-    pub(crate) fn on_net_window(&mut self, claim: u64, window: frame::Window, slot: u32) {
+    pub(crate) fn on_net_window(
+        &mut self,
+        claim: u64,
+        window: frame::Window,
+        slot: u32,
+        packed: Option<wire::PackedWindow>,
+    ) {
         let Some(staging) = self.net.clone() else {
             return;
         };
@@ -393,7 +411,7 @@ impl Engine {
         let ready = wire::WindowReady {
             claim_id: claim,
             window: Some(wire::WindowSpec {
-                packed: None,
+                packed,
                 index: shape.index,
                 region: wire::Region::Staging as i32,
                 offset: staging.offset(slot),
@@ -465,15 +483,6 @@ impl Engine {
             return false;
         }
         let restore = claim.restore;
-        if spec.packed.is_some() {
-            self.fail_restore(
-                restore,
-                Some(id),
-                Error::new("unexpected packed window for raw grant"),
-                wire::CopyOutcome::CopyErrorOutcome,
-            );
-            return false;
-        }
         let dest = match claim.coverage.accept(&spec, page_bytes, row_bytes) {
             Ok(dest) => dest,
             Err(why) => {
@@ -513,6 +522,59 @@ impl Engine {
             );
             return true;
         };
+        if let Some(manifest) = &spec.packed {
+            let bytes = region
+                .bytes(spec.offset, spec.length)
+                .expect("checked above");
+            let jobs = super::super::agent::restore_packets(
+                &spec,
+                manifest,
+                bytes,
+                &claim.pages[dest as usize..],
+                claim.slot,
+                self.ranks.is_some().then_some(0),
+            );
+            let forward: Vec<_> = claim
+                .peers
+                .iter()
+                .filter(|p| p.shared && p.done.is_none())
+                .map(|p| (p.rank, p.xfer))
+                .collect();
+            let window = claim.windows.get_mut(&spec.index).expect("inserted");
+            window.jobs_left = jobs.len() as u32;
+            window.peers_left = forward.iter().map(|p| p.0).collect();
+            claim.jobs_outstanding += jobs.len() as u32;
+            for job in jobs {
+                self.queue_job(
+                    job,
+                    Owner::Claim {
+                        claim: id,
+                        window: spec.index,
+                    },
+                );
+            }
+            for (rank, xfer) in forward {
+                if !self.ranks.as_mut().is_some_and(|r| {
+                    r.send_window(
+                        rank,
+                        super::super::rank::Window {
+                            xfer,
+                            spec: Some(spec.clone()),
+                            sums: None,
+                        },
+                    )
+                }) {
+                    self.fail_restore(
+                        restore,
+                        Some(id),
+                        Error::new("packed rank link closed"),
+                        wire::CopyOutcome::CopyErrorOutcome,
+                    );
+                    break;
+                }
+            }
+            return true;
+        }
         let count = spec.page_count as usize;
         if ready.page_xxh3.len() != count || ready.has_row != spec.row {
             self.fail_restore(

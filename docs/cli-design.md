@@ -743,6 +743,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
+| `--lossless-kv-compression off\|cpu\|gpu` | Offer the checkpoint profile and decode packed restores on the selected processor. GPU workspace refusal selects CPU decode. | `off` |
 | `--prefix-cache-memory SIZE` | Warm host memory for prefix checkpoints and prepared inputs, such as `16G`; `0` disables warm retention | `[prefix_cache] memory`, otherwise `0` |
 | `--prefix-cache-disk DIR` | Directory for prefix checkpoints and prepared inputs on disk | `[paths] prefix_cache`, otherwise disabled |
 | `--prefix-cache-disk-limit SIZE` | Disk retention limit, such as `100G`; `0` disables | `[prefix_cache] disk_limit`, otherwise 10% of free space |

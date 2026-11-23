@@ -40,13 +40,19 @@ use flare_selene::{
     slab::{RankPart, SlabPool, WINDOW_PAGES},
 };
 
+mod codec;
 use crate::cuda::{Event, Stream};
+#[cfg(feature = "server")]
+pub(crate) use codec::codec_metrics;
+#[cfg(all(test, feature = "runtime-core"))]
+pub(crate) use codec::{live_scratch, workspace_parts};
 
 pub use crate::cuda::{BATCH_BYTES, BATCH_ENTRIES};
 
 pub const NICE: i32 = 10;
 
 pub struct Transfers {
+    profile: Option<[u8; 32]>,
     layout: Layout,
     ranks: Vec<RankThread>,
     receiver: Receiver<RankReply>,
@@ -277,6 +283,7 @@ fn lower_priority() {
 }
 
 struct RankWorker {
+    codec: Option<codec::RankCodec>,
     rank: usize,
     geometry: CacheGeometry,
     layout: RankLayout,
@@ -304,6 +311,7 @@ impl RankWorker {
     ) -> Result<Self> {
         let stream = Stream::open_lowest_priority(context, device)?;
         let event = stream.blocking_event()?;
+        let codec = codec::RankCodec::new(context, &stream, &geometry)?;
         let chunks = |bytes: u64| bytes.div_ceil(BATCH_BYTES as u64) as usize;
         let window = geometry
             .planes
@@ -313,6 +321,7 @@ impl RankWorker {
             * WINDOW_PAGES
             + chunks(geometry.row.unit_bytes);
         Ok(Self {
+            codec,
             rank,
             geometry,
             layout,
@@ -328,6 +337,21 @@ impl RankWorker {
 
     /// Issue every batch of the job, then wait for the last one; returns the bytes copied.
     fn run(&mut self, job: &Job) -> Result<u64> {
+        if let Some(window) = &job.codec {
+            return self
+                .codec
+                .as_mut()
+                .ok_or_else(|| invalid("unqualified codec layout"))?
+                .run(
+                    self.rank,
+                    &self.geometry,
+                    &self.layout,
+                    &self.stream,
+                    &self.event,
+                    job,
+                    window,
+                );
+        }
         expand(
             &self.geometry,
             &self.layout,
@@ -443,36 +467,67 @@ impl Transfers {
         layout: Layout,
         parts: Vec<Option<RankPart>>,
     ) -> Result<Self> {
+        Self::reserve(contexts, &geometry, layout.clone())?.bind(geometry, &layout, parts)
+    }
+
+    fn reserve(
+        contexts: &[(usize, i32)],
+        geometry: &[CacheGeometry],
+        layout: Layout,
+    ) -> Result<PendingTransfers> {
+        if contexts.is_empty() || contexts.len() != geometry.len() {
+            return Err(invalid("transfer threads need one context per cache rank"));
+        }
         let (reply_sender, receiver) = mpsc::channel();
         let mut transfers = Self {
+            profile: flare_selene::codec_copy::profile(geometry),
             layout,
             ranks: Vec::with_capacity(contexts.len()),
             receiver,
             pending: HashMap::new(),
         };
-        for (rank, ((&(context, device), geometry), part)) in
-            contexts.iter().zip(geometry).zip(parts).enumerate()
-        {
+        let mut scratch = vec![[0u64; 2]; contexts.len()];
+        let mut bindings = Vec::new();
+        for (rank, (&(context, device), geometry)) in contexts.iter().zip(geometry).enumerate() {
             let layout = transfers.layout.ranks[rank].clone();
+            #[cfg(test)]
+            if transfers.profile.is_some()
+                && geometry.placement == flare_selene::offload::KvCompression::Gpu
+                && FAIL_GPU_RESERVATION.replace(false)
+            {
+                return Err(invalid("injected GPU decode workspace refusal"));
+            }
+            let mut geometry = geometry.clone();
+            if transfers.profile.is_none() {
+                geometry.codec_fields.clear();
+            }
+            let (bind, binding) = mpsc::channel::<(CacheGeometry, Option<RankPart>)>();
             let (sender, jobs) = mpsc::sync_channel(QUEUE_DEPTH);
             let (ready_sender, ready) = mpsc::channel();
             let replies = reply_sender.clone();
             let thread = std::thread::Builder::new()
-                .name(format!("flare-offload-{rank}"))
+                .name(format!("flare-copy-{rank}"))
                 .spawn(move || {
-                    let worker =
-                        match RankWorker::open(rank, context, device, geometry, layout, part) {
-                            Ok(worker) => worker,
-                            Err(error) => {
-                                let _ = ready_sender.send(Err(error));
-                                return;
-                            }
-                        };
+                    let mut worker = match RankWorker::open(
+                        rank, context, device, geometry, layout, None,
+                    ) {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            let _ = ready_sender.send(Err(error));
+                            return;
+                        }
+                    };
                     lower_priority();
-                    if ready_sender.send(Ok(())).is_err() {
+                    let bytes = worker.codec.as_ref().map_or([0; 2], |codec| codec.reserved);
+                    if ready_sender.send(Ok(bytes)).is_err() {
                         return;
                     }
-                    worker.serve(jobs, replies);
+                    if let Ok((mut final_geometry, part)) = binding.recv() {
+                        final_geometry.placement = worker.geometry.placement;
+                        worker.geometry = final_geometry;
+                        worker.part = part;
+                        worker.serve(jobs, replies);
+                    }
                 })
                 .map_err(|error| {
                     Error::caused_by(
@@ -480,26 +535,67 @@ impl Transfers {
                         error,
                     )
                 })?;
-            transfers.ranks.push(RankThread {
+            let worker = RankThread {
                 sender: Some(sender),
                 thread: Some(thread),
                 outstanding: 0,
-            });
+            };
             match ready.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(error),
+                Ok(Ok([host, device])) => {
+                    scratch[rank] = [host, device];
+                }
+                Ok(Err(error)) => {
+                    return Err(invalid(format!("rank {rank} restore workspace: {error}")));
+                }
                 Err(_) => {
                     return Err(invalid(format!(
                         "offload thread for rank {rank} stopped during startup"
                     )));
                 }
             }
+            bindings.push((rank, bind));
+            transfers.ranks.push(worker);
         }
-        Ok(transfers)
+        Ok(PendingTransfers {
+            bindings,
+            transfers,
+            scratch,
+        })
+    }
+}
+
+// Drop the binding senders before joining workers that have not received their final slots.
+pub(crate) struct PendingTransfers {
+    scratch: Vec<[u64; 2]>,
+    bindings: Vec<(usize, Sender<(CacheGeometry, Option<RankPart>)>)>,
+    transfers: Transfers,
+}
+
+impl PendingTransfers {
+    fn bind(
+        self,
+        geometry: Vec<CacheGeometry>,
+        layout: &Layout,
+        parts: Vec<Option<RankPart>>,
+    ) -> Result<Transfers> {
+        if &self.transfers.layout != layout || parts.len() != geometry.len() {
+            return Err(invalid(
+                "reserved codec geometry differs from the final cache",
+            ));
+        }
+        for (rank, sender) in self.bindings {
+            sender
+                .send((geometry[rank].clone(), parts[rank].clone()))
+                .map_err(|_| invalid("reserved transfer worker stopped before binding"))?;
+        }
+        Ok(self.transfers)
     }
 }
 
 impl PageCopier for Transfers {
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.profile
+    }
     fn layout(&self) -> &Layout {
         &self.layout
     }
@@ -697,6 +793,7 @@ mod tests {
 
     fn job(direction: Direction) -> Job {
         Job {
+            codec: None,
             replication: Default::default(),
             id: JobId(9),
             window: 2,
@@ -715,6 +812,7 @@ mod tests {
         let host = pool.slot_address(flare_selene::slab::Slot(0));
         let parts = pool.registered_parts(&layout, device);
         let mut job = Job {
+            codec: None,
             id: JobId(1),
             window: 0,
             direction: Direction::In,
@@ -790,6 +888,7 @@ mod tests {
         let rows: Vec<_> = (0..2).map(|_| pool.allocate_page().unwrap()).collect();
         for (rank, part) in parts.iter().enumerate() {
             let mut job = Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(1),
                 window: 0,
@@ -905,6 +1004,7 @@ mod tests {
         );
         let rows = start + 8 * page_record;
         let job = Job {
+            codec: None,
             replication: Default::default(),
             id: JobId(4),
             window: 0,
@@ -1099,7 +1199,12 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let layout = Layout::new(&[geometry(64, &[("k", 8192)], 4096)]).unwrap();
         let transfers = Transfers {
+            profile: None,
+
             layout,
+
+
+
             ranks: (0..ranks)
                 .map(|_| RankThread {
                     sender: None,
@@ -1222,6 +1327,8 @@ mod tests {
             outstanding: 0,
         };
         let mut transfers = Transfers {
+            profile: None,
+
             layout,
             ranks: vec![rank(accepting), rank(full), rank(disconnected)],
             receiver,
@@ -1396,6 +1503,7 @@ mod tests {
         };
         transfers
             .submit(Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(1),
                 window: 0,
@@ -1456,6 +1564,7 @@ mod tests {
 
         transfers
             .submit(Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(2),
                 window: 0,
@@ -1507,6 +1616,7 @@ mod tests {
         for (id, slot) in [(capacity, 0), (0, rank.row_capacity as u32)] {
             transfers
                 .submit(Job {
+                    codec: None,
                     replication: Default::default(),
                     id: JobId(3 + u64::from(slot != 0)),
                     window: 0,
@@ -1581,8 +1691,8 @@ mod tests {
                     })
                     .collect();
                 geometry.push(CacheGeometry {
-                    codec_fields: Vec::new(),
                     placement: Default::default(),
+                    codec_fields: Vec::new(),
                     snapshot_pages: Vec::new(),
                     page_tokens: 64,
                     page_capacity: PAGES,
@@ -1737,6 +1847,7 @@ mod tests {
             .sum();
         transfers
             .submit(Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(1),
                 window: 0,
@@ -1788,6 +1899,7 @@ mod tests {
 
         transfers
             .submit(Job {
+                codec: None,
                 replication: Default::default(),
                 id: JobId(2),
                 window: 0,
@@ -1887,6 +1999,7 @@ mod tests {
         for parts in [&registered, &split] {
             for (rank, geometry) in ranks.iter().enumerate() {
                 let mut job = Job {
+                    codec: None,
                     replication: Default::default(),
                     id: JobId(1),
                     window: 0,
@@ -1935,12 +2048,77 @@ mod tests {
     }
 }
 
-pub(crate) struct Copiers;
-impl flare_selene::offload::CopierFactory for Copiers {
-    fn mapped(&self, contexts: &[(usize, i32)], geometry: Vec<flare_selene::CacheGeometry>, slabs: &flare_selene::slab::SlabPool) -> flare_selene::Result<flare_selene::SharedCopier> {
-        Ok(std::sync::Arc::new(std::sync::Mutex::new(Transfers::start(contexts, geometry, slabs)?)))
+#[derive(Copy, Clone, Default)]
+pub(crate) struct CodecMemory {
+    pub device: u64,   // per device
+    pub pinned: u64,   // across local ranks
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_GPU_RESERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) enum Copiers {
+    OnDemand,
+    Reserved(std::sync::Mutex<Option<PendingTransfers>>),
+}
+
+impl Copiers {
+    pub(crate) fn reserve(
+        contexts: &[(usize, i32)],
+        geometry: &[CacheGeometry],
+    ) -> Result<(Self, CodecMemory)> {
+        let layout = Layout::new(geometry)?;
+        let worker = Transfers::reserve(contexts, geometry, layout)?;
+        let memory = CodecMemory {
+            device: worker.scratch.iter().map(|s| s[1]).max().unwrap_or(0),
+            pinned: worker.scratch.iter().map(|s| s[0]).sum(),
+        };
+        Ok((Self::Reserved(std::sync::Mutex::new(Some(worker))), memory))
     }
-    fn unmapped(&self, contexts: &[(usize, i32)], geometry: Vec<flare_selene::CacheGeometry>) -> flare_selene::Result<Box<dyn flare_selene::PageCopier>> {
-        Ok(Box::new(Transfers::start_unmapped(contexts, geometry)?))
+
+    fn start(
+        &self,
+        contexts: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+        pool: Option<&SlabPool>,
+    ) -> Result<Transfers> {
+        let layout = Layout::new(&geometry)?;
+        let parts = match pool {
+            Some(pool) => pool.device_parts(&layout)?.into_iter().map(Some).collect(),
+            None => vec![None; contexts.len()],
+        };
+        if let Self::Reserved(workers) = self {
+            return workers
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| invalid("pool copy engine already bound"))?
+                .bind(geometry, &layout, parts);
+        }
+        Transfers::start_parts(contexts, geometry, layout, parts)
+    }
+}
+
+impl flare_selene::offload::CopierFactory for Copiers {
+    fn mapped(
+        &self,
+        contexts: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+        slabs: &SlabPool,
+    ) -> Result<flare_selene::SharedCopier> {
+        Ok(std::sync::Arc::new(std::sync::Mutex::new(self.start(
+            contexts,
+            geometry,
+            Some(slabs),
+        )?)))
+    }
+    fn unmapped(
+        &self,
+        contexts: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+    ) -> Result<Box<dyn PageCopier>> {
+        Ok(Box::new(self.start(contexts, geometry, None)?))
     }
 }

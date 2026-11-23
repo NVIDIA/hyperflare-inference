@@ -156,6 +156,7 @@ impl RankAgent {
             address: config.address,
             ca: config.ca,
             roots,
+            page_tokens: config.scope.geometry.page_tokens,
             fingerprint: config.scope.layout_fingerprint,
             layout,
             rank: config.rank,
@@ -292,7 +293,39 @@ struct Xfer {
     row_bytes: u64,
 }
 
+impl Xfer {
+    fn packed_jobs(
+        &mut self,
+        spec: &wire::WindowSpec,
+        manifest: &wire::PackedWindow,
+        bytes: &[u8],
+        dest: usize,
+        rank: usize,
+        slot: Option<u32>,
+    ) -> Vec<Job> {
+        let jobs = restore_packets(
+            spec,
+            manifest,
+            bytes,
+            &self.pages[dest..],
+            self.slot,
+            Some(rank as u32),
+        );
+        self.windows.insert(
+            spec.index,
+            Win {
+                jobs_left: 0,
+                spec: spec.clone(),
+                slot,
+                persisted: None,
+            },
+        );
+        jobs
+    }
+}
+
 struct Agent {
+    page_tokens: u64,
     address: PoolAddress,
     ca: Option<PathBuf>,
     roots: net::Roots,
@@ -634,7 +667,16 @@ impl Agent {
         };
         let (tx, rx) = mpsc::channel::<wire::RankClientMessage>(256);
         let attach = wire::RankAttach {
-            codec: Some(crate::shared::packed::raw_reader()),
+            codec: Some(crate::codec_copy::reader_caps(
+                self.copier.lock().unwrap().codec_profile(),
+                self.shared.is_none()
+                    && net::can_negotiate_rdma(
+                        hello
+                            .data_transports
+                            .contains(&(wire::DataTransport::Rdma as i32)),
+                        tls.is_some(),
+                    ),
+            )),
             manager_incarnation: hello.manager_incarnation,
             instance_id: bound.instance_id.clone(),
             rank0_nonce: bound.rank0_nonce.clone(),
@@ -898,6 +940,28 @@ impl Agent {
         {
             return self.reject(xfer, "the transfer's record sizes are not this instance's");
         }
+        let mut coverage = Coverage::new(expected);
+        coverage.channel_rank = (!shared).then_some(self.rank as u32);
+        let caps =
+            crate::codec_copy::reader_caps(self.copier.lock().unwrap().codec_profile(), false);
+        if let Err(why) = coverage.select_packed(
+            &open.records,
+            (!out).then_some(&caps),
+            self.page_tokens,
+            || {
+                (0..self.world)
+                    .map(|r| {
+                        let s = self.layout.rank(r);
+                        crate::record::RankSizes {
+                            planes: vec![s.page_len],
+                            row_bytes: s.row_len,
+                        }
+                    })
+                    .collect()
+            },
+        ) {
+            return self.reject(xfer, why);
+        }
         let mut run = Xfer {
             host: open.host,
             records: open.records.clone(),
@@ -905,7 +969,7 @@ impl Agent {
             out,
             kind: open.kind,
             fence_id: open.fence_id,
-            coverage: Coverage::new(expected),
+            coverage,
             pages: open.pages.iter().map(|id| PageId(*id)).collect(),
             slot: open.has_slot.then_some(StateSlotId(open.slot)),
             shared,
@@ -974,6 +1038,11 @@ impl Agent {
         };
         let (count, row) = (spec.page_count as usize, spec.row);
         let rank = self.rank;
+        if let Some(manifest) = &spec.packed {
+            let bytes = region.bytes(spec.offset, spec.length).expect("checked");
+            let jobs = run.packed_jobs(&spec, manifest, bytes, dest, rank, None);
+            return self.queue(xfer, spec.index, jobs);
+        }
         if !run.out {
             // Verify this rank's slices against the transfer checksums before copying.
             let Some(sums) = window.sums else {
@@ -1153,11 +1222,27 @@ impl Agent {
 
     fn on_net(&mut self, event: Event) {
         match event {
+            Event::PackedWindow {
+                claim,
+                shape,
+                manifest,
+                slot,
+            } => self.on_net_window(
+                claim,
+                super::frame::Window {
+                    shape,
+                    page_xxh3: Vec::new(),
+                    row_xxh3: 0,
+                    slot: super::frame::NO_SLOT,
+                },
+                slot,
+                Some(manifest),
+            ),
             Event::Window {
                 claim,
                 window,
                 slot,
-            } => self.on_net_window(claim, window, slot),
+            } => self.on_net_window(claim, window, slot, None),
             Event::End { claim } => {
                 if let Some(run) = self.xfers.get_mut(&claim) {
                     run.ended = true;
@@ -1213,7 +1298,13 @@ impl Agent {
     }
 
     /// A window of an incoming claim arrived whole in a slot of this agent's staging.
-    fn on_net_window(&mut self, xfer: u64, window: super::frame::Window, slot: u32) {
+    fn on_net_window(
+        &mut self,
+        xfer: u64,
+        window: super::frame::Window,
+        slot: u32,
+        packed: Option<wire::PackedWindow>,
+    ) {
         let Some(staging) = self.staging.clone() else {
             return;
         };
@@ -1227,7 +1318,7 @@ impl Agent {
         }
         let shape = window.shape;
         let spec = wire::WindowSpec {
-            packed: None,
+            packed,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -1249,6 +1340,10 @@ impl Agent {
             .region()
             .bytes(spec.offset, spec.length)
             .expect("a slot of the staging");
+        if let Some(manifest) = &spec.packed {
+            let jobs = run.packed_jobs(&spec, manifest, bytes, dest, rank, Some(slot));
+            return self.queue(xfer, spec.index, jobs);
+        }
         let page_len = mine.page_len as usize;
         let sums = self.layout.packed_sums(rank, bytes, count as u32, row);
         let bad = sums.map_or(true, |sums| {
@@ -1665,8 +1760,70 @@ impl Agent {
     }
 }
 
-/// Copier jobs for one window: pages and then the row, at most [`WINDOW_PAGES`] pages each.
-#[allow(clippy::too_many_arguments)]
+pub(crate) fn restore_packets(
+    spec: &wire::WindowSpec,
+    manifest: &wire::PackedWindow,
+    bytes: &[u8],
+    pages: &[PageId],
+    slot: Option<StateSlotId>,
+    local_rank: Option<u32>,
+) -> Vec<Job> {
+    // Coverage::accept checked the manifest against the pinned selection and window length.
+    let expected = &manifest.units;
+    // The window remains leased until all these copier jobs have fenced.
+    let mut offset = 0;
+    let mut packets: Vec<_> = expected
+        .iter()
+        .map(|unit| {
+            let length = unit.stored_length as usize;
+            let address = bytes[offset..].as_ptr() as usize;
+            offset += length;
+            crate::codec_copy::PinnedPacket {
+                unit: unit.clone(),
+                spans: vec![(address, length)],
+            }
+        })
+        .collect();
+    if let Some(rank) = local_rank {
+        packets.retain(|p| p.unit.stored_rank == rank || p.unit.replicas.contains(&rank));
+        for p in &mut packets {
+            p.unit.stored_rank = 0;
+            p.unit.replicas.clear();
+        }
+    }
+    let mut first = expected
+        .iter()
+        .find(|u| u.kind == 0)
+        .map_or(0, |u| u.logical_index);
+    let mut jobs = jobs_of(
+        Direction::In,
+        spec.index,
+        spec.page_count as usize,
+        spec.row,
+        |i| pages[i],
+        slot,
+        |_| 0,
+        0,
+    );
+    for j in &mut jobs {
+        let end = first + j.pages.len() as u64;
+        let selected = packets
+            .iter()
+            .filter(|p| {
+                if p.unit.kind == 1 {
+                    j.row.is_some()
+                } else {
+                    (first..end).contains(&p.unit.logical_index)
+                }
+            })
+            .cloned()
+            .collect();
+        j.codec = Some(crate::codec_copy::Window::restore_pinned(first, selected));
+        first = end;
+    }
+    jobs
+}
+
 pub(crate) fn jobs_of(
     direction: Direction,
     window: u32,
@@ -1692,6 +1849,7 @@ pub(crate) fn jobs_of(
             )
         });
         jobs.push(Job {
+            codec: None,
             replication: Default::default(),
             id: JobId(0),
             window,

@@ -3022,7 +3022,9 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
     let mut worker = fixture.worker(receiver);
     let checkpoint = unpinned_checkpoint(&mut worker, 0, 70);
     let key = worker.scheduler.publication(checkpoint).unwrap().key;
-    let mut store = FakeStore::new(None);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&[0; 70], &[]).unwrap();
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
     store.pooled = true;
     store.pending_tickets = true;
     worker.attach_store(Some(Box::new(store)));
@@ -3035,6 +3037,8 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
     assert!(worker.active[0].is_some());
     assert!(fake_store(&mut worker).tickets_seen.is_empty());
     assert_eq!(fake_store(&mut worker).reused, [key]);
+    // Both host decoders are downstream of fetch.
+    assert!(fake_store(&mut worker).fetched.is_empty());
 }
 
 #[test]

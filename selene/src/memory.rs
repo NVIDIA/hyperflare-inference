@@ -1345,6 +1345,7 @@ fn windows(
     while let Some(chunk) = chunks.next() {
         let last = chunks.peek().is_none();
         queued.push_back(Job {
+            codec: None,
             replication: Default::default(),
             id,
             window: queued.len() as u32,
@@ -1355,6 +1356,7 @@ fn windows(
     }
     if queued.is_empty() && row.is_some() {
         queued.push_back(Job {
+            codec: None,
             replication: Default::default(),
             id,
             window: 0,

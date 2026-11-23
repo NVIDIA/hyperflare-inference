@@ -24,6 +24,8 @@ pub struct NativeModel {
     pub(super) server_config: serde_json::Value,
     engram: Vec<(std::sync::Arc<crate::engram::Shared>, usize)>,
     pub(super) offload: flare_selene::offload::Startup,
+    pub(super) codec_copiers: Option<std::sync::Arc<crate::offload::transfer::Copiers>>,
+    pub(super) codec_workspace_error: Option<String>,
     cluster: Option<ClusterRank>,
     roce: Vec<Option<RoceSpec>>,
 }
@@ -603,6 +605,8 @@ impl NativeModel {
             server_config,
             engram: Vec::new(),
             offload: Default::default(),
+            codec_copiers: None,
+            codec_workspace_error: None,
             cluster,
             roce,
         };
@@ -867,9 +871,24 @@ impl NativeModel {
             staging,
             shard,
         )?;
-        let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
-        phase.finish(summary);
+        phase.finish(self.attach_offload(prepared)?);
         Ok(())
+    }
+
+    fn attach_offload(&mut self, mut prepared: crate::offload::Preparation) -> Result<String> {
+        let reserved = self.codec_copiers.take();
+        if let crate::offload::Preparation::Store(store) = &mut prepared {
+            store.reserved_copiers = reserved.map(|f| f as _);
+            store.codec_workspace_error = self.codec_workspace_error.take();
+            if store.codec_workspace_error.is_some() {
+                for rank in &mut store.geometry {
+                    rank.placement = crate::offload::KvCompression::Cpu;
+                }
+            }
+        }
+        Ok(self
+            .offload
+            .attach(prepared, &crate::offload::transfer::Copiers::OnDemand)?)
     }
 
     fn parallel<F: super::payload::Files>(
@@ -957,6 +976,7 @@ impl NativeModel {
 
 impl Drop for NativeModel {
     fn drop(&mut self) {
+        self.codec_copiers.take();
         self.offload.reset();
         self.engram.clear();
         // Phase 1: destroy graphs, modules, and peer-accessible mappings across every rank
@@ -1081,6 +1101,10 @@ fn validate_peer_memory(cores: &[Core], peers: &[protobuf::wire::PeerMemory]) ->
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "codec_workspace_tests.rs"]
+mod codec_workspace_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,12 +1201,15 @@ mod tests {
             server_config: serde_json::Value::Null,
             engram: Vec::new(),
             offload: Default::default(),
+            codec_copiers: None,
+            codec_workspace_error: None,
             cluster: None,
             roce: Vec::new(),
         };
         for prefix_cache in [
             crate::offload::PrefixCacheOffload::default(),
             crate::offload::PrefixCacheOffload {
+                compression: Default::default(),
                 memory_bytes: Some(0),
                 disk: Some("unopened-prefix-cache".into()),
                 disk_limit: Some(0),

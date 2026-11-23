@@ -501,6 +501,7 @@ impl OutboundRecord {
                     return Ok(false);
                 };
                 let job = copier::Job {
+                    codec: None,
                     replication: Default::default(),
                     id,
                     window: index,
@@ -949,6 +950,7 @@ impl InboundRecord {
         }
         let plan = window.plan;
         resources.submit_transfer(copier::Job {
+            codec: None,
             replication: Default::default(),
             id,
             window: plan.index,
@@ -1523,21 +1525,29 @@ impl DiskStore {
     ) -> Result<Self> {
         let layout = Layout::new(&geometry)?;
         let mut index = Index::new(layout.page_tokens);
+        let total = scanned.len();
+        let mut raw = Vec::with_capacity(total);
+        for record in scanned {
+            if record.header.packed.is_some() {
+                record::remove(&record.path)?;
+            } else {
+                raw.push(record);
+            }
+        }
+        let scanned = if raw.len() < total {
+            record::remove_orphans(raw)?
+        } else {
+            raw
+        };
         let mut used = 0u64;
         for record in &scanned {
-            // Until this copier has a decoder, it cannot restore this root or its dependents.
-            let ready = record.header.packed.is_none()
-                && record
-                    .header
-                    .parent
-                    .is_none_or(|k| index.node(&k).is_some_and(|n| n.ready));
             index.insert(
                 record.header.key,
                 record.header.parent,
                 record.header.bucket,
                 record.header.tail_pages as usize,
                 record.row,
-                ready,
+                true,
                 DiskRecord {
                     path: record.path.clone(),
                     header: record.header.clone(),
@@ -3052,6 +3062,58 @@ mod tests {
         )
         .unwrap();
         (store, log)
+    }
+
+    #[test]
+    fn recovery_removes_a_local_v4_parent_and_its_raw_child() {
+        let dir = directory();
+        let lock = crate::testing::directory_lock(&dir).unwrap();
+        let history = history(2 * PAGE_TOKENS);
+        let geo = geometry();
+        let parent = header(&geo, &history, PAGE_TOKENS, None);
+        let child = header(&geo, &history, 2 * PAGE_TOKENS, Some(PAGE_TOKENS));
+        let unit = crate::shared::wire::PackedUnit {
+            original_length: parent.page_record_bytes(),
+            stored_length: 1,
+            representation: 1,
+            profile: vec![3; 32],
+            ..Default::default()
+        };
+        let parent = parent
+            .with_packed(crate::shared::wire::PackedOffer {
+                first_page: 0,
+                units: vec![unit],
+            })
+            .unwrap();
+        let parent_path = dir.join(record::file_name(&parent.key));
+        let mut bytes = parent.packed_metadata().unwrap();
+        bytes.push(0);
+        fs::write(&parent_path, bytes).unwrap();
+        let child_path = dir.join(record::file_name(&child.key));
+        let mut bytes = vec![0; child.length(true) as usize];
+        bytes[..4096].copy_from_slice(&child.encode().unwrap());
+        fs::write(&child_path, bytes).unwrap();
+        let scanned = record::scan(
+            &lock,
+            &IDENTITY,
+            &FINGERPRINT,
+            PAGE_TOKENS,
+            &record::rank_sizes(&geo),
+        )
+        .unwrap();
+        assert_eq!(scanned.len(), 2);
+        let store = DiskStore::new(
+            lock,
+            IDENTITY,
+            FINGERPRINT,
+            1 << 20,
+            geo,
+            scanned,
+            Box::new(Recorder(Default::default())),
+        )
+        .unwrap();
+        assert!(store.index.is_empty());
+        assert!(!parent_path.exists() && !child_path.exists());
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub enum Direction {
 pub struct Job {
     pub id: JobId,
     pub window: u32,
+    pub codec: Option<crate::codec_copy::Window>,
     pub direction: Direction,
     /// Inbound pages and row contain one verified share, reused by every local rank.
     pub replication: crate::record::Replication,
@@ -59,6 +60,12 @@ pub trait PageCopier: Send {
     /// The cross-rank record layout the copier moves.
     fn layout(&self) -> &Layout;
 
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        None
+    }
+    fn codec_layout(&self) -> Option<crate::shared::wire::CodecLayout> {
+        None
+    }
     /// Queue the job on every rank without waiting.
     ///
     /// `Err` means the job was rejected and no reply follows. After `Ok`,

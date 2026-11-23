@@ -107,11 +107,25 @@ impl Engine {
     pub(crate) fn collect_net(&mut self) {
         for event in self.net_events.take() {
             match event {
+                Event::PackedWindow {
+                    claim,
+                    shape,
+                    manifest,
+                    slot,
+                } => {
+                    let window = super::super::frame::Window {
+                        shape,
+                        page_xxh3: Vec::new(),
+                        row_xxh3: 0,
+                        slot: super::super::frame::NO_SLOT,
+                    };
+                    self.on_net_window(claim, window, slot, Some(manifest))
+                }
                 Event::Window {
                     claim,
                     window,
                     slot,
-                } => self.on_net_window(claim, window, slot),
+                } => self.on_net_window(claim, window, slot, None),
                 Event::End { claim } => self.on_net_end(claim),
                 Event::Granted { id, shape, slot } => match id {
                     Id::Export(export) => self.on_export_grant(export, shape, slot),

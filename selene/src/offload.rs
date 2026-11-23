@@ -64,6 +64,7 @@ impl std::fmt::Display for KvCompression {
 /// staged transport.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrefixCacheOffload {
+    pub compression: KvCompression,
     /// Host retention budget shared by registered checkpoints and ordinary CPU inputs.
     /// Zero selects no memory retention.
     pub memory_bytes: Option<u64>,
@@ -228,6 +229,9 @@ pub struct Resolved {
 /// turns into a store: registered pools, the scanned record directory, and
 /// every rank's geometry and CUDA context.
 pub struct Prepared {
+    pub reserved_copiers: Option<std::sync::Arc<dyn CopierFactory + Send + Sync>>,
+    pub codec_workspace_error: Option<String>,
+    pub compression: KvCompression,
     pub inputs: Option<input::InputStore>,
     pub disk_budget: std::sync::Arc<input::DiskBudget>,
     pub resolved: Resolved,
@@ -440,7 +444,7 @@ pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
     core: &std::path::Path,
     identity: [u8; 32],
-    geometry: Vec<CacheGeometry>,
+    mut geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
     max_active: usize,
     input_staging: u64,
@@ -451,6 +455,9 @@ pub fn prepare_with_inputs(
         return Ok(Preparation::None("disabled".to_owned()));
     }
     let _ = core;
+    for rank in &mut geometry {
+        rank.placement = options.compression;
+    }
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
         (None, _) => geometry::fingerprint(&geometry),
@@ -550,6 +557,9 @@ pub fn prepare_with_inputs(
         inputs.retain_directory(guard.clone());
     }
     Ok(Preparation::Store(Box::new(Prepared {
+        reserved_copiers: None,
+        codec_workspace_error: None,
+        compression: options.compression,
         inputs,
         drain_on_shutdown: options.drain_on_shutdown,
         max_age: options.max_age,
@@ -592,6 +602,9 @@ fn free_space(path: &std::path::Path) -> Result<u64> {
 /// transfer threads on every rank's context.
 pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn HostStore>> {
     let Prepared {
+        reserved_copiers,
+        codec_workspace_error: _,
+        compression: _,
         inputs: _,
         drain_on_shutdown,
         max_age,
@@ -610,8 +623,16 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         shards,
         pool,
     } = prepared;
+    let restore_factory = reserved_copiers
+        .as_deref()
+        .map_or(factory, |f| f as &dyn CopierFactory);
     if let Some(pool) = &pool {
-        pool.start_copies(&contexts, geometry.clone(), factory)?;
+        pool.start_copies(&contexts, geometry.clone(), restore_factory)?;
+    }
+    let mut raw = geometry.clone();
+    for rank in &mut raw {
+        rank.codec_fields.clear();
+        rank.placement = KvCompression::Off;
     }
     // Inside a composite the disk index owns the tree; memory nodes are flat.
     let capture = pool.is_some() && warm_bytes == 0 && directory_lock.is_none();
@@ -619,7 +640,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         .as_ref()
         .filter(|_| warm_bytes != 0 || capture)
         .map(|pool| {
-            let transfers = factory.mapped(&contexts, geometry.clone(), pool)?;
+            let transfers = factory.mapped(&contexts, raw.clone(), pool)?;
             let mut store = memory::MemoryStore::open(
                 identity, pool.clone(), transfers, directory_lock.is_some(), capture,
             )?;
@@ -631,7 +652,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         .map(|directory| {
             let disk_transfers = factory.mapped(
                 &contexts,
-                geometry.clone(),
+                raw.clone(),
                 memory_pool
                     .as_ref()
                     .ok_or("disk transfers require a slot pool")?,
@@ -770,6 +791,10 @@ impl Startup {
         if let Preparation::Store(store) = &mut preparation
             && let Some(mut pool) = self.pool.take()
         {
+            let reserved = store.reserved_copiers.clone();
+            let factory = reserved
+                .as_deref()
+                .map_or(factory, |f| f as &dyn CopierFactory);
             pool.prepare_peer(store, factory)?;
             store.pool = Some(pool);
         }

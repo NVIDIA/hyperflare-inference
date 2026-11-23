@@ -209,6 +209,11 @@
     single-process instance of the same TP width: restore a record written by
     one into the other.
 
+[ ] Qualify manager CPU write-back under peak GLM-5.3-Flash TP4 row load.
+    Measure packed bytes, raw bytes by cause and time under pressure. Restart
+    Flare and the manager with a packed row on disk, confirm that row is
+    restored and compare the top-five log probabilities before and after.
+
 [ ] Resolve pool-only host retention for ranks on separate hosts.
     prefix-cache-offload.md section 1 allows it, while ModelRuntime::start in
     helios/src/server/runtime.rs requires shard links that

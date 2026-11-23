@@ -680,6 +680,22 @@ impl ModelRuntime {
                     .as_ref()
                     .and_then(|binding| binding.take())
                     .map(|prepared| {
+                        worker_metrics.configure_codec(
+                            if prepared.pool.is_some() {
+                                prepared.compression
+                            } else {
+                                crate::offload::KvCompression::Off
+                            },
+                            worker_config
+                                .contract
+                                .cache
+                                .codec_layout
+                                .as_ref()
+                                .map(|l| l.revision),
+                            &prepared.geometry,
+                            prepared.codec_workspace_error.as_deref(),
+                            |warning| eprintln!("warning: {warning}"),
+                        );
                         if let Some(warning) =
                             prepared.intake_warning(worker_config.limits.max_active)
                         {
@@ -1238,7 +1254,10 @@ impl<'a> Worker<'a> {
             return;
         }
         shutdown.drained = false;
-        match store.close() {
+        let closed = store.close();
+        let stats = store.stats();
+        self.metrics.store(stats);
+        match closed {
             Ok(()) => {
                 shutdown.drained = true;
                 drop(std::mem::ManuallyDrop::into_inner(store));

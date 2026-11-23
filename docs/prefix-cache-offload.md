@@ -35,11 +35,21 @@ starts the pool at load time (`pool.rs`).
 Host offload requires explicit configuration: `flare run` retains no host
 records unless a memory size, disk directory, or pool is configured. Derived
 default sizes and a default record directory are designed, not implemented
-(section 2.11). Host offload does not change the contracts of preparation,
-captured graphs, or the runtime core format. The
+(section 2.11). Preparation can include an optional codec layout for qualified
+recipes. Captured graphs continue to use the raw checkpoint layout. The
 [core design](core-design.md#4-prefix-checkpoints-and-complete-model-state)
 defines checkpoint contents and ownership; the [CLI design](cli-design.md)
 defines configuration precedence.
+
+## Packed checkpoint restores
+
+Flare captures raw pages and continuation rows in DRAM, in local NVMe files and in puts to the Selene manager. The manager can encode a raw arena record when it writes the record to NVMe. With a qualified layout, `--lossless-kv-compression gpu|cpu` offers the profile and layout to the manager so it can write files the instance can restore. The default, `off`, requests raw records.
+
+Packed records travel through pool windows in their stored representation. Each rank checks and restores the selected page shares and endpoint row. GPU placement batches page packets, overlaps upload with decode, and scatters the decoded bytes after checksum verification. CPU placement checks and decodes packets into pinned scratch before copying them to the GPU. Both hold the source windows until all participating ranks have fenced their transfers.
+
+For a pool restore tier, the loader reserves decode scratch before allocating KV pages. If GPU reservation fails, it reserves CPU scratch and keeps the profile offer. Startup logs the reason, and `flare_kv_codec_active{placement="cpu"}` reports the effective placement. An unsupported layout is reported by `flare_kv_codec_inactive_info`. Codec transfer metrics with `boundary="out"` count restores.
+
+Shared memory and TCP carry the selected stored bytes. RDMA sessions advertise raw-only capability. Flare writes raw local NVMe files. During recovery it prunes local v4 files, dependent records and page-only leaves that no longer lead to a row.
 
 ## 1. Scope and configurations
 
@@ -850,7 +860,7 @@ Offload limits interference through bounded work and explicit ownership:
 - Ticket resources belong to the scheduler until `finish_inbound`.
 - A restored endpoint's row and pages describe the same token prefix. GPU
   ancestor pages are retained, and only the missing page suffix is uploaded.
-- Rows and pages are stored byte-exact; no compression or requantization.
+- Storage compression preserves every byte; state is never requantized.
 - Record files are keyed by model and execution-state identity plus layout
   fingerprint; incompatible state is never restored. Each record directory
   has one process owner through its complete I/O lifetime.

@@ -6,7 +6,10 @@
 
 //! Choose physical cache capacities within reserved virtual address ranges.
 
-use flare_selene::{CacheGeometry, Plane};
+use std::collections::HashMap;
+
+use crate::model::contract::CodecLayout;
+use flare_selene::{CacheGeometry, Plane, geometry::CodecField};
 use super::{
     KvCacheLimit, LoadOptions, MemoryLimit, NativeModel, NativeResources,
     format::{Memory, Core, invalid},
@@ -18,7 +21,7 @@ use crate::{
 
 // Graphs are uploaded before sizing caches; leave room for driver bookkeeping
 // and the execution streams and events created when the server starts.
-const HEADROOM_BYTES: u64 = 64 << 20;
+pub(super) const HEADROOM_BYTES: u64 = 64 << 20;
 // A GPU that allocates from system memory (GB10) shares it with the operating system and with
 // the server's host allocations made after sizing: frontend workers, tokenizers and request
 // buffers took about 1.4 GiB on a DGX Spark. Caches leave room for both beyond the reserve.
@@ -230,6 +233,10 @@ fn fixed_bytes(core: &Core, integrated: bool) -> Result<u64> {
                 .checked_add(a.nbytes as u64)
                 .ok_or_else(|| invalid("fixed model memory overflows the device budget"))
         })
+}
+
+fn live_charge(before: u64, after: u64, owned: u64) -> u64 {
+    owned.max(before.saturating_sub(after))
 }
 
 fn limited_budget(
@@ -631,24 +638,46 @@ impl NativeModel {
         let ceiling = page_ceiling(options.kv_cache_limit, context, active as u64, &contract)?;
         let minimum_pages = ceiling.map_or(active as u64 * 8192u64.div_ceil(page_tokens), |limit| limit.minimum);
         let capture = options.prefix_cache.pool_only() && self.cluster().is_none();
-        let (offload_bytes, offload_host, tier_host) = if options.prefix_cache.enabled() {
-            let geometry = cores
+        let cfg = &options.prefix_cache;
+        let compression_requested =
+            cfg.pool.is_some() && cfg.compression != crate::offload::KvCompression::Off;
+        let codec_layout = if compression_requested {
+            contract.cache.codec_layout.as_ref()
+        } else {
+            None
+        };
+        let mut geometry = if cfg.enabled() {
+            let execution_rows = (active as u64)
+                .checked_mul(width)
+                .and_then(|n| n.checked_add(1))
+                .filter(|&rows| rows < u32::MAX as u64)
+                .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?;
+            cores
                 .iter()
                 .map(|core| {
                     cache_geometry(
                         core,
                         contract.cache.page_tokens as u64,
-                        (active as u64).checked_mul(width).and_then(|rows| rows.checked_add(1))
-                            .filter(|&rows| rows < u32::MAX as u64)
-                            .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?,
+                        execution_rows,
                         1,
+                        codec_layout,
                     )
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        for g in &mut geometry {
+            g.placement = cfg.compression;
+        }
+        let qualified =
+            compression_requested && flare_selene::codec_copy::profile(&geometry).is_some();
+        let (offload_bytes, offload_host, tier_host) = if cfg.enabled() {
+            let layout = flare_selene::Layout::new(&geometry)?;
             let staging = input_window;
             let (device, tier_host) = options.prefix_cache.headroom_with_inputs(
                 self.ranks.len(),
-                &flare_selene::Layout::new(&geometry)?,
+                &layout,
                 active,
                 staging != 0,
                 capture.then_some(minimum_pages),
@@ -678,69 +707,150 @@ impl NativeModel {
             .checked_add(input_window)
             .and_then(|bytes| bytes.checked_add(source_window))
             .ok_or_else(|| invalid("CPU image input windows overflow host memory"))?;
-        let mut available = Vec::new();
-        let mut loaded_bytes = Vec::new();
-        for (index, (rank, core)) in self.ranks.iter().zip(cores.iter()).enumerate() {
-            let (memory, loaded, future, share) = if rank.integrated {
-                let memory = MemorySnapshot {
-                    free: observations
+        let remaining = |live: crate::offload::transfer::CodecMemory| -> Result<_> {
+            // Charge at least the owned allocations. CUDA can also acquire context, module
+            // and mapping memory while the lanes open. Count that observed growth once.
+            let updated;
+            let after = if qualified {
+                updated = self
+                    .ranks
+                    .iter()
+                    .map(|rank| unsafe { rank.memory_snapshot() })
+                    .collect::<Result<Vec<_>>>()?;
+                &updated
+            } else {
+                &observations
+            };
+            let mut available = Vec::new();
+            let mut loaded_bytes = Vec::new();
+            for (index, (rank, core)) in self.ranks.iter().zip(cores.iter()).enumerate() {
+                let (memory, loaded, future, share) = if rank.integrated {
+                    let memory = MemorySnapshot {
+                        free: observations
+                            .iter()
+                            .zip(&self.ranks)
+                            .filter(|(_, r)| r.integrated)
+                            .map(|(m, _)| m.free)
+                            .min()
+                            .unwrap(),
+                        total: observations[index].total,
+                    };
+                    let fixed = cores
                         .iter()
                         .zip(&self.ranks)
                         .filter(|(_, r)| r.integrated)
-                        .map(|(m, _)| m.free)
-                        .min()
-                        .unwrap(),
-                    total: observations[index].total,
-                };
-                let fixed = cores
-                    .iter()
-                    .zip(&self.ranks)
-                    .filter(|(_, r)| r.integrated)
-                    .try_fold(0u64, |n, (p, _)| {
-                        fixed_bytes(p, true).and_then(|bytes| {
-                            n.checked_add(bytes)
-                                .ok_or_else(|| invalid("shared fixed memory overflow"))
-                        })
+                        .try_fold(0u64, |n, (p, _)| {
+                            fixed_bytes(p, true).and_then(|bytes| {
+                                n.checked_add(bytes)
+                                    .ok_or_else(|| invalid("shared fixed memory overflow"))
+                            })
+                        })?;
+                    let fixed = fixed.checked_add(embedding_host_bytes).ok_or_else(|| {
+                        invalid("resident host memory overflows the shared budget")
                     })?;
-                let fixed = fixed
-                    .checked_add(embedding_host_bytes)
-                    .ok_or_else(|| invalid("resident host memory overflows the shared budget"))?;
-                (
-                    memory,
-                    fixed.max(initial[index].free.saturating_sub(memory.free)),
-                    offload_bytes
-                        .saturating_mul(integrated)
-                        .saturating_add(host_future),
-                    integrated,
-                )
-            } else {
-                (
-                    observations[index],
-                    fixed_bytes(core, false)?
-                        .max(initial[index].free.saturating_sub(observations[index].free)),
-                    offload_bytes,
-                    1,
-                )
+                    (
+                        memory,
+                        fixed.max(initial[index].free.saturating_sub(memory.free)),
+                        offload_bytes
+                            .saturating_mul(integrated)
+                            .saturating_add(host_future)
+                            .saturating_add(live_charge(
+                                memory.free,
+                                after
+                                    .iter()
+                                    .zip(&self.ranks)
+                                    .filter(|(_, r)| r.integrated)
+                                    .map(|(m, _)| m.free)
+                                    .min()
+                                    .unwrap(),
+                                live.device
+                                    .saturating_mul(integrated)
+                                    .saturating_add(live.pinned),
+                            )),
+                        integrated,
+                    )
+                } else {
+                    (
+                        observations[index],
+                        fixed_bytes(core, false)?
+                            .max(initial[index].free.saturating_sub(observations[index].free)),
+                        offload_bytes.saturating_add(live_charge(
+                            observations[index].free,
+                            after[index].free,
+                            live.device,
+                        )),
+                        1,
+                    )
+                };
+                available.push(
+                    limited_budget(
+                        memory,
+                        loaded,
+                        options.memory_limit,
+                        reserve,
+                        rank.integrated,
+                        future,
+                    )? / share,
+                );
+                loaded_bytes.push(loaded / share);
+            }
+            Ok((available, loaded_bytes, host_future))
+        };
+        let qualified = match self.cluster() {
+            Some(cluster) if compression_requested => agree.pool_approved(qualified, cluster.world)?,
+            _ => qualified,
+        };
+        let reservation = if qualified {
+            let contexts: Vec<_> = self.ranks.iter().map(|rank| rank.context_handle()).collect();
+            let reserve = |geometry: &[CacheGeometry]| {
+                let (workers, live) =
+                    crate::offload::transfer::Copiers::reserve(&contexts, geometry)?;
+                let budget = remaining(live)?;
+                capacities(cores, &budget.0, active as u64, width, page_tokens, ceiling, |_, _| Some(0))?;
+                Ok::<_, crate::Error>((workers, budget))
             };
-            available.push(
-                limited_budget(
-                    memory,
-                    loaded,
-                    options.memory_limit,
-                    reserve,
-                    rank.integrated,
-                    future,
-                )? / share,
-            );
-            loaded_bytes.push(loaded / share);
-        }
-        let geometry = if options.prefix_cache.pool.is_some() {
-            cores
-                .iter()
-                .map(|core| cache_geometry(core, contract.cache.page_tokens as u64, 1, 1))
-                .collect::<Result<Vec<_>>>()?
+            let reservation = reserve(&geometry);
+            let approved = match self.cluster() {
+                Some(cluster) => agree.pool_approved(reservation.is_ok(), cluster.world)?,
+                None => reservation.is_ok(),
+            };
+            if approved {
+                Some(reservation?)
+            } else {
+                // Release successful sibling reservations before charging the fallback.
+                let reason = reservation.err().map_or_else(
+                    || "a peer rank could not reserve its decode workspace".to_owned(),
+                    |error| error.to_string(),
+                );
+                self.codec_workspace_error = Some(reason);
+                if cfg.compression == crate::offload::KvCompression::Gpu {
+                    for rank in &mut geometry {
+                        rank.placement = crate::offload::KvCompression::Cpu;
+                    }
+                    let cpu = reserve(&geometry);
+                    if let Some(cluster) = self.cluster()
+                        && !agree.pool_approved(cpu.is_ok(), cluster.world)?
+                    {
+                        return Err(cpu.err().unwrap_or_else(|| {
+                            invalid("a peer rank could not reserve CPU decode scratch")
+                        }));
+                    }
+                    Some(cpu?)
+                } else {
+                    None
+                }
+            }
         } else {
-            Vec::new()
+            None
+        };
+        let (mut available, loaded_bytes, host_future) = if let Some((workers, budget)) = reservation {
+            self.codec_copiers = Some(std::sync::Arc::new(workers));
+            budget
+        } else {
+            for rank in &mut geometry {
+                rank.codec_fields.clear();
+            }
+            remaining(Default::default())?
         };
         let peers = if let Some(cluster) = self.cluster() {
             agree.pool(crate::offload::shard::PoolOffer {
@@ -750,7 +860,7 @@ impl NativeModel {
                 } else {
                     [0; 32]
                 },
-                layout: if geometry.is_empty() {
+                layout: if options.prefix_cache.pool.is_none() {
                     [0; 16]
                 } else {
                     flare_selene::geometry::fingerprint(&geometry)
@@ -913,7 +1023,14 @@ impl NativeModel {
         progress.phase("Plan cache", None).finish(summary);
         unsafe {
             self.allocate_cache_capacity(
-                cores, progress, &contract, rows, pages, execution, &limiting,
+                cores,
+                progress,
+                &contract,
+                codec_layout.filter(|_| self.codec_copiers.is_some()),
+                rows,
+                pages,
+                execution,
+                &limiting,
             )
         }
     }
@@ -923,6 +1040,7 @@ impl NativeModel {
         cores: &mut [Core],
         progress: &StartupProgress,
         contract: &crate::model::PreparedContract,
+        codec_layout: Option<&CodecLayout>,
         rows: u64,
         pages: u64,
         execution: u64,
@@ -934,7 +1052,7 @@ impl NativeModel {
         let logical_page_tokens = contract.cache.page_tokens as u64;
         let mut geometry = cores
             .iter()
-            .map(|core| cache_geometry(core, logical_page_tokens, rows, pages))
+            .map(|core| cache_geometry(core, logical_page_tokens, rows, pages, codec_layout))
             .collect::<Result<Vec<_>>>()?;
         let mut layouts = cores
             .iter()
@@ -1089,13 +1207,54 @@ impl NativeModel {
     }
 }
 
+/// Codec fields name execution buffers. Each rank binds those views to its own allocations.
+fn codec_fields(core: &Core, layout: &CodecLayout) -> Option<Vec<CodecField>> {
+    if layout.revision != 1 {
+        return None;
+    }
+    let buffers: HashMap<_, _> = core
+        .execution
+        .as_ref()?
+        .buffers
+        .iter()
+        .map(|buffer| (buffer.name.as_str(), buffer))
+        .collect();
+    let units: HashMap<_, _> = core
+        .allocations
+        .iter()
+        .filter_map(|a| Some((a.name.as_str(), a.sizing.as_ref()?.unit_bytes)))
+        .collect();
+    layout
+        .fields
+        .iter()
+        .map(|field| {
+            let view = buffers.get(field.buffer.as_str())?;
+            let reference = view.reference.as_ref()?;
+            let offset = reference.offset.checked_add(field.offset)?;
+            let unit = *units.get(reference.allocation.as_str())?;
+            if field.offset.checked_add(field.length)? > view.nbytes
+                || offset.checked_add(field.length)? > unit
+            {
+                return None;
+            }
+            Some(CodecField {
+                buffer: reference.allocation.clone(),
+                offset,
+                length: field.length,
+                encoding: field.encoding,
+            })
+        })
+        .collect()
+}
+
 /// The row plane and page planes of one rank in name order, read before
 /// the sizing records are consumed. Peer allocations never carry sizing.
-fn cache_geometry(
+pub(super) fn cache_geometry(
     core: &Core,
     page_tokens: u64,
     rows: u64,
     pages: u64,
+    layout: Option<&CodecLayout>,
 ) -> Result<CacheGeometry> {
     let mut row = None;
     let mut planes = Vec::new();
@@ -1122,8 +1281,10 @@ fn cache_geometry(
     }
     planes.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let geometry = CacheGeometry {
-        codec_fields: Vec::new(),
         placement: Default::default(),
+        codec_fields: layout
+            .and_then(|l| codec_fields(core, l))
+            .unwrap_or_default(),
         snapshot_pages: Vec::new(),
         page_tokens,
         page_capacity: pages,
@@ -1134,6 +1295,9 @@ fn cache_geometry(
     geometry.validate()?;
     Ok(geometry)
 }
+
+#[cfg(test)]
+mod codec_layout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1459,7 +1623,7 @@ mod tests {
             memory: Memory::Peer,
             sizing: None,
         });
-        let geometry = cache_geometry(&p, 256, 40, 5000).unwrap();
+        let geometry = cache_geometry(&p, 256, 40, 5000, None).unwrap();
         assert_eq!(geometry.page_tokens, 256);
         assert_eq!((geometry.row_capacity, geometry.page_capacity), (40, 5000));
         assert_eq!(geometry.row.name, "state");
@@ -1474,7 +1638,7 @@ mod tests {
         );
         assert_eq!(geometry.planes[1].address, 0x300000000000);
         p.allocations.reverse();
-        let reordered = cache_geometry(&p, 256, 40, 5000).unwrap();
+        let reordered = cache_geometry(&p, 256, 40, 5000, None).unwrap();
         assert_eq!(geometry, reordered);
         assert!(geometry.same_layout(&reordered));
         let original_ranks = vec![geometry.clone(); 4];
@@ -1486,10 +1650,12 @@ mod tests {
         );
         let mut options = core(4096, 4096, 16);
         assert_eq!(
-            flare_selene::geometry::fingerprint(&[cache_geometry(&options, 64, 8, 16).unwrap()]),
-            flare_selene::geometry::fingerprint(
-                &[cache_geometry(&options, 64, 80, 160).unwrap()]
-            )
+            flare_selene::geometry::fingerprint(&[
+                cache_geometry(&options, 64, 8, 16, None).unwrap()
+            ]),
+            flare_selene::geometry::fingerprint(&[
+                cache_geometry(&options, 64, 80, 160, None).unwrap()
+            ])
         );
         options.allocations.push(Allocation {
             name: "state-2".into(),
@@ -1507,7 +1673,7 @@ mod tests {
                 maximum: 16,
             }),
         });
-        assert!(cache_geometry(&options, 64, 8, 16).is_err());
+        assert!(cache_geometry(&options, 64, 8, 16, None).is_err());
     }
 
     #[test]

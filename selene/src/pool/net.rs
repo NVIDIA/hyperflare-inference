@@ -233,6 +233,12 @@ pub(crate) enum Id {
 
 #[derive(Debug)]
 pub(crate) enum Event {
+    PackedWindow {
+        claim: u64,
+        shape: Shape,
+        manifest: wire::PackedWindow,
+        slot: u32,
+    },
     /// A claim's window is in `slot`, whole.
     Window {
         claim: u64,
@@ -351,6 +357,9 @@ pub(crate) struct Open {
 
 /// Opens transfers. The engine owns one per session; tests substitute their own.
 pub(crate) trait Dial: Send + Sync {
+    fn may_use_rdma(&self) -> bool {
+        false
+    }
     fn open(&self, request: Open) -> io::Result<Channel>;
 }
 
@@ -368,7 +377,14 @@ pub(crate) struct Tcp {
     pub rdma_broken: Arc<AtomicBool>,
 }
 
+pub(crate) fn can_negotiate_rdma(offered: bool, tls: bool) -> bool {
+    cfg!(feature = "rdma") && offered && !tls
+}
 impl Dial for Tcp {
+    fn may_use_rdma(&self) -> bool {
+        can_negotiate_rdma(self.rdma_offered, self.tls.is_some())
+            && !self.rdma_broken.load(Ordering::Relaxed)
+    }
     fn open(&self, request: Open) -> io::Result<Channel> {
         let token: [u8; TOKEN_BYTES] = request
             .reference
@@ -391,9 +407,7 @@ impl Dial for Tcp {
             token,
             staging: self.staging.clone(),
             events: self.events.clone(),
-            rdma: transport == wire::DataTransport::Rdma as i32
-                && self.rdma_offered
-                && !self.rdma_broken.load(Ordering::Relaxed),
+            rdma: transport == wire::DataTransport::Rdma as i32 && self.may_use_rdma(),
             rdma_broken: self.rdma_broken.clone(),
         };
         let (events, id) = (self.events.clone(), request.id);
@@ -656,8 +670,11 @@ fn note_failure(target: &Target, link_was_rdma: bool, result: &io::Result<()>) {
 }
 
 /// The length of a window must fit a slot and the page grid.
+fn fits_slot(target: &Target, length: u64) -> bool {
+    length != 0 && length <= target.staging.slot_bytes()
+}
 fn usable_length(target: &Target, length: u64) -> bool {
-    length != 0 && length.is_multiple_of(ALIGN) && length <= target.staging.slot_bytes()
+    length.is_multiple_of(ALIGN) && fits_slot(target, length)
 }
 
 /// A claim: windows arrive until the manager ends the transfer.
@@ -757,6 +774,26 @@ async fn receive_windows(
         )
         .await?;
         match frame {
+            ToInstance::PackedWindow(shape, manifest) => {
+                if lent.is_some() || !fits_slot(target, shape.length) {
+                    return Err(invalid("unusable packed TCP window"));
+                }
+                let held = target.staging.take().await;
+                // This task owns the slot until the event transfers it to the requester.
+                let bytes = unsafe { target.staging.bytes(held.slot(), shape.length)? };
+                within(
+                    IDLE_TIMEOUT,
+                    "the manager stopped sending a packed window",
+                    conn.read_exact(bytes),
+                )
+                .await?;
+                target.events.push(Event::PackedWindow {
+                    claim,
+                    shape,
+                    manifest,
+                    slot: held.give(),
+                });
+            }
             ToInstance::Window(window) => {
                 let length = window.shape.length;
                 if !usable_length(target, length) {
