@@ -10,7 +10,7 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from ignition.components.collectives import (
-    ConcurrentAllGather, PreparedAllGather, PreparedChunkedAllGather,
+    ConcurrentAllGather, PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather,
 )
 
 
@@ -80,3 +80,22 @@ def test_functional_gather_trace_uses_invocation_dependencies():
     call, = [node for node in graph.nodes if node.target == torch.ops.flare.pcie_all_gather.default]
     assert call.args[2][0].op == "placeholder"
     assert call.args[1].target == torch.ops.aten.empty_strided.default
+
+
+def test_functional_all_reduce_fused_addend_with_dependencies():
+    source = torch.ones((2, 4), dtype=torch.bfloat16)
+    addend = torch.full((2, 4), 2.0, dtype=torch.bfloat16)
+    reduce = PreparedAllReduce(source, torch.empty_like(source), runtime=None,
+        session=None, coordinator=None, name="reduce").functional(session=None)
+    reduce.single, reduce.fused_addend, reduce.handle = False, True, 0
+
+    def forward(value, extra, dep):
+        return reduce(value, addend=extra, dependencies=(dep,))
+
+    graph = make_fx(forward, tracing_mode="fake")(source, addend, torch.ones(1)).graph
+    call, = [node for node in graph.nodes if node.target == torch.ops.flare.pcie_all_reduce_addend_dep.default]
+    assert call.args[0].op == "placeholder"
+    assert call.args[1].op == "placeholder"
+    assert call.args[2].target == torch.ops.aten.empty_strided.default
+    assert call.args[3][0].op == "placeholder"
+    assert not any(node.target == torch.ops.aten.add.Tensor for node in graph.nodes)
