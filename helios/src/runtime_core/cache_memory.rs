@@ -40,17 +40,18 @@ impl Chunk {
         }
         let row = geometry.row.unit_bytes;
         let unit = geometry.planes[self.plane].unit_bytes;
+        let plane_bytes = geometry.page_capacity * unit;
         let end = self.row_offset + self.row_bytes;
         for id in
             (self.row_offset / row).max(execution)..end.div_ceil(row).min(geometry.row_capacity)
         {
             let first = self.offset + (id * row).saturating_sub(self.row_offset);
-            let last = self.offset + ((id + 1) * row).min(end) - self.row_offset;
-            let range = &mut aliases[(id - execution) as usize];
-            range.start = range.start.min((first / unit) as u32);
-            range.end = range
-                .end
-                .max(last.div_ceil(unit).min(geometry.page_capacity) as u32);
+            let last = (self.offset + ((id + 1) * row).min(end) - self.row_offset).min(plane_bytes);
+            if first < last {
+                let range = &mut aliases[(id - execution) as usize];
+                range.start = range.start.min((first / unit) as u32);
+                range.end = range.end.max(last.div_ceil(unit) as u32);
+            }
         }
     }
 }
@@ -221,8 +222,8 @@ impl Layout {
         if cursor < row_end {
             return Err(invalid("KV backing cannot cover continuation aliases"));
         }
-        for (snapshot, range) in aliases.iter_mut().enumerate() {
-            if (execution + snapshot as u64 + 1) * row_bytes <= fixed_bytes {
+        for range in &mut aliases {
+            if *range == (u32::MAX..0) {
                 *range = 0..0;
             } else if range.start >= range.end {
                 return Err(invalid("continuation alias lacks a KV conflict range"));
@@ -1044,6 +1045,27 @@ mod tests {
                 assert_eq!(range.is_empty(), row < 23);
             }
         }
+    }
+
+    #[test]
+    fn plane_granule_padding_backs_snapshots_without_kv_conflicts() {
+        let alignment = 2 << 20;
+        let geometry = geometry(256 << 10, &[64 << 10, 4 << 10], 1000, 8 + 16);
+        let layout = Layout::new(&geometry, 8, &[alignment; 2], alignment).unwrap();
+        assert_eq!(layout.aliases.len(), 16);
+        let mut unconflicted = 0usize;
+        for (snapshot, range) in layout.aliases.iter().enumerate() {
+            let pages = conflicts(&layout, &geometry, 8 + snapshot as u64);
+            if pages.is_empty() {
+                assert_eq!(range, &(0..0));
+                unconflicted += 1;
+            } else {
+                assert!(range.start <= range.end && range.end <= 1000);
+                assert!((range.start as u64) <= *pages.first().unwrap());
+                assert!((range.end as u64) > *pages.last().unwrap());
+            }
+        }
+        assert!(unconflicted > 0);
     }
 
     #[test]
