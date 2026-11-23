@@ -299,6 +299,10 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
                     stop_flag_allocation,
                     stop_flag_offset,
                     stop_flag_address,
+                    metrics_allocation: None,
+                    metrics_offset: 0,
+                    metrics_address: 0,
+                    metrics_count: 0,
                     control: None,
                 });
             }

@@ -650,6 +650,14 @@ impl GraphExecutor {
     pub fn manifest(&self) -> &ExecutionManifest {
         &self.manifest
     }
+
+    /// Lock-free telemetry snapshot from the manifest's persistent worker, when present.
+    pub fn persistent_worker_snapshot(&self) -> Option<super::PersistentWorkerSnapshot> {
+        self.manifest
+            .persistent_workers
+            .first()
+            .and_then(super::PersistentWorkerDescriptor::snapshot)
+    }
     pub fn completed_fence(&self) -> Fence {
         self.completed
     }

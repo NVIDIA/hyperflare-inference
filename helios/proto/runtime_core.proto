@@ -732,6 +732,9 @@ message PersistentWorker {
   uint32 worker_sm_count = 1;
   string graph = 2;
   Reference stop_flag = 3;
+  // Optional 8-byte-aligned mapped-host range of `metrics_count` u64 counters.
+  Reference metrics = 4;
+  uint32 metrics_count = 5;
 }
 message TuningGraph {
   string name = 1;

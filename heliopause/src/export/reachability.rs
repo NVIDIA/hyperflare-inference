@@ -98,6 +98,9 @@ impl Reachability {
             if let Some(stop_flag) = &worker.stop_flag {
                 self.reference(&stop_flag.allocation)?;
             }
+            if let Some(metrics) = &worker.metrics {
+                self.reference(&metrics.allocation)?;
+            }
         }
         Ok(())
     }
@@ -617,6 +620,8 @@ mod tests {
                     allocation: "host-stop".into(),
                     offset: 0,
                 }),
+                metrics: None,
+                metrics_count: 0,
             }],
             ..Default::default()
         };
