@@ -1179,12 +1179,63 @@ impl NativeResources {
                     ));
                 }
                 let stop_flag_address = stop_alloc.address + stop_offset;
+                let (metrics_address, metrics_count) = match (
+                    worker.metrics.as_ref(),
+                    worker.metrics_count,
+                ) {
+                    (None, 0) => (0usize, 0usize),
+                    (Some(_), 0) => {
+                        return Err(invalid(
+                            "persistent worker metrics reference requires a positive metrics_count",
+                        ));
+                    }
+                    (None, _) => {
+                        return Err(invalid(
+                            "persistent worker metrics_count requires a metrics reference",
+                        ));
+                    }
+                    (Some(metrics), count) => {
+                        let metrics_alloc =
+                            self.allocations.get(&metrics.allocation).ok_or_else(|| {
+                                invalid(format!("unknown allocation {:?}", metrics.allocation))
+                            })?;
+                        if !matches!(metrics_alloc.memory, Memory::MappedHost) {
+                            return Err(invalid(
+                                "persistent worker metrics must reside in a mapped host allocation",
+                            ));
+                        }
+                        let metrics_offset = protobuf::size(metrics.offset)?;
+                        let count = count as usize;
+                        let metrics_bytes = count
+                            .checked_mul(std::mem::size_of::<u64>())
+                            .ok_or_else(|| invalid("persistent worker metrics size overflow"))?;
+                        if metrics_offset % std::mem::align_of::<u64>() != 0
+                            || metrics_offset
+                                .checked_add(metrics_bytes)
+                                .is_none_or(|end| end > metrics_alloc.nbytes)
+                        {
+                            return Err(invalid(
+                                "persistent worker metrics offset must be 8-byte aligned and in bounds",
+                            ));
+                        }
+                        let address = (metrics_alloc.address as usize)
+                            .checked_add(metrics_offset)
+                            .ok_or_else(|| {
+                                invalid("persistent worker metrics address overflow")
+                            })?;
+                        (address, count)
+                    }
+                };
                 self.persistent_worker = Some(persistent_worker::PersistentWorkerRuntime::new(
+                    worker.graph.clone(),
+                    partition.worker_sm_count,
                     self.driver.clone(),
                     partition.worker_context,
                     partition.worker_stream,
                     self.executables[index],
                     stop_flag_address,
+                    metrics_address,
+                    metrics_count,
                 ));
             }
         }
@@ -1274,6 +1325,14 @@ impl NativeResources {
         self.persistent_worker.as_ref().map(|worker| worker.state())
     }
 
+    /// Lock-free telemetry snapshot from the rank's persistent worker, if declared.
+    pub fn persistent_worker_snapshot(
+        &self,
+    ) -> Option<crate::execution::PersistentWorkerSnapshot> {
+        self.persistent_worker
+            .as_ref()
+            .map(|worker| worker.snapshot())
+    }
     pub(super) fn persistent_worker_control(
         &self,
     ) -> Option<crate::execution::PersistentWorkerControl> {
@@ -1312,7 +1371,10 @@ impl NativeResources {
 
     /// Copy an allocation after the caller has drained every replay that uses it.
     pub fn download(&self, name: &str) -> Result<Vec<u8>> {
-        if self.persistent_worker_state() == Some(WorkerState::Running) {
+        if matches!(
+            self.persistent_worker_state(),
+            Some(WorkerState::Running | WorkerState::Draining | WorkerState::FailedDrain)
+        ) {
             return Err(invalid(
                 "cannot synchronize primary context while persistent worker is running",
             ));
@@ -1335,7 +1397,10 @@ impl NativeResources {
 
     /// Replace allocation contents after draining replay on the owned context.
     pub fn upload(&self, name: &str, bytes: &[u8]) -> Result<()> {
-        if self.persistent_worker_state() == Some(WorkerState::Running) {
+        if matches!(
+            self.persistent_worker_state(),
+            Some(WorkerState::Running | WorkerState::Draining | WorkerState::FailedDrain)
+        ) {
             return Err(invalid(
                 "cannot synchronize primary context while persistent worker is running",
             ));
@@ -1398,6 +1463,9 @@ impl NativeResources {
             }
             for module in self.modules.drain(..).rev() {
                 (self.driver.module_unload)(module);
+            }
+            if let Some(worker) = &self.persistent_worker {
+                worker.invalidate_metrics();
             }
             for (_, allocation) in std::mem::take(&mut self.allocations) {
                 if allocation.nbytes == 0 {

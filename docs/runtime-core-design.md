@@ -601,12 +601,18 @@ loaded, instantiated under their partition's green context (clamping
 cooperative grids to that partition's SM count), and uploaded on their
 partition's non-blocking stream before the persistent worker starts; the
 executor launches the worker graph once on its worker stream only after startup
-completes, while compute graphs replay on the compute green context. Shutdown
+completes, while compute graphs replay on the compute green context. When the
+entry also declares an optional mapped-host `metrics` reference with positive
+`metrics_count`, Helios validates that the range is 8-byte aligned and in bounds
+for `metrics_count` 64-bit counters and exposes read-only atomic snapshots of
+worker state and counter values to Prometheus `/metrics`, `GET /v1/worker`, and
+the serving dashboard without synchronizing GPU streams. Shutdown
 drains compute and copy streams first, writes `1u32` (release) to the
 mapped-host `stop_flag` reference, and polls `cuStreamQuery` on the worker
 stream against a bounded drain timeout with context save/restore (returning
 `ExecutionError::Drain` and retaining GPU resources on timeout). Resource
-teardown stops any still-running worker, synchronizes the primary context, and
+teardown stops any still-running worker, synchronizes the primary context,
+drains active telemetry counter readers before unmapping allocations, and
 only after context synchronization succeeds destroys worker and compute
 streams, executables, modules, mappings, green contexts, virtual-address
 reservations, and the primary context.

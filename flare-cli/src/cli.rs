@@ -71,6 +71,33 @@ pub enum Command {
     },
     /// List, inspect, and manage locally prepared models.
     Models(CacheArgs),
+    /// Monitor live Parallax expert-movement and persistent-worker telemetry.
+    #[command(alias = "worker")]
+    Parallax(ParallaxArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ParallaxArgs {
+    /// Serving base URL to poll.
+    #[arg(long, value_name = "URL", default_value = "http://127.0.0.1:8000")]
+    pub url: String,
+
+    /// Polling interval in milliseconds (100..=10000).
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 500,
+        value_parser = clap::value_parser!(u64).range(100..=10_000)
+    )]
+    pub interval_ms: u64,
+
+    /// Print one JSON telemetry snapshot to stdout instead of opening the live dashboard.
+    #[arg(long, conflicts_with = "plain")]
+    pub json: bool,
+
+    /// Print one plain-text telemetry summary instead of opening the live dashboard.
+    #[arg(long)]
+    pub plain: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2429,6 +2456,66 @@ mod cache_cli_tests {
         assert!(
             Cli::try_parse_from(["flare", "models", "gc", "--cache-dir", "/downloads"]).is_err(),
             "download cache selection requires --downloads"
+        );
+    }
+
+    #[test]
+    fn parallax_command_parses_flags_and_worker_alias() {
+        let default_cmd = Cli::try_parse_from(["flare", "parallax"]).unwrap();
+        match default_cmd.command {
+            Command::Parallax(args) => {
+                assert_eq!(args.url, "http://127.0.0.1:8000");
+                assert_eq!(args.interval_ms, 500);
+                assert!(!args.json);
+                assert!(!args.plain);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let explicit = Cli::try_parse_from([
+            "flare",
+            "parallax",
+            "--url",
+            "http://127.0.0.1:9001",
+            "--interval-ms",
+            "250",
+            "--json",
+        ])
+        .unwrap();
+        match explicit.command {
+            Command::Parallax(args) => {
+                assert_eq!(args.url, "http://127.0.0.1:9001");
+                assert_eq!(args.interval_ms, 250);
+                assert!(args.json);
+                assert!(!args.plain);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let alias = Cli::try_parse_from([
+            "flare",
+            "worker",
+            "--url",
+            "http://10.0.0.2:8000",
+            "--plain",
+        ])
+        .unwrap();
+        match alias.command {
+            Command::Parallax(args) => {
+                assert_eq!(args.url, "http://10.0.0.2:8000");
+                assert!(args.plain);
+                assert!(!args.json);
+            }
+            other => panic!("unexpected alias command: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["flare", "parallax", "--interval-ms", "50"]).is_err(),
+            "interval below 100ms must be rejected"
+        );
+        assert!(
+            Cli::try_parse_from(["flare", "parallax", "--json", "--plain"]).is_err(),
+            "--json and --plain must conflict"
         );
     }
 }

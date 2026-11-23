@@ -1663,6 +1663,8 @@ mod identity_tests {
                         allocation: "worker_ctrl".into(),
                         offset: 0,
                     }),
+                    metrics: None,
+                    metrics_count: 0,
                 }],
                 ..Default::default()
             }),

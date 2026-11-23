@@ -103,6 +103,13 @@ execution. Each `PersistentWorker` carries:
 - `stop_flag`: a `Reference` (`allocation` and `offset`) naming a
   4-byte-aligned, in-bounds 32-bit word inside a fixed `Memory::MappedHost`
   allocation.
+- `metrics` and `metrics_count` (optional): when `metrics_count` is positive,
+  `metrics` must be a `Reference` (`allocation` and `offset`) naming an
+  8-byte-aligned, in-bounds range of `metrics_count * 8` bytes inside a fixed
+  `Memory::MappedHost` allocation. When `metrics_count` is zero, `metrics` must
+  be absent. Helios reads these 64-bit counters atomically from host memory
+  without GPU synchronization and drains active telemetry readers before
+  unmapping allocations during teardown.
 
 `NativeResources` retains the device's primary CUDA context, partitions SMs
 through `cuDevSmResourceSplit` into explicit structured worker and compute
