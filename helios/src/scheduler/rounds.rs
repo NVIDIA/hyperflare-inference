@@ -210,7 +210,8 @@ impl RequestScheduler {
         let length = self.speculative_tokens(request, width);
         self.costs.packed_round_shapes().filter(|shape| shape.batch == batch && shape.width == width
             && shape.drafts + 1 >= length && shape.tokens >= length)
-            .map(|shape| shape.nanos).min()
+            .map(|shape| shape.nanos)
+            .min_by_key(|&nanos| (nanos == 0, nanos))
     }
 
     pub(super) fn observe_packed_forecasts(&mut self, step: &ScheduledStep,
