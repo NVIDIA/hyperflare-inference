@@ -164,48 +164,63 @@ impl RequestScheduler {
             .fold(0usize, usize::saturating_add)
     }
 
-    /// Each prefill capacity this request can use, with its measured cost when one is known
-    /// and nonzero. Selection reads the costs once instead of once per chunk of every interval.
-    fn prefill_catalog_costs(&self, request: &LiveRequest) -> Vec<(usize, Option<u64>)> {
+    /// Each prefill capacity this request can use, with its measured non-terminal and terminal
+    /// costs when known and nonzero. Selection reads the costs once instead of once per chunk of
+    /// every interval.
+    fn prefill_catalog_costs(
+        &self,
+        request: &LiveRequest,
+    ) -> Vec<(usize, Option<u64>, Option<u64>)> {
         let catalog = if request.prompt_logprobs {
             &self.scored_prefill_catalog
         } else {
             &self.prefill_catalog
         };
+        let has_terminal = !request.prompt_logprobs && !self.terminal_prefill_catalog.is_empty();
         catalog
             .iter()
             .map(|&capacity| {
                 // Prefill dispatch retains measured costs after expiry; aging alone
                 // does not make its predicted work unknown.
-                let nanos = self
+                let prefill_ns = self
                     .costs
                     .duration(request.prefill_kind(), 1, capacity)
-                    .filter(|&nanos| nanos != 0)
-                    .or_else(|| {
-                        (!request.prompt_logprobs).then(|| {
-                            self.costs
-                                .duration(GraphKind::TerminalPrefill, 1, capacity)
-                                .filter(|&nanos| nanos != 0)
-                        })
-                        .flatten()
-                    });
-                (capacity, nanos)
+                    .filter(|&nanos| nanos != 0);
+                if !has_terminal {
+                    return (capacity, prefill_ns, prefill_ns);
+                }
+                let terminal_ns = if self.terminal_prefill_catalog.binary_search(&capacity).is_ok()
+                {
+                    self.costs
+                        .duration(GraphKind::TerminalPrefill, 1, capacity)
+                        .filter(|&nanos| nanos != 0)
+                        .or(prefill_ns)
+                } else {
+                    prefill_ns
+                };
+                let non_terminal_ns = prefill_ns.or(terminal_ns);
+                (capacity, non_terminal_ns, terminal_ns)
             })
             .collect()
     }
 
     fn interval_prefill_ns(
         request: &LiveRequest,
-        catalog: &[(usize, Option<u64>)],
+        catalog: &[(usize, Option<u64>, Option<u64>)],
+        terminal_window: usize,
         mut start: usize,
         end: usize,
     ) -> Option<u64> {
+        let uniform = terminal_window == 0
+            && catalog
+                .iter()
+                .all(|&(_, non_terminal, terminal)| non_terminal == terminal);
         // With every cost known, the capacity cheapest per token is chosen whole at each
         // position whose chunk ends by the next window end, span start or interval end: a
         // smaller one fits unchanged, and a larger one only does worse when cut short.
         let stride = catalog
             .iter()
-            .try_fold(None, |best, &(capacity, nanos)| {
+            .try_fold(None, |best, &(capacity, nanos, _)| {
                 let nanos = nanos?;
                 Some(if cheaper(capacity, nanos, best) {
                     Some((capacity, nanos))
@@ -231,13 +246,18 @@ impl RequestScheduler {
                     .iter()
                     .any(|span| span.start <= start && start < span.end)
             {
-                let bound = request
+                let mut bound = request
                     .prefill_spans
                     .iter()
                     .map(|span| span.start)
                     .filter(|&span_start| start < span_start)
                     .fold(limit, usize::min);
-                let chunks = (bound - start) / capacity;
+                if !uniform {
+                    // Stop before the terminal chunk and any penultimate chunk inside the
+                    // SWA tail protection window so those chunks price with `terminal_ns`.
+                    bound = bound.min(end.saturating_sub(terminal_window + 1));
+                }
+                let chunks = bound.saturating_sub(start) / capacity;
                 if chunks > 0 {
                     #[cfg(test)]
                     tests::STRIDE_RUNS.set(tests::STRIDE_RUNS.get() + 1);
@@ -246,8 +266,26 @@ impl RequestScheduler {
                     continue;
                 }
             }
+            let remaining = end.saturating_sub(start);
+            let terminal_only = !uniform
+                && limit >= end
+                && catalog.last().is_some_and(|&(max_cap, _, _)| {
+                    let mut through = start.saturating_add(max_cap).min(limit);
+                    if let Some(span) = request
+                        .prefill_spans
+                        .iter()
+                        .find(|span| span.start < through && through < span.end)
+                    {
+                        through = span.start;
+                    }
+                    through >= end && remaining <= max_cap
+                })
+                && catalog
+                    .iter()
+                    .find(|&&(cap, _, _)| cap >= remaining)
+                    .is_some_and(|&(_, non_terminal, terminal)| non_terminal != terminal);
             let mut best: Option<(usize, u64)> = None;
-            for &(capacity, nanos) in catalog {
+            for &(capacity, non_terminal_ns, terminal_ns) in catalog {
                 let mut through = start.saturating_add(capacity).min(limit);
                 if let Some(span) = request
                     .prefill_spans
@@ -260,7 +298,17 @@ impl RequestScheduler {
                 if work == 0 {
                     continue;
                 }
-                let nanos = nanos?;
+                let is_terminal = !uniform
+                    && (through >= end
+                        || (terminal_window > 0 && end.saturating_sub(through) <= terminal_window));
+                if terminal_only && !is_terminal {
+                    continue;
+                }
+                let nanos = if is_terminal {
+                    terminal_ns?
+                } else {
+                    non_terminal_ns?
+                };
                 if cheaper(work, nanos, best) {
                     best = Some((work, nanos));
                 }
@@ -320,9 +368,19 @@ impl RequestScheduler {
             request.prompt_tokens,
         ));
         let catalog = self.prefill_catalog_costs(request);
+        let terminal_window = if request.prompt_logprobs {
+            0
+        } else {
+            self.terminal_prefill_window()
+        };
         if accounting.initial_prefill_ns.is_none() {
-            accounting.initial_prefill_ns =
-                Self::interval_prefill_ns(request, &catalog, baseline_start, baseline_end);
+            accounting.initial_prefill_ns = Self::interval_prefill_ns(
+                request,
+                &catalog,
+                terminal_window,
+                baseline_start,
+                baseline_end,
+            );
         }
         if anchor > start {
             accounting.cuts.push(Cut {
@@ -375,14 +433,32 @@ impl RequestScheduler {
                 let whole = match between {
                     Some((interval, nanos)) if interval == (left, right) => nanos,
                     _ => {
-                        let nanos = Self::interval_prefill_ns(request, &catalog, left, right);
+                        let nanos = Self::interval_prefill_ns(
+                            request,
+                            &catalog,
+                            terminal_window,
+                            left,
+                            right,
+                        );
                         between = Some(((left, right), nanos));
                         nanos
                     }
                 };
                 whole.and_then(|whole| {
-                    let before = Self::interval_prefill_ns(request, &catalog, left, endpoint)?;
-                    let after = Self::interval_prefill_ns(request, &catalog, endpoint, right)?;
+                    let before = Self::interval_prefill_ns(
+                        request,
+                        &catalog,
+                        terminal_window,
+                        left,
+                        endpoint,
+                    )?;
+                    let after = Self::interval_prefill_ns(
+                        request,
+                        &catalog,
+                        terminal_window,
+                        endpoint,
+                        right,
+                    )?;
                     Some(before.saturating_add(after).saturating_sub(whole))
                 })
             };
@@ -940,8 +1016,13 @@ mod tests {
                 STRIDE_RUNS.set(0);
                 let mut unknown = 0;
                 for &(start, end) in &intervals {
-                    let walked =
-                        RequestScheduler::interval_prefill_ns(request, &catalog, start, end);
+                    let walked = RequestScheduler::interval_prefill_ns(
+                        request,
+                        &catalog,
+                        0,
+                        start,
+                        end,
+                    );
                     assert_eq!(
                         walked,
                         reference_interval_prefill_ns(&scheduler, request, start, end),
@@ -1447,5 +1528,56 @@ mod tests {
         );
         assert_eq!(scheduler.free_snapshot_count(), 16);
         assert_eq!(scheduler.stats().checkpoint_extra_work_ns, 0);
+    }
+
+    #[test]
+    fn terminal_prefill_cut_pricing_accounts_for_extra_terminal_chunk_cost() {
+        let mut scheduler = super::super::tests::scheduler(1, 128, 16);
+        let mut graphs = super::super::tests::duration_graphs(1);
+        for tokens in [256, 512] {
+            graphs.push(crate::execution::GraphDescriptor {
+                tuned_bindings: vec![],
+                confidence_width: 0,
+                draft_tokens: 0,
+                packed_token_capacity: 0,
+                name: format!("terminal_prefill{tokens}"),
+                kind: GraphKind::TerminalPrefill,
+                sampling_mode: crate::execution::SamplingMode::General,
+                handle: 1,
+                batch_capacity: 1,
+                token_capacity: tokens,
+                prefill_capacity: 0,
+                estimated_duration_ns: 0,
+                input_bindings: vec![],
+            });
+        }
+        scheduler.measured_graph_durations(&graphs).unwrap();
+        scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+        scheduler.terminal_prefill_graphs(&[256, 512]).unwrap();
+        measure(&mut scheduler, GraphKind::Prefill, 128, 18_000);
+        measure(&mut scheduler, GraphKind::Prefill, 256, 25_000);
+        measure(&mut scheduler, GraphKind::Prefill, 512, 40_000);
+        measure(&mut scheduler, GraphKind::TerminalPrefill, 256, 41_000);
+        measure(&mut scheduler, GraphKind::TerminalPrefill, 512, 56_000);
+        measure(&mut scheduler, GraphKind::Snapshot, 1, 500);
+        scheduler
+            .configure_policy(PolicyConfig {
+                checkpoint_extra_work_fraction: 0.25,
+                ..Default::default()
+            })
+            .unwrap();
+        // 1024 tokens = 1 encoder-only Prefill(512) (40_000) + 1 TerminalPrefill(512) (56_000) = 96_000.
+        // Cutting at 512 turns chunk 0 into TerminalPrefill(512) (+16_000 split cost) + 500 snapshot.
+        let mut spec = super::super::tests::spec(1024, 3);
+        spec.message_boundaries = vec![512, 1024];
+        let handle = scheduler.admit(spec).unwrap();
+        let (selected, _, _) = scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
+        assert_eq!(selected.initial_prefill_ns, Some(96_000));
+        let cut = selected
+            .cuts
+            .iter()
+            .find(|c| c.endpoint == 512)
+            .expect("cut at 512 fits within 25% allowance (24_000)");
+        assert_eq!(cut.split_ns, 16_000);
     }
 }

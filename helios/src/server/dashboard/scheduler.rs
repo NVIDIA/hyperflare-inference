@@ -161,6 +161,8 @@ impl SchedulerView {
                     matches!(
                         kind,
                         GraphKind::Prefill
+                            | GraphKind::TerminalPrefill
+                            | GraphKind::ScoredPrefill
                             | GraphKind::Decode
                             | GraphKind::Speculative
                             | GraphKind::Vision
