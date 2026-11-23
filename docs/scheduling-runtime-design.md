@@ -90,7 +90,10 @@ sixty-fourth. It is one mean per position across all requests, so it follows
 whichever traffic ran most recently. A model whose graphs allocate prefix
 lengths on the GPU takes the value from the completed prefix probability of
 each lane in the round's confidence sidecar; a model with any such graph is
-treated this way for all its rounds. Every other model takes it from the
+treated this way for all its rounds, calibrated per depth by an online ratio of
+realized verification survival to predicted prefix confidence over offered,
+determined positions (capped at weight 64 so calibration follows traffic shifts
+without penalizing already calibrated drafters). Every other model takes it from the
 verification outcome: for each position a completed MTP round determined, the
 value is the reported survival, or one for an accepted position and zero for a
 rejected one. On this path only lanes whose request is live and whose status

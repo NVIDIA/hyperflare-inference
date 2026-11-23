@@ -4456,3 +4456,27 @@ fn terminal_prefill_rejects_invalid_capacities_and_post_admission_registration()
     let _ = add(&mut s, 1, 64, 1);
     assert!(s.terminal_prefill_graphs(&[512]).is_err());
 }
+
+#[test]
+fn gpu_confidence_calibration_corrects_overconfident_draft_forecasts() {
+    let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    let handle = add(&mut scheduler, 1, 64, 512);
+    ready(&mut scheduler, &[handle]);
+    // Feed repeated rounds where GPU confidence claims 0.95 per draft position but verification
+    // accepts only 1 draft (rejecting depth >= 1).
+    for _ in 0..32 {
+        let plan = scheduler.plan().unwrap();
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = 4;
+        scheduler.complete_packed_round(fence, &records, gpu_time(MS), &vec![vec![0.95; 15]; 2]).unwrap();
+    }
+    let request = scheduler.request(handle).unwrap();
+    let curve = scheduler.speculative_curve(request, false);
+    // Depth 0 was accepted every round (~1.0), whereas depth 1+ were always rejected despite
+    // raw confidence ~0.90+, so calibration must pull depth 1+ sharply below raw confidence.
+    assert!(curve[0] > 0.8, "depth 0 should remain high, got {:?}", &curve[..4]);
+    assert!(curve[1] < 0.25, "depth 1 should calibrate down toward realized rejections, got {:?}", &curve[..4]);
+    assert!(curve[2] <= curve[1], "calibrated curve must stay nonincreasing, got {:?}", &curve[..4]);
+}
