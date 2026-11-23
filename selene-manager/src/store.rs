@@ -149,8 +149,19 @@ impl PlannedGrant {
         region: Region,
         offset: u64,
         hold: Arc<Extent>,
+        header: &Header,
     ) -> WindowGrant {
+        let packed = header.packed.as_ref().map(|p| {
+            let first = self.page_first.saturating_sub(p.offer().first_page) as usize;
+            flare_selene::shared::wire::PackedWindow {
+                units: p
+                    .units(first, self.pages as usize, self.row)
+                    .expect("planned range")
+                    .to_vec(),
+            }
+        });
         WindowGrant {
+            packed,
             transfer,
             index,
             record: self.record,
@@ -487,6 +498,8 @@ pub struct Metrics {
 
 #[derive(Clone, Debug)]
 pub struct EntryData {
+    pub packed: bool,
+    pub required_profiles: Vec<Vec<u8>>,
     pub key: Key,
     pub parent: Option<Key>,
     pub bucket: [u8; 16],
@@ -945,6 +958,13 @@ impl Store {
     fn entry(namespace: &Namespace, key: Key) -> EntryData {
         let node = &namespace.tree[&key];
         EntryData {
+            packed: node.location.header.packed.is_some(),
+            required_profiles: node
+                .location
+                .header
+                .packed
+                .as_ref()
+                .map_or_else(Vec::new, |p| p.required_profiles(true)),
             key,
             parent: node.parent,
             bucket: node.bucket,
@@ -2047,9 +2067,14 @@ impl Store {
                         put.hold_slots[slot] = Some(HoldSlot { index, job: None });
                     }
                     put.windows.granted.insert(index, plan);
-                    put.outbox.push_back(Ok(PutAnswer::Grant(
-                        plan.window(transfer, index, region, offset, extent),
-                    )));
+                    put.outbox.push_back(Ok(PutAnswer::Grant(plan.window(
+                        transfer,
+                        index,
+                        region,
+                        offset,
+                        extent,
+                        &put.header,
+                    ))));
                     *progress = Instant::now();
                 }
                 true
@@ -2121,7 +2146,12 @@ impl Store {
                     return progressed;
                 }
             };
-            let Some(table) = metadata.get(4096..4096 + header.tail_pages as usize * 8) else {
+            let sum_count = if header.packed.is_some() {
+                0
+            } else {
+                header.tail_pages as usize
+            };
+            let Some(table) = metadata.get(4096..4096 + sum_count * 8) else {
                 self.fail_get(
                     connection,
                     transfer,
@@ -2229,6 +2259,7 @@ impl Store {
                     Region::Arena,
                     offset,
                     memory,
+                    &get.records[plan.record as usize].header,
                 ))));
                 *progress = Instant::now();
                 return true;
@@ -2956,6 +2987,25 @@ impl Store {
         };
         let mut get = get;
         get.outbox.push_back(Ok(GetAnswer::Leased {
+            packed: get
+                .records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    r.header.packed.as_ref().map(|p| {
+                        let skip = if i == 0 {
+                            request.skip_pages as usize
+                        } else {
+                            0
+                        };
+                        let row = i + 1 == get.records.len() && request.row;
+                        flare_selene::shared::wire::PackedOffer {
+                            first_page: p.offer().first_page + skip as u64,
+                            units: p.units(skip, p.page_count() - skip, row).unwrap().to_vec(),
+                        }
+                    })
+                })
+                .collect(),
             transfer,
             windows: get.grants.len(),
         }));
@@ -3026,7 +3076,13 @@ impl Store {
                     .location
                     .disk
                     .as_ref()
-                    .map(|extent| extent.reader())
+                    .map(|extent| {
+                        if header.packed.is_some() {
+                            std::fs::File::open(&extent.path).map(Arc::new)
+                        } else {
+                            extent.reader()
+                        }
+                    })
                     .transpose()?,
                 header,
                 meta: None,
@@ -3216,6 +3272,7 @@ impl Store {
                         Region::Staging,
                         offset,
                         extent,
+                        &get.records[plan.record as usize].header,
                     ))));
                     *progress = Instant::now();
                 }
@@ -4371,6 +4428,7 @@ pub struct WindowGrant {
     pub transfer: u64,
     pub index: u32,
     pub record: u32,
+    pub packed: Option<flare_selene::shared::wire::PackedWindow>,
     pub record_offset: u64,
     pub length: u64,
     pub region: i32,
@@ -4400,6 +4458,7 @@ pub enum PutAnswer {
 
 pub enum GetAnswer {
     Leased {
+        packed: Vec<Option<flare_selene::shared::wire::PackedOffer>>,
         transfer: u64,
         windows: usize,
     },
@@ -4508,6 +4567,24 @@ fn record_grants(
     max_window: u64,
     record: u32,
 ) -> Vec<PlannedGrant> {
+    if let Some(packed) = &header.packed {
+        return packed
+            .windows(skip, include_row, max_window)
+            .into_iter()
+            .map(|w| PlannedGrant {
+                record,
+                record_offset: header.page_segment + w.offset,
+                length: w.length,
+                pages: w.pages,
+                row: w.row,
+                page_first: if w.pages == 0 {
+                    0
+                } else {
+                    u64::from(first_page) + u64::from(w.first)
+                },
+            })
+            .collect();
+    }
     use crate::pool::windows::{self, RecordShape};
     let shape = RecordShape {
         first_page: skip,

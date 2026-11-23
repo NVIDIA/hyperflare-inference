@@ -409,3 +409,7 @@ requesting an export, and the instance falls back to an equivalent local
 copy or recomputes after draining. An occasional warning during restarts is
 expected; repeated warnings on a quiet pool warrant checking source sessions
 and record retention.
+
+### Upgrading a checkpoint root for codec envelopes
+
+Managers read raw v1–v3 and packed v4 records. Upgrade managers that share a root before placing v4 records there. An older manager deletes unreadable files during recovery and may prune dependent records. Readers need a matching profile for every packed ancestor. Staging must fit the largest indivisible stored row.

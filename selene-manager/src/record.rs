@@ -94,6 +94,13 @@ pub fn verify_record(bytes: &[u8], header: &Header, row: bool) -> Result<()> {
     {
         return Err(invalid("record header or length"));
     }
+    if let Some(layout) = &header.packed {
+        return flare_selene::shared::packed::verify_units(
+            layout.units(0, layout.page_count(), row).unwrap(),
+            &bytes[header.page_segment as usize..],
+        )
+        .map_err(|e| invalid(e.to_string()));
+    }
     for page in 0..header.tail_pages as usize {
         let start = header.page_segment as usize + page * header.page_record_bytes() as usize;
         let expected = u64::from_le_bytes(

@@ -41,6 +41,8 @@
 //! the stream carrier. Windows arrive in index order and only the transfer's own windows are
 //! ever named, so a reader needs no state beyond the grant's plan to check them.
 
+use super::{packed, wire::PackedWindow};
+use prost::Message;
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -106,10 +108,11 @@ pub struct Window {
 }
 
 /// A frame the manager sends.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ToInstance {
     /// A window of a claim; its payload follows.
     Window(Window),
+    PackedWindow(Shape, PackedWindow),
     End,
     Abort(String),
     /// A window of a put the instance is to fill.
@@ -211,6 +214,12 @@ impl ToInstance {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            ToInstance::PackedWindow(shape, units) => {
+                out.push(8);
+                put_shape(&mut out, shape);
+                out.extend_from_slice(&(units.encoded_len() as u32).to_le_bytes());
+                units.encode(&mut out).expect("Vec write");
+            }
             ToInstance::Window(window) => {
                 out.push(WINDOW);
                 put_shape(&mut out, &window.shape);
@@ -288,6 +297,29 @@ impl ToInstance {
                 Ok(ToInstance::Abort(
                     String::from_utf8_lossy(&text).into_owned(),
                 ))
+            }
+            8 => {
+                let mut bytes = [0; SHAPE_BYTES];
+                reader.read_exact(&mut bytes).await?;
+                let shape = parse_shape(&bytes)?;
+                let size = reader.read_u32_le().await? as usize;
+                if size > packed::MAX_DIRECTORY || shape.page_count > max_pages {
+                    return Err(invalid("oversized packed window"));
+                }
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes).await?;
+                let window =
+                    PackedWindow::decode(&*bytes).map_err(|_| invalid("bad packed window"))?;
+                if window.units.len() > packed::MAX_UNITS
+                    || window
+                        .units
+                        .iter()
+                        .try_fold(0u64, |sum, u| sum.checked_add(u.stored_length))
+                        != Some(shape.length)
+                {
+                    return Err(invalid("packed window length disagrees with units"));
+                }
+                Ok(Self::PackedWindow(shape, window))
             }
             GRANT => {
                 let mut shape = [0u8; SHAPE_BYTES];

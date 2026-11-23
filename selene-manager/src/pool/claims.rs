@@ -150,6 +150,7 @@ pub enum Phase {
 }
 
 pub struct Win {
+    pub packed: Option<v2::PackedWindow>,
     pub plan: PlannedWindow,
     pub region: i32,
     pub offset: u64,
@@ -319,6 +320,7 @@ impl Claim {
     pub(super) fn spec(&self, index: usize) -> v2::WindowSpec {
         let window = &self.windows[index];
         v2::WindowSpec {
+            packed: window.packed.clone(),
             index: window.plan.index,
             region: window.region,
             offset: window.offset,
@@ -620,25 +622,39 @@ impl Core {
         ) else {
             return refuse(self, v2::ClaimReason::ChainGap);
         };
-        let shapes = shapes_of(&walk, m.want_row);
-        let Some(plan) = windows::plan(
-            &shapes,
-            geometry.page_bytes(),
-            geometry.row_bytes(),
-            self.cfg.limits.max_window_bytes,
-        ) else {
-            return refuse(self, v2::ClaimReason::InvalidClaim);
-        };
-        let total = windows::total_bytes(&plan);
+        if walk.nodes.iter().any(|n| {
+            !flare_selene::shared::packed::permits_holding(
+                self.sessions[&sid].codec.as_ref(),
+                n.packed,
+                &n.required_profiles,
+            )
+        }) {
+            return refuse(self, v2::ClaimReason::ChainGap);
+        }
         if source == SourceId::Manager {
             return self.manager_claim(sid, key, &m, walk, &geometry, mode);
         }
+        let packed_hint = walk.nodes.iter().any(|n| n.packed || !n.required_profiles.is_empty());
+        let total = if packed_hint {
+            0
+        } else {
+            let Some(plan) = windows::plan(
+                &shapes_of(&walk, m.want_row),
+                geometry.page_bytes(),
+                geometry.row_bytes(),
+                self.cfg.limits.max_window_bytes,
+            ) else {
+                return refuse(self, v2::ClaimReason::InvalidClaim);
+            };
+            windows::total_bytes(&plan)
+        };
 
         // Retained staging: required for a GPU export, preferred for host tiers.
         let mut block = None;
         let mut retained = false;
         match usize::try_from(total)
             .ok()
+            .filter(|_| !packed_hint)
             .and_then(|total| self.staging.allocate(total))
         {
             Some(extent) => {
@@ -837,6 +853,7 @@ impl Core {
             .map(|(index, node)| {
                 let first_page = if index == 0 { walk.skip_pages } else { 0 };
                 v2::Record {
+                    packed: None,
                     key: Some(key_to(node.key)),
                     first_page,
                     pages: node.tail_pages - first_page,
@@ -884,7 +901,22 @@ impl Core {
         }
         let terminal = claim.is_terminal();
         match answer {
-            Ok(GetAnswer::Leased { windows, .. }) => {
+            Ok(GetAnswer::Leased {
+                windows, packed, ..
+            }) => {
+                let caps = self
+                    .sessions
+                    .get(&claim.requester_sid)
+                    .and_then(|s| s.codec.as_ref());
+                if packed.iter().flatten().any(|offer| {
+                    !flare_selene::shared::packed::permits_offer(caps, offer)
+                }) {
+                    self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::ChainGap);
+                    return;
+                }
+                for (record, offer) in claim.records.iter_mut().zip(packed) {
+                    record.packed = offer
+                }
                 claim.manager.as_mut().unwrap().remaining = windows;
                 if terminal || claim.state != v2::ClaimState::Requested {
                     return;
@@ -945,6 +977,11 @@ impl Core {
                             .get(first..first + count)
                             .map(|pages| (pages.to_vec(), *row_sum))
                     });
+                let sums = if grant.packed.is_some() {
+                    Some((Vec::new(), 0))
+                } else {
+                    sums
+                };
                 let Some((page_xxh3, row_xxh3)) = sums else {
                     self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
                     return;
@@ -958,6 +995,7 @@ impl Core {
                     length: grant.length,
                 };
                 let window = Win {
+                    packed: grant.packed,
                     plan,
                     region: grant.region,
                     offset: grant.offset,
@@ -972,6 +1010,7 @@ impl Core {
                 while claim.windows.len() <= index {
                     // A window index the store skipped is not in anyone's hands.
                     let mut filler = Win {
+                        packed: None,
                         plan,
                         region: grant.region,
                         offset: 0,
@@ -1102,6 +1141,9 @@ impl Core {
                 row: record.row,
             });
         }
+        if ack.records.iter().any(|record| record.packed.is_some()) {
+            return bad(self, v2::ClaimReason::CopyError);
+        }
         let last_key = key_from(ack.records.last().and_then(|record| record.key.as_ref()));
         if last_key.ok() != Some(claim.endpoint)
             || pages != ack.total_pages
@@ -1141,6 +1183,7 @@ impl Core {
                     running += plan.length;
                 }
                 Win {
+                    packed: None,
                     plan,
                     region: v2::Region::Staging as i32,
                     offset,
@@ -2104,7 +2147,10 @@ pub(super) fn shape_for(
         first_page: spec.first_page,
         page_count: spec.page_count,
         row: spec.row,
-        length: layout.slice_bytes(rank, spec.page_count, spec.row),
+        length: spec.packed.as_ref().map_or_else(
+            || layout.slice_bytes(rank, spec.page_count, spec.row),
+            |_| spec.length,
+        ),
     }
 }
 
@@ -2153,6 +2199,8 @@ mod tests {
         core.sessions.insert(
             1,
             Session {
+                offered_codec: None,
+                codec: None,
                 sid: 1,
                 instance: INSTANCE,
                 nonce: NONCE,
@@ -2206,6 +2254,7 @@ mod tests {
         claim.row = true;
         claim.granted_at = Some(now);
         claim.windows = vec![Win {
+            packed: None,
             plan,
             region: v2::Region::Staging as i32,
             offset: 0,

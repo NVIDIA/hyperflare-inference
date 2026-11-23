@@ -111,6 +111,8 @@ pub fn entry_from(entry: &v2::IndexEntry) -> Checked<Entry> {
         return Err(Violation::new("zero consumed_tokens"));
     }
     Ok(Entry {
+        packed: false,
+        required_profiles: Vec::new(),
         key,
         parent,
         bucket,

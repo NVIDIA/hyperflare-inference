@@ -379,6 +379,7 @@ message OpenSession {
   // puts, answers exports); each other rank attaches with `Rank` using this secret
   // and moves only its own slice. See "Rank agents".
   bytes rank_secret = 8;
+  CodecCaps codec = 9;
 }
 
 enum OpenStatus {
@@ -396,6 +397,7 @@ message SessionOpened {
   bytes scope_id = 3;
   uint32 export_slots = 4;
   ReadinessInfo readiness = 6;
+  CodecCaps codec = 7;
 }
 
 // Orderly close from the client. After sending it the client sends nothing more.
@@ -451,6 +453,7 @@ message IndexEntry {
   Tier tier = 7;
   // Payload bytes of this record, excluding any envelope.
   uint64 bytes = 9;
+  reserved 10, 11;
 }
 
 message Notice {
@@ -635,6 +638,7 @@ message Record {
   uint32 pages = 4;
   // True only on the last record, and only if the claim wanted the row.
   bool row = 5;
+  PackedOffer packed = 6;
 }
 
 // The manager's single authoritative per-claim state (PROTOCOL.md). Only the
@@ -742,6 +746,7 @@ message WindowSpec {
   // The window carries the row after its pages (or alone). Only in the window
   // that completes the last record.
   bool row = 8;
+  PackedWindow packed = 9;
 }
 // length == page_count * Geometry.page_record_bytes + (row ? row_record_bytes : 0).
 
@@ -866,6 +871,7 @@ message ExportRequest {
   DataChannelRef channel = 12;
   // A multi-process source: the channel of each peer rank that is in channel mode.
   repeated RankChannel rank_channels = 13;
+  reserved 14;
 }
 
 enum PinResult {
@@ -1000,6 +1006,7 @@ message PutBegin {
   PrefixKey next_child = 13;
   // A ready descendant on the unbranched path can supply a restore row.
   bool descendant_row = 14;
+  reserved 15;
 }
 
 message PutAccept {
@@ -1014,6 +1021,7 @@ message PutAccept {
   // A multi-process writer: the channel of each peer rank that is in channel mode.
   repeated RankChannel rank_channels = 7;
   CaptureRole capture_role = 8;
+  reserved 9;
 }
 
 // A window to fill, STAGING or ARENA region. At most Limits.window_credits
@@ -1129,6 +1137,7 @@ message RankAttach {
   uint32 rank = 4;             // 1 .. ranks-1.
   bytes agent_nonce = 5;       // 16 random bytes, fresh per agent process.
   bytes rank_secret = 6;
+  CodecCaps codec = 7;
 }
 
 // The agent's own drain attestation for one transfer. The only thing besides
@@ -1160,10 +1169,37 @@ message RankAttached {
   // Assigned from the session-incarnation counter. A transfer is bound to it.
   uint64 generation = 2;
   RankMode mode = 3;
+  CodecCaps codec = 4;
 }
 
 // The agent must stop work, drain, send its RankFences and RankGoodbye, and end.
 message RankClosing {
   ClosingReason reason = 1;
   string detail = 2;
+}
+
+// Capability is scoped to one connection. A missing acknowledgement means raw only.
+message CodecCaps {
+  uint32 envelope_revision = 1;
+  repeated bytes receive_profiles = 2;
+}
+message PackedOffer {
+  uint64 first_page = 1;
+  repeated PackedUnit units = 2;
+}
+message PackedWindow { repeated PackedUnit units = 1; }
+message PackedUnit {
+  enum Kind { PAGE = 0; ROW = 1; }
+  enum Representation { LITERAL = 0; PACKET = 1; }
+  Kind kind = 1;
+  uint64 logical_index = 2; // Absolute page index, or zero for the endpoint row.
+  uint32 stored_rank = 3;
+  Representation representation = 4;
+  bytes profile = 5;
+  uint64 original_length = 6;
+  uint64 stored_length = 7;
+  repeated uint32 replicas = 8; // Additional destination ranks, in ascending order.
+  fixed32 stored_crc = 9;
+  fixed32 original_crc = 10;
+  fixed64 raw_xxh3 = 11; // Literal units only.
 }

@@ -814,6 +814,7 @@ dependencies = [
  "base64 0.22.1",
  "blake2",
  "brotli",
+ "cc",
  "crossterm",
  "deepseek-recipe",
  "deepseek-recipe-core",
@@ -852,11 +853,14 @@ name = "flare-selene"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "cc",
+ "crc32fast",
  "flare-eos",
  "hyper-util",
  "io-uring",
  "libc",
  "prost",
+ "rayon",
  "rustls",
  "tokio",
  "tokio-rustls",

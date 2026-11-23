@@ -165,6 +165,8 @@ impl Core {
                 _ => Tier::Nvme,
             };
             Entry {
+                packed: entry.packed,
+                required_profiles: entry.required_profiles.clone(),
                 key: entry.key,
                 parent: entry.parent,
                 bucket: entry.bucket,
@@ -638,6 +640,7 @@ impl Core {
                 }
                 let legs = rec.legs.iter().map(|l| (l.ch.transfer, l.rank)).collect();
                 let spec = v2::WindowSpec {
+                    packed: None,
                     index: grant.index,
                     region: grant.region,
                     offset: grant.offset,
@@ -656,7 +659,7 @@ impl Core {
                 };
                 let message = M::PutGrant(v2::PutGrant {
                     put_id,
-                    window: Some(spec),
+                    window: Some(spec.clone()),
                 });
                 self.grant_windows(sid, message, legs, &layout, &[spec]);
             }

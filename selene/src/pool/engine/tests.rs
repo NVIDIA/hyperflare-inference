@@ -234,6 +234,7 @@ impl Rig {
 
     pub fn open_session(&mut self, regions: Option<Arc<Regions>>) -> Vec<wire::ClientMessage> {
         let opened = wire::SessionOpened {
+            codec: None,
             status: wire::OpenStatus::OpenOk as i32,
             session_incarnation: SESSION,
             scope_id: vec![3; 32],
@@ -398,6 +399,7 @@ pub(super) fn records(fetch: &PoolFetch) -> Vec<wire::Record> {
         .iter()
         .enumerate()
         .map(|(i, k)| wire::Record {
+            packed: None,
             key: Some(super::super::codec::key_to(*k)),
             first_page: 0,
             pages: nodes[i].tail_pages as u32,
@@ -415,6 +417,7 @@ pub(super) fn window(
     offset: u64,
 ) -> wire::WindowSpec {
     wire::WindowSpec {
+        packed: None,
         index,
         region: wire::Region::Staging as i32,
         offset,

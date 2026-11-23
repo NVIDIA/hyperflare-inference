@@ -113,7 +113,7 @@ pub async fn put(
     }
     let mut pick = |m: &M| match m {
         M::PutAccept(a) if a.put_id == id => Some(Next::Accept(a.clone())),
-        M::PutGrant(g) if g.put_id == id => Some(Next::Grant(g.window.unwrap())),
+        M::PutGrant(g) if g.put_id == id => Some(Next::Grant(g.window.clone().unwrap())),
         M::Stored(s) if s.put_id == id => Some(Next::Stored(s.bytes)),
         M::PutRefused(r) if r.put_id == id => Some(Next::Refused(r.clone())),
         _ => None,

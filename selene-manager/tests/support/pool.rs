@@ -150,6 +150,7 @@ pub use flare_selene::shared::record::checksum as xxh3;
 /// A client's identity for one process.
 #[derive(Clone)]
 pub struct Ident {
+    pub codec: Option<v2::CodecCaps>,
     pub instance_id: [u8; 16],
     pub nonce: [u8; 16],
     pub name: String,
@@ -170,6 +171,7 @@ impl Ident {
             .and_then(|mut file| file.read_exact(&mut nonce))
             .unwrap();
         Self {
+            codec: None,
             instance_id,
             nonce,
             name: name.into(),
@@ -252,6 +254,7 @@ impl Pool {
         tx.send(ClientMessage {
             header: None,
             m: Some(c::M::Open(v2::OpenSession {
+                codec: ident.codec.clone(),
                 manager_incarnation: incarnation,
                 instance_id: ident.instance_id.to_vec(),
                 scope: Some(ident.scope.clone()),
@@ -712,6 +715,7 @@ pub fn records_for(
         let last = index + 1 == tokens.len();
         if end > start_page || last {
             records.push(v2::Record {
+                packed: None,
                 key: Some(pkey(*token)),
                 first_page: first as u32,
                 pages: pages as u32,

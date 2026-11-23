@@ -325,6 +325,8 @@ impl Engine {
             } else {
                 "the grant names a data channel, which this session does not use"
             })
+        } else if granted.records.iter().any(|r| r.packed.is_some()) {
+            Err("packed grant to a raw-only restore worker")
         } else if !records_match(&claim.coverage.expected, &granted.records)
             || granted.total_pages != claim.total_pages
             || granted.row != claim.wants_row
@@ -391,6 +393,7 @@ impl Engine {
         let ready = wire::WindowReady {
             claim_id: claim,
             window: Some(wire::WindowSpec {
+                packed: None,
                 index: shape.index,
                 region: wire::Region::Staging as i32,
                 offset: staging.offset(slot),
@@ -462,6 +465,15 @@ impl Engine {
             return false;
         }
         let restore = claim.restore;
+        if spec.packed.is_some() {
+            self.fail_restore(
+                restore,
+                Some(id),
+                Error::new("unexpected packed window for raw grant"),
+                wire::CopyOutcome::CopyErrorOutcome,
+            );
+            return false;
+        }
         let dest = match claim.coverage.accept(&spec, page_bytes, row_bytes) {
             Ok(dest) => dest,
             Err(why) => {
@@ -511,7 +523,7 @@ impl Engine {
             );
             return true;
         }
-        let sums = self.window_sums(spec, slot.is_some());
+        let sums = self.window_sums(spec.clone(), slot.is_some());
         let mismatch = sums.map_or(true, |sums| {
             sums.pages != ready.page_xxh3 || sums.row != spec.row.then_some(ready.row_xxh3)
         });
@@ -578,7 +590,7 @@ impl Engine {
                     rank,
                     super::super::rank::Window {
                         xfer,
-                        spec: Some(spec),
+                        spec: Some(spec.clone()),
                         sums: Some(crate::shared::SliceSums {
                             pages: sums.page_xxh3,
                             row: sums.has_row.then_some(sums.row_xxh3),

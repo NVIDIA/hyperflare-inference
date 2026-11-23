@@ -462,13 +462,11 @@ impl Local {
         length: u64,
     ) -> Result<u64> {
         let length = usize::try_from(length).map_err(|_| invalid("window length overflows"))?;
-        if !within.is_multiple_of(PAGE_BYTES as usize)
-            || !length.is_multiple_of(PAGE_BYTES as usize)
-            || within
-                .checked_add(length)
-                .is_none_or(|end| end > extent.bytes().len())
+        if within
+            .checked_add(length)
+            .is_none_or(|end| end > extent.bytes().len())
         {
-            return Err(invalid("window exceeds its extent or is not page aligned"));
+            return Err(invalid("window exceeds its extent"));
         }
         let offset = extent
             .offset()

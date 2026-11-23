@@ -1525,13 +1525,19 @@ impl DiskStore {
         let mut index = Index::new(layout.page_tokens);
         let mut used = 0u64;
         for record in &scanned {
+            // Until this copier has a decoder, it cannot restore this root or its dependents.
+            let ready = record.header.packed.is_none()
+                && record
+                    .header
+                    .parent
+                    .is_none_or(|k| index.node(&k).is_some_and(|n| n.ready));
             index.insert(
                 record.header.key,
                 record.header.parent,
                 record.header.bucket,
                 record.header.tail_pages as usize,
                 record.row,
-                true,
+                ready,
                 DiskRecord {
                     path: record.path.clone(),
                     header: record.header.clone(),

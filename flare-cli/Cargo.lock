@@ -1060,12 +1060,15 @@ name = "flare-selene"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "cc",
+ "crc32fast",
  "flare-eos",
  "hyper-util",
  "ibverbs-sys",
  "io-uring",
  "libc",
  "prost",
+ "rayon",
  "rustls",
  "tokio",
  "tokio-rustls",
