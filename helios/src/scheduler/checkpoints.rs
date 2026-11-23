@@ -180,7 +180,15 @@ impl RequestScheduler {
                 let nanos = self
                     .costs
                     .duration(request.prefill_kind(), 1, capacity)
-                    .filter(|&nanos| nanos != 0);
+                    .filter(|&nanos| nanos != 0)
+                    .or_else(|| {
+                        (!request.prompt_logprobs).then(|| {
+                            self.costs
+                                .duration(GraphKind::TerminalPrefill, 1, capacity)
+                                .filter(|&nanos| nanos != 0)
+                        })
+                        .flatten()
+                    });
                 (capacity, nanos)
             })
             .collect()

@@ -639,6 +639,8 @@ impl ModelRuntime {
                     .and_then(|()| {
                         scheduler.scored_prefill_graphs(&executor.manifest().graphs.iter()
                             .filter(|g| g.kind == GraphKind::ScoredPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
+                        scheduler.terminal_prefill_graphs(&executor.manifest().graphs.iter()
+                            .filter(|g| g.kind == GraphKind::TerminalPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
                         scheduler.prefill_graphs(
                             &executor
                                 .manifest()
@@ -1639,6 +1641,7 @@ impl<'a> Worker<'a> {
         if matches!(
             kind,
             GraphKind::Prefill
+                | GraphKind::TerminalPrefill
                 | GraphKind::ScoredPrefill
                 | GraphKind::Decode
                 | GraphKind::Speculative

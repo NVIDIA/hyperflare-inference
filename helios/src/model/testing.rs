@@ -346,6 +346,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 GraphOperation::Restore => GraphKind::Restore,
                 GraphOperation::Snapshot => GraphKind::Snapshot,
                 GraphOperation::Prefill => GraphKind::Prefill,
+                GraphOperation::TerminalPrefill => GraphKind::TerminalPrefill,
                 GraphOperation::ScoredPrefill => GraphKind::ScoredPrefill,
                 GraphOperation::Decode => GraphKind::Decode,
                 GraphOperation::Resume => GraphKind::Resume,

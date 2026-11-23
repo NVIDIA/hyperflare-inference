@@ -661,6 +661,7 @@ pub struct RequestScheduler {
     speculative_fixed_width: Option<usize>,
     speculative_catalog: [Vec<usize>; 7],
     prefill_catalog: Vec<usize>,
+    terminal_prefill_catalog: Vec<usize>,
     scored_prefill_catalog: Vec<usize>,
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
@@ -753,6 +754,7 @@ impl RequestScheduler {
             speculative_fixed_width: None,
             speculative_catalog: Default::default(),
             prefill_catalog: prefill_capacities(limits.prefill_chunk_size).collect(),
+            terminal_prefill_catalog: Vec::new(),
             scored_prefill_catalog: Vec::new(),
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
@@ -820,6 +822,93 @@ impl RequestScheduler {
         }
         self.scored_prefill_catalog = catalog;
         Ok(())
+    }
+
+    pub fn terminal_prefill_graphs(&mut self, capacities: &[usize]) -> Result<()> {
+        if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
+            return Err("terminal prefill graphs must be selected before admission".into());
+        }
+        let mut catalog = capacities.to_vec();
+        catalog.sort_unstable();
+        if catalog.iter().any(|n| {
+            *n == 0 || !n.is_multiple_of(64) || *n > self.limits.prefill_chunk_size
+        }) || catalog.windows(2).any(|p| p[0] == p[1])
+        {
+            return Err(
+                "terminal prefill capacities must be distinct aligned capacities within the chunk size"
+                    .into(),
+            );
+        }
+        self.terminal_prefill_catalog = catalog;
+        Ok(())
+    }
+
+    pub(super) fn terminal_prefill_window(&self) -> usize {
+        if self.terminal_prefill_catalog.is_empty() {
+            return 0;
+        }
+        self.prefill_catalog
+            .iter()
+            .copied()
+            .filter(|capacity| self.terminal_prefill_catalog.binary_search(capacity).is_err())
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn resolve_prefill_kind(
+        &self,
+        request: &LiveRequest,
+        capacity: usize,
+        work: usize,
+        cut: Option<usize>,
+    ) -> GraphKind {
+        if request.prompt_logprobs {
+            return GraphKind::ScoredPrefill;
+        }
+        if self.terminal_prefill_catalog.binary_search(&capacity).is_err() {
+            return GraphKind::Prefill;
+        }
+        let next_stop = cut
+            .unwrap_or(request.prompt_tokens)
+            .min(request.prefill_limit())
+            .min(request.prompt_tokens);
+        let end = (request.consumed_tokens as usize).saturating_add(work);
+        let window = self.terminal_prefill_window();
+        if end >= next_stop || (window > 0 && next_stop.saturating_sub(end) <= window) {
+            GraphKind::TerminalPrefill
+        } else {
+            GraphKind::Prefill
+        }
+    }
+
+    pub(super) fn prefill_requires_terminal_completion(
+        &self,
+        request: &LiveRequest,
+        cut: Option<usize>,
+    ) -> bool {
+        if request.prompt_logprobs || self.terminal_prefill_catalog.is_empty() {
+            return false;
+        }
+        let next_stop = cut
+            .unwrap_or(request.prompt_tokens)
+            .min(request.prefill_limit())
+            .min(request.prompt_tokens);
+        let remaining = next_stop.saturating_sub(request.consumed_tokens as usize);
+        if remaining == 0 {
+            return false;
+        }
+        let Some(&max_capacity) = self.prefill_catalog.last() else {
+            return false;
+        };
+        if self.prefill_work_through(request, max_capacity, cut) < remaining {
+            return false;
+        }
+        let Some(&smallest_fit) = self.prefill_catalog.iter().find(|&&cap| cap >= remaining) else {
+            return false;
+        };
+        self.terminal_prefill_catalog
+            .binary_search(&smallest_fit)
+            .is_ok()
     }
 
     pub fn snapshot_slot(&self, snapshot: SnapshotId) -> StateSlotId {

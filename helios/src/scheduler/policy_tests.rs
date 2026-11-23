@@ -4259,3 +4259,200 @@ fn fixed_host_prefixes_preserve_lengths_above_255() {
     assert_eq!(plan.lanes[0].tokens, 257);
     assert_eq!(plan.token_capacity, 257);
 }
+
+fn engine_with_terminal_prefill(terminal_capacities: &[usize]) -> RequestScheduler {
+    let mut s = engine(1, false);
+    s.prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    s.terminal_prefill_graphs(terminal_capacities).unwrap();
+    let mut graphs = super::tests::duration_graphs(1);
+    graphs.retain(|g| g.kind != GraphKind::Prefill);
+    for &capacity in &[64usize, 128, 256, 512] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("prefill-{capacity}"),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 100 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: (capacity as u64 / 64 + 1) * MS,
+            input_bindings: vec![],
+        });
+    }
+    for &capacity in terminal_capacities {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("terminal-prefill-{capacity}"),
+            kind: GraphKind::TerminalPrefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 1000 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: (capacity as u64 / 64 + 4) * MS,
+            input_bindings: vec![],
+        });
+    }
+    s.measured_graph_durations(&graphs).unwrap();
+    s
+}
+
+fn run_prefill_sequence(
+    s: &mut RequestScheduler,
+    handle: RequestHandle,
+) -> Vec<(GraphKind, usize, usize)> {
+    let init = s.plan().unwrap();
+    assert_eq!(init.kind, GraphKind::Init);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(s, &init, fence, 0, false);
+
+    let mut steps = Vec::new();
+    loop {
+        let plan = s.plan().unwrap();
+        if !plan.kind.is_prefill() {
+            break;
+        }
+        steps.push((plan.kind, plan.token_capacity, plan.lanes[0].tokens));
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        complete(s, &plan, fence, 0, false);
+        if s.request(handle).unwrap().phase != RequestPhase::Prefill {
+            break;
+        }
+    }
+    steps
+}
+
+#[test]
+fn terminal_prefill_falls_back_to_prefill_when_unavailable() {
+    let mut s = engine_with_terminal_prefill(&[]);
+    let handle = add(&mut s, 1, 1024, 4);
+    let steps = run_prefill_sequence(&mut s, handle);
+    assert_eq!(
+        steps,
+        vec![
+            (GraphKind::Prefill, 512, 512),
+            (GraphKind::Prefill, 512, 512),
+        ]
+    );
+}
+
+#[test]
+fn terminal_prefill_selects_last_chunk_and_protects_small_tail_window() {
+    // 1536 = 3 * 512: first two chunks run encoder-only Prefill, final chunk runs TerminalPrefill.
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    let handle = add(&mut s, 1, 1536, 4);
+    assert_eq!(
+        run_prefill_sequence(&mut s, handle),
+        vec![
+            (GraphKind::Prefill, 512, 512),
+            (GraphKind::Prefill, 512, 512),
+            (GraphKind::TerminalPrefill, 512, 512),
+        ]
+    );
+
+    // 640 = 512 + 128 when TerminalPrefill(512) beats smaller chunks per token:
+    // chunk 0 leaves 128 <= window (128), so chunk 0 uses TerminalPrefill(512) to populate
+    // the tail SWA state; chunk 1 falls back to Prefill(128) (absent from terminal catalog).
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 512, 9 * MS);
+    let handle = add(&mut s, 2, 640, 4);
+    assert_eq!(
+        run_prefill_sequence(&mut s, handle),
+        vec![
+            (GraphKind::TerminalPrefill, 512, 512),
+            (GraphKind::Prefill, 128, 128),
+        ]
+    );
+
+    // 640 = 512 + 128 when encoder-only Prefill(256) beats TerminalPrefill(512) per token:
+    // chunk 0 runs Prefill(256) (leaving 384 > 128), then chunk 1 runs TerminalPrefill(512)
+    // (384 > 128 -> fresh SWA boundary). Still never leaves <= 128 tokens after an encoder-only chunk.
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    let handle = add(&mut s, 4, 640, 4);
+    assert_eq!(
+        run_prefill_sequence(&mut s, handle),
+        vec![
+            (GraphKind::Prefill, 256, 256),
+            (GraphKind::TerminalPrefill, 512, 384),
+        ]
+    );
+
+    // 641 = 512 + 129: chunk 0 leaves 129 > window (128), so chunk 0 runs encoder-only Prefill;
+    // chunk 1 has 129 tokens and runs TerminalPrefill(256) with a fresh SWA replay boundary.
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    let handle = add(&mut s, 3, 641, 4);
+    assert_eq!(
+        run_prefill_sequence(&mut s, handle),
+        vec![
+            (GraphKind::Prefill, 512, 512),
+            (GraphKind::TerminalPrefill, 256, 129),
+        ]
+    );
+}
+
+#[test]
+fn terminal_prefill_runs_at_checkpoint_boundary_cut() {
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    let handle = s
+        .admit(RequestSpec {
+            prompt: vec![9; 1536],
+            message_boundaries: vec![512],
+            conditioning: vec![],
+            max_new_tokens: 4,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        })
+        .unwrap();
+    let init = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+
+    // Chunk 0 terminates at message boundary 512 -> must run TerminalPrefill before Snapshot.
+    let first = s.plan().unwrap();
+    assert_eq!((first.kind, first.token_capacity, first.lanes[0].tokens), (GraphKind::TerminalPrefill, 512, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    complete(&mut s, &first, fence, 0, false);
+
+    let snap = s.plan().unwrap();
+    assert_eq!(snap.kind, GraphKind::Snapshot);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&snap, fence).unwrap();
+    complete(&mut s, &snap, fence, 0, false);
+
+    // Chunk 1 (512..1024) has 512 remaining > 128 -> encoder-only Prefill.
+    let second = s.plan().unwrap();
+    assert_eq!((second.kind, second.token_capacity, second.lanes[0].tokens), (GraphKind::Prefill, 512, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&second, fence).unwrap();
+    complete(&mut s, &second, fence, 0, false);
+
+    // Chunk 2 (1024..1536) is the terminal prompt chunk -> TerminalPrefill.
+    let third = s.plan().unwrap();
+    assert_eq!((third.kind, third.token_capacity, third.lanes[0].tokens), (GraphKind::TerminalPrefill, 512, 512));
+    assert_eq!(third.lanes[0].request, handle);
+}
+
+#[test]
+fn terminal_prefill_rejects_invalid_capacities_and_post_admission_registration() {
+    let mut s = engine(1, false);
+    assert!(s.terminal_prefill_graphs(&[0]).is_err());
+    assert!(s.terminal_prefill_graphs(&[100]).is_err());
+    assert!(s.terminal_prefill_graphs(&[256, 256]).is_err());
+    assert!(s.terminal_prefill_graphs(&[1024]).is_err());
+    s.terminal_prefill_graphs(&[256, 512]).unwrap();
+    let _ = add(&mut s, 1, 64, 1);
+    assert!(s.terminal_prefill_graphs(&[512]).is_err());
+}

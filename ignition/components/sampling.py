@@ -691,8 +691,9 @@ class PreparedSampling:
         if not self._prepared:
             raise RuntimeError("sampling prepare() must complete before capture")
         if hasattr(self, "local_layout"):
+            needed = {name for _, name in self._record.scratch_slots}
             scratch = {name: torch.empty(shape, dtype=dtype, device=self.state.generation.device)
-                       for name, (shape, dtype) in self.local_layout.items()}
+                       for name, (shape, dtype) in self.local_layout.items() if name in needed}
             self._launch_with_scratch(self._record, scratch,
                 self._runtime_rows(slots, generations, live_rows, sample_enabled))
         else:

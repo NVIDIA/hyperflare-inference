@@ -78,7 +78,7 @@ def capture_observers(forwards, signatures, *, device, cache_root=None, **kwargs
     wrappers = {}
     for name, forward in forwards.items():
         signature = signatures[name]
-        if signature.kind not in ("prefill", "speculative"):
+        if signature.kind not in ("prefill", "terminal_prefill", "speculative"):
             raise ValueError("benchmark observations require prefill or speculative graphs")
         wrappers[names[name]] = ObservationForward(forward, rows=signature.batch_capacity, device=device,
             draft=signature.kind == "speculative" and forward.draft is not None)

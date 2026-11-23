@@ -73,6 +73,7 @@ pub enum GraphKind {
     Restore,
     Snapshot,
     Prefill,
+    TerminalPrefill,
     ScoredPrefill,
     Decode,
     Speculative,
@@ -83,13 +84,14 @@ pub enum GraphKind {
 
 impl GraphKind {
     pub fn is_prefill(self) -> bool {
-        matches!(self, Self::Prefill | Self::ScoredPrefill)
+        matches!(self, Self::Prefill | Self::TerminalPrefill | Self::ScoredPrefill)
     }
 
     pub fn samples(self) -> bool {
         matches!(
             self,
             Self::Prefill
+                | Self::TerminalPrefill
                 | Self::ScoredPrefill
                 | Self::Decode
                 | Self::Speculative
@@ -126,6 +128,7 @@ impl TryFrom<&str> for GraphKind {
             "restore" => Ok(Self::Restore),
             "snapshot" => Ok(Self::Snapshot),
             "prefill" => Ok(Self::Prefill),
+            "terminal_prefill" => Ok(Self::TerminalPrefill),
             "scored_prefill" => Ok(Self::ScoredPrefill),
             "decode" => Ok(Self::Decode),
             "speculative" => Ok(Self::Speculative),
@@ -703,7 +706,7 @@ impl ExecutionManifest {
                         && graph.batch_capacity <= self.request_capacity()
                         && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                 }
-                GraphKind::Prefill | GraphKind::ScoredPrefill => {
+                GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => {
                     graph.batch_capacity == 1
                         && ([1, 16].contains(&graph.token_capacity)
                             || (graph.token_capacity >= 64

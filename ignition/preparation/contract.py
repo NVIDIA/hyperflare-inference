@@ -26,12 +26,12 @@ def text_inputs(kind):
     if kind != "resume":
         values += [b("page_tables", p.PAGE_TABLE, p.REQUEST_ROW),
                    b("draft_page_tables", p.PAGE_TABLE, p.REQUEST_ROW)]
-    if kind in ("prefill", "scored_prefill", "decode", "speculative", "mixed", "resume"):
+    if kind in ("prefill", "terminal_prefill", "scored_prefill", "decode", "speculative", "mixed", "resume"):
         values += [b("sampling_grammar_mask", p.GRAMMAR_MASK, p.REQUEST_ROW)]
         if kind != "resume":
             values += [b("sample_enabled", p.SAMPLE_ENABLED)]
             values += [b("query_lengths", p.QUERY_LENGTH)]
-    if kind in ("prefill", "scored_prefill", "mixed"):
+    if kind in ("prefill", "terminal_prefill", "scored_prefill", "mixed"):
         values += [b("token_ids", p.PROMPT_TOKEN, p.PACKED_TOKEN),
                    b("prefill_positions", p.PROMPT_POSITION, p.PACKED_TOKEN),
                    b("vision_token_indices", p.IMAGE_FEATURE_INDEX, p.PACKED_TOKEN),
@@ -84,7 +84,7 @@ def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, r
             state_rows_per_request=signature.token_capacity if rows is None and kind == "speculative" else (rows or 1),
             draft_cursor=cursor if signature.speculation_enabled and kind in ("speculative", "mixed") else None,
             embedding_tables=list(embedding_tables) if kind in (
-                "prefill", "scored_prefill", "decode", "speculative", "mixed") else [],
+                "prefill", "terminal_prefill", "scored_prefill", "decode", "speculative", "mixed") else [],
             pending_token=pending if kind not in ("init", "restore", "snapshot", "vision") else None))
     return result
 

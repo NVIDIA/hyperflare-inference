@@ -849,6 +849,29 @@ mod tests {
     }
 
     #[test]
+    fn serialized_terminal_prefill_preserves_operation_and_kind() {
+        // GraphContract(graph="terminal", kind=14)
+        let graph = wire::GraphContract::decode(b"\x0a\x08terminal\x40\x0e".as_slice()).unwrap();
+        let contract: crate::model::contract::GraphContract =
+            serde_json::from_value(serde_json::to_value(graph).unwrap()).unwrap();
+        assert_eq!(
+            contract.kind,
+            crate::model::contract::GraphOperation::TerminalPrefill
+        );
+        // ExecutionGraph(kind="terminal_prefill", batch_capacity=1, token_capacity=256)
+        let execution = wire::ExecutionGraph::decode(
+            b"\x12\x10terminal_prefill\x20\x01\x28\x80\x02".as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::execution::GraphKind::try_from(execution.kind.as_str()).unwrap(),
+            crate::execution::GraphKind::TerminalPrefill
+        );
+        assert_eq!(execution.draft_tokens, None);
+        assert_eq!(execution.packed_tokens(), 256);
+    }
+
+    #[test]
     fn unified_generation_rejects_removed_operations_and_preserves_geometry() {
         for operation in [0, 10, 11, 13, 99] {
             assert!(crate::model::contract::GraphOperation::try_from(operation).is_err());
