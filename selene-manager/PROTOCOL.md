@@ -891,6 +891,19 @@ writer                          manager
 - `Stored` means the manager can serve the indexed record from its arena
   or from disk. Arena puts can be acknowledged before write-back. `PRESENT`
   can also mean an empty put is already covered by its parent.
+- A put that conflicts with another put of the same key, or needs to replace a
+  pinned or disk-busy record, waits for admission. Each continuous conflict
+  starts one wait in `selene_put_inflight_waits_total`. Once the conflict
+  clears, a later conflict starts a fresh five-second wait. Time queued for
+  write-back to free arena space is excluded.
+- `selene_put_inflight_wait_max_seconds` is the longest individual conflict
+  wait since manager startup among puts admitted (including upgrades) or
+  answered `PRESENT`. A put still blocked at its deadline receives `INFLIGHT`
+  and increments `selene_put_inflight_expired_total`. A writer whose own
+  store connection pins the key receives `INFLIGHT` immediately. Both
+  refusals count in `selene_puts_total{outcome="inflight"}`. With one writer
+  process per manager, the own-pin rule limits waiting to write-back,
+  compaction and same-key puts.
 - **Pressure policy.** A DRAM handoff sends predecessors root-first. An
   ancestor refused with `INVALID` or `OVERSIZE` triggers a leaf-only put.
   `BUDGET` and `INFLIGHT` retry once before the same fallback. If the

@@ -69,20 +69,51 @@ async fn store_when_room(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_03_accept_shapes_and_present_inflight() {
+async fn a_same_key_put_waits_and_upgrades_the_stored_role() {
+    use flare_selene::{CaptureRole::Message, shared::record::Header};
+
+    let mut host = Host::with_storage(4096, 4 << 20);
+    let (gate, entered, release) = disk::IoGate::new();
+    host.config.faults.io_gate = Some(gate);
+    host.run();
+    let mut first = host.client().await;
+    let mut second = host.client().await;
+    let record = key(128);
+    let write = tokio::spawn(async move { first.store(record, None).await });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let options = PutOptions {
+        role: Message,
+        ..Default::default()
+    };
+    let upgrade = tokio::spawn(async move { second.put(record, None, options).await });
+    host.wait(|host| upgrade.is_finished() || host.gauge("put_inflight_waits_total") == 1);
+    release.send(()).unwrap();
+    let payload = write.await.unwrap();
+    let outcome = upgrade.await.unwrap();
+    let PutOutcome::Stored(upgraded) = outcome else {
+        panic!("role upgrade returned {outcome:?}")
+    };
+    assert_eq!(upgraded, payload);
+    let path = host
+        .config
+        .root
+        .as_ref()
+        .unwrap()
+        .join(descriptor().name())
+        .join(record::file_name(&record));
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(
+        Header::decode(&bytes[..4096]).unwrap().capture_role(),
+        Message
+    );
+    assert_eq!(host.gauge("put_inflight_waits_total"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l0_03_accept_shapes_and_present() {
     let mut host = Host::with_storage(4 * 1024 * 1024, 4 * 1024 * 1024);
     host.run();
-    let mut a = host.client().await;
     let mut b = host.client().await;
-    // A second writer sees INFLIGHT while the first put is open.
-    let (open, start) = a.start_put(key(128), None).await;
-    assert!(matches!(start, PutStart::Accepted(_)), "{start:?}");
-    assert_eq!(
-        b.put(key(128), None, PutOptions::default()).await,
-        PutOutcome::Refused(v2::Reason::Inflight as u8)
-    );
-    a.abandon_put(open).await;
-    host.wait(|host| host.gauge("open_ops") == 0);
     let bytes = b.store(key(128), None).await;
     assert!(!bytes.is_empty());
     assert_eq!(

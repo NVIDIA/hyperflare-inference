@@ -30,6 +30,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+// Stay above NO_PROGRESS (3 s) so a stalled blocking put is cleaned up before its waiter expires.
+const PUT_INFLIGHT_WAIT: Duration = Duration::from_secs(5);
+
 pub const OPEN_GETS: usize = 4;
 pub const MAX_CHAIN: usize = flare_selene::shared::MAX_CHAIN_NODES as usize;
 /// Records in a chain at which a put starts a new root instead of linking. Lookups, claims
@@ -468,6 +471,9 @@ pub struct Metrics {
     pub retry_queue: u64,
     pub retry_budget: u64,
     put_writeback_waits: u64,
+    put_inflight_waits: u64,
+    put_inflight_expired: u64,
+    put_inflight_wait_max: Duration,
     shutdown_unflushed: Option<(u64, u64)>,
     pub retry_inflight: u64,
     pub oversize: u64,
@@ -499,6 +505,8 @@ pub struct EntryData {
 }
 
 struct PendingPut {
+    inflight_since: Option<Instant>,
+    longest_inflight_wait: Duration,
     connection: u64,
     transfer: u64,
     request: PutRequest,
@@ -1064,14 +1072,21 @@ impl Store {
         request: PutRequest,
         events: tokio::sync::mpsc::Sender<Result<PutAnswer>>,
     ) {
-        let queue = self.pending_puts.entry(connection).or_default();
-        let was_empty = queue.is_empty();
-        queue.push_back(PendingPut {
+        self.queue_put(PendingPut {
+            inflight_since: None,
+            longest_inflight_wait: Duration::ZERO,
             connection,
             transfer,
             request,
             events,
         });
+    }
+
+    fn queue_put(&mut self, pending: PendingPut) {
+        let connection = pending.connection;
+        let queue = self.pending_puts.entry(connection).or_default();
+        let was_empty = queue.is_empty();
+        queue.push_back(pending);
         if was_empty {
             self.put_order.push_back(connection);
         }
@@ -1233,12 +1248,48 @@ impl Store {
         false
     }
 
-    fn begin_put(&mut self, pending: PendingPut) {
+    fn wait_for_inflight(&mut self, mut pending: PendingPut) {
+        let key = &pending.request.key;
+        // This writer may wait for admission before releasing its own lease or put.
+        let session = &self.sessions[&pending.connection];
+        let owns_pin = session.ops.values().any(|open| match &open.operation {
+            Operation::Get(get) => get.pins.contains(key),
+            Operation::Put(put) => put.pins.contains(key),
+        });
+        let expired = !owns_pin
+            && pending
+                .inflight_since
+                .is_some_and(|start| start.elapsed() >= PUT_INFLIGHT_WAIT);
+        if owns_pin || expired {
+            if expired {
+                self.metrics.put_inflight_expired += 1;
+            }
+            self.metrics.retry_inflight += 1;
+            self.reject_put(&pending.events, proto::Reason::Inflight as u8);
+            return;
+        }
+        if pending.inflight_since.is_none() {
+            self.metrics.put_inflight_waits += 1;
+            pending.inflight_since = Some(Instant::now());
+        }
+        self.queue_put(pending);
+    }
+
+    fn put_present(&mut self, pending: &PendingPut) {
+        self.metrics.present += 1;
+        self.metrics.put_inflight_wait_max = self
+            .metrics
+            .put_inflight_wait_max
+            .max(pending.longest_inflight_wait);
+        self.reject_put(&pending.events, proto::Reason::Present as u8);
+    }
+
+    fn begin_put(&mut self, mut pending: PendingPut) {
         let PendingPut {
             connection,
             transfer,
-            request,
-            events,
+            ref request,
+            ..
         } = pending;
         let Some(id) = self.sessions.get(&connection).map(|_| request.namespace) else {
             return;
@@ -1248,7 +1299,7 @@ impl Store {
             .get(&id)
             .map(|namespace| namespace.descriptor.clone())
         else {
-            self.reject_put(&events, proto::Reason::Invalid as u8);
+            self.reject_put(&pending.events, proto::Reason::Invalid as u8);
             return;
         };
         let invalid_geometry = request.key.consumed_tokens == 0
@@ -1273,15 +1324,14 @@ impl Store {
                 .any(|keys| keys[0].consumed_tokens <= keys[1].consumed_tokens);
         if invalid_geometry {
             self.metrics.puts_error += 1;
-            self.reject_put(&events, proto::Reason::Invalid as u8);
+            self.reject_put(&pending.events, proto::Reason::Invalid as u8);
+            return;
+        }
+        if self.namespaces[&id].inflight.contains(&request.key) {
+            self.wait_for_inflight(pending);
             return;
         }
         let initial_old = self.namespaces[&id].tree.node(&request.key).cloned();
-        if self.namespaces[&id].inflight.contains(&request.key) {
-            self.metrics.retry_inflight += 1;
-            self.reject_put(&events, proto::Reason::Inflight as u8);
-            return;
-        }
         let role = initial_old.as_ref().map_or(request.capture_role, |old| {
             old.location
                 .header
@@ -1319,40 +1369,43 @@ impl Store {
                         |node| node.ready,
                     ))
         };
-        if let Some(node) = &initial_old {
+        let present = if let Some(node) = &initial_old {
             if node.bucket != request.bucket {
-                self.reject_put(&events, proto::Reason::Invalid as u8);
+                self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
             }
-            let stored_role = node.location.header.capture_role();
-            let covers_role = stored_role == role;
-            if (node.location.memory.is_some() || node.location.disk.is_some())
+            let covers_role = node.location.header.capture_role() == role;
+            (node.location.memory.is_some() || node.location.disk.is_some())
                 && (!request.row
                     || (node.row && covers_role)
                     || (!node.row && !needs_row(node.parent)))
-            {
-                self.namespaces
-                    .get_mut(&id)
-                    .unwrap()
-                    .tree
-                    .touch_ancestors(&request.key);
-                self.metrics.present += 1;
-                self.reject_put(&events, proto::Reason::Present as u8);
-                return;
-            }
-        }
-        if initial_old
-            .as_ref()
-            .is_some_and(|node| node.pinned() || node.location.disk_busy())
+        } else {
+            false
+        };
+        if !present
+            && initial_old
+                .as_ref()
+                .is_some_and(|node| node.pinned() || node.location.disk_busy())
         {
-            self.metrics.retry_inflight += 1;
-            self.reject_put(&events, proto::Reason::Inflight as u8);
+            self.wait_for_inflight(pending);
+            return;
+        }
+        if let Some(start) = pending.inflight_since.take() {
+            pending.longest_inflight_wait = pending.longest_inflight_wait.max(start.elapsed());
+        }
+        if present {
+            self.namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .touch_ancestors(&request.key);
+            self.put_present(&pending);
             return;
         }
         let initial_bucket = match &initial_old {
             Some(node) => {
                 if node.bucket != request.bucket {
-                    self.reject_put(&events, proto::Reason::Invalid as u8);
+                    self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                     return;
                 }
                 node.bucket
@@ -1381,7 +1434,7 @@ impl Store {
         // refused. That is normal operation, not an error.
         if initial_parent.is_none() && !request.row {
             self.metrics.puts_unlinked += 1;
-            self.reject_put_detail(&events, proto::Reason::Invalid as u8, PUT_UNLINKED);
+            self.reject_put_detail(&pending.events, proto::Reason::Invalid as u8, PUT_UNLINKED);
             return;
         }
         let mut row = request.row && needs_row(initial_parent);
@@ -1391,7 +1444,7 @@ impl Store {
             .chain_pages
             .checked_sub(u32::try_from(initial_first).unwrap_or(u32::MAX))
         else {
-            self.reject_put(&events, proto::Reason::Invalid as u8);
+            self.reject_put(&pending.events, proto::Reason::Invalid as u8);
             return;
         };
         if initial_tail == 0 && !row {
@@ -1404,7 +1457,6 @@ impl Store {
                     .touch_ancestors(&parent);
             }
             self.metrics.put_shapes_empty += 1;
-            self.metrics.present += 1;
             if request.row {
                 let action = self
                     .metrics
@@ -1414,7 +1466,7 @@ impl Store {
                 action.0 += 1;
                 action.1 += descriptor.row_bytes();
             }
-            self.reject_put(&events, proto::Reason::Present as u8);
+            self.put_present(&pending);
             return;
         }
         let child_header = match crate::record::new_header(
@@ -1426,7 +1478,7 @@ impl Store {
         ) {
             Ok(header) => header.with_capture_role(wire_role),
             Err(_) => {
-                self.reject_put(&events, proto::Reason::Invalid as u8);
+                self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
             }
         };
@@ -1439,7 +1491,7 @@ impl Store {
         ) {
             Ok(header) => header.with_capture_role(wire_role),
             Err(_) => {
-                self.reject_put(&events, proto::Reason::Invalid as u8);
+                self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
             }
         };
@@ -1452,7 +1504,7 @@ impl Store {
         // what else must stay resident is a capacity question.
         if rootless && child_header.length(row).max(4096).next_power_of_two() > arena_bytes {
             self.metrics.oversize += 1;
-            self.reject_put(&events, proto::Reason::Oversize as u8);
+            self.reject_put(&pending.events, proto::Reason::Oversize as u8);
             return;
         }
         let selected_pins: Vec<Key> = initial_parent
@@ -1473,7 +1525,7 @@ impl Store {
         };
         if !rootless && charge > self.config.nvme {
             self.metrics.oversize += 1;
-            self.reject_put(&events, proto::Reason::Oversize as u8);
+            self.reject_put(&pending.events, proto::Reason::Oversize as u8);
             return;
         }
         // Pick the shape by asking the arena allocator. A failed allocation
@@ -1497,7 +1549,7 @@ impl Store {
                     None if rootless => {
                         if !request.row {
                             self.metrics.retry_budget += 1;
-                            self.reject_put(&events, proto::Reason::Budget as u8);
+                            self.reject_put(&pending.events, proto::Reason::Budget as u8);
                             return;
                         }
                         let root_pins: Vec<Key> =
@@ -1518,7 +1570,7 @@ impl Store {
                             }
                             RootChoice::Wait => {
                                 self.metrics.retry_budget += 1;
-                                self.reject_put(&events, proto::Reason::Budget as u8);
+                                self.reject_put(&pending.events, proto::Reason::Budget as u8);
                                 return;
                             }
                         }
@@ -1529,12 +1581,12 @@ impl Store {
                         .any(|job| matches!(job, Job::Write { .. })) =>
                     {
                         self.metrics.put_writeback_waits += 1;
-                        self.submit_put(connection, transfer, request, events);
+                        self.queue_put(pending);
                         return;
                     }
                     None => {
                         self.metrics.retry_budget += 1;
-                        self.reject_put(&events, proto::Reason::Budget as u8);
+                        self.reject_put(&pending.events, proto::Reason::Budget as u8);
                         return;
                     }
                 }
@@ -1550,11 +1602,11 @@ impl Store {
         if requirement.streaming && requirement.allocation > self.staging.capacity() as u64 {
             if selected.streaming {
                 self.metrics.oversize += 1;
-                self.reject_put(&events, proto::Reason::Oversize as u8);
+                self.reject_put(&pending.events, proto::Reason::Oversize as u8);
                 return;
             }
             self.metrics.retry_budget += 1;
-            self.reject_put(&events, proto::Reason::Budget as u8);
+            self.reject_put(&pending.events, proto::Reason::Budget as u8);
             return;
         }
         for key in &pins {
@@ -1562,7 +1614,7 @@ impl Store {
                 for key in &pins {
                     let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                 }
-                self.reject_put(&events, proto::Reason::Invalid as u8);
+                self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
             }
         }
@@ -1577,10 +1629,10 @@ impl Store {
                 .any(|job| matches!(job, Job::Write { .. }))
             {
                 self.metrics.put_writeback_waits += 1;
-                self.submit_put(connection, transfer, request, events);
+                self.queue_put(pending);
             } else {
                 self.metrics.retry_budget += 1;
-                self.reject_put(&events, proto::Reason::Budget as u8);
+                self.reject_put(&pending.events, proto::Reason::Budget as u8);
             }
             return;
         }
@@ -1593,7 +1645,7 @@ impl Store {
                         let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                     }
                     self.metrics.retry_budget += 1;
-                    self.reject_put(&events, proto::Reason::Budget as u8);
+                    self.reject_put(&pending.events, proto::Reason::Budget as u8);
                     return;
                 }
             }
@@ -1611,7 +1663,7 @@ impl Store {
                     for key in &pins {
                         let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                     }
-                    self.reject_put(&events, proto::Reason::Io as u8);
+                    self.reject_put(&pending.events, proto::Reason::Io as u8);
                     return;
                 }
             }
@@ -1663,7 +1715,7 @@ impl Store {
             staging_hold,
             hold_unit: requirement.unit as usize,
             hold_slots: [None, None],
-            events,
+            events: pending.events,
             outbox: VecDeque::new(),
         };
         let namespace = self.namespaces.get_mut(&id).unwrap();
@@ -1689,6 +1741,10 @@ impl Store {
                 action.1 += descriptor.row_bytes();
             }
         }
+        self.metrics.put_inflight_wait_max = self
+            .metrics
+            .put_inflight_wait_max
+            .max(pending.longest_inflight_wait);
         put.outbox.push_back(Ok(PutAnswer::Accept(PutAccept {
             capture_role: wire_role,
             transfer,
@@ -4214,6 +4270,11 @@ impl Store {
                 "put_writeback_waits_total",
                 self.metrics.put_writeback_waits,
             ),
+            ("put_inflight_waits_total", self.metrics.put_inflight_waits),
+            (
+                "put_inflight_expired_total",
+                self.metrics.put_inflight_expired,
+            ),
             ("evictions_total", self.metrics.evictions),
             ("compactions_total", self.metrics.compactions),
             ("nvme_bytes_total", self.metrics.nvme_bytes),
@@ -4269,6 +4330,10 @@ impl Store {
         ] {
             text.push_str(&format!("selene_{name} {value}\n"));
         }
+        text.push_str(&format!(
+            "selene_put_inflight_wait_max_seconds {}\n",
+            self.metrics.put_inflight_wait_max.as_secs_f64()
+        ));
         text.push_str(&format!(
             "selene_nvme_seconds_total {}\n",
             self.metrics.nvme_seconds
@@ -4960,6 +5025,8 @@ mod tests {
             let mut accepted = 0;
             for index in 0..count {
                 store.begin_put(PendingPut {
+                    inflight_since: None,
+                    longest_inflight_wait: Duration::ZERO,
                     connection: 1,
                     transfer: index + 1,
                     request: PutRequest {
@@ -6323,6 +6390,8 @@ mod tests {
         let chain_pages = key.consumed_tokens / 64;
         let (events, mut answers) = tokio::sync::mpsc::channel(16);
         store.begin_put(PendingPut {
+            inflight_since: None,
+            longest_inflight_wait: Duration::ZERO,
             connection: 1,
             transfer: 1,
             request: PutRequest {
@@ -6546,6 +6615,8 @@ mod tests {
                 digest: [99; 16],
             };
             store.begin_put(PendingPut {
+                inflight_since: None,
+                longest_inflight_wait: Duration::ZERO,
                 connection: 1,
                 transfer: 1,
                 request: PutRequest {
@@ -6625,6 +6696,8 @@ mod tests {
             loc.header = loc.header.clone().with_capture_role(CaptureRole::Endpoint);
             let (events, mut answers) = tokio::sync::mpsc::channel(16);
             store.begin_put(PendingPut {
+                inflight_since: None,
+                longest_inflight_wait: Duration::ZERO,
                 connection: 1,
                 transfer: 1,
                 request: PutRequest {
@@ -8532,6 +8605,229 @@ mod tests {
             store.pump();
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn offer_root_upgrade(
+        store: &mut Store,
+        connection: u64,
+    ) -> tokio::sync::mpsc::Receiver<Result<PutAnswer>> {
+        let (events, answers) = tokio::sync::mpsc::channel(4);
+        store.submit_put(
+            connection,
+            2,
+            PutRequest {
+                namespace: store.sessions[&connection].namespace,
+                key: page_key(1),
+                published_parent: None,
+                ancestor_keys: vec![],
+                bucket: [0; 16],
+                chain_pages: 1,
+                published_tail_pages: 1,
+                capture_role: CaptureRole::Message,
+                child_paths: 0,
+                descendant_row: false,
+                next_child: None,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch();
+        store.flush_outboxes();
+        answers
+    }
+
+    fn put_inflight_wait_max_seconds(store: &Store) -> f64 {
+        store
+            .metrics_text()
+            .lines()
+            .find_map(|line| line.strip_prefix("selene_put_inflight_wait_max_seconds "))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_put_waits_for_its_records_writeback() {
+        let (mut store, base, shm, id) = page_only_parent_writing("put-waits-writeback");
+        store.hello(1, 0, None, descriptor()).unwrap();
+        let start = Instant::now();
+        let mut answers = offer_root_upgrade(&mut store, 1);
+        finish_jobs(&mut store);
+        assert!(store.namespaces[&id].tree[&page_key(1)].location.durable);
+        match answers.try_recv().unwrap().unwrap() {
+            PutAnswer::Accept(accept) => assert_eq!(accept.capture_role, CaptureRole::Message),
+            PutAnswer::Refused(r) => panic!("write-back refused the upgrade: {}", r.detail),
+            _ => panic!("expected an admission answer"),
+        }
+        let observed = start.elapsed().as_secs_f64();
+        let max_wait = put_inflight_wait_max_seconds(&store);
+        assert!(
+            max_wait > 0.0 && max_wait <= observed,
+            "gauge {max_wait}s, observed {observed}s"
+        );
+        assert!(
+            store
+                .metrics_text()
+                .contains("selene_put_inflight_waits_total 1\n")
+        );
+        assert_eq!(store.metrics.retry_inflight, 0);
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(shm).unwrap();
+    }
+
+    #[test]
+    fn a_put_starts_a_fresh_wait_after_writeback_requeue() {
+        let key = page_key(1);
+        let value = descriptor();
+        let header = crate::record::new_header(&value, key, None, [0; 16], 1).unwrap();
+        let extent = record_charge(&header, true) as usize;
+        let (mut store, base, shm) = store_with_root("put-waits-twice", 4 * extent);
+        let held = store.memory.allocate(2 * extent).unwrap();
+        store.hello(1, 0, None, value.clone()).unwrap();
+        let id = store.sessions[&1].namespace;
+        insert_chain(&mut store, id, &value, &[1, 2]);
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .pin(&key)
+            .unwrap();
+        let mut answers = offer_root_upgrade(&mut store, 1);
+        assert_eq!(store.metrics.put_inflight_waits, 1);
+
+        // The arena is full. Writing back the child first requires writing its dirty parent.
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .unpin(&key)
+            .unwrap();
+        store.dispatch();
+        assert_eq!(store.metrics.put_writeback_waits, 1);
+        assert!(store.namespaces[&id].tree[&key].location.writing);
+        assert_eq!(put_inflight_wait_max_seconds(&store), 0.0);
+
+        // Advance any clock still running during write-back, without polling its completion.
+        let pending = store.pending_puts.get_mut(&1).unwrap().front_mut().unwrap();
+        if let Some(start) = &mut pending.inflight_since {
+            *start -= PUT_INFLIGHT_WAIT;
+        }
+        store.dispatch();
+        match answers.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Ok(Ok(PutAnswer::Refused(r))) => {
+                panic!("second conflict refused the upgrade: {}", r.reason)
+            }
+            _ => panic!("expected the upgrade to stay queued"),
+        }
+        assert_eq!(store.metrics.put_inflight_waits, 2);
+        drop(held);
+        finish_jobs(&mut store);
+        assert!(matches!(
+            answers.try_recv().unwrap().unwrap(),
+            PutAnswer::Accept(_)
+        ));
+        assert!(put_inflight_wait_max_seconds(&store) > 0.0);
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(shm).unwrap();
+    }
+
+    #[test]
+    fn a_put_refuses_to_wait_for_its_own_sessions_pin() {
+        for read_lease in [false, true] {
+            let (mut store, shm, id) = held_chain("own-put-pin", 1 << 20, &[1], &[]);
+            if read_lease {
+                let (events, _answers) = tokio::sync::mpsc::channel(4);
+                store.submit_get(
+                    1,
+                    1,
+                    GetRequest {
+                        namespace: id,
+                        keys: vec![page_key(1)],
+                        skip_pages: 0,
+                        expected_pages: 1,
+                        row: true,
+                    },
+                    events,
+                );
+                store.dispatch();
+            } else {
+                assert!(matches!(
+                    first_put_answer(&mut store, id, page_key(2), Some(page_key(1)), vec![], true),
+                    PutAnswer::Accept(_)
+                ));
+            }
+            assert!(store.namespaces[&id].tree[&page_key(1)].pinned());
+            let mut answers = offer_root_upgrade(&mut store, 1);
+            assert!(
+                matches!(answers.try_recv().unwrap().unwrap(), PutAnswer::Refused(r) if r.reason == proto::Reason::Inflight as u8)
+            );
+            assert_eq!(store.metrics.put_inflight_waits, 0);
+            assert_eq!(store.metrics.retry_inflight, 1);
+            assert_eq!(store.metrics.put_inflight_expired, 0);
+            store.hello(2, 0, None, descriptor()).unwrap();
+            let mut other = offer_root_upgrade(&mut store, 2);
+            assert_eq!(store.metrics.put_inflight_waits, 1);
+            store.cancel(1, 1);
+            store.pump();
+            store.pump();
+            assert!(matches!(
+                other.try_recv().unwrap().unwrap(),
+                PutAnswer::Accept(_)
+            ));
+            drop(store);
+            fs::remove_dir_all(shm).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_put_waiting_for_another_sessions_pin_expires() {
+        let (mut store, shm, id) = held_chain("put-pin-deadline", 1 << 20, &[1], &[]);
+        store.hello(2, 0, None, descriptor()).unwrap();
+        // A child put pins its parent while it waits for window credit.
+        assert!(matches!(
+            first_put_answer(&mut store, id, page_key(2), Some(page_key(1)), vec![], true),
+            PutAnswer::Accept(_)
+        ));
+        let mut upgrade = offer_root_upgrade(&mut store, 2);
+        store.cancel(1, 1);
+        store.pump();
+        store.pump();
+        assert!(matches!(
+            upgrade.try_recv().unwrap().unwrap(),
+            PutAnswer::Accept(_)
+        ));
+        let successful = put_inflight_wait_max_seconds(&store);
+        assert!(successful > 0.0);
+
+        store.cancel(2, 2);
+        store.pump();
+        assert!(matches!(
+            first_put_answer(&mut store, id, page_key(2), Some(page_key(1)), vec![], true),
+            PutAnswer::Accept(_)
+        ));
+        let mut answers = offer_root_upgrade(&mut store, 2);
+        let mut pending = store.pop_put().unwrap();
+        pending.inflight_since = Some(Instant::now() - PUT_INFLIGHT_WAIT);
+        store.begin_put(pending);
+        assert!(
+            matches!(answers.try_recv().unwrap().unwrap(), PutAnswer::Refused(r) if r.reason == proto::Reason::Inflight as u8)
+        );
+        assert!(store.namespaces[&id].tree[&page_key(1)].pinned());
+        assert_eq!(store.metrics.put_inflight_waits, 2);
+        assert_eq!(store.metrics.retry_inflight, 1);
+        assert!(
+            store
+                .metrics_text()
+                .contains("selene_put_inflight_expired_total 1\n")
+        );
+        assert_eq!(put_inflight_wait_max_seconds(&store), successful);
+        drop(store);
+        fs::remove_dir_all(shm).unwrap();
     }
 
     #[test]
