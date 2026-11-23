@@ -1252,6 +1252,27 @@ fn warm_launch_reuses_a_verified_entry_without_rewriting_its_marker() {
 #[test]
 fn unreadable_marker_directory_still_serves_the_verified_rank() {
     let temp = tempfile::tempdir().unwrap();
+    // The test installs a directory that denies writes by clearing its permission
+    // bits. Root and any holder of the corresponding capability writes there
+    // regardless, so the condition cannot be established and the assertion below
+    // would report a product defect that does not exist. Probe the condition
+    // itself rather than the caller's identity.
+    let probe = temp.path().join("read-only-probe");
+    fs::create_dir(&probe).unwrap();
+    let mut probe_permissions = fs::metadata(&probe).unwrap().permissions();
+    probe_permissions.set_readonly(true);
+    fs::set_permissions(&probe, probe_permissions).unwrap();
+    if fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(probe.join(VERIFIED_MARKER))
+        .is_ok()
+    {
+        eprintln!(
+            "skipping: this process writes into a read-only directory, so the marker cannot be prevented"
+        );
+        return;
+    }
     let model_root = temp.path().join("flare");
     let (files, specs, plan) = fixture(temp.path(), "export-readonly-marker");
     let entry = run(&files, &specs, plan_like(&plan, &plan.export), &model_root).unwrap();
