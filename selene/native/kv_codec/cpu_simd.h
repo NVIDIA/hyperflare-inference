@@ -33,22 +33,22 @@ KV_AVX2 static inline __m256 bounded_vector(__m256 values) {
     return _mm256_castsi256_ps(_mm256_and_si256(words, keep));
 }
 
-KV_AVX2 static inline void divide_scales(U *values, int first, U divisor) {
+KV_AVX2 static inline void divide_scales(U *values, int first, U divisor, int end) {
     __m256 d = _mm256_castsi256_ps(_mm256_set1_epi32(divisor));
-    for (int i = first & ~7; i < 128; i += 8) {
+    for (int i = first & ~7; i < end; i += 8) {
         __m256 v = _mm256_castsi256_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(values + i)));
         __m256 result = bounded_vector(_mm256_div_ps(v, d));
         _mm256_store_si256(reinterpret_cast<__m256i *>(values + i), _mm256_castps_si256(result));
     }
 }
 
-template <bool bound> KV_AVX2 static void update_simd(U *p, const U *v, int columns, U factor) {
+template <bool bound, bool bound_product = bound> KV_AVX2 static void update_simd(U *p, const U *v, int columns, U factor) {
     __m256 scale = _mm256_castsi256_ps(_mm256_set1_epi32(factor));
     for (int j = 0; j < columns; j += 8) {
         __m256 values = _mm256_castsi256_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(v + j)));
         __m256 prior = _mm256_castsi256_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + j)));
         __m256 product = _mm256_mul_ps(scale, values);
-        __m256 result = _mm256_add_ps(prior, bound ? bounded_vector(product) : product);
+        __m256 result = _mm256_add_ps(prior, bound_product ? bounded_vector(product) : product);
         if (bound)
             result = bounded_vector(result);
         _mm256_storeu_si256(reinterpret_cast<__m256i *>(p + j), _mm256_castps_si256(result));
@@ -62,21 +62,22 @@ static inline float32x4_t bounded_vector(float32x4_t values) {
     return vreinterpretq_f32_u32(vandq_u32(words, keep));
 }
 
-static inline void divide_scales(U *values, int first, U divisor) {
+static inline void divide_scales(U *values, int first, U divisor, int end) {
     float32x4_t d = vreinterpretq_f32_u32(vdupq_n_u32(divisor));
-    for (int i = first & ~3; i < 128; i += 4) {
+    for (int i = first & ~3; i < end; i += 4) {
         float32x4_t v = vreinterpretq_f32_u32(vld1q_u32(values + i));
         vst1q_u32(values + i, vreinterpretq_u32_f32(bounded_vector(vdivq_f32(v, d))));
     }
 }
 
-template <bool bound> static void update_simd(U *p, const U *v, int columns, U factor) {
+template <bool bound, bool bound_product = bound> static void update_simd(U *p, const U *v, int columns, U factor) {
     float32x4_t scale = vreinterpretq_f32_u32(vdupq_n_u32(factor));
+#pragma GCC unroll 4
     for (int j = 0; j < columns; j += 4) {
         float32x4_t values = vreinterpretq_f32_u32(vld1q_u32(v + j));
         float32x4_t prior = vreinterpretq_f32_u32(vld1q_u32(p + j));
         float32x4_t product = vmulq_f32(scale, values);
-        float32x4_t result = vaddq_f32(prior, bound ? bounded_vector(product) : product);
+        float32x4_t result = vaddq_f32(prior, bound_product ? bounded_vector(product) : product);
         if (bound)
             result = bounded_vector(result);
         vst1q_u32(p + j, vreinterpretq_u32_f32(result));

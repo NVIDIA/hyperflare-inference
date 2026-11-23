@@ -9,15 +9,30 @@ struct EncodeSymbol {
     U bias;
 };
 
+struct Quotient {
+    U multiplier;
+    U shift;
+};
+
+struct DivisionTable {
+    Quotient entries[4097] = {};
+
+    constexpr DivisionTable() {
+        entries[1] = {UINT32_MAX, 0};
+        U shift = 0;
+        for (U f = 2; f <= 4096; ++f) {
+            if (f > (U(1) << shift))
+                ++shift;
+            entries[f] = {U(((uint64_t(1) << (31 + shift)) + f - 1) / f), shift - 1};
+        }
+    }
+};
+static constexpr DivisionTable division_table;
+
 static EncodeSymbol encoder_symbol(int frequency, int start) {
-    if (frequency == 0)
-        return {};
-    const U f = frequency;
-    if (f == 1)
-        return {f << 19, UINT32_MAX, 0, 4095, U(start) + 4095};
-    const U shift = lg(f - 1);
-    const U reciprocal = U(((uint64_t(1) << (31 + shift)) + f - 1) / f);
-    return {f << 19, reciprocal, shift - 1, 4096 - f, U(start)};
+    U f = frequency;
+    const Quotient quotient = division_table.entries[f];
+    return {f << 19, quotient.multiplier, quotient.shift, 4096 - f, U(start) + (f == 1 ? 4095u : 0u)};
 }
 
 static inline U put_symbol(U state, const EncodeSymbol &s, B *&next) {
@@ -38,6 +53,30 @@ static inline U put_symbol(U state, const EncodeSymbol &s, B *&next) {
 // Lane counts in lanes(n) give at most 2048 symbols per lane. Each emits
 // at most two normalization bytes. Low bits for matrix residuals precede them.
 constexpr int MAX_LANE_SYMBOLS = 2048;
+
+static void put_low_bits(B *out, const B *src, const B *widths, int n, int first, int stride) {
+    B *next_low = out;
+    uint64_t bits = 0;
+    int count = 0;
+    for (int i = first; i < n; i += stride) {
+        U v = value(src, i, true);
+        int low = widths[i] ? widths[i] - 1 : 0;
+        bits |= uint64_t(v & ((U(1) << low) - 1)) << count;
+        count += low;
+        // At least four bytes of terminal state follow this bit stream.
+        store32(next_low, U(bits));
+        next_low += count / 8;
+        bits >>= count & ~7;
+        count &= 7;
+    }
+    if (count)
+        *next_low = B(bits);
+}
+
+#if defined(KV_AVX2) || defined(KV_NEON)
+#include "cpu_encode.h"
+#endif
+
 template <int width, bool mat, int channel_shift>
 static int put_group(B *out, int capacity, const B *src, int n, int first, int stride,
                      const EncodeSymbol *table, const B *classes, B *lengths, const B *widths, const int *low_bits) {
@@ -75,22 +114,7 @@ static int put_group(B *out, int capacity, const B *src, int n, int first, int s
             int bytes = (low_bits[first + j] + 7) / 8;
             if (capacity - used - high < bytes)
                 return -1;
-            B *next_low = out + used;
-            uint64_t bits = 0;
-            int count = 0;
-            for (int i = first + j; i < n; i += stride) {
-                U v = value(src, i, true);
-                int low = widths[i] ? widths[i] - 1 : 0;
-                bits |= uint64_t(v & ((U(1) << low) - 1)) << count;
-                count += low;
-                // At least four bytes of terminal state follow this bit stream.
-                store32(next_low, U(bits));
-                next_low += count / 8;
-                bits >>= count & ~7;
-                count &= 7;
-            }
-            if (count)
-                *next_low = B(bits);
+            put_low_bits(out + used, src, widths, n, first + j, stride);
             used += bytes;
         }
         store32(next[j], states[j]);
@@ -103,8 +127,123 @@ static int put_group(B *out, int capacity, const B *src, int n, int first, int s
     return used;
 }
 
+// Lower bound on log2(4096 / frequency), in 1/256 bits. Truncating each
+// fixed-point square rounds the bound down.
+struct SymbolCost {
+    uint16_t bits[4097] = {};
+    constexpr SymbolCost() {
+        for (U f = 1; f <= 4096; ++f) {
+            uint64_t ratio = (4096u << 16) / f;
+            U cost = 0;
+            while (ratio >= (2u << 16)) {
+                ratio >>= 1;
+                cost += 256;
+            }
+            for (int bit = 128; bit; bit >>= 1) {
+                ratio = (ratio * ratio) >> 16;
+                if (ratio >= (2u << 16)) {
+                    ratio >>= 1;
+                    cost += bit;
+                }
+            }
+            bits[f] = uint16_t(cost);
+        }
+    }
+};
+
+static const SymbolCost symbol_cost;
+
+static void normalize_counts(const int *hist, int *freq, int *cum, int symbols, int n) {
+    if (!n) {
+        std::fill_n(freq, symbols, 0);
+        std::fill_n(cum, symbols, 0);
+        return;
+    }
+    int active = 0;
+    int best = 0;
+    for (int s = 0; s < symbols; ++s) {
+        active += hist[s] != 0;
+        if (hist[s] > hist[best])
+            best = s;
+    }
+    // A frame contains at most 131072 symbols. The upward reciprocal error
+    // in a scaled count is less than n * 4096 / 2^48, below 1/n.
+    const uint64_t scale = (((uint64_t(1) << 48) + n - 1) / n) * (4096 - active);
+    int total = 0;
+    for (int s = 0; s < symbols; ++s) {
+        freq[s] = (hist[s] != 0) + int((hist[s] * scale) >> 48);
+        total += freq[s];
+    }
+    freq[best] += 4096 - total;
+    total = 0;
+    for (int s = 0; s < symbols; ++s) {
+        cum[s] = total;
+        total += freq[s];
+    }
+}
+
+#if defined(KV_AVX2) || defined(KV_NEON)
+#ifdef KV_AVX2
+KV_AVX2
+#endif
+static int column_class(const B *src, int rows) {
+    int negative = 0;
+#ifdef KV_AVX2
+    for (int i = 0; i < rows; i += 32) {
+        __m256i bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src + i));
+        negative += __builtin_popcount(unsigned(_mm256_movemask_epi8(bytes)));
+    }
+#else
+    uint8x16_t count = vdupq_n_u8(0);
+    for (int i = 0; i < rows; i += 16)
+        count = vsubq_u8(count, vreinterpretq_u8_s8(vshrq_n_s8(vreinterpretq_s8_u8(vld1q_u8(src + i)), 7)));
+    negative = vaddlvq_u8(count);
+#endif
+    bool flip = negative > rows / 2;
+    return (flip ? 4 : 0) + (flip ? rows - negative : negative) * 8 / (rows + 1);
+}
+#endif
+
+#if defined(KV_AVX2) || defined(KV_NEON)
+#ifdef KV_AVX2
+KV_AVX2
+#endif
+static void matrix_widths(const B *src, int n, int stride, B *widths, int *low_bits) {
+    const U *words = reinterpret_cast<const U *>(src);
+#ifdef KV_AVX2
+    // A nonzero halfword converts to binary32 exactly in every rounding mode.
+    __m256i one = _mm256_set1_epi32(1);
+    for (int i = 0; i < n; i += 8) {
+        __m256i value = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(words + i));
+        __m256i top = _mm256_srli_epi32(value, 16);
+        __m256i lower = _mm256_cmpeq_epi32(top, _mm256_setzero_si256());
+        __m256i nonzero_half = _mm256_blendv_epi8(top, value, lower);
+        __m256i biased = _mm256_srli_epi32(_mm256_castps_si256(_mm256_cvtepi32_ps(nonzero_half)), 23);
+        __m256i length = _mm256_max_epi32(_mm256_sub_epi32(biased, _mm256_set1_epi32(126)), _mm256_setzero_si256());
+        length = _mm256_add_epi32(length, _mm256_andnot_si256(lower, _mm256_set1_epi32(16)));
+        __m256i packed = _mm256_shuffle_epi8(length, _mm256_set1_epi32(0x0c080400));
+        __m128i pair = _mm_unpacklo_epi32(_mm256_castsi256_si128(packed), _mm256_extracti128_si256(packed, 1));
+        _mm_storel_epi64(reinterpret_cast<__m128i *>(widths + i), pair);
+        int *sum = low_bits + (i & (stride - 1));
+        __m256i prior = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(sum));
+        __m256i count = _mm256_max_epi32(_mm256_sub_epi32(length, one), _mm256_setzero_si256());
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(sum), _mm256_add_epi32(prior, count));
+    }
+#else
+    for (int i = 0; i < n; i += 8) {
+        uint32x4_t a = vsubq_u32(vdupq_n_u32(32), vclzq_u32(vld1q_u32(words + i)));
+        uint32x4_t b = vsubq_u32(vdupq_n_u32(32), vclzq_u32(vld1q_u32(words + i + 4)));
+        vst1_u8(widths + i, vmovn_u16(vcombine_u16(vmovn_u32(a), vmovn_u32(b))));
+        int *sum = low_bits + (i & (stride - 1));
+        vst1q_s32(sum, vaddq_s32(vld1q_s32(sum), vreinterpretq_s32_u32(vqsubq_u32(a, vdupq_n_u32(1)))));
+        vst1q_s32(sum + 4, vaddq_s32(vld1q_s32(sum + 4), vreinterpretq_s32_u32(vqsubq_u32(b, vdupq_n_u32(1)))));
+    }
+#endif
+}
+#endif
+
 template <bool mat, int channel_shift>
-static int encode_frame(B *out, const B *src, int n) {
+static int encode_frame(B *out, const B *src, int n, bool simd = has_simd()) {
     constexpr int models = channel_shift ? 4 : 1;
     constexpr int symbols = mat ? 33 : 256;
     const int columns = channel_shift ? n >> channel_shift : 0;
@@ -119,7 +258,8 @@ static int encode_frame(B *out, const B *src, int n) {
         return 4;
     }
 
-    int hist[models][256] = {};
+    // Independent counters avoid a load dependency between repeated symbols.
+    int hist[models][4][symbols] = {};
     int population[models] = {};
     B classes[512];
     B widths[mat ? 16384 : 1];
@@ -129,47 +269,102 @@ static int encode_frame(B *out, const B *src, int n) {
         constexpr int rows = 1 << channel_shift;
         for (int col = 0; col < columns; ++col) {
             const B *bytes = src + col * rows;
-            int group = classify(bytes, rows);
+            int group;
+#if defined(KV_AVX2) || defined(KV_NEON)
+            if (simd)
+                group = column_class(bytes, rows);
+            else
+#endif
+                group = classify(bytes, rows);
             classes[col] = B(group);
-            int *counts = hist[group & 3];
+            auto &counts = hist[group & 3];
             int flip = (group >> 2) * 128;
-            for (int i = 0; i < rows; ++i)
-                ++counts[bytes[i] ^ flip];
+            for (int i = 0; i < rows; i += 4)
+                for (int lane = 0; lane < 4; ++lane)
+                    ++counts[lane][bytes[i + lane] ^ flip];
             population[group & 3] += rows;
         }
-    } else {
+    }
+#if defined(KV_AVX2) || defined(KV_NEON)
+    else if (mat && simd) {
+        matrix_widths(src, n, stride, widths, low_bits);
+        for (int i = 0; i < n; i += 4)
+            for (int lane = 0; lane < 4; ++lane)
+                ++hist[0][lane][widths[i + lane]];
+        population[0] = n;
+    }
+#endif
+    else {
         for (int i = 0; i < n; ++i) {
             int symbol = sym(value(src, i, mat), mat);
-            ++hist[0][symbol];
+            ++hist[0][i & 3][symbol];
             if (mat) {
                 widths[i] = B(symbol);
-                low_bits[i % stride] += symbol ? symbol - 1 : 0;
+                low_bits[i & (stride - 1)] += symbol ? symbol - 1 : 0;
             }
         }
         population[0] = n;
     }
 
     int freq[256], cum[256];
-    EncodeSymbol table[models * 256];
+    EncodeSymbol table[models * symbols];
+#if defined(KV_AVX2) || defined(KV_NEON)
+    uint64_t entries[models * symbols];
+    const bool vector = simd && stride >= 8 && n % stride == 0;
+#endif
     B tables[models * 576];
     int size = 0;
+    int minimum_bits = 0;
     for (int model = 0; model < models; ++model) {
-        normalize(hist[model], freq, cum, symbols, population[model]);
+        int *counts = hist[model][0];
+        for (int s = 0; s < symbols; ++s)
+            counts[s] += hist[model][1][s] + hist[model][2][s] + hist[model][3][s];
+        if (simd)
+            normalize_counts(counts, freq, cum, symbols, population[model]);
+        else
+            normalize(counts, freq, cum, symbols, population[model]);
         size += write_table(tables + size, freq, symbols);
-        for (int symbol = 0; symbol < symbols; ++symbol)
-            table[model * 256 + symbol] = encoder_symbol(freq[symbol], cum[symbol]);
+        for (int symbol = 0; symbol < symbols; ++symbol) {
+            int slot = model * 256 + symbol;
+            if (!mat && simd)
+                minimum_bits += counts[symbol] * symbol_cost.bits[freq[symbol]];
+            const auto entry = encoder_symbol(freq[symbol], cum[symbol]);
+#if defined(KV_AVX2) || defined(KV_NEON)
+            if (vector) {
+                U fields = (U(cum[symbol]) << 16) | (entry.shift << 12) | ((U(freq[symbol]) - 1) & 4095);
+                entries[slot] = (uint64_t(entry.reciprocal) << 32) | fields;
+            } else
+#endif
+                table[slot] = entry;
+        }
     }
     int directory = 4 + columns + size;
     int pos = directory + 2 * stride;
-    if (pos < raw + 4) {
+    // A normalized input contains at least 2048 frequency intervals after
+    // renormalization. The two integer truncations lose less than 1/256 bit
+    // per symbol. Each terminal state can absorb at most eight extra bits.
+    const int payload_limit = raw + 4 - pos - 4 * stride;
+    bool can_shrink = mat || !simd || minimum_bits - n - 8 * 256 * stride < int64_t(payload_limit) * 8 * 256;
+    if (pos < raw + 4 && can_shrink) {
         memcpy(out + 4, classes, columns);
         memcpy(out + 4 + columns, tables, size);
         for (int first = 0; first < stride;) {
             int width = stride >= 8 ? 8 : 1;
             int cap = raw + 3 - pos;
-            int length = width == 8 ?
-                put_group<8, mat, channel_shift>(out + pos, cap, src, n, first, stride, table, classes, out + directory + 2 * first, widths, low_bits) :
-                put_group<1, mat, channel_shift>(out + pos, cap, src, n, first, stride, table, classes, out + directory + 2 * first, widths, low_bits);
+            int length;
+#if defined(KV_AVX2) || defined(KV_NEON)
+            if (vector) {
+                width = std::min(stride, 16);
+                length = put_vectors<channel_shift, mat>(out + pos, cap, src, n, first, stride, entries,
+                                                         classes, out + directory + 2 * first, widths, low_bits);
+            } else
+#endif
+            if (width == 8)
+                length = put_group<8, mat, channel_shift>(out + pos, cap, src, n, first, stride, table,
+                                                          classes, out + directory + 2 * first, widths, low_bits);
+            else
+                length = put_group<1, mat, channel_shift>(out + pos, cap, src, n, first, stride, table,
+                                                          classes, out + directory + 2 * first, widths, low_bits);
             if (length < 0)
                 break;
             pos += length;
@@ -284,6 +479,48 @@ static bool unpack_residuals(U *out, const B *widths, int n, int stride, const D
     return true;
 }
 
+// Seven spare entries let the last eight-slot store cross a frequency boundary.
+// The next symbol overwrites its slots before the table is used.
+static int expand_table(const B *in, int bytes, U *table, int symbols, bool populate) {
+    int pos = 0;
+    int mask_bytes = (symbols + 7) / 8;
+    if (mask_bytes > bytes)
+        return -1;
+    const B *presence = in;
+    pos += mask_bytes;
+    int total = 0;
+    for (int index = 0; index < mask_bytes; ++index) {
+        unsigned mask = presence[index];
+        if (index == symbols / 8)
+            mask &= (1u << (symbols % 8)) - 1;
+        while (mask) {
+            int symbol = index * 8 + lg(mask & -mask) - 1;
+            mask &= mask - 1;
+            if (pos == bytes)
+                return -1;
+            int count = in[pos++];
+            if (count & 128) {
+                if (pos == bytes)
+                    return -1;
+                count = (count & 127) + 128 * in[pos++];
+            }
+            if (!count || count > 4096 - total)
+                return -1;
+            if (populate) {
+                U entry = ((U(count) - 1) << 20) | U(symbol);
+                U *slots = table + total;
+                for (int offset = 0; offset < count; offset += 8)
+                    for (int lane = 0; lane < 8; ++lane)
+                        slots[offset + lane] = entry + (U(offset + lane) << 8);
+            }
+            total += count;
+        }
+    }
+    if (total != 4096 && (total || populate))
+        return -1;
+    return pos;
+}
+
 template <bool mat, int channel_shift>
 static bool decode_frame(B *out, const B *in, int bytes, int n, [[maybe_unused]] bool simd) {
     if (bytes < 4)
@@ -319,24 +556,13 @@ static bool decode_frame(B *out, const B *in, int bytes, int n, [[maybe_unused]]
             return false;
         used |= 1 << (classes[i] & 3);
     }
-    U tables[models * 4096];
+    U tables[models * 4096 + 7];
     for (int model = 0; model < models; ++model) {
-        int frequency[256], start[256];
-        int length = read_table(in + pos, bytes - pos, frequency, start, symbols);
+        int length = expand_table(in + pos, bytes - pos, tables + model * 4096,
+                                  symbols, used & (1 << model));
         if (length < 0)
             return false;
         pos += length;
-        if (!(used & (1 << model)))
-            continue;
-        if (start[symbols - 1] + frequency[symbols - 1] != 4096)
-            return false;
-        for (int symbol = 0; symbol < symbols; ++symbol) {
-            int f = frequency[symbol];
-            U entry = ((U(f) - 1) << 20) | U(symbol);
-            U *slots = tables + model * 4096 + start[symbol];
-            for (int offset = 0; offset < f; ++offset)
-                slots[offset] = entry + (U(offset) << 8);
-        }
     }
 
     int stride = lanes(n);
@@ -383,5 +609,9 @@ static bool decode_frame(B *out, const B *in, int bytes, int n, [[maybe_unused]]
             first += width;
         }
     }
+#if defined(KV_SVE2) || defined(KV_AVX2)
+    if (mat && gathered)
+        return gather_residuals(reinterpret_cast<U *>(out), widths, n, stride, readers, in);
+#endif
     return !mat || unpack_residuals(reinterpret_cast<U *>(out), widths, n, stride, readers);
 }

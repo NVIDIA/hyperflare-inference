@@ -6,8 +6,6 @@ use super::packed::{crc32, crc32_chunks};
 use rayon::prelude::*;
 use std::io::{Error, ErrorKind, Result};
 
-pub static MIRROR_FAILURES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 pub static ORIGINAL_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -71,6 +69,16 @@ impl Frame {
         let words = words.into_iter().chain([pos as u32, len as u32]);
         for (dst, word) in entry.chunks_exact_mut(4).zip(words) {
             dst.copy_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    // Frame::work is a disjoint, word-aligned interval in the plan's workspace.
+    fn scratch(&self, workspace: Option<usize>, local: &mut Vec<u32>) -> *mut u32 {
+        if let Some(base) = workspace {
+            (base + self.work as usize) as *mut u32
+        } else {
+            local.resize(self.raw_bytes().div_ceil(4), 0);
+            local.as_mut_ptr()
         }
     }
 
@@ -252,10 +260,6 @@ impl Plan {
         self.work
     }
 
-    pub fn arena_bytes(&self) -> usize {
-        self.arena
-    }
-
     pub fn metadata(&self) -> usize {
         HEADER + self.frames.len() * ENTRY
     }
@@ -312,11 +316,19 @@ impl Plan {
         Ok(input.len)
     }
 
-    fn encode_in(&self, source: &[u8], pool: Option<&rayon::ThreadPool>) -> Result<Vec<u8>> {
+    fn encode_in(
+        &self,
+        source: &[u8],
+        out: &mut [u8],
+        pool: &rayon::ThreadPool,
+        work: Option<usize>,
+    ) -> Result<usize> {
         if source.len() != self.original_bytes {
             return Err(invalid("codec input size mismatch"));
         }
-        let mut out = vec![0; self.max_packet()];
+        if out.len() < self.max_packet() {
+            return Err(invalid("codec packet buffer too small"));
+        }
         for (chunk, word) in out[..HEADER].chunks_exact_mut(4).zip([
             MAGIC,
             1,
@@ -328,7 +340,7 @@ impl Plan {
         let mut pos = self.metadata();
         let encode = |scratch: &mut Vec<u32>, frame: &Frame, output: *mut u8| {
             let cap = frame.raw_bytes() + 4;
-            scratch.resize(frame.raw_bytes().div_ceil(4), 0);
+            let scratch = frame.scratch(work, scratch);
             // The caller reserves raw_bytes + 4 output bytes per frame. Encoding only reads source.
             let n = unsafe {
                 kv_cpu_frame(
@@ -336,7 +348,7 @@ impl Plan {
                     source.as_ptr().cast_mut(),
                     output,
                     cap as i32,
-                    scratch.as_mut_ptr(),
+                    scratch,
                     false,
                 )
             };
@@ -347,36 +359,28 @@ impl Plan {
             }
         };
         let (directory, payload) = out.split_at_mut(self.metadata());
-        let entries = directory[HEADER..].chunks_exact_mut(ENTRY);
-        if let Some(pool) = pool {
-            // Each arena offset reserves a separate maximum-sized output until all frames finish.
-            let base = payload.as_mut_ptr() as usize;
-            let sizes: Vec<usize> = pool.install(|| {
-                self.frames
-                    .par_iter()
-                    .map_init(Vec::new, |scratch, frame| {
-                        encode(scratch, frame, (base + frame.arena as usize) as *mut u8)
-                    })
-                    .collect::<Result<_>>()
-            })?;
-            for ((frame, length), entry) in self.frames.iter().zip(sizes).zip(entries) {
-                let start = frame.arena as usize;
-                payload.copy_within(start..start + length, pos - self.metadata());
-                frame.write_entry(entry, pos, length);
-                pos += length;
-            }
-        } else {
-            let mut scratch = Vec::new();
-            for (frame, entry) in self.frames.iter().zip(entries) {
-                let offset = pos - self.metadata();
-                let output = &mut payload[offset..offset + frame.raw_bytes() + 4];
-                let length = encode(&mut scratch, frame, output.as_mut_ptr())?;
-                frame.write_entry(entry, pos, length);
-                pos += length;
-            }
+        let entries = &mut directory[HEADER..];
+        // Each arena offset reserves a separate maximum-sized output until all frames finish.
+        let base = payload.as_mut_ptr() as usize;
+        pool.install(|| {
+            self.frames
+                .par_iter()
+                .zip(entries.par_chunks_exact_mut(ENTRY))
+                .with_min_len(if work.is_some() { 4 } else { 1 })
+                .try_for_each_init(Vec::new, |scratch, (frame, entry)| {
+                    let length = encode(scratch, frame, (base + frame.arena as usize) as *mut u8)?;
+                    frame.write_entry(entry, 0, length);
+                    Ok::<_, Error>(())
+                })
+        })?;
+        for (frame, entry) in self.frames.iter().zip(entries.chunks_exact_mut(ENTRY)) {
+            let start = frame.arena as usize;
+            let length = u32::from_le_bytes(entry[36..40].try_into().unwrap()) as usize;
+            payload.copy_within(start..start + length, pos - self.metadata());
+            entry[32..36].copy_from_slice(&(pos as u32).to_le_bytes());
+            pos += length;
         }
-        out.truncate(pos);
-        Ok(out)
+        Ok(pos)
     }
 
     fn decode_chunks(
@@ -384,6 +388,7 @@ impl Plan {
         chunks: &[&[u8]],
         dst: &mut [u8],
         pool: Option<&rayon::ThreadPool>,
+        work: Option<usize>,
     ) -> Result<()> {
         if dst.len() != self.original_bytes {
             return Err(invalid("codec destination size mismatch"));
@@ -393,7 +398,7 @@ impl Plan {
         let base = dst.as_mut_ptr() as usize;
         let decode = |scratch: &mut Vec<u32>, (frame, range): (&Frame, std::ops::Range<usize>)| {
             let input = input.range(range)?;
-            scratch.resize(frame.raw_bytes().div_ceil(4), 0);
+            let scratch = frame.scratch(work, scratch);
             // Prepared frames partition output bytes, including transposed fields and padding.
             let n = unsafe {
                 kv_cpu_frame(
@@ -401,7 +406,7 @@ impl Plan {
                     base as *mut u8,
                     input.as_ptr().cast_mut(),
                     input.len() as i32,
-                    scratch.as_mut_ptr(),
+                    scratch,
                     true,
                 )
             };
@@ -413,36 +418,105 @@ impl Plan {
         };
         match pool {
             Some(pool) => pool.install(|| {
-                self.frames.par_iter().zip(ranges).try_for_each_init(Vec::new, decode)
+                self.frames
+                    .par_iter()
+                    .zip(ranges)
+                    .with_min_len(if work.is_some() { 4 } else { 1 })
+                    .try_for_each_init(Vec::new, decode)
             }),
             None => {
                 let mut scratch = Vec::new();
-                self.frames.iter().zip(ranges).try_for_each(|frame| decode(&mut scratch, frame))
+                self.frames
+                    .iter()
+                    .zip(ranges)
+                    .try_for_each(|frame| decode(&mut scratch, frame))
             }
         }
     }
 
     /// Encode a complete rank share and compare its decoded bytes before returning the packet.
-    /// Without a frame pool the calling thread processes the unit itself.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn encode_verified(
         &self,
         source: &[u8],
         verification: &mut [u8],
         pool: Option<&rayon::ThreadPool>,
     ) -> Result<Vec<u8>> {
-        let packet = self.encode_in(source, pool)?;
-        self.decode_chunks(&[&packet], verification, pool)?;
-        let exact = match pool {
-            Some(pool) => pool.install(|| {
-                source.par_chunks(CHUNK).zip(verification.par_chunks(CHUNK)).all(|(a, b)| a == b)
+        let mut packet = vec![0; self.max_packet()];
+        static SINGLE: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+        let pool = pool.unwrap_or_else(|| {
+            SINGLE.get_or_init(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap()
+            })
+        });
+        let used = self.encode_in(source, &mut packet, pool, None)?;
+        packet.truncate(used);
+        self.verify(source, verification, &packet, Some(pool), None)?;
+        Ok(packet)
+    }
+
+    fn verify(
+        &self,
+        source: &[u8],
+        verification: &mut [u8],
+        packet: &[u8],
+        pool: Option<&rayon::ThreadPool>,
+        work: Option<usize>,
+    ) -> Result<()> {
+        self.decode_chunks(&[packet], verification, pool, work)?;
+        let exact = match (work, pool) {
+            (None, Some(pool)) => pool.install(|| {
+                source
+                    .par_chunks(CHUNK)
+                    .zip(verification.par_chunks(CHUNK))
+                    .all(|(a, b)| a == b)
             }),
-            None => source == verification,
+            _ => source == verification,
         };
         if !exact {
-            MIRROR_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(invalid("codec round-trip verification failed"));
         }
-        Ok(packet)
+        Ok(())
+    }
+
+    /// Bytes for the decoded share and word-aligned frame scratch.
+    pub fn verification_bytes(&self) -> usize {
+        self.original_bytes + align_of::<u32>() - 1 + self.work
+    }
+
+    /// Write a verified packet into a record slot and select its integrity fields.
+    pub fn encode_unit(
+        &self,
+        unit: super::wire::PackedUnit,
+        profile: &[u8; 32],
+        source: &[u8],
+        scratch: &mut [u8],
+        slot: &mut [u8],
+        pool: &rayon::ThreadPool,
+    ) -> Result<super::wire::PackedUnit> {
+        let (verification, scratch) = scratch
+            .split_at_mut_checked(self.original_bytes)
+            .ok_or_else(|| invalid("short verification workspace"))?;
+        let skip = scratch.as_mut_ptr().align_offset(align_of::<u32>());
+        let work = scratch
+            .get_mut(skip..)
+            .filter(|s| s.len() >= self.workspace_bytes())
+            .ok_or_else(|| invalid("short frame workspace"))?;
+        // Each frame owns a disjoint interval until both pool operations return.
+        let work = Some(work.as_mut_ptr() as usize);
+        let used = self.encode_in(source, slot, pool, work)?;
+        let packet = &slot[..used];
+        let (verified, unit) = pool.install(|| {
+            rayon::join(
+                || self.verify(source, verification, packet, Some(pool), work),
+                || super::packed::verified_unit(unit, profile, source, packet).0,
+            )
+        });
+        verified?;
+        Ok(unit)
     }
 
     /// Check the stored CRC before decoding and the original CRC before releasing the output.
@@ -455,9 +529,10 @@ impl Plan {
         pool: Option<&rayon::ThreadPool>,
     ) -> Result<()> {
         if crc32_chunks(chunks) != stored_crc {
+            super::packed::STORED_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(invalid("stored codec checksum mismatch"));
         }
-        self.decode_chunks(chunks, dst, pool)?;
+        self.decode_chunks(chunks, dst, pool, None)?;
         if crc32(dst) != original_crc {
             ORIGINAL_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(invalid("original codec checksum mismatch"));
@@ -561,7 +636,7 @@ mod tests {
         packet[directory] -= 1;
         packet[directory + 2] += 1;
         let mut dst = vec![0; 4096];
-        assert!(plan.decode_chunks(&[&packet], &mut dst, None).is_err());
+        assert!(plan.decode_chunks(&[&packet], &mut dst, None, None).is_err());
         let frame = &mut packet[plan.metadata()..];
         let mut scratch = vec![0u32; dst.len() / 4];
         // Only the two lane lengths changed. The destination and scratch cover the full frame.
@@ -597,6 +672,122 @@ mod tests {
             assert_eq!(&guarded[1..=size], raw);
             assert_eq!((guarded[0], guarded[size + 1]), (0xff, 0xff));
         }
+    }
+
+    #[test]
+    fn literal_and_entropy_frames_match_the_scalar_encoder_at_the_size_cutoff() {
+        let mut modes = [false; 3];
+        for alphabet in [1u32, 2, 16, 224, 240, 244, 248, 252, 256] {
+            for size in [4096, 65536] {
+                let mut state = 7u32;
+                let source: Vec<u8> = (0..size).map(|_| {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((u64::from(state) * u64::from(alphabet)) >> 32) as u8
+                }).collect();
+                let plan = Plan::new(size, &[]).unwrap();
+                let mut decoded = vec![0; size];
+                let packet = plan.encode_verified(&source, &mut decoded, None).unwrap();
+                assert_eq!(decoded, source);
+                for (frame, range) in plan.frames.iter().zip(plan.entries(&packet, packet.len()).unwrap()) {
+                    modes[packet[range.start] as usize] = true;
+                    let mut reference = vec![0; frame.raw_bytes() + 4];
+                    let mut scratch = vec![0u32; frame.raw_bytes().div_ceil(4)];
+                    // The scalar encoder gets a whole frame of scratch and its maximum output extent.
+                    let length = unsafe {
+                        kv_cpu_frame_scalar(
+                            frame,
+                            source.as_ptr().cast_mut(),
+                            reference.as_mut_ptr(),
+                            reference.len() as i32,
+                            scratch.as_mut_ptr(),
+                            false,
+                        )
+                    };
+                    assert_eq!(length as usize, range.len());
+                    assert_eq!(&reference[..range.len()], &packet[range]);
+                }
+            }
+        }
+        assert_eq!(modes, [true; 3]);
+    }
+
+    #[test]
+    fn a_matrix_lane_rejects_a_missing_low_byte() {
+        let size = 128 * 128 * 4;
+        let field = Field { offset: 0, length: size, encoding: Encoding::Float32Matrix128 };
+        let plan = Plan::new(size, &[field]).unwrap();
+        let source: Vec<u8> = (0..size / 4).flat_map(|i| {
+            let fraction = ((i * 113) % 257) as f32 / 256.0;
+            (1.0 + fraction).to_le_bytes()
+        }).collect();
+        let mut decoded = vec![0; size];
+        let packet = plan.encode_verified(&source, &mut decoded, None).unwrap();
+        let mut frame = packet[plan.metadata()..].to_vec();
+        assert_eq!(frame[0], 2);
+        // The 33 residual widths have a five-byte mask and variable-length frequencies.
+        let mut directory = 9;
+        for symbol in 0..33 {
+            if frame[4 + symbol / 8] & (1 << (symbol % 8)) != 0 {
+                directory += 1 + usize::from(frame[directory] >= 128);
+            }
+        }
+        let length = u16::from_le_bytes(frame[directory..directory + 2].try_into().unwrap());
+        assert!(length > 4);
+        frame[directory..directory + 2].copy_from_slice(&(length - 1).to_le_bytes());
+        frame.remove(directory + 2 * 32);
+        let mut scratch = vec![0u32; size / 4];
+        for decoder in [kv_cpu_frame, kv_cpu_frame_scalar] {
+            // All buffers cover the matrix. Only lane zero's low-bit extent is short.
+            let result = unsafe {
+                decoder(
+                    &plan.frames[0],
+                    decoded.as_mut_ptr(),
+                    frame.as_mut_ptr(),
+                    frame.len() as i32,
+                    scratch.as_mut_ptr(),
+                    true,
+                )
+            };
+            assert!(result < 0);
+        }
+    }
+
+    #[test]
+    fn matrix_packets_match_the_scalar_encoder_across_pivot_ties_and_zero_pivots() {
+        let mut source = Vec::with_capacity(128 * 128 * 4);
+        for column in 0..128 {
+            for row in 0..128 {
+                let word = match row % 4 {
+                    0 => 0,
+                    1 => 0x3f80_0000 | (((column & 1) as u32) << 31),
+                    2 => 1u32 << ((row + column) % 32),
+                    _ => (1u32 << ((row + column) % 32)).wrapping_sub(1),
+                };
+                source.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        let field = Field { offset: 0, length: source.len(), encoding: Encoding::Float32Matrix128 };
+        let plan = Plan::new(source.len(), &[field]).unwrap();
+        let mut restored = vec![0; source.len()];
+        let packet = plan.encode_verified(&source, &mut restored, None).unwrap();
+        assert_eq!(restored, source);
+        let ranges = plan.entries(&packet, packet.len()).unwrap();
+        assert_eq!(ranges.len(), 1);
+        let mut reference = vec![0; source.len() + 4];
+        let mut scratch = vec![0u32; source.len() / 4];
+        // The scalar encoder reads one complete matrix and owns its output and scratch.
+        let size = unsafe {
+            kv_cpu_frame_scalar(
+                &plan.frames[0],
+                source.as_mut_ptr(),
+                reference.as_mut_ptr(),
+                reference.len() as i32,
+                scratch.as_mut_ptr(),
+                false,
+            )
+        };
+        assert_eq!(usize::try_from(size).unwrap(), ranges[0].len());
+        assert_eq!(&reference[..size as usize], &packet[ranges[0].clone()]);
     }
 
     #[test]
@@ -671,6 +862,28 @@ mod tests {
             let parallel = plan.encode_verified(&raw, &mut dst, Some(&pool)).unwrap();
             assert_eq!(packet, parallel);
             assert_eq!(raw, dst);
+            let mut scratch = vec![0xa5; plan.verification_bytes() + 1];
+            let mut slot = vec![0xa5; plan.max_packet()];
+            let profile = [7; 32];
+            let unit = plan
+                .encode_unit(
+                    Default::default(),
+                    &profile,
+                    &raw,
+                    &mut scratch[1..],
+                    &mut slot,
+                    &pool,
+                )
+                .unwrap();
+            assert_eq!(slot[..packet.len()], packet);
+            assert_eq!(scratch[1..1 + raw.len()], raw);
+            let expected = super::super::packed::verified_unit(
+                Default::default(),
+                &profile,
+                &raw,
+                packet.as_slice(),
+            );
+            assert_eq!(unit, expected.0);
             let mut scalar_output = vec![0; raw.len()];
             let ranges = plan.entries(&packet, packet.len()).unwrap();
             for (frame, range) in plan.frames.iter().zip(ranges) {

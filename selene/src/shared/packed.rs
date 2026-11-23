@@ -56,6 +56,29 @@ pub fn permits_holding(caps: Option<&CodecCaps>, packed: bool, profiles: &[Vec<u
     (!packed && profiles.is_empty()) || permits(caps, profiles)
 }
 
+/// Select the smaller payload and its matching integrity domain after CPU verification.
+pub fn verified_unit<'a>(
+    mut unit: PackedUnit,
+    profile: &[u8; 32],
+    raw: &'a [u8],
+    packet: impl Into<std::borrow::Cow<'a, [u8]>>,
+) -> (PackedUnit, std::borrow::Cow<'a, [u8]>) {
+    let packet = packet.into();
+    unit.original_length = raw.len() as u64;
+    if packet.len() < raw.len() {
+        unit.representation = 1;
+        unit.profile = profile.to_vec();
+        unit.stored_crc = crc32(&packet);
+        unit.original_crc = crc32(raw);
+        unit.stored_length = packet.len() as u64;
+        (unit, packet)
+    } else {
+        unit.stored_length = raw.len() as u64;
+        unit.raw_xxh3 = super::record::checksum(raw);
+        (unit, raw.into())
+    }
+}
+
 pub fn crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }
