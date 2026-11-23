@@ -57,6 +57,51 @@ def test_four_paged_verification_rows_match_independent_logical_order():
 
 
 @torch.inference_mode()
+def test_prefill_rows_sharing_one_page_table_match_host_ordering():
+    """The fused ordering kernel reads the stride-0 table view that the rows of a prefill forward share."""
+    import os
+    import pytest
+    from ignition.components.sparse_record_order import ordered_sparse_records
+    from ignition.recipes.glm53_full.attention import PAGE_RECORDS
+    from ignition.recipes.glm53_full.indexer import index_tables
+
+    if os.environ.get("FLARE_RUN_CUDA_TESTS") != "1":
+        pytest.skip("requires FLARE_RUN_CUDA_TESTS=1")
+    generator = torch.Generator().manual_seed(5371)
+    rows, width, model_pages = 96, 2048, 12
+    tokens = model_pages * 256
+    block_table = torch.randperm(40, generator=generator)[:model_pages].int()[None]
+    block_table[0, [3, 7]] = -1
+    logical = torch.stack([torch.randperm(tokens, generator=generator)[:width] for _ in range(rows)]).int()
+    logical[:, ::97] = -1
+    positions = torch.randint(0, tokens, (rows,), generator=generator)
+    positions[::11] = -1
+    requests = torch.zeros(rows, dtype=torch.int64)
+    # The host path of `selected_records` is the reference; it shares no code with the kernel.
+    host = selected_records(logical, positions, index_tables(block_table, requests, mode="prefill")[1])
+    causal = ((logical >= 0) & (logical <= positions[:, None])).sum(1)
+    assert host.lengths[::11].eq(0).all() and host.lengths.max() > 1024
+    assert (host.lengths < causal).any(), "some selected positions must lie on unassigned pages"
+
+    device = torch.device("cuda")
+    def shared_pages(table):
+        tables, pages = index_tables(table.to(device), requests.to(device), mode="prefill")
+        assert pages.stride(0) == 0 and pages.untyped_storage().data_ptr() == tables.untyped_storage().data_ptr()
+        return pages
+
+    def verify(pages):
+        records, lengths = ordered_sparse_records(logical.to(device), positions.to(device), pages, PAGE_RECORDS)
+        assert torch.equal(lengths.cpu(), host.lengths)
+        assert torch.equal(records.cpu(), host.records)
+
+    verify(shared_pages(block_table))
+    dispatched = selected_records(logical.to(device), positions.to(device), shared_pages(block_table))
+    assert torch.equal(dispatched.records.cpu(), host.records) and torch.equal(dispatched.lengths.cpu(), host.lengths)
+    with pytest.raises(AssertionError):
+        verify(shared_pages(block_table.roll(1, dims=1)))
+
+
+@torch.inference_mode()
 def test_captured_index_tables_follow_reassigned_request_pages():
     import os
     import pytest

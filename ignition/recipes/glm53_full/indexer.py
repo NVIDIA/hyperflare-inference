@@ -38,11 +38,37 @@ def index_page_table(block_table):
     return torch.where(block_table[:, :, None] >= 0, pages, -1).flatten(1)
 
 
-def index_tables(block_table, requests):
-    """Expand model pages once and gather the index pages belonging to each packed row."""
+def index_tables(block_table, requests, *, mode="decode"):
+    """Expand model pages once and give each packed row the index pages of its request.
+
+    A prefill forward packs one request, so its rows share that request's
+    pages through a view that holds no storage. A decode or verification
+    forward gathers one contiguous table, which the selector of every
+    selecting layer reads in place. The single row of a single request reads
+    its table directly.
+    """
     tables = index_page_table(block_table)
-    row_pages = tables.expand(requests.numel(), -1) if tables.shape[0] == 1 else tables[requests.long()]
-    return tables, row_pages
+    if mode == "prefill":
+        if tables.shape[0] != 1:
+            raise ValueError("GLM 5.3 prefill indexes the pages of one request")
+        return tables, tables.expand(requests.numel(), -1)
+    if tables.shape[0] == 1 and requests.numel() == 1:
+        return tables, tables
+    return tables, tables[requests.long()]
+
+
+def selection_pages(tables, row_pages, mode):
+    """The page table rows one selection call reads, without copying.
+
+    Prefill rows share the table of their one request. Decode rows read the
+    contiguous table their forward gathered; a strided view would otherwise
+    be copied by every selecting layer.
+    """
+    if mode == "prefill":
+        return tables[:1].expand(row_pages.shape[0], -1)
+    if not row_pages.is_contiguous():
+        raise ValueError("GLM 5.3 decode selection reads the contiguous index page table of its forward")
+    return row_pages
 
 
 def selected_records(logical, positions, pages):
@@ -135,19 +161,17 @@ class PreparedIndexer:
         visible = (metadata.visible[:rows] if metadata.visible is not None
                    else (positions + 1).clamp(min=0).to(torch.int32))
         tables, row_pages = metadata.index_tables if metadata.index_tables is not None else index_tables(
-            metadata.block_table, metadata.requests[:rows])
+            metadata.block_table, metadata.requests[:rows], mode=self.mode)
         row_pages = row_pages[:rows]
         if len(self.bounds) == 1:
-            pages = tables[:1].expand(rows, -1) if self.mode == "prefill" else (
-                row_pages if row_pages.is_contiguous() else row_pages.contiguous())
+            pages = selection_pages(tables, row_pages, self.mode)
             logical = self.selectors[rows](q_fp8, scaled_weights, pages, visible, None, cache=self.cache)
             return selected_records(logical, positions, row_pages)
         logical = torch.empty((rows, TOPK), dtype=torch.int32, device=device)
         for start, end in self.bounds:
-            count = end - start
-            pages = tables[:1].expand(count, -1) if self.mode == "prefill" else row_pages[start:end].contiguous()
-            logical[start:end].copy_(self.selectors[count](q_fp8[start:end], scaled_weights[start:end], pages,
-                                                           visible[start:end], None, cache=self.cache))
+            pages = selection_pages(tables, row_pages[start:end], self.mode)
+            logical[start:end].copy_(self.selectors[end - start](q_fp8[start:end], scaled_weights[start:end], pages,
+                                                                 visible[start:end], None, cache=self.cache))
         return selected_records(logical, positions, row_pages)
 
     def store(self, index_key, metadata, angles):

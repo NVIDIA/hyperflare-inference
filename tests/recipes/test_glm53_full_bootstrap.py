@@ -145,17 +145,50 @@ def test_model_config_validates_attention_scale_and_positive_scalars():
             ModelConfig.from_dict(bad)
 
 
-def test_single_request_index_tables_expand_without_copying():
-    from ignition.recipes.glm53_full.indexer import index_tables, selected_records
+def test_prefill_rows_share_one_index_page_table_without_storage():
+    from ignition.recipes.glm53_full.indexer import index_tables, selected_records, selection_pages
 
     block_table = torch.tensor([[2, -1, 5]], dtype=torch.int32)
     requests = torch.zeros(4096, dtype=torch.int64)
-    tables, row_pages = index_tables(block_table, requests)
+    tables, row_pages = index_tables(block_table, requests, mode="prefill")
     assert row_pages.shape == (4096, 12) and row_pages.stride(0) == 0
     assert row_pages.untyped_storage().data_ptr() == tables.untyped_storage().data_ptr()
+    # One selection call reads a block of prefill rows through the same table.
+    pages = selection_pages(tables, row_pages[:128], "prefill")
+    assert pages.shape == (128, 12) and pages.stride(0) == 0
+    assert pages.untyped_storage().data_ptr() == tables.untyped_storage().data_ptr()
     logical = torch.tensor([[65, 2, 260]], dtype=torch.int32)
     positions = torch.tensor([400], dtype=torch.int64)
     selection = selected_records(logical, positions, row_pages[:1])
     assert selection.records.tolist() == [[8 * 64 + 2, 9 * 64 + 1, -1]]
     assert selection.lengths.tolist() == [2]
+    with pytest.raises(ValueError):
+        index_tables(torch.tensor([[2, -1, 5], [3, 4, -1]], dtype=torch.int32), requests, mode="prefill")
 
+
+@pytest.mark.parametrize("rows", [1, 4, 8])
+def test_decode_rows_of_one_request_read_one_contiguous_index_page_table(rows):
+    """A verification round packs several rows of one request; no selecting layer copies their table."""
+    from ignition.components.paged_batch import Metadata
+    from ignition.recipes.glm53_full.decoder import attention_metadata
+
+    packed = Metadata.allocate(rows, 1, 3, torch.device("cpu"))
+    packed.page_table.copy_(torch.tensor([[2, -1, 5]], dtype=torch.int32))
+    packed.positions.copy_(torch.arange(520, 520 + rows))
+    tables, row_pages = attention_metadata(packed).index_tables
+    expected = torch.tensor([[8, 9, 10, 11, -1, -1, -1, -1, 20, 21, 22, 23]], dtype=torch.int32)
+    assert torch.equal(tables, expected) and torch.equal(row_pages, expected.expand(rows, -1))
+    assert row_pages.is_contiguous()
+    if rows == 1:
+        assert row_pages.untyped_storage().data_ptr() == tables.untyped_storage().data_ptr()
+
+
+def test_decode_selection_reads_its_page_table_in_place_and_rejects_strided_views():
+    from ignition.recipes.glm53_full.indexer import index_tables, selection_pages
+
+    block_table = torch.tensor([[2, -1, 5]], dtype=torch.int32)
+    tables, row_pages = index_tables(block_table, torch.zeros(4, dtype=torch.int64))
+    # Each selecting layer passes its selector this tensor itself.
+    assert selection_pages(tables, row_pages, "decode") is row_pages
+    with pytest.raises(ValueError):
+        selection_pages(tables, tables.expand(4, -1), "decode")

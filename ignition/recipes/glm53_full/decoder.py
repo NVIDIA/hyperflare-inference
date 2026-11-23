@@ -37,8 +37,12 @@ from .weights import BF16Experts, LayerWeights, ModelWeights, MoEWeights
 HIDDEN, VOCABULARY = 6144, 154880
 
 
-def attention_metadata(metadata: Metadata) -> AttentionMetadata:
-    """Token placement of one packed batch: each live token's latent record follows from its request's pages."""
+def attention_metadata(metadata: Metadata, *, mode="decode") -> AttentionMetadata:
+    """Token placement of one packed batch: each live token's latent record follows from its request's pages.
+
+    `mode` is the execution mode of the forward that reads the placement; it
+    decides how rows share index page tables.
+    """
     positions = metadata.positions
     live = positions >= 0
     position = positions.clamp(min=0)
@@ -46,7 +50,7 @@ def attention_metadata(metadata: Metadata) -> AttentionMetadata:
     slots = torch.where(live, pages * PAGE_TOKENS + position % PAGE_TOKENS, -1)
     visible = (positions + 1).clamp(min=0).to(torch.int32)
     return AttentionMetadata(positions, slots, metadata.requests, metadata.page_table,
-                             index_tables(metadata.page_table, metadata.requests), visible)
+                             index_tables(metadata.page_table, metadata.requests, mode=mode), visible)
 
 
 class PreparedMoE:
@@ -362,7 +366,7 @@ class PreparedDecoder:
         hidden state each request's continuation row held before this forward.
         `observe(index, hidden, selection)` sees each layer's output; tests use it.
         """
-        placement = attention_metadata(metadata)
+        placement = attention_metadata(metadata, mode=self.mode)
         saved = None
         if self.feeds_draft:
             saved = gather_rows(self.pool.last_hidden, metadata.state_rows,
