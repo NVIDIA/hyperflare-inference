@@ -760,7 +760,10 @@ The indexer normalizes those values in FP32. Attention reads the selected
 records in ascending logical token order, independent of physical page
 placement. Selection is qualified on eight SM120 GPUs with the FlashInfer
 selector that breaks equal scores by increasing logical position at every
-top-k reduction (`local-inference-lab/flashinfer#130`).
+top-k reduction. `local-inference-lab/flashinfer#130` adds that selector in
+commit `b03de91eddb43897ee7e77f0422bffe971fda586`. The measurements in this
+paragraph ran on the same selector source, which FlashInfer commit
+`661af16ee061af9d21056bbe3ca7db1f5f4bd2aa` records.
 The 21 target indexers and the draft indexer passed independent FP8 score
 and cutoff checks on 60,081 prefill and decode rows per 2,722-token prompt.
 Four cutoff exchanges on the long checkpoint fixture fell within their
@@ -842,13 +845,25 @@ off. Prompt log probabilities and images are not prepared. Requests with
 image content are rejected.
 
 Serving is qualified on eight RTX PRO 6000 Blackwell Max-Q GPUs (SM120,
-96 GB each) with `local-inference-lab/flashinfer#130`. Signed exports with and without learned drafts served through
-`flare run` at the default capacities. Each passed five GLM service tests
-and 93 shared protocol tests, and each reproduced the FP32 most-likely token
-on 16 growing prefixes from each of the 24-token `short.pt` and 2,722-token
-`long.pt` fixtures in `FLARE_GLM53_FULL_REFERENCE`. The draft-enabled
-core offered 1050 first-step and 810 second-step learned proposals during
-these checks. Independent arithmetic checks qualify the prepared first and
+96 GB each) for a signed export with learned drafts, prepared from Flare
+commit `6510be0e45f6a72c30f413c66b8a55c271450f94` with FlashInfer
+`35b5be28b7d37d5f03e1c1e7aa952a2870a3b711` and served through `flare run`
+at the default capacities. The export was served twice: with default flags
+and an API key, and with `--mtp-draft-tokens 3
+--no-mtp-adaptive-verification` and no key. Each service passed the five
+cases of `tests/server/test_glm53_full.py`. At 393 growing prefixes of the
+2,722-token `long.pt` fixture in `FLARE_GLM53_FULL_REFERENCE`, the
+most-likely next token and the log probability of the reference token
+stayed within that file's bounds on the FP32 reference; after the 24-token
+`short.pt` fixture the service predicted the reference token; a repeated
+prompt and a changed prompt each read the cached prefix; and 16 requests
+completed at the declared concurrency of eight. `tests/server/test_protocols.py`
+passed its 93 cases against the service with the API key, and 92 against the
+service without one, where the authenticated-headers case is skipped. The
+service with default flags offered 915 first-step and 882 second-step
+learned proposals during these checks and accepted 816 and 632. An export
+without learned drafts (`--no-mtp`) is implemented and not qualified at these
+revisions. Independent arithmetic checks qualify the prepared first and
 recursive draft steps on fixed checkpoint inputs at prefix lengths 2048,
 2049, 2305, and 2561.
 [Draft arithmetic regression](../tests/recipes/test_glm53_full_draft_arithmetic_cuda.py).
@@ -864,7 +879,9 @@ split partials stored in BF16, and the reduction on each stage's inputs.
 
 Target distribution qualification depends on physical decode capacity.
 With the packed expert kernel that assigns reduction boundaries by output
-column (`local-inference-lab/flashinfer#130`),
+column (FlashInfer commit `e3c7023a94a59e8951bb87c872a68e350bc33b19`, which
+`local-inference-lab/flashinfer#130` carries as
+`ce596f7112b995da6b24373c95cc65a1efb60222`),
 the prepared target produced bitwise-identical watched logits at capacity
 eight when future tokens, an unrelated request, an inactive row, or the
 watched row's slot changed at the start of four three-token intervals.
@@ -892,14 +909,44 @@ FP8 reference on 32. Reversing the last 674 input tokens left all 78 layer
 outputs and every vocabulary score bitwise identical through position 2,047
 in both the prepared prefill and the matched FP8 reference.
 
-The repository lockfile selects FlashInfer `994df9c4f32256c9d9281fc39ae7c646dedd42b3`.
-On that locked revision, GLM 5.3 prepares with `UnquantizedProjection`,
-unfused two-shot BF16 reductions, and scratch-copied decode attention outputs,
-without logical-position FP8 index tie breaking or column-based W4A16 split-K
-boundaries. Full TP8 numerical qualification, fused scatter-gather shard-owner
-RMSNorm, weight-first router and shared-expert projection staging, and bound
-decode sparse MLA outputs require `local-inference-lab/flashinfer#130`; those
-paths activate automatically once `uv.lock` advances to include it.
+GLM 5.3 is qualified with FlashInfer commit
+`35b5be28b7d37d5f03e1c1e7aa952a2870a3b711`, the head of
+`local-inference-lab/flashinfer#130`. The repository lockfile selects
+FlashInfer `994df9c4f32256c9d9281fc39ae7c646dedd42b3`, which contains none of
+that pull request's five commits, and GLM 5.3 is unqualified on it. On eight
+SM120 GPUs with the locked revision, the eight-rank case of
+`tests/recipes/test_glm53_full_stack_tp_cuda.py` fails: the logits of a
+pending token change when two later verification tokens change. FlashInfer's
+23 FP8 cutoff tests and the whole-K case of its packed-expert
+route-independence test fail there as well. All of them pass at `35b5be28`.
+The checkpoint cutoff regression
+`tests/recipes/test_glm53_full_indexer_cuda.py` passes on both revisions,
+because it accepts either choice between equal scores.
+
+Preparation checks the installed FlashInfer for three interfaces:
+`gemm.weight_first_projection`, the rounding-order and dependent-launch
+parameters of the fused one-shot reduction, and the `out` parameter of
+`sparse_mla.run`. Where one is absent, it selects the corresponding unfused
+path: separate router and shared-expert projections instead of the
+weight-first projection that stages both, an all-reduce followed by a
+separate normalization instead of the fused reduction and normalization, or
+a scratch copy of the decode attention output instead of a write into the
+caller's buffer. The locked revision provides none of the three.
+
+A locked install is qualified for GLM 5.3 only when `uv.lock` selects a
+FlashInfer revision that contains `local-inference-lab/flashinfer#130`. The
+required order is that the FlashInfer pull request merges, `uv.lock` advances
+to a revision that contains it, and the GLM 5.3 recipe merges after both, so
+that the lockfile never selects a FlashInfer revision without the two
+numerical repairs while the recipe is present. Until the lockfile advances,
+check out that pull request's head in `../flashinfer` and run these commands
+from the Flare repository before exporting the checkpoint.
+
+```sh
+uv sync --locked --extra prepare --extra test
+BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 \
+  uv pip install --python .venv/bin/python --no-deps -e ../flashinfer
+```
 
 The signed plain core declared 59.662 GiB of fixed device allocations on
 seven ranks and 59.727 GiB on rank five. The draft-enabled core declared

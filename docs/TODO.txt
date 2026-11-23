@@ -602,6 +602,12 @@
     that sum to BF16 produced residuals up to 0.00390625 from the fixed-order
     CPU reference. Check the required order at TP4 and TP8 and ensure that a
     worker assertion releases peers waiting in replay or collective cleanup.
+    At Flare 6510be0e with FlashInfer 35b5be28 the four-rank case fails with
+    that residual, as it does at b9cac839, and the eight-rank case and the
+    three cases of test_bf16_projection_transport_preserves_fp32_residuals in
+    that file have not been run. Close when every case of the file passes and
+    a rank's failed assertion ends the test without the other ranks waiting
+    for the collective barrier's timeout.
 
 [ ] Repair runtime collective-policy fixtures in tests/cli/test_planning.py.
     test_every_recipe_passes_collective_policy_to_preparation rewrites a TP4
@@ -683,22 +689,40 @@
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `ignition/components/linear.py`; SM103 execution is unqualified.
 
-[ ] Reduce cross-capacity BF16 projection drift across GLM 5.3 decode batch
-    shapes. At equal physical capacity eight, ordinary decode and speculative
-    verification logits match bit-for-bit on all twelve tested TP8 checkpoint
-    rows, while capacity-one GEMV and capacity-eight MMA differ by 1-3 BF16
-    ULPs in the layer-zero query projection and up to 0.07361 in total
-    variation at temperature one and top-p 0.95. Close when cross-capacity
-    drift is characterized across batch sizes or reduced.
+[ ] Establish equal GLM 5.3 target distributions across physical decode
+    capacities before qualifying lossless speculation. On twelve TP8
+    checkpoint rows, ordinary decode and verification logits are bitwise
+    equal when both use capacity eight. Ordinary capacity one and
+    verification capacity eight differ by up to 0.07361 in total variation
+    at temperature one and top-p 0.95. On identical inputs the two
+    capacities first differ in one to three of the 16,384 BF16 outputs of
+    the layer-zero query expansion, each by one unit in the last place. The
+    recorded `gemm.bf16_gemv` plans for that projection use the `simt`
+    backend at capacity one and the `tc` backend at capacity eight.
+    Capacities two and four are unmeasured. Close when the executed target
+    and proposal laws satisfy mtp-design.md at every prepared decode
+    capacity. See model-preparation.md, section GLM 5.3.
 
-[ ] Advance uv.lock once local-inference-lab/flashinfer#130 merges so locked
-    installs include logical-position FP8 sparse-selection tie breaking,
-    column-based W4A16 split-K boundaries, scatter-gather shard-owner RMSNorm,
-    weight-first projection staging, and bound decode sparse MLA outputs.
-    uv.lock (994df9c4f) precedes those changes. Close when a locked
-    install passes the checkpoint cutoff and target-row regressions and serves
-    freshly exported plain and draft-enabled GLM 5.3 cores. See
+[ ] Advance uv.lock to a FlashInfer revision that contains
+    local-inference-lab/flashinfer#130, which is qualified at commit
+    35b5be28. The lock selects 994df9c4, where the eight-rank case of
+    tests/recipes/test_glm53_full_stack_tp_cuda.py fails because a pending
+    token's logits change with later verification tokens, and where
+    FlashInfer's FP8 cutoff tests and whole-K packed-expert
+    route-independence test fail. A complete GLM 5.3 export on 994df9c4 has
+    not been run. Required order: the FlashInfer pull request merges,
+    uv.lock advances, and the GLM 5.3 recipe merges after both. Close when a
+    locked install passes that eight-rank case and those FlashInfer tests
+    and serves freshly exported plain and draft-enabled GLM 5.3 cores. See
     model-preparation.md, section GLM 5.3.
+
+[ ] Publish a corrected model.safetensors.index.json for
+    local-inference-lab/GLM-5.3-NVFP4. At the pinned revision cca10d15 and
+    the six later revisions of that repository, the index declares a
+    total_size 27,799,760 bytes larger than its tensors, so checkpoint
+    inspection rejects the published directory and preparation needs the
+    view directory that model-preparation.md describes. Close when the
+    recipe pins a revision whose published files pass inspection.
 
 [ ] Exercise Kimi K3 and K3.1 MLA key absorption and value expansion with
     core-backed storage at eight decode rows. Their shared weight loader
@@ -728,3 +752,63 @@
     rank, in the checkpoint's declared expansion bytes
     (`ignition/recipes/glm53_full/recipe.py`). Close when the declared
     expansion accounts for the replicated tensors in the loaded draft weights.
+
+[ ] Run tests/server/test_protocols.py against services of recipes other
+    than GLM 5.3. The suite's 2,048-token reply ceilings, the prompts that
+    precede its Messages block-hint cases until the scheduler prices
+    checkpoint cuts, its raw-completion usage check against the
+    generated-token counter, and its image-rejection branch ran only against
+    GLM 5.3 TP8 services. Close when the suite passes against a service of a
+    recipe with image input and a service of a recipe whose chat template
+    does not open a reasoning block.
+
+[ ] Make the exact-reply cases of tests/server/test_protocols.py hold for
+    every sampled reply of a checkpoint that always reasons. With adaptive
+    verification the token sequence of a fixed seed depends on the
+    verification widths the scheduler chose (mtp-design.md). On a TP8
+    service of a GLM 5.3 export from Flare 6510be0e with FlashInfer 35b5be28,
+    started with default flags, the request of
+    test_messages_inline_system_text_and_empty_controls returned `OK` for
+    266 of 300 seeds, `OK.` for 33, and other text for one; with the default
+    seed the case passed 60 of 60 repetitions. Close when the case asserts
+    a property that every sampled reply satisfies, or the suite states the
+    verification policy its service must run.
+
+[ ] Qualify a GLM 5.3 export without learned drafts (`ignition export
+    --no-mtp`). Serving is qualified only for the export with learned drafts,
+    at Flare 6510be0e with FlashInfer 35b5be28 (model-preparation.md). Close
+    when a `--no-mtp` export at those or later revisions passes
+    tests/server/test_glm53_full.py and tests/server/test_protocols.py
+    through `flare run`.
+
+[ ] Select the kernel of the GLM 5.3 attention output projection by its time
+    in the prepared decode graph. FlashInfer's tuner races the BF16
+    projection kernels alone with a cold cache; the graph reads that
+    projection's weights on an auxiliary stream before the projection runs
+    (`PreparedWeightPrefetch`). At four rows, the race of the export from
+    Flare 6510be0e with FlashInfer 35b5be28 measured the small-row kernel at
+    21.9 us and the tensor-core kernel at 22.5 us and selected the small-row
+    kernel. In node-level traces of the four-row verification graph on eight
+    RTX PRO 6000 GPUs, the small-row kernel took 11.4 us per launch; the
+    tensor-core kernel took 8.5 us per launch in an export of the same
+    checkpoint that uses it. Against that export, the stage of each layer
+    that holds this projection was 0.30 ms longer per round of a 0.33 ms
+    difference on a 24-token prompt, and 0.31 ms of 0.56 ms on a 2,722-token
+    prompt; the remainder on the longer prompt is unattributed. Without
+    tracing, one-request rounds took 13.98 ms against 13.65 ms and 14.25 ms
+    against 13.85 ms. Close when preparation selects the faster kernel for
+    the prepared graph and a paired serving measurement of an export
+    confirms the round time.
+
+[ ] Compute the reference of
+    tests/recipes/test_kimi31_mla_direct_projection_cuda.py from contiguous
+    inputs. The reference calls `torch.bmm` on batch-interleaved views, the
+    input layout that `BatchedUnquantizedProjection` copies before cuBLASLt
+    (ignition/components/linear.py). At Flare 6510be0e with FlashInfer
+    35b5be28, one of six runs of that file after
+    tests/recipes/test_glm53_mla_cuda.py in the same process ended the
+    five-row case and the cases after it in a CUDA illegal memory access,
+    reported at the synchronization that follows the reference products; the
+    faulting launch was not identified. Close when the reference reads
+    contiguous inputs, or the fault is reproduced and traced to another
+    operand.
