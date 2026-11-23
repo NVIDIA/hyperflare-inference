@@ -980,7 +980,9 @@ actual generated read tokens. No prose or streaming is returned. Dropping a
 request cancels its current child through the ordinary generation lifetime.
 
 The scorer uses the normal assistant generation prompt with thinking disabled
-where supported and an `Answer:` cue in the final user turn. Labels are verified
+where supported and an `Answer:` cue in the final user turn. Labels are the
+letters `A` through `Z`, then `AA` through `ZZ`, written without a leading space
+because they are read as the start of the assistant reply. Labels are verified
 as the first assistant token against the actual rendered prompt, including with
 the native DeepSeek encoders. A core without the explicit-ID logprob inputs that
 `logprob_token_ids` uses returns HTTP 400 and requires re-export.
@@ -1042,6 +1044,4 @@ Input and instruction text that spells a control token is scored as ordinary
 text, as in chat requests. Each label is checked against the token IDs of the
 rendered prompt: the text after the prompt's last added token, encoded as
 ordinary text, must take the label as exactly one new non-special token, and a
-label that fails the check is unavailable. A prompt that ends in an added token
-with `rstrip` offers no label, because that token strips the leading space of a
-label that follows it directly.
+label that fails the check is unavailable.

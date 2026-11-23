@@ -639,7 +639,7 @@ fn messages(
     )?;
     text(&mut question_parts, "\nOptions:\n");
     for (label, option) in labels.iter().zip(&question.options) {
-        text(&mut question_parts, label.trim_start());
+        text(&mut question_parts, label);
         text(&mut question_parts, ": ");
         text(&mut question_parts, "{\"value\":");
         text(&mut question_parts, &option["value"].to_string());
@@ -663,14 +663,16 @@ fn messages(
     ])
 }
 
+/// Label candidates in preference order. A label is read as the first token of the assistant reply,
+/// which follows the generation prompt directly, so labels have no leading space.
 fn candidates() -> Vec<String> {
     let mut candidates = Vec::new();
     for a in b'A'..=b'Z' {
-        candidates.push(format!(" {}", a as char));
+        candidates.push((a as char).to_string());
     }
     for a in b'A'..=b'Z' {
         for b in b'A'..=b'Z' {
-            candidates.push(format!(" {}{}", a as char, b as char));
+            candidates.push(format!("{}{}", a as char, b as char));
         }
     }
     candidates
@@ -681,8 +683,6 @@ fn candidates() -> Vec<String> {
 /// the text after the prompt's last added token can change how the label tokenizes: the prompt's
 /// tokens from there on must stay as they are when the label is appended. That text is encoded as
 /// ordinary text, because request text that spells a control holds ordinary token IDs in `tokens`.
-/// An added token with `rstrip` swallows the whitespace that follows it, including the leading
-/// space of a label that follows it directly, so a prompt that ends in one offers no label.
 fn label_id(
     frontend: &crate::frontend::Frontend,
     tokens: &[u32],
@@ -693,9 +693,6 @@ fn label_id(
     let added = added_vocabulary.get_added_tokens_decoder();
     let last = tokens.iter().rposition(|id| added.contains_key(id));
     let tail = &tokens[last.map_or(0, |at| at + 1)..];
-    if tail.is_empty() && last.is_some_and(|at| added[&tokens[at]].rstrip) {
-        return Ok(None);
-    }
     let decoded = frontend.decode(tail, false)?;
     let extended = frontend.encode_ordinary(&format!("{decoded}{label}"))?;
     let Some(&id) = extended.last() else {
