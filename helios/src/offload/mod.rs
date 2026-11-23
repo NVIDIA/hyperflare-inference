@@ -18,6 +18,7 @@
 mod gpu_tests;
 #[cfg(feature = "runtime-core")]
 pub(crate) mod pool;
+pub mod kv_codec;
 mod registrar;
 pub mod shard;
 pub mod transfer;

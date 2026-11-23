@@ -884,6 +884,7 @@ dependencies = [
  "prost",
  "prost-build",
  "ratatui",
+ "rayon",
  "ring",
  "ryu",
  "serde",
