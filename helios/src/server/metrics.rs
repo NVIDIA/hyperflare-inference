@@ -293,6 +293,8 @@ pub(super) struct Metrics {
     host_deeper_link_pages: [AtomicU64; 2],
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 8],
+    decode: std::sync::Mutex<flare_selene::codec_copy::DecodeStats>,
+    codec_state: std::sync::OnceLock<crate::offload::KvCompression>,
     host_refusal_drops: [AtomicU64; 5],
     pub(super) host_reoffer_calls: AtomicU64,
     pub(super) host_reoffer_present: AtomicU64,
@@ -547,10 +549,14 @@ impl Metrics {
         }
     }
 
-    /// Host prefix store counters and gauges, written from the model thread.
-    /// Lookups, hits, and reused tokens come from the scheduler, which applies
-    /// the fetch policy.
+    pub(super) fn codec_placement(&self, placement: crate::offload::KvCompression) {
+        let _ = self.codec_state.set(placement);
+    }
+
     pub fn store(&self, stats: StoreStats) {
+        if self.codec_state.get().is_some_and(|placement| *placement != crate::offload::KvCompression::Off) {
+            *self.decode.lock().unwrap() = stats.decode;
+        }
         for (gauge, value) in self
             .host_retirement_buckets
             .iter()
@@ -645,6 +651,23 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
+        use crate::offload::KvCompression;
+        let placement = self.codec_state.get().copied().unwrap_or_default();
+        if placement != KvCompression::Off {
+            let _ = writeln!(text, "flare_kv_codec_active{{placement=\"{placement}\"}} 1");
+            let stats = *self.decode.lock().unwrap();
+            for (name, value) in [
+                ("original_bytes_total", stats.original_bytes),
+                ("stored_bytes_total", stats.stored_bytes),
+                ("failed_windows_total", stats.failed_windows),
+                ("transform_nanoseconds_total", stats.transform_ns),
+            ] {
+                let _ = writeln!(text, "flare_kv_codec_{name}{{placement=\"{placement}\"}} {value}");
+            }
+            for (stage, value) in [("stored", stats.stored_failures), ("original", stats.original_failures)] {
+                let _ = writeln!(text, "flare_kv_codec_verification_failures_total{{stage=\"{stage}\"}} {value}");
+            }
+        }
         for (tier, count) in ["gpu", "dram", "nvme"]
             .iter()
             .zip(&self.host_restores_by_tier)

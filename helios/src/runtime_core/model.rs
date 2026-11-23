@@ -885,9 +885,14 @@ impl NativeModel {
             staging,
             shard,
         )?;
-        let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
-        phase.finish(summary);
+        phase.finish(self.attach_offload(prepared)?);
         Ok(())
+    }
+
+    fn attach_offload(&mut self, prepared: crate::offload::Preparation) -> Result<String> {
+        Ok(self
+            .offload
+            .attach(prepared, &crate::offload::transfer::Copiers)?)
     }
 
     fn parallel<F: super::payload::Files>(
@@ -1201,6 +1206,7 @@ mod tests {
         for prefix_cache in [
             crate::offload::PrefixCacheOffload::default(),
             crate::offload::PrefixCacheOffload {
+                compression: Default::default(),
                 memory_bytes: Some(0),
                 disk: Some("unopened-prefix-cache".into()),
                 disk_limit: Some(0),

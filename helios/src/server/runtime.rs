@@ -680,6 +680,9 @@ impl ModelRuntime {
                     .as_ref()
                     .and_then(|binding| binding.take())
                     .map(|prepared| {
+                        if let Some(rank) = prepared.geometry.first() {
+                            worker_metrics.codec_placement(rank.placement);
+                        }
                         if let Some(warning) =
                             prepared.intake_warning(worker_config.limits.max_active)
                         {
@@ -2393,9 +2396,6 @@ impl<'a> Worker<'a> {
         }
         if self.scheduler.take_evictions_lost() {
             store.evictions_lost();
-        }
-        for key in self.scheduler.take_reused() {
-            store.reused(key);
         }
         if released {
             for incoming in self

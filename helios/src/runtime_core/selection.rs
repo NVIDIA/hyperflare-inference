@@ -67,6 +67,9 @@ impl LoadOptions {
     }
 
     pub(super) fn select(&self, cores: &mut [Core], config: &mut Value) -> Result<usize> {
+        self.prefix_cache
+            .validate_compression()
+            .map_err(|error| invalid(error.to_string()))?;
         if self.mtp_verification_token_budget.is_some()
             && self.mtp_max_verification_token_budget.is_some()
         {
@@ -1820,4 +1823,19 @@ mod tests {
         }
     }
 
+}
+
+
+#[cfg(test)]
+mod codec_configuration_tests {
+    use super::*;
+    use crate::offload::KvCompression;
+
+    #[test]
+    fn decode_requires_a_pool() {
+        let mut options = LoadOptions::default();
+        options.prefix_cache.compression = KvCompression::Cpu;
+        let error = options.select(&mut [], &mut Value::Null).unwrap_err();
+        assert!(error.to_string().contains("requires --prefix-cache-pool"));
+    }
 }

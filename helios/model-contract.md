@@ -196,6 +196,30 @@ speculative-state commits; native code manages the declared storage.
 
 ## Attention histories and cache policy
 
+### Checkpoint codec layout
+
+The optional `CacheContract.codec_layout` (`CodecLayout`) declares lossless
+storage formats that Selene may use for pool write-back and restore.
+Cores without this field serve with compression off. Requesting compression
+requires a supported layout.
+
+A unit is one rank's share of a logical cache page or one continuation row.
+Each field names an execution buffer, a byte offset and length within its
+unit, and a storage encoding. Revision 1 uses the following block sizes.
+
+| ID | Elements in one block | Bytes |
+|---|---|---:|
+| 0 | One uninterpreted byte | 1 |
+| 1 | One 128 × 128 binary32 matrix | 65,536 |
+| 2 | One bfloat16 element | 2 |
+| 20 | Ten bfloat16 convolution history elements | 20 |
+| 32 | Sixteen bfloat16 convolution history elements | 32 |
+| 40 | 256 rows of 512 FP8 values and four binary32 scales per row | 135,168 |
+| 41 | 64 rows of 128 FP8 values plus one binary32 scale per row | 8,448 |
+| 42 | 64 rows of 512 FP8 values | 32,768 |
+| 45 | 64 rows of 512 packed FP4 data bytes and 16 scale bytes per row | 33,792 |
+| 47 | 64 rows of 256 packed FP4 data bytes and 32 scale bytes per row | 18,432 |
+
 `CacheContract.page_tokens` is the logical token count represented by one page
 ID. History regions identify paged key/value, paged latent, sliding-window,
 recurrent, or continuation storage. Paged regions name their actual cache planes

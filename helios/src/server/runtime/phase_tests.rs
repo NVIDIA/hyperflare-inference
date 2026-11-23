@@ -2362,123 +2362,6 @@ fn a_gpu_hit_refreshes_the_host_record_at_admission() {
     assert_eq!(fake_store(&mut worker).reused, [key]);
 }
 
-fn two_prompt_store(identity: [u8; 32]) -> flare_selene::memory::MemoryStore {
-    use flare_selene::{Layout, memory::MemoryStore, slab::SlabPool, testing::{SimulatedGpu, geometry}};
-    let geometry = [geometry(64, &[("kv", 4096)], 4096)];
-    let layout = Layout::new(&geometry).unwrap();
-    let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
-    for (buffers, bytes) in [(&gpu.pages, layout.page_record_bytes), (&gpu.rows, layout.row_record_bytes)] {
-        buffers.lock().unwrap().extend((0..64).map(|id| (id, vec![0; bytes as usize])));
-    }
-    // Each independent prompt occupies one page slot and one row slot.
-    let pool = SlabPool::new(layout.page_record_bytes, 4, 0).unwrap();
-    MemoryStore::new(identity, pool, copier).unwrap()
-}
-
-fn prompt_capture_worker<'a>(fixture: &'a Fixture, receiver: mpsc::Receiver<Vec<Incoming>>) -> Worker<'a> {
-    let mut worker = fixture.worker(receiver);
-    let mut graphs = crate::model::testing::manifest(&fixture.config).graphs;
-    for graph in &mut graphs {
-        graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
-    }
-    worker.scheduler.measured_graph_durations(&graphs).unwrap();
-    worker
-}
-
-fn capture_store_prompt(fixture: &Fixture, worker: &mut Worker<'_>, sender: &mpsc::Sender<Vec<Incoming>>, token: u32, limit: u32, fence: u64) -> Generation {
-    let (incoming, generation) = fixture.incoming(vec![token; 64], limit);
-    sender.send(vec![incoming]).unwrap();
-    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
-    advance(worker, GraphKind::Init, fence, None);
-    advance(worker, GraphKind::Prefill, fence + 1, Some(1));
-    advance(worker, GraphKind::Snapshot, fence + 2, None);
-    generation
-}
-
-#[test]
-fn completion_refreshes_resident_host_endpoint_after_interleaved_store() {
-    fn run_interleaved(forward_completion_reused: bool) -> (bool, bool) {
-        let fixture = Fixture::new();
-        let (sender, receiver) = mpsc::channel();
-        let mut worker = prompt_capture_worker(&fixture, receiver);
-        let store = two_prompt_store(fixture.config.identity);
-        worker.attach_store(Some(Box::new(store)));
-        let prompt_hit = |worker: &mut Worker<'_>, token| {
-            let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
-            history.append(&[token; 64], &[]).unwrap();
-            worker.store.as_mut().unwrap().lookup(&history, 0, 65)
-                .is_some_and(|hit| Some(hit.key) == history.key_at(64))
-        };
-        let settle = |worker: &mut Worker<'_>| {
-            assert!(worker.service_store().unwrap()); // submit the copy
-            assert!(worker.service_store().unwrap()); // consume its completion
-        };
-
-        let _long = capture_store_prompt(&fixture, &mut worker, &sender, 3, 2, 1);
-        settle(&mut worker);
-        assert!(prompt_hit(&mut worker, 3));
-        let _short = capture_store_prompt(&fixture, &mut worker, &sender, 2, 1, 4);
-        assert!(worker.publish().unwrap());
-        settle(&mut worker);
-        assert!(prompt_hit(&mut worker, 2));
-
-        advance(&mut worker, GraphKind::Decode, 7, Some(2));
-        advance(&mut worker, GraphKind::Snapshot, 8, None);
-        assert!(worker.publish().unwrap());
-        if !forward_completion_reused {
-            let _ = worker.scheduler.take_reused();
-        }
-        worker.service_store().unwrap();
-
-        let _evictor = capture_store_prompt(&fixture, &mut worker, &sender, 4, 1, 9);
-        assert!(worker.publish().unwrap());
-        settle(&mut worker);
-        assert!(prompt_hit(&mut worker, 4));
-        (prompt_hit(&mut worker, 3), prompt_hit(&mut worker, 2))
-    }
-    assert_eq!(run_interleaved(false), (false, true));
-    assert_eq!(run_interleaved(true), (true, false));
-}
-
-#[test]
-fn completion_reuse_follows_copy_settlement_and_precedes_store_submission() {
-    use flare_selene::{History, HostHit, HostStore, InboundTicket, PrefixKey, PublishedCheckpoint, Result as StoreResult, StoreEvent, StoreOutcome, StoreStats, memory::MemoryStore};
-    struct OrderStore(MemoryStore, mpsc::Sender<(&'static str, PrefixKey)>);
-    impl HostStore for OrderStore {
-        fn lookup(&mut self, h: &dyn History, r: u64, b: u64) -> Option<HostHit> { self.0.lookup(h, r, b) }
-        fn fetch(&mut self, h: HostHit, t: InboundTicket) -> StoreResult<()> { self.0.fetch(h, t) }
-        fn stats(&self) -> StoreStats { self.0.stats() }
-        fn close(&mut self) -> StoreResult<()> { self.0.close() }
-        fn reused(&mut self, k: PrefixKey) { self.1.send(("reuse", k)).unwrap(); self.0.reused(k); }
-        fn store(&mut self, p: &PublishedCheckpoint) -> StoreResult<StoreOutcome> {
-            self.1.send(("store", p.key)).unwrap(); self.0.store(p)
-        }
-        fn poll(&mut self, events: &mut Vec<StoreEvent>) -> StoreResult<()> {
-            self.0.poll(events)?;
-            for event in events {
-                if let StoreEvent::Stored { key, result: Ok(_), .. } = event { self.1.send(("settled", *key)).unwrap(); }
-            }
-            Ok(())
-        }
-    }
-    let fixture = Fixture::new();
-    let (sender, receiver) = mpsc::channel();
-    let (log, calls) = mpsc::channel();
-    let mut worker = prompt_capture_worker(&fixture, receiver);
-    worker.attach_store(Some(Box::new(OrderStore(two_prompt_store(fixture.config.identity), log))));
-    let _first = capture_store_prompt(&fixture, &mut worker, &sender, 3, 1, 1);
-    assert!(worker.service_store().unwrap());
-    let (submitted, first) = calls.try_recv().unwrap();
-    assert_eq!(submitted, "store");
-    assert!(worker.publish().unwrap());
-    let _second = capture_store_prompt(&fixture, &mut worker, &sender, 4, 1, 4);
-    assert!(worker.service_store().unwrap());
-    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
-    history.append(&[4; 64], &[]).unwrap();
-    assert_eq!(calls.try_iter().collect::<Vec<_>>(), [("settled", first), ("reuse", first), ("store", history.key_at(64).unwrap())]);
-    assert!(worker.service_store().unwrap());
-}
-
 #[test]
 fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
     let fixture = Fixture::new();
@@ -3139,7 +3022,9 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
     let mut worker = fixture.worker(receiver);
     let checkpoint = unpinned_checkpoint(&mut worker, 0, 70);
     let key = worker.scheduler.publication(checkpoint).unwrap().key;
-    let mut store = FakeStore::new(None);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&[0; 70], &[]).unwrap();
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
     store.pooled = true;
     store.pending_tickets = true;
     worker.attach_store(Some(Box::new(store)));
@@ -3152,6 +3037,8 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
     assert!(worker.active[0].is_some());
     assert!(fake_store(&mut worker).tickets_seen.is_empty());
     assert_eq!(fake_store(&mut worker).reused, [key]);
+    // Both host decoders are downstream of fetch.
+    assert!(fake_store(&mut worker).fetched.is_empty());
 }
 
 #[test]

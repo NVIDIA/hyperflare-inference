@@ -35,11 +35,38 @@ starts the pool at load time (`pool.rs`).
 Host offload requires explicit configuration: `flare run` retains no host
 records unless a memory size, disk directory, or pool is configured. Derived
 default sizes and a default record directory are designed, not implemented
-(section 2.11). Host offload does not change the contracts of preparation,
-captured graphs, or the runtime core format. The
+(section 2.11). Preparation can include an optional codec layout for qualified
+recipes. Captured graphs continue to use the raw checkpoint layout. The
 [core design](core-design.md#4-prefix-checkpoints-and-complete-model-state)
 defines checkpoint contents and ownership; the [CLI design](cli-design.md)
 defines configuration precedence.
+
+## Compression at rest
+
+Flare captures raw pages and continuation rows in DRAM, in its local record
+directory and in puts to Selene. A manager started with `--compress-at-rest cpu`
+can encode an arena record during NVMe write-back when a session supplies a
+compatible layout. The manager verifies the encoded bytes against the source.
+It writes a v4 file only when the complete file is smaller. The v4 directory
+describes the stored shares of each page and row. The catalog identifies the
+profile a reader needs to restore them.
+
+Shared-memory and TCP readers offering that profile can claim a packed file.
+RDMA readers and Flare instances running with compression off can claim the
+raw arena copy while the manager holds it. Once the manager releases that
+copy, those readers miss a record whose only copy is packed. Use the same
+compression setting on every Flare instance sharing a pool namespace. The
+manager selects the write-back profile per namespace. Upgrade every manager
+sharing a record root before enabling compression. Older managers discard
+unreadable files during recovery and can prune their descendants.
+
+The manager can use an additional one eighth of its arena capacity for
+temporary encoding storage, outside `--memory`. Each restoring rank accounts
+for one pinned host scratch buffer sized for its largest page or row before
+KV sizing, and decodes packed restores on a shared CPU worker pool (up to
+eight threads) before issuing host-to-device copies on its low-priority stream.
+Decoding verifies both stored and original checksums before completing a
+restore and retains the source windows through the last rank's copy fence.
 
 ## 1. Scope and configurations
 
@@ -209,10 +236,9 @@ and gives the tail page count since the nearest offered ancestor. `MemoryStore`,
 implement the trait for serving, `PooledStore` wraps them when a pool is
 attached (section 2.15), and a test double implements it for worker tests. The
 worker holds `Option<Box<dyn HostStore>>`. The trait's remaining methods have
-default bodies that do nothing. Local stores implement `reused` to refresh an
-indexed record when its GPU checkpoint is reused at admission or refreshed on
-request completion. Pooled stores implement the export, eviction-notice, and
-pool-lookup hooks of section 2.15.
+default bodies: `reused` refreshes a retained record when a request reuses its
+GPU checkpoint, and the export, eviction-notice, and pool-lookup hooks of
+section 2.15 do nothing unless a pooled store overrides them.
 
 Three components are shared by the implementations:
 
@@ -457,7 +483,7 @@ page count, the rank count, the per-rank plane sizes and row bytes, the page
 segment offset, the row segment offset, the row checksum, and the creation
 time. Versions 1 and 2 encode each plane size as `u64`; version 3 uses `u32`
 plane sizes so wider rank/plane catalogs fit the same header block. Row sizes
-remain `u64`. New records use version 3 when every plane fits `u32`, otherwise
+remain `u64`. Version 4 stores the variable-length shares described in [Compression at rest](#compression-at-rest). New raw records use version 3 when every plane fits `u32`, otherwise
 the `u64` format is retained. All encodings still require the header to fit 4 KiB.
 Versions 2 and 3 use flag bit 31 for a replicated page segment and bit 30 for a
 replicated row; version 3 also permits non-replicated records. Page offsets use
@@ -523,10 +549,8 @@ usual stop time plus DRAM bytes ÷ measured disk write rate.
 Host record expiry is off by default. Enable it with
 `--prefix-cache-max-age DURATION|off` or `[prefix_cache] max_age = "2h"`;
 positive durations accept ms, s, m, h, or bare seconds. `off` disables expiry.
-With expiry enabled, publication, GPU reuse at admission, request completion,
-restore, and child publication refresh last-use timestamps for the indexed
-record and its required ancestors in memory only. A reuse notice changes the
-LRU position of its named key only. Recovery uses file mtime, from the last write
+Publication, reuse, restore and child publication refresh the record and its
+required ancestors in memory only. Recovery uses file mtime, from the last write
 when a record was spilled cold or drained. After a restart, a record reused from
 disk but never rewritten may expire up to one max age early. The cost is a
 recompute, never wrong output. With expiry off, hits do not refresh last use;
@@ -681,13 +705,13 @@ disk-only store whose ranks each keep their own records; see
 
 The worker loop admits requests, completes executor frames, and publishes
 finished requests. `service_store` polls host completions, applies inbound and
-outbound results, delivers eviction notices, refreshes checkpoint recency through
-`reused`, reports publications through `store`, and retries capacity refusals
-after host progress. The worker then
+outbound results, delivers eviction notices, reports publications through
+`store`, and retries capacity refusals after host progress. The worker then
 plans and submits model work. Copy-out pins are taken before the next admission, so a
-checkpoint cannot be evicted between submission and its pin. Only pooled stores
-receive logical eviction notices, including compaction. Any attached store can
-receive completion refreshes. Every store call from the worker returns without waiting.
+checkpoint cannot be evicted between submission and its pin. A pooled store
+receives logical eviction notices, including compaction; the scheduler queues
+no notices for a store without a pool. Every store
+call from the worker returns without waiting.
 
 Admission consults the store after `plan_admission`: `lookup` runs above the
 GPU hit, the policy in section 2.10 decides whether to fetch, and
@@ -738,16 +762,8 @@ Policy:
   eviction cascade only when the preceding tier needs room. Only queued copies
   pin GPU checkpoints. A capacity refusal waits for host progress before retry;
   admission uses ordinary cache eviction and the cache's pin and retirement fences.
-  A GPU hit at admission refreshes the matching host record. On successful
-  terminal publication, the worker reports the terminal's direct parent first,
-  then the terminal itself. Without a terminal publication, completion or a
-  client stop after inference progress reports only the retained prefix.
-  Preemption, execution errors, and cancellation before progress send no
-  completion notice. Each notice changes only the named record's LRU position.
-  Usually the prompt or message boundary is already on the host and the terminal
-  is deferred on the GPU until reuse. An indexed copy-out accepts the notice
-  before its transfer completes; an absent key is ignored. A notice neither
-  recreates a host copy nor protects an endpoint from tree compaction.
+  A GPU-resident hit refreshes the matching host record's recency. This does not
+  recreate an evicted host copy or protect an endpoint from tree compaction.
 - Inbound: fetch when the estimated transfer time is below half the estimated
   prefill time of the tokens gained. Transfer time is record bytes divided by
   the tier rate; prefill time is tokens gained divided by prefill throughput.
@@ -861,7 +877,7 @@ Offload limits interference through bounded work and explicit ownership:
 - Ticket resources belong to the scheduler until `finish_inbound`.
 - A restored endpoint's row and pages describe the same token prefix. GPU
   ancestor pages are retained, and only the missing page suffix is uploaded.
-- Rows and pages are stored byte-exact; no compression or requantization.
+- Storage compression preserves every byte; state is never requantized.
 - Record files are keyed by model and execution-state identity plus layout
   fingerprint; incompatible state is never restored. Each record directory
   has one process owner through its complete I/O lifetime.
@@ -1523,4 +1539,4 @@ bandwidth from each NVMe root complex to each GPU root complex.
   without copying pages.
 - Page-granular matching in the GPU cache, which depends on rows being cheap
   to refetch.
-- Prefetch of likely continuations, and compression.
+- Prefetch of likely continuations.

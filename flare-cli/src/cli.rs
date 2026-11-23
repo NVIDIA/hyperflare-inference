@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand, builder::PossibleValuesParser, builder::Typ
 use flare_helios::{
     engram::Storage,
     offload::{
-        PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
+        KvCompression, PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
         parse_pool_address, parse_size,
     },
     runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit},
@@ -959,6 +959,15 @@ pub struct ServingOptions {
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
+    /// Offer the checkpoint codec profile and decode packed restores on the CPU [default: off].
+    #[arg(
+        long,
+        value_name = "cpu|off",
+        requires_if("cpu", "prefix_cache_pool"),
+        help_heading = "Prefix cache options"
+    )]
+    pub lossless_kv_compression: Option<KvCompression>,
+
     /// Warm host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables warm retention.
     /// Automatic intake is additional when memory or disk is enabled [default: prefix_cache.memory, else 0].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
@@ -1077,6 +1086,9 @@ impl ServingOptions {
         }
         if self.roce_switch_only {
             options.push(ROCE_SWITCH_ONLY.into());
+        }
+        if let Some(mode) = self.lossless_kv_compression {
+            options.extend(["--lossless-kv-compression".into(), mode.to_string()]);
         }
         if self.verify_weights {
             options.push("--verify-weights".into());
@@ -1210,6 +1222,7 @@ impl ServingOptions {
             },
             device_labels: (!self.gpus.is_empty()).then(|| self.gpus.clone()),
             prefix_cache: PrefixCacheOffload {
+                compression: self.lossless_kv_compression.unwrap_or_default(),
                 memory_bytes: self.prefix_cache_memory,
                 disk: self.prefix_cache_disk.clone(),
                 disk_limit: self.prefix_cache_disk_limit,
@@ -1663,6 +1676,7 @@ mod tests {
         assert_eq!(
             options.prefix_cache,
             PrefixCacheOffload {
+                compression: Default::default(),
                 memory_bytes: Some(3 << 29),
                 disk: Some(PathBuf::from("prefixes")),
                 disk_limit: Some(0),
@@ -2125,6 +2139,31 @@ mod tests {
             peer.load_options().prefix_cache.pool,
             args.load_options().prefix_cache.pool
         );
+    }
+
+    #[test]
+    fn codec_placement_reaches_each_rank_and_defaults_to_off() {
+        let base = ["flare", "run", "model.safetensors"];
+        assert_eq!(
+            run(&base).load_options().prefix_cache.compression,
+            KvCompression::Off
+        );
+        for name in ["cpu", "off"] {
+            let mut argv = base.to_vec();
+            argv.extend(["--lossless-kv-compression", name]);
+            if name != "off" {
+                assert!(Cli::try_parse_from(&argv).is_err());
+            }
+            argv.extend(["--prefix-cache-pool", "unix:/run/selene.sock"]);
+            let args = run(&argv);
+            assert_eq!(args.rank_options(), [
+                "--lossless-kv-compression", name, "--prefix-cache-pool", "unix:/run/selene.sock",
+            ]);
+            assert_eq!(
+                args.load_options().prefix_cache.compression.to_string(),
+                name
+            );
+        }
     }
 
     #[test]

@@ -673,9 +673,6 @@ pub struct RequestScheduler {
     publications: Vec<CheckpointId>,
     offered_publications: BTreeSet<CheckpointId>,
     pending_reoffers: BTreeSet<CheckpointId>,
-    /// Completion refreshes in retirement order, including repeated keys.
-    /// The worker drains them on each host-store service pass.
-    reused: Vec<PrefixKey>,
     track_evictions: bool,
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
@@ -768,7 +765,6 @@ impl RequestScheduler {
             publications: Vec::new(),
             offered_publications: BTreeSet::new(),
             pending_reoffers: BTreeSet::new(),
-            reused: Vec::new(),
             track_evictions: false,
             evictions: Vec::new(),
             evictions_lost: false,
@@ -1806,11 +1802,6 @@ impl RequestScheduler {
             .into_iter()
             .filter_map(|id| self.publication(id))
             .collect()
-    }
-
-    /// Takes all completion refreshes since the previous drain, in retirement order.
-    pub fn take_reused(&mut self) -> Vec<PrefixKey> {
-        std::mem::take(&mut self.reused)
     }
 
     pub(crate) fn publication(&self, id: CheckpointId) -> Option<PublishedCheckpoint> {
@@ -2969,19 +2960,8 @@ impl RequestScheduler {
             let epoch = self.cache.new_use_epoch()?;
             self.cache.touch(id, epoch)?;
             // Duplicate publication can retain a different parent than the request's prefix.
-            let parent = if result.is_some() {
-                self.cache.checkpoint(id)?.parent()
-            } else {
-                None
-            };
-            if let Some(parent) = parent {
+            if result.is_some() && let Some(parent) = self.cache.checkpoint(id)?.parent() {
                 self.cache.touch(parent, epoch)?;
-            }
-            if self.track_publications {
-                if let Some(parent) = parent {
-                    self.reused.push(self.cache.checkpoint(parent)?.prefix());
-                }
-                self.reused.push(self.cache.checkpoint(id)?.prefix());
             }
         }
         let mut request = self.slots[handle.slot as usize].request.take().unwrap();
