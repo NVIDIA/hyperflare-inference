@@ -263,9 +263,10 @@ class PreparedAllReduce:
                     submode=mode, active_blocks=initial_active))
                 if cluster_size > 1:
                     plan_options["joint_cluster_size"] = cluster_size
-                if has_addend:
-                    plan_options["joint_has_addend"] = True
-                    self.fused_addend = True
+            elif (has_addend and source.dtype == torch.bfloat16
+                  and getattr(channel, "_eager_ptrs", None) is not None):
+                plan_options["has_addend"] = True
+                self.fused_addend = True
             self.plan = runtime.plan(source, out=output, **plan_options)
             group = runtime.exchange_group
             zero_addend = torch.zeros_like(source) if self.fused_addend else None
@@ -274,6 +275,14 @@ class PreparedAllReduce:
                 if state.query.surface == "PCIeTwoShotBF16.all_reduce":
                     from b12x.comm.pcie._twoshot_preparation import prepared_call
 
+                    if zero_addend is not None:
+                        call = prepared_call(state, payload=source, out=output, addend=zero_addend)
+                        return PreparedCall(
+                            run=call.run,
+                            output=call.output,
+                            capture_safe=call.capture_safe,
+                            owners=(*call.owners, runtime, zero_addend),
+                        )
                     return prepared_call(state, payload=source, out=output)
                 state.bind_input(source)
                 return PreparedCall(
@@ -953,9 +962,13 @@ class PreparedAllGather:
         self.runtime, self.output = runtime, output
         call = {"local_input": transport_source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
                 "out": transport_output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim)}
+        runtime_tuning = getattr(session, "collective_tuning", "static") == "runtime"
+        if has_gate and not runtime_tuning:
+            call["has_gate"] = True
+            self.gated = True
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
         startup = False
-        if getattr(session, "collective_tuning", "static") == "runtime":
+        if runtime_tuning:
             from dataclasses import replace
             from b12x.preparation import FrozenMapping
             from ignition.preparation.collective_ladder import select_gather
@@ -968,19 +981,16 @@ class PreparedAllGather:
                     world_size=runtime.world_size, capability=torch.cuda.get_device_capability(source.device))
                 self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
                 self.runtime_cache_policy = ladder["cache_policy"]
-                transport = row["implementation"].removeprefix("gather_")
-                use_gate = bool(has_gate and transport in ("joint", "selected_barrier", "selected_word_exchange"))
-                extra = {"has_gate": True} if use_gate else {}
                 query = replace(query, call=FrozenMapping(dict(query.call,
-                    gather_transport=transport,
+                    gather_transport=row["implementation"].removeprefix("gather_"),
                     threads=row["threads"], block_limit=row["blocks"],
-                    submode=self.runtime_profiles[0][0], active_blocks=1, **extra)))
-                self.gated = use_gate
+                    submode=self.runtime_profiles[0][0], active_blocks=1)))
                 startup = True
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         one_gate = torch.ones((1,), dtype=torch.int32, device=source.device) if self.gated else None
-        prepare_call_kwargs = call if one_gate is None else {**call, "gate": one_gate}
+        run_call = {k: v for k, v in call.items() if k != "has_gate"}
+        prepare_call_kwargs = run_call if one_gate is None else {**run_call, "gate": one_gate}
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: PreparedCall(run=lambda: state.run(**prepare_call_kwargs), output=output,
                                                     owners=(runtime,) if one_gate is None else (runtime, one_gate)),
