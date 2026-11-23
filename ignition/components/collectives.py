@@ -115,6 +115,61 @@ def _fake_join_all_reduce(source, output, dependencies, dependency, stream):
     pass
 
 
+@torch.library.custom_op("flare::pcie_all_reduce_side", mutates_args=("output",))
+def _all_reduce_side(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                     handle: int, stream_handle: int, after_handle: int) -> None:
+    owner = _OWNERS[handle]
+    main = torch.cuda.current_stream(source.device)
+    side = torch.cuda.ExternalStream(stream_handle, device=source.device)
+    side.wait_stream(main)
+    if after_handle:
+        side.wait_stream(torch.cuda.ExternalStream(after_handle, device=source.device))
+    with torch.cuda.stream(side):
+        from ignition.preparation.startup_tuning import record_consumer
+        record_consumer(owner)
+        owner.runtime.all_reduce(source, out=output, plan=owner.plan)
+
+
+@_all_reduce_side.register_fake
+def _fake_all_reduce_side(source, output, dependencies, handle, stream_handle, after_handle):
+    pass
+
+
+@torch.library.custom_op("flare::join_side_stream", mutates_args=("output",))
+def _join_side_stream(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                      stream_handle: int) -> None:
+    torch.cuda.current_stream(output.device).wait_stream(
+        torch.cuda.ExternalStream(stream_handle, device=output.device))
+
+
+@_join_side_stream.register_fake
+def _fake_join_side_stream(source, output, dependencies, stream_handle):
+    pass
+
+
+class SideStream:
+    """Non-blocking CUDA stream for overlapped collectives inside captured graphs."""
+
+    def __init__(self, device):
+        from weakref import finalize
+        from cuda.bindings import driver as cuda
+
+        with torch.cuda.device(device):
+            status, handle = cuda.cuStreamCreate(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING)
+            if status != cuda.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cannot create collective side stream: {status}")
+            self.stream = torch.cuda.ExternalStream(int(handle), device=device)
+        finalize(self.stream, cuda.cuStreamDestroy, handle).atexit = False
+        self.stream_handle = int(handle)
+
+
+@dataclass(frozen=True)
+class PendingSideReduce:
+    source: torch.Tensor
+    output: torch.Tensor
+    side: SideStream | None
+
+
 @dataclass(frozen=True)
 class PendingAllReduce:
     source: torch.Tensor
@@ -292,6 +347,26 @@ class PreparedAllReduce:
             _all_reduce(source, output, self.handle)
         return output
 
+    def start_side(self, source, side, *, after=None, dependencies=()):
+        """Launch a reduction on `side` after the main stream and optional `after` stream."""
+        source = source.contiguous()
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        if self.single:
+            output.copy_(source)
+            return PendingSideReduce(source, output, None)
+        _all_reduce_side(source, output, list(dependencies), self.handle, side.stream_handle,
+                         0 if after is None else after.stream_handle)
+        return PendingSideReduce(source, output, side)
+
+    def join_side(self, pending, *, dependencies=()):
+        """Join `pending`'s side stream back to the main stream and return its output."""
+        if not self.single and pending.side is not None:
+            _join_side_stream(pending.source, pending.output, list(dependencies), pending.side.stream_handle)
+        return pending.output
+
 
 class PreparedChunkedAllGather:
     """Column gathers of more rows than the channel's batch capacity, gathered in row chunks it accepts.
@@ -356,12 +431,20 @@ class PreparedChunkedAllReduce:
         elif runtime is not None:
             from b12x.comm import pcie
 
-            # One-shot pools answer through their stream channel; hierarchical runtimes directly.
-            accepts = (runtime.for_stream().should_allreduce
-                       if not isinstance(runtime, pcie.DmaAllReduce) and runtime.algorithm == "oneshot"
-                       else runtime.should_allreduce)
-            while step > 1 and not accepts(source[:step]):
-                step = (step + 1) // 2
+            if isinstance(runtime, pcie.DmaAllReduce):
+                row_bytes = source[0].numel() * source.element_size()
+                step = min(rows, runtime.max_bytes // row_bytes)
+                if step < 1:
+                    raise ValueError("one reduction row exceeds the DMA channel capacity")
+                while step > 1 and not runtime.should_allreduce(source[:step]):
+                    step -= 1
+            else:
+                # One-shot pools answer through their stream channel; hierarchical runtimes directly.
+                accepts = (runtime.for_stream().should_allreduce
+                           if runtime.algorithm == "oneshot"
+                           else runtime.should_allreduce)
+                while step > 1 and not accepts(source[:step]):
+                    step = (step + 1) // 2
         self.bounds = [(start, min(start + step, rows)) for start in range(0, rows, step)]
         self.parts = [PreparedAllReduce(source[begin:end], output[begin:end], runtime=runtime, session=session,
                                         coordinator=coordinator, name=name if len(self.bounds) == 1 else f"{name}.{index}")
