@@ -1122,6 +1122,8 @@ fn cache_geometry(
     }
     planes.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let geometry = CacheGeometry {
+        codec_fields: Vec::new(),
+        placement: Default::default(),
         snapshot_pages: Vec::new(),
         page_tokens,
         page_capacity: pages,

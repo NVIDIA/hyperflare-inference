@@ -40,6 +40,15 @@ impl Plane {
     }
 }
 
+/// Prepared transform for a byte interval within a named physical allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodecField {
+    pub buffer: String,
+    pub offset: u64,
+    pub length: u64,
+    pub encoding: u32,
+}
+
 /// One rank's checkpoint storage: the row plane and the page planes in name order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheGeometry {
@@ -51,9 +60,19 @@ pub struct CacheGeometry {
     /// KV ids sharing physical bytes with each snapshot row, excluding execution rows.
     /// Ownership of a snapshot excludes every page in its range through GPU retirement.
     pub snapshot_pages: Vec<std::ops::Range<u32>>,
+    pub codec_fields: Vec<CodecField>,
+    pub placement: crate::offload::KvCompression,
 }
 
 impl CacheGeometry {
+    pub fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.checked_codec_profile().ok()
+    }
+
+    pub fn checked_codec_profile(&self) -> std::result::Result<[u8; 32], String> {
+        crate::shared::wire::CodecLayout::from(self).profile()
+    }
+
     /// Bytes a page occupies on the GPU across every plane.
     pub fn page_bytes(&self) -> u64 {
         self.planes.iter().map(|plane| plane.unit_bytes).sum()

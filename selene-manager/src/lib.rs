@@ -4,6 +4,7 @@
  */
 
 pub mod arena;
+mod compression;
 pub mod config;
 pub mod control;
 pub mod data;

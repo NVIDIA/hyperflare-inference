@@ -42,14 +42,16 @@ pub fn key(tokens: u64) -> Key {
 }
 
 pub fn descriptor() -> Descriptor {
+    let mut rank = RankSizes {
+        planes: vec![4000],
+        row_bytes: 1000,
+    };
+    flare_selene::pool::pad_pool_rank(&mut rank.planes, &mut rank.row_bytes);
     Descriptor {
         identity: [7; 32],
         fingerprint: [3; 16],
         page_tokens: 64,
-        ranks: vec![RankSizes {
-            planes: vec![4000],
-            row_bytes: 1000,
-        }],
+        ranks: vec![rank],
         pool_name: "tenant".into(),
     }
 }

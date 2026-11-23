@@ -412,4 +412,18 @@ and record retention.
 
 ### Upgrading a checkpoint root for codec envelopes
 
-Managers read raw v1–v3 and packed v4 records. Upgrade managers that share a root before placing v4 records there. An older manager deletes unreadable files during recovery and may prune dependent records. Readers need a matching profile for every packed ancestor. Staging must fit the largest indivisible stored row.
+Upgrade managers that share a record root before enabling write-back compression. A manager reads raw v1–v3 and packed v4 files. A pre-v4 manager deletes packed files during recovery and can prune dependent entries. Flare writes raw checkpoints to its local disk and prunes v4 files there. A Flare instance with `--lossless-kv-compression cpu` or `gpu` offers its layout and profile to the manager. GPU workspace refusal selects CPU decode. RDMA requesters advertise raw-only capability.
+
+For a cold restore, staging must fit the largest indivisible stored row. The file's physical length includes the header, directory and stored payload.
+
+### Compressing raw checkpoints on NVMe
+
+Set `--compress-at-rest cpu` to let a manager with a record root compress raw arena records at write-back. The default is `off`. Set `--compress-workers N` to choose the number of encoder threads. The default is one quarter of available CPUs, rounded down and limited to 1–16 threads. Startup logs the pool size.
+
+The manager checks the original page and row checksums before encoding. It decodes and compares each packet before retaining it, and writes a packed file only when the complete file is smaller. Records streamed directly to disk stay raw. Compression shares temporary storage equal to one eighth of the arena capacity. A raw-only reader can claim a resident raw copy. After its release, a packed file requires a compatible reader.
+
+Each encode job gets 250 ms plus the time to process its raw record at 500 MB/s (decimal). The worker checks this deadline before each unit. If it expires, the manager writes the original record raw. A put can wait for several ancestor writes or arena reclaims. In the final 500 ms of shutdown, new writes go raw and running encodes stop at their next unit.
+
+`selene_codec_encoded_original_bytes_total` and `selene_codec_encoded_stored_bytes_total` compare complete file lengths for successful encoded writes. The `selene_codec_encode_seconds` histogram measures elapsed time per encode attempt. With write-back compression enabled, an invalid offered layout increments `selene_codec_layout_rejected_total`. Incompatible pool lookups and claims increment `selene_pool_codec_incompatible_total`.
+
+`selene_codec_writeback_raw_total` and `selene_codec_writeback_raw_bytes_total` count raw fallback by cause. The resource and eligibility causes are `deadline`, `shutdown`, `temp_budget`, `v4_limits`, `no_plan` and `streamed`. A record with no smaller packet counts as `literal_only`. Directory overhead that eliminates the savings counts as `not_smaller`. A logged `raw_checksum` indicates damaged input. A logged `verify_failed` indicates a codec failure. Both paths preserve the original raw checksums.

@@ -977,6 +977,7 @@ dependencies = [
  "flare-selene",
  "libc",
  "prost",
+ "rayon",
  "rcgen",
  "rustls",
  "socket2",

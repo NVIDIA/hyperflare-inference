@@ -390,6 +390,7 @@ mod tests {
             .open(
                 peer,
                 v2::OpenSession {
+                    codec_layout: None,
                     codec,
                     manager_incarnation: core.incarnation,
                     instance_id: INSTANCE.to_vec(),

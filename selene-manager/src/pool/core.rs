@@ -574,7 +574,7 @@ impl Core {
                 detail: detail.to_string(),
             }),
         );
-        self.session_lost(sid);
+        self.remove_session(sid, reason == v2::ClosingReason::ClosingShutdown);
     }
 
     pub(super) fn violation(&mut self, sid: u64, violation: Violation) {
@@ -725,6 +725,14 @@ impl Core {
                 ranks,
             },
         );
+        if let Some(layout) = open.codec_layout {
+            self.store_send(crate::store::StoreCommand::OfferLayout {
+                session: sid,
+                namespace: scope.descriptor.namespace_id(),
+                layout,
+                caps: codec.clone(),
+            });
+        }
         let readiness = self.readiness_info();
         let scope_id = scope.id.to_vec();
         self.send(
@@ -746,9 +754,18 @@ impl Core {
 
     /// The session's stream ended or it was closed. Everything it owned is lost.
     pub(super) fn session_lost(&mut self, sid: u64) {
+        self.remove_session(sid, false);
+    }
+
+    fn remove_session(&mut self, sid: u64, final_drain: bool) {
         let Some(session) = self.sessions.remove(&sid) else {
             return;
         };
+        // The store drains after the pool closes its sessions. Retain the offers
+        // present at shutdown through that final write-back.
+        if !final_drain {
+            self.store_send(crate::store::StoreCommand::WithdrawLayout { session: sid });
+        }
         let proc_key = (session.instance, session.nonce);
         if !self
             .sessions

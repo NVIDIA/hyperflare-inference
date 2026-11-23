@@ -525,17 +525,26 @@ impl Worker {
                     if let Some(gate) = &self.faults.read_gate {
                         gate.wait().map_err(Error::carrying)?;
                     }
-                    if !span.aligned() {
-                        use std::os::unix::fs::FileExt;
-                        // The caller owns this output span until the worker replies.
-                        let bytes = unsafe {
-                            std::slice::from_raw_parts_mut(span.address as *mut u8, span.length)
-                        };
-                        file.read_exact_at(bytes, span.offset)
-                            .map_err(|e| io_failure("read packed record", e))?;
-                        return Ok(span.length as u64);
+                    let required_end = span
+                        .offset
+                        .checked_add(span.length as u64)
+                        .ok_or_else(|| invalid("record read offset overflow"))?;
+                    let span = Span {
+                        length: span
+                            .length
+                            .checked_next_multiple_of(4096)
+                            .ok_or_else(|| invalid("record read length overflow"))?,
+                        ..span
+                    };
+                    let bytes =
+                        self.ring
+                            .transfer_until(&file, &[span], false, Some(required_end))?;
+                    #[cfg(any(test, feature = "test-support"))]
+                    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_DIRECT != 0
+                    {
+                        self.faults.trace(b'r');
                     }
-                    self.ring.transfer(&file, &[span], false)
+                    Ok(bytes)
                 })();
                 #[cfg(any(test, feature = "test-support"))]
                 self.faults.trace(b'R');
@@ -563,6 +572,12 @@ impl Worker {
                         let file = flare_eos::direct_update_file(&temporary, true)
                             .map_err(|e| io_failure("open record writer", e))?;
                         let bytes = self.ring.transfer(&file, &[span], true)?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_DIRECT
+                            != 0
+                        {
+                            self.faults.trace(b'w');
+                        }
                         (file, bytes)
                     } else {
                         use std::os::unix::fs::FileExt;
@@ -1246,6 +1261,16 @@ impl Ring {
     /// completed, so the caller's buffers are quiescent whatever the outcome.
     /// An undrainable ring retains the call and its buffers through shutdown.
     fn transfer(&mut self, file: &File, spans: &[Span], write: bool) -> Result<u64> {
+        self.transfer_until(file, spans, write, None)
+    }
+
+    fn transfer_until(
+        &mut self,
+        file: &File,
+        spans: &[Span],
+        write: bool,
+        required_end: Option<u64>,
+    ) -> Result<u64> {
         if let Some(reason) = &self.broken {
             return Err(invalid(format!(
                 "disk thread ring failed earlier: {reason}"
@@ -1328,7 +1353,11 @@ impl Ring {
                             io::Error::from_raw_os_error(-result),
                         )
                     });
-                } else if result as u32 != chunk.length {
+                } else if (result as u64)
+                    < required_end.map_or(u64::from(chunk.length), |end| {
+                        end.saturating_sub(chunk.offset).min(chunk.length.into())
+                    })
+                {
                     failure.get_or_insert_with(|| {
                         invalid(format!(
                             "short direct {verb} of {result} bytes at file offset {}; {} were requested",
@@ -1336,7 +1365,7 @@ impl Ring {
                         ))
                     });
                 } else {
-                    moved += chunk.length as u64;
+                    moved += result as u64;
                 }
             }
         }
@@ -1737,6 +1766,37 @@ mod tests {
         io::{Seek, SeekFrom, Write as _},
         time::{Duration, Instant, SystemTime},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_final_read_accepts_only_a_complete_logical_window() {
+        let Some(directory) = test_directory("packed-final-window") else {
+            return;
+        };
+        let path = directory.join("row");
+        let file_bytes: Vec<_> = (0..7180).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &file_bytes).unwrap();
+        let file = Arc::new(flare_eos::direct_file(&path, false).unwrap());
+        let thread = DiskThread::start("packed-final-window").unwrap();
+        let output = AlignedBuffer::new(4096).unwrap();
+        let required = file_bytes.len() - 4096;
+        for length in [required, required + 1] {
+            thread
+                .submit(Job::ReadRecord {
+                    id: JobId(1),
+                    file: file.clone(),
+                    span: Span {
+                        address: output.address(),
+                        offset: 4096,
+                        length,
+                    },
+                })
+                .unwrap();
+            let result = wait(&thread, 1).pop().unwrap().result;
+            assert_eq!(result.is_ok(), length == required, "{result:?}");
+        }
+        assert_eq!(&output.as_slice()[..required], &file_bytes[4096..]);
+    }
 
     #[cfg(unix)]
     #[test]

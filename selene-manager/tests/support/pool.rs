@@ -58,19 +58,9 @@ pub fn boundaries(tokens: u64) -> Vec<v2::PrefixKey> {
 }
 
 pub fn scope_for(model: u8) -> v2::Scope {
-    v2::Scope {
-        model_identity: vec![model; 32],
-        layout_fingerprint: vec![3; 16],
-        geometry: Some(v2::Geometry {
-            page_tokens: PAGE_TOKENS,
-            ranks: vec![v2::RankPlanes {
-                plane_bytes: vec![4000],
-                row_bytes: 1000,
-            }],
-            page_record_bytes: PAGE_BYTES,
-            row_record_bytes: ROW_BYTES,
-        }),
-    }
+    let mut descriptor = super::descriptor();
+    descriptor.identity = [model; 32];
+    super::scope_of(&descriptor)
 }
 
 pub fn scope() -> v2::Scope {
@@ -150,6 +140,7 @@ pub use flare_selene::shared::record::checksum as xxh3;
 /// A client's identity for one process.
 #[derive(Clone)]
 pub struct Ident {
+    pub codec_layout: Option<v2::CodecLayout>,
     pub codec: Option<v2::CodecCaps>,
     pub instance_id: [u8; 16],
     pub nonce: [u8; 16],
@@ -172,6 +163,7 @@ impl Ident {
             .unwrap();
         Self {
             codec: None,
+            codec_layout: None,
             instance_id,
             nonce,
             name: name.into(),
@@ -255,6 +247,7 @@ impl Pool {
             header: None,
             m: Some(c::M::Open(v2::OpenSession {
                 codec: ident.codec.clone(),
+                codec_layout: ident.codec_layout.clone(),
                 manager_incarnation: incarnation,
                 instance_id: ident.instance_id.to_vec(),
                 scope: Some(ident.scope.clone()),

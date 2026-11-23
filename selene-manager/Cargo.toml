@@ -23,6 +23,7 @@ flare-eos = { path = "../eos" }
 rcgen = { version = "0.14", features = ["pem"], optional = true }
 flare-selene = { path = "../selene" }
 blake2 = "0.10"
+rayon = "1.12"
 ibverbs-sys = { version = "0.3.2", optional = true }
 libc = "0.2"
 socket2 = "0.6"

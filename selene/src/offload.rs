@@ -27,6 +27,36 @@ pub trait CopierFactory {
     ) -> Result<Box<dyn crate::PageCopier>>;
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvCompression {
+    Gpu,
+    Cpu,
+    #[default]
+    Off,
+}
+
+impl std::str::FromStr for KvCompression {
+    type Err = &'static str;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "gpu" => Ok(Self::Gpu),
+            "cpu" => Ok(Self::Cpu),
+            "off" => Ok(Self::Off),
+            _ => Err("expected gpu, cpu or off"),
+        }
+    }
+}
+
+impl std::fmt::Display for KvCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+            Self::Off => "off",
+        })
+    }
+}
+
 /// Offload settings as the command line and configuration file supply them.
 /// `None` selects the default: no memory store and no disk store until the
 /// isolation measurements in `docs/prefix-cache-offload.md` enable derived

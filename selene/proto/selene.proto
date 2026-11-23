@@ -380,6 +380,7 @@ message OpenSession {
   // and moves only its own slice. See "Rank agents".
   bytes rank_secret = 8;
   CodecCaps codec = 9;
+  CodecLayout codec_layout = 10;
 }
 
 enum OpenStatus {
@@ -1182,6 +1183,23 @@ message RankClosing {
 message CodecCaps {
   uint32 envelope_revision = 1;
   repeated bytes receive_profiles = 2;
+}
+// Field offsets are relative to their unpadded plane.
+message CodecLayout {
+  string revision = 1;
+  uint64 page_tokens = 2;
+  repeated CodecPlane planes = 3;
+  CodecPlane row = 4;
+}
+message CodecPlane {
+  string name = 1;
+  uint64 unit_bytes = 2;
+  repeated CodecField fields = 3;
+}
+message CodecField {
+  uint64 offset = 1;
+  uint64 length = 2;
+  uint32 encoding = 3;
 }
 message PackedOffer {
   uint64 first_page = 1;

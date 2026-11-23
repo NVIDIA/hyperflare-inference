@@ -26,6 +26,8 @@ pub struct Config {
     pub root: Option<PathBuf>,
     pub memory: u64,
     pub nvme: u64,
+    pub compress_at_rest: bool,
+    pub compress_workers: usize,
     pub staging: u64,
     /// Serve the pool protocol to instances on other hosts at this address.
     pub listen: Option<SocketAddr>,
@@ -85,6 +87,9 @@ impl Config {
             root: None,
             memory: DEFAULT_MEMORY,
             nvme: 0,
+            compress_at_rest: false,
+            compress_workers: (std::thread::available_parallelism().map_or(1, usize::from) / 4)
+                .clamp(1, 16),
             staging: DEFAULT_STAGING,
             listen: None,
             listen_data: None,
@@ -171,6 +176,9 @@ impl Config {
 
     /// Validate every configuration rule.
     pub fn validate(&self) -> io::Result<()> {
+        if self.compress_workers == 0 {
+            return Err(invalid("--compress-workers must be a positive integer"));
+        }
         if !valid_name(&self.name) {
             return Err(invalid(
                 "--name must be 1-64 bytes of letters, digits, '.', '_' or '-'",
@@ -249,6 +257,8 @@ pub fn help_text() -> String {
      --root PATH                     NVMe directory, owned by this manager alone\n\
      --memory BYTES                  shared arena, default 1G\n\
      --nvme BYTES                    NVMe budget; required with --root\n\
+     --compress-at-rest off|cpu      CPU compression on arena write-back, default off\n\
+     --compress-workers N            CPU encoder threads, default one quarter of CPUs (1-16)\n\
      --staging BYTES                 shared staging, default 4G\n\
      --listen ADDR:PORT              serve instances on other hosts\n\
      --listen-data ADDR:PORT         where they copy bytes, default --listen's next port\n\
@@ -305,6 +315,20 @@ where
             }
             "--nvme" => {
                 config.nvme = parse_size(value(index)?)?;
+                index += 2;
+            }
+            "--compress-at-rest" => {
+                config.compress_at_rest = match value(index)? {
+                    "off" => false,
+                    "cpu" => true,
+                    _ => return Err(invalid("--compress-at-rest requires off or cpu")),
+                };
+                index += 2;
+            }
+            "--compress-workers" => {
+                config.compress_workers = value(index)?
+                    .parse()
+                    .map_err(|_| invalid("--compress-workers must be a positive integer"))?;
                 index += 2;
             }
             "--staging" => {
@@ -408,6 +432,8 @@ mod tests {
     fn defaults_match_the_spec() {
         let config = run(&[]);
         assert_eq!(config.name, "default");
+        assert!(!config.compress_at_rest);
+        assert!((1..=16).contains(&config.compress_workers));
         assert_eq!(config.socket, PathBuf::from("/run/selene/default.sock"));
         assert_eq!(config.memory, 1 << 30);
         assert_eq!(config.staging, 4 << 30);
@@ -441,6 +467,10 @@ mod tests {
             "pool",
             "--root",
             "/var/lib/selene",
+            "--compress-at-rest",
+            "cpu",
+            "--compress-workers",
+            "3",
             "--nvme",
             "1G",
             "--memory",
@@ -448,6 +478,10 @@ mod tests {
             "--staging",
             "16M",
         ]);
+        assert!(config.compress_at_rest);
+        assert_eq!(config.compress_workers, 3);
+        assert!(parse_args(args(&["--compress-workers", "0"])).is_err());
+        assert!(parse_args(args(&["--compress-at-rest", "gpu"])).is_err());
         assert_eq!(config.nvme, 1 << 30);
         assert_eq!(config.memory, 2 << 30);
         assert_eq!(config.staging, 16 << 20);

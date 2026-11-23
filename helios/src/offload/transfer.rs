@@ -1581,6 +1581,8 @@ mod tests {
                     })
                     .collect();
                 geometry.push(CacheGeometry {
+                    codec_fields: Vec::new(),
+                    placement: Default::default(),
                     snapshot_pages: Vec::new(),
                     page_tokens: 64,
                     page_capacity: PAGES,

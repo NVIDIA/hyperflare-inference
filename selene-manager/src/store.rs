@@ -6,6 +6,7 @@
 use crate::{
     Key, Result,
     arena::{Arena, Extent, ExtentSlice},
+    compression::{self, Encoder, PackedRecord, Profiles, WAIT},
     disk::{self, DiskExtent},
     invalid,
     local::Local,
@@ -26,7 +27,10 @@ use std::{
     fs::{self, File},
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -59,6 +63,7 @@ pub use crate::config::Config;
 
 #[derive(Clone)]
 pub struct Location {
+    pub disk_header: Option<Header>,
     pub header: Header,
     pub memory: Option<Arc<Extent>>,
     pub disk: Option<Arc<DiskExtent>>,
@@ -80,6 +85,15 @@ enum PublishTarget {
 }
 
 impl Location {
+    fn visible_header(&self) -> &Header {
+        if self.memory.is_none()
+            && let Some(header) = &self.disk_header
+        {
+            return header;
+        }
+        &self.header
+    }
+
     /// Whether a disk job is writing or truncating this record's file.
     ///
     /// Removing the record then would strand the job's completion, so removal
@@ -111,7 +125,7 @@ pub struct Namespace {
     /// Invariant: when the namespace has a disk, every record that is not durable is in this
     /// set, so code that inserts into `tree` must call `refresh_durability` for the new key.
     /// A removed record may linger here until the next refresh drops it.
-    undurable: HashSet<Key>,
+    pub(crate) undurable: HashSet<Key>,
 }
 
 impl Namespace {
@@ -142,6 +156,15 @@ struct PlannedGrant {
 }
 
 impl PlannedGrant {
+    fn read_prefix(self) -> usize {
+        (self.record_offset % 4096) as usize
+    }
+    fn read_length(self) -> usize {
+        usize::try_from(self.length)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.read_prefix())
+    }
+
     fn window(
         self,
         transfer: u64,
@@ -404,8 +427,7 @@ enum Job {
         namespace: NamespaceId,
         key: Key,
         reason: &'static str,
-        _memory: Arc<Extent>,
-        _temporary: Arc<DiskExtent>,
+        write: Writeback,
     },
     Chunk {
         connection: u64,
@@ -428,6 +450,34 @@ enum Job {
         kind: ReadKind,
         buffer: Extent,
     },
+}
+
+struct Writeback {
+    writer: usize,
+    memory: Arc<Extent>,
+    temporary: Arc<DiskExtent>,
+    path: PathBuf,
+    raw_length: u64,
+    encoded: Option<PackedRecord>,
+}
+
+impl Writeback {
+    fn submit(&self, job: JobId, writers: &[DiskThread]) -> flare_selene::Result<()> {
+        let (data, length) = match &self.encoded {
+            Some(record) => (record.bytes(), record.bytes().len() as u64),
+            None => (
+                &self.memory.bytes()[..self.raw_length as usize],
+                self.raw_length,
+            ),
+        };
+        writers[self.writer].submit(DiskJob::write_record(
+            job,
+            self.temporary.path.clone(),
+            0,
+            data,
+            Some((self.path.clone(), length)),
+        ))
+    }
 }
 
 fn finish_record(
@@ -551,6 +601,10 @@ pub struct GetRequest {
 const WRITEBACK_WORKERS: usize = 4;
 
 pub struct Store {
+    encoder: Option<Encoder>,
+    profiles: Profiles,
+    codec_metrics: compression::Metrics,
+    shutdown_raw: Arc<AtomicBool>,
     config: Config,
     local: Local,
     memory: Arena,
@@ -682,6 +736,12 @@ impl Store {
             Err(error) => return Err(error),
         };
         let mut store = Self {
+            encoder: (config.compress_at_rest && config.root.is_some())
+                .then(|| Encoder::new(config.compress_workers, memory.capacity()))
+                .transpose()?,
+            profiles: Profiles::default(),
+            codec_metrics: compression::Metrics::default(),
+            shutdown_raw: Arc::new(AtomicBool::new(false)),
             _name_lock: name_lock,
             config: config.clone(),
             local,
@@ -731,6 +791,7 @@ impl Store {
                         row,
                         true,
                         Location {
+                            disk_header: Some(header.clone()),
                             header,
                             memory: None,
                             disk: Some(extent),
@@ -933,6 +994,7 @@ impl Store {
             }
             self.delta(id, CatalogKind::Removed, node.key);
         }
+        self.profiles.release_if_empty(id, &self.namespaces[&id]);
         count
     }
 
@@ -957,14 +1019,13 @@ impl Store {
 
     fn entry(namespace: &Namespace, key: Key) -> EntryData {
         let node = &namespace.tree[&key];
+        let header = node.location.visible_header();
         EntryData {
-            packed: node.location.header.packed.is_some(),
-            required_profiles: node
-                .location
-                .header
+            packed: header.packed.is_some(),
+            required_profiles: header
                 .packed
                 .as_ref()
-                .map_or_else(Vec::new, |p| p.required_profiles(true)),
+                .map_or_else(Vec::new, |p| p.required_profiles(node.row)),
             key,
             parent: node.parent,
             bucket: node.bucket,
@@ -1084,17 +1145,26 @@ impl Store {
         request: PutRequest,
         events: tokio::sync::mpsc::Sender<Result<PutAnswer>>,
     ) {
-        let queue = self.pending_puts.entry(connection).or_default();
-        let was_empty = queue.is_empty();
-        queue.push_back(PendingPut {
+        self.queue_put(PendingPut {
             connection,
             transfer,
             request,
             events,
         });
-        if was_empty {
+    }
+
+    fn queue_put(&mut self, pending: PendingPut) {
+        let connection = pending.connection;
+        let queue = self.pending_puts.entry(connection).or_default();
+        if queue.is_empty() {
             self.put_order.push_back(connection);
         }
+        queue.push_back(pending);
+    }
+
+    fn wait_for_writeback(&mut self, pending: PendingPut) {
+        self.metrics.put_writeback_waits += 1;
+        self.queue_put(pending);
     }
 
     pub fn submit_get(
@@ -1254,12 +1324,8 @@ impl Store {
     }
 
     fn begin_put(&mut self, pending: PendingPut) {
-        let PendingPut {
-            connection,
-            transfer,
-            request,
-            events,
-        } = pending;
+        let (connection, transfer) = (pending.connection, pending.transfer);
+        let request = &pending.request;
         let Some(id) = self.sessions.get(&connection).map(|_| request.namespace) else {
             return;
         };
@@ -1268,7 +1334,7 @@ impl Store {
             .get(&id)
             .map(|namespace| namespace.descriptor.clone())
         else {
-            self.reject_put(&events, proto::Reason::Invalid as u8);
+            self.reject_put(&pending.events, proto::Reason::Invalid as u8);
             return;
         };
         let invalid_geometry = request.key.consumed_tokens == 0
@@ -1293,13 +1359,13 @@ impl Store {
                 .any(|keys| keys[0].consumed_tokens <= keys[1].consumed_tokens);
         if invalid_geometry {
             self.metrics.puts_error += 1;
-            self.reject_put(&events, proto::Reason::Invalid as u8);
+            self.reject_put(&pending.events, proto::Reason::Invalid as u8);
             return;
         }
         let initial_old = self.namespaces[&id].tree.node(&request.key).cloned();
         if self.namespaces[&id].inflight.contains(&request.key) {
             self.metrics.retry_inflight += 1;
-            self.reject_put(&events, proto::Reason::Inflight as u8);
+            self.reject_put(&pending.events, proto::Reason::Inflight as u8);
             return;
         }
         let role = initial_old.as_ref().map_or(request.capture_role, |old| {
@@ -1341,7 +1407,7 @@ impl Store {
         };
         if let Some(node) = &initial_old {
             if node.bucket != request.bucket {
-                self.reject_put(&events, proto::Reason::Invalid as u8);
+                self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
             }
             let stored_role = node.location.header.capture_role();
@@ -1357,7 +1423,7 @@ impl Store {
                     .tree
                     .touch_ancestors(&request.key);
                 self.metrics.present += 1;
-                self.reject_put(&events, proto::Reason::Present as u8);
+                self.reject_put(&pending.events, proto::Reason::Present as u8);
                 return;
             }
         }
@@ -1366,13 +1432,13 @@ impl Store {
             .is_some_and(|node| node.pinned() || node.location.disk_busy())
         {
             self.metrics.retry_inflight += 1;
-            self.reject_put(&events, proto::Reason::Inflight as u8);
+            self.reject_put(&pending.events, proto::Reason::Inflight as u8);
             return;
         }
         let initial_bucket = match &initial_old {
             Some(node) => {
                 if node.bucket != request.bucket {
-                    self.reject_put(&events, proto::Reason::Invalid as u8);
+                    self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                     return;
                 }
                 node.bucket
@@ -1401,7 +1467,7 @@ impl Store {
         // refused. That is normal operation, not an error.
         if initial_parent.is_none() && !request.row {
             self.metrics.puts_unlinked += 1;
-            self.reject_put_detail(&events, proto::Reason::Invalid as u8, PUT_UNLINKED);
+            self.reject_put_detail(&pending.events, proto::Reason::Invalid as u8, PUT_UNLINKED);
             return;
         }
         let mut row = request.row && needs_row(initial_parent);
@@ -1411,7 +1477,7 @@ impl Store {
             .chain_pages
             .checked_sub(u32::try_from(initial_first).unwrap_or(u32::MAX))
         else {
-            self.reject_put(&events, proto::Reason::Invalid as u8);
+            self.reject_put(&pending.events, proto::Reason::Invalid as u8);
             return;
         };
         if initial_tail == 0 && !row {
@@ -1434,7 +1500,7 @@ impl Store {
                 action.0 += 1;
                 action.1 += descriptor.row_bytes();
             }
-            self.reject_put(&events, proto::Reason::Present as u8);
+            self.reject_put(&pending.events, proto::Reason::Present as u8);
             return;
         }
         let child_header = match crate::record::new_header(
@@ -1446,7 +1512,7 @@ impl Store {
         ) {
             Ok(header) => header.with_capture_role(wire_role),
             Err(_) => {
-                self.reject_put(&events, proto::Reason::Invalid as u8);
+                self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
             }
         };
@@ -1459,7 +1525,7 @@ impl Store {
         ) {
             Ok(header) => header.with_capture_role(wire_role),
             Err(_) => {
-                self.reject_put(&events, proto::Reason::Invalid as u8);
+                self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
             }
         };
@@ -1472,7 +1538,7 @@ impl Store {
         // what else must stay resident is a capacity question.
         if rootless && child_header.length(row).max(4096).next_power_of_two() > arena_bytes {
             self.metrics.oversize += 1;
-            self.reject_put(&events, proto::Reason::Oversize as u8);
+            self.reject_put(&pending.events, proto::Reason::Oversize as u8);
             return;
         }
         let selected_pins: Vec<Key> = initial_parent
@@ -1493,7 +1559,7 @@ impl Store {
         };
         if !rootless && charge > self.config.nvme {
             self.metrics.oversize += 1;
-            self.reject_put(&events, proto::Reason::Oversize as u8);
+            self.reject_put(&pending.events, proto::Reason::Oversize as u8);
             return;
         }
         // Pick the shape by asking the arena allocator. A failed allocation
@@ -1517,7 +1583,7 @@ impl Store {
                     None if rootless => {
                         if !request.row {
                             self.metrics.retry_budget += 1;
-                            self.reject_put(&events, proto::Reason::Budget as u8);
+                            self.reject_put(&pending.events, proto::Reason::Budget as u8);
                             return;
                         }
                         let root_pins: Vec<Key> =
@@ -1538,7 +1604,7 @@ impl Store {
                             }
                             RootChoice::Wait => {
                                 self.metrics.retry_budget += 1;
-                                self.reject_put(&events, proto::Reason::Budget as u8);
+                                self.reject_put(&pending.events, proto::Reason::Budget as u8);
                                 return;
                             }
                         }
@@ -1548,13 +1614,12 @@ impl Store {
                         .values()
                         .any(|job| matches!(job, Job::Write { .. })) =>
                     {
-                        self.metrics.put_writeback_waits += 1;
-                        self.submit_put(connection, transfer, request, events);
+                        self.wait_for_writeback(pending);
                         return;
                     }
                     None => {
                         self.metrics.retry_budget += 1;
-                        self.reject_put(&events, proto::Reason::Budget as u8);
+                        self.reject_put(&pending.events, proto::Reason::Budget as u8);
                         return;
                     }
                 }
@@ -1570,11 +1635,11 @@ impl Store {
         if requirement.streaming && requirement.allocation > self.staging.capacity() as u64 {
             if selected.streaming {
                 self.metrics.oversize += 1;
-                self.reject_put(&events, proto::Reason::Oversize as u8);
+                self.reject_put(&pending.events, proto::Reason::Oversize as u8);
                 return;
             }
             self.metrics.retry_budget += 1;
-            self.reject_put(&events, proto::Reason::Budget as u8);
+            self.reject_put(&pending.events, proto::Reason::Budget as u8);
             return;
         }
         for key in &pins {
@@ -1582,7 +1647,7 @@ impl Store {
                 for key in &pins {
                     let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                 }
-                self.reject_put(&events, proto::Reason::Invalid as u8);
+                self.reject_put(&pending.events, proto::Reason::Invalid as u8);
                 return;
             }
         }
@@ -1596,11 +1661,10 @@ impl Store {
                 .values()
                 .any(|job| matches!(job, Job::Write { .. }))
             {
-                self.metrics.put_writeback_waits += 1;
-                self.submit_put(connection, transfer, request, events);
+                self.wait_for_writeback(pending);
             } else {
                 self.metrics.retry_budget += 1;
-                self.reject_put(&events, proto::Reason::Budget as u8);
+                self.reject_put(&pending.events, proto::Reason::Budget as u8);
             }
             return;
         }
@@ -1613,7 +1677,7 @@ impl Store {
                         let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                     }
                     self.metrics.retry_budget += 1;
-                    self.reject_put(&events, proto::Reason::Budget as u8);
+                    self.reject_put(&pending.events, proto::Reason::Budget as u8);
                     return;
                 }
             }
@@ -1631,7 +1695,7 @@ impl Store {
                     for key in &pins {
                         let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                     }
-                    self.reject_put(&events, proto::Reason::Io as u8);
+                    self.reject_put(&pending.events, proto::Reason::Io as u8);
                     return;
                 }
             }
@@ -1683,7 +1747,7 @@ impl Store {
             staging_hold,
             hold_unit: requirement.unit as usize,
             hold_slots: [None, None],
-            events,
+            events: pending.events,
             outbox: VecDeque::new(),
         };
         let namespace = self.namespaces.get_mut(&id).unwrap();
@@ -1771,7 +1835,7 @@ impl Store {
                     && (require_durable || !excluded.contains(&node.key))
             }) else {
                 if require_durable {
-                    let idle = self.writers.iter().filter(|w| w.is_idle()).count();
+                    let idle = self.idle_writers().count();
                     for _ in 0..idle {
                         let Some((id, key)) = self.oldest(|id, node| {
                             node.location.memory.is_some()
@@ -1831,16 +1895,26 @@ impl Store {
             return false;
         }
         if node.location.disk.is_some() {
-            let old = node.location.bytes;
-            node.location.memory = None;
-            node.location.bytes = node.location.header.length(node.row);
-            self.charged = self.charged - old + node.location.bytes;
-            self.delta(id, CatalogKind::Changed, key);
+            self.release_arena(id, key);
             return true;
         }
         let removed = self.evict_accounted(id, key);
         self.metrics.evictions += removed;
         removed != 0
+    }
+
+    fn release_arena(&mut self, id: NamespaceId, key: Key) {
+        let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
+        let bytes = node
+            .location
+            .disk_header
+            .as_ref()
+            .expect("record has a file")
+            .length(node.row);
+        node.location.memory = None;
+        self.charged = self.charged - node.location.bytes + bytes;
+        node.location.bytes = bytes;
+        self.delta(id, CatalogKind::Changed, key);
     }
 
     /// The physical requirement for this Put shape. A record whose
@@ -1927,6 +2001,21 @@ impl Store {
                             && node.location.header.capture_role() == CaptureRole::Endpoint
                             && counts.get(&(id, node.key)).is_some_and(|&n| n > 0)))
             });
+            if self.encoder.is_some()
+                && candidate.is_none_or(|(id, key)| self.namespaces[&id].tree[&key].children() == 0)
+                && let Some((id, key)) = self.oldest(|_, node| {
+                    node.location.durable
+                        && node.location.memory.is_some()
+                        && node
+                            .location
+                            .disk_header
+                            .as_ref()
+                            .is_some_and(|h| h.length(node.row) < node.location.bytes)
+                })
+            {
+                self.release_arena(id, key);
+                continue;
+            }
             let Some((id, key)) = candidate else {
                 if let Some((id, key)) = self.oldest(|id, node| {
                     !node.location.durable
@@ -1958,7 +2047,12 @@ impl Store {
                 let task = DiskJob::Truncate {
                     id: JobId(job),
                     path: disk.path.clone(),
-                    length: node.location.header.row_segment,
+                    length: node
+                        .location
+                        .disk_header
+                        .as_ref()
+                        .expect("durable record has a file")
+                        .row_segment,
                 };
                 if namespace.disk.as_ref().unwrap().submit(task).is_err() {
                     compact = false;
@@ -2265,7 +2359,7 @@ impl Store {
                 return true;
             }
             Next::Read { file } => {
-                let length = usize::try_from(plan.length).unwrap_or(usize::MAX);
+                let length = plan.read_length();
                 // Restore windows are transient staging traffic: reads do not
                 // grow the durable set, so they are bounded by the staging
                 // region alone and never by the NVMe budget.
@@ -2305,7 +2399,7 @@ impl Store {
             file,
             span: Span {
                 address: extent.bytes().as_ptr() as usize,
-                offset: plan.record_offset,
+                offset: plan.record_offset - plan.read_prefix() as u64,
                 length: extent.bytes().len(),
             },
         };
@@ -2748,6 +2842,9 @@ impl Store {
             prepared;
         let replace = matches!(target, PublishTarget::Replace);
         if disk.is_some() {
+            if self.encoder.is_some() {
+                self.codec_metrics.raw("streamed", record_bytes);
+            }
             let action = self
                 .metrics
                 .record_actions
@@ -2757,6 +2854,7 @@ impl Store {
             action.1 += record_bytes;
         }
         let location = Location {
+            disk_header: disk.as_ref().map(|_| header.clone()),
             header: header.clone(),
             memory,
             disk,
@@ -2934,7 +3032,7 @@ impl Store {
                 )
         }) || grants.iter().any(|grant| {
             records[grant.record as usize].memory.is_none()
-                && !self.staging_can_ever_hold(usize::try_from(grant.length).unwrap_or(usize::MAX))
+                && !self.staging_can_ever_hold(grant.read_length())
         });
         if unservable {
             self.metrics.gets_error += 1;
@@ -3057,7 +3155,7 @@ impl Store {
                 return Err(invalid("Get skip"));
             }
             total += node.tail_pages as u64;
-            let header = node.location.header.clone();
+            let header = node.location.visible_header().clone();
             let skip = if index == 0 { request.skip_pages } else { 0 };
             let first_page = node.parent.map_or(0, |parent| {
                 parent.consumed_tokens / namespace.descriptor.page_tokens
@@ -3076,13 +3174,7 @@ impl Store {
                     .location
                     .disk
                     .as_ref()
-                    .map(|extent| {
-                        if header.packed.is_some() {
-                            std::fs::File::open(&extent.path).map(Arc::new)
-                        } else {
-                            extent.reader()
-                        }
-                    })
+                    .map(|extent| extent.reader())
                     .transpose()?,
                 header,
                 meta: None,
@@ -3258,7 +3350,12 @@ impl Store {
                     *plan
                 };
                 let extent = Arc::new(extent);
-                let offset = match self.local.offset(Region::Staging, &extent, 0, plan.length) {
+                let offset = match self.local.offset(
+                    Region::Staging,
+                    &extent,
+                    plan.read_prefix(),
+                    plan.length,
+                ) {
                     Ok(offset) => offset,
                     Err(error) => {
                         self.fail_get(connection, transfer, proto::Reason::Invalid as u8, error);
@@ -3536,6 +3633,48 @@ impl Store {
 
     fn disk_events(&mut self) {
         let mut completions = Vec::new();
+        while let Some(ready) = self.encoder.as_mut().and_then(Encoder::poll) {
+            self.codec_metrics.observe(ready.elapsed);
+            let Some(Job::Write {
+                namespace,
+                key,
+                write,
+                ..
+            }) = self.jobs.get_mut(&ready.id)
+            else {
+                continue;
+            };
+            if self.namespaces[namespace].tree[key].location.job != Some(ready.id) {
+                self.jobs.remove(&ready.id);
+                continue;
+            }
+            match ready.result {
+                Ok(record) => write.encoded = Some(record),
+                Err(cause) => {
+                    self.codec_metrics.raw(cause, write.raw_length);
+                    match cause {
+                        "raw_checksum" => eprintln!(
+                            "selene: checkpoint {key:?} failed its raw checksum before compression"
+                        ),
+                        "verify_failed" => eprintln!(
+                            "selene: CPU codec failed verification for checkpoint {key:?}"
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            if let Err(error) = write.submit(JobId(ready.id), &self.writers) {
+                completions.push(flare_selene::disk::Reply {
+                    id: JobId(ready.id),
+                    operation: flare_selene::disk::Operation::WriteRecord,
+                    window: 0,
+                    result: Err(error),
+                    bytes: 0,
+                    elapsed: Duration::ZERO,
+                    header: None,
+                });
+            }
+        }
         for worker in &self.writers {
             worker.poll(&mut completions);
         }
@@ -3551,6 +3690,19 @@ impl Store {
             let failed = completion.result.is_err();
             if failed {
                 self.metrics.nvme_errors += 1;
+            }
+            if failed
+                && let Some(Job::Write {
+                    namespace,
+                    key,
+                    write,
+                    ..
+                }) = self.jobs.get_mut(&completion.id.0)
+                && write.encoded.take().is_some()
+                && self.namespaces[namespace].tree[key].location.job == Some(completion.id.0)
+                && write.submit(completion.id, &self.writers).is_ok()
+            {
+                continue;
             }
             let Some(job) = self.jobs.remove(&completion.id.0) else {
                 continue;
@@ -3577,6 +3729,7 @@ impl Store {
                     namespace,
                     key,
                     reason,
+                    write,
                     ..
                 } => {
                     let path = self.namespaces[&namespace].path(key);
@@ -3606,6 +3759,15 @@ impl Store {
                         action.0 += 1;
                         action.1 += completion.bytes;
                         if let Some(path) = path {
+                            let header = if let Some(record) = write.encoded {
+                                self.codec_metrics.original +=
+                                    node.location.header.length(node.row);
+                                self.codec_metrics.stored += record.bytes().len() as u64;
+                                record.header
+                            } else {
+                                node.location.header.clone()
+                            };
+                            node.location.disk_header = Some(header);
                             node.location.disk = Some(Arc::new(DiskExtent::new(path)));
                         }
                         node.location.retry = Instant::now();
@@ -3680,11 +3842,7 @@ impl Store {
                     node.location.job = None;
                     node.location.writing = false;
                     if !failed {
-                        let bytes = node.location.bytes - node.location.header.row_segment;
-                        node.location.bytes -= bytes;
-                        self.charged -= bytes;
-                        node.location.memory = None;
-                        self.delta(namespace, CatalogKind::Changed, key);
+                        self.release_arena(namespace, key);
                     } else {
                         node.row = true;
                         self.delta(namespace, CatalogKind::Changed, key);
@@ -3883,6 +4041,17 @@ impl Store {
         Some(key)
     }
 
+    fn idle_writers(&self) -> impl Iterator<Item = usize> + '_ {
+        self.writers.iter().enumerate().filter_map(|(i, worker)| {
+            (worker.is_idle()
+                && !self
+                    .jobs
+                    .values()
+                    .any(|job| matches!(job, Job::Write { write, .. } if write.writer == i)))
+            .then_some(i)
+        })
+    }
+
     fn write_ancestor(&mut self, id: NamespaceId, target: Key, reason: &'static str) {
         let namespace = &self.namespaces[&id];
         let Some(node) = namespace.tree.node(&target) else {
@@ -3901,7 +4070,7 @@ impl Store {
             return;
         };
         let node = &namespace.tree[&key];
-        let Some(worker) = self.writers.iter().find(|worker| worker.is_idle()) else {
+        let Some(writer) = self.idle_writers().next() else {
             return;
         };
         let Some(memory) = node.location.memory.clone() else {
@@ -3911,32 +4080,55 @@ impl Store {
         let Some(temporary) = namespace.temporary(job) else {
             return;
         };
-        let length = node.location.header.length(node.row);
-        let task = DiskJob::write_record(
-            JobId(job),
-            temporary.path.clone(),
-            0,
-            &memory.bytes()[..length as usize],
-            Some((namespace.path(key).unwrap(), length)),
-        );
-        if worker.submit(task).is_ok() {
-            self.job_counter = job;
-            self.jobs.insert(
-                job,
-                Job::Write {
-                    namespace: id,
-                    key,
-                    reason: if key == target { reason } else { "dependency" },
-                    _memory: memory,
-                    _temporary: temporary,
-                },
-            );
-            let tree = &mut self.namespaces.get_mut(&id).unwrap().tree;
-            tree.pin(&key).expect("writeback holds a resident record");
-            let location = &mut tree[&key].location;
-            location.writing = true;
-            location.job = Some(job);
+        let header = &node.location.header;
+        let length = header.length(node.row);
+        let mut encoding = false;
+        if let Some(encoder) = &mut self.encoder
+            && header.packed.is_none()
+        {
+            if self.shutdown_raw.load(Relaxed) {
+                self.codec_metrics.raw("shutdown", length);
+            } else if let Some((profile, plans)) = self.profiles.for_chain(namespace, id, key) {
+                encoder.start(
+                    job,
+                    memory.clone(),
+                    header.clone(),
+                    node.row,
+                    profile,
+                    plans,
+                    self.shutdown_raw.clone(),
+                );
+                encoding = true;
+            } else {
+                self.codec_metrics.raw("no_plan", length);
+            }
         }
+        let write = Writeback {
+            writer,
+            memory,
+            temporary,
+            path: namespace.path(key).unwrap(),
+            raw_length: length,
+            encoded: None,
+        };
+        if !encoding && write.submit(JobId(job), &self.writers).is_err() {
+            return;
+        }
+        self.job_counter = job;
+        self.jobs.insert(
+            job,
+            Job::Write {
+                namespace: id,
+                key,
+                reason: if key == target { reason } else { "dependency" },
+                write,
+            },
+        );
+        let tree = &mut self.namespaces.get_mut(&id).unwrap().tree;
+        tree.pin(&key).expect("writeback holds a resident record");
+        let location = &mut tree[&key].location;
+        location.writing = true;
+        location.job = Some(job);
     }
 
     fn schedule(&mut self) {
@@ -4096,6 +4288,10 @@ impl Store {
         let mut targets = self.shutdown_targets();
         let mut complete = false;
         while Instant::now() < deadline {
+            self.shutdown_raw.store(
+                deadline.saturating_duration_since(Instant::now()) <= 2 * WAIT,
+                Relaxed,
+            );
             self.pump();
             if targets.iter().all(VecDeque::is_empty) && self.jobs.is_empty() {
                 targets = self.shutdown_targets();
@@ -4111,7 +4307,7 @@ impl Store {
             }
             for queue in &mut targets {
                 for _ in 0..queue.len() {
-                    if !self.writers.iter().any(DiskThread::is_idle) {
+                    if self.idle_writers().next().is_none() {
                         break;
                     }
                     let (id, key) = queue.pop_front().unwrap();
@@ -4233,6 +4429,7 @@ impl Store {
 
     pub fn metrics_text(&self) -> String {
         let mut text = String::new();
+        self.codec_metrics.render(&mut text);
         if self.config.root.is_some() {
             let mut arena_only = 0u64;
             let mut oldest = Duration::ZERO;
@@ -4393,7 +4590,15 @@ impl Store {
                     };
                     if retained {
                         count += 1;
-                        bytes += node.location.header.length(node.row);
+                        let header = if tier == "disk" {
+                            node.location
+                                .disk_header
+                                .as_ref()
+                                .expect("durable record has a file")
+                        } else {
+                            &node.location.header
+                        };
+                        bytes += header.length(node.row);
                     }
                 }
                 text.push_str(&format!("selene_records{{namespace=\"{name}\",tier=\"{tier}\"}} {count}\nselene_bytes{{namespace=\"{name}\",tier=\"{tier}\"}} {bytes}\n"));
@@ -4474,6 +4679,15 @@ pub enum GetAnswer {
 }
 
 pub enum StoreCommand {
+    OfferLayout {
+        session: u64,
+        namespace: NamespaceId,
+        layout: proto::v2::CodecLayout,
+        caps: Option<proto::v2::CodecCaps>,
+    },
+    WithdrawLayout {
+        session: u64,
+    },
     Metrics {
         reply: std::sync::mpsc::Sender<String>,
     },
@@ -4624,6 +4838,31 @@ fn record_grants(
 impl Store {
     pub fn handle(&mut self, command: StoreCommand) {
         match command {
+            StoreCommand::OfferLayout {
+                session,
+                namespace,
+                layout,
+                caps,
+            } => {
+                if self.encoder.is_none() {
+                    return;
+                }
+                let offered = match self.namespaces.get(&namespace) {
+                    Some(ns) => self
+                        .profiles
+                        .offer(session, &ns.descriptor, layout, caps.as_ref()),
+                    None => Err("unknown namespace".into()),
+                };
+                if let Err(reason) = offered {
+                    eprintln!("selene: codec layout of session {session} rejected: {reason}");
+                    self.codec_metrics.rejected += 1;
+                }
+            }
+            StoreCommand::WithdrawLayout { session } => {
+                if let Some(id) = self.profiles.withdraw(session) {
+                    self.profiles.release_if_empty(id, &self.namespaces[&id]);
+                }
+            }
             StoreCommand::Hello {
                 connection,
                 pid,
@@ -4842,6 +5081,8 @@ fn validate_commit(put: &mut Put, descriptor: &Descriptor) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    mod at_rest;
+
     #[test]
     fn a_delivered_put_waits_while_the_disk_makes_progress() {
         use super::{NO_PROGRESS, stalled};
@@ -5231,6 +5472,7 @@ mod tests {
                 true,
                 true,
                 Location {
+                    disk_header: None,
                     header,
                     memory: Some(Arc::new(extent)),
                     disk: None,
@@ -5429,6 +5671,7 @@ mod tests {
         io::Write::write_all(&mut file, &header.encode().unwrap()).unwrap();
         file.set_len(header.length_with_row()).unwrap();
         node.location.memory = None;
+        node.location.disk_header = Some(node.location.header.clone());
         node.location.disk = Some(Arc::new(DiskExtent::new(path)));
         node.location.durable = true;
     }
@@ -6090,6 +6333,7 @@ mod tests {
                 true,
                 true,
                 Location {
+                    disk_header: None,
                     header,
                     memory: None,
                     disk: None,
@@ -6117,6 +6361,7 @@ mod tests {
         let insert = |store: &mut Store, key: Key, parent: Option<Key>, on_disk: bool| {
             let header = crate::record::new_header(&value, key, parent, [0; 16], 1).unwrap();
             let location = Location {
+                disk_header: on_disk.then(|| header.clone()),
                 header,
                 memory: None,
                 disk: if on_disk { extent() } else { None },
@@ -6882,6 +7127,7 @@ mod tests {
                 true,
                 true,
                 Location {
+                    disk_header: None,
                     header: header.clone(),
                     memory: Some(extent),
                     disk: None,
@@ -6930,6 +7176,7 @@ mod tests {
             let bytes = header.length_with_row();
             store.charged += bytes;
             let location = Location {
+                disk_header: Some(header.clone()),
                 header,
                 memory: None,
                 disk: Some(Arc::new(DiskExtent::new(base.join(format!("old-{}", key.digest[0]))))),
@@ -7174,6 +7421,7 @@ mod tests {
                 true,
                 true,
                 Location {
+                    disk_header: None,
                     header,
                     memory: Some(extent),
                     disk: None,
@@ -7393,6 +7641,7 @@ mod tests {
                     true,
                     true,
                     Location {
+                        disk_header: None,
                         header: header.clone(),
                         memory: Some(extent),
                         disk: None,
@@ -8047,6 +8296,7 @@ mod tests {
             .tree
             .node_mut(&key)
             .unwrap();
+        node.location.disk_header = Some(node.location.header.clone());
         node.location.disk = Some(Arc::new(DiskExtent::new(base.join("warm.ckpt"))));
         node.location.durable = true;
         let used = store.memory.used();
@@ -8083,6 +8333,7 @@ mod tests {
                 .unwrap()
                 .set_len(loc.header.length(true))
                 .unwrap();
+            loc.disk_header = Some(loc.header.clone());
             loc.disk = Some(Arc::new(DiskExtent::new(path)));
             loc.durable = pages != 5;
         }
@@ -8197,6 +8448,7 @@ mod tests {
             }
             let location = &mut namespace.tree[&key(record)].location;
             location.header = header;
+            location.disk_header = Some(location.header.clone());
             location.disk = Some(Arc::new(DiskExtent::new(path)));
             location.durable = true;
         }

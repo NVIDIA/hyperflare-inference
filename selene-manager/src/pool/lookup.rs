@@ -123,7 +123,7 @@ impl Core {
     }
 
     fn answer_lookup(
-        &self,
+        &mut self,
         sid: u64,
         request: v2::LookupRequest,
     ) -> (v2::LookupStatus, Vec<v2::Candidate>) {
@@ -221,6 +221,10 @@ impl Core {
                         &n.required_profiles,
                     )
                 }) {
+                    *self
+                        .counters
+                        .entry(("codec_incompatible_total", "action=\"lookup\"".into()))
+                        .or_default() += 1;
                     continue;
                 }
                 if source == SourceId::Manager

@@ -404,6 +404,7 @@ dependencies = [
  "ibverbs-sys",
  "libc",
  "prost",
+ "rayon",
  "rcgen",
  "rustls",
  "socket2",
