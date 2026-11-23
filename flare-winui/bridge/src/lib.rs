@@ -31,6 +31,43 @@ fn text(value: &str) -> FlareString {
 mod tests {
     use super::*;
     #[test]
+    fn publisher_key_snapshot_preserves_the_decision_identity_and_profile_source() {
+        let mut snapshot = FlareSnapshot {
+            view: Snapshot::default(),
+        };
+        assert_eq!(
+            unsafe { flare_snapshot_publisher_key(&snapshot, ptr::null_mut()) },
+            0
+        );
+        snapshot.view.publisher_key = Some(flare::controller::PublisherKeyView {
+            operation_id: 12,
+            review: flare::controller::TrustView {
+                decision_id: 19,
+                publisher: "local-development".into(),
+                fingerprint: "ab".repeat(32),
+                identity_status: "Development signing key; publisher identity is unverified".into(),
+                ..Default::default()
+            },
+            publisher_name: "Publisher 模型".into(),
+            profile_url: "https://huggingface.co/publisher/core/resolve/commit/publisher.json"
+                .into(),
+        });
+        let mut output = std::mem::MaybeUninit::<FlarePublisherKey>::uninit();
+        assert_eq!(
+            unsafe { flare_snapshot_publisher_key(&snapshot, output.as_mut_ptr()) },
+            1
+        );
+        let output = unsafe { output.assume_init() };
+        let string = |value: FlareString| unsafe {
+            std::str::from_utf8(slice::from_raw_parts(value.data.cast(), value.length)).unwrap()
+        };
+        assert_eq!(output.review.decision_id, 19);
+        assert_eq!(string(output.review.publisher), "local-development");
+        assert_eq!(string(output.review.fingerprint), "ab".repeat(32));
+        assert_eq!(string(output.publisher_name), "Publisher 模型");
+        assert!(string(output.profile_url).ends_with("/resolve/commit/publisher.json"));
+    }
+    #[test]
     fn published_build_mismatch_preserves_unknown_and_matching_targets() {
         let mut view = Snapshot::default();
         for target in [None, Some(true), Some(false)] {
@@ -345,6 +382,33 @@ pub unsafe extern "C" fn flare_app_accept_trust(
             })
     })
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flare_app_import_publisher_key(
+    value: *mut FlareApp,
+    id: u64,
+    fingerprint: *const c_char,
+    fingerprint_length: usize,
+    namespace: *const c_char,
+    namespace_length: usize,
+) -> u64 {
+    boundary(0, || {
+        unsafe { app(value) }?
+            .controller
+            .submit(Command::ImportPublisherKey {
+                decision: id,
+                fingerprint: unsafe { utf8(fingerprint, fingerprint_length) }?,
+                namespace: unsafe { utf8(namespace, namespace_length) }?,
+            })
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flare_app_reject_publisher_key(value: *mut FlareApp, id: u64) -> u64 {
+    boundary(0, || {
+        unsafe { app(value) }?
+            .controller
+            .submit(Command::RejectPublisherKey(id))
+    })
+}
 thread_local! {static ERROR:RefCell<String>=const{RefCell::new(String::new())};}
 fn failed(error: impl ToString) {
     ERROR.with(|slot| *slot.borrow_mut() = error.to_string());
@@ -571,6 +635,22 @@ pub struct FlareTrust {
     license: FlareString,
     identity_status: FlareString,
 }
+fn trust_view(value: &flare::controller::TrustView) -> FlareTrust {
+    FlareTrust {
+        decision_id: value.decision_id,
+        publisher: text(&value.publisher),
+        fingerprint: text(&value.fingerprint),
+        official_source: text(&value.official_source),
+        license: text(&value.license),
+        identity_status: text(&value.identity_status),
+    }
+}
+#[repr(C)]
+pub struct FlarePublisherKey {
+    review: FlareTrust,
+    publisher_name: FlareString,
+    profile_url: FlareString,
+}
 unsafe fn output<T>(destination: *mut T, value: T) -> Result<u32, String> {
     if destination.is_null() {
         return Err("Missing output structure".into());
@@ -685,13 +765,27 @@ pub unsafe extern "C" fn flare_snapshot_trust(
         unsafe {
             output(
                 out,
-                FlareTrust {
-                    decision_id: s.decision_id,
-                    publisher: text(&s.publisher),
-                    fingerprint: text(&s.fingerprint),
-                    official_source: text(&s.official_source),
-                    license: text(&s.license),
-                    identity_status: text(&s.identity_status),
+                trust_view(s),
+            )
+        }
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flare_snapshot_publisher_key(
+    value: *const FlareSnapshot,
+    out: *mut FlarePublisherKey,
+) -> u32 {
+    boundary(0, || {
+        let Some(key) = unsafe { snapshot(value) }?.publisher_key.as_ref() else {
+            return Ok(0);
+        };
+        unsafe {
+            output(
+                out,
+                FlarePublisherKey {
+                    review: trust_view(&key.review),
+                    publisher_name: text(&key.publisher_name),
+                    profile_url: text(&key.profile_url),
                 },
             )
         }

@@ -402,6 +402,7 @@ pub struct Disclosure {
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOptions {
     pub publisher_keys: Vec<PathBuf>,
+    pub profiles: Vec<Publisher>,
     pub hub: crate::options::HubOptions,
     pub trust_store: Option<PathBuf>,
     pub rank: Option<usize>,
@@ -415,10 +416,47 @@ pub struct Acceptance {
 }
 
 /// Authenticate signed metadata and disclose identity without accepting terms or reading stdin.
-pub fn review(root: &Path, options: &ReviewOptions) -> Result<Review> {
-    let resolved = resolve_identity(
+pub(crate) fn review_key_profile(root: &Path, options: &ReviewOptions) -> Result<Disclosure> {
+    use flare_helios::core::{container, protection, reader};
+    if reader::declared_format(root)?.as_deref() != Some(container::PAYLOAD_FORMAT) {
+        return Ok(review(root, options)?.disclosure);
+    }
+    let resolved = resolve_identity_with(
         root,
         &options.publisher_keys,
+        &options.profiles,
+        &options.hub,
+        options.trust_store.as_deref(),
+    )?;
+    let metadata = reader::Metadata::open(root)?;
+    let verified = protection::verify(
+        &metadata.envelope,
+        &resolved.profiles,
+        protection::Selection::Catalog,
+    )?;
+    let publisher = verified
+        .core()
+        .publisher
+        .as_ref()
+        .ok_or("core has no publisher metadata")?;
+    Ok(Disclosure {
+        fingerprint: verified.publisher().fingerprint(),
+        namespace: publisher.namespace.clone(),
+        publisher: verified.publisher().name.clone(),
+        official_source: publisher.official_source.clone(),
+        license_name: (!publisher.license_name.is_empty()).then(|| publisher.license_name.clone()),
+        license_url: (!publisher.license_link.is_empty()).then(|| publisher.license_link.clone()),
+        identity: resolved.identity,
+        remembered: resolved.remembered.is_some(),
+    })
+}
+
+/// Authenticate the selected core, retaining its resource owners until consent.
+pub fn review(root: &Path, options: &ReviewOptions) -> Result<Review> {
+    let resolved = resolve_identity_with(
+        root,
+        &options.publisher_keys,
+        &options.profiles,
         &options.hub,
         options.trust_store.as_deref(),
     )?;

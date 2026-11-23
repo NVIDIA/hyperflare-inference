@@ -11,9 +11,11 @@
     host memory admission. Its nine-worker assertion requires 296 GiB available
     under the 32 GiB worker allowance and 8 GiB headroom; smaller hosts admit fewer.
 
-[ ] Ensure Rust bridge updates relink the WinUI executable during incremental
-    builds. MSBuild can retain flare-winui.exe after the bridge library changes;
-    verify loose and single-file outputs without requiring /t:Rebuild.
+[ ] Add metadata-only publisher-key review for legacy cores whose verification
+    opens companion files before acquisition has fetched them. The desktop key
+    import dialog verifies payload-core catalogs before downloading companions;
+    legacy review still requires the files that VerifiedCore::open reads.
+    Verify a legacy acquisition with an unknown key and missing companions.
 
 [ ] Report rebuild_weights for payload cores in flare inspect --json.
     Payload inspection reports the selected deployment's rebuild manifest but

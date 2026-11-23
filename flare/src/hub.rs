@@ -14,7 +14,10 @@ use std::{
 
 use hf_hub::{
     Cache, Repo, RepoType,
-    api::sync::{Api, ApiBuilder},
+    api::{
+        RepoInfo,
+        sync::{Api, ApiBuilder, ApiError},
+    },
 };
 use sha2::Digest as _;
 use flare_helios::core::progress::AcquisitionPhase;
@@ -22,6 +25,74 @@ use flare_helios::core::progress::AcquisitionPhase;
 use crate::options::HubOptions;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Acquisition cannot verify the core until a matching public profile is supplied.
+#[derive(Debug)]
+pub struct PublisherKeyRequired {
+    primary: PathBuf,
+    profile_url: String,
+}
+
+impl std::fmt::Display for PublisherKeyRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "core signer is not a configured publisher; supply its public profile with --publisher-keys"
+        )
+    }
+}
+
+impl std::error::Error for PublisherKeyRequired {}
+
+#[derive(Clone, Debug)]
+pub struct PublisherKeyReview {
+    pub profile: flare_helios::runtime_core::Publisher,
+    pub disclosure: crate::trust::Disclosure,
+    pub profile_url: String,
+}
+
+impl PublisherKeyRequired {
+    /// Fetch a candidate from the pinned acquisition commit and verify signed metadata.
+    /// The repository supplying this profile does not establish publisher identity.
+    pub fn review(&self, options: &crate::trust::ReviewOptions) -> Result<PublisherKeyReview> {
+        if options.hub.offline {
+            return Err(
+                "publisher profiles cannot be fetched offline; supply --publisher-keys".into(),
+            );
+        }
+        let bytes = match crate::identity::fetch(&self.profile_url, token(&options.hub)?.as_deref()) {
+            crate::identity::Fetched::Body(bytes) => bytes,
+            crate::identity::Fetched::Status(status) => return Err(format!("cannot retrieve the publisher profile at {}: HTTP {status}; supply --publisher-keys", self.profile_url).into()),
+            crate::identity::Fetched::Failed(reason) => return Err(format!("cannot retrieve the publisher profile at {}: {reason}", self.profile_url).into()),
+        };
+        let profiles: Vec<flare_helios::runtime_core::Publisher> =
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid publisher profile: {error}"))?;
+        for profile in &profiles {
+            profile.validate()?;
+        }
+        let claim = flare_helios::runtime_core::CoreClaim::read(&self.primary)?;
+        let mut matches = profiles.into_iter().filter(|profile| {
+            profile.fingerprint() == claim.signer
+                && profile.namespace == claim.namespace
+                && profile.development == claim.development
+        });
+        let profile = matches.next().ok_or(
+            "repository publisher profile does not match the core's signing key and namespace",
+        )?;
+        if matches.any(|other| other != profile) {
+            return Err("conflicting publisher profiles for the core's signing key".into());
+        }
+        let mut options = options.clone();
+        options.profiles.push(profile.clone());
+        let disclosure = crate::trust::review_key_profile(&self.primary, &options)?;
+        Ok(PublisherKeyReview {
+            profile,
+            disclosure,
+            profile_url: self.profile_url.clone(),
+        })
+    }
+}
 
 fn check_cancel(
     progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
@@ -319,6 +390,15 @@ fn download_for_model_at(
         )
         .map_err(|error| transport_hint(transport.root(), error))?;
         let publishers = resolved.profiles;
+        if !publishers.iter().any(|publisher| {
+            publisher.fingerprint() == resolved.claim.signer
+                && publisher.namespace == resolved.claim.namespace
+        }) {
+            return Err(Box::new(PublisherKeyRequired {
+                primary,
+                profile_url: api.repo(pinned.clone()).url("publisher.json"),
+            }));
+        }
         let legacy = flare_helios::core::conversion::form(&primary)
             .map_err(|error| error.to_string())?
             .is_none();
@@ -1609,18 +1689,9 @@ fn refresh_model_at(
         .build()?;
     let revision = requested.revision.as_deref().unwrap();
     log::info!("Checking model origin: {}@{revision}", origin.repository);
-    let info = with_transient_retry(|| {
-        api.repo(Repo::with_revision(
-            origin.repository.clone(),
-            RepoType::Model,
-            revision.into(),
-        ))
-        .info()
-    })
-    .map_err(|error| format!("cannot check {}@{revision} for updates: {error}; the local version is unchanged (use --offline to skip the check)", origin.repository))?;
-    if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Hugging Face returned an invalid commit ID".into());
-    }
+    let repo = Repo::with_revision(origin.repository.clone(), RepoType::Model, revision.into());
+    let info = resolve_revision(&api, &repo, None)
+        .map_err(|error| format!("cannot check {}@{revision} for updates: {error}; the local version is unchanged (use --offline to skip the check)", origin.repository))?;
     if info.sha == origin.commit
         && revision == origin.revision
         && requested.filename == origin.filename
@@ -2431,6 +2502,33 @@ fn fetch_primary(
     fetch_primary_with_progress(api, transport, repo, requested, None, None)
 }
 
+fn resolve_revision(
+    api: &Api,
+    repo: &Repo,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<RepoInfo> {
+    check_cancel(progress)?;
+    let revision = repo.revision();
+    let info = match with_transient_retry(|| api.repo(repo.clone()).info()) {
+        Err(ApiError::RequestError(error))
+            if matches!(error.as_ref(), ureq::Error::StatusCode(404))
+                && revision.starts_with("gb")
+                && flare_helios::core::naming::PLATFORMS.contains(&revision) =>
+        {
+            check_cancel(progress)?;
+            let alias = format!("{revision}-tp1");
+            log::info!("Hugging Face revision {revision} returned 404, trying {alias}");
+            let repo = Repo::with_revision(repo.url(), RepoType::Model, alias);
+            with_transient_retry(|| api.repo(repo.clone()).info())?
+        }
+        result => result?,
+    };
+    if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Hugging Face returned an invalid commit ID".into());
+    }
+    Ok(info)
+}
+
 fn fetch_primary_with_progress(
     api: &Api,
     transport: &Transport,
@@ -2439,11 +2537,7 @@ fn fetch_primary_with_progress(
     token: Option<&str>,
     progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<(PathBuf, Repo)> {
-    check_cancel(progress)?;
-    let info = with_transient_retry(|| api.repo(repo.clone()).info())?;
-    if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Hugging Face returned an invalid commit ID".into());
-    }
+    let info = resolve_revision(api, repo, progress)?;
     let filename = choose_file(
         info.siblings.into_iter().map(|file| file.rfilename),
         requested,
@@ -3514,8 +3608,7 @@ fn with_identity_retry(
 /// Errors from Hub resolution or file identity that may succeed when retried.
 /// Authentication, missing repositories, missing files, and malformed responses
 /// are permanent and are never retried, so the signed binding is unchanged.
-fn transient_hub_error(error: &hf_hub::api::sync::ApiError) -> bool {
-    use hf_hub::api::sync::ApiError;
+fn transient_hub_error(error: &ApiError) -> bool {
     let ApiError::RequestError(request) = error else {
         return false;
     };
@@ -3532,8 +3625,8 @@ fn transient_hub_error(error: &hf_hub::api::sync::ApiError) -> bool {
 /// Run one Hub metadata operation with bounded backoff. The operation is
 /// idempotent: resolution and file identity are read-only requests.
 fn with_transient_retry<T>(
-    mut operation: impl FnMut() -> std::result::Result<T, hf_hub::api::sync::ApiError>,
-) -> Result<T> {
+    mut operation: impl FnMut() -> std::result::Result<T, ApiError>,
+) -> std::result::Result<T, ApiError> {
     let mut attempt = 0usize;
     loop {
         match operation() {
@@ -3541,7 +3634,7 @@ fn with_transient_retry<T>(
             Err(error) => {
                 attempt += 1;
                 if attempt >= TRANSFER_STALLED_ATTEMPTS || !transient_hub_error(&error) {
-                    return Err(error.into());
+                    return Err(error);
                 }
                 log::info!("Retrying after a transient Hugging Face error: {error}");
                 std::thread::sleep(retry_delay(attempt, None));
@@ -4263,9 +4356,13 @@ pub(crate) mod tests {
         let version = entry.id().to_owned();
         let response =
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
-        let (endpoint, worker) = mock_hub(
-            HubRoutes::default().document("/api/models/publisher/prepared/revision/gb10", response),
-        );
+        let routes = HubRoutes::default()
+            .document(
+                "/api/models/publisher/prepared/revision/gb10",
+                response.clone(),
+            )
+            .document("/api/models/publisher/prepared/revision/gb10-tp1", response);
+        let (endpoint, worker) = mock_hub(routes);
         let error = refresh_model_at(
             &endpoint,
             &store,
@@ -4809,6 +4906,144 @@ pub(crate) mod tests {
         walk(root, root, &mut files);
         files.sort();
         files
+    }
+
+    fn publisher_response(bytes: &[u8]) -> Vec<u8> {
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
+        response.extend_from_slice(bytes);
+        response
+    }
+
+    #[test]
+    fn publisher_key_review_verifies_before_import_and_does_not_accept_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, publisher, _) = signed_payload_fixture(temp.path());
+        let empty_profiles = temp.path().join("empty-profiles.json");
+        std::fs::write(&empty_profiles, b"[]").unwrap();
+        let trust = temp.path().join("trust.toml");
+        let repository = "publisher/prepared";
+        let profile_path = format!("/{repository}/resolve/{COMMIT}/publisher.json");
+        let routes = core_routes(&core, repository, "gb10-tp1").document(
+            &profile_path,
+            publisher_response(&serde_json::to_vec(&[&publisher]).unwrap()),
+        );
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let options = HubOptions {
+            revision: Some("gb10-tp1".into()),
+            core_cache: Some(temp.path().join("models")),
+            ..Default::default()
+        };
+        let keys = std::slice::from_ref(&empty_profiles);
+        let failure = download_with_token_at(
+            &endpoint,
+            repository,
+            &options,
+            1,
+            None,
+            keys,
+            Some(&trust),
+            &[],
+            None,
+        )
+        .err()
+        .expect("a key must be supplied before acquisition");
+        let required = failure.downcast_ref::<PublisherKeyRequired>().unwrap();
+        assert_eq!(log.lock().unwrap().files.len(), 1);
+        let review = required
+            .review(&crate::trust::ReviewOptions {
+                publisher_keys: vec![empty_profiles.clone()],
+                hub: options.clone(),
+                trust_store: Some(trust.clone()),
+                tensor_parallel: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(review.profile, publisher);
+        assert_eq!(review.disclosure.fingerprint, publisher.fingerprint());
+        assert_eq!(review.profile_url, format!("{endpoint}{profile_path}"));
+        assert!(matches!(
+            review.disclosure.identity,
+            crate::trust::Identity::Development
+        ));
+        assert!(!review.disclosure.remembered);
+        assert!(!trust.exists());
+        assert_eq!(log.lock().unwrap().files.len(), 1);
+        let entry = download_with_token_at(
+            &endpoint,
+            repository,
+            &options,
+            1,
+            None,
+            keys,
+            Some(&trust),
+            &[review.profile],
+            None,
+        )
+        .unwrap();
+        assert!(entry.directory().exists());
+        assert!(!trust.exists());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn publisher_key_review_rejects_mismatched_malformed_and_oversized_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, mut publisher, _) = signed_payload_fixture(temp.path());
+        publisher.public_key = [1; 32];
+        let invalid_profiles = [
+            (serde_json::to_vec(&[publisher]).unwrap(), "does not match"),
+            (b"not JSON".to_vec(), "invalid publisher profile"),
+            (vec![b' '; 65537], "cannot retrieve"),
+        ];
+        for (bytes, expected) in invalid_profiles {
+            let (endpoint, worker) = mock_hub(
+                HubRoutes::default().document("/publisher.json", publisher_response(&bytes)),
+            );
+            let required = PublisherKeyRequired {
+                primary: core.join("model.safetensors"),
+                profile_url: format!("{endpoint}/publisher.json"),
+            };
+            let error = required
+                .review(&crate::trust::ReviewOptions::default())
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn publisher_key_review_rejects_a_matching_key_with_an_invalid_signature() {
+        use prost::Message;
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, publisher, _) = signed_payload_fixture(temp.path());
+        let primary = core.join("model.safetensors");
+        let mut bytes = std::fs::read(&primary).unwrap();
+        let header_length = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&bytes[8..8 + header_length]).unwrap();
+        let offsets = &header["flare.manifest"]["data_offsets"];
+        let start = 8 + header_length + offsets[0].as_u64().unwrap() as usize;
+        let end = 8 + header_length + offsets[1].as_u64().unwrap() as usize;
+        let mut envelope =
+            flare_helios::core::schema::wire::ProtectedCore::decode(&bytes[start..end]).unwrap();
+        envelope.core_signature[0] ^= 1;
+        let encoded = envelope.encode_to_vec();
+        assert_eq!(encoded.len(), end - start);
+        bytes[start..end].copy_from_slice(&encoded);
+        std::fs::write(&primary, bytes).unwrap();
+        let (endpoint, worker) = mock_hub(HubRoutes::default().document(
+            "/publisher.json",
+            publisher_response(&serde_json::to_vec(&[publisher]).unwrap()),
+        ));
+        let required = PublisherKeyRequired {
+            primary,
+            profile_url: format!("{endpoint}/publisher.json"),
+        };
+        let error = required
+            .review(&crate::trust::ReviewOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("signature"), "{error}");
+        worker.join().unwrap();
     }
 
     fn core_routes(root: &Path, repository: &str, revision: &str) -> HubRoutes {
@@ -6263,24 +6498,25 @@ pub(crate) mod tests {
 
     #[test]
     fn permanent_resolution_failures_are_not_retried() {
-        let routes = HubRoutes::default().scripted_document(
-            "/api/models/owner/model/revision/gb10",
-            vec![
-                b"HTTP/1.1 404 Missing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-            ],
-        );
-        let (endpoint, worker, log) = mock_hub_counted(routes);
-        let (_temp, transport) = transport_fixture();
-        let repo = Repo::with_revision("owner/model".into(), RepoType::Model, "gb10".into());
-        let error = fetch_primary(&transport_api(endpoint), &transport, &repo, None)
-            .unwrap_err()
-            .to_string();
-        worker.join().unwrap();
-        assert!(error.contains("404"), "{error}");
-        assert_eq!(
-            log.lock().unwrap().documents["/api/models/owner/model/revision/gb10"],
-            1
-        );
+        for (revision, status) in [("gb10", 401), ("gb10-tp1", 404), ("custom", 404)] {
+            let route = format!("/api/models/owner/model/revision/{revision}");
+            let routes = HubRoutes::default().document(
+                &route,
+                format!(
+                    "HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes(),
+            );
+            let (endpoint, worker, log) = mock_hub_counted(routes);
+            let (_temp, transport) = transport_fixture();
+            let repo = Repo::with_revision("owner/model".into(), RepoType::Model, revision.into());
+            let error = fetch_primary(&transport_api(endpoint), &transport, &repo, None)
+                .unwrap_err()
+                .to_string();
+            worker.join().unwrap();
+            assert!(error.contains(&status.to_string()), "{error}");
+            assert_eq!(log.lock().unwrap().documents[&route], 1);
+        }
     }
 
     #[test]
@@ -10261,6 +10497,10 @@ pub(crate) mod tests {
                 "/api/models/owner/model/revision/gb202",
                 metadata_response(),
             )
+            .document(
+                "/api/models/owner/model/revision/gb202-tp1",
+                revision_response("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
             .file(
                 format!("/owner/model/resolve/{COMMIT}/model.safetensors"),
                 MockFile::new(&etag, core.clone()),
@@ -10282,6 +10522,83 @@ pub(crate) mod tests {
             )
             .unwrap(),
             COMMIT
+        );
+    }
+
+    #[test]
+    fn blackwell_revision_alias_installs_and_refreshes_the_pinned_core() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, publisher, _) = signed_payload_fixture(temp.path());
+        let model_root = temp.path().join("models");
+        let repository = "publisher/prepared";
+        let missing = "/api/models/publisher/prepared/revision/gb10";
+        let alias = "/api/models/publisher/prepared/revision/gb10-tp1";
+        let routes = core_routes(&core, repository, "gb10-tp1").document(
+            missing,
+            b"HTTP/1.1 404 Missing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        );
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let options = HubOptions {
+            revision: Some("gb10".into()),
+            core_cache: Some(model_root.clone()),
+            ..Default::default()
+        };
+        let profiles = std::slice::from_ref(&publisher);
+        let entry = download_with_token_at(
+            &endpoint,
+            repository,
+            &options,
+            1,
+            None,
+            &[],
+            None,
+            profiles,
+            None,
+        )
+        .unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
+        let origin = entry_origin(&store, &entry).unwrap().unwrap();
+        assert_eq!(origin.revision, "gb10");
+        assert_eq!(origin.commit, COMMIT);
+        let offline_options = HubOptions {
+            offline: true,
+            ..options.clone()
+        };
+        let offline = download_with_token_at(
+            &endpoint,
+            repository,
+            &offline_options,
+            1,
+            None,
+            &[],
+            None,
+            profiles,
+            None,
+        )
+        .unwrap();
+        assert_eq!(offline.id(), entry.id());
+
+        let id = entry.id().to_owned();
+        let selected = refresh_model_at(
+            &endpoint,
+            &store,
+            entry,
+            false,
+            &options,
+            1,
+            &[],
+            None,
+            profiles,
+        )
+        .unwrap();
+        assert_eq!(selected.id(), id);
+        worker.join().unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.documents[missing], 2);
+        assert_eq!(log.documents[alias], 2);
+        assert_eq!(
+            log.files[&format!("/{repository}/resolve/{COMMIT}/model.safetensors")],
+            1
         );
     }
 

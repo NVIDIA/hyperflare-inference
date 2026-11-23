@@ -110,6 +110,19 @@ first be prepared through Ignition. A discovery tag does not establish core
 compatibility or publisher trust; the Rust application validates the core
 before serving and supplies the exact publisher identity for consent.
 
+During acquisition of a payload-format core with an unknown signing key, the
+desktop client reads `publisher.json` from the resolved repository commit.
+It checks the profile's fingerprint and namespace against the core and verifies
+the signed catalog before showing **Review publisher key**. The dialog shows
+the key fingerprint, profile source, publisher identity status, and model license.
+Type the displayed namespace to import the public profile and continue downloading,
+or cancel the download. Imported profiles persist in desktop application state.
+Importing a profile enables signature verification; it does not establish publisher
+identity or accept execution. First use still requires the publisher and license
+review before loading. Invalid signatures and mismatched profiles prevent import.
+For production identities, revocation at the signed official source also prevents
+import.
+
 Discovery cards recognize downloaded cores through retained acquisition records,
 including CLI downloads, and offer Run model for that local version. The
 association does not claim that the local version is the latest Hub revision.

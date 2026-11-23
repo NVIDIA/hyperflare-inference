@@ -47,6 +47,7 @@ fn load_with(
         root,
         &ReviewOptions {
             publisher_keys: args.publisher_keys.clone(),
+            profiles: Vec::new(),
             hub: (&args.hub).into(),
             trust_store: args.trust_store.clone(),
             rank: args.rank.filter(|&rank| rank != 0),

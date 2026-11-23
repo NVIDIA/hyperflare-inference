@@ -896,8 +896,10 @@ An explicit GPU list must match the core's local rank count.
 
 An explicit `--revision` overrides `@revision` and hardware detection. It accepts
 a branch, tag, or commit, and permits downloading on a machine without NVIDIA
-hardware. Online resolution obtains the revision's commit and downloads from
-that exact commit. Flare excludes SHA-256 blob filenames and
+hardware. For `gb10`, `gb202`, and `gb300`, the shared CLI and desktop downloader
+tries the corresponding `-tp1` revision if the initial revision lookup returns
+HTTP 404. Flare downloads from the resolved commit and records it under the
+requested revision for offline use. Flare excludes SHA-256 blob filenames and
 `*-data-NN-of-NN.safetensors` companions when selecting the primary; multiple
 primaries require `--filename`. Referenced companions resolve from the primary's
 directory at that same commit. Offline resolution requires every referenced file.

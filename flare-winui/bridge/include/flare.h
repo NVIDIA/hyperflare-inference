@@ -178,6 +178,11 @@ typedef struct flare_trust_review {
     flare_string license;
     flare_string identity_status;
 } flare_trust_review;
+typedef struct flare_publisher_key_review {
+    flare_trust_review review;
+    flare_string publisher_name;
+    flare_string profile_url;
+} flare_publisher_key_review;
 /* Empty config path uses the user's Flare configuration. Windows paths use
    counted UTF-16 and are never converted through a display string. */
 flare_app* flare_app_create(const uint16_t* config_path, size_t length);
@@ -202,6 +207,7 @@ uint32_t flare_snapshot_model(const flare_snapshot* snapshot, size_t index, flar
 size_t flare_snapshot_download_count(const flare_snapshot* snapshot);
 uint32_t flare_snapshot_download(const flare_snapshot* snapshot, size_t index, flare_download* value);
 uint32_t flare_snapshot_trust(const flare_snapshot* snapshot, flare_trust_review* value);
+uint32_t flare_snapshot_publisher_key(const flare_snapshot* snapshot, flare_publisher_key_review* value);
 uint32_t flare_snapshot_model_detail(const flare_snapshot* snapshot, flare_model_detail* value);
 size_t flare_snapshot_gpu_count(const flare_snapshot* snapshot);
 uint32_t flare_snapshot_gpu(const flare_snapshot* snapshot, size_t index, flare_gpu* value);
@@ -221,6 +227,9 @@ uint64_t flare_app_pause_download(flare_app* app, uint64_t operation_id);
 uint64_t flare_app_accept_trust(flare_app* app, uint64_t decision_id,
     const char* publisher, size_t publisher_length);
 uint64_t flare_app_reject_trust(flare_app* app, uint64_t decision_id);
+uint64_t flare_app_import_publisher_key(flare_app* app, uint64_t decision_id,
+    const char* fingerprint, size_t fingerprint_length, const char* publisher_namespace, size_t namespace_length);
+uint64_t flare_app_reject_publisher_key(flare_app* app, uint64_t decision_id);
 uint64_t flare_app_set_model_directory(flare_app* app, const uint16_t* path, size_t length);
 uint64_t flare_app_inspect_model(flare_app* app, const char* id, size_t length);
 uint64_t flare_app_remove_reference(flare_app* app, const char* id, size_t length);

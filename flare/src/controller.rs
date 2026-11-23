@@ -62,6 +62,12 @@ pub enum Command {
     Resume(u64),
     AcceptTrust { decision: u64, publisher: String },
     RejectTrust(u64),
+    ImportPublisherKey {
+        decision: u64,
+        fingerprint: String,
+        namespace: String,
+    },
+    RejectPublisherKey(u64),
     SetModelDirectory(PathBuf),
     SetAppearance { theme: u32, compact: bool },
     SetRuntimeSettings(RuntimeSettings),
@@ -125,6 +131,40 @@ pub struct TrustView {
     pub license: String,
     pub identity_status: String,
 }
+impl TrustView {
+    fn disclosure(decision_id: u64, disclosure: &crate::trust::Disclosure) -> Self {
+        Self {
+            decision_id,
+            publisher: disclosure.namespace.clone(),
+            fingerprint: disclosure.fingerprint.clone(),
+            official_source: disclosure.official_source.clone(),
+            license: match (&disclosure.license_name, &disclosure.license_url) {
+                (Some(name), Some(url)) => format!("{name} ({url})"),
+                (Some(name), None) => name.clone(),
+                (None, Some(url)) => url.clone(),
+                _ => "No license declared in the core".into(),
+            },
+            identity_status: match &disclosure.identity {
+                crate::trust::Identity::Verified => {
+                    "Publisher repository confirmed this signing key".into()
+                }
+                crate::trust::Identity::Unverified(reason) => {
+                    format!("Signing profile; publisher identity unconfirmed: {reason}")
+                }
+                crate::trust::Identity::Development => {
+                    "Development signing key; publisher identity is unverified".into()
+                }
+            },
+        }
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct PublisherKeyView {
+    pub operation_id: u64,
+    pub review: TrustView,
+    pub publisher_name: String,
+    pub profile_url: String,
+}
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub runtime_settings: RuntimeSettings,
@@ -171,6 +211,7 @@ pub struct Snapshot {
     pub models: Vec<ModelView>,
     pub downloads: Vec<DownloadView>,
     pub trust: Option<TrustView>,
+    pub publisher_key: Option<PublisherKeyView>,
 }
 const QUEUED: u32 = 0;
 const RUNNING: u32 = 1;
@@ -205,6 +246,7 @@ struct Persistent {
     model_directory: Option<PathBuf>,
     external: Vec<PathBuf>,
     downloads: Vec<SavedDownload>,
+    publisher_profiles: Vec<flare_helios::runtime_core::Publisher>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct SavedDownload {
@@ -234,13 +276,23 @@ impl Persistent {
         }
         let mut value: Self = serde_json::from_slice(&bytes)
             .map_err(|e| format!("Invalid application state: {e}"))?;
-        if value.external.len() > 256 || value.downloads.len() > 128 {
+        if value.external.len() > 256
+            || value.downloads.len() > 128
+            || value.publisher_profiles.len() > 256
+        {
             return Err("Application state exceeds its entry limit".into());
         }
         if value.appearance.theme > 2 {
             return Err("Application appearance is invalid".into());
         }
         if let Some(runtime) = &value.runtime { runtime.validate()?; }
+        let mut keys = std::collections::HashSet::new();
+        for profile in &value.publisher_profiles {
+            profile.validate().map_err(|error| error.to_string())?;
+            if !keys.insert((profile.fingerprint(), profile.namespace.clone())) {
+                return Err("Application state contains duplicate publisher profiles".into());
+            }
+        }
         for download in &mut value.downloads {
             if matches!(download.state, QUEUED | RUNNING) {
                 download.state = PAUSED;
@@ -361,6 +413,215 @@ impl DownloadRate {
 }
 
 #[cfg(test)]
+mod publisher_key_tests {
+    use super::*;
+
+    fn awaiting_key(
+        parent: &Path,
+    ) -> (
+        Worker,
+        mpsc::Receiver<Result<flare_helios::runtime_core::Publisher, String>>,
+        AcquisitionProgress,
+        PathBuf,
+    ) {
+        let (core, _, profile, _) = crate::hub::tests::signed_payload_fixture(parent);
+        let config = parent.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let mut settings = Settings::load(Some(&config)).unwrap();
+        settings.trust_store = Some(parent.join("trust.toml"));
+        let review = crate::trust::review(
+            &core,
+            &TrustOptions {
+                profiles: vec![profile.clone()],
+                hub: crate::options::HubOptions {
+                    offline: true,
+                    ..Default::default()
+                },
+                trust_store: settings.trust_store.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let progress = AcquisitionProgress::new();
+        let mut operation = Operation::new();
+        operation.acquisition = Some(progress.clone());
+        let shared = Arc::new(Shared {
+            hardware: crate::hardware::HardwareMonitor::start().unwrap(),
+            preview: crate::preview::Preview::new(None).unwrap(),
+            inner: Mutex::new(Inner {
+                view: Snapshot::default(),
+                active: None,
+                startup: None,
+                operations: HashMap::from([(5, operation)]),
+                downloads: Vec::new(),
+                runtime_operation: None,
+                publisher_profiles: Vec::new(),
+            }),
+            closing: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            next: AtomicU64::new(8),
+            dashboard: Mutex::new(dashboard::DashboardHistory::default()),
+            restart_required: AtomicBool::new(false),
+        });
+        let mut worker = Worker::new(shared, settings, Persistent::default());
+        let (events, receiver) = mpsc::channel();
+        worker.download_done = receiver;
+        let (reply, response) = mpsc::sync_channel(1);
+        events.send(DownloadEvent::PublisherKey(PublisherKeyRequest {
+            decision: 7, operation: 5,
+            review: crate::hub::PublisherKeyReview {
+                profile, disclosure: review.disclosure,
+                profile_url: "https://huggingface.co/publisher/core/resolve/commit/publisher.json".into(),
+            },
+            reply,
+        })).unwrap();
+        worker.collect_downloads();
+        assert!(
+            worker
+                .shared
+                .inner
+                .lock()
+                .unwrap()
+                .view
+                .publisher_key
+                .is_some()
+        );
+        (worker, response, progress, core)
+    }
+
+    #[test]
+    fn publisher_key_import_binds_the_decision_and_persists_without_execution_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut worker, response, progress, core) = awaiting_key(temp.path());
+        let disclosure = worker
+            .pending_key
+            .as_ref()
+            .unwrap()
+            .review
+            .disclosure
+            .clone();
+        for (decision, fingerprint, namespace) in [
+            (
+                8,
+                disclosure.fingerprint.as_str(),
+                disclosure.namespace.as_str(),
+            ),
+            (7, "wrong", disclosure.namespace.as_str()),
+            (7, disclosure.fingerprint.as_str(), "wrong"),
+        ] {
+            assert!(
+                worker
+                    .import_publisher_key(decision, fingerprint, namespace)
+                    .is_err()
+            );
+            assert!(!worker.settings.state_file.exists());
+            assert!(worker.persistent.publisher_profiles.is_empty());
+        }
+        worker
+            .import_publisher_key(7, &disclosure.fingerprint, &disclosure.namespace)
+            .unwrap();
+        let profile = wait_for_publisher_key(&response, &progress, &worker.shared).unwrap();
+        assert_eq!(profile.fingerprint(), disclosure.fingerprint);
+        let restored = Persistent::load(&worker.settings.state_file).unwrap();
+        assert_eq!(restored.publisher_profiles, vec![profile]);
+        let review = crate::trust::review(
+            &core,
+            &TrustOptions {
+                profiles: restored.publisher_profiles,
+                hub: crate::options::HubOptions {
+                    offline: true,
+                    ..Default::default()
+                },
+                trust_store: worker.settings.trust_store.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!review.disclosure.remembered);
+        assert!(!worker.settings.trust_store.as_ref().unwrap().exists());
+        assert!(worker.pending_key.is_none());
+        worker.shutdown();
+    }
+
+    #[test]
+    fn publisher_key_rejection_and_cancelled_decisions_do_not_import_keys() {
+        for reject in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut worker, response, progress, _) = awaiting_key(temp.path());
+            if reject {
+                worker.execute(10, Command::RejectPublisherKey(7)).unwrap();
+                assert!(progress.is_cancelled());
+                assert!(wait_for_publisher_key(&response, &progress, &worker.shared).is_err());
+            } else {
+                progress.request_cancel();
+                // A queued click may arrive after the user cancelled the download.
+                let disclosure = &worker.pending_key.as_ref().unwrap().review.disclosure;
+                let fingerprint = disclosure.fingerprint.clone();
+                let namespace = disclosure.namespace.clone();
+                assert!(
+                    worker
+                        .import_publisher_key(7, &fingerprint, &namespace)
+                        .is_err()
+                );
+            }
+            assert!(worker.persistent.publisher_profiles.is_empty());
+            assert!(!worker.settings.state_file.exists());
+            worker.shutdown();
+            assert!(
+                worker
+                    .shared
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .view
+                    .publisher_key
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn publisher_key_save_failure_keeps_the_review_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut worker, response, _, _) = awaiting_key(temp.path());
+        std::fs::create_dir(&worker.settings.state_file).unwrap();
+        let disclosure = worker
+            .pending_key
+            .as_ref()
+            .unwrap()
+            .review
+            .disclosure
+            .clone();
+        assert!(
+            worker
+                .import_publisher_key(7, &disclosure.fingerprint, &disclosure.namespace)
+                .is_err()
+        );
+        assert!(worker.persistent.publisher_profiles.is_empty());
+        assert!(worker.pending_key.is_some());
+        assert!(matches!(
+            response.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        worker.shutdown();
+    }
+
+    #[test]
+    fn publisher_key_wait_exits_when_the_application_closes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut worker, response, progress, _) = awaiting_key(temp.path());
+        let shared = worker.shared.clone();
+        let waiting = thread::spawn(move || wait_for_publisher_key(&response, &progress, &shared));
+        let started = std::time::Instant::now();
+        worker.shared.closing.store(true, Ordering::Release);
+        worker.shutdown();
+        assert!(waiting.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!worker.settings.state_file.exists());
+    }
+}
+
+#[cfg(test)]
 mod download_rate_tests {
     use super::*;
 
@@ -439,6 +700,7 @@ struct Inner {
     operations: HashMap<u64, Operation>,
     downloads: Vec<DownloadSlot>,
     runtime_operation: Option<u64>,
+    publisher_profiles: Vec<flare_helios::runtime_core::Publisher>,
 }
 struct Shared {
     hardware: crate::hardware::HardwareMonitor,
@@ -472,7 +734,12 @@ impl Shared {
                 .unwrap_or_else(|e| e.into_inner())
                 .operations
                 .get(&operation)
-                .is_some_and(|v| v.cancel.load(Ordering::Acquire))
+                .is_some_and(|v| {
+                    v.cancel.load(Ordering::Acquire)
+                        || v.acquisition
+                            .as_ref()
+                            .is_some_and(AcquisitionProgress::is_cancelled)
+                })
     }
     fn id(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed)
@@ -520,6 +787,7 @@ impl Controller {
                 startup: None,
                 operations: HashMap::new(),
                 runtime_operation: None,
+                publisher_profiles: persistent.publisher_profiles.clone(),
                 downloads: persistent
                     .downloads
                     .iter()
@@ -685,6 +953,17 @@ impl Controller {
                 .iter_mut()
                 .map(DownloadSlot::snapshot)
                 .collect();
+            if let Some(key) = &view.publisher_key {
+                if let Some(download) = view
+                    .downloads
+                    .iter_mut()
+                    .find(|download| download.operation_id == key.operation_id)
+                {
+                    download.phase = "Review publisher key".into();
+                    download.transfer_active = false;
+                    download.bytes_per_second = 0.0;
+                }
+            }
             // Borrow the session while sampling so its CUDA owner can only be
             // destroyed by the application worker after this lock is released.
             let live = inner.active.as_ref().map(|active| {
@@ -849,6 +1128,35 @@ struct DownloadDone {
     result: Result<String, String>,
     cancelled: bool,
 }
+struct PublisherKeyRequest {
+    decision: u64,
+    operation: u64,
+    review: crate::hub::PublisherKeyReview,
+    reply: mpsc::SyncSender<Result<flare_helios::runtime_core::Publisher, String>>,
+}
+enum DownloadEvent {
+    Finished(DownloadDone),
+    PublisherKey(PublisherKeyRequest),
+}
+
+fn wait_for_publisher_key(
+    response: &mpsc::Receiver<Result<flare_helios::runtime_core::Publisher, String>>,
+    progress: &AcquisitionProgress,
+    shared: &Shared,
+) -> Result<flare_helios::runtime_core::Publisher, String> {
+    loop {
+        if progress.is_cancelled() || shared.closing.load(Ordering::Acquire) {
+            return Err("Publisher key review cancelled".into());
+        }
+        match response.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Publisher key review dismissed".into());
+            }
+        }
+    }
+}
 struct Worker {
     shared: Arc<Shared>,
     settings: Settings,
@@ -856,9 +1164,10 @@ struct Worker {
     sources: HashMap<String, Source>,
     catalog: Vec<ModelView>,
     pending: Option<PendingReview>,
+    pending_key: Option<PublisherKeyRequest>,
     active: Option<Arc<ActiveSession>>,
     download_sender: Option<mpsc::SyncSender<DownloadJob>>,
-    download_done: mpsc::Receiver<DownloadDone>,
+    download_done: mpsc::Receiver<DownloadEvent>,
     download_thread: Option<JoinHandle<()>>,
 }
 
@@ -898,29 +1207,72 @@ impl Worker {
                             }
                             let store = ModelStore::open(job.saved.directory.clone())
                                 .map_err(|e| e.to_string())?;
-                            let profiles =
+                            let mut profiles =
                                 crate::trust::trusted_profiles(job.settings.trust_store.as_deref())
                                     .map_err(|e| e.to_string())?;
-                            let entry = store
-                                .acquire(
+                            profiles.extend(
+                                observed
+                                    .inner
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .publisher_profiles
+                                    .clone(),
+                            );
+                            let acquire = |profiles: &[_]| {
+                                store.acquire(
                                     &job.saved.source,
                                     &options,
                                     1,
                                     &job.settings.publisher_keys,
                                     job.settings.trust_store.as_deref(),
-                                    &profiles,
+                                    profiles,
                                     job.progress.clone(),
                                 )
-                                .map_err(|e| e.to_string())?;
+                            };
+                            let entry = match acquire(&profiles) {
+                                Ok(entry) => entry,
+                                Err(error) => {
+                                    let Some(required) =
+                                        error.downcast_ref::<crate::hub::PublisherKeyRequired>()
+                                    else {
+                                        return Err(error.to_string());
+                                    };
+                                    let review = required
+                                        .review(&TrustOptions {
+                                            publisher_keys: job.settings.publisher_keys.clone(),
+                                            profiles: profiles.clone(),
+                                            hub: options.clone(),
+                                            trust_store: job.settings.trust_store.clone(),
+                                            tensor_parallel: Some(1),
+                                            rank: None,
+                                        })
+                                        .map_err(|error| error.to_string())?;
+                                    let (reply, response) = mpsc::sync_channel(1);
+                                    done.send(DownloadEvent::PublisherKey(PublisherKeyRequest {
+                                        decision: observed.id(),
+                                        operation: job.saved.id,
+                                        review,
+                                        reply,
+                                    }))
+                                    .map_err(|_| "The acquisition worker is unavailable")?;
+                                    let profile = wait_for_publisher_key(
+                                        &response,
+                                        &job.progress,
+                                        &observed,
+                                    )?;
+                                    profiles.push(profile);
+                                    acquire(&profiles).map_err(|error| error.to_string())?
+                                }
+                            };
                             Ok(format!("local:{}@{}", entry.model(), entry.id()))
                         },
                     ))
                     .unwrap_or_else(|_| Err("The acquisition worker failed".into()));
-                    let _ = done.send(DownloadDone {
+                    let _ = done.send(DownloadEvent::Finished(DownloadDone {
                         id: job.saved.id,
                         result,
                         cancelled: job.progress.is_cancelled(),
-                    });
+                    }));
                 }
             })
             .ok();
@@ -932,6 +1284,7 @@ impl Worker {
             sources: HashMap::new(),
             catalog: Vec::new(),
             pending: None,
+            pending_key: None,
             active: None,
             download_sender,
             download_done,
@@ -958,6 +1311,13 @@ impl Worker {
     fn run(&mut self, receiver: mpsc::Receiver<Envelope>) {
         while !self.shared.closing.load(Ordering::Acquire) {
             self.collect_downloads();
+            if self
+                .pending_key
+                .as_ref()
+                .is_some_and(|key| self.shared.cancelled(key.operation))
+            {
+                self.clear_publisher_key();
+            }
             if self
                 .pending
                 .as_ref()
@@ -1146,6 +1506,28 @@ impl Worker {
                 self.queue_download(id, source, self.settings.model_directory.clone())
             }
             Command::ClearFailedDownloads => self.clear_failed_downloads(),
+            Command::ImportPublisherKey {
+                decision,
+                fingerprint,
+                namespace,
+            } => self.import_publisher_key(decision, &fingerprint, &namespace),
+            Command::RejectPublisherKey(decision) => {
+                let pending = self
+                    .pending_key
+                    .as_ref()
+                    .ok_or("The publisher key review has expired")?;
+                if pending.decision != decision {
+                    return Err("The publisher key review has expired".into());
+                }
+                let operation = pending.operation;
+                self.shared.update(|state| {
+                    if let Some(control) = state.operations.get(&operation) {
+                        control.cancel();
+                    }
+                });
+                self.clear_publisher_key();
+                Ok(())
+            }
             Command::Resume(previous) => {
                 let saved = self
                     .persistent
@@ -1869,6 +2251,7 @@ mod tests {
                 operations: HashMap::from([(7, operation.clone())]),
                 downloads: Vec::new(),
                 runtime_operation: Some(7),
+                publisher_profiles: Vec::new(),
             }),
             closing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -2027,6 +2410,7 @@ impl Worker {
                 &source,
                 &TrustOptions {
                     publisher_keys: self.settings.publisher_keys.clone(),
+                    profiles: self.persistent.publisher_profiles.clone(),
                     hub: self.settings.hub.clone(),
                     trust_store: self.settings.trust_store.clone(),
                     tensor_parallel: Some(1),
@@ -2041,28 +2425,7 @@ impl Worker {
         if review.disclosure.remembered {
             return self.authorize_and_load(operation, id, name, review);
         }
-        let disclosure = &review.disclosure;
-        let trust = TrustView {
-            decision_id: operation,
-            publisher: disclosure.namespace.clone(),
-            fingerprint: disclosure.fingerprint.clone(),
-            official_source: disclosure.official_source.clone(),
-            license: match (&disclosure.license_name, &disclosure.license_url) {
-                (Some(name), Some(url)) => format!("{name} ({url})"),
-                (Some(name), None) => name.clone(),
-                (None, Some(url)) => url.clone(),
-                _ => "No license declared in the core".into(),
-            },
-            identity_status: match &disclosure.identity {
-                crate::trust::Identity::Verified => {
-                    "Publisher repository confirmed this signing key".into()
-                }
-                crate::trust::Identity::Unverified(reason) => {
-                    format!("Local signing profile; repository identity unconfirmed: {reason}")
-                }
-                crate::trust::Identity::Development => "Local development publisher".into(),
-            },
-        };
+        let trust = TrustView::disclosure(operation, &review.disclosure);
         self.pending = Some(PendingReview {
             decision: operation,
             operation,
@@ -2406,6 +2769,13 @@ impl Worker {
         Ok(())
     }
     fn finish_download(&mut self, done: DownloadDone) {
+        if self
+            .pending_key
+            .as_ref()
+            .is_some_and(|key| key.operation == done.id)
+        {
+            self.clear_publisher_key();
+        }
         let paused = self
             .shared
             .inner
@@ -2473,14 +2843,78 @@ impl Worker {
         }
     }
     fn collect_downloads(&mut self) {
-        while let Ok(done) = self.download_done.try_recv() {
-            self.finish_download(done);
+        while let Ok(event) = self.download_done.try_recv() {
+            match event {
+                DownloadEvent::Finished(done) => self.finish_download(done),
+                DownloadEvent::PublisherKey(request) => {
+                    if self.shared.cancelled(request.operation) || self.pending_key.is_some() {
+                        let _ = request
+                            .reply
+                            .try_send(Err("Publisher key review cancelled".into()));
+                        continue;
+                    }
+                    let view = PublisherKeyView {
+                        operation_id: request.operation,
+                        review: TrustView::disclosure(request.decision, &request.review.disclosure),
+                        publisher_name: request.review.disclosure.publisher.clone(),
+                        profile_url: request.review.profile_url.clone(),
+                    };
+                    self.pending_key = Some(request);
+                    self.shared
+                        .update(|state| state.view.publisher_key = Some(view));
+                }
+            }
         }
+    }
+    fn clear_publisher_key(&mut self) {
+        self.pending_key.take();
+        self.shared.update(|state| state.view.publisher_key = None);
+    }
+    fn import_publisher_key(
+        &mut self,
+        decision: u64,
+        fingerprint: &str,
+        namespace: &str,
+    ) -> Result<(), String> {
+        let request = self
+            .pending_key
+            .as_ref()
+            .ok_or("The publisher key review has expired")?;
+        if self.shared.cancelled(request.operation) || request.decision != decision {
+            return Err("The publisher key review has expired".into());
+        }
+        if request.review.disclosure.fingerprint != fingerprint
+            || request.review.disclosure.namespace != namespace
+        {
+            return Err(
+                "Key import must match the displayed fingerprint and exact publisher namespace"
+                    .into(),
+            );
+        }
+        let profile = request.review.profile.clone();
+        let mut persistent = self.persistent.clone();
+        persistent.publisher_profiles.retain(|previous| {
+            previous.fingerprint() != fingerprint || previous.namespace != namespace
+        });
+        if persistent.publisher_profiles.len() >= 256 {
+            return Err("The desktop publisher-profile limit has been reached".into());
+        }
+        persistent.publisher_profiles.push(profile.clone());
+        persistent.save(&self.settings.state_file)?;
+        self.persistent = persistent;
+        self.shared.update(|state| {
+            state.publisher_profiles = self.persistent.publisher_profiles.clone();
+            state.view.publisher_key = None;
+        });
+        let request = self.pending_key.take().unwrap();
+        let _ = request.reply.try_send(Ok(profile));
+        Ok(())
     }
     fn shutdown(&mut self) {
         self.shared.preview.close();
         self.shared.hardware.close();
         self.clear_review();
+        self.clear_publisher_key();
         self.shared.update(|s| {
             for control in s.operations.values() {
                 control.cancel();
@@ -2549,6 +2983,7 @@ impl Worker {
                 source,
                 &TrustOptions {
                     publisher_keys: self.settings.publisher_keys.clone(),
+                    profiles: self.persistent.publisher_profiles.clone(),
                     hub: self.settings.hub.clone(),
                     trust_store: self.settings.trust_store.clone(),
                     ..Default::default()
