@@ -501,6 +501,7 @@ impl OutboundRecord {
                     return Ok(false);
                 };
                 let job = copier::Job {
+                    codec: None,
                     replication: Default::default(),
                     id,
                     window: index,
@@ -949,6 +950,7 @@ impl InboundRecord {
         }
         let plan = window.plan;
         resources.submit_transfer(copier::Job {
+            codec: None,
             replication: Default::default(),
             id,
             window: plan.index,
@@ -1523,6 +1525,19 @@ impl DiskStore {
     ) -> Result<Self> {
         let layout = Layout::new(&geometry)?;
         let mut index = Index::new(layout.page_tokens);
+        let scanned = if scanned.iter().any(|record| record.header.packed.is_some()) {
+            let mut raw = Vec::with_capacity(scanned.len());
+            for record in scanned {
+                if record.header.packed.is_some() {
+                    record::remove(&record.path)?;
+                } else {
+                    raw.push(record);
+                }
+            }
+            record::remove_orphans(raw)?
+        } else {
+            scanned
+        };
         let mut used = 0u64;
         for record in &scanned {
             index.insert(

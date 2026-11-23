@@ -43,6 +43,7 @@ const SESSION: u64 = 7;
 
 #[derive(Default)]
 pub(super) struct FakeCopier {
+    codec_profile: Option<[u8; 32]>,
     layout: Option<Layout>,
     /// Device pages and rows by id.
     pub gpu_pages: HashMap<u32, Vec<u8>>,
@@ -119,6 +120,9 @@ impl FakeCopier {
 }
 
 impl PageCopier for FakeCopier {
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.codec_profile
+    }
     fn layout(&self) -> &Layout {
         self.layout.as_ref().unwrap()
     }
@@ -234,6 +238,7 @@ impl Rig {
 
     pub fn open_session(&mut self, regions: Option<Arc<Regions>>) -> Vec<wire::ClientMessage> {
         let opened = wire::SessionOpened {
+            codec: None,
             status: wire::OpenStatus::OpenOk as i32,
             session_incarnation: SESSION,
             scope_id: vec![3; 32],
@@ -398,6 +403,7 @@ pub(super) fn records(fetch: &PoolFetch) -> Vec<wire::Record> {
         .iter()
         .enumerate()
         .map(|(i, k)| wire::Record {
+            packed: None,
             key: Some(super::super::codec::key_to(*k)),
             first_page: 0,
             pages: nodes[i].tail_pages as u32,
@@ -415,6 +421,7 @@ pub(super) fn window(
     offset: u64,
 ) -> wire::WindowSpec {
     wire::WindowSpec {
+        packed: None,
         index,
         region: wire::Region::Staging as i32,
         offset,
@@ -790,6 +797,68 @@ fn records_that_do_not_match_the_plan_are_abandoned_after_nothing_was_copied() {
     let events = rig.events();
     assert_eq!(fetched(&events).len(), 1);
     assert!(fetched(&events)[0].1.is_err());
+}
+
+#[test]
+fn a_changed_packed_manifest_is_rejected_before_the_first_decode_job() {
+    for corrupt in [false, true] {
+        let mut rig = Rig::new();
+        rig.open();
+        rig.engine.sess.as_mut().unwrap().codec =
+            Some(crate::codec_copy::reader_caps(Some([3; 32]), false));
+        let fetch = single_part();
+        let begun = rig.command(Command::Fetch(fetch.clone()));
+        let claim = pick!(begun, Claim)[0].claim_id;
+        let In::ClaimGranted(mut g) = granted(claim, &fetch) else {
+            unreachable!()
+        };
+        let bytes = vec![17; 15];
+        let units = (0..2)
+            .map(|logical_index| wire::PackedUnit {
+                logical_index,
+                original_length: PAGE,
+                stored_length: 15,
+                representation: 1,
+                profile: vec![3; 32],
+                stored_crc: crate::shared::packed::crc32(&bytes),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        g.records[0].packed = Some(wire::PackedOffer {
+            first_page: 0,
+            units: units.clone(),
+        });
+        let out = rig.send(In::ClaimGranted(g));
+        assert!(
+            pick!(out, CopyResult).is_empty(),
+            "the pinned selection must be accepted"
+        );
+        let wire_bytes = bytes.repeat(2);
+        let mut units = units;
+        if corrupt {
+            units[1].stored_crc ^= 1;
+        }
+        rig.staging(0, &wire_bytes);
+        let mut spec = window(0, 0, 0, 2, false, 0);
+        spec.packed = Some(wire::PackedWindow { units });
+        spec.length = wire_bytes.len() as u64;
+        let out = rig.send(In::WindowReady(wire::WindowReady {
+            claim_id: claim,
+            window: Some(spec),
+            ..Default::default()
+        }));
+        if corrupt {
+            assert_eq!(
+                pick!(out, CopyResult)[0].outcome,
+                wire::CopyOutcome::CopyErrorOutcome as i32
+            );
+            assert!(rig.copier.lock().unwrap().submitted.is_empty());
+            assert!(pick!(out, WindowReleased).is_empty());
+        } else {
+            assert!(pick!(out, CopyResult).is_empty());
+            assert!(rig.copier.lock().unwrap().submitted[0].codec.is_some());
+        }
+    }
 }
 
 #[test]

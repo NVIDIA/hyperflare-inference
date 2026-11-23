@@ -472,7 +472,14 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     };
     let st = engine.st.clone();
     let (tx, rx) = mpsc::channel::<wire::ClientMessage>(OUTBOUND);
+    let caps = engine.codec_caps(dial.as_ref().is_some_and(|d| d.may_use_rdma()));
     let open = wire::OpenSession {
+        codec_layout: if caps.receive_profiles.is_empty() {
+            None
+        } else {
+            engine.codec_layout()
+        },
+        codec: (!caps.receive_profiles.is_empty()).then_some(caps),
         manager_incarnation: hello.manager_incarnation,
         instance_id: st.instance_id.to_vec(),
         scope: Some(super::codec::scope_to(&st.scope)),
@@ -595,9 +602,10 @@ async fn attach(
     tls: Option<(TlsConnector, ServerName<'static>)>,
 ) -> std::result::Result<(Option<Arc<Regions>>, Option<Arc<dyn Dial>>), Attempt> {
     let limits = checked_limits(hello.limits);
-    let rdma_offered = hello
-        .data_transports
-        .contains(&(wire::DataTransport::Rdma as i32));
+    let rdma_offered = engine.codec_layout().is_none()
+        && hello
+            .data_transports
+            .contains(&(wire::DataTransport::Rdma as i32));
     let network = match &link.address {
         PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address)
             if !hello.data_transports.is_empty() =>

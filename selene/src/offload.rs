@@ -27,6 +27,33 @@ pub trait CopierFactory {
     ) -> Result<Box<dyn crate::PageCopier>>;
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvCompression {
+    Cpu,
+    #[default]
+    Off,
+}
+
+impl std::str::FromStr for KvCompression {
+    type Err = &'static str;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "off" => Ok(Self::Off),
+            _ => Err("expected cpu or off"),
+        }
+    }
+}
+
+impl std::fmt::Display for KvCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Cpu => "cpu",
+            Self::Off => "off",
+        })
+    }
+}
+
 /// Offload settings as the command line and configuration file supply them.
 /// `None` selects the default: no memory store and no disk store until the
 /// isolation measurements in `docs/prefix-cache-offload.md` enable derived
@@ -34,6 +61,7 @@ pub trait CopierFactory {
 /// staged transport.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrefixCacheOffload {
+    pub compression: KvCompression,
     /// Host retention budget shared by registered checkpoints and ordinary CPU inputs.
     /// Zero selects no memory retention.
     pub memory_bytes: Option<u64>,
@@ -49,6 +77,13 @@ pub struct PrefixCacheOffload {
 }
 
 impl PrefixCacheOffload {
+    pub fn validate_compression(&self) -> Result<()> {
+        if self.compression != KvCompression::Off && self.pool.is_none() {
+            return Err("--lossless-kv-compression cpu requires --prefix-cache-pool".into());
+        }
+        Ok(())
+    }
+
     pub fn enabled(&self) -> bool {
         self.memory_bytes.unwrap_or(0) != 0
             || (self.disk.is_some() && self.disk_limit != Some(0))
@@ -410,17 +445,21 @@ pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
     core: &std::path::Path,
     identity: [u8; 32],
-    geometry: Vec<CacheGeometry>,
+    mut geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
     max_active: usize,
     input_staging: u64,
     shard: Option<(usize, usize)>,
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
+    options.validate_compression()?;
     if !options.enabled() {
         return Ok(Preparation::None("disabled".to_owned()));
     }
     let _ = core;
+    for rank in &mut geometry {
+        rank.placement = options.compression;
+    }
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
         (None, _) => geometry::fingerprint(&geometry),
@@ -558,6 +597,15 @@ fn free_space(path: &std::path::Path) -> Result<u64> {
     flare_eos::free_space(path).map_err(|e| e.to_string().into())
 }
 
+fn raw_geometry(geometry: &[CacheGeometry]) -> Vec<CacheGeometry> {
+    let mut raw = geometry.to_vec();
+    for rank in &mut raw {
+        rank.codec_fields.clear();
+        rank.placement = KvCompression::Off;
+    }
+    raw
+}
+
 /// Open the configured store over the prepared resources, starting its
 /// transfer threads on every rank's context.
 pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn HostStore>> {
@@ -583,13 +631,14 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
     if let Some(pool) = &pool {
         pool.start_copies(&contexts, geometry.clone(), factory)?;
     }
+    let raw = raw_geometry(&geometry);
     // Inside a composite the disk index owns the tree; memory nodes are flat.
     let capture = pool.is_some() && warm_bytes == 0 && directory_lock.is_none();
     let memory = memory_pool
         .as_ref()
         .filter(|_| warm_bytes != 0 || capture)
         .map(|pool| {
-            let transfers = factory.mapped(&contexts, geometry.clone(), pool)?;
+            let transfers = factory.mapped(&contexts, raw.clone(), pool)?;
             let mut store = memory::MemoryStore::open(
                 identity, pool.clone(), transfers, directory_lock.is_some(), capture,
             )?;
@@ -601,7 +650,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         .map(|directory| {
             let disk_transfers = factory.mapped(
                 &contexts,
-                geometry.clone(),
+                raw.clone(),
                 memory_pool
                     .as_ref()
                     .ok_or("disk transfers require a slot pool")?,

@@ -26,6 +26,7 @@ pub struct PoolOffer {
     pub enabled: bool,
     pub identity: [u8; 32],
     pub layout: [u8; 16],
+    pub codec_profile: Option<[u8; 32]>,
     pub rank: usize,
     pub world: usize,
     pub gpu_uuid: [u8; 16],
@@ -49,7 +50,11 @@ impl PoolOffer {
                 .bytes(&self.layout)
                 .u32(self.rank as u32)
                 .u32(self.world as u32)
-                .bytes(&self.gpu_uuid);
+                .bytes(&self.gpu_uuid)
+                .u8(self.codec_profile.is_some() as u8);
+            if let Some(profile) = &self.codec_profile {
+                writer.bytes(profile);
+            }
         }
         writer.finish()[5..].to_vec()
     }
@@ -78,6 +83,22 @@ impl PoolOffer {
                     )));
                 }
                 uuids.push(reader.take(16)?.try_into().unwrap());
+                let has_codec = reader.u8()?;
+                if has_codec > 1 {
+                    return Err(invalid(format!(
+                        "rank {rank} sent an invalid codec profile flag"
+                    )));
+                }
+                let profile = if has_codec == 1 {
+                    Some(<[u8; 32]>::try_from(reader.take(32)?).unwrap())
+                } else {
+                    None
+                };
+                if profile != self.codec_profile {
+                    return Err(invalid(format!(
+                        "rank {rank} selected different lossless KV compression settings; configure the same mode on every rank"
+                    )));
+                }
             }
             reader.end()?;
         }

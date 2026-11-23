@@ -410,7 +410,7 @@ pub fn join_peer(
         .memory_pool
         .as_ref()
         .ok_or_else(|| invalid("a peer's prefix record service needs an intake pool"))?;
-    let transfers = factory.mapped(&prepared.contexts, prepared.geometry.clone(), pool)?;
+    let transfers = factory.mapped(&prepared.contexts, super::raw_geometry(&prepared.geometry), pool)?;
     let staged = Staged::new(
         prepared.memory_pool.take(),
         transfers,

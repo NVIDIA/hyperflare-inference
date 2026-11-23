@@ -11,6 +11,7 @@ fn offer(rank: usize, enabled: bool) -> PoolOffer {
         enabled,
         identity: [3; 32],
         layout: [4; 16],
+        codec_profile: None,
         rank,
         world: 2,
         gpu_uuid: [rank as u8 + 1; 16],
@@ -26,6 +27,15 @@ fn pool_agreement_checks_identity_layout_world_and_rank_bindings() {
         zero.agreement(&good).unwrap().unwrap(),
         vec![[1; 16], [2; 16]]
     );
+    let with_codec = |rank| PoolOffer {
+        codec_profile: Some([7; 32]),
+        ..offer(rank, true)
+    };
+    let good_codec = vec![with_codec(0).encode(), with_codec(1).encode()];
+    assert_eq!(
+        with_codec(0).agreement(&good_codec).unwrap().unwrap(),
+        vec![[1; 16], [2; 16]]
+    );
     for bad in [
         PoolOffer {
             enabled: false,
@@ -37,6 +47,10 @@ fn pool_agreement_checks_identity_layout_world_and_rank_bindings() {
         },
         PoolOffer {
             layout: [9; 16],
+            ..peer.clone()
+        },
+        PoolOffer {
+            codec_profile: Some([7; 32]),
             ..peer.clone()
         },
         PoolOffer {

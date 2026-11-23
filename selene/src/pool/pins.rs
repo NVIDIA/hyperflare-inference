@@ -83,12 +83,14 @@ fn check_window(
         .records
         .get(window.record as usize)
         .ok_or_else(|| Error::new("window names no record"))?;
-    let end = record.first_page + record.pages;
+    let end = u64::from(record.first_page) + u64::from(record.pages);
     if window.first_page < record.first_page
-        || window.first_page + window.page_count > end
+        || u64::from(window.first_page) + u64::from(window.page_count) > end
         || (window.row && !record.row)
-        || dst.len() as u64
-            != u64::from(window.page_count) * page + if window.row { row } else { 0 }
+        || u64::from(window.page_count)
+            .checked_mul(page)
+            .and_then(|n| n.checked_add(if window.row { row } else { 0 }))
+            != Some(dst.len() as u64)
     {
         return Err(Error::new("window does not fit the pinned record"));
     }

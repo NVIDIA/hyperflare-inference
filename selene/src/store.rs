@@ -185,6 +185,7 @@ pub enum StoreEvent {
 /// Counters every store maintains; rates are bytes per second of completed transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoreStats {
+    pub decode: crate::codec_copy::DecodeStats,
     pub retirement_paths: u64,
     pub retirement_max_depth: u64,
     pub retirement_ns: u64,
@@ -320,8 +321,7 @@ pub trait HostStore {
     /// Copy a published checkpoint. Only Queued promises an event and retains
     /// its GPU copy-out pin until Stored or Deferred.
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
-    /// Refresh the indexed host record for a GPU checkpoint used at admission
-    /// or refreshed on request completion. An absent key needs no copy-out.
+    /// A request reused this GPU checkpoint: refresh any retained host record.
     fn reused(&mut self, _key: PrefixKey) {}
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
