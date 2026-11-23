@@ -149,6 +149,90 @@ def test_native_lock_methods_are_not_rebound_in_worker():
         restored.lock.acquire
 
 
+@pytest.mark.parametrize('operator', [torch.ops.aten, torch.ops.aten.add, torch.ops.aten.add.Tensor])
+def test_retained_torch_operator_bindings_are_process_local(operator):
+    restored = loads(dumps(SimpleNamespace(operator=operator)))
+    with pytest.raises(RuntimeError, match='process-local resource Torch operator binding'):
+        restored.operator(torch.ones(1), torch.ones(1))
+    assert torch.equal(torch.ops.aten.add.Tensor(torch.ones(1), torch.ones(1)), torch.full((1,), 2.))
+
+
+def test_anonymous_builtin_method_is_process_local():
+    import types
+
+    anonymous = torch.ops.aten.add.Tensor._op
+    assert isinstance(anonymous, types.BuiltinMethodType) and not anonymous.__name__
+    restored = loads(dumps(SimpleNamespace(method=anonymous)))
+    with pytest.raises(RuntimeError, match=r'process-local resource .*\.<anonymous>'):
+        restored.method()
+
+
+def test_importable_native_module_remains_available_to_workers():
+    import math
+
+    restored = loads(dumps(SimpleNamespace(module=math)))
+    assert restored.module.sqrt(9) == 3
+
+
+def test_unimportable_native_extension_module_is_process_local():
+    import types
+    from importlib.machinery import ExtensionFileLoader, ModuleSpec
+
+    extension = types.ModuleType("flare_nonexistent_jit_ext")
+    extension.__spec__ = ModuleSpec("flare_nonexistent_jit_ext",
+                                    ExtensionFileLoader("flare_nonexistent_jit_ext", "/nonexistent/ext.so"))
+    restored = loads(dumps(SimpleNamespace(module=extension)))
+    with pytest.raises(RuntimeError, match="process-local resource native extension flare_nonexistent_jit_ext"):
+        restored.module.launch
+
+
+def test_metadata_preserves_custom_tensor_attributes_without_altering_plain_tensors():
+    plain = torch.empty(16, dtype=torch.float32)
+    annotated = torch.empty((16, 32), dtype=torch.float8_e4m3fn)
+    annotated.sf = torch.empty((16, 1), dtype=torch.int32)
+    annotated.scale_mode = "block"
+    restored = loads(dumps(SimpleNamespace(plain=plain, annotated=annotated)))
+    assert isinstance(restored.plain, FakeTensor)
+    assert isinstance(restored.annotated, FakeTensor)
+    assert not hasattr(restored.plain, "sf")
+    assert isinstance(restored.annotated.sf, FakeTensor)
+    assert tuple(restored.annotated.sf.shape) == (16, 1)
+    assert restored.annotated.sf.dtype == torch.int32
+    assert restored.annotated.scale_mode == "block"
+
+
+def test_compile_pool_applies_runtime_patches_before_starting_pool(monkeypatch, tmp_path):
+    from concurrent.futures import Future
+    from torch._inductor.compile_worker import subproc_pool
+    from ignition.preparation import compile_pool
+
+    events = []
+
+    def record_apply():
+        events.append("apply")
+
+    class Executor:
+        def __init__(self, count, *, kind=None, mp_context=None):
+            events.append("init_pool")
+
+        def submit(self, function, *arguments):
+            events.append("submit")
+            future = Future()
+            future.set_result(None)
+            return future
+
+        def shutdown(self):
+            events.append("shutdown")
+
+    monkeypatch.setattr(compile_pool.runtime_patches, "apply", record_apply)
+    monkeypatch.setattr(subproc_pool, "SubprocPool", Executor)
+    monkeypatch.setattr(compile_pool, "ProcessPoolExecutor", Executor)
+    with compile_pool.CompilePool("cuda:0", workers=1) as pool:
+        pool.submit(SimpleNamespace(), tmp_path / "first.bin")
+        pool.submit(SimpleNamespace(), tmp_path / "second.bin")
+    assert events == ["apply", "init_pool", "submit", "submit", "shutdown"]
+
+
 def test_selected_plan_metadata_survives_without_registering_a_worker_plan():
     from b12x.preparation.types import Plan, plan_from_handle, require_prepared
 

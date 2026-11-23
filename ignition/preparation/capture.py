@@ -93,7 +93,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      collective=None, coordinator=None, compile_decoder=True, materialize=None,
                      progress=None, label="Prepare serving graphs", cache_root=None, retain_graphs=False,
                      warmup_storage=None, capture_names=None, before_run=None, compile_group=None,
-                     report_catalog=True, retain_forwards=False,
+                     report_catalog=True, retain_forwards=False, compile_options=None,
                      compile_kinds=("prefill", "terminal_prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision")):
     """Retain compiled resources and capture with an optional b12x IPC runtime.
 
@@ -114,6 +114,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     forwards, then checks every owner's guards and storage aliases before
     capturing their distinct CUDA graphs.
     ``retain_forwards`` preserves guarded Python execution for eager diagnostics.
+    ``compile_options`` overrides Inductor configuration passed to ``ForwardCache``
+    without mutating the module defaults.
     """
     if (report_catalog and progress is not None and not getattr(session, "_graph_catalog_reported", False)
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)):
@@ -132,6 +134,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     if compile_decoder:
         cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
+                             options=compile_options,
                              compile_workers=getattr(session, "requested_compile_workers", None),
                              lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune)
         forwards = {name: function for name, function in functions.items()

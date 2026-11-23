@@ -3,13 +3,17 @@
 
 """Persist guard source while binding each process's closure values."""
 
+import io
+import pickle
 import subprocess
 import sys
 
+import pytest
 import torch
 from torch._dynamo import guards
+from torch._dynamo.guards import _Missing
 
-from ignition.preparation.aot import _guard_code_cache
+from ignition.preparation.aot import _GuardPickler, _guard_code_cache, _guard_serialization
 
 
 class GuardedForward:
@@ -82,3 +86,97 @@ for size, enabled in ((3, True), (1, False)):
     assert not check(dict(values=list(range(size)), enabled=not enabled))
 assert guards.build_guard_function is forbid_build
 ''', str(tmp_path)], check=True)
+
+
+def _roundtrip_guard(value, *, guard_tree_values=None, empty_values=None, missing_values=None):
+    buffer = io.BytesIO()
+    pickler = _GuardPickler(
+        {} if guard_tree_values is None else guard_tree_values,
+        {} if empty_values is None else empty_values,
+        {} if missing_values is None else missing_values,
+        buffer,
+    )
+    pickler.dump(value)
+    return pickle.loads(buffer.getvalue())
+
+
+@pytest.mark.parametrize("use_fake", [False, True])
+def test_guard_pickler_preserves_guarded_tensor_user_attributes_only(use_fake):
+    from torch._subclasses import FakeTensorMode
+
+    if use_fake:
+        mode = FakeTensorMode(allow_non_fake_inputs=True)
+        tensor = mode.from_tensor(torch.ones((4, 8), dtype=torch.float32))
+        guarded_scale = mode.from_tensor(torch.ones((4, 1), dtype=torch.float32))
+    else:
+        tensor = torch.ones((4, 8), dtype=torch.float32)
+        guarded_scale = torch.ones((4, 1), dtype=torch.float32)
+    unguarded_owner = object()
+    tensor.scale = guarded_scale
+    tensor.unguarded = unguarded_owner
+
+    restored = _roundtrip_guard(
+        tensor,
+        guard_tree_values={id(tensor): tensor, id(guarded_scale): guarded_scale},
+    )
+    assert tuple(restored.shape) == (4, 8)
+    assert tuple(restored.scale.shape) == (4, 1)
+    assert isinstance(restored.unguarded, _Missing)
+
+    omitted = _roundtrip_guard(tensor, guard_tree_values={})
+    assert isinstance(omitted, _Missing)
+
+
+def test_guard_pickler_honors_empty_and_missing_values_before_custom_overrides():
+    device = torch.device("cpu")
+    tensor = torch.ones(4)
+    restored_missing = _roundtrip_guard(
+        device,
+        guard_tree_values={id(device): device},
+        missing_values={id(device): device},
+    )
+    assert isinstance(restored_missing, _Missing)
+    restored_missing_tensor = _roundtrip_guard(
+        tensor,
+        guard_tree_values={id(tensor): tensor},
+        missing_values={id(tensor): tensor},
+    )
+    assert isinstance(restored_missing_tensor, _Missing)
+
+
+def test_guard_pickler_preserves_ignition_enum_identity():
+    from ignition.preparation.frontend import PromptEncoder
+
+    member = PromptEncoder.PROMPT_JINJA
+    restored = _roundtrip_guard(member, guard_tree_values={id(member): member})
+    assert restored is member
+
+
+class _AnnotatedTensorForward:
+    def __init__(self, scale_value=2.0):
+        self.weight = torch.ones((2, 4), dtype=torch.float32)
+        self.weight.scale = torch.full((2, 1), scale_value, dtype=torch.float32)
+        self.weight.unused = lambda: None
+
+    def __call__(self):
+        return self.weight * self.weight.scale
+
+
+def test_guard_serialization_roundtrips_tensor_user_attributes():
+    from torch._dynamo.aot_compile_types import GraphModuleSerializableCallable
+
+    forward = _AnnotatedTensorForward(scale_value=3.0)
+    with _guard_serialization():
+        compiled = torch.compile(
+            _execute,
+            backend=lambda graph, inputs: GraphModuleSerializableCallable(graph),
+            fullgraph=True,
+            dynamic=False,
+        ).aot_compile(((forward,), {}))
+        data = type(compiled).serialize(compiled).serialized_data
+    restored = type(compiled).deserialize(data)
+    torch.testing.assert_close(restored(forward), torch.full((2, 4), 3.0))
+    wrong_scale = _AnnotatedTensorForward(scale_value=3.0)
+    wrong_scale.weight.scale = torch.ones((2, 2), dtype=torch.float32)
+    assert restored.guard_check(forward)
+    assert not restored.guard_check(wrong_scale)

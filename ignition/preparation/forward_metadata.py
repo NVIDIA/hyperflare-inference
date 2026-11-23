@@ -8,8 +8,10 @@ import ctypes
 import io
 import pickle
 import socket
+import sys
 import types
 from contextvars import ContextVar
+from importlib.machinery import ExtensionFileLoader, PathFinder
 from threading import Lock, RLock, local
 
 import torch
@@ -19,6 +21,17 @@ from torch.utils.weak import WeakIdKeyDictionary
 _MODE = ContextVar('flare_forward_metadata_mode')
 _TENSOR_KINDS = ContextVar('flare_forward_tensor_kinds', default=None)
 _LOCK_TYPES = (type(Lock()), type(RLock()))
+_FAKE_TENSOR_ATTRS = frozenset(
+    vars(FakeTensor(FakeTensorMode(), torch.empty(0, device='meta'), torch.device('cpu')))
+) | {'_is_param', '_debug_context'}
+
+
+def _tensor_user_attributes(tensor):
+    if not hasattr(tensor, '__dict__') or not vars(tensor):
+        return {}
+    if isinstance(tensor, FakeTensor):
+        return {key: value for key, value in vars(tensor).items() if key not in _FAKE_TENSOR_ATTRS}
+    return dict(vars(tensor))
 
 
 class _Unavailable:
@@ -104,8 +117,12 @@ class _ForwardPickler(pickle.Pickler):
                 raise TypeError(f'unsupported forward tensor subclass: {type(value)}')
             storage = value.untyped_storage()
             owner = self.storages.setdefault(storage._cdata, _Storage(storage.nbytes()))
-            return _tensor, (owner, tuple(value.shape), value.stride(), value.storage_offset(),
-                             value.dtype, value.device, value.requires_grad, type(value))
+            args = (owner, tuple(value.shape), value.stride(), value.storage_offset(),
+                    value.dtype, value.device, value.requires_grad, type(value))
+            user_attrs = _tensor_user_attributes(value)
+            if user_attrs:
+                return _tensor, args, user_attrs, None, None, _set_state
+            return _tensor, args
         if isinstance(value, _PreparedSlot):
             # Tracing needs selected layouts; normal plan pickling clears prepared state.
             return _object, (type(value),), dict(vars(value)), None, None, _set_state
@@ -118,6 +135,8 @@ class _ForwardPickler(pickle.Pickler):
             return _deserialize_triton_kernel, (_serialize_triton_kernel(value),)
         if isinstance(value, types.MappingProxyType):
             return _mapping_proxy, (dict(value),)
+        if isinstance(value, (torch._ops.OpOverloadPacket, torch._ops.OpOverload, torch._ops._OpNamespace)):
+            return _Unavailable, (f'Torch operator binding {value}',)
         from tvm_ffi.core import CObject
 
         if isinstance(value, CObject) or (not isinstance(value, type) and '<locals>' in type(value).__qualname__):
@@ -136,13 +155,23 @@ class _ForwardPickler(pickle.Pickler):
         if not isinstance(value, type) and (hasattr(type(value), '__del__')
                 or type(value).__module__.startswith('cutlass._mlir.')):
             return _Unavailable, (f'{type(value).__module__}.{type(value).__qualname__}',)
-        if isinstance(value, types.BuiltinMethodType) and isinstance(value.__self__, (*_LOCK_TYPES, local)):
-            return _Unavailable, (f'{type(value.__self__).__qualname__}.{value.__name__}',)
+        if isinstance(value, types.BuiltinMethodType) and (
+                isinstance(value.__self__, (*_LOCK_TYPES, local))
+                or not value.__name__
+                or value.__name__ == '<lambda>'):
+            owner = type(value).__qualname__ if value.__self__ is None else type(value.__self__).__qualname__
+            return _Unavailable, (f'{owner}.{value.__name__ or "<anonymous>"}',)
         if isinstance(value, types.FunctionType) and (
                 '<locals>' in value.__qualname__ or value.__name__ == '<lambda>'):
             return _Unavailable, (value.__qualname__,)
         if isinstance(value, types.ModuleType):
             import importlib
+            spec = value.__spec__
+            if spec is not None and isinstance(spec.loader, ExtensionFileLoader):
+                parent = sys.modules.get(spec.parent)
+                if PathFinder.find_spec(value.__name__, getattr(parent, '__path__', None)) is None:
+                    # Preparation-built extensions are owned by the rank, not compiler workers.
+                    return _Unavailable, (f'native extension {value.__name__}',)
             return importlib.import_module, (value.__name__,)
         if (type(value).__module__.startswith(('b12x.', 'ignition.'))
                 and hasattr(type(value), '__getattr__') and hasattr(value, '__dict__')):

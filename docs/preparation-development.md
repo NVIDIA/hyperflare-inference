@@ -56,7 +56,11 @@ before the session's capture guard forbids further kernel resolution.
   from its transient pools and release them before capture, so
   their workspaces do not coexist with retained graph intermediates. Ranks
   synchronize before each warmup and each capture. Retain compiled kernel owners
-  until native replay has drained.
+  until native replay has drained. Compiled forwards retain Inductor memory-pool
+  planning, storage reuse, and default peak-memory operation reordering; callers
+  with asymmetric auxiliary-stream forks can pass an explicit `compile_options`
+  mapping (for example, `reorder_for_peak_memory: False`) through
+  `capture_forwards` to `ForwardCache` without mutating the module defaults.
 
 `ignition.runtime_patches.apply()` installs process-local Dynamo, Inductor, and
 Triton fixes after dependency environment setup and before compilation or artifact
@@ -64,8 +68,10 @@ loading. It requires Torch 2.14.1+cu132 and Triton 3.8.0, checks replacement sou
 contexts, and leaves dependency files unchanged. Spawned preparation ranks and
 tuning replicas install the fixes before GPU setup. Dependency worker hooks cover
 b12x's offline compiler initializer, Inductor's subprocess sidecar and job workers,
-and direct spawned Inductor workers. The lightweight Triton bootstrap does not
-import Torch or initialize CUDA.
+and direct spawned Inductor workers, and place `sys.path` ahead of
+`torch_package_root` in Inductor subprocess `PYTHONPATH` so workspace and
+virtual-environment packages are not shadowed. The lightweight Triton bootstrap
+does not import Torch or initialize CUDA.
 
 The runtime patches defer mutation-region recomputation during single-node
 auto-functionalization decomposition, directly construct eligible no-clone
@@ -176,6 +182,12 @@ dependencies to reuse storage within a combined pool. A temporary allocated
 inside an opaque operator cannot participate in that planning.
 Tensors retained by constructors appear as external storage inputs to compilation.
 Their owners keep those allocations alive across graph variants.
+
+Cloned temporaries that opaque operations mutate retain an explicit materialization
+boundary during compilation. Their views address the clone's storage, including
+when the clone's source is a slice with a nonzero offset; folding such a clone into
+its source would invalidate the zero-based offsets used to reconstruct mutable
+operands.
 
 Constructors use example tensors to declare layouts and prepare kernels.
 The [declaration tensor helper](../ignition/preparation/examples.py) shares examples

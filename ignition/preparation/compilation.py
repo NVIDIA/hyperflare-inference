@@ -388,6 +388,29 @@ def _lower_storage(module):
             node.target = torch.ops.flare.native_layer_norm.default
         elif node.op == 'call_function' and node.target is torch.ops.aten._fused_rms_norm.default:
             node.target = torch.ops.flare.native_rms_norm.default
+        elif (node.op == 'call_function' and node.target is torch.ops.aten.lift_fresh_copy.default
+                and len(node.args) == 1 and isinstance(node.args[0], torch.fx.Node)
+                and node.args[0].op == 'get_attr'):
+            source = node.args[0]
+            constant = operator.attrgetter(source.target)(module)
+            if (isinstance(constant, torch.Tensor)
+                    and not isinstance(constant, torch._subclasses.FakeTensor)
+                    and constant.ndim == 0 and constant.device.type == 'cpu'):
+                with torch._C._DisableTorchDispatch():
+                    scalar = constant.item()
+                with graph.inserting_before(node):
+                    replacement = graph.call_function(
+                        torch.ops.aten.scalar_tensor.default,
+                        (scalar,),
+                        {'dtype': constant.dtype, 'layout': torch.strided, 'device': torch.device('cpu')},
+                    )
+                    replacement.meta = node.meta.copy()
+                node.replace_all_uses_with(replacement)
+                graph.erase_node(node)
+                if not source.users:
+                    graph.erase_node(source)
+                    if hasattr(module, source.target):
+                        delattr(module, source.target)
     for node in reversed(list(graph.nodes)):
         if (node.op == 'call_function' and isinstance(node.target, torch._ops.OpOverload)
                 and node.target._schema.name in (
@@ -451,6 +474,13 @@ def _lower_storage(module):
     mutations = {node: _mutated_tensors(node) for node in originals if node.op == 'call_function'}
     regions = _storage_regions(originals, keys)
     materialize = _reads_across_mutations(originals, keys, mutations)
+    mutable_keys = {keys[arg] for operands in mutations.values() for arg in operands}
+    for node in originals:
+        if node.target is torch.ops.aten.clone.default and keys.get(node) in mutable_keys:
+            # Functionalization reconstructs mutable views relative to the clone's
+            # zero offset. Folding that clone into an offset source slice makes
+            # those views address the wrong row. Preserve its allocation boundary.
+            materialize.setdefault(node, [])
     dtypes = {}
     for node, key in keys.items():
         dtypes.setdefault(key, set()).add(node.meta['val'].dtype)

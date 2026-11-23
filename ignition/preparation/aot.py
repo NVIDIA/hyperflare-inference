@@ -4,6 +4,7 @@
 
 """Serializable compiled forwards with caller-owned storage and runtime handles."""
 
+import enum
 import hashlib
 import importlib
 import inspect
@@ -119,23 +120,45 @@ class _GuardPickler(GuardsStatePickler):
         from triton.runtime import JITFunction
         from torch._dynamo.aot_compile_types import _deserialize_triton_kernel, _serialize_triton_kernel
 
+        if id(obj) in self.empty_values or id(obj) in self.missing_values:
+            return super().reducer_override(obj)
         if isinstance(obj, torch.device):
             return restore_device, (obj.type, obj.index)
-        if isinstance(obj, torch._subclasses.FakeTensor):
+        if isinstance(obj, torch.Tensor) and obj.device.type != "meta":
+            from torch.utils._python_dispatch import is_traceable_wrapper_subclass
+
+            if id(obj) not in self.guard_tree_values:
+                return _Missing, ('tensor guard tree',)
+            if is_traceable_wrapper_subclass(obj):
+                return super().reducer_override(obj)
             with torch._C._DisableTorchDispatch():
                 meta = torch.empty_strided(obj.shape, obj.stride(), dtype=obj.dtype,
                                           device="meta", requires_grad=obj.requires_grad)
-            from .forward_metadata import _TENSOR_KINDS
-            kinds = _TENSOR_KINDS.get()
-            kind = torch._subclasses.FakeTensor if kinds is None else kinds.get(obj, torch._subclasses.FakeTensor)
-            deferred = kind is torch._subclasses.FakeTensor
-            return type(self)._unpickle_tensor, (meta, obj.device, torch.Tensor if deferred else kind,
-                torch._C._dispatch_keys(obj).raw_repr(), obj.grad, deferred)
+            from .forward_metadata import _TENSOR_KINDS, _set_state, _tensor_user_attributes
+            if isinstance(obj, torch._subclasses.FakeTensor):
+                kinds = _TENSOR_KINDS.get()
+                kind = torch._subclasses.FakeTensor if kinds is None else kinds.get(obj, torch._subclasses.FakeTensor)
+                deferred = kind is torch._subclasses.FakeTensor
+                pytype = torch.Tensor if deferred else kind
+            else:
+                deferred = False
+                pytype = type(obj)
+            args = (meta, obj.device, pytype,
+                    torch._C._dispatch_keys(obj).raw_repr(), obj.grad, deferred)
+            user_attrs = _tensor_user_attributes(obj)
+            if user_attrs:
+                state = {key: value if id(value) in self.guard_tree_values
+                         else _Missing('unguarded attribute')
+                         for key, value in user_attrs.items()}
+                return type(self)._unpickle_tensor, args, state, None, None, _set_state
+            return type(self)._unpickle_tensor, args
         if isinstance(obj, JITFunction):
             return _deserialize_triton_kernel, (_serialize_triton_kernel(obj),)
         if (hasattr(obj, '__dict__')
                 and type(obj).__module__.startswith(('ignition.', 'b12x.'))
-                and not inspect.isclass(obj) and not isinstance(obj, (torch.Tensor, torch.nn.Module))):
+                and not inspect.isclass(obj)
+                and not isinstance(obj, (torch.Tensor, torch.nn.Module, enum.Enum,
+                                         int, float, str, bytes, dict, list, tuple, set, frozenset))):
             state = {key: value if id(value) in self.guard_tree_values
                      else _Missing('unguarded attribute')
                      for key, value in vars(obj).items()}
