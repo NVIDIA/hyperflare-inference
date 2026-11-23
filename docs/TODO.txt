@@ -346,3 +346,11 @@
     on SM103 GPUs alongside --row-shard-prefill. Close each target when
     tensor-parallel export with replicated attention weights and native flare
     run serving pass on that hardware and transport.
+
+[ ] Qualify Gemma 4 vision end-to-end once the companion Gemma 4 vision recipe
+    is wired (declaring `vision.patch_features = 768` alongside the
+    `ImageLayoutKind::Bracketed` + `ImagePreparationKind::Gemma4` contract):
+    verify E2B, E4B, 26B-A4B, and 31B checkpoints through export and native
+    serving (Gemma 4 12B uses `gemma4_unified` and is outside this profile),
+    and audit prefix-cache behavior when a cached prefix ends inside an atomic
+    image envelope (partial-span cache hit).
