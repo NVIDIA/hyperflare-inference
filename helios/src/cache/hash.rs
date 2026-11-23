@@ -35,9 +35,22 @@ pub struct PrefixHistory {
 
 impl PrefixHistory {
     pub fn new(identity: [u8; 32]) -> Self {
+        Self::with_request_scalars(identity, std::iter::empty::<(&str, f32)>())
+    }
+
+    pub fn with_request_scalars<'a>(
+        identity: [u8; 32],
+        scalars: impl IntoIterator<Item = (&'a str, f32)>,
+    ) -> Self {
         let mut hash = Blake2b::<U16>::new();
         hash.update(b"flare-prefix-root-v1\0");
         hash.update(identity);
+        for (name, value) in scalars {
+            let value = if value == 0. { 0. } else { value };
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+            hash.update(value.to_bits().to_le_bytes());
+        }
         Self {
             identity,
             boundaries: vec![PrefixKey {

@@ -315,7 +315,7 @@ fn completion_refreshes_restored_parent_without_refreshing_its_ancestors() {
     let seed = s.admit(spec(Some(70), 140, 3)).unwrap();
     finish(&mut s, seed);
     let request = spec(Some(70), 200, 5);
-    let plan = s.plan_admission(&request).unwrap();
+    let plan = s.plan_admission_with_scalars(&request, &[], &Default::default()).unwrap();
     let ancestor = plan.lookup.checkpoint.unwrap();
     let key = history(200).key_at(200).unwrap();
     let pages = 200 / 64 - plan.lookup.consumed_tokens as usize / 64;

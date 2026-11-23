@@ -47,6 +47,7 @@ pub struct Inputs {
     /// Grammar-mask byte ranges (buffer, offset, length) that already hold an unconstrained mask.
     unconstrained_masks: Vec<(String, usize, usize)>,
     integers: Vec<i64>,
+    scalars: Vec<f32>,
     values: Vec<i64>,
 }
 
@@ -142,12 +143,18 @@ impl Inputs {
                             );
                         }
                         if matches!(binding.indexing, SubmissionRow | RequestRow | ActiveRow)
-                            && elements < config.limits.request_capacity() * width
+                            && config
+                                .limits
+                                .request_capacity()
+                                .checked_mul(width)
+                                .is_none_or(|required| elements < required)
                         {
                             return Err("row input cannot cover the prepared request slots".into());
                         }
-                        if matches!(binding.source, SamplingParameters | ImageTensor | PageTable)
-                            && binding.value_offset != 0
+                        if matches!(
+                            binding.source,
+                            SamplingParameters | ScalarArgument | ImageTensor | PageTable
+                        ) && binding.value_offset != 0
                         {
                             return Err("value offset requires an integer value source".into());
                         }
@@ -167,7 +174,10 @@ impl Inputs {
                             } else {
                                 graph.packed_tokens()
                             };
-                            if elements < rows * width {
+                            if rows
+                                .checked_mul(width)
+                                .is_none_or(|required| elements < required)
+                            {
                                 return Err(
                                     "packed input cannot cover the graph token capacity".into()
                                 );
@@ -215,13 +225,21 @@ impl Inputs {
                                     | ValueSource::RequestGeneration
                                     | ValueSource::CopyGeneration
                             ) && buffer.dtype != Dtype::Int64)
-                            || (binding.source == ValueSource::SamplingParameters
-                                && buffer.dtype != Dtype::Float32)
-                            || (binding.source != ValueSource::SamplingParameters
-                                && binding.source != ValueSource::ImageTensor
-                                && !matches!(buffer.dtype, Dtype::Int32 | Dtype::Int64))
+                            || (matches!(
+                                binding.source,
+                                ValueSource::SamplingParameters | ValueSource::ScalarArgument
+                            ) && buffer.dtype != Dtype::Float32)
+                            || (!matches!(
+                                binding.source,
+                                ValueSource::SamplingParameters
+                                    | ValueSource::ScalarArgument
+                                    | ValueSource::ImageTensor
+                            ) && !matches!(buffer.dtype, Dtype::Int32 | Dtype::Int64))
                             || (binding.indexing != InputIndexing::Scalar
-                                && elements < width * graph.batch_capacity)
+                                && graph
+                                    .batch_capacity
+                                    .checked_mul(width)
+                                    .is_none_or(|required| elements < required))
                         {
                             return Err(format!(
                                 "invalid shape or dtype for semantic input {}",
@@ -257,6 +275,14 @@ impl Inputs {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let scalar_capacity = if graphs.iter().flat_map(|graph| &graph.inputs).any(|input| {
+            input.binding.source == ValueSource::ScalarArgument
+                && input.binding.indexing == InputIndexing::SubmissionRow
+        }) {
+            config.limits.request_capacity()
+        } else {
+            0
+        };
         let maximum = graphs
             .iter()
             .flat_map(|g| &g.inputs)
@@ -270,6 +296,7 @@ impl Inputs {
             pages: vec![[(0, 0); REQUEST_LANES]; config.contract.cache.page_tables.len()],
             unconstrained_masks: Vec::new(),
             integers: Vec::with_capacity(maximum),
+            scalars: Vec::with_capacity(scalar_capacity),
             values: Vec::with_capacity(maximum),
         })
     }
@@ -347,7 +374,11 @@ impl Inputs {
                         .iter()
                         .find(|t| t.buffer == input.binding.tensor)
                         .ok_or("image layout did not produce a required tensor")?;
-                    if tensor.offset + tensor.bytes.len() > input.elements * input.dtype.size() {
+                    if tensor
+                        .offset
+                        .checked_add(tensor.bytes.len())
+                        .is_none_or(|end| end > input.elements * input.dtype.size())
+                    {
                         return Err("image tensor exceeds prepared graph capacity".into());
                     }
                     self.staging.put(
@@ -455,13 +486,24 @@ impl Inputs {
                 continue;
             }
             if binding.indexing == InputIndexing::SubmissionRow {
-                self.integers.clear();
-                self.integers.resize(
-                    frame.config.limits.request_capacity() * input.width,
-                    binding.padding,
-                );
+                let elements = frame
+                    .config
+                    .limits
+                    .request_capacity()
+                    .checked_mul(input.width)
+                    .ok_or("submission-row input extent overflow")?;
+                if elements > input.elements {
+                    return Err("packed values exceed prepared input storage".into());
+                }
+                if binding.source == ValueSource::ScalarArgument {
+                    self.scalars.clear();
+                    self.scalars.resize(elements, 0.);
+                } else {
+                    self.integers.clear();
+                    self.integers.resize(elements, binding.padding);
+                }
             }
-            let mut token_offset = 0;
+            let mut token_offset: usize = 0;
             for (row, lane) in frame.step.lanes.iter().enumerate() {
                 let slot = lane.request.slot as usize;
                 let admission = frame.admissions[slot]
@@ -470,22 +512,57 @@ impl Inputs {
                 let live = frame.scheduler.request(lane.request)?;
                 let lane_kind = frame.step.lane_kind(row);
                 let destination = match binding.indexing {
-                    InputIndexing::SubmissionRow | InputIndexing::ActiveRow => row * input.width,
-                    InputIndexing::RequestRow => slot * input.width,
-                    InputIndexing::PackedToken => token_offset * input.width,
+                    InputIndexing::SubmissionRow | InputIndexing::ActiveRow => {
+                        row.checked_mul(input.width)
+                    }
+                    InputIndexing::RequestRow => slot.checked_mul(input.width),
+                    InputIndexing::PackedToken => token_offset.checked_mul(input.width),
                     InputIndexing::Scalar => unreachable!(),
-                };
-                token_offset += lane.tokens;
+                }
+                .ok_or("packed input offset overflow")?;
+                token_offset = token_offset
+                    .checked_add(lane.tokens)
+                    .ok_or("packed token offset overflow")?;
                 if binding.source == ValueSource::SamplingParameters {
-                    self.staging.put(
-                        &binding.buffer,
-                        destination * 4,
-                        admission
-                            .sampling
-                            .values()
-                            .into_iter()
-                            .flat_map(f32::to_le_bytes),
-                    );
+                    let values = admission.sampling.values();
+                    write_floats(&mut self.staging, input, destination, &values)?;
+                    continue;
+                }
+                if binding.source == ValueSource::ScalarArgument {
+                    let value = admission
+                        .request_scalars
+                        .get(&binding.argument)
+                        .copied()
+                        .ok_or("scalar-argument admission is incomplete")?;
+                    let planned = live
+                        .request_scalars()
+                        .get(&binding.argument)
+                        .copied()
+                        .ok_or("scalar-argument admission plan is incomplete")?;
+                    if value.to_bits() != planned.to_bits() {
+                        return Err(
+                            "packed scalar argument differs from its prefix-history value".into()
+                        );
+                    }
+                    if destination
+                        .checked_add(1)
+                        .is_none_or(|end| end > input.elements)
+                    {
+                        return Err("packed values exceed prepared input storage".into());
+                    }
+                    if binding.indexing == InputIndexing::SubmissionRow {
+                        *self
+                            .scalars
+                            .get_mut(destination)
+                            .ok_or("packed values exceed scalar staging storage")? = value;
+                    } else {
+                        write_floats(
+                            &mut self.staging,
+                            input,
+                            destination,
+                            std::slice::from_ref(&value),
+                        )?;
+                    }
                     continue;
                 }
                 if binding.source == ValueSource::GrammarMask
@@ -769,10 +846,14 @@ impl Inputs {
                     if values.len() != input.width {
                         return Err("submission row has an invalid value count".into());
                     }
-                    for (to, value) in self.integers[destination..destination + input.width]
-                        .iter_mut()
-                        .zip(values.iter())
-                    {
+                    let end = destination
+                        .checked_add(input.width)
+                        .ok_or("submission-row input extent overflow")?;
+                    let target = self
+                        .integers
+                        .get_mut(destination..end)
+                        .ok_or("packed values exceed integer staging storage")?;
+                    for (to, value) in target.iter_mut().zip(values.iter()) {
                         *to = value
                             .checked_add(binding.value_offset)
                             .ok_or("input value overflow")?;
@@ -781,14 +862,48 @@ impl Inputs {
                     write_integers(&mut self.staging, input, destination, &values)?;
                 }
             }
-            if binding.indexing == InputIndexing::SubmissionRow
-                && binding.source != ValueSource::SamplingParameters
-            {
-                write_raw(&mut self.staging, input, 0, self.integers.iter().copied())?;
+            if binding.indexing == InputIndexing::SubmissionRow {
+                if binding.source == ValueSource::ScalarArgument {
+                    write_floats(&mut self.staging, input, 0, &self.scalars)?;
+                } else if binding.source != ValueSource::SamplingParameters {
+                    write_raw(
+                        &mut self.staging,
+                        input,
+                        0,
+                        self.integers.len(),
+                        self.integers.iter().copied(),
+                    )?;
+                }
             }
         }
         Ok(())
     }
+}
+
+fn write_floats(
+    staging: &mut UploadBatch,
+    input: &BoundInput,
+    offset: usize,
+    values: &[f32],
+) -> Result<()> {
+    if input.dtype != Dtype::Float32 {
+        return Err("floating-point source requires a float32 input buffer".into());
+    }
+    if offset
+        .checked_add(values.len())
+        .is_none_or(|end| end > input.elements)
+    {
+        return Err("packed values exceed prepared input storage".into());
+    }
+    let byte_offset = offset
+        .checked_mul(input.dtype.size())
+        .ok_or("packed input byte offset overflow")?;
+    staging.put(
+        &input.binding.buffer,
+        byte_offset,
+        values.iter().flat_map(|value| (*value).to_le_bytes()),
+    );
+    Ok(())
 }
 
 fn write_integers(
@@ -809,6 +924,7 @@ fn write_integers(
         staging,
         input,
         offset,
+        values.len(),
         values.iter().map(|v| v + input.binding.value_offset),
     )
 }
@@ -817,15 +933,25 @@ fn write_raw(
     staging: &mut UploadBatch,
     input: &BoundInput,
     offset: usize,
+    count: usize,
     values: impl Iterator<Item = i64> + Clone,
 ) -> Result<()> {
+    if offset
+        .checked_add(count)
+        .is_none_or(|end| end > input.elements)
+    {
+        return Err("packed values exceed prepared input storage".into());
+    }
+    let byte_offset = offset
+        .checked_mul(input.dtype.size())
+        .ok_or("packed input byte offset overflow")?;
     match input.dtype {
-        Dtype::Int64 => staging.i64(&input.binding.buffer, offset * 8, values),
+        Dtype::Int64 => staging.i64(&input.binding.buffer, byte_offset, values),
         Dtype::Int32 => {
             if values.clone().any(|value| i32::try_from(value).is_err()) {
                 return Err("input value exceeds int32".into());
             }
-            staging.i32(&input.binding.buffer, offset * 4, values.map(|v| v as i32));
+            staging.i32(&input.binding.buffer, byte_offset, values.map(|v| v as i32));
         }
         _ => return Err("integer source requires an integer input buffer".into()),
     }

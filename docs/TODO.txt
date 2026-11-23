@@ -323,3 +323,55 @@
     dense Qwen3.8, and read each one's pre-tokenizer for Metaspace (see the test
     header). Close when each passes and none uses Metaspace, or loading rejects
     one that does.
+
+[ ] Decide whether Helios should require each declared scalar argument
+    (`ModelContract.scalar_arguments`) to be bound on every graph that reads its
+    destination. Validation requires at least one selected binding per argument
+    and cannot see which captured graphs read a persistent buffer, so a graph that
+    reads the destination without binding it can read another request's value
+    from a reused request slot. Close when the rule is enforced with tests, or
+    the owner decides the obligation stays with the recipe.
+
+[ ] Export a declaring core from an external recipe with the tooling of this
+    revision and serve it with this revision's CLI. The declaring core in these
+    measurements was exported by an earlier iteration of the export code, not by
+    the tooling of this revision. Close when a core exported on this revision
+    passes the prefix-isolation check and the grammar-fixed continuation checks
+    (two rows and eight rows) on this revision's CLI, against a fixed same-gain
+    reference with identical same-gain repeats at each row count.
+
+[ ] Qualify declared scalar arguments in mixed batches at 16 and at 32
+    concurrent requests, and with speculative decoding. At eight rows the
+    fixed-reference comparison gives 3,789 of 4,096 and the same-gain repeats
+    are not identical, so that row count is not qualified. A check needs a core
+    whose decode graphs take that many rows and a nonzero supported draft
+    setting, with an observed speculative launch that carries an argument.
+    Compare each mixed row with one fixed same-gain reference and require the
+    same-gain repeats to be identical at that row count. Close when each of the
+    three passes, or the limit is stated where the arguments are declared.
+
+[ ] Isolate the cost of declared scalar arguments to a core that declares none:
+    measure the same declaration-free core and workload on the base revision
+    and on this change with repeated alternating runs. The one run per build
+    (order stock, this CLI, stock, production draft settings) puts this CLI
+    outside the two stock runs on all four metrics, in both directions, which
+    does not isolate a cost. Close when the declaration-free cost is isolated.
+
+[ ] Explain the batch-to-batch numeric variation on a core that declares none:
+    two CLIs give different logprobs for one forced continuation (0 of 512
+    values equal at two rows, 0 of 2,048 at eight rows, in plain decode and
+    with speculative decoding), and one CLI does not reproduce itself across
+    two starts (0 of 512, largest 2.93; 0 of 2,048, largest 8.13). Within one
+    process, cached batches repeat exactly at two rows and agree to within
+    0.000004 at eight rows, with one observer outlier of 0.49. On this one
+    forced continuation the cross-build differences are of the same order as
+    the stock CLI's difference across two starts (2.93 and 8.13): 2.87 and
+    8.17 with draft settings, 3.03 and 5.54 in plain decode, and 2.19, 2.30
+    and 6.78 in the follow-up control, so the comparison does not isolate
+    this change. Close when the variation is explained.
+
+[ ] Explain why unconstrained chat top-logprobs exceed a 0.05 tolerance between
+    matched batches: 1,244 matched pairs on the core without declarations with
+    no scalar request, and 332 pairs with the other row's gain changed plus
+    520 same-gain repeats on the declaring core. Close when a cause is
+    identified or the comparison is shown not to apply.

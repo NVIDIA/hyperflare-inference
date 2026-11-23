@@ -52,6 +52,25 @@ def layout(**overrides):
                   page_views={"page_tables": 0, "draft_page_tables": 1})
 
 
+def test_layout_constructor_preserves_positional_fields_and_keeps_extensions_keyword_only():
+    from inspect import Parameter, signature
+
+    fixture = layout()
+    copied = Layout(
+        fixture.capacity, fixture.max_active, fixture.context, fixture.page_tokens,
+        fixture.table_width, fixture.pages, fixture.snapshots, fixture.prefill_chunk,
+        fixture.vocabulary, fixture.eos, fixture.graphs, fixture.bindings,
+        fixture.buffer_specs, fixture.page_views, fixture.widths, fixture.fixed_width,
+        fixture.state_rows_per_request, fixture.draft_pages, fixture.record_fields,
+        fixture.confidence_widths, fixture.completion_cursors,
+        buffer_contiguity=fixture.buffer_contiguity, scalar_arguments=fixture.scalar_arguments)
+    assert (copied.page_views, copied.widths, copied.fixed_width, copied.state_rows_per_request) == (
+        fixture.page_views, fixture.widths, fixture.fixed_width, fixture.state_rows_per_request)
+    parameters = signature(Layout).parameters
+    assert parameters["buffer_contiguity"].kind == Parameter.KEYWORD_ONLY
+    assert parameters["scalar_arguments"].kind == Parameter.KEYWORD_ONLY
+
+
 def request(ident, prompt, limit=8, seed=0):
     return Request(ident, prompt, limit, SamplingParameters(seed=seed, temperature=1., top_p=.95))
 
@@ -154,6 +173,40 @@ def test_a_cold_request_initializes_prefills_in_chunks_snapshots_and_decodes():
     retired = scheduler.complete(step, records(scheduler, step, {first: (2, 703, [7], 0)}))
     assert retired == [first] and first.finish_reason == "stop" and first.slot == 0
     assert scheduler.idle and scheduler.page_pool.available == 64 - 2
+
+
+def test_inflight_capture_coalesces_an_identical_prompt_and_reserves_a_distinct_one():
+    scheduler = Scheduler(layout())
+    capturing = request(1, [10, 11], limit=1)
+    scheduler.submit(capturing)
+    scheduler._admit()
+    capturing.capture = scheduler.free_snapshots.pop(0)
+    free = list(scheduler.free_snapshots)
+
+    same_prompt = request(2, [10, 11], limit=1)
+    assert scheduler._capture(same_prompt) is False
+    assert same_prompt.capture is None and scheduler.free_snapshots == free
+
+    distinct = request(3, [9, 11], limit=1)
+    assert scheduler._capture(distinct) is True
+    assert distinct.capture == free[0] and distinct.phase == "snapshot"
+
+
+def test_inflight_capture_separates_two_scalar_values_of_one_prompt():
+    scheduler = Scheduler(scalar_layout())
+    capturing = Request(1, [10, 11], 1, SamplingParameters(), request_scalars={"alpha": 0.5})
+    scheduler.submit(capturing)
+    scheduler._admit()
+    capturing.capture = scheduler.free_snapshots.pop(0)
+    free = list(scheduler.free_snapshots)
+
+    same_value = Request(2, [10, 11], 1, SamplingParameters(), request_scalars={"alpha": 0.5})
+    assert scheduler._capture(same_value) is False
+    assert same_value.capture is None and scheduler.free_snapshots == free
+
+    other_value = Request(3, [10, 11], 1, SamplingParameters(), request_scalars={"alpha": 0.75})
+    assert scheduler._capture(other_value) is True
+    assert other_value.capture == free[0] and other_value.phase == "snapshot"
 
 
 def test_an_identical_prompt_restores_its_checkpoint_and_shares_its_complete_pages():
@@ -408,7 +461,6 @@ def test_layout_selects_the_serving_variant_of_each_graph(prefill_only):
     assert result.graphs == expected
     assert (result.capacity, result.max_active, result.table_width, result.draft_pages) == (4, 3, 32, 1)
     assert (result.execution_width, result.state_row(2), result.snapshot_row(1)) == (2, 3, 5)
-
 
 
 def test_native_confidence_uses_conditional_survival_without_observed_acceptance_updates():
@@ -720,3 +772,330 @@ def test_terminal_prefill_contract_and_signature():
     assert contracts[0]["kind"] == p.TERMINAL_PREFILL == 14
     assert contracts[0]["embedding_tables"] == [0, 1]
     assert contracts[0]["pending_token"] is not None
+
+
+def test_scalar_argument_declaration_reaches_the_wire_contract():
+    from google.protobuf import json_format
+
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
+
+    def graphs(binding):
+        return [{"graph": "init128", "kind": p.INIT, "state": [], "tuned_bindings": [],
+                 "state_rows_per_request": 1, "inputs": [binding]}]
+
+    def parse(value_bindings, **extra):
+        # The exporter serializes helper output as JSON into the core's ModelContract.
+        contract = c.model_contract(vocabulary=1000, page_tokens=256,
+                                   page_tables=[{"buffer": "page_tables", "page_offset": 0}],
+                                   graphs=value_bindings, frontend={}, regions=[], **extra)
+        return contract, json_format.ParseDict(contract, p.ModelContract())
+
+    scalar = c.binding("request_gain", p.SCALAR_ARGUMENT, p.REQUEST_ROW, argument="gain")
+    declaring, wire = parse(graphs(scalar), scalar_arguments=[
+        c.scalar_argument("gain", 1.0, minimum=0.5, maximum=1.5)])
+    assert [(a.name, a.default_value, a.range.min, a.range.max) for a in wire.scalar_arguments] == [
+        ("gain", 1.0, 0.5, 1.5)]
+    binding = wire.graphs[0].inputs[0]
+    assert (binding.source, binding.indexing, binding.argument) == (p.SCALAR_ARGUMENT, p.REQUEST_ROW, "gain")
+    assert p.ModelContract.FromString(wire.SerializeToString()) == wire
+    # A contract without declarations omits both new fields and decodes them as empty.
+    plain, plain_wire = parse(graphs(c.binding("row_slot_ids", p.REQUEST_SLOT, padding=-1)))
+    assert "scalar_arguments" not in plain and "argument" not in plain["graphs"][0]["inputs"][0]
+    assert list(plain_wire.scalar_arguments) == [] and plain_wire.graphs[0].inputs[0].argument == ""
+    assert plain_wire.graphs[0].inputs[0].source == p.REQUEST_SLOT
+
+
+def scalar_layout(default=0.0, *, minimum=None, maximum=None, rows=None, column=False, contiguity=True,
+                  tensor=""):
+    """The test fixture with one request-row scalar binding and a `request_alpha` buffer.
+
+    `rows`, `column`, `contiguity` and `tensor` override the buffer and the binding, so a negative test
+    starts from the accepted layout and changes one property.
+    """
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
+
+    lay = layout()
+    scalar_arg = c.scalar_argument("alpha", default, minimum=minimum, maximum=maximum)
+    bindings = {name: list(fields) for name, fields in lay.bindings.items()}
+    first_graph = next(iter(bindings))
+    bindings[first_graph] = bindings[first_graph] + [
+        c.binding("request_alpha", p.SCALAR_ARGUMENT, p.REQUEST_ROW, tensor=tensor, argument="alpha")
+    ]
+    specs = dict(lay.buffer_specs)
+    shape = (lay.capacity if rows is None else rows,) + ((1,) if column else ())
+    specs["request_alpha"] = (np.dtype("float32"), shape)
+    return Layout(
+        capacity=lay.capacity, max_active=lay.max_active, context=lay.context,
+        page_tokens=lay.page_tokens, table_width=lay.table_width, pages=lay.pages,
+        snapshots=lay.snapshots, prefill_chunk=lay.prefill_chunk, vocabulary=lay.vocabulary,
+        eos=lay.eos, graphs=lay.graphs, widths=lay.widths, fixed_width=lay.fixed_width,
+        bindings=bindings, buffer_specs=specs, buffer_contiguity={"request_alpha": contiguity},
+        scalar_arguments=(scalar_arg,),
+        page_views=lay.page_views, state_rows_per_request=lay.state_rows_per_request,
+        draft_pages=lay.draft_pages, record_fields=lay.record_fields,
+        confidence_widths=lay.confidence_widths, completion_cursors=lay.completion_cursors,
+    )
+
+
+def test_direct_prefill_packs_scalar_and_only_matching_prompt_state_is_restored():
+    scheduler = Scheduler(scalar_layout())
+    prompt = [10, 11, 12]
+    for ident, alpha in enumerate((0.5, 0.75), start=1):
+        req = Request(ident, prompt, 1, SamplingParameters(), request_scalars={"alpha": alpha})
+        scheduler.submit(req)
+        init = scheduler.plan()
+        assert init.kind == "init" and req.reused == 0
+        scheduler.complete(init, records(scheduler, init, {req: (1, 0, [], 0)}))
+        prefill = scheduler.plan()
+        assert prefill.kind == "prefill"
+        assert [(offset, bytes(data)) for name, offset, data in scheduler.pack(prefill)
+                if name == "request_alpha"] == [(req.slot * 4, np.float32(alpha).tobytes())]
+        scheduler.complete(prefill, records(scheduler, prefill, {req: (2, len(prompt), [42], 0)}))
+        snapshot = scheduler.plan()
+        assert snapshot.kind == "snapshot"
+        scheduler.complete(snapshot, records(scheduler, snapshot, {req: (2, len(prompt), [], 0)}))
+    again = Request(3, prompt, 1, SamplingParameters(), request_scalars={"alpha": 0.5})
+    scheduler.submit(again)
+    assert scheduler.plan().kind == "restore" and again.reused == len(prompt)
+
+
+@pytest.mark.parametrize("default,minimum,maximum", [
+    (16_777_217, 16_777_216, 16_777_216),
+    (16_777_216, 16_777_217, 16_777_217),
+])
+def test_scalar_declarations_validate_and_resolve_after_wire_fp32_normalization(default, minimum, maximum):
+    lay = scalar_layout(default, minimum=minimum, maximum=maximum)
+    assert lay.scalar_arguments == ({
+        "name": "alpha",
+        "default_value": 16_777_216.0,
+        "range": {"min": 16_777_216.0, "max": 16_777_216.0},
+    },)
+    assert lay.resolve_request_scalars({}) == {"alpha": 16_777_216.0}
+
+
+def test_direct_model_card_uses_wire_fp32_scalar_declarations(monkeypatch):
+    from types import SimpleNamespace
+
+    from ignition.direct import server as direct_server
+
+    class HTTPServer:
+        def __init__(self, *args):
+            pass
+
+    lay = scalar_layout(16_777_217)
+    monkeypatch.setattr(direct_server, "Layout", SimpleNamespace(of=lambda model: lay))
+    monkeypatch.setattr(direct_server, "_Frontend", lambda config: None)
+    monkeypatch.setattr(direct_server, "RankSteps", lambda *args, **kwargs: None)
+    monkeypatch.setattr(direct_server, "ThreadingHTTPServer", HTTPServer)
+    server = direct_server.DirectServer(
+        SimpleNamespace(server_config={}), (), bind="127.0.0.1:0", eager=False,
+        served_names=("test-model",), verbose=False)
+    assert server.model_cards == [{
+        "id": "test-model",
+        "object": "model",
+        "owned_by": "flare",
+        "flare": {"request_scalars": [{
+            "name": "alpha",
+            "default": 16_777_216.0,
+            "range": None,
+        }]},
+    }]
+
+
+def test_admitted_scalar_values_cannot_change_before_checkpoint_publication():
+    scheduler = Scheduler(scalar_layout())
+    source = {"alpha": 0.5}
+    req = Request(1, [11, 12], 2, SamplingParameters(), request_scalars=source)
+    scheduler.validate(req)  # The direct HTTP server validates before submitting.
+    scheduler.submit(req)
+    source["alpha"] = 1.0
+    with pytest.raises(TypeError):
+        req.request_scalars["alpha"] = 1.0
+    with pytest.raises(AttributeError):
+        req.request_scalars = source
+    assert scheduler.layout.scalar_identity(req.request_scalars) == (("alpha", 0x3f000000),)
+
+
+def test_direct_request_rejects_list_of_scalar_pairs():
+    with pytest.raises(AdmissionError, match="must be an object"):
+        Request(1, [11, 12], 2, SamplingParameters(), request_scalars=[("alpha", 1)])
+
+
+def test_request_scalar_integer_boundary_matches_helios_f64_semantics():
+    lay = scalar_layout()
+    f32_max = float(np.finfo(np.float32).max)
+    # JSON integer int(f32::MAX) + 1 rounds to f32::MAX as f64; Helios accepts it, so must --direct.
+    boundary = int(f32_max) + 1
+    assert lay.resolve_request_scalars({"alpha": boundary})["alpha"] == float(np.float32(boundary))
+    # A much larger integer is rejected.
+    with pytest.raises(AdmissionError):
+        lay.resolve_request_scalars({"alpha": 1 << 200})
+    # A JSON float above f32::MAX is rejected.
+    with pytest.raises(AdmissionError):
+        lay.resolve_request_scalars({"alpha": f32_max * 2.0})
+
+
+def test_request_scalar_duplicate_large_integers_match_helios_f64_semantics():
+    from ignition.direct.server import _scalar_numbers_equal
+
+    # Two JSON integers above u64::MAX round to the same f64; the duplicate-name
+    # comparison treats them as one value, and both then narrow to the same FP32.
+    # (2^64 is about 1.8e19, well inside the FP32 range, so no rejection follows.)
+    assert _scalar_numbers_equal(18446744073709551616, 18446744073709551617)
+    # Two distinct small integers remain distinct.
+    assert not _scalar_numbers_equal(1, 2)
+    # Integer and matching float compare equal.
+    assert _scalar_numbers_equal(1, 1.0)
+
+
+def test_direct_request_scalar_merge_matches_helios_boundaries():
+    from types import SimpleNamespace
+
+    from ignition.direct.server import _request_scalars
+
+    layout = SimpleNamespace(resolve_request_scalars=lambda values: values)
+
+    def merged(top, nested):
+        body = {
+            "request_scalars": {"alpha": top},
+            "chat_template_kwargs": {"request_scalars": {"alpha": nested}},
+        }
+        result = _request_scalars(body, layout)
+        assert body["chat_template_kwargs"]["request_scalars"] == {"alpha": nested}
+        return result["alpha"]
+
+    assert merged(1, 1.0) == 1.0
+    assert merged(-0.0, 0) == 0.0
+    for top, nested in (
+        ((1 << 64) - 1, float(1 << 64)),
+        (1 << 53, (1 << 53) + 1),
+        (1, 1.00000001),
+        ((1 << 64) + 2048, (1 << 64) + 2049),
+    ):
+        with pytest.raises(AdmissionError):
+            merged(top, nested)
+
+
+def test_direct_request_scalars_leave_the_body_unchanged():
+    import copy
+    from types import SimpleNamespace
+
+    from ignition.direct.server import _request_scalars
+
+    layout = SimpleNamespace(resolve_request_scalars=lambda values: dict(values))
+    body = {
+        "messages": [{"role": "user", "content": "x"}],
+        "chat_template_kwargs": {"request_scalars": {"alpha": 0.5}, "enable_thinking": False},
+    }
+    before = copy.deepcopy(body)
+    assert _request_scalars(body, layout) == {"alpha": 0.5}
+    assert _request_scalars(body, layout) == {"alpha": 0.5}
+    assert body == before
+
+
+def test_direct_render_never_passes_request_scalars_to_the_template():
+    from ignition.direct.server import _Frontend
+
+    class Tokenizer:
+        def __init__(self):
+            self.options = []
+
+        def apply_chat_template(self, messages, **options):
+            self.options.append(options)
+            return [7, 8] if options.get("tokenize") else "rendered"
+
+    frontend = _Frontend.__new__(_Frontend)
+    frontend.tokenizer = Tokenizer()
+    body = {
+        "messages": [{"role": "user", "content": "x"}],
+        "chat_template_kwargs": {"request_scalars": {"alpha": 0.5}, "enable_thinking": False},
+    }
+    assert frontend.render(body) == ([7, 8], "rendered")
+    assert all("request_scalars" not in options for options in frontend.tokenizer.options)
+    assert body["chat_template_kwargs"]["request_scalars"] == {"alpha": 0.5}
+
+
+def test_direct_rejects_a_scalar_binding_that_also_names_a_tensor():
+    # The same layout without the tensor name is accepted, so the tensor name is what rejects it.
+    scalar_layout()
+    with pytest.raises(ValueError):
+        scalar_layout(tensor="some_tensor")
+
+
+def test_direct_rejects_a_scalar_buffer_shorter_than_the_request_capacity():
+    scalar_layout()
+    with pytest.raises(ValueError):
+        scalar_layout(rows=1)
+
+
+def test_direct_rejects_a_scalar_buffer_whose_rows_are_not_dense():
+    # The same shape is accepted when the buffer reports dense rows.
+    scalar_layout(column=True)
+    with pytest.raises(ValueError):
+        scalar_layout(column=True, contiguity=False)
+    with pytest.raises(ValueError):
+        scalar_layout(column=True, contiguity=None)
+
+
+def test_layout_of_checks_the_layout_a_scalar_destination_reports():
+    from types import SimpleNamespace
+
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
+    from ignition.preparation.execution import GraphSignature
+
+    lay = layout()
+    scalar_arg = c.scalar_argument("alpha", 0.0)
+    bindings = {name: list(fields) for name, fields in lay.bindings.items()}
+    first_graph = next(iter(bindings))
+    scalar_binding = c.binding("request_alpha", p.SCALAR_ARGUMENT, p.REQUEST_ROW, argument="alpha")
+    bindings[first_graph] = bindings[first_graph] + [scalar_binding]
+    plain = dict(bindings)
+    plain[first_graph] = [field for field in bindings[first_graph] if field is not scalar_binding]
+
+    class FakeTensor:
+        def __init__(self, arr):
+            self.arr, self.shape, self.dtype = arr, arr.shape, "torch.float32"
+
+        def numel(self):
+            return self.arr.size
+
+    def model(buffer, declared):
+        inputs = bindings[first_graph] if declared else plain[first_graph]
+        return SimpleNamespace(
+            server_config={
+                "max_sequence_tokens": 4096,
+                "pages": 64,
+                "snapshots": 2,
+                "prefill_chunk_size": 512,
+                "model_contract": {
+                    "vocabulary": 1000,
+                    "cache": {"page_tokens": 256, "page_tables": [{"buffer": "page_tables", "page_offset": 0}]},
+                    "graphs": [{"graph": first_graph, "inputs": inputs, "state_rows_per_request": 1}],
+                    "scalar_arguments": [scalar_arg] if declared else [],
+                },
+                "frontend": {"eos_token_ids": [7]},
+            },
+            buffers={
+                "row_slot_ids": FakeTensor(np.zeros(4, dtype=np.int32)),
+                "page_tables": np.zeros((64, 16), dtype=np.int32),
+                "completion_records": np.zeros((4, 32), dtype=np.int64),
+                "request_alpha": buffer,
+            },
+            signatures={first_graph: GraphSignature("prefill", 1, 128)},
+            max_active=4,
+        )
+
+    backing = np.zeros(19, dtype=np.uint8)
+    column = backing[:16].view(np.float32).reshape(4, 1)
+    assert column.strides == (4, 4)
+    assert Layout.of(model(column, True)).buffer_contiguity["request_alpha"] is True
+    # A 5-byte row stride is not dense storage for one FP32 value per request row.
+    strided = np.lib.stride_tricks.as_strided(column, shape=(4, 1), strides=(5, 4))
+    with pytest.raises(ValueError, match="one named FP32 value per request row"):
+        Layout.of(model(strided, True))
+    # A buffer that reports no layout is refused as a scalar destination.
+    opaque = FakeTensor(np.zeros(4, dtype=np.float32))
+    with pytest.raises(ValueError, match="one named FP32 value per request row"):
+        Layout.of(model(opaque, True))
+    # A core that declares no scalar argument does not bind that buffer.
+    assert "request_alpha" not in Layout.of(model(opaque, False)).buffer_contiguity

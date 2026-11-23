@@ -125,6 +125,36 @@ fn hash_matches_independent_blake2b128_vectors() {
 }
 
 #[test]
+fn request_scalar_names_fp32_bits_and_declaration_order_isolate_prefixes() {
+    let tokens = (0..130).collect::<Vec<_>>();
+    let build = |scalars: &[(&str, f32)]| {
+        let mut history =
+            PrefixHistory::with_request_scalars([7; 32], scalars.iter().copied());
+        history.append(&tokens, &[]).unwrap();
+        history
+    };
+    let baseline = build(&[]);
+    let zero = build(&[("alpha", 0.), ("beta", -0.)]);
+    // Declared scalars always salt the root, even when zero, so a zero-valued request
+    // on a scalar-enabled core differs from a history built without scalars.
+    for endpoint in [0, 5, 64, 128, 130] {
+        assert_ne!(baseline.key_at(endpoint), zero.key_at(endpoint));
+    }
+    let first = build(&[("alpha", 0.5), ("beta", 1.)]);
+    let same = build(&[("alpha", 0.5), ("beta", 1.)]);
+    let other_value = build(&[("alpha", 0.25), ("beta", 1.)]);
+    let other_name = build(&[("gamma", 0.5), ("beta", 1.)]);
+    let other_order = build(&[("beta", 1.), ("alpha", 0.5)]);
+    for endpoint in [0, 5, 64, 128, 130] {
+        assert_eq!(first.key_at(endpoint), same.key_at(endpoint));
+        assert_ne!(first.key_at(endpoint), baseline.key_at(endpoint));
+        assert_ne!(first.key_at(endpoint), other_value.key_at(endpoint));
+        assert_ne!(first.key_at(endpoint), other_name.key_at(endpoint));
+        assert_ne!(first.key_at(endpoint), other_order.key_at(endpoint));
+    }
+}
+
+#[test]
 fn chunking_retains_partial_tokens_and_conditioning_until_complete() {
     let mut whole = PrefixHistory::new([7; 32]);
     let events = [

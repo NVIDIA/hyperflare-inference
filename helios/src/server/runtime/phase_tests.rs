@@ -212,6 +212,7 @@ impl Fixture {
             conditioned_inputs: vec![],
             conditioning: vec![],
             sampling: SamplingParameters::default(),
+            request_scalars: Default::default(),
             max_new_tokens: limit,
             reasoning_cut: None,
             stop_sequences: vec![],
@@ -3268,6 +3269,7 @@ fn a_first_pool_lookup_starts_while_blocked_and_retries_when_selected() {
     begin_pool_lookup(
         &mut worker.scheduler,
         worker.store.as_mut().unwrap().as_mut(),
+        &worker.config.contract.scalar_arguments,
         &mut incoming,
     );
     incoming.pool_lookup_started =
@@ -4013,6 +4015,188 @@ fn text_preemption_restores_or_recomputes_every_attention_contract() {
             );
         }
     }
+}
+
+fn enable_request_scalar(config: &mut ModelConfig) {
+    config.contract.scalar_arguments = vec![crate::model::contract::ScalarArgument {
+        name: "gain".into(),
+        default_value: 0.,
+        range: Some(crate::model::contract::ScalarArgumentRange {
+            min: 0.,
+            max: 1.,
+        }),
+    }];
+    for graph in &mut config.contract.graphs {
+        if graph.kind == crate::model::contract::GraphOperation::Vision {
+            continue;
+        }
+        let mut binding = crate::model::testing::binding(
+            "request_gain",
+            crate::model::contract::ValueSource::ScalarArgument,
+            crate::model::contract::InputIndexing::RequestRow,
+            0,
+            0,
+        );
+        binding.argument = "gain".into();
+        graph.inputs.push(binding);
+    }
+}
+
+#[test]
+fn scalar_pool_lookup_retry_preserves_declared_history_and_value() {
+    let mut fixture = Fixture::new();
+    fixture.config.contract = crate::model::testing::metadata();
+    enable_request_scalar(&mut fixture.config);
+    let (sender, receiver) = mpsc::channel();
+    let (mut incoming, _generation) = fixture.incoming(vec![7; 70], 2);
+    incoming.prompt.request_scalars =
+        std::collections::BTreeMap::from([("gain".into(), 0.75)]);
+
+    let mut scalar_history = crate::cache::PrefixHistory::with_request_scalars(
+        fixture.config.identity,
+        [("gain", 0.75)],
+    );
+    scalar_history.append(&incoming.prompt.tokens, &[]).unwrap();
+    let mut default_history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    default_history.append(&incoming.prompt.tokens, &[]).unwrap();
+    assert_ne!(scalar_history.key_at(64), default_history.key_at(64));
+
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(Some(host_hit(&scalar_history, 64)));
+    store.pooled = true;
+    store.refused_lookups = 1;
+    worker.attach_store(Some(Box::new(store)));
+
+    sender.send(vec![incoming]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let handle = worker.active[0].as_ref().unwrap().request;
+    let live = worker.scheduler.request(handle).unwrap();
+    assert_eq!((live.phase, live.reused_prompt_tokens()), (RequestPhase::Inbound, 64));
+    assert_eq!(live.request_scalars()["gain"], 0.75);
+    let store = fake_store(&mut worker);
+    assert_eq!(store.begun, vec![70, 70]);
+    assert_eq!(store.tickets_seen, vec![true]);
+    assert_eq!(store.fetched.len(), 1);
+}
+
+#[test]
+fn scalar_preemption_preserves_prefix_identity_and_packed_value() {
+    let mut fixture = Fixture::new();
+    fixture.config.contract = crate::model::testing::metadata();
+    enable_request_scalar(&mut fixture.config);
+    fixture.config.prepared_sequence_tokens = 4096;
+    fixture.config.limits.max_sequence_tokens = 4096;
+    fixture.config.limits.pages = 6;
+    fixture.config.limits.max_active = 2;
+    let page_tokens = crate::model::scheduler_capabilities(&fixture.config).page_tokens;
+    let budget = (page_tokens * 4) as u32;
+    let data = |count: usize| PromptData {
+        positions: (0..count).map(|position| [position as i64; 3]).collect(),
+        vision_token_indices: vec![-1; count],
+        ..Default::default()
+    };
+    let (sender, receiver) = mpsc::channel();
+    let (mut first, mut first_generation) =
+        fixture.incoming_for(vec![3; 60], budget, data(60));
+    let (mut second, mut second_generation) =
+        fixture.incoming_for(vec![5; 60], budget, data(60));
+    let scalars = std::collections::BTreeMap::from([("gain".into(), 0.75)]);
+    first.prompt.request_scalars = scalars.clone();
+    second.prompt.request_scalars = scalars.clone();
+    sender.send(vec![first, second]).unwrap();
+    let mut worker = fixture.worker_for(receiver);
+    let manifest = crate::model::testing::manifest(&fixture.config);
+    worker.inputs = Some(crate::model::Inputs::new(&fixture.config, &manifest).unwrap());
+    let mut graphs = manifest.graphs;
+    for graph in &mut graphs {
+        graph.estimated_duration_ns =
+            if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
+    }
+    worker.scheduler.measured_graph_durations(&graphs).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+
+    let mut sequence = 0;
+    while worker.parked.is_empty() {
+        sequence += 1;
+        assert!(sequence < (page_tokens * 8) as u64);
+        let step = worker.plan(0).unwrap().0.unwrap();
+        worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
+        let sample = match step.kind {
+            GraphKind::Decode | GraphKind::Resume => Some(1),
+            GraphKind::Prefill => {
+                let lane = &step.lanes[0];
+                let live = worker.scheduler.request(lane.request).unwrap();
+                (lane.start_position as usize + lane.tokens == live.prompt_tokens).then_some(1)
+            }
+            _ => None,
+        };
+        let mut frame = completion(&worker, &step, sequence, sample);
+        frame.timing.gpu_ns[0] =
+            Some(if step.kind == GraphKind::Snapshot { 10 } else { 1000 });
+        worker.complete(step.kind, frame).unwrap();
+        worker.publish().unwrap();
+        while first_generation.events.try_recv().is_ok() {}
+        while second_generation.events.try_recv().is_ok() {}
+    }
+    let (parked_incoming, _) = worker.parked.front().unwrap();
+    assert_eq!(parked_incoming.prompt.request_scalars, scalars);
+    let parked_tokens = parked_incoming.prompt.tokens.clone();
+
+    let request = RequestSpec {
+        prompt: parked_tokens,
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 1,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    let running = worker
+        .active
+        .iter()
+        .flatten()
+        .map(|active| active.request)
+        .collect::<Vec<_>>();
+    worker.retire(&running).unwrap();
+    assert_eq!(
+        worker.scheduler.plan_admission_with_scalars(&request, &[], &Default::default()).unwrap().resident_tokens(),
+        0
+    );
+    assert!(
+        worker
+            .scheduler
+            .plan_admission_with_scalars(
+                &request,
+                &fixture.config.contract.scalar_arguments,
+                &scalars,
+            )
+            .unwrap()
+            .resident_tokens()
+            > 0
+    );
+
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.parked.is_empty());
+    let active = worker.active.iter().flatten().next().unwrap();
+    let readmitted = active.request;
+    assert!(worker.scheduler.request(readmitted).unwrap().reused_prompt_tokens() > 0);
+    sequence += 1;
+    let restore = worker.plan(0).unwrap().0.unwrap();
+    assert_eq!(restore.kind, GraphKind::Restore);
+    worker.reserve_and_pack(&restore, Fence(sequence)).unwrap();
+    let upload = worker
+        .inputs
+        .as_ref()
+        .unwrap()
+        .uploads()
+        .into_iter()
+        .find(|upload| {
+            upload.buffer == "request_gain"
+                && upload.offset == readmitted.slot as usize * 4
+        })
+        .unwrap();
+    assert_eq!(upload.bytes, 0.75f32.to_le_bytes());
 }
 
 #[test]
@@ -5982,7 +6166,7 @@ fn unpinned_checkpoint(
         prompt_logprobs: false,
         growable_output: true,
     };
-    let plan = worker.scheduler.plan_admission(&spec).unwrap();
+    let plan = worker.scheduler.plan_admission_with_scalars(&spec, &[], &Default::default()).unwrap();
     let key = plan.history().key_at(end as u64).unwrap();
     let pages = (end as u64 - plan.resident_tokens()) as usize / 64;
     let admitted = worker
@@ -6144,7 +6328,7 @@ fn publication_copy_pins_survive_ancestor_compaction() {
         prompt_logprobs: false,
         growable_output: true,
     };
-    let plan = worker.scheduler.plan_admission(&spec).unwrap();
+    let plan = worker.scheduler.plan_admission_with_scalars(&spec, &[], &Default::default()).unwrap();
     let key = plan.history().key_at(64).unwrap();
     worker
         .scheduler

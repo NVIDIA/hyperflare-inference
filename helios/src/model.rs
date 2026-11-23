@@ -25,6 +25,8 @@ pub use admission::Admission;
 pub use contract::PreparedContract;
 pub use inputs::{InputStep, pack_inputs};
 pub use packing::Inputs;
+
+pub type RequestScalars = std::collections::BTreeMap<String, f32>;
 #[cfg(feature = "server")]
 pub use prompt::{
     declared_control_tokens, prepare_image_inputs, prepare_input, prepare_output, reasoning_delimiter_tokens,

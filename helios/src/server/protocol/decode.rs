@@ -46,6 +46,63 @@ fn reject(v: &Value, keys: &[&str]) -> Result<()> {
     }
     Ok(())
 }
+fn request_scalar_map(
+    value: &Value,
+) -> Result<std::collections::BTreeMap<String, (serde_json::Number, f32)>> {
+    let object = value
+        .as_object()
+        .ok_or("request_scalars must be a JSON object")?;
+    let mut result = std::collections::BTreeMap::new();
+    for (name, value) in object {
+        if name.is_empty() {
+            return Err("request_scalars names must be nonempty".into());
+        }
+        let number = value
+            .as_number()
+            .ok_or_else(|| format!("request_scalars.{name} must be a finite FP32 number"))?;
+        let wide = number
+            .as_f64()
+            .filter(|value| value.is_finite() && value.abs() <= f32::MAX as f64)
+            .ok_or_else(|| format!("request_scalars.{name} must be a finite FP32 number"))?;
+        let narrowed = wide as f32;
+        if !narrowed.is_finite() || (wide != 0. && narrowed == 0.) {
+            return Err(format!("request_scalars.{name} is outside the finite FP32 range").into());
+        }
+        result.insert(
+            name.clone(),
+            (number.clone(), if narrowed == 0. { 0. } else { narrowed }),
+        );
+    }
+    Ok(result)
+}
+
+fn scalar_numbers_equal(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    let integer = |value: &serde_json::Number| {
+        value
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| value.as_u64().map(i128::from))
+    };
+    let integer_float_equal = |integer: i128, float: f64| {
+        float.is_finite()
+            && float.fract() == 0.
+            && float >= i128::MIN as f64
+            && float < -(i128::MIN as f64)
+            && float as i128 == integer
+            && integer as f64 == float
+    };
+    match (integer(left), integer(right)) {
+        (Some(left), Some(right)) => left == right,
+        (Some(integer), None) => right
+            .as_f64()
+            .is_some_and(|float| integer_float_equal(integer, float)),
+        (None, Some(integer)) => left
+            .as_f64()
+            .is_some_and(|float| integer_float_equal(integer, float)),
+        (None, None) => left.as_f64() == right.as_f64(),
+    }
+}
+
 fn strings(v: Option<&Value>) -> Result<Vec<String>> {
     match v {
         None | Some(Value::Null) => Ok(vec![]),
@@ -584,14 +641,36 @@ fn options(body: &Value, protocol: Protocol) -> Result<Options> {
             options.template.insert(key.into(), value.clone());
         }
     }
+    let mut scalars = body
+        .get("request_scalars")
+        .map(request_scalar_map)
+        .transpose()?
+        .unwrap_or_default();
     if present(body, "chat_template_kwargs") {
-        options.template.extend(
-            body["chat_template_kwargs"]
-                .as_object()
-                .ok_or("chat_template_kwargs must be an object")?
-                .clone(),
-        );
+        let mut template = body["chat_template_kwargs"]
+            .as_object()
+            .ok_or("chat_template_kwargs must be an object")?
+            .clone();
+        if let Some(nested) = template.remove("request_scalars") {
+            for (name, (number, value)) in request_scalar_map(&nested)? {
+                if let Some((top, _)) = scalars.get(&name) {
+                    if !scalar_numbers_equal(top, &number) {
+                        return Err(format!(
+                            "top-level and chat_template_kwargs request_scalars.{name} must match"
+                        )
+                        .into());
+                    }
+                } else {
+                    scalars.insert(name, (number, value));
+                }
+            }
+        }
+        options.template.extend(template);
     }
+    options.request_scalars = scalars
+        .into_iter()
+        .map(|(name, (_, value))| (name, value))
+        .collect();
     Ok(options)
 }
 fn raw_prompts(value: &Value) -> Result<Vec<RawPrompt>> {
@@ -939,6 +1018,116 @@ mod tests {
                 serde_json::json!({"tool_calls":[{"function":{"arguments":invalid}}]});
             assert!(normalize_tool_arguments(&mut message).is_err());
         }
+    }
+    #[test]
+    fn request_scalars_are_accepted_by_every_generation_protocol() {
+        for (protocol, body) in [
+            (Protocol::Chat, json!({"messages":[{"role":"user","content":"x"}]})),
+            (Protocol::Completions, json!({"prompt":"x"})),
+            (Protocol::Responses, json!({"input":"x"})),
+            (Protocol::Messages, json!({"max_tokens": 4, "messages":[{"role":"user","content":"x"}]})),
+        ] {
+            let mut body = body;
+            body.as_object_mut()
+                .unwrap()
+                .insert("request_scalars".into(), json!({"alpha": 0.5}));
+            let decoded = decode(protocol, body, false).unwrap();
+            assert_eq!(decoded.request.options.request_scalars["alpha"], 0.5);
+        }
+    }
+
+    #[test]
+    fn request_scalar_maps_merge_without_leaking_into_template_options() {
+        let chat = |extra: Value| {
+            let mut body = json!({"messages":[{"role":"user","content":"x"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            decode(Protocol::Chat, body, false)
+        };
+        let decoded = chat(json!({
+            "request_scalars":{"alpha":0.5,"shared":1},
+            "chat_template_kwargs":{"request_scalars":{"beta":-0.0,"shared":1.0}}
+        }))
+        .unwrap();
+        assert_eq!(
+            decoded.request.options.request_scalars,
+            std::collections::BTreeMap::from([
+                ("alpha".into(), 0.5),
+                ("beta".into(), 0.0),
+                ("shared".into(), 1.0),
+            ])
+        );
+        assert!(!decoded
+            .request
+            .options
+            .template
+            .contains_key("request_scalars"));
+        assert!(chat(json!({
+            "request_scalars":{"shared":1},
+            "chat_template_kwargs":{"request_scalars":{"shared":2}}
+        }))
+        .is_err());
+        assert!(chat(json!({
+            "request_scalars":{"shared":9007199254740992u64},
+            "chat_template_kwargs":{"request_scalars":{"shared":9007199254740993u64}}
+        }))
+        .is_err());
+        for invalid in [
+            json!({"request_scalars":null}),
+            json!({"request_scalars":[]}),
+            json!({"request_scalars":{"alpha":true}}),
+            json!({"request_scalars":{"alpha":"0.5"}}),
+            json!({"request_scalars":{"alpha":1e100}}),
+            json!({"request_scalars":{"alpha":1e-100}}),
+            json!({"chat_template_kwargs":{"request_scalars":null}}),
+        ] {
+            assert!(chat(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn request_scalar_integer_boundary_matches_direct_f64_semantics() {
+        let chat = |value: serde_json::Value| {
+            let mut body = json!({"messages":[{"role":"user","content":"x"}]});
+            body.as_object_mut()
+                .unwrap()
+                .insert("request_scalars".into(), json!({"alpha": value}));
+            decode(Protocol::Chat, body, false)
+        };
+        let boundary: Value =
+            serde_json::from_str("340282346638528859811704183484516925441").unwrap();
+        let decoded = chat(boundary).expect("int(f32::MAX)+1 rounds to f32::MAX as f64");
+        assert_eq!(decoded.request.options.request_scalars["alpha"], f32::MAX);
+        assert!(chat(json!(1e100)).is_err());
+    }
+
+    #[test]
+    fn duplicate_numbers_match_direct_semantics() {
+        let chat = |top: Value, nested: Value| {
+            let mut body = json!({"messages":[{"role":"user","content":"x"}]});
+            body.as_object_mut()
+                .unwrap()
+                .insert("request_scalars".into(), json!({"alpha": top}));
+            body.as_object_mut().unwrap().insert(
+                "chat_template_kwargs".into(),
+                json!({"request_scalars": {"alpha": nested}}),
+            );
+            decode(Protocol::Chat, body, false)
+        };
+        let top: Value = serde_json::from_str("18446744073709551616").unwrap();
+        let nested: Value = serde_json::from_str("18446744073709551617").unwrap();
+        assert!(chat(top, nested).is_ok());
+        assert!(chat(json!(1), json!(2)).is_err());
+        assert!(chat(json!(1), json!(1.0)).is_ok());
+        assert!(chat(json!(-0.0), json!(0)).is_ok());
+        assert!(chat(json!(1), json!(1.00000001)).is_err());
+        assert!(chat(json!(9007199254740992u64), json!(9007199254740993u64)).is_err());
+        let rounded_u64_max: Value = serde_json::from_str("18446744073709551616.0").unwrap();
+        assert!(chat(json!(u64::MAX), rounded_u64_max).is_err());
+        let lower: Value = serde_json::from_str("18446744073709553664").unwrap();
+        let upper: Value = serde_json::from_str("18446744073709553665").unwrap();
+        assert!(chat(lower, upper).is_err());
     }
 }
 #[cfg(test)]

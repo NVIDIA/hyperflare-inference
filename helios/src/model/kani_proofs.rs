@@ -78,6 +78,7 @@ fn completion_fixture(tokens_below_vocabulary: bool) -> CompletionFixture {
                 prefix_boundary: None,
                 image_tokens: None,
             },
+            scalar_arguments: Vec::new(),
         },
         identity: [0; 32],
         model_id: String::new(),

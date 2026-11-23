@@ -59,7 +59,7 @@ contract_enum!(ValueSource {
     EosTokenIds = 26, EosCount = 27, PromptHistogram = 28, GrammarMask = 29,
     GrammarEnabled = 30, CopyTokenIds = 31, CopyTokenCount = 32,
     CopyConsumedTokens = 33, CopyGeneration = 34, CopyGrammarMask = 35,
-    CopyGrammarCount = 36, ImageTensor = 37, ImageFeatureSlot = 38, PromptTargetToken = 39, SpeculativePrefixLimit = 40,
+    CopyGrammarCount = 36, ImageTensor = 37, ImageFeatureSlot = 38, PromptTargetToken = 39, SpeculativePrefixLimit = 40, ScalarArgument = 41,
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
@@ -106,6 +106,37 @@ pub struct PreparedContract {
     pub cache: CacheContract,
     pub graphs: Vec<GraphContract>,
     pub frontend: FrontendContract,
+    #[cfg_attr(any(feature = "frontend", feature = "runtime-core"), serde(default))]
+    pub scalar_arguments: Vec<ScalarArgument>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core"),
+    serde(deny_unknown_fields)
+)]
+pub struct ScalarArgumentRange {
+    pub min: f32,
+    pub max: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core"),
+    serde(deny_unknown_fields)
+)]
+pub struct ScalarArgument {
+    pub name: String,
+    pub default_value: f32,
+    pub range: Option<ScalarArgumentRange>,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +200,8 @@ pub struct ValueBinding {
     pub value_offset: i64,
     pub padding: i64,
     pub tensor: String,
+    #[cfg_attr(any(feature = "frontend", feature = "runtime-core"), serde(default))]
+    pub argument: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -353,12 +386,98 @@ impl ImageTokenLayout {
     }
 }
 
+fn canonical_scalar(value: f32) -> f32 {
+    if value == 0. { 0. } else { value }
+}
+
+impl ScalarArgument {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty()
+            || !self.default_value.is_finite()
+            || self.range.is_some_and(|range| {
+                !range.min.is_finite()
+                    || !range.max.is_finite()
+                    || range.min > range.max
+                    || !(range.min..=range.max).contains(&self.default_value)
+            })
+        {
+            return Err("invalid scalar-argument declaration".into());
+        }
+        Ok(())
+    }
+}
+
 impl PreparedContract {
     pub fn graph(&self, name: &str) -> Result<&GraphContract> {
         self.graphs
             .iter()
             .find(|g| g.graph == name)
             .ok_or_else(|| format!("graph {name} has no semantic contract").into())
+    }
+
+    pub fn scalar_argument(&self, name: &str) -> Option<&ScalarArgument> {
+        self.scalar_arguments
+            .iter()
+            .find(|argument| argument.name == name)
+    }
+
+    pub fn resolve_request_scalars(
+        &self,
+        requested: &std::collections::BTreeMap<String, f32>,
+    ) -> Result<std::collections::BTreeMap<String, f32>> {
+        if requested
+            .keys()
+            .any(|name| self.scalar_argument(name).is_none())
+        {
+            return Err(
+                "request_scalars contains an argument not declared by the model core".into(),
+            );
+        }
+        let mut resolved = std::collections::BTreeMap::new();
+        for argument in &self.scalar_arguments {
+            let mut value = requested
+                .get(&argument.name)
+                .copied()
+                .unwrap_or(argument.default_value);
+            if !value.is_finite() {
+                return Err("request_scalars values must be finite FP32 numbers".into());
+            }
+            if let Some(range) = argument.range {
+                value = value.clamp(range.min, range.max);
+            }
+            resolved.insert(argument.name.clone(), canonical_scalar(value));
+        }
+        Ok(resolved)
+    }
+
+    pub fn validate_request_scalars(
+        &self,
+        values: &std::collections::BTreeMap<String, f32>,
+    ) -> Result<()> {
+        if values.len() != self.scalar_arguments.len()
+            || self.scalar_arguments.iter().any(|argument| {
+                values.get(&argument.name).is_none_or(|&value| {
+                    !value.is_finite() || value.to_bits() != canonical_scalar(value).to_bits()
+                        || argument.range.is_some_and(|range| value < range.min || value > range.max)
+                })
+            })
+        {
+            return Err(
+                "request_scalars does not match the model core's resolved arguments".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_scalar_arguments(&self) -> Result<()> {
+        let mut names = std::collections::HashSet::new();
+        for argument in &self.scalar_arguments {
+            argument.validate()?;
+            if !names.insert(argument.name.as_str()) {
+                return Err("duplicate scalar-argument declaration".into());
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
@@ -374,6 +493,8 @@ impl PreparedContract {
             return Err("invalid prepared model contract vocabulary or geometry".into());
         }
         self.vision.validate()?;
+        self.validate_scalar_arguments()?;
+        let mut bound_scalars = std::collections::HashSet::new();
         self.frontend.validate()?;
         if self.vision.enabled() != self.frontend.image_layout.is_some()
             || self.frontend.image_layout.is_some() != self.frontend.image_preparation.is_some()
@@ -487,6 +608,29 @@ impl PreparedContract {
                 {
                     return Err("host input bindings require contiguous prepared storage".into());
                 }
+                let scalar = input.source == ValueSource::ScalarArgument;
+                if scalar == input.argument.is_empty()
+                    || scalar
+                        && (self.scalar_argument(&input.argument).is_none()
+                            || buffer.dtype != crate::execution::Dtype::Float32
+                            || buffer.shape.is_empty()
+                            || buffer.shape[0] < manifest.request_capacity()
+                            || buffer.shape[1..].iter().any(|&extent| extent != 1)
+                            || !matches!(
+                                input.indexing,
+                                InputIndexing::SubmissionRow
+                                    | InputIndexing::RequestRow
+                                    | InputIndexing::ActiveRow
+                            )
+                            || input.value_offset != 0
+                            || input.padding != 0
+                            || !input.tensor.is_empty())
+                {
+                    return Err("invalid scalar-argument graph binding".into());
+                }
+                if scalar {
+                    bound_scalars.insert(input.argument.as_str());
+                }
             }
             let prefix: Vec<_> = graph.inputs.iter().filter(|input| input.source == ValueSource::SpeculativePrefixLimit).collect();
             let query: Vec<_> = graph.inputs.iter().filter(|input| input.source == ValueSource::QueryLength).collect();
@@ -586,6 +730,9 @@ impl PreparedContract {
             {
                 return Err("decode graph must declare its pending token source".into());
             }
+        }
+        if bound_scalars.len() != self.scalar_arguments.len() {
+            return Err("declared scalar argument has no selected graph binding".into());
         }
         Ok(())
     }

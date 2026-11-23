@@ -262,9 +262,14 @@ pub struct LiveRequest {
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
     admission_order: u64,
+    request_scalars: crate::model::RequestScalars,
 }
 
 impl LiveRequest {
+    pub fn request_scalars(&self) -> &crate::model::RequestScalars {
+        &self.request_scalars
+    }
+
     pub fn checkpoint_accounting(&self) -> CheckpointAccounting {
         self.checkpoints.clone()
     }
@@ -594,6 +599,7 @@ struct Slot {
 pub struct AdmissionPlan {
     history: PrefixHistory,
     lookup: Lookup,
+    request_scalars: crate::model::RequestScalars,
 }
 
 impl AdmissionPlan {
@@ -1498,13 +1504,18 @@ impl RequestScheduler {
     }
 
     pub fn admit(&mut self, spec: RequestSpec) -> Result<RequestHandle> {
-        let plan = self.plan_admission(&spec)?;
+        let plan = self.plan_admission_with_scalars(&spec, &[], &Default::default())?;
         Ok(self.admit_planned(spec, plan, None)?.handle)
     }
 
     /// Validates the request, builds its prefix history, and looks up the GPU
     /// cache without reserving anything.
-    pub fn plan_admission(&mut self, spec: &RequestSpec) -> Result<AdmissionPlan> {
+    pub fn plan_admission_with_scalars(
+        &mut self,
+        spec: &RequestSpec,
+        arguments: &[crate::model::contract::ScalarArgument],
+        request_scalars: &crate::model::RequestScalars,
+    ) -> Result<AdmissionPlan> {
         if spec.prompt.is_empty()
             || spec.message_boundaries.first() == Some(&0)
             || spec.message_boundaries.last().is_some_and(|n| *n > spec.prompt.len())
@@ -1515,14 +1526,26 @@ impl RequestScheduler {
                 .len()
                 .checked_add(spec.max_new_tokens as usize)
                 .is_none_or(|count| count > self.limits.max_sequence_tokens)
+            || arguments.len() != request_scalars.len()
+            || arguments.iter().any(|argument| {
+                request_scalars
+                    .get(&argument.name)
+                    .is_none_or(|value| !value.is_finite())
+            })
         {
             return Err(crate::Error::admission(
                 crate::AdmissionError::Invalid,
-                "request requires a nonempty prompt, positive output limit, and bounded total tokens",
+                "request requires a nonempty prompt, positive output limit, bounded total tokens, and resolved scalar arguments",
             ));
         }
         self.free_slot()?;
-        let mut history = PrefixHistory::new(self.identity);
+        let scalar_values = arguments.iter().map(|argument| {
+            (
+                argument.name.as_str(),
+                request_scalars[argument.name.as_str()],
+            )
+        });
+        let mut history = PrefixHistory::with_request_scalars(self.identity, scalar_values);
         history.append(&spec.prompt, &spec.conditioning)?;
         if spec.prompt_logprobs && self.scored_prefill_catalog.is_empty() {
             return Err(crate::Error::admission(crate::AdmissionError::Invalid,
@@ -1531,7 +1554,11 @@ impl RequestScheduler {
         let lookup = if spec.prompt_logprobs {
             Lookup { checkpoint: None, consumed_tokens: 0, pages: Vec::new(), snapshot: None }
         } else { self.cache.lookup(&history)? };
-        Ok(AdmissionPlan { history, lookup })
+        Ok(AdmissionPlan {
+            history,
+            lookup,
+            request_scalars: request_scalars.clone(),
+        })
     }
 
     /// Recheck GPU residency while retaining a queued request's validated history.
@@ -1540,6 +1567,7 @@ impl RequestScheduler {
         Ok(AdmissionPlan {
             history: plan.history.clone(),
             lookup: self.cache.lookup(&plan.history)?,
+            request_scalars: plan.request_scalars.clone(),
         })
     }
 
@@ -1583,7 +1611,11 @@ impl RequestScheduler {
         inbound: Option<InboundRequest>,
         accounting: Option<CheckpointAccounting>,
     ) -> Result<Admitted> {
-        let AdmissionPlan { history, lookup } = plan;
+        let AdmissionPlan {
+            history,
+            lookup,
+            request_scalars,
+        } = plan;
         // Lookups count once per admitted request, not per attempt of a waiting one.
         let (hit, reused) = (lookup.checkpoint.is_some(), lookup.consumed_tokens);
         let page_tokens = self.capabilities.page_tokens as u64;
@@ -1773,6 +1805,7 @@ impl RequestScheduler {
             growable_output: spec.growable_output,
             preempted: false,
             admission_order: self.admissions,
+            request_scalars,
         });
         self.admissions += 1;
         if let Some(inbound) = &inbound {

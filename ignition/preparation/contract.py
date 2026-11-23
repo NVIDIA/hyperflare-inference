@@ -7,9 +7,13 @@
 from . import runtime_core_pb2 as p
 
 
-def binding(buffer, source, indexing=p.SUBMISSION_ROW, *, offset=0, padding=0, tensor=""):
-    return dict(buffer=buffer, source=source, indexing=indexing, value_offset=offset,
-                padding=padding, tensor=tensor)
+def binding(buffer, source, indexing=p.SUBMISSION_ROW, *, offset=0, padding=0, tensor="",
+            argument=""):
+    result = dict(buffer=buffer, source=source, indexing=indexing, value_offset=offset,
+                  padding=padding, tensor=tensor)
+    if argument:
+        result["argument"] = argument
+    return result
 
 
 def state_view(buffer, stride, *, offset=0, nbytes=None):
@@ -106,11 +110,23 @@ def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_sta
         required_marker=required_marker)
 
 
+def scalar_argument(name, default, *, minimum=None, maximum=None):
+    """Declare one named per-request FP32 graph argument."""
+    if (minimum is None) != (maximum is None):
+        raise ValueError("scalar argument range requires both minimum and maximum")
+    range_ = None if minimum is None else dict(min=minimum, max=maximum)
+    return dict(name=name, default_value=default, range=range_)
+
+
 def model_contract(*, vocabulary, input_vocabulary=None, vision=None, page_tokens, page_tables, graphs, frontend,
-                   regions):
-    return dict(version=3, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
+                   regions, scalar_arguments=()):
+    result = dict(version=3, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
         vision={"feature_slots": 0, **(vision or dict(features_per_request=0, max_images=0, patches_per_feature=0, patch_capacities=[]))},
-        cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions), graphs=graphs, frontend=frontend)
+        cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions), graphs=graphs,
+        frontend=frontend)
+    if scalar_arguments:
+        result["scalar_arguments"] = list(scalar_arguments)
+    return result
 
 
 def vision_inputs(fields):

@@ -57,6 +57,386 @@ pub(super) fn config() -> ModelConfig {
 }
 
 #[test]
+fn generic_scalar_arguments_resolve_pack_and_preserve_sampling_width() {
+    let mut config = config();
+    config.contract.scalar_arguments = vec![
+        ScalarArgument {
+            name: "gain".into(),
+            default_value: 0.,
+            range: Some(ScalarArgumentRange { min: 0., max: 1. }),
+        },
+        ScalarArgument {
+            name: "offset".into(),
+            default_value: 0.25,
+            range: None,
+        },
+    ];
+    for graph in config
+        .contract
+        .graphs
+        .iter_mut()
+        .filter(|graph| graph.kind == GraphOperation::Init)
+    {
+        for (buffer, argument) in [
+            ("request_gain", "gain"),
+            ("request_offset", "offset"),
+        ] {
+            let mut binding = testing::binding(
+                buffer,
+                ValueSource::ScalarArgument,
+                InputIndexing::RequestRow,
+                0,
+                0,
+            );
+            binding.argument = argument.into();
+            graph.inputs.push(binding);
+        }
+    }
+    let manifest = manifest(&config);
+    assert_eq!(
+        manifest
+            .buffer("admission_parameters")
+            .unwrap()
+            .shape,
+        [config.limits.request_capacity(), 6]
+    );
+    let requested = std::collections::BTreeMap::from([
+        ("gain".into(), 3.),
+    ]);
+    let resolved = config.contract.resolve_request_scalars(&requested).unwrap();
+    assert_eq!(
+        resolved,
+        std::collections::BTreeMap::from([
+            ("gain".into(), 1.),
+            ("offset".into(), 0.25),
+        ])
+    );
+    let mut unknown = requested.clone();
+    unknown.insert("unknown".into(), 1.);
+    assert!(config.contract.resolve_request_scalars(&unknown).is_err());
+
+    let mut scheduler = RequestScheduler::new(
+        config.identity,
+        config.limits,
+        scheduler_capabilities(&config),
+    )
+    .unwrap();
+    scheduler.measured_graph_durations(&manifest.graphs).unwrap();
+    let spec = RequestSpec {
+        message_boundaries: vec![],
+        prompt: vec![7; 4],
+        conditioning: vec![],
+        max_new_tokens: 2,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: false,
+    };
+    let plan = scheduler
+        .plan_admission_with_scalars(
+            &spec,
+            &config.contract.scalar_arguments,
+            &resolved,
+        )
+        .unwrap();
+    let handle = scheduler.admit_planned(spec, plan, None).unwrap().handle;
+    let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
+    admissions[handle.slot as usize] = Some(Admission {
+        handle,
+        sampling: SamplingParameters::default(),
+        request_scalars: resolved,
+        max_new_tokens: 2,
+        prompt: vec![7; 4],
+        data: PromptData {
+            positions: (0..4).map(|position| [position; 3]).collect(),
+            vision_token_indices: vec![-1; 4],
+            ..Default::default()
+        },
+        grammar_mask: None,
+        ignore_eos: false,
+        prompt_logprobs: false,
+    });
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(1)).unwrap();
+    let mut inputs = Inputs::new(&config, &manifest).unwrap();
+    pack_inputs(&mut inputs, &config, &scheduler, &step, &admissions).unwrap();
+    let uploads = inputs.uploads();
+    for (buffer, expected) in [
+        ("request_gain", 1.0f32),
+        ("request_offset", 0.25f32),
+    ] {
+        let upload = uploads.iter().find(|upload| upload.buffer == buffer).unwrap();
+        assert_eq!(upload.offset, 0);
+        assert_eq!(upload.bytes, expected.to_le_bytes());
+    }
+
+    config.contract.validate(&manifest).unwrap();
+    let mut wrong_type = manifest.clone();
+    wrong_type
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == "request_gain")
+        .unwrap()
+        .dtype = crate::execution::Dtype::Int32;
+    assert!(config.contract.validate(&wrong_type).is_err());
+
+    let mut wrong_width = manifest.clone();
+    wrong_width
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == "request_gain")
+        .unwrap()
+        .shape
+        .push(2);
+    assert!(config.contract.validate(&wrong_width).is_err());
+    let mut no_row_dimension = manifest.clone();
+    no_row_dimension
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == "request_gain")
+        .unwrap()
+        .shape = vec![];
+    assert!(config.contract.validate(&no_row_dimension).is_err());
+    let mut short_buffer = manifest.clone();
+    short_buffer
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == "request_gain")
+        .unwrap()
+        .shape[0] -= 1;
+    assert!(config.contract.validate(&short_buffer).is_err());
+    let mut missing_binding = config.contract.clone();
+    missing_binding.graphs.iter_mut().for_each(|graph| {
+        graph
+            .inputs
+            .retain(|input| input.source != crate::model::contract::ValueSource::ScalarArgument)
+    });
+    let error = missing_binding
+        .validate(&manifest)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no selected graph binding"), "{error}");
+
+    let mut duplicate = config.contract.clone();
+    duplicate.scalar_arguments.push(duplicate.scalar_arguments[0].clone());
+    assert!(duplicate.validate(&manifest).is_err());
+
+    let mut non_scalar_argument = config.contract.clone();
+    non_scalar_argument
+        .graphs
+        .iter_mut()
+        .for_each(|graph| {
+            if let Some(binding) = graph.inputs.first_mut() {
+                binding.argument = "undeclared".into();
+            }
+        });
+    assert!(non_scalar_argument.validate(&manifest).is_err());
+}
+
+#[test]
+fn scalar_arguments_pack_sparse_permuted_rows_and_preserve_prefix_values() {
+    let mut config = config();
+    config.contract.scalar_arguments = vec![ScalarArgument {
+        name: "gain".into(),
+        default_value: 0.25,
+        range: None,
+    }];
+    for graph in config
+        .contract
+        .graphs
+        .iter_mut()
+        .filter(|graph| graph.kind == GraphOperation::Init)
+    {
+        let mut binding = testing::binding(
+            "request_gain",
+            ValueSource::ScalarArgument,
+            InputIndexing::SubmissionRow,
+            0,
+            0,
+        );
+        binding.argument = "gain".into();
+        graph.inputs.push(binding);
+    }
+    let manifest = manifest(&config);
+    let mut scheduler = RequestScheduler::new(
+        config.identity,
+        config.limits,
+        scheduler_capabilities(&config),
+    )
+    .unwrap();
+    scheduler.measured_graph_durations(&manifest.graphs).unwrap();
+    let spec = RequestSpec {
+        message_boundaries: vec![],
+        prompt: vec![7; 4],
+        conditioning: vec![],
+        max_new_tokens: 2,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: false,
+    };
+    let requests = [0.125f32, 0.25, 0.5, 0.75]
+        .into_iter()
+        .map(|gain| {
+            let scalars = std::collections::BTreeMap::from([("gain".into(), gain)]);
+            let plan = scheduler
+                .plan_admission_with_scalars(
+                    &spec,
+                    &config.contract.scalar_arguments,
+                    &scalars,
+                )
+                .unwrap();
+            let handle = scheduler
+                .admit_planned(spec.clone(), plan, None)
+                .unwrap()
+                .handle;
+            assert_eq!(
+                scheduler.request(handle).unwrap().request_scalars(),
+                &scalars
+            );
+            (handle, scalars)
+        })
+        .collect::<Vec<_>>();
+    for index in [0, 2] {
+        scheduler.cancel(requests[index].0).unwrap();
+    }
+
+    let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
+    for index in [1, 3] {
+        let handle = requests[index].0;
+        admissions[handle.slot as usize] = Some(Admission {
+            handle,
+            sampling: SamplingParameters::default(),
+            request_scalars: requests[index].1.clone(),
+            max_new_tokens: 2,
+            prompt: vec![7; 4],
+            data: PromptData {
+                positions: (0..4).map(|position| [position; 3]).collect(),
+                vision_token_indices: vec![-1; 4],
+                ..Default::default()
+            },
+            grammar_mask: None,
+            ignore_eos: false,
+            prompt_logprobs: false,
+        });
+    }
+    let step = crate::scheduler::ScheduledStep {
+        draft_tokens: 0,
+        kind: GraphKind::Init,
+        batch_capacity: 4,
+        token_capacity: 1,
+        packed_token_capacity: 0,
+        mixed: None,
+        requires_feedback: true,
+        lanes: [3, 1]
+            .map(|index| crate::scheduler::ScheduledLane {
+                request: requests[index].0,
+                start_position: 0,
+                tokens: 0,
+            })
+            .into(),
+    };
+    assert_eq!(
+        step.lanes
+            .iter()
+            .map(|lane| lane.request.slot)
+            .collect::<Vec<_>>(),
+        [3, 1]
+    );
+
+    for indexing in [
+        InputIndexing::SubmissionRow,
+        InputIndexing::ActiveRow,
+        InputIndexing::RequestRow,
+    ] {
+        let mut indexed_config = config.clone();
+        for graph in indexed_config
+            .contract
+            .graphs
+            .iter_mut()
+            .filter(|graph| graph.kind == GraphOperation::Init)
+        {
+            graph
+                .inputs
+                .iter_mut()
+                .find(|binding| binding.buffer == "request_gain")
+                .unwrap()
+                .indexing = indexing;
+        }
+        let mut inputs = Inputs::new(&indexed_config, &manifest).unwrap();
+        admissions[3]
+            .as_mut()
+            .unwrap()
+            .request_scalars
+            .insert("gain".into(), 0.5);
+        assert!(
+            pack_inputs(
+                &mut inputs,
+                &indexed_config,
+                &scheduler,
+                &step,
+                &admissions,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            scheduler
+                .request(requests[3].0)
+                .unwrap()
+                .request_scalars()["gain"],
+            0.75
+        );
+        admissions[3]
+            .as_mut()
+            .unwrap()
+            .request_scalars
+            .insert("gain".into(), 0.75);
+        pack_inputs(
+            &mut inputs,
+            &indexed_config,
+            &scheduler,
+            &step,
+            &admissions,
+        )
+        .unwrap();
+
+        let uploads = inputs
+            .uploads()
+            .into_iter()
+            .filter(|upload| upload.buffer == "request_gain")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uploads.len(),
+            if indexing == InputIndexing::SubmissionRow {
+                1
+            } else {
+                2
+            }
+        );
+        let mut actual = vec![0xa5; config.limits.request_capacity() * 4];
+        for upload in uploads {
+            let end = upload.offset + upload.bytes.len();
+            actual[upload.offset..end].copy_from_slice(upload.bytes);
+        }
+        let mut expected = vec![0xa5; actual.len()];
+        let destinations = match indexing {
+            InputIndexing::SubmissionRow => {
+                expected.fill(0);
+                [0, 1]
+            }
+            InputIndexing::ActiveRow => [0, 1],
+            InputIndexing::RequestRow => [3, 1],
+            InputIndexing::Scalar | InputIndexing::PackedToken => unreachable!(),
+        };
+        for (destination, value) in destinations.into_iter().zip([0.75f32, 0.25]) {
+            expected[destination * 4..(destination + 1) * 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(actual, expected, "{indexing:?}");
+    }
+}
+
+#[test]
 fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics() {
     let config = config();
     let mut scheduler = RequestScheduler::new(
@@ -88,6 +468,7 @@ fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics()
             temperature: 1.,
             ..Default::default()
         },
+        request_scalars: Default::default(),
         max_new_tokens: 4,
         prompt: vec![7; 65],
         data: PromptData {
@@ -232,6 +613,7 @@ fn large_prefill_uploads_preserve_token_position_and_image_indices_without_tail_
     admissions[handle.slot as usize] = Some(Admission {
         handle,
         sampling: SamplingParameters::default(),
+        request_scalars: Default::default(),
         max_new_tokens: 4,
         data: PromptData {
             positions: prompt.iter().map(|&token| [token as i64; 3]).collect(),
@@ -547,6 +929,7 @@ fn packing_follows_value_bindings_after_buffers_and_model_are_renamed() {
             seed: u64::MAX,
             ..Default::default()
         },
+        request_scalars: Default::default(),
         max_new_tokens: 4,
         prompt: vec![7; 65],
         data: PromptData {
@@ -704,6 +1087,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
     admissions[2] = Some(Admission {
         handle,
         sampling: SamplingParameters::default(),
+        request_scalars: Default::default(),
         max_new_tokens: 16,
         prompt: vec![7; 65],
         data: PromptData {
@@ -917,6 +1301,7 @@ fn mixed_native_uploads_pack_prompt_after_the_decode_extent_and_sample_only_elig
             admissions[h.slot as usize] = Some(Admission {
                 handle: h,
                 sampling: SamplingParameters::default(),
+                request_scalars: Default::default(),
                 max_new_tokens: 16,
                 prompt,
                 data: PromptData {
@@ -1131,6 +1516,7 @@ fn state_transfer_and_resume_upload_fixture() {
         admissions[handle.slot as usize] = Some(Admission {
             handle,
             sampling: SamplingParameters::default(),
+            request_scalars: Default::default(),
             max_new_tokens: 2,
             prompt,
             data: PromptData {
@@ -1349,6 +1735,7 @@ fn grammar_packing_fixture() -> (
         admissions.push(Some(Admission {
             handle,
             sampling: SamplingParameters::default(),
+            request_scalars: Default::default(),
             max_new_tokens: 512,
             prompt: vec![7; 66],
             data: PromptData::default(),
@@ -1587,6 +1974,7 @@ fn prefill_compacts_execution_feature_indices_and_preserves_admission_metadata()
     admissions[handle.slot as usize] = Some(Admission {
         handle,
         sampling: SamplingParameters::default(),
+        request_scalars: Default::default(),
         max_new_tokens: 1,
         prompt: vec![7; 4],
         data: PromptData {
@@ -1688,7 +2076,7 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
                 max_new_tokens: 64, grammar_constrained: false, host_stops: false, prompt_logprobs: false, growable_output: false }).unwrap();
             let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
             admissions[handle.slot as usize] = Some(Admission { handle, sampling: SamplingParameters::default(),
-                max_new_tokens: 64, prompt: vec![7; 64], data: PromptData {
+                request_scalars: Default::default(), max_new_tokens: 64, prompt: vec![7; 64], data: PromptData {
                     positions: (0..64).map(|position| [position; 3]).collect(),
                     vision_token_indices: vec![-1; 64], ..Default::default()
                 }, grammar_mask: None, ignore_eos: true, prompt_logprobs: false });

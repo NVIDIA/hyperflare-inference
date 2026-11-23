@@ -54,8 +54,18 @@ pub(super) fn serving_contract(
     value: wire::ServingContract,
     _prepared_concurrency: u64,
 ) -> Result<serde_json::Value> {
-    if value.model_contract.as_ref().is_none_or(|contract| !(1..=3).contains(&contract.version)) {
+    let Some(contract) = value.model_contract.as_ref() else {
         return Err(invalid("unsupported prepared model contract version; re-export the model core"));
+    };
+    if !(1..=3).contains(&contract.version) {
+        return Err(invalid("unsupported prepared model contract version; re-export the model core"));
+    }
+    for argument in &contract.scalar_arguments {
+        required(argument.default_value, "scalar argument default_value")?;
+        if let Some(range) = &argument.range {
+            required(range.min, "scalar argument range min")?;
+            required(range.max, "scalar argument range max")?;
+        }
     }
     let mut value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
     value.as_object_mut().unwrap().retain(|_, v| !v.is_null());
@@ -837,6 +847,7 @@ mod tests {
             contract.inputs[0].indexing,
             crate::model::contract::InputIndexing::PackedToken
         );
+        assert!(contract.inputs[0].argument.is_empty());
         let execution =
             wire::ExecutionGraph::decode(b"\x12\x0escored_prefill\x20\x01\x28\x40".as_slice())
                 .unwrap();
@@ -869,6 +880,60 @@ mod tests {
         );
         assert_eq!(execution.draft_tokens, None);
         assert_eq!(execution.packed_tokens(), 256);
+    }
+
+    #[test]
+    fn scalar_argument_declarations_and_bindings_round_trip_additively() {
+        let contract = wire::ModelContract {
+            version: 3,
+            scalar_arguments: vec![
+                wire::ScalarArgument {
+                    name: "gain".into(),
+                    default_value: Some(0.),
+                    range: Some(wire::ScalarArgumentRange {
+                        min: Some(0.),
+                        max: Some(1.),
+                    }),
+                },
+                wire::ScalarArgument {
+                    name: "residual_gain".into(),
+                    default_value: Some(0.25),
+                    range: None,
+                },
+            ],
+            graphs: vec![wire::GraphContract {
+                inputs: vec![wire::ValueBinding {
+                    buffer: "request_gain".into(),
+                    source: 41,
+                    indexing: 3,
+                    argument: "gain".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let restored =
+            wire::ModelContract::decode(contract.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(restored, contract);
+        assert_eq!(restored.scalar_arguments[0].default_value, Some(0.));
+        assert_eq!(
+            restored.scalar_arguments[0].range.as_ref().unwrap().max,
+            Some(1.)
+        );
+        let binding: crate::model::contract::ValueBinding = serde_json::from_value(
+            serde_json::to_value(&restored.graphs[0].inputs[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            binding.source,
+            crate::model::contract::ValueSource::ScalarArgument
+        );
+        assert_eq!(binding.argument, "gain");
+
+        let previous = wire::ModelContract::decode(b"\x08\x03".as_slice()).unwrap();
+        assert_eq!(previous.version, 3);
+        assert!(previous.scalar_arguments.is_empty());
     }
 
     #[test]

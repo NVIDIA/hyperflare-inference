@@ -51,6 +51,8 @@ def pack(layout, step):
             elif source in (p.CONSUMED_TOKENS, p.SNAPSHOT_CONSUMED_TOKENS): values = [request.consumed]
             elif source == p.SAMPLING_SEED: values = [request.sampling.seed if request.sampling.seed < 1 << 63 else request.sampling.seed - (1 << 64)]
             elif source == p.SAMPLING_PARAMETERS: values = request.sampling.values()
+            elif source == p.SCALAR_ARGUMENT:
+                values = [request.request_scalars[binding["argument"]]]
             elif source == p.SAMPLING_TOP_K: values = [request.sampling.top_k]
             elif source == p.MAX_NEW_TOKENS: values = [request.max_new_tokens]
             elif source == p.EOS_TOKEN_IDS: values = list(layout.eos) + [-1] * (width - len(layout.eos))

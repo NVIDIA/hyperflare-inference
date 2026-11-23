@@ -3059,11 +3059,11 @@ fn terminal_snapshot_publishes_exact_partial_page_for_shared_cache_geometries() 
         let spec = RequestSpec { prompt: vec![1; page_tokens + 1], message_boundaries: vec![],
             conditioning: vec![], max_new_tokens: 1, grammar_constrained: false,
             host_stops: false, prompt_logprobs: false, growable_output: false };
-        assert_eq!(s.plan_admission(&spec).unwrap().resident_tokens(), 0);
+        assert_eq!(s.plan_admission_with_scalars(&spec, &[], &Default::default()).unwrap().resident_tokens(), 0);
         assert_eq!(s.stats().snapshot_publications, publications);
         complete_timed(&mut s, &plan, fence, 0, true, gpu_time(MS / 10));
         assert!(s.request(terminal).is_err());
-        assert_eq!(s.plan_admission(&spec).unwrap().resident_tokens(), (page_tokens + 1) as u64);
+        assert_eq!(s.plan_admission_with_scalars(&spec, &[], &Default::default()).unwrap().resident_tokens(), (page_tokens + 1) as u64);
     }
 }
 

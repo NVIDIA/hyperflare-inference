@@ -59,6 +59,7 @@ impl PromptMetadataMut<'_> {
 pub struct Admission {
     pub handle: RequestHandle,
     pub sampling: SamplingParameters,
+    pub request_scalars: crate::model::RequestScalars,
     pub max_new_tokens: u32,
     pub prompt: Vec<u32>,
     pub data: crate::model::PromptData,
@@ -70,6 +71,9 @@ pub struct Admission {
 impl Admission {
     pub fn validate(&self, config: &ModelConfig) -> Result<()> {
         self.sampling.validate()?;
+        config
+            .contract
+            .validate_request_scalars(&self.request_scalars)?;
         if self.handle.slot as usize >= config.limits.max_active
             || self.handle.generation == 0
             || self.handle.generation > i64::MAX as u64
@@ -111,6 +115,7 @@ impl Admission {
         let admission = Self {
             handle,
             sampling: prompt.sampling.clone(),
+            request_scalars: prompt.request_scalars.clone(),
             max_new_tokens: prompt.max_new_tokens,
             prompt: prompt.tokens.clone(),
             data: prompt.data.clone(),
@@ -129,6 +134,9 @@ impl Admission {
 #[cfg(feature = "server")]
 pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> Result<()> {
     prompt.sampling.validate()?;
+    config
+        .contract
+        .validate_request_scalars(&prompt.request_scalars)?;
     if !prompt.logprob_token_ids.is_empty() {
         if config.logprob_token_id_capacity == 0 {
             return Err("logprob_token_ids are not available in this model core; re-export to enable them".into());

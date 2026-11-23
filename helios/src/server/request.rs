@@ -325,6 +325,9 @@ pub(super) fn prepare_validated_inference(
     }
     let mut sampling = sampling_parameters(object, &config.sampling_defaults, &config.sampling_ranges)?;
     sampling.seed = sampling.seed.wrapping_add(index as u64);
+    let request_scalars = config
+        .contract
+        .resolve_request_scalars(&opts.request_scalars)?;
     let stop_sequences = opts.token_stops.clone();
     super::stops::TokenStops::new(stop_sequences.clone(), config.contract.vocabulary)?;
     let stop_strings = opts.stops.clone();
@@ -398,6 +401,7 @@ pub(super) fn prepare_validated_inference(
             conditioned_inputs,
             conditioning,
             sampling,
+            request_scalars,
             max_new_tokens,
             reasoning_cut,
             stop_sequences,

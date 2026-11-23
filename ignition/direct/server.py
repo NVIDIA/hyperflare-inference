@@ -57,6 +57,7 @@ class _Frontend:
         if not isinstance(messages, list) or not messages:
             raise AdmissionError("messages must be a nonempty list")
         options = dict(body.get("chat_template_kwargs") or {})
+        options.pop("request_scalars", None)
         for name in ("tools", "reasoning_effort"):
             if body.get(name) is not None:
                 options[name] = body[name]
@@ -108,6 +109,61 @@ def _sampling(body, defaults):
         top_k=integer("top_k", int(defaults.get("top_k", -1))))
 
 
+def _scalar_integer(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if -(2**63) <= value <= 2**64 - 1 else None
+
+
+def _integer_float_equal(integer, float_value):
+    if not math.isfinite(float_value) or float_value != math.floor(float_value):
+        return False
+    if not (-(2**127) <= float_value < 2**127):
+        return False
+    try:
+        return int(float_value) == integer and float(integer) == float_value
+    except OverflowError:
+        return False
+
+
+def _scalar_numbers_equal(left, right):
+    li, ri = _scalar_integer(left), _scalar_integer(right)
+    if li is not None and ri is not None:
+        return li == ri
+    if li is not None:
+        return _integer_float_equal(li, float(right))
+    if ri is not None:
+        return _integer_float_equal(ri, float(left))
+    return float(left) == float(right)
+
+
+def _request_scalars(body, layout):
+    """Resolve the declared scalar arguments a request body names. The body is left unchanged."""
+    top = body.get("request_scalars", {})
+    if not isinstance(top, dict):
+        raise AdmissionError("request_scalars must be a JSON object")
+    template = body.get("chat_template_kwargs")
+    if template is None:
+        nested = {}
+    elif not isinstance(template, dict):
+        raise AdmissionError("chat_template_kwargs must be a JSON object")
+    else:
+        nested = template.get("request_scalars", {})
+    if not isinstance(nested, dict):
+        raise AdmissionError("chat_template_kwargs.request_scalars must be a JSON object")
+    resolved = layout.resolve_request_scalars(top)
+    nested_resolved = layout.resolve_request_scalars(nested)
+    # A name given in both places must compare equal before FP32 narrowing.
+    for name, value in nested.items():
+        if name in top:
+            if not _scalar_numbers_equal(top[name], value):
+                raise AdmissionError(
+                    f"top-level and chat_template_kwargs request_scalars.{name} must match")
+        else:
+            resolved[name] = nested_resolved[name]
+    return resolved
+
+
 class DirectServer:
     """Own the scheduler, the rank-zero step runner and the HTTP listener for one prepared model."""
 
@@ -122,6 +178,16 @@ class DirectServer:
         self.frontend = _Frontend(model.server_config)
         self.defaults = model.server_config.get("sampling_defaults", {})
         self.served_names = tuple(served_names)
+        request_scalars = [
+            {"name": argument["name"], "default": argument["default_value"],
+             "range": argument.get("range")}
+            for argument in self.layout.scalar_arguments
+        ]
+        self.model_cards = [
+            {"id": name, "object": "model", "owned_by": "flare",
+             "flare": {"request_scalars": request_scalars}}
+            for name in self.served_names
+        ]
         self.inbox = queue.Queue()
         self.identities = iter(range(1, 1 << 62))
         self.lock = threading.Lock()
@@ -159,8 +225,7 @@ class DirectServer:
                 if self.path == "/health":
                     self._send(503 if server.failure else 200, {"status": "failed" if server.failure else "ok"})
                 elif self.path == "/v1/models":
-                    self._send(200, {"object": "list", "data": [
-                        {"id": name, "object": "model", "owned_by": "flare"} for name in server.served_names]})
+                    self._send(200, {"object": "list", "data": server.model_cards})
                 elif self.path == "/metrics":
                     self._send(200, server.metrics().encode(), "text/plain; version=0.0.4")
                 else:
@@ -186,14 +251,17 @@ class DirectServer:
                 raise AdmissionError("direct diagnostic serving answers non-streaming requests only")
             if body.get("n", 1) != 1:
                 raise AdmissionError("direct diagnostic serving returns one choice")
+            request_scalars = _request_scalars(body, self.layout)
             prompt, rendered = self.frontend.render(body)
             limit = body.get("max_completion_tokens", body.get("max_tokens"))
             if limit is None:
                 limit = min(_DEFAULT_OUTPUT_LIMIT, self.layout.context - len(prompt))
             if isinstance(limit, bool) or not isinstance(limit, int):
                 raise AdmissionError("the output limit must be an integer")
-            request = Request(next(self.identities), prompt, limit, _sampling(body, self.defaults),
-                              ignore_eos=bool(body.get("ignore_eos", False)))
+            request = Request(
+                next(self.identities), prompt, limit, _sampling(body, self.defaults),
+                ignore_eos=bool(body.get("ignore_eos", False)),
+                request_scalars=request_scalars)
             self.scheduler.validate(request)
         except (AdmissionError, ValueError, TypeError) as error:
             return 400, {"error": {"message": str(error), "type": "invalid_request_error"}}

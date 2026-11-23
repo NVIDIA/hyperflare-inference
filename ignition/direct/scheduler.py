@@ -40,11 +40,42 @@ from types import MappingProxyType
 import numpy as np
 
 from ignition.components.capacity import completion_token_capacity
+from ignition.preparation import runtime_core_pb2 as wire
 
 from .policy import Accounting, Policy
 
 INACTIVE, RUNNING, FINISHED, ERROR = 0, 1, 2, 3
 _MAINTENANCE = ("init", "restore", "snapshot")
+
+_FP32_MAX = float(np.finfo(np.float32).max)
+
+
+def _wire_fp32(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError
+    try:
+        wide = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError from error
+    if not math.isfinite(wide) or abs(wide) > _FP32_MAX:
+        raise ValueError
+    return float(np.float32(wide))
+
+
+def _row_contiguous(tensor):
+    """Whether a buffer's rows are densely packed; None when the buffer does not report its layout."""
+    flags = getattr(tensor, "flags", None)
+    if hasattr(flags, "c_contiguous"):
+        return bool(flags.c_contiguous)
+    contiguous = getattr(tensor, "is_contiguous", None)
+    return bool(contiguous()) if callable(contiguous) else None
+
+
+def _scalar_rows(shape):
+    """Rows in a width-one buffer shape, or -1 without a row dimension or with a wider trailing one."""
+    if len(shape) < 1 or any(extent != 1 for extent in shape[1:]):
+        return -1
+    return shape[0]
 
 
 class AdmissionError(ValueError):
@@ -80,6 +111,9 @@ class Layout:
     record_fields: int = 24
     confidence_widths: dict = field(default_factory=dict)
     completion_cursors: dict = field(default_factory=dict)
+    # Buffer name to whether its rows are densely packed (True, False, or None when unreported).
+    buffer_contiguity: dict = field(default_factory=dict, kw_only=True)
+    scalar_arguments: tuple[dict, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self):
         if not 1 <= self.max_active <= self.capacity or self.pages <= 0 or self.page_tokens <= 0:
@@ -91,6 +125,48 @@ class Layout:
                 or any(key[0] == "speculative" and key[2] > self.completion_token_capacity for key in self.graphs)):
             raise ValueError("verification width exceeds completion token capacity")
         object.__setattr__(self, "graphs", MappingProxyType(dict(self.graphs)))
+        arguments = tuple(dict(argument) for argument in self.scalar_arguments)
+        names = [argument.get("name") for argument in arguments]
+        if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+            raise ValueError("direct execution requires distinct named scalar arguments")
+        for argument in arguments:
+            try:
+                default = _wire_fp32(argument.get("default_value"))
+            except ValueError:
+                raise ValueError("scalar argument defaults must be finite FP32 values") from None
+            range_ = argument.get("range")
+            if range_ is None:
+                normalized_range = None
+            elif not isinstance(range_, dict) or set(range_) != {"min", "max"}:
+                raise ValueError("scalar argument ranges must be finite and contain their default")
+            else:
+                try:
+                    minimum, maximum = _wire_fp32(range_["min"]), _wire_fp32(range_["max"])
+                except ValueError:
+                    raise ValueError("scalar argument ranges must be finite and contain their default") from None
+                if minimum > maximum or not minimum <= default <= maximum:
+                    raise ValueError("scalar argument ranges must be finite and contain their default")
+                normalized_range = {"min": minimum, "max": maximum}
+            argument["default_value"] = default
+            argument["range"] = normalized_range
+        bindings = [binding for values in self.bindings.values() for binding in values]
+        scalar_bindings = [binding for binding in bindings if binding["source"] == wire.SCALAR_ARGUMENT]
+        if any(binding.get("argument") not in names
+               or binding["indexing"] not in (wire.SUBMISSION_ROW, wire.REQUEST_ROW, wire.ACTIVE_ROW)
+               or binding.get("value_offset", 0) != 0 or binding.get("padding", 0) != 0
+               or binding.get("tensor", "")
+               or binding["buffer"] not in self.buffer_specs
+               or self.buffer_specs[binding["buffer"]][0] != np.dtype("float32")
+               or _scalar_rows(self.buffer_specs[binding["buffer"]][1]) < self.capacity
+               or self.buffer_contiguity.get(binding["buffer"]) is not True
+               for binding in scalar_bindings):
+            raise ValueError("direct scalar bindings require one named FP32 value per request row")
+        if any(binding.get("argument", "") for binding in bindings
+               if binding["source"] != wire.SCALAR_ARGUMENT):
+            raise ValueError("only scalar-argument bindings may name an argument")
+        if set(names) != {binding["argument"] for binding in scalar_bindings}:
+            raise ValueError("every declared scalar argument requires a graph binding")
+        object.__setattr__(self, "scalar_arguments", arguments)
 
     @classmethod
     def of(cls, model):
@@ -118,6 +194,11 @@ class Layout:
                    bindings={g["graph"]: g["inputs"] for g in config["model_contract"]["graphs"] if g["graph"] in graphs.values()},
                    buffer_specs={name: (np.dtype(str(tensor.dtype).removeprefix("torch.")), tuple(tensor.shape))
                        for name, tensor in buffers.items() if name in {b["buffer"] for g in config["model_contract"]["graphs"] if g["graph"] in graphs.values() for b in g["inputs"]}},
+                   buffer_contiguity={binding["buffer"]: _row_contiguous(buffers[binding["buffer"]])
+                       for g in config["model_contract"]["graphs"] if g["graph"] in graphs.values()
+                       for binding in g["inputs"]
+                       if binding["source"] == wire.SCALAR_ARGUMENT and binding["buffer"] in buffers},
+                   scalar_arguments=tuple(config["model_contract"].get("scalar_arguments", ())),
                    page_views={v["buffer"]: v["page_offset"] for v in config["model_contract"]["cache"]["page_tables"]},
                    state_rows_per_request=max(g["state_rows_per_request"] for g in config["model_contract"]["graphs"] if g["graph"] in graphs.values()),
                    draft_pages=max((v["page_offset"] for v in config["model_contract"]["cache"]["page_tables"]), default=0),
@@ -126,6 +207,39 @@ class Layout:
                                       if signature.confidence_width},
                    completion_cursors={g["graph"]: None if g["draft_cursor"] is None else g["draft_cursor"]["lag_tokens"]
                        for g in config["model_contract"]["graphs"] if "draft_cursor" in g and g["graph"] in graphs.values()})
+
+    def resolve_request_scalars(self, requested):
+        if not isinstance(requested, (dict, MappingProxyType)):
+            raise AdmissionError("request_scalars must be an object")
+        names = {argument["name"] for argument in self.scalar_arguments}
+        unknown = set(requested) - names
+        if unknown:
+            raise AdmissionError(
+                "request_scalars contains unknown arguments: " + ", ".join(sorted(unknown)))
+        resolved = {}
+        for argument in self.scalar_arguments:
+            name = argument["name"]
+            if name in requested:
+                value = requested[name]
+                try:
+                    narrowed = _wire_fp32(value)
+                except ValueError as exc:
+                    raise AdmissionError(f"request_scalars.{name} must be a finite FP32 number") from exc
+                if value != 0 and narrowed == 0:
+                    raise AdmissionError(f"request_scalars.{name} is outside the finite FP32 range")
+            else:
+                narrowed = argument["default_value"]
+            range_ = argument.get("range")
+            if range_ is not None:
+                narrowed = min(max(narrowed, range_["min"]), range_["max"])
+            resolved[name] = 0.0 if narrowed == 0 else narrowed
+        return resolved
+
+    def scalar_identity(self, request_scalars):
+        return tuple(
+            (argument["name"], int(np.float32(request_scalars[argument["name"]]).view(np.uint32)))
+            for argument in self.scalar_arguments
+        )
 
     @property
     def completion_token_capacity(self):
@@ -273,23 +387,34 @@ class Acceptance:
 
 @dataclass
 class Checkpoint:
-    """An immutable snapshot row holding the state after consuming exactly `key`, and its complete pages."""
+    """An immutable snapshot row holding exact prompt and scalar identity."""
 
-    key: tuple
+    tokens: tuple
     snapshot: int
     pages: tuple[int, ...]
     pins: int = 0
     used: int = 0
+    scalar_identity: tuple = ()
 
     @property
     def consumed(self):
-        return len(self.key)
+        return len(self.tokens)
+
+    # Without declared scalars the key is the tokens alone; with them it is
+    # (scalar identity, tokens). The two shapes never compare equal.
+    @property
+    def cache_key(self):
+        return self.tokens if not self.scalar_identity else (self.scalar_identity, self.tokens)
 
 
 class Request:
-    def __init__(self, ident, prompt, max_new_tokens, sampling, *, ignore_eos=False):
+    def __init__(self, ident, prompt, max_new_tokens, sampling, *, ignore_eos=False,
+                 request_scalars=None):
         self.ident, self.prompt = ident, list(prompt)
         self.max_new_tokens, self.sampling, self.ignore_eos = max_new_tokens, sampling, ignore_eos
+        if request_scalars is not None and not isinstance(request_scalars, dict):
+            raise AdmissionError("request_scalars must be an object")
+        self._request_scalars = {} if request_scalars is None else request_scalars.copy()
         self.slot = self.prefix = self.capture = self.error = self.finish_reason = None
         self.generation = self.consumed = self.reused = self.shared = self.rounds = 0
         self.pages, self.generated = [], []
@@ -299,6 +424,10 @@ class Request:
         self.accounting = Accounting()
         # Sequence of the last step that carried the request; Helios's `last_use` fence.
         self.last_use = 0
+
+    @property
+    def request_scalars(self):
+        return self._request_scalars
 
     @property
     def pending_token(self):
@@ -395,6 +524,7 @@ class Scheduler:
 
     def validate(self, request):
         prompt, layout = request.prompt, self.layout
+        request._request_scalars = MappingProxyType(layout.resolve_request_scalars(request.request_scalars))
         if not prompt or any(type(t) is not int or not 0 <= t < layout.vocabulary for t in prompt):
             raise AdmissionError("the prompt must be a nonempty list of vocabulary token IDs")
         if type(request.max_new_tokens) is not int or not 1 <= request.max_new_tokens < 1 << 31:
@@ -446,7 +576,7 @@ class Scheduler:
             if not candidates:
                 return False
             victim = min(candidates, key=lambda c: c.used)
-            del self.cache[victim.key]
+            del self.cache[victim.cache_key]
             self.page_pool.release(victim.pages)
             heapq.heappush(self.free_snapshots, victim.snapshot)
             self.stats["checkpoint_evictions"] += 1
@@ -458,7 +588,7 @@ class Scheduler:
             slot = next((index for index, occupant in enumerate(self.slots) if occupant is None), None)
             if slot is None:
                 return
-            hit = self.cache.get(tuple(request.prompt)) if self.prefix_cache else None
+            hit = self.cache.get(self._cache_key(request)) if self.prefix_cache else None
             shared = hit.pages if hit is not None else ()
             needed = self._pages_needed(request, len(shared))
             if hit is not None:
@@ -731,12 +861,24 @@ class Scheduler:
         if physical > step.packed_tokens:
             raise CompletionError("packed completion exceeds its physical row capacity")
 
+    def _cache_key(self, request, tokens=None):
+        tokens = tuple(request.prompt if tokens is None else tokens)
+        if not self.layout.scalar_arguments:
+            return tokens
+        return self.layout.scalar_identity(request.request_scalars), tokens
+
     def _capture(self, request):
         """Reserve a snapshot row for the request's prompt endpoint unless that prompt is cached or in capture."""
         if not self.prefix_cache:
             return False
-        key = tuple(request.prompt)
-        if key in self.cache or any(r.capture is not None and r.prompt == request.prompt for r in self.active):
+        key = self._cache_key(request)
+        scalar_identity = key[0] if self.layout.scalar_arguments else None
+        if key in self.cache or any(
+                r.capture is not None
+                and r.prompt == request.prompt
+                and (scalar_identity is None
+                     or self.layout.scalar_identity(r.request_scalars) == scalar_identity)
+                for r in self.active):
             return False
         if not self.free_snapshots and not self._evict(snapshots=1):
             return False
@@ -748,7 +890,9 @@ class Scheduler:
         pages = tuple(request.pages[:request.consumed // self.layout.page_tokens])
         self.page_pool.retain(pages)
         self.clock += 1
-        key = tuple(request.prompt[:request.consumed])
-        self.cache[key] = Checkpoint(key, request.capture, pages, used=self.clock)
+        tokens = tuple(request.prompt[:request.consumed])
+        scalar_identity = self.layout.scalar_identity(request.request_scalars)
+        checkpoint = Checkpoint(tokens, request.capture, pages, used=self.clock, scalar_identity=scalar_identity)
+        self.cache[checkpoint.cache_key] = checkpoint
         request.capture = None
         self.stats["checkpoints"] += 1

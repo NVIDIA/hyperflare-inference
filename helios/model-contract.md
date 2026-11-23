@@ -83,6 +83,7 @@ serving contract and replay path unchanged.
 | `cache` | Logical page tokens, attention-history storage, and page-table views |
 | `graphs` | Per-program operation, value bindings, persistent-state accesses, and resource dependencies |
 | `frontend` | Independent parser and image implementation identifiers plus their syntax and layout data |
+| `scalar_arguments` | Ordered generic per-request FP32 declarations, each with a name, default, and optional inclusive range |
 
 Every enum has an unspecified zero value, which cannot select an implementation.
 Unknown identifiers, unsupported versions, and unknown semantic JSON fields are
@@ -104,12 +105,31 @@ registered transport destination and an enum-selected source:
 | Copied proposals | Candidate IDs, count, generation, consumed endpoint, and per-position grammar masks |
 | Constants | Declared integer values and inactive-row padding |
 | Image tensors | Named outputs of the selected image layout implementation |
+| Declared scalar arguments | One named FP32 value per request row, independently bound from sampling storage |
 
 Indexing is explicit: scalar, submission row, active row, physical request row,
 or packed token. Active rows omit inactive tails; submission rows initialize
 padding across the request capacity. Packed-token indices follow each lane's
 actual token count. Integer offsets and padding are declared separately.
 Omitted transfers retain device bytes; scratch buffers need no host value source.
+
+`SCALAR_ARGUMENT` requires an `argument` name matching one unique
+`ModelContract.scalar_arguments` declaration. Its destination is a contiguous
+FP32 buffer with width one and submission-row, active-row, or physical-request-row
+indexing. Other value sources leave `ValueBinding.argument` empty. Every
+declaration must have at least one selected graph binding. Shared admission
+fills omitted names from declared defaults, clamps values to declared ranges,
+and rejects unknown names or values outside finite FP32; a declaration without
+a range accepts any finite FP32 value. The six-column `SAMPLING_PARAMETERS`
+layout remains independent.
+
+The core must bind a declared scalar on every graph that reads its destination.
+Helios validates only that each declaration has at least one selected graph
+binding and cannot see which captured graphs read a persistent buffer. A graph
+that reads the destination without binding it sees what the last binding
+submission left there, which for a reused request slot can be the previous
+occupant's value. Inactive rows of a submission-row scalar binding carry 0.0.
+
 The execution transport owns frame index and submission sequence.
 
 `GraphContract.tuned_bindings` names persistent buffers populated by captured
@@ -220,6 +240,14 @@ checkpoints own complete pages; partial-page payloads remain in continuation
 storage. Restore copies those payloads to private writable pages. Cancellation
 and preemption retain resources through their final GPU fence. Failed execution
 cannot publish a successful checkpoint.
+
+Prefix-history roots include each declared request scalar in declaration order, including zero values,
+encoded as its name and canonical FP32 bits. Negative zero is canonical positive
+zero. A core with no declared scalars hashes only the domain tag and core
+identity into the prefix root. Admission plans retain the
+resolved scalar map through pool lookup retries, preemption, and readmission, and
+packing verifies that each uploaded value matches the map used for prefix
+identity.
 
 ## Frontend implementations
 

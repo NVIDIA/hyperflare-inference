@@ -42,6 +42,7 @@ The additional `flare` object reports prepared and selected serving metadata:
 | `sampling_defaults` | Prepared seed, temperature, filters, and penalties used for omitted request fields |
 | `thinking_token_budget` | Operator default reasoning-token cap for conversational requests; null when unset |
 | `sampling_ranges` | Inclusive `{min, max}` bounds for distribution parameters; null fixes a parameter at its prepared default; seed is request-controlled |
+| `request_scalars` | Ordered generic per-request scalar declarations. Each entry contains `name`, `default`, and an optional inclusive `range` with `min` and `max`. |
 | `max_images_per_prompt` | Context-derived upper bound on image count; image sizes, framing, text, output, and HTTP body size further constrain admission; zero for text-only cores |
 | `max_image_tokens_per_prompt` | Context-derived upper bound on image tokens across the entire conversation; text, framing, and output also occupy context; zero for text-only cores |
 | `image_feature_window_tokens` | Prepared feature storage per active image request; chunked prefill reuses this storage across windows, so it does not limit total conversation image tokens |
@@ -725,6 +726,28 @@ Malformed types return HTTP 400; `top_k` must be an integer. `seed` is
 request-controlled and uses its prepared default when omitted. Sampling defaults
 and ranges come from the model author's recommendations declared in the recipe,
 except for DeepSeek V4.1's repetition-penalty range based on measured use.
+
+Every generation protocol accepts a top-level `request_scalars` JSON object whose
+keys name scalar arguments declared by the loaded model core. Requests that
+carry `chat_template_kwargs` may also place that object at
+`chat_template_kwargs.request_scalars`; the server consumes it before prompt
+rendering. Disjoint top-level and nested entries are merged. A name present in
+both locations must have the same numeric value. Unknown names, nonnumeric
+values, booleans, values outside finite FP32, and conflicting duplicate values
+return HTTP 400. A `request_scalars` value of `null` is also rejected with HTTP
+400; omit the field instead.
+
+An omitted declared scalar uses its prepared default. A declaration with an
+inclusive range clamps a finite FP32 request value to that range; a declaration
+without a range accepts any finite FP32 value. Request resolution canonicalizes
+negative zero to positive zero. The effective values are carried independently
+of the six FP32 sampling-parameter columns. Prefix identity includes every
+declared effective scalar in declaration order, using its name and canonical
+FP32 bits, so requests with different model inputs cannot share checkpoints.
+For a core that declares no scalars, the prefix root hashes only the domain
+tag and core identity. Distinct integers above `u64::MAX` can compare
+equal as `f64`. Duplicate-name equality is compared before FP32 narrowing, so
+`1` and `1.00000001` conflict.
 
 The recipes use these default-mode settings. Parameters without an interval in
 the table are fixed at their defaults. Bounds span the minimum and maximum values

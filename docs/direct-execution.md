@@ -81,6 +81,10 @@ kind, device errors by code, request outcomes and prefix-cache counters. Each
 retired request prints one line on stderr: prompt and reused tokens, generated
 tokens, speculative rounds and outcome.
 
+`/v1/models` reports the core's generic request-scalar declarations. Chat
+requests accept the same top-level and nested `request_scalars` maps as native
+serving. The direct scheduler resolves defaults and ranges before prefix lookup.
+
 ## Design
 
 **Scheduler** (`ignition/direct/scheduler.py`, CPU only). FIFO admission
@@ -145,10 +149,13 @@ would otherwise age every request and expire estimates sooner than under Helios.
 **Packing.** Each step's uploads follow the prepared graph's typed value bindings,
 as in Helios's shared packer: state-row indices, row slots and
 generations, page and draft page tables, token IDs, query lengths, sampling
-flags, state-transfer commands and admission rows. Bytes it does not write
-keep their resident values, as with native partial uploads. Combined packed
-rounds bind `SPECULATIVE_PREFIX_LIMIT` and leave query lengths to the captured
-GPU allocator.
+flags, state-transfer commands, admission rows, and named FP32 scalar arguments.
+Bytes it does not write keep their resident values, as with native partial
+uploads. Combined packed rounds bind `SPECULATIVE_PREFIX_LIMIT` and leave query
+lengths to the captured GPU allocator. Direct prefix keys use the same canonical
+scalar identity as native serving and include every declared scalar, including
+zero values.
+
 Completion records are validated against the step before any state changes;
 a record that contradicts it stops execution.
 

@@ -69,6 +69,18 @@ impl ModelCatalog {
                 .ok()
             })
             .flatten();
+        let request_scalars: Vec<_> = model
+            .contract
+            .scalar_arguments
+            .iter()
+            .map(|argument| {
+                json!({
+                    "name": &argument.name,
+                    "default": argument.default_value,
+                    "range": argument.range,
+                })
+            })
+            .collect();
         // Match vLLM's ModelCard / ModelPermission wire fields while
         // advertising only features supported by this server.
         let card = json!({
@@ -102,6 +114,7 @@ impl ModelCatalog {
                 "sampling_defaults": model.sampling_defaults,
                 "thinking_token_budget": thinking_token_budget,
                 "sampling_ranges": model.sampling_ranges,
+                "request_scalars": request_scalars,
                 "max_images_per_prompt": limits.map_or(0, |l| l.max_images),
                 "max_image_tokens_per_prompt": limits.map_or(0, |l| l.max_image_tokens_per_prompt()),
                 "image_feature_window_tokens": model.contract.vision.features_per_request,
@@ -321,6 +334,30 @@ mod tests {
         assert_eq!(
             text["flare"]["sampling_ranges"],
             json!(model.sampling_ranges)
+        );
+        assert_eq!(text["flare"]["request_scalars"], json!([]));
+        model.contract.scalar_arguments = vec![
+            crate::model::contract::ScalarArgument {
+                name: "gain".into(),
+                default_value: 0.,
+                range: Some(crate::model::contract::ScalarArgumentRange {
+                    min: 0.,
+                    max: 1.,
+                }),
+            },
+            crate::model::contract::ScalarArgument {
+                name: "residual_gain".into(),
+                default_value: 0.25,
+                range: None,
+            },
+        ];
+        let scalar_card = ModelCatalog::new(&model, &[], None).card;
+        assert_eq!(
+            scalar_card["flare"]["request_scalars"],
+            json!([
+                {"name":"gain","default":0.,"range":{"min":0.,"max":1.}},
+                {"name":"residual_gain","default":0.25,"range":null},
+            ])
         );
         assert_eq!(text["flare"]["input_modalities"], json!(["text"]));
         assert_eq!(text["flare"]["output_modalities"], json!(["text"]));

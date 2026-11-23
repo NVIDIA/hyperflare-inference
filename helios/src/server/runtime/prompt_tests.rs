@@ -51,6 +51,7 @@ fn prompt_prefill_gpu_and_native_costs() {
                         conditioned_inputs: vec![], conditioning: vec![], sampling: crate::model::SamplingParameters {
                             top_k: 1, ..Default::default()
                         }, max_new_tokens: budget, reasoning_cut: None, stop_sequences: vec![], stop_strings: vec![],
+                        request_scalars: Default::default(),
                         grammar: None, ignore_eos: false, logprobs: false,
                         logprob_token_ids: vec![], prompt_logprobs: scored,
                     };

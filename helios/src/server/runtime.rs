@@ -34,6 +34,7 @@ pub struct Prompt {
     pub conditioned_inputs: Vec<crate::frontend::images::PreparedImageInput>,
     pub conditioning: Vec<ConditioningEvent>,
     pub sampling: SamplingParameters,
+    pub request_scalars: crate::model::RequestScalars,
     pub max_new_tokens: u32,
     pub reasoning_cut: Option<ReasoningCut>,
     pub stop_sequences: Vec<Vec<u32>>,
@@ -1225,7 +1226,12 @@ impl<'a> Worker<'a> {
             return;
         };
         for incoming in requests {
-            begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
+            begin_pool_lookup(
+                &mut self.scheduler,
+                store.as_mut(),
+                &self.config.contract.scalar_arguments,
+                incoming,
+            );
         }
     }
 
@@ -1355,7 +1361,12 @@ impl<'a> Worker<'a> {
                 if incoming.pool_plan.is_none()
                     && let Some(store) = self.store.as_mut().filter(|store| store.pooled())
                 {
-                    begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
+                    begin_pool_lookup(
+                        &mut self.scheduler,
+                        store.as_mut(),
+                        &self.config.contract.scalar_arguments,
+                        incoming,
+                    );
                 }
                 incoming.poll_pool_lookup();
                 incoming.poll_restore_wait(now);
@@ -1399,7 +1410,12 @@ impl<'a> Worker<'a> {
                 continue;
             }
             if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
-                begin_pool_lookup(&mut self.scheduler, store.as_mut(), &mut incoming);
+                begin_pool_lookup(
+                    &mut self.scheduler,
+                    store.as_mut(),
+                    &self.config.contract.scalar_arguments,
+                    &mut incoming,
+                );
             }
             if incoming.awaits_pool(std::time::Instant::now()) {
                 match parked {
@@ -1423,6 +1439,8 @@ impl<'a> Worker<'a> {
                     store.as_mut(),
                     incoming.pool_lookup.as_ref(),
                     spec,
+                    &self.config.contract.scalar_arguments,
+                    &incoming.prompt.request_scalars,
                     incoming.pool_plan.as_ref(),
                     checkpoint_accounting,
                     self.prefill_rate,
@@ -1436,7 +1454,13 @@ impl<'a> Worker<'a> {
                     handle
                 })
             } else {
-                admit_with_checkpoint_accounting(&mut self.scheduler, spec, checkpoint_accounting)
+                admit_with_checkpoint_accounting(
+                    &mut self.scheduler,
+                    spec,
+                    &self.config.contract.scalar_arguments,
+                    &incoming.prompt.request_scalars,
+                    checkpoint_accounting,
+                )
             };
             let handle = match admission {
                 Ok(handle) => handle,
@@ -2698,6 +2722,7 @@ fn serve_export(
 fn begin_pool_lookup(
     scheduler: &mut RequestScheduler,
     store: &mut dyn flare_selene::HostStore,
+    scalar_arguments: &[crate::model::contract::ScalarArgument],
     incoming: &mut Incoming,
 ) {
     if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end {
@@ -2711,7 +2736,11 @@ fn begin_pool_lookup(
     }
     let plan = match incoming.pool_plan.as_ref() {
         Some(plan) => scheduler.refresh_admission_plan(plan),
-        None => scheduler.plan_admission(&incoming.spec()),
+        None => scheduler.plan_admission_with_scalars(
+            &incoming.spec(),
+            scalar_arguments,
+            &incoming.prompt.request_scalars,
+        ),
     };
     let Ok(plan) = plan else {
         return;
@@ -2729,9 +2758,12 @@ fn begin_pool_lookup(
 fn admit_with_checkpoint_accounting(
     scheduler: &mut RequestScheduler,
     spec: RequestSpec,
+    scalar_arguments: &[crate::model::contract::ScalarArgument],
+    request_scalars: &crate::model::RequestScalars,
     accounting: Option<crate::scheduler::CheckpointAccounting>,
 ) -> Result<RequestHandle> {
-    let plan = scheduler.plan_admission(&spec)?;
+    let plan =
+        scheduler.plan_admission_with_scalars(&spec, scalar_arguments, request_scalars)?;
     Ok(scheduler.admit_planned_with_checkpoint_accounting(spec, plan, None, accounting)?.handle)
 }
 
@@ -2742,6 +2774,8 @@ fn admit_with_host_store(
     store: &mut dyn flare_selene::HostStore,
     pool_lookup: Option<&flare_selene::pool::LookupTicket>,
     spec: RequestSpec,
+    scalar_arguments: &[crate::model::contract::ScalarArgument],
+    request_scalars: &crate::model::RequestScalars,
     queued_plan: Option<&crate::scheduler::AdmissionPlan>,
     accounting: Option<crate::scheduler::CheckpointAccounting>,
     prefill_rate: f64,
@@ -2750,7 +2784,11 @@ fn admit_with_host_store(
 ) -> Result<(RequestHandle, Option<crate::offload::LookupOutcome>)> {
     let plan = match queued_plan {
         Some(plan) => scheduler.refresh_admission_plan(plan)?,
-        None => scheduler.plan_admission(&spec)?,
+        None => scheduler.plan_admission_with_scalars(
+            &spec,
+            scalar_arguments,
+            request_scalars,
+        )?,
     };
     let reused = (plan.resident_tokens() != 0)
         .then(|| plan.history().key_at(plan.resident_tokens()))
@@ -2798,7 +2836,13 @@ fn admit_with_host_store(
                     return Err(Error::Admission(AdmissionError::Capacity(failure)));
                 }
                 restore_wait.retry_at = None;
-                let handle = admit_with_checkpoint_accounting(scheduler, spec, accounting.clone())?;
+                let handle = admit_with_checkpoint_accounting(
+                    scheduler,
+                    spec,
+                    scalar_arguments,
+                    request_scalars,
+                    accounting.clone(),
+                )?;
                 scheduler.record_host_lookup();
                 return Ok((handle, Some(LookupOutcome::CapacityRejected)));
             }
@@ -2814,8 +2858,14 @@ fn admit_with_host_store(
             // No event follows a rejected fetch; this request is the ticket's only
             // waiter, so retire it and admit the request again without the store.
             scheduler.finish_inbound(key, false)?;
-            return admit_with_checkpoint_accounting(scheduler, spec, Some(admitted_accounting))
-                .map(|handle| (handle, Some(LookupOutcome::EnqueueRejected)));
+            return admit_with_checkpoint_accounting(
+                scheduler,
+                spec,
+                scalar_arguments,
+                request_scalars,
+                Some(admitted_accounting),
+            )
+            .map(|handle| (handle, Some(LookupOutcome::EnqueueRejected)));
         }
         Ok((admitted.handle, Some(LookupOutcome::Admitted)))
     })();
@@ -2940,6 +2990,7 @@ mod tests {
                     top_k: 1,
                     ..Default::default()
                 },
+                request_scalars: Default::default(),
                 max_new_tokens: 16,
                 prompt: vec![7],
                 data: PromptData {
@@ -3195,6 +3246,7 @@ mod tests {
                 conditioned_inputs: vec![],
                 conditioning: vec![],
                 sampling: SamplingParameters::default(),
+                request_scalars: Default::default(),
                 max_new_tokens: 10,
                 reasoning_cut: None,
                 stop_sequences: vec![],
@@ -3529,6 +3581,7 @@ mod tests {
             admissions[handle.slot as usize] = Some(Admission {
                 handle,
                 sampling: SamplingParameters::default(),
+                request_scalars: Default::default(),
                 max_new_tokens: 10,
                 prompt: vec![0],
                 data: PromptData {

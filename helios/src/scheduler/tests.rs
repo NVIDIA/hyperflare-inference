@@ -2697,7 +2697,7 @@ fn host_scheduler(active: usize, pages: u32, snapshots: u32) -> RequestScheduler
     scheduler
 }
 fn inbound(scheduler: &mut RequestScheduler, spec: RequestSpec, consumed: u64) -> Admitted {
-    let plan = scheduler.plan_admission(&spec).unwrap();
+    let plan = scheduler.plan_admission_with_scalars(&spec, &[], &Default::default()).unwrap();
     let key = plan.history().key_at(consumed).unwrap();
     let pages = (consumed / 64 - plan.resident_tokens() / 64) as usize;
     scheduler
@@ -2969,7 +2969,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     assert_eq!(notices[0].chain_pages, ancestor_pages);
     assert_eq!(free(&scheduler), (7, 3));
     let request = spec(130, 2);
-    let plan = scheduler.plan_admission(&request).unwrap();
+    let plan = scheduler.plan_admission_with_scalars(&request, &[], &Default::default()).unwrap();
     assert_eq!(plan.resident_tokens(), 64);
     let key = plan.history().key_at(128).unwrap();
     let admitted = scheduler
@@ -3411,7 +3411,7 @@ fn invalid_inbound_requests_reserve_nothing_and_planned_admission_matches_admit(
             pages: 0,
         },
     ] {
-        let plan = scheduler.plan_admission(&request).unwrap();
+        let plan = scheduler.plan_admission_with_scalars(&request, &[], &Default::default()).unwrap();
         assert!(
             scheduler
                 .admit_planned(request.clone(), plan, Some(inbound))
@@ -3421,7 +3421,7 @@ fn invalid_inbound_requests_reserve_nothing_and_planned_admission_matches_admit(
         assert_eq!(scheduler.stats().active_requests, 0);
     }
     assert_eq!(scheduler.stats().host_hits, 0);
-    let plan = scheduler.plan_admission(&request).unwrap();
+    let plan = scheduler.plan_admission_with_scalars(&request, &[], &Default::default()).unwrap();
     assert_eq!(plan.resident_tokens(), 0);
     // Lookups count once per admitted request; the failed attempts above count none.
     assert_eq!(scheduler.stats().cache_lookups, 0);
@@ -3433,7 +3433,7 @@ fn invalid_inbound_requests_reserve_nothing_and_planned_admission_matches_admit(
     let live = scheduler.request(admitted.handle).unwrap();
     assert_eq!(live.phase, RequestPhase::Initialize);
     assert_eq!(live.consumed_tokens, 0);
-    assert!(scheduler.plan_admission(&request).is_err());
+    assert!(scheduler.plan_admission_with_scalars(&request, &[], &Default::default()).is_err());
     scheduler.cancel(admitted.handle).unwrap();
     assert_eq!(free(&scheduler), (8, 4));
 }
@@ -3918,10 +3918,10 @@ fn scored_requests_bypass_prefix_lookup_and_keep_their_own_prefill_catalog() {
     assert!(scheduler.stats().snapshot_publications > 0);
     let mut again = spec(700, 1);
     again.prompt_logprobs = true;
-    let scored = scheduler.plan_admission(&again).unwrap();
+    let scored = scheduler.plan_admission_with_scalars(&again, &[], &Default::default()).unwrap();
     assert!(scored.lookup.checkpoint.is_none());
     again.prompt_logprobs = false;
-    let ordinary = scheduler.plan_admission(&again).unwrap();
+    let ordinary = scheduler.plan_admission_with_scalars(&again, &[], &Default::default()).unwrap();
     assert!(ordinary.lookup.checkpoint.is_some());
 }
 

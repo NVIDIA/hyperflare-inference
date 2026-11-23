@@ -144,6 +144,7 @@ impl ThinkingBudget {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Options {
     pub sampling: Sampling,
+    pub request_scalars: crate::model::RequestScalars,
     pub logprobs: Option<LogprobOptions>,
     pub prompt_logprobs: Option<usize>,
     pub effort: Option<Effort>,

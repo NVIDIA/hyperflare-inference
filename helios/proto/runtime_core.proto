@@ -209,6 +209,17 @@ message ModelContract {
   CacheContract cache = 5;
   repeated GraphContract graphs = 6;
   FrontendContract frontend = 7;
+  // Generic per-request FP32 values consumed by SCALAR_ARGUMENT graph bindings.
+  repeated ScalarArgument scalar_arguments = 8;
+}
+message ScalarArgument {
+  string name = 1;
+  optional float default_value = 2;
+  ScalarArgumentRange range = 3;
+}
+message ScalarArgumentRange {
+  optional float min = 1;
+  optional float max = 2;
 }
 message VisionCapacity {
   // Zero inherits prepared execution concurrency when max_images is nonzero.
@@ -284,6 +295,8 @@ enum ValueSource {
   PROMPT_TARGET_TOKEN = 39;
   // Immutable per-request query-length ceiling for GPU-owned packed allocation.
   SPECULATIVE_PREFIX_LIMIT = 40;
+  // Named FP32 value declared by ModelContract.scalar_arguments.
+  SCALAR_ARGUMENT = 41;
 }
 enum InputIndexing {
   INDEXING_UNSPECIFIED = 0;
@@ -300,6 +313,8 @@ message ValueBinding {
   sint64 value_offset = 4;
   sint64 padding = 5;
   string tensor = 6;
+  // ScalarArgument.name for SCALAR_ARGUMENT; empty for every other source.
+  string argument = 7;
 }
 enum StateAccessKind {
   STATE_ACCESS_UNSPECIFIED = 0;

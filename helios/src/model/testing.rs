@@ -26,6 +26,7 @@ pub fn binding(
         value_offset,
         padding,
         tensor: String::new(),
+        argument: String::new(),
     }
 }
 
@@ -236,6 +237,7 @@ pub fn metadata() -> PreparedContract {
             prefix_boundary: None,
             image_tokens: None,
         },
+        scalar_arguments: vec![],
     }
 }
 
@@ -274,7 +276,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 }
             };
             let dtype = match b.source {
-                SamplingParameters => Dtype::Float32,
+                SamplingParameters | ScalarArgument => Dtype::Float32,
                 RequestSlot if b.buffer == "row_slot_ids" || b.buffer == "admission_slots" => {
                     Dtype::Int32
                 }
