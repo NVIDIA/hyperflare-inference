@@ -683,19 +683,22 @@
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `ignition/components/linear.py`; SM103 execution is unqualified.
 
-[ ] Establish equal GLM 5.3 target distributions across decode capacities
-    before qualifying lossless speculation. On twelve TP8 checkpoint rows,
-    ordinary capacity one and verification capacity eight differ by up to
-    0.07361 in total variation at temperature one and top-p 0.95. Their
-    first differences occur in the layer-zero BF16 query projection.
-    Close when the executed target and proposal laws satisfy mtp-design.md.
+[ ] Reduce cross-capacity BF16 projection drift across GLM 5.3 decode batch
+    shapes. At equal physical capacity eight, ordinary decode and speculative
+    verification logits match bit-for-bit on all twelve tested TP8 checkpoint
+    rows, while capacity-one GEMV and capacity-eight MMA differ by 1-3 BF16
+    ULPs in the layer-zero query projection and up to 0.07361 in total
+    variation at temperature one and top-p 0.95. Close when cross-capacity
+    drift is characterized across batch sizes or reduced.
 
-[ ] Pin FlashInfer to a revision containing logical-position tie breaking
-    in FP8 sparse selection and column-based split-K in the packed W4A16
-    expert kernel. The lockfile selects 598c8547, which has neither repair.
-    Close when a locked install passes the checkpoint cutoff and target-row
-    regressions and serves freshly exported plain and draft-enabled GLM 5.3
-    cores. See model-preparation.md, section GLM 5.3.
+[ ] Advance uv.lock once local-inference-lab/flashinfer#130 merges so locked
+    installs include logical-position FP8 sparse-selection tie breaking,
+    column-based W4A16 split-K boundaries, scatter-gather shard-owner RMSNorm,
+    weight-first projection staging, and bound decode sparse MLA outputs.
+    uv.lock (994df9c4f) precedes those changes. Close when a locked
+    install passes the checkpoint cutoff and target-row regressions and serves
+    freshly exported plain and draft-enabled GLM 5.3 cores. See
+    model-preparation.md, section GLM 5.3.
 
 [ ] Exercise Kimi K3 and K3.1 MLA key absorption and value expansion with
     core-backed storage at eight decode rows. Their shared weight loader

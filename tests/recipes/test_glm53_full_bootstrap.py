@@ -103,3 +103,59 @@ def test_frontend_syntax_is_that_of_glm53_flash_without_rejected_media_tokens():
     from ignition.recipes.glm53_full.contract import FRONTEND
 
     assert FRONTEND == {**flash, "rejected_tokens": []}
+
+
+def test_model_config_validates_attention_scale_and_positive_scalars():
+    from ignition.recipes.glm53_full.config import ARCHITECTURE, ModelConfig, _REQUIRED
+
+    valid = {
+        **_REQUIRED,
+        "architectures": [ARCHITECTURE],
+        "rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0},
+        "num_hidden_layers": 2,
+        "indexer_types": ["full", "shared"],
+        "mlp_layer_types": ["dense", "sparse"],
+        "rms_norm_eps": 1e-5,
+        "routed_scaling_factor": 2.5,
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "kv_cache_quant_algo": None,
+            "ignore": ["lm_head"],
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {"dynamic": False, "num_bits": 4, "type": "float", "group_size": 16},
+                    "input_activations": {"dynamic": False, "num_bits": 4, "type": "float", "group_size": 16},
+                }
+            },
+        },
+    }
+    parsed = ModelConfig.from_dict(valid)
+    assert parsed.qk_head_dim == 256 and parsed.norm_eps == 1e-5 and parsed.routed_scale == 2.5
+    for bad in (
+        {**valid, "qk_head_dim": 128},
+        {k: v for k, v in valid.items() if k != "qk_head_dim"},
+        {**valid, "rms_norm_eps": 0.0},
+        {**valid, "rms_norm_eps": True},
+        {**valid, "routed_scaling_factor": -1.0},
+        {**valid, "routed_scaling_factor": None},
+    ):
+        with pytest.raises(ValueError):
+            ModelConfig.from_dict(bad)
+
+
+def test_single_request_index_tables_expand_without_copying():
+    from ignition.recipes.glm53_full.indexer import index_tables, selected_records
+
+    block_table = torch.tensor([[2, -1, 5]], dtype=torch.int32)
+    requests = torch.zeros(4096, dtype=torch.int64)
+    tables, row_pages = index_tables(block_table, requests)
+    assert row_pages.shape == (4096, 12) and row_pages.stride(0) == 0
+    assert row_pages.untyped_storage().data_ptr() == tables.untyped_storage().data_ptr()
+    logical = torch.tensor([[65, 2, 260]], dtype=torch.int32)
+    positions = torch.tensor([400], dtype=torch.int64)
+    selection = selected_records(logical, positions, row_pages[:1])
+    assert selection.records.tolist() == [[8 * 64 + 2, 9 * 64 + 1, -1]]
+    assert selection.lengths.tolist() == [2]
+

@@ -7,7 +7,7 @@ import torch
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.draft_sampling import PreparedDraftDistribution
-from ignition.components.paged_batch import PAGE_TOKENS, Metadata, PreparedBatch
+from ignition.components.paged_batch import Metadata, PreparedBatch
 from ignition.components.speculation import (
     DRAFT_RNG_DOMAIN,
     PreparedSpeculativeCommit,
@@ -32,10 +32,9 @@ class PreparedCausalDraftRound:
         device, blocks = o.pool.backing.device, o.inputs.page_tables.shape[1]
         self.rows = torch.arange(b, device=device)
         self.metadata = Metadata.allocate(b * w, b, blocks, device, samples=b * w)
-        # An owner whose pages hold another token count than the paged default names it as `page_tokens`.
         self.validator = PreparedBatch(o.inputs, o.requests, Metadata.allocate(b, b, blocks, device),
             mode="decode", shard=o.weights.shard, pool=o.pool, verification_width=w,
-            page_tokens=getattr(o, "page_tokens", PAGE_TOKENS))
+            page_tokens=o.page_tokens)
         self.validation = PreparedAllReduce(self.validator.validation_input, self.validator.validation_sum,
             runtime=o.collectives["runtime"], coordinator=o.collectives["coordinator"],
             session=o.session, name=name + ".validation").functional(session=o.session)

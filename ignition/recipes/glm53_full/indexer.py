@@ -41,7 +41,8 @@ def index_page_table(block_table):
 def index_tables(block_table, requests):
     """Expand model pages once and gather the index pages belonging to each packed row."""
     tables = index_page_table(block_table)
-    return tables, tables[requests.long()]
+    row_pages = tables.expand(requests.numel(), -1) if tables.shape[0] == 1 else tables[requests.long()]
+    return tables, row_pages
 
 
 def selected_records(logical, positions, pages):

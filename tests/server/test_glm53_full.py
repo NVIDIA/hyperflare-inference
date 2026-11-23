@@ -98,7 +98,7 @@ def test_greedy_tokens_follow_the_reference(card):
                 changed.append((row, margins[row]))
         if row in final:
             scores, _ = next_token_scores(card, prefix, score_token=expected[row])
-            exact = float(logprobs[row - (rows - 64), expected[row]])
+            exact = float(logprobs[row - (rows - logprobs.shape[0]), expected[row]])
             differences.append(abs(scores[expected[row]] - exact))
     assert len(changed) <= math.ceil(2 * CHANGED_DECISIVE_TOKENS * decisive), (changed, decisive)
     assert sum(differences) / len(differences) < 2 * LOGPROB_FLOOR, differences

@@ -760,7 +760,7 @@ The indexer normalizes those values in FP32. Attention reads the selected
 records in ascending logical token order, independent of physical page
 placement. Selection is qualified on eight SM120 GPUs with the FlashInfer
 selector that breaks equal scores by increasing logical position at every
-top-k reduction (commit `661af16ee061af9d21056bbe3ca7db1f5f4bd2aa`).
+top-k reduction (`local-inference-lab/flashinfer#130`).
 The 21 target indexers and the draft indexer passed independent FP8 score
 and cutoff checks on 60,081 prefill and decode rows per 2,722-token prompt.
 Four cutoff exchanges on the long checkpoint fixture fell within their
@@ -842,8 +842,7 @@ off. Prompt log probabilities and images are not prepared. Requests with
 image content are rejected.
 
 Serving is qualified on eight RTX PRO 6000 Blackwell Max-Q GPUs (SM120,
-96 GB each) with the two FlashInfer kernel repairs identified in this
-section. Signed exports with and without learned drafts served through
+96 GB each) with `local-inference-lab/flashinfer#130`. Signed exports with and without learned drafts served through
 `flare run` at the default capacities. Each passed five GLM service tests
 and 93 shared protocol tests, and each reproduced the FP32 most-likely token
 on 16 growing prefixes from each of the 24-token `short.pt` and 2,722-token
@@ -865,7 +864,7 @@ split partials stored in BF16, and the reduction on each stage's inputs.
 
 Target distribution qualification depends on physical decode capacity.
 With the packed expert kernel that assigns reduction boundaries by output
-column (FlashInfer commit `e3c7023a94a59e8951bb87c872a68e350bc33b19`),
+column (`local-inference-lab/flashinfer#130`),
 the prepared target produced bitwise-identical watched logits at capacity
 eight when future tokens, an unrelated request, an inactive row, or the
 watched row's slot changed at the start of four three-token intervals.
@@ -893,19 +892,14 @@ FP8 reference on 32. Reversing the last 674 input tokens left all 78 layer
 outputs and every vocabulary score bitwise identical through position 2,047
 in both the prepared prefill and the matched FP8 reference.
 
-The repository lockfile selects FlashInfer `598c8547be335bcd833254177ac18ccb2bf4dabc`.
-Local GLM 5.3 preparation with decode overlap uses the paired FlashInfer
-revision `f364798ac3093402e6acfb0782889019d1701f41`. It includes the
-logical-position tie rule, column-based expert reduction, attention weight
-reads, and the mixed FP32 and BF16 projection. With that revision checked
-out in `../flashinfer`, run these commands from the Flare repository before
-exporting the checkpoint.
-
-```sh
-uv sync --locked --extra prepare --extra test
-BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 \
-  uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e ../flashinfer
-```
+The repository lockfile selects FlashInfer `994df9c4f32256c9d9281fc39ae7c646dedd42b3`.
+On that locked revision, GLM 5.3 prepares with `UnquantizedProjection`,
+unfused two-shot BF16 reductions, and scratch-copied decode attention outputs,
+without logical-position FP8 index tie breaking or column-based W4A16 split-K
+boundaries. Full TP8 numerical qualification, fused scatter-gather shard-owner
+RMSNorm, weight-first router and shared-expert projection staging, and bound
+decode sparse MLA outputs require `local-inference-lab/flashinfer#130`; those
+paths activate automatically once `uv.lock` advances to include it.
 
 The signed plain core declared 59.662 GiB of fixed device allocations on
 seven ranks and 59.727 GiB on rank five. The draft-enabled core declared

@@ -16,7 +16,7 @@ ARCHITECTURE = "GlmMoeDsaForCausalLM"
 # declares anything else is a different model, not a configuration of this recipe.
 _REQUIRED = {
     "model_type": "glm_moe_dsa", "hidden_size": 6144, "num_attention_heads": 64, "num_key_value_heads": 64,
-    "q_lora_rank": 2048, "kv_lora_rank": 512, "qk_nope_head_dim": 192, "qk_rope_head_dim": 64,
+    "q_lora_rank": 2048, "kv_lora_rank": 512, "qk_head_dim": 256, "qk_nope_head_dim": 192, "qk_rope_head_dim": 64,
     "v_head_dim": 256, "index_n_heads": 32, "index_head_dim": 128, "index_topk": 2048,
     "indexer_rope_interleave": True, "rope_interleave": True, "attention_bias": False,
     "intermediate_size": 12288, "moe_intermediate_size": 2048, "n_routed_experts": 256,
@@ -45,6 +45,10 @@ class ModelConfig:
                 raise ValueError(f"GLM 5.3 {key} requires {expected!r}, got {raw.get(key)!r}")
         if type(raw.get("index_share_for_mtp_iteration", False)) is not bool:
             raise ValueError("GLM 5.3 index_share_for_mtp_iteration must be boolean")
+        for key in ("rms_norm_eps", "routed_scaling_factor"):
+            value = raw.get(key)
+            if type(value) not in (int, float) or value <= 0:
+                raise ValueError(f"GLM 5.3 {key} must be a positive number, got {value!r}")
         rope = raw.get("rope_parameters")
         if (not isinstance(rope, dict) or rope.get("rope_type") != "default"
                 or type(rope.get("rope_theta")) not in (int, float) or rope["rope_theta"] <= 0):
@@ -94,12 +98,16 @@ class ModelConfig:
         return float(self.raw["rope_parameters"]["rope_theta"])
 
     @property
+    def qk_head_dim(self):
+        return self.raw["qk_head_dim"]
+
+    @property
     def norm_eps(self):
-        return self.raw["rms_norm_eps"]
+        return float(self.raw["rms_norm_eps"])
 
     @property
     def routed_scale(self):
-        return self.raw["routed_scaling_factor"]
+        return float(self.raw["routed_scaling_factor"])
 
     def selects(self, layer):
         """Whether a layer computes its own sparse-attention selection. The draft layer does."""

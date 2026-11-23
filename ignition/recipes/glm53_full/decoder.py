@@ -139,7 +139,7 @@ class PreparedLayer:
             raise ValueError("GLM 5.3 index key pages exist exactly for layers that select")
         source = buffers("layer.source", rows, HIDDEN)
         self.attention = PreparedAttention(weights.attention, source, metadata, cache, angles, heads=heads,
-            selects=self.selects, eps=1e-6, softmax_scale=config.raw["qk_head_dim"] ** -0.5, mode=mode,
+            selects=self.selects, eps=1e-6, softmax_scale=config.qk_head_dim ** -0.5, mode=mode,
             session=session, name=f"{name}.attention", workspace=workspace, buffers=buffers,
             cache_only=cache_only)
         self.indexer = self.attention_reduce = self.mlp = self.mlp_reduce = None

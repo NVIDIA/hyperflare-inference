@@ -210,7 +210,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         speculation = None
         if config.mtp:
             speculation = SimpleNamespace(weights=weights, pool=pool, inputs=inputs, requests=requests, scratch=decode_storage,
-                draft_scratch=draft_storage,
+                draft_scratch=draft_storage, page_tokens=PAGE_TOKENS,
                 session=session, workspace=arena, collectives=collectives, overlap=config.stream_overlap,
                 completion=completion, frame=frame, sequence=sequence, rng=SpeculativeRngState.allocate(device, capacity=slots),
                 offset=torch.zeros(slots, dtype=torch.int64, device=device),

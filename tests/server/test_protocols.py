@@ -131,48 +131,45 @@ def test_ollama_model_discovery(clients):
 
 def test_sdk_buffered_and_streaming_text(clients):
     o, a, _ = clients
-    # Generating through EOS gives every protocol the same explicit termination cause.
-    extra = {**EXTRA, "ignore_eos": True}
-    chat = o.chat.completions.create(model="local", messages=USER, max_tokens=32, extra_body=extra)
-    message = chat.choices[0].message
-    assert message.content or getattr(message, "reasoning_content", None)
-    assert chat.choices[0].finish_reason == "length"
-    assert chat.usage.completion_tokens == 32
+    # Checkpoints whose templates always open reasoning need room for that block before replying.
+    chat = o.chat.completions.create(model="local", messages=USER, max_tokens=256, extra_body=EXTRA)
+    assert chat.choices[0].message.content.strip() == "OK"
+    assert chat.choices[0].finish_reason == "stop"
     chunks = list(o.chat.completions.create(
-        model="local", messages=USER, max_tokens=32, stream=True,
-        stream_options={"include_usage": True}, extra_body=extra,
+        model="local", messages=USER, max_tokens=256, stream=True,
+        stream_options={"include_usage": True}, extra_body=EXTRA,
     ))
-    choices = [c for chunk in chunks for c in chunk.choices]
-    assert any(c.delta.content or getattr(c.delta, "reasoning_content", None) for c in choices)
-    assert [c.finish_reason for c in choices if c.finish_reason] == ["length"]
-    assert choices[-1].finish_reason == "length"
-    assert chunks[-1].usage.completion_tokens == 32
-    with a.messages.stream(model="local", messages=USER, max_tokens=32, extra_body=extra) as stream:
+    assert "".join(c.choices[0].delta.content or "" for c in chunks if c.choices).strip() == "OK"
+    assert [c.finish_reason for chunk in chunks for c in chunk.choices if c.finish_reason] == ["stop"]
+    assert chunks[-1].usage.total_tokens > 0
+    with a.messages.stream(model="local", messages=USER, max_tokens=256, extra_body=EXTRA) as stream:
         events = list(stream)
-        streamed = stream.get_final_message()
+        message = stream.get_final_message()
     assert events[0].type == "message_start" and events[-1].type == "message_stop"
-    for index, block in enumerate(streamed.content):
+    for index, block in enumerate(message.content):
         parts = [event.delta for event in events if event.type == "content_block_delta" and event.index == index]
         if block.type == "text":
             assert "".join(d.text for d in parts if d.type == "text_delta") == block.text
         elif block.type == "thinking":
             assert "".join(d.thinking for d in parts if d.type == "thinking_delta") == block.thinking
-    buffered = a.messages.create(model="local", messages=USER, max_tokens=32, extra_body=extra)
-    for result in (buffered, streamed):
-        assert any(b.type in ("text", "thinking") for b in result.content)
-        assert result.stop_reason == "max_tokens"
-        assert result.usage.output_tokens == 32
-    assert message_input_tokens(buffered.usage) == message_input_tokens(streamed.usage)
-    with o.responses.stream(model="local", input=USER, max_output_tokens=32, extra_body=extra) as stream:
+    assert "".join(b.text for b in message.content if b.type == "text").strip() == "OK"
+    assert message.stop_reason == "end_turn"
+    buffered = a.messages.create(model="local", messages=USER, max_tokens=256, extra_body=EXTRA)
+    assert buffered.stop_reason == "end_turn"
+    assert [b.text.strip() for b in buffered.content if b.type == "text"] == [
+        b.text.strip() for b in message.content if b.type == "text"
+    ]
+    assert message_input_tokens(buffered.usage) == message_input_tokens(message.usage)
+    with o.responses.stream(model="local", input=USER, max_output_tokens=256, extra_body=EXTRA) as stream:
         events = list(stream)
-    assert events[0].type == "response.created" and events[-1].type == "response.incomplete"
-    streamed = events[-1].response
-    assert "".join(e.delta for e in events if e.type == "response.output_text.delta") == streamed.output_text
-    buffered = o.responses.create(model="local", input=USER, max_output_tokens=32, extra_body=extra)
-    for result in (buffered, streamed):
-        assert any(item.type in ("message", "reasoning") for item in result.output)
-        assert result.status == "incomplete" and result.incomplete_details.reason == "max_output_tokens"
-        assert result.usage.output_tokens == 32
+        response = stream.get_final_response()
+    assert response.output_text.strip() == "OK"
+    assert "".join(e.delta for e in events if e.type == "response.output_text.delta") == response.output_text
+    assert response.status == "completed"
+    assert events[-1].type == "response.completed"
+    buffered = o.responses.create(model="local", input=USER, max_output_tokens=256, extra_body=EXTRA)
+    assert buffered.status == "completed"
+    assert buffered.output_text.strip() == response.output_text.strip()
 
 
 def test_raw_completion_batch_and_zero_tokens(clients):
@@ -209,15 +206,20 @@ def test_raw_completion_batch_and_zero_tokens(clients):
 @pytest.mark.parametrize("hinted", [False, True])
 def test_messages_block_hint_reuses_history_after_suffix_changes(clients, hinted):
     _, anthropic, http = clients
-    history = {"type": "text", "text": f"History {time.time_ns()}. "
-               + "An earlier action read a file and checked its output.\n" * 100}
-    if hinted:
-        history["cache_control"] = {"type": "ephemeral"}
-    blocks = [history, {"type": "text", "text": "First action: inspect the file. Reply OK."}]
+    line = "An earlier action read a file and checked its output.\n"
+    # Warm short and multi-chunk prefill durations so the scheduler prices interior cuts from measurements.
     kwargs = {"model": "local", "max_tokens": 1, "extra_body": EXTRA}
+    for count in (1, 500):
+        anthropic.messages.create(
+            messages=[{"role": "user", "content": f"Warm {time.time_ns()}. " + line * count}], **kwargs,
+        )
     anthropic.messages.create(
         messages=[{"role": "user", "content": "Warm the shared message preamble."}], **kwargs,
     )
+    history = {"type": "text", "text": f"History {time.time_ns()}. " + line * 500}
+    if hinted:
+        history["cache_control"] = {"type": "ephemeral"}
+    blocks = [history, {"type": "text", "text": "First action: inspect the file. Reply OK."}]
     before = service_metrics(http)
     first = anthropic.messages.create(
         messages=[{"role": "user", "content": blocks}], **kwargs,
@@ -234,20 +236,13 @@ def test_messages_block_hint_reuses_history_after_suffix_changes(clients, hinted
         "flare_cache_reused_tokens_total", "flare_host_cache_reused_tokens_total",
     ))
     reused = cached - (first.usage.cache_read_input_tokens or 0)
-    if not hinted:
-        assert reused == 0
-    elif reused > 500:
+    if hinted:
+        assert reused > 500
+        assert captured['flare_checkpoint_captures_total{role="message"}'] > before[
+            'flare_checkpoint_captures_total{role="message"}'
+        ]
         assert captured["flare_snapshot_publications_total"] > before["flare_snapshot_publications_total"]
     else:
-        # The changed suffix rules out restoring the first request's end. A skip can
-        # explain zero additional reuse only when the request published no interior cut.
-        message = 'flare_checkpoint_captures_total{role="message"}'
-        assert captured[message] == before[message]
-        assert any(captured[key] > before[key] for key in (
-            'flare_checkpoint_skips_total{reason="unknown_cost"}',
-            'flare_checkpoint_skips_total{reason="work_budget"}',
-            'flare_checkpoint_skips_total{reason="storage"}',
-        ))
         assert reused == 0
 
 
@@ -322,13 +317,13 @@ def test_token_count_and_compressed_requests(clients):
     counted = a.messages.count_tokens(model="local", messages=USER, extra_body=EXTRA)
     message = a.messages.create(model="local", messages=USER, max_tokens=16, extra_body=EXTRA)
     assert counted.input_tokens == message_input_tokens(message.usage)
-    body = json.dumps({"input": USER, "max_output_tokens": 16, "ignore_eos": True, **EXTRA}).encode()
+    body = json.dumps({"input": "Reply with exactly OK.", "max_output_tokens": 256, **EXTRA}).encode()
     result = http.post("/v1/responses", content=gzip.compress(body), headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
     result.raise_for_status()
     response = result.json()
-    assert response["status"] == "incomplete" and response["incomplete_details"]["reason"] == "max_output_tokens"
-    assert response["usage"]["output_tokens"] == 16
-    assert any(item["type"] in ("message", "reasoning") for item in response["output"])
+    assert response["status"] == "completed"
+    texts = [c["text"].strip() for item in response["output"] if item["type"] == "message" for c in item.get("content", [])]
+    assert texts == ["OK"]
 
 
 def test_messages_tool_history(clients):
@@ -590,12 +585,11 @@ def test_messages_inline_system_text_and_empty_controls(clients):
     counted = a.messages.count_tokens(model="local", messages=history, extra_body=EXTRA)
     empty = a.messages.count_tokens(model="local", messages=history + [controls], extra_body=EXTRA)
     assert counted.input_tokens == empty.input_tokens
-    with a.messages.stream(model="local", messages=history + [controls], max_tokens=32,
-                           extra_body={**EXTRA, "ignore_eos": True}) as stream:
-        list(stream)
+    with a.messages.stream(model="local", messages=history + [controls], max_tokens=256, extra_body=EXTRA) as stream:
+        assert "".join(stream.text_stream).strip() == "OK"
         result = stream.get_final_message()
     assert message_input_tokens(result.usage) == counted.input_tokens
-    assert result.stop_reason == "max_tokens" and result.usage.output_tokens == 32
+    assert result.stop_reason == "end_turn"
 
 
 def test_responses_tool_history(clients):
