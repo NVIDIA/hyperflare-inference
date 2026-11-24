@@ -138,16 +138,20 @@ output delivery: g/z
 
 Only decoding requests have a delivery coordinate or output-age cost. Normalized
 service prices follow the entropy-dual update in `scheduling-utility.md`. When a
-prefilling request's maximum feasible token rate drops between chunks (for
+prefilling request's maximum feasible token rate changes between chunks (for
 example from a faster intermediate `PREFILL` chunk to a slower
-`TERMINAL_PREFILL` chunk or a short prompt tail), `ServicePrice::rebase_downward`
+`TERMINAL_PREFILL` chunk or a short prompt tail), `ServicePrice::rebase`
 rescales its stored token price by the rate ratio so its normalized GPU-time
-share `p * m` stays continuous across the transition; tracked prefill rate state
-clears once prompt consumption finishes so prefill-to-decode transitions remain
-unchanged. Individually feasible prefill service rates price each request from
-the prefill catalog and operation it can execute (`PREFILL`, `TERMINAL_PREFILL`,
-or `SCORED_PREFILL`), excluding `MIXED` durations for `prompt_logprobs` requests
-and for requests holding incomplete deferred prefill state. Actual
+share `p * m` stays continuous across prefill transitions. When the request
+completes prompt consumption and enters decode, `ServicePrice::rebase_upward`
+caps any upward feasible-rate jump (such as exiting a slow padded prefill tail
+into speculative decode) so normalized decode priority cannot inflate above its
+pre-transition share, then clears the tracked prefill rate while leaving
+downward rate transitions into decode unchanged. Individually feasible prefill
+service rates price each request from the prefill catalog and operation it can
+execute (`PREFILL`, `TERMINAL_PREFILL`, or `SCORED_PREFILL`), excluding `MIXED`
+durations for `prompt_logprobs` requests and for requests holding incomplete
+deferred prefill state. Actual
 service updates history; expected acceptance scores choices. Conditional
 acceptance is estimated per request, started from the population mean when the
 model reports no GPU confidence, and respects available proposals, grammar and stop
@@ -229,7 +233,10 @@ continuation state until a `TERMINAL_PREFILL` chunk completes. While deferred
 state is active, the scheduler excludes the request from `MIXED` graphs and
 suppresses checkpoint and early-retirement snapshot capture so incomplete
 continuation state is never published. Checkpoint cut budgeting prices
-non-terminal and terminal chunks using their separate measured durations.
+non-terminal and terminal chunks using their separate measured durations with
+sibling fallback when only one operation is measured, skipping unmeasured
+larger capacities that consume no additional tokens and unmeasured non-target
+capacities on terminal-prefill catalogs.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a

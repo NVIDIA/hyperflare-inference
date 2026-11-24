@@ -336,11 +336,11 @@ impl RequestScheduler {
                     .get_or_insert_with(|| ServicePrice::initial(rate / count as f64));
                 if prefill {
                     if let Some(previous) = service.prefill_rate {
-                        price.rebase_downward(previous, rate);
+                        price.rebase(previous, rate);
                     }
                     service.prefill_rate = Some(rate);
-                } else {
-                    service.prefill_rate = None;
+                } else if let Some(previous) = service.prefill_rate.take() {
+                    price.rebase_upward(previous, rate);
                 }
             } else if !prefill {
                 service.prefill_rate = None;

@@ -4715,3 +4715,96 @@ fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
         "deferred prefill request must not appear as a Mixed prefill lane"
     );
 }
+
+#[test]
+fn short_prefill_tail_caps_service_price_on_decode_transition() {
+    let mut s = engine(4, true);
+    let caps = [128usize, 256, 512];
+    s.prefill_graphs(&caps).unwrap();
+    s.terminal_prefill_graphs(&caps).unwrap();
+    let mut graphs = super::tests::duration_graphs(4);
+    let terminal: Vec<_> = graphs
+        .iter()
+        .filter(|g| g.kind == GraphKind::Prefill && caps.contains(&g.token_capacity))
+        .cloned()
+        .map(|mut g| {
+            g.kind = GraphKind::TerminalPrefill;
+            g.name = format!("terminal-{}", g.token_capacity);
+            g
+        })
+        .collect();
+    graphs.extend(terminal);
+    s.measured_graph_durations(&graphs).unwrap();
+    for batch in [1usize, 2, 4] {
+        set_cost(&mut s, GraphKind::Init, batch, 1, MS);
+        set_cost(&mut s, GraphKind::Snapshot, batch, 1, 2 * MS);
+        for &w in &[1usize, 2, 4, 8] {
+            set_cost(&mut s, GraphKind::Speculative, batch, w, 8 * MS);
+        }
+    }
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 128, 25 * MS);
+    let mut sp = super::tests::spec(30, 64);
+    sp.message_boundaries = vec![28];
+    let handle = s.admit(sp).unwrap();
+    initialize(&mut s, handle);
+    // Run 0..28 anchor chunk, anchor snapshot, and 2-token tail (3 useful tokens in 25 ms = 0.12 tok/ms).
+    for _ in 0..3 {
+        let plan = s.plan().unwrap();
+        let dt = plan.estimated_duration_ns();
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        s.advance_to(s.now_ns + dt).unwrap();
+        let mut records = completion_records(&s, &plan, fence, 0);
+        if plan.kind == GraphKind::TerminalPrefill {
+            let r = s.request(handle).unwrap();
+            let lane = &plan.lanes[0];
+            let end = lane.start_position + lane.tokens as u64;
+            let emitted = u32::from(end == r.prompt_tokens as u64);
+            records[handle.slot as usize].consumed_tokens = end as i64;
+            records[handle.slot as usize].generated_tokens = (r.generated_tokens + emitted) as i64;
+            records[handle.slot as usize].token_id = if emitted > 0 { 99 } else { -1 };
+            records[handle.slot as usize].status = 1;
+        }
+        let out = s.complete(fence, &records, gpu_time(dt)).unwrap();
+        for tok in out {
+            s.published_output(tok.request, fence).unwrap();
+        }
+    }
+    let req = s.request(handle).unwrap();
+    assert_eq!(req.phase, RequestPhase::Decode);
+    assert!(req.accounting.service.prefill_rate.is_some());
+    let (decode_rate, _) = s.service_rates(req);
+    let decode_rate = decode_rate.unwrap();
+    assert!(
+        decode_rate > 0.12,
+        "decode feasible rate should exceed 2-token padded tail rate"
+    );
+    // lane_values must cap upward rate jumps before the first decode commit.
+    let (values, _, scale) = s.lane_values(0);
+    let unscaled_token_price = (values[handle.slot as usize].output_token
+        - s.policy.output_token_value * (-scale).exp())
+        * scale.exp();
+    let normalized_share = unscaled_token_price * decode_rate;
+    assert!(
+        normalized_share <= s.policy.token_fairness + 1e-6,
+        "lane_values decode transition must not inflate normalized token share: got {normalized_share}, limit {}",
+        s.policy.token_fairness
+    );
+
+    // Committing the first decode step rebases upward in service_participants and clears prefill_rate.
+    let decode_plan = s.plan().unwrap();
+    assert_eq!(decode_plan.kind, GraphKind::Speculative);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&decode_plan, fence).unwrap();
+    assert!(s.request(handle).unwrap().accounting.service.prefill_rate.is_none());
+    let (post_values, _, post_scale) = s.lane_values(0);
+    let post_unscaled_price = (post_values[handle.slot as usize].output_token
+        - s.policy.output_token_value * (-post_scale).exp())
+        * post_scale.exp();
+    let post_normalized_share = post_unscaled_price * decode_rate;
+    assert!(
+        post_normalized_share <= s.policy.token_fairness + 1e-6,
+        "service_participants decode transition must not inflate normalized token share: got {post_normalized_share}, limit {}",
+        s.policy.token_fairness
+    );
+}

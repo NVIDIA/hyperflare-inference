@@ -424,9 +424,11 @@ impl RequestScheduler {
                 let mut price = service
                     .tokens
                     .unwrap_or_else(|| ServicePrice::initial(rate / count as f64));
-                if r.consumed_tokens < r.prompt_tokens as u64 {
-                    if let Some(previous) = service.prefill_rate {
-                        price.rebase_downward(previous, rate);
+                if let Some(previous) = service.prefill_rate {
+                    if r.consumed_tokens < r.prompt_tokens as u64 {
+                        price.rebase(previous, rate);
+                    } else {
+                        price.rebase_upward(previous, rate);
                     }
                 }
                 token_log[slot] = price.log_price(self.policy.token_fairness);
