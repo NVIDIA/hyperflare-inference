@@ -18,8 +18,9 @@ only for decode rounds, and it estimates graph costs with a 7/8 moving average
 that reverts to unmeasured after 30 seconds. The duration estimates, funded
 refresh, and acceptance learning specified below describe Helios alone.
 
-The native catalog contains prefill, scored prefill, ordinary decode, complete
-speculative generation, mixed prefill/generation, vision, and state operations.
+The native catalog contains prefill, terminal prefill, scored prefill, ordinary
+decode, complete speculative generation, mixed prefill/generation, vision, and
+state operations.
 A complete speculative graph contains proposal generation, optional confidence
 and prefix allocation, target verification, and accepted-state commit. Proposal
 and verification are internal stages, not independently scheduled operations.
@@ -136,7 +137,17 @@ output delivery: g/z
 ```
 
 Only decoding requests have a delivery coordinate or output-age cost. Normalized
-service prices follow the entropy-dual update in `scheduling-utility.md`. Actual
+service prices follow the entropy-dual update in `scheduling-utility.md`. When a
+prefilling request's maximum feasible token rate drops between chunks (for
+example from a faster intermediate `PREFILL` chunk to a slower
+`TERMINAL_PREFILL` chunk or a short prompt tail), `ServicePrice::rebase_downward`
+rescales its stored token price by the rate ratio so its normalized GPU-time
+share `p * m` stays continuous across the transition; tracked prefill rate state
+clears once prompt consumption finishes so prefill-to-decode transitions remain
+unchanged. Individually feasible prefill service rates price each request from
+the prefill catalog and operation it can execute (`PREFILL`, `TERMINAL_PREFILL`,
+or `SCORED_PREFILL`), excluding `MIXED` durations for `prompt_logprobs` requests
+and for requests holding incomplete deferred prefill state. Actual
 service updates history; expected acceptance scores choices. Conditional
 acceptance is estimated per request, started from the population mean when the
 model reports no GPU confidence, and respects available proposals, grammar and stop
@@ -205,6 +216,20 @@ and prompt length also restrict logical work. A graph with 64 useful prompt toke
 earns 64 prompt units and at most one output token, regardless of physical capacity.
 Candidate scoring has no smallest-fitting-shape filter, duration ceiling, forced
 oldest-request filter, or per-chunk prefill lateness cost.
+
+When a prepared model registers `TERMINAL_PREFILL` graphs for a subset of
+aligned prefill capacities, Helios infers the tail-protection window as the
+largest ordinary `PREFILL` capacity absent from the terminal catalog. For
+capacities present in the terminal catalog, Helios schedules `TERMINAL_PREFILL`
+at prompt completion, checkpoint cuts, conditioned-window boundaries, and any
+penultimate chunk leaving at most the tail-protection window, while earlier
+chunks run `PREFILL`. Committing a non-terminal `PREFILL` chunk at a capacity
+present in the terminal catalog marks the request as holding deferred
+continuation state until a `TERMINAL_PREFILL` chunk completes. While deferred
+state is active, the scheduler excludes the request from `MIXED` graphs and
+suppresses checkpoint and early-retirement snapshot capture so incomplete
+continuation state is never published. Checkpoint cut budgeting prices
+non-terminal and terminal chunks using their separate measured durations.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a

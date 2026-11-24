@@ -24,6 +24,17 @@ impl ServicePrice {
         coefficient.ln() + self.log_inverse_rate
     }
 
+    /// Rescales a stored physical price when a prefilling request's feasible rate
+    /// drops (for example across intermediate-to-terminal prefill or a short tail),
+    /// preserving its normalized GPU-time share `p * m`.
+    pub fn rebase_downward(&mut self, previous_rate: f64, current_rate: f64) {
+        debug_assert!(previous_rate.is_finite() && previous_rate > 0.0);
+        debug_assert!(current_rate.is_finite() && current_rate > 0.0);
+        if current_rate < previous_rate {
+            self.log_inverse_rate += (previous_rate / current_rate).ln();
+        }
+    }
+
     /// Integrate dp/dt = (f - p*y)/(m*tau) for physical service rate y.
     /// An unserved request's price grows linearly with occupied elapsed time.
     pub fn observe(
@@ -228,6 +239,21 @@ mod tests {
         rate.observe(30.0, 8.0, 10.0, 100.0);
         assert!(rate.log_inverse_rate.is_finite());
         assert!(rate.log_price(4.0) < 10.0);
+    }
+
+    #[test]
+    fn rebase_downward_preserves_normalized_price_on_rate_drop() {
+        let mut price = ServicePrice::initial(50.0);
+        let normalized_before = price.log_price(2.0).exp() * 50.0;
+        price.rebase_downward(50.0, 2.5);
+        let normalized_after = price.log_price(2.0).exp() * 2.5;
+        assert!((normalized_after - normalized_before).abs() < 1e-12);
+
+        let unchanged = price.log_inverse_rate;
+        price.rebase_downward(2.5, 2.5);
+        assert_eq!(price.log_inverse_rate, unchanged);
+        price.rebase_downward(2.5, 10.0);
+        assert_eq!(price.log_inverse_rate, unchanged);
     }
 
     #[test]

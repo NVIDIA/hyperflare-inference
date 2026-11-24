@@ -537,7 +537,9 @@ impl RequestScheduler {
             let cut = accounting
                 .cuts
                 .iter()
-                .find(|cut| cut.endpoint == end)
+                .find(|cut| {
+                    cut.endpoint == end && !self.is_non_terminal_prefill(kind, step.token_capacity)
+                })
                 .copied();
             let reserve_guard = cut.is_some_and(|cut| cut.endpoint < anchor)
                 && request.anchor_guard.is_none()

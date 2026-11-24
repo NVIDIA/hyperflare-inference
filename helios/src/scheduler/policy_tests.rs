@@ -172,7 +172,7 @@ fn completion_records(
             continue;
         };
         let count = match kind {
-            GraphKind::Prefill => {
+            GraphKind::Prefill | GraphKind::TerminalPrefill => {
                 usize::from(r.consumed_tokens + lane.tokens as u64 == r.prompt_tokens as u64)
             }
             GraphKind::Resume | GraphKind::Decode => 1,
@@ -4455,4 +4455,263 @@ fn terminal_prefill_rejects_invalid_capacities_and_post_admission_registration()
     s.terminal_prefill_graphs(&[256, 512]).unwrap();
     let _ = add(&mut s, 1, 64, 1);
     assert!(s.terminal_prefill_graphs(&[512]).is_err());
+}
+
+#[test]
+fn terminal_prefill_rebases_service_price_when_rate_drops_from_intermediate_prefill() {
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 128, 8 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 256, 8 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 512, 10 * MS);
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 256, 80 * MS);
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 512, 100 * MS);
+    let prompt = add(&mut s, 1, 641, 16);
+    let init = s.plan().unwrap();
+    let init_fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, init_fence).unwrap();
+    complete(&mut s, &init, init_fence, 0, false);
+
+    // Run one fast intermediate Prefill chunk (512 tokens in 10 ms => 51.2 tok/ms).
+    let first = s.plan().unwrap();
+    assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    s.advance_to(s.now_ns + 10 * MS).unwrap();
+    complete_timed(&mut s, &first, fence, 0, true, gpu_time(10 * MS));
+
+    // 129 tokens remain (> window 128), so TerminalPrefill(256) is required
+    // (130 useful tokens in 80 ms => 1.625 tok/ms, >31x slower than intermediate Prefill).
+    // Rebased prefill_token price must preserve normalized GPU-time share.
+    let (values, _, scale) = s.lane_values(0);
+    let unscaled_prefill_price = values[prompt.slot as usize].prefill_token * scale.exp();
+    let expected = 1.0 + s.policy.token_fairness / (130.0 / 80.0);
+    assert!(
+        (unscaled_prefill_price - expected).abs() < 1e-6,
+        "terminal prefill price should rebase to terminal feasible rate: got {unscaled_prefill_price}, expected {expected}"
+    );
+
+    // Completing TerminalPrefill moves through any prompt Snapshot to Decode and clears prefill_rate.
+    let terminal = s.plan().unwrap();
+    assert_eq!(
+        (terminal.kind, terminal.token_capacity),
+        (GraphKind::TerminalPrefill, 256)
+    );
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&terminal, fence).unwrap();
+    s.advance_to(s.now_ns + 80 * MS).unwrap();
+    complete_timed(&mut s, &terminal, fence, 1, true, gpu_time(80 * MS));
+    if s.request(prompt).unwrap().phase == RequestPhase::Snapshot {
+        let snap = s.plan().unwrap();
+        assert_eq!(snap.kind, GraphKind::Snapshot);
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&snap, fence).unwrap();
+        complete(&mut s, &snap, fence, 0, false);
+    }
+    assert_eq!(s.request(prompt).unwrap().phase, RequestPhase::Decode);
+    let decode = s.plan().unwrap();
+    assert_eq!(decode.kind, GraphKind::Decode);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&decode, fence).unwrap();
+    assert!(s.request(prompt).unwrap().accounting.service.prefill_rate.is_none());
+}
+
+#[test]
+fn deferred_prefill_finish_early_skips_incomplete_terminal_snapshot() {
+    let mut s = engine_with_terminal_prefill(&[256, 512]);
+    let handle = add(&mut s, 1, 1536, 4);
+    let init = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+
+    // Chunk 0 runs non-terminal Prefill(512), leaving deferred continuation state.
+    let first = s.plan().unwrap();
+    assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    assert!(s.request(handle).unwrap().deferred_prefill);
+    complete(&mut s, &first, fence, 0, false);
+    assert!(s.request(handle).unwrap().deferred_prefill);
+
+    // Ending early during deferred prefill must not retain a snapshot of incomplete state.
+    s.finish_early(handle, false).unwrap();
+    let request = s.request(handle).unwrap();
+    assert_eq!(request.phase, RequestPhase::Finishing);
+    assert!(request.terminal_snapshot.is_none());
+    assert!(s.finish(handle).unwrap().is_none());
+
+    // After TerminalPrefill completes, deferred state clears and finish_early retains a snapshot.
+    let second = add(&mut s, 2, 1024, 4);
+    let init = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+    for expected in [GraphKind::Prefill, GraphKind::TerminalPrefill] {
+        let plan = s.plan().unwrap();
+        assert_eq!((plan.kind, plan.token_capacity), (expected, 512));
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        complete(
+            &mut s,
+            &plan,
+            fence,
+            usize::from(expected == GraphKind::TerminalPrefill),
+            false,
+        );
+    }
+    assert!(!s.request(second).unwrap().deferred_prefill);
+    s.finish_early(second, false).unwrap();
+    let request = s.request(second).unwrap();
+    assert_eq!(request.phase, RequestPhase::Snapshot);
+    assert!(request.terminal_snapshot.is_some());
+}
+
+#[test]
+fn mixed_graphs_excluded_for_deferred_prefill_and_prompt_logprobs() {
+    let mut s = engine(2, false);
+    s.prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    s.terminal_prefill_graphs(&[256, 512]).unwrap();
+    s.scored_prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    s.mixed_graphs(&[(2, 1, 512)]).unwrap();
+    let mut graphs = super::tests::duration_graphs(2);
+    graphs.retain(|g| g.kind != GraphKind::Prefill);
+    for &capacity in &[64usize, 128, 256, 512] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("prefill-{capacity}"),
+            kind: GraphKind::Prefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 100 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: (capacity as u64 / 64 + 1) * MS,
+            input_bindings: vec![],
+        });
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("scored-prefill-{capacity}"),
+            kind: GraphKind::ScoredPrefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 200 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 20 * MS,
+            input_bindings: vec![],
+        });
+    }
+    for &capacity in &[256usize, 512] {
+        graphs.push(crate::execution::GraphDescriptor {
+            tuned_bindings: vec![],
+            confidence_width: 0,
+            name: format!("terminal-prefill-{capacity}"),
+            kind: GraphKind::TerminalPrefill,
+            sampling_mode: SamplingMode::General,
+            draft_tokens: 0,
+            handle: 1000 + capacity,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            packed_token_capacity: 0,
+            prefill_capacity: 0,
+            estimated_duration_ns: 40 * MS,
+            input_bindings: vec![],
+        });
+    }
+    graphs.push(crate::execution::GraphDescriptor {
+        tuned_bindings: vec![],
+        confidence_width: 0,
+        name: "mixed-2-1-512".into(),
+        kind: GraphKind::Mixed,
+        sampling_mode: SamplingMode::General,
+        draft_tokens: 0,
+        handle: 2000,
+        batch_capacity: 2,
+        token_capacity: 1,
+        packed_token_capacity: 0,
+        prefill_capacity: 512,
+        estimated_duration_ns: MS,
+        input_bindings: vec![],
+    });
+    s.measured_graph_durations(&graphs).unwrap();
+
+    // 1. prompt_logprobs requests exclude fast Mixed durations (1 ms) and price only ScoredPrefill (20 ms).
+    let scored = s
+        .admit(RequestSpec {
+            prompt: vec![7; 512],
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 1,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: true,
+            growable_output: false,
+        })
+        .unwrap();
+    let (scored_rate, _) = s.service_rates(s.request(scored).unwrap());
+    let expected_scored_rate = 513.0 / 20.0;
+    assert!(
+        (scored_rate.unwrap() - expected_scored_rate).abs() < 1e-9,
+        "prompt_logprobs service rate must exclude Mixed: got {scored_rate:?}, expected {expected_scored_rate}"
+    );
+    s.cancel(scored).unwrap();
+
+    // 2. A deferred-prefill request excludes Mixed in service_rates and candidate generation.
+    let decoder = add(&mut s, 10, 64, 8);
+    let init = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+    let pre = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&pre, fence).unwrap();
+    complete(&mut s, &pre, fence, 1, false);
+    if s.request(decoder).unwrap().phase == RequestPhase::Snapshot {
+        let snap = s.plan().unwrap();
+        assert_eq!(snap.kind, GraphKind::Snapshot);
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&snap, fence).unwrap();
+        complete(&mut s, &snap, fence, 0, false);
+    }
+    assert_eq!(s.request(decoder).unwrap().phase, RequestPhase::Decode);
+
+    let deferred = add(&mut s, 20, 1024, 4);
+    let init = s.phase_plan(GraphKind::Init, Some(deferred));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&init, fence).unwrap();
+    complete(&mut s, &init, fence, 0, false);
+
+    // Run non-terminal Prefill(512) to enter deferred_prefill state with 512 tokens remaining.
+    let first = s.phase_plan(GraphKind::Prefill, Some(deferred));
+    assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 512));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    complete(&mut s, &first, fence, 0, false);
+    assert!(s.request(deferred).unwrap().deferred_prefill);
+
+    // service_rates must use TerminalPrefill(512) (40 ms => 513/40), not Mixed (1 ms => 513/1).
+    let (deferred_rate, _) = s.service_rates(s.request(deferred).unwrap());
+    let expected_deferred_rate = 513.0 / 40.0;
+    assert!(
+        (deferred_rate.unwrap() - expected_deferred_rate).abs() < 1e-9,
+        "deferred prefill service rate must exclude Mixed: got {deferred_rate:?}, expected {expected_deferred_rate}"
+    );
+
+    // mixed_candidates must not pair the deferred-prefill request into a Mixed step.
+    let (values, age_price, _) = s.lane_values(0);
+    let mut mixed_out = Vec::new();
+    s.mixed_candidates(&mut mixed_out, &values, age_price, false);
+    assert!(
+        mixed_out
+            .iter()
+            .all(|candidate| candidate.prefill_slot != Some(deferred.slot as usize)),
+        "deferred prefill request must not appear as a Mixed prefill lane"
+    );
 }
