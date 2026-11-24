@@ -479,9 +479,11 @@ impl RequestScheduler {
                 let mut price = service
                     .tokens
                     .unwrap_or_else(|| ServicePrice::initial(rate / count as f64));
-                if r.consumed_tokens < r.prompt_tokens as u64 {
-                    if let Some(previous) = service.prefill_rate {
-                        price.rebase_downward(previous, rate);
+                if let Some(previous) = service.prefill_rate {
+                    if r.consumed_tokens < r.prompt_tokens as u64 {
+                        price.rebase(previous, rate);
+                    } else {
+                        price.rebase_upward(previous, rate);
                     }
                 }
                 token_log[slot] = price.log_price(self.policy.token_fairness);
@@ -898,6 +900,49 @@ impl RequestScheduler {
         )
     }
 
+    pub(super) fn prefill_effective_horizon(
+        &self,
+        request: &LiveRequest,
+        kind: GraphKind,
+        tokens: usize,
+        cut: Option<usize>,
+        duration_ns: u64,
+    ) -> (usize, bool, u64) {
+        let end = request.consumed_tokens as usize + tokens;
+        if kind != GraphKind::Prefill || self.terminal_prefill_min_tokens == 0 || duration_ns == 0 {
+            return (tokens, end == request.prompt_tokens, duration_ns);
+        }
+        let boundary = self.prefill_boundary_through(request, cut);
+        // Compare all candidates over the same completion horizon. Charging a
+        // terminal tail only to chunks that happen to leave one fitting tail
+        // would favor smaller chunks that postpone entering that horizon.
+        if boundary.saturating_sub(request.consumed_tokens as usize)
+            > self.prefill_catalog.last().copied().unwrap_or(0)
+        {
+            return (tokens, end == request.prompt_tokens, duration_ns);
+        }
+        let remaining = boundary.saturating_sub(end);
+        if remaining < self.terminal_prefill_min_tokens {
+            return (tokens, end == request.prompt_tokens, duration_ns);
+        }
+        let Some(&terminal_capacity) = self.prefill_catalog.iter().find(|&&size| size >= remaining)
+        else {
+            return (tokens, end == request.prompt_tokens, duration_ns);
+        };
+        let Some(following) = self
+            .costs
+            .duration(GraphKind::TerminalPrefill, 1, terminal_capacity)
+            .filter(|&ns| ns > 0)
+        else {
+            return (tokens, end == request.prompt_tokens, duration_ns);
+        };
+        (
+            tokens + remaining,
+            boundary == request.prompt_tokens,
+            duration_ns.saturating_add(following),
+        )
+    }
+
     fn prefill_value_for_tokens(
         &self,
         request: &LiveRequest,
@@ -907,35 +952,16 @@ impl RequestScheduler {
         duration_ns: u64,
         value: LaneValue,
     ) -> f64 {
-        let end = request.consumed_tokens as usize + tokens;
-        let immediate = value.prefill(tokens, end == request.prompt_tokens);
-        if kind != GraphKind::Prefill || self.terminal_prefill_min_tokens == 0 || duration_ns == 0 {
-            return immediate;
+        let (effective_tokens, first_output, total_ns) =
+            self.prefill_effective_horizon(request, kind, tokens, cut, duration_ns);
+        let combined = value.prefill(effective_tokens, first_output);
+        if total_ns == duration_ns || total_ns == 0 {
+            return combined;
         }
-        let boundary = self.prefill_boundary_through(request, cut);
-        // Compare all candidates over the same completion horizon. Charging a
-        // terminal tail only to chunks that happen to leave one fitting tail
-        // would favor smaller chunks that postpone entering that horizon.
-        if boundary.saturating_sub(request.consumed_tokens as usize)
-            > self.prefill_catalog.last().copied().unwrap_or(0) {
-            return immediate;
-        }
-        let remaining = boundary.saturating_sub(end);
-        if remaining < self.terminal_prefill_min_tokens {
-            return immediate;
-        }
-        let Some(&terminal_capacity) = self.prefill_catalog.iter().find(|&&size| size >= remaining) else {
-            return immediate;
-        };
-        let Some(following) = self.costs.duration(GraphKind::TerminalPrefill, 1, terminal_capacity)
-            .filter(|&ns| ns > 0) else {
-            return immediate;
-        };
         // Price a measured terminal tail with the intermediate work that makes
         // it necessary. Only this graph is submitted; the next fence replans.
         // Decode waiting remains bounded by this graph's actual duration.
-        value.prefill(tokens + remaining, boundary == request.prompt_tokens)
-            * (duration_ns as f64 / duration_ns.saturating_add(following) as f64)
+        combined * (duration_ns as f64 / total_ns as f64)
     }
 
     fn lane_value(

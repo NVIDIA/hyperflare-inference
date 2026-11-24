@@ -232,19 +232,24 @@ the request cannot publish a checkpoint, decode, resume, or enter a mixed graph;
 cancellation discards the incomplete state after its last-use fence drains.
 When the remaining work to the boundary fits within the largest prefill capacity
 and an intermediate chunk leaves a measured terminal tail of at least
-`terminal_prefill_min_tokens`, chunk selection scales the combined boundary
-value by `T_intermediate / (T_intermediate + T_terminal)` so every candidate
-compares over the same completion horizon while decode waiting remains bounded
-by the submitted graph's duration. Individually feasible prefill service rates
-price each request from the prefill catalog and operation it actually executes
+`terminal_prefill_min_tokens`, chunk selection and feasible prefill service-rate
+normalization both evaluate the combined boundary horizon
+`T_intermediate + T_terminal` so candidate values and token-service prices agree
+over the same completion horizon while decode waiting remains bounded by the
+submitted graph's duration. Individually feasible prefill service rates price
+each request from the prefill catalog and operation it actually executes
 (`PREFILL`, `TERMINAL_PREFILL`, or `SCORED_PREFILL`), excluding `MIXED` graphs
-for scored-prompt requests and requests awaiting terminal completion. When a
-prefilling request's maximum feasible token rate drops across chunks (for
-example from a fast intermediate `PREFILL` chunk to a slower `TERMINAL_PREFILL`
-chunk or short tail), its stored token service price rescales downward-rate
-transitions to preserve its normalized GPU-time share. Optional-discovery
-gating on `TERMINAL_PREFILL` catalogs applies only to alternative prefill
-shapes so larger unmeasured decode batch capacities still discover immediately.
+for scored-prompt requests and requests awaiting terminal completion. Stored
+token service prices rebase across prefill feasible-rate changes to preserve
+normalized GPU-time share, and cap upward rate jumps when a short padded prefill
+tail transitions into decode so the tail's low token rate cannot inflate
+normalized decode priority. Checkpoint extra-work interval pricing on
+`TERMINAL_PREFILL` catalogs accounts for terminal tail reservation, resolves
+`TERMINAL_PREFILL` and `PREFILL` costs with sibling fallback when only one is
+measured, and skips unmeasured larger capacities that consume no additional
+tokens. Optional-discovery gating on `TERMINAL_PREFILL` catalogs applies only
+to alternative prefill shapes so larger unmeasured decode batch capacities still
+discover immediately.
 
 ## Prerequisites and completion
 

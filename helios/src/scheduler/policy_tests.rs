@@ -4501,3 +4501,99 @@ fn terminal_prefill_rebases_service_price_when_rate_drops_from_intermediate_pref
         "terminal prefill price should rebase to terminal feasible rate: got {unscaled_prefill_price}, expected {expected}"
     );
 }
+
+#[test]
+fn terminal_prefill_horizon_rate_matches_service_rate_normalizer() {
+    let mut s = cold_terminal_engine(4, false);
+    for batch in [1usize, 2, 4] {
+        set_cost(&mut s, GraphKind::Decode, batch, 1, 10 * MS);
+    }
+    set_cost(&mut s, GraphKind::Prefill, 1, 256, 10 * MS);
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 256, 50 * MS);
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 512, 80 * MS);
+    // 400 tokens fits within max capacity 512. Prefill(256) pairs with a 144-token
+    // TerminalPrefill(256) tail: 401 useful tokens in 10 + 50 = 60 ms (6.683 tok/ms),
+    // which beats TerminalPrefill(512)'s 401 / 80 = 5.0125 tok/ms, rather than the
+    // unscaled intermediate-only rate 256 / 10 = 25.6 tok/ms.
+    let prompt = add(&mut s, 1, 400, 16);
+    initialize(&mut s, prompt);
+    let (token_rate, delivery_rate) = s.service_rates(s.request(prompt).unwrap());
+    assert!(delivery_rate.is_none());
+    let expected = 401.0 / 60.0;
+    assert!(
+        (token_rate.unwrap() - expected).abs() < 1e-6,
+        "service_rates must match combined intermediate+terminal horizon rate: got {:?}, expected {expected}",
+        token_rate
+    );
+}
+
+#[test]
+fn short_prefill_tail_caps_service_price_on_decode_transition() {
+    let mut s = cold_terminal_engine(4, true);
+    let mut graphs = super::tests::duration_graphs(4);
+    let caps = [128usize, 256, 512];
+    let terminal: Vec<_> = graphs
+        .iter()
+        .filter(|g| g.kind == GraphKind::Prefill && caps.contains(&g.token_capacity))
+        .cloned()
+        .map(|mut g| {
+            g.kind = GraphKind::TerminalPrefill;
+            g.name = format!("terminal-{}", g.token_capacity);
+            g
+        })
+        .collect();
+    graphs.extend(terminal);
+    s.measured_graph_durations(&graphs).unwrap();
+    for batch in [1usize, 2, 4] {
+        set_cost(&mut s, GraphKind::Init, batch, 1, MS);
+        set_cost(&mut s, GraphKind::Snapshot, batch, 1, MS);
+        for &w in &[1usize, 2, 4, 8] {
+            set_cost(&mut s, GraphKind::Speculative, batch, w, 8 * MS);
+        }
+    }
+    set_cost(&mut s, GraphKind::TerminalPrefill, 1, 128, 25 * MS);
+    let mut sp = super::tests::spec(30, 64);
+    sp.message_boundaries = vec![28];
+    let handle = s.admit(sp).unwrap();
+    initialize(&mut s, handle);
+    // Run 0..28 anchor chunk, snapshot, and 2-token tail (3 useful tokens in 25 ms = 0.12 tok/ms).
+    for _ in 0..3 {
+        let plan = s.plan().unwrap();
+        let dt = plan.estimated_duration_ns();
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        s.advance_to(s.now_ns + dt).unwrap();
+        let mut records = completion_records(&s, &plan, fence, 0);
+        if plan.kind == GraphKind::TerminalPrefill {
+            let r = s.request(handle).unwrap();
+            let lane = &plan.lanes[0];
+            let end = lane.start_position + lane.tokens as u64;
+            let emitted = u32::from(end == r.prompt_tokens as u64);
+            records[handle.slot as usize].consumed_tokens = end as i64;
+            records[handle.slot as usize].generated_tokens = (r.generated_tokens + emitted) as i64;
+            records[handle.slot as usize].token_id = if emitted > 0 { 99 } else { -1 };
+            records[handle.slot as usize].status = 1;
+        }
+        let out = s.complete(fence, &records, gpu_time(dt)).unwrap();
+        for tok in out {
+            s.published_output(tok.request, fence).unwrap();
+        }
+    }
+    let req = s.request(handle).unwrap();
+    assert_eq!(req.phase, RequestPhase::Decode);
+    let (decode_rate, _) = s.service_rates(req);
+    let decode_rate = decode_rate.unwrap();
+    assert!(decode_rate > 0.12, "decode feasible rate should exceed 2-token padded tail rate");
+    let (values, _, scale) = s.lane_values(0);
+    let unscaled_token_price = (values[handle.slot as usize].output_token
+        - s.policy.output_token_value * (-scale).exp())
+        * scale.exp();
+    // Normalized GPU-time share p * m_decode must not inflate above the pre-transition
+    // single-request share f (= token_fairness).
+    let normalized_share = unscaled_token_price * decode_rate;
+    assert!(
+        normalized_share <= s.policy.token_fairness + 1e-6,
+        "decode transition must not inflate normalized token share: got {normalized_share}, limit {}",
+        s.policy.token_fairness
+    );
+}

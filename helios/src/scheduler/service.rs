@@ -165,21 +165,20 @@ impl RequestScheduler {
                 consider(GraphKind::Snapshot, batch, 1, 0.0, true);
             }
         } else if prefill {
+            let cut = self.estimated_checkpoint_cut(request);
             for &capacity in self.prefill_catalog(request.prefill_kind()) {
                 let kind = self.prefill_operation(request, capacity);
                 let work = self.prefill_work(request, capacity);
                 if work == 0 {
                     continue;
                 }
-                let first_output =
-                    request.consumed_tokens + work as u64 == request.prompt_tokens as u64;
-                consider(
-                    kind,
-                    1,
-                    capacity,
-                    work as f64 + f64::from(first_output),
-                    false,
-                );
+                if let Some(ns) = self.costs.duration(kind, 1, capacity).filter(|&n| n > 0) {
+                    let (effective_tokens, first_output, effective_ns) =
+                        self.prefill_effective_horizon(request, kind, work, cut, ns);
+                    let per_ms = 1e6 / effective_ns as f64;
+                    token_rate =
+                        token_rate.max((effective_tokens as f64 + f64::from(first_output)) * per_ms);
+                }
             }
         } else {
             let mut curve = None;
@@ -320,11 +319,13 @@ impl RequestScheduler {
                     .get_or_insert_with(|| ServicePrice::initial(rate / count as f64));
                 if prefill {
                     if let Some(previous) = service.prefill_rate {
-                        price.rebase_downward(previous, rate);
+                        price.rebase(previous, rate);
                     }
                     service.prefill_rate = Some(rate);
                 } else {
-                    service.prefill_rate = None;
+                    if let Some(previous) = service.prefill_rate.take() {
+                        price.rebase_upward(previous, rate);
+                    }
                 }
             } else if !prefill {
                 service.prefill_rate = None;

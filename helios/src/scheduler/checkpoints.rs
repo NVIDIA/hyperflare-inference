@@ -166,6 +166,11 @@ impl RequestScheduler {
         } else {
             &self.prefill_catalog
         };
+        let minimum = if request.prompt_logprobs {
+            0
+        } else {
+            self.terminal_prefill_min_tokens
+        };
         let mut total = 0u64;
         while start < end {
             let limit = request
@@ -178,8 +183,18 @@ impl RequestScheduler {
                 .unwrap_or(end)
                 .min(end);
             let mut best: Option<(usize, u64)> = None;
+            let mut max_work = 0usize;
+            let remaining = limit.saturating_sub(start);
+            let target_capacity = catalog
+                .iter()
+                .copied()
+                .find(|&capacity| capacity >= remaining)
+                .or_else(|| catalog.last().copied());
             for &capacity in catalog {
                 let mut through = start.saturating_add(capacity).min(limit);
+                if minimum != 0 && through < limit {
+                    through = through.min(limit.saturating_sub(minimum));
+                }
                 if let Some(span) = request
                     .prefill_spans
                     .iter()
@@ -187,16 +202,47 @@ impl RequestScheduler {
                 {
                     through = span.start;
                 }
+                if through <= start && minimum != 0 {
+                    through = start.saturating_add(capacity).min(limit);
+                    if let Some(span) = request
+                        .prefill_spans
+                        .iter()
+                        .find(|span| span.start < through && through < span.end)
+                    {
+                        through = span.start;
+                    }
+                }
                 let work = through.saturating_sub(start);
                 if work == 0 {
                     continue;
                 }
+                let adds_work = work > max_work;
+                max_work = max_work.max(work);
                 // Prefill dispatch retains measured costs after expiry; aging alone
                 // does not make its predicted work unknown.
-                let nanos = self
+                let prefill_ns = self
                     .costs
                     .duration(request.prefill_kind(), 1, capacity)
-                    .filter(|&nanos| nanos != 0)?;
+                    .filter(|&nanos| nanos != 0);
+                let nanos = if minimum != 0 {
+                    let terminal_ns = self
+                        .costs
+                        .duration(GraphKind::TerminalPrefill, 1, capacity)
+                        .filter(|&nanos| nanos != 0);
+                    if limit.saturating_sub(through) < minimum {
+                        terminal_ns.or(prefill_ns)
+                    } else {
+                        prefill_ns.or(terminal_ns)
+                    }
+                } else {
+                    prefill_ns
+                };
+                let Some(nanos) = nanos else {
+                    if !adds_work || (minimum != 0 && Some(capacity) != target_capacity) {
+                        continue;
+                    }
+                    return None;
+                };
                 if best.is_none_or(|(old_work, old_ns)| {
                     u128::from(nanos) * (old_work as u128) < u128::from(old_ns) * work as u128
                         || (u128::from(nanos) * old_work as u128
@@ -1110,5 +1156,40 @@ mod tests {
         );
         assert_eq!(scheduler.free_snapshot_count(), 16);
         assert_eq!(scheduler.stats().checkpoint_extra_work_ns, 0);
+    }
+
+    #[test]
+    fn terminal_prefill_catalog_captures_extras_without_nonterminal_or_padded_costs() {
+        let mut scheduler = super::super::tests::scheduler(1, 128, 16);
+        let caps = [128usize, 256, 512];
+        scheduler.prefill_graphs(&caps).unwrap();
+        scheduler.terminal_prefill_graphs(129, &caps).unwrap();
+        let mut graphs = super::super::tests::duration_graphs(1);
+        let terminal: Vec<_> = graphs
+            .iter()
+            .filter(|g| g.kind == GraphKind::Prefill && caps.contains(&g.token_capacity))
+            .cloned()
+            .map(|mut g| {
+                g.kind = GraphKind::TerminalPrefill;
+                g.name = format!("terminal-{}", g.token_capacity);
+                g
+            })
+            .collect();
+        graphs.extend(terminal);
+        scheduler.graph_durations(&graphs).unwrap();
+        // Only TerminalPrefill(128) and Snapshot(1) are measured; non-terminal Prefill
+        // and larger padded capacities (256, 512) remain unmeasured (0 ns).
+        measure(&mut scheduler, GraphKind::TerminalPrefill, 128, 100_000);
+        measure(&mut scheduler, GraphKind::Snapshot, 1, 1_000);
+        let mut spec = super::super::tests::spec(96, 3);
+        spec.message_boundaries = vec![94];
+        let handle = scheduler.admit(spec).unwrap();
+        let (selected, unknown, budget) =
+            scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
+        assert!(!unknown, "short terminal prefill must not report unknown_cost");
+        assert!(!budget);
+        assert_eq!(selected.initial_prefill_ns, Some(100_000));
+        let endpoints: Vec<_> = selected.cuts.iter().map(|cut| cut.endpoint).collect();
+        assert_eq!(endpoints, vec![94, 96]);
     }
 }
