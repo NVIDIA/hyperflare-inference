@@ -27,6 +27,36 @@ pub trait CopierFactory {
     ) -> Result<Box<dyn crate::PageCopier>>;
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvCompression {
+    Cpu,
+    Gpu,
+    #[default]
+    Off,
+}
+
+impl std::str::FromStr for KvCompression {
+    type Err = &'static str;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            "off" => Ok(Self::Off),
+            _ => Err("expected cpu, gpu, or off"),
+        }
+    }
+}
+
+impl std::fmt::Display for KvCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+            Self::Off => "off",
+        })
+    }
+}
+
 /// Offload settings as the command line and configuration file supply them.
 /// `None` selects the default: no memory store and no disk store until the
 /// isolation measurements in `docs/prefix-cache-offload.md` enable derived
@@ -34,6 +64,7 @@ pub trait CopierFactory {
 /// staged transport.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrefixCacheOffload {
+    pub compression: KvCompression,
     /// Host retention budget shared by registered checkpoints and ordinary CPU inputs.
     /// Zero selects no memory retention.
     pub memory_bytes: Option<u64>,
@@ -49,6 +80,16 @@ pub struct PrefixCacheOffload {
 }
 
 impl PrefixCacheOffload {
+    pub fn validate_compression(&self) -> Result<()> {
+        if self.compression != KvCompression::Off && !self.enabled() {
+            return Err(
+                "--lossless-kv-compression requires an offload tier (--prefix-cache-memory, --prefix-cache-disk, or --prefix-cache-pool)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn enabled(&self) -> bool {
         self.memory_bytes.unwrap_or(0) != 0
             || (self.disk.is_some() && self.disk_limit != Some(0))
@@ -410,17 +451,21 @@ pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
     core: &std::path::Path,
     identity: [u8; 32],
-    geometry: Vec<CacheGeometry>,
+    mut geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
     max_active: usize,
     input_staging: u64,
     shard: Option<(usize, usize)>,
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
+    options.validate_compression()?;
     if !options.enabled() {
         return Ok(Preparation::None("disabled".to_owned()));
     }
     let _ = core;
+    for rank in &mut geometry {
+        rank.placement = options.compression;
+    }
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
         (None, _) => geometry::fingerprint(&geometry),
@@ -490,8 +535,11 @@ pub fn prepare_with_inputs(
             let transfer_slots = (host - memory_bytes) / layout.page_record_bytes;
             let intake = if capture { 0 } else { transfer_slots as usize };
             let bytes = (checkpoint_memory / layout.page_record_bytes + transfer_slots) * layout.page_record_bytes;
-            // Shared records must be readable by the CPU.
-            let pool = if directory.is_none() && options.pool.is_none() {
+            // Shared and compressed records must be readable by the CPU.
+            let pool = if directory.is_none()
+                && options.pool.is_none()
+                && options.compression == KvCompression::Off
+            {
                 slab::SlabPool::sized_by_rank(&layout, bytes, intake, &contexts, registrar)?
             } else {
                 let mut pool = slab::SlabPool::sized(&layout, bytes, intake)?;

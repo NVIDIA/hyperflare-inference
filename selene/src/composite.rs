@@ -106,8 +106,9 @@ enum DiskJob {
 }
 
 pub struct CompositeStore {
-    memory: MemoryStore,
+    /// Declared before `memory` so Drop joins `DiskThread` before unmapping DRAM slabs.
     disk: DiskStore,
+    memory: MemoryStore,
     stats: StoreStats,
     outbound: HashMap<PrefixKey, Outbound>,
     inbound: HashMap<PrefixKey, Inbound>,
@@ -140,7 +141,7 @@ fn resident_copy(
 ) -> bool {
     !stale.contains(key)
         && memory.record(key).is_some_and(|record| {
-            record.pages.len() == tail_pages && (!row || record.row.is_some())
+            record.page_count() == tail_pages && (!row || record.row.is_some())
         })
 }
 
@@ -267,7 +268,7 @@ impl CompositeStore {
             let row = position + 1 == chain.nodes.len();
             if let Some(memory) = self.memory.index().node(key) {
                 if memory.pinned()
-                    && (memory.location.pages.len() != node.tail_pages
+                    && (memory.location.page_count() != node.tail_pages
                         || (row && memory.location.row.is_none())
                         || self.stale.contains(key))
                 {
@@ -435,7 +436,7 @@ impl CompositeStore {
             });
             return;
         }
-        let record = self.memory.record(&key).unwrap();
+        let record = &self.memory.index().node(&key).unwrap().location;
         let role = record.capture_role;
         let row = record.row.is_some();
         let reserved = self.disk.reserve_capture(
@@ -525,6 +526,46 @@ impl CompositeStore {
         temporary: PathBuf,
         path: PathBuf,
     ) -> Result<JobId> {
+        let record = self
+            .memory
+            .record(&key)
+            .ok_or_else(|| invalid("the record has no complete memory copy"))?;
+        if let Some(packed) = record.packed.clone() {
+            let pool = self.memory.pool();
+            let slab_bytes = pool.page_bytes();
+            let page_addrs = pool.addresses(&record.pages);
+            let row_addrs = record.row.as_ref().map(|slots| pool.addresses(slots));
+            let has_row = row_addrs.is_some() && packed.row.is_some();
+            let mut units = Vec::with_capacity(
+                packed.pages.len() + packed.row.as_ref().map_or(0, Vec::len),
+            );
+            let mut spans = Vec::with_capacity(units.capacity());
+            for (unit, offset) in &packed.pages {
+                units.push(unit.clone());
+                spans.extend(crate::memory::slab_spans(
+                    &page_addrs,
+                    slab_bytes,
+                    *offset,
+                    unit.stored_length as usize,
+                ));
+            }
+            if let (Some(row_addrs), Some(row_units)) = (&row_addrs, &packed.row) {
+                for (unit, offset) in row_units {
+                    units.push(unit.clone());
+                    spans.extend(crate::memory::slab_spans(
+                        row_addrs,
+                        slab_bytes,
+                        *offset,
+                        unit.stored_length as usize,
+                    ));
+                }
+            }
+            let id = self.disk.next_job();
+            self.staged()?
+                .write_packed(id, header, temporary, path, units, spans, has_row)?;
+            self.jobs.insert(id, DiskJob::Write(key));
+            return Ok(id);
+        }
         let (pages, row) = self.slot_addresses(&key)?;
         header.set_replication(self.memory.record(&key).unwrap().replication)?;
         let sums = self.memory.announced_sums(&key).map(|s| (*s).clone());
@@ -825,9 +866,13 @@ impl CompositeStore {
         let pages = pool.addresses(&record.pages);
         let row = record.row.as_ref().map(|slots| pool.addresses(slots));
         let id = self.disk.next_job();
-        let submitted = self
-            .staged()
-            .and_then(|staged| staged.read_into(id, path, header, 0, pages, row));
+        let submitted = if header.packed.is_some() {
+            self.staged()
+                .and_then(|staged| staged.read_into_packed(id, path, header, row.is_some()))
+        } else {
+            self.staged()
+                .and_then(|staged| staged.read_into(id, path, header, 0, pages, row))
+        };
         if let Err(error) = submitted {
             let _ = self.memory.complete_record(&key, false);
             return Err(error);
@@ -991,6 +1036,10 @@ impl CompositeStore {
         let position = inbound.nodes.iter().position(|entry| {
             entry.key == node && matches!(entry.state, NodeState::Reading)
         });
+        let packed_read = self
+            .staged()
+            .ok()
+            .and_then(|staged| staged.take_packed_read(id));
         match (result, position) {
             (Ok(bytes), Some(index)) => {
                 inbound.disk_bytes += bytes;
@@ -1003,10 +1052,29 @@ impl CompositeStore {
                     inbound.disk_bytes = 0;
                 }
                 // The copy is complete: a durable resident, pinned for the upload.
-                let pinned = self
-                    .memory
-                    .complete_record(&node, true)
-                    .and_then(|()| self.memory.pin_record(&node));
+                let completed = if let Some((header, payload)) = packed_read {
+                    let layout = header
+                        .packed
+                        .as_ref()
+                        .ok_or_else(|| invalid("packed read missing v4 layout"));
+                    layout.and_then(|layout| {
+                        self.memory.complete_packed_record(
+                            &node,
+                            layout,
+                            &payload,
+                            inbound.nodes[index].row,
+                        )
+                    })
+                } else {
+                    self.memory.complete_record(&node, true)
+                };
+                let pinned = match completed {
+                    Ok(()) => self.memory.pin_record(&node),
+                    Err(error) => {
+                        let _ = self.memory.complete_record(&node, false);
+                        Err(error)
+                    }
+                };
                 match pinned {
                     Ok(()) => {
                         inbound.nodes[index].state = NodeState::Resident;
@@ -1424,7 +1492,9 @@ impl HostStore for CompositeStore {
             self.maintenance_progress = progress;
             // A spill moves records to disk with their rows; rows are reclaimed
             // only where an allocation needs room.
-            self.spill_parked(self.memory.reserve(2 * self.memory.pool().intake_slots()));
+            self.spill_parked(self.memory.reserve(
+                2 * self.memory.pool().intake_slots() + self.memory.compressing_slots(),
+            ));
             self.disk.maintain();
         }
         polled
@@ -1440,6 +1510,14 @@ impl HostStore for CompositeStore {
             .filter(|parked| !parked.writing)
             .count();
         StoreStats {
+            decode: crate::codec_copy::DecodeStats {
+                original_bytes: memory.decode.original_bytes + disk.decode.original_bytes,
+                stored_bytes: memory.decode.stored_bytes + disk.decode.stored_bytes,
+                transform_ns: memory.decode.transform_ns + disk.decode.transform_ns,
+                failed_windows: memory.decode.failed_windows + disk.decode.failed_windows,
+                stored_failures: memory.decode.stored_failures + disk.decode.stored_failures,
+                original_failures: memory.decode.original_failures + disk.decode.original_failures,
+            },
             outbound_in_flight: self.outbound.len().saturating_sub(parked)
                 + disk.outbound_in_flight,
             parked_records: parked,
@@ -5390,6 +5468,276 @@ mod tests {
             store.disk.index().node(&root.key).unwrap().last_used,
             modified
         );
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "codec")]
+    #[test]
+    fn packed_composite_spills_v4_and_promotes_across_restart() {
+        use crate::shared::{
+            codec::Plan,
+            wire::{
+                PackedUnit,
+                packed_unit::{Kind, Representation},
+            },
+        };
+        let Some(directory) = test_directory("composite", "packed-spill-promote") else {
+            return;
+        };
+        struct MockCodecCopier {
+            layout: Layout,
+            profile: [u8; 32],
+            page_plan: Plan,
+            row_plan: Plan,
+            gpu: crate::testing::GpuMemory,
+            replies: Vec<crate::copier::Reply>,
+        }
+        impl crate::copier::PageCopier for MockCodecCopier {
+            fn layout(&self) -> &Layout {
+                &self.layout
+            }
+            fn codec_profile(&self) -> Option<[u8; 32]> {
+                Some(self.profile)
+            }
+            fn submit(&mut self, job: crate::copier::Job) -> Result<()> {
+                let win = job.codec.as_ref().expect("packed job");
+                let mut bytes = 0u64;
+                match job.direction {
+                    crate::copier::Direction::Out => {
+                        let cap = win.capture.as_ref().unwrap();
+                        let mut buf = vec![
+                            0u8;
+                            self.page_plan.max_packet().max(self.row_plan.max_packet())
+                        ];
+                        for (i, (page, _)) in job.pages.iter().enumerate() {
+                            let raw = self.gpu.pages.lock().unwrap()[&page.0].clone();
+                            let base = PackedUnit {
+                                kind: Kind::Page as i32,
+                                logical_index: win.first + i as u64,
+                                stored_rank: 0,
+                                ..Default::default()
+                            };
+                            let (u, n) = self
+                                .page_plan
+                                .encode_capture(base, &self.profile, &raw, &mut buf, None)
+                                .unwrap();
+                            cap.push(u, buf[..n].to_vec());
+                            bytes += raw.len() as u64;
+                        }
+                        if let Some((slot, _)) = &job.row {
+                            let raw = self.gpu.rows.lock().unwrap()[&slot.0].clone();
+                            let base = PackedUnit {
+                                kind: Kind::Row as i32,
+                                logical_index: 0,
+                                stored_rank: 0,
+                                ..Default::default()
+                            };
+                            let (u, n) = self
+                                .row_plan
+                                .encode_capture(base, &self.profile, &raw, &mut buf, None)
+                                .unwrap();
+                            cap.push(u, buf[..n].to_vec());
+                            bytes += raw.len() as u64;
+                        }
+                    }
+                    crate::copier::Direction::In => {
+                        for (i, (page, _)) in job.pages.iter().enumerate() {
+                            let idx = win.first + i as u64;
+                            let pkt = win
+                                .packets
+                                .iter()
+                                .find(|p| {
+                                    p.unit.kind == Kind::Page as i32 && p.unit.logical_index == idx
+                                })
+                                .unwrap();
+                            assert_eq!(pkt.unit.representation, Representation::Packet as i32);
+                            let chunks = unsafe { pkt.chunks() };
+                            let mut dst = vec![0u8; self.layout.page_record_bytes as usize];
+                            self.page_plan
+                                .decode_checked(
+                                    &chunks,
+                                    &mut dst,
+                                    pkt.unit.stored_crc,
+                                    pkt.unit.original_crc,
+                                    None,
+                                )
+                                .unwrap();
+                            self.gpu.pages.lock().unwrap().insert(page.0, dst);
+                            bytes += self.layout.page_record_bytes;
+                        }
+                        if let Some((slot, _)) = &job.row {
+                            let pkt = win
+                                .packets
+                                .iter()
+                                .find(|p| p.unit.kind == Kind::Row as i32)
+                                .unwrap();
+                            let chunks = unsafe { pkt.chunks() };
+                            let mut dst = vec![0u8; self.layout.row_record_bytes as usize];
+                            self.row_plan
+                                .decode_checked(
+                                    &chunks,
+                                    &mut dst,
+                                    pkt.unit.stored_crc,
+                                    pkt.unit.original_crc,
+                                    None,
+                                )
+                                .unwrap();
+                            self.gpu.rows.lock().unwrap().insert(slot.0, dst);
+                            bytes += self.layout.row_record_bytes;
+                        }
+                    }
+                }
+                self.replies.push(crate::copier::Reply {
+                    id: job.id,
+                    window: job.window,
+                    direction: job.direction,
+                    result: Ok(()),
+                    bytes,
+                    elapsed: Duration::from_micros(1),
+                });
+                Ok(())
+            }
+            fn poll(&mut self, out: &mut Vec<crate::copier::Reply>) {
+                out.append(&mut self.replies);
+            }
+            fn in_flight(&self) -> usize {
+                self.replies.len()
+            }
+            fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
+        let gpu = crate::testing::GpuMemory::default();
+        let profile = [0xCC; 32];
+        let open_composite = || -> CompositeStore {
+            let pool = SlabPool::new(layout.page_record_bytes, 64, 8).unwrap();
+            let make_copier = || -> crate::SharedCopier {
+                Arc::new(std::sync::Mutex::new(MockCodecCopier {
+                    layout: layout.clone(),
+                    profile,
+                    page_plan: Plan::new(layout.page_record_bytes as usize, &[]).unwrap(),
+                    row_plan: Plan::new(layout.row_record_bytes as usize, &[]).unwrap(),
+                    gpu: gpu.clone(),
+                    replies: Vec::new(),
+                }))
+            };
+            let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), make_copier()).unwrap();
+            let guard = crate::testing::directory_lock(&directory).unwrap();
+            let scanned = record::scan(
+                &guard,
+                &IDENTITY,
+                &FINGERPRINT,
+                PAGE_TOKENS,
+                &record::rank_sizes(&geometry),
+            )
+            .unwrap();
+            let disk = DiskStore::new(
+                guard,
+                IDENTITY,
+                FINGERPRINT,
+                1 << 30,
+                geometry.clone(),
+                scanned,
+                Box::new(Staged::new(
+                    Some(pool),
+                    make_copier(),
+                    crate::disk::DiskThread::start("packed-composite-test").unwrap(),
+                )),
+            )
+            .unwrap();
+            CompositeStore::new(memory, disk).unwrap()
+        };
+
+        let mut ids = Ids::new();
+        let h = history(6 * PAGE_TOKENS + 5);
+        let expected_pages: Vec<Vec<u8>> = (0..6u32)
+            .map(|p| {
+                (0..layout.page_record_bytes as usize)
+                    .map(|j| ((j / 32 + p as usize) % 4) as u8)
+                    .collect()
+            })
+            .collect();
+        let expected_row: Vec<u8> = (0..layout.row_record_bytes as usize)
+            .map(|j| ((j / 16) % 3) as u8)
+            .collect();
+        for (i, p) in expected_pages.iter().enumerate() {
+            gpu.pages.lock().unwrap().insert(i as u32, p.clone());
+        }
+        gpu.rows.lock().unwrap().insert(0, expected_row.clone());
+        gpu.rows.lock().unwrap().insert(1, expected_row.clone());
+        let c1 = checkpoint(
+            &mut ids,
+            &h,
+            4 * PAGE_TOKENS + 1,
+            None,
+            (0..4).map(crate::PageId).collect(),
+            4,
+            crate::StateSlotId(0),
+        );
+        let c2 = checkpoint(
+            &mut ids,
+            &h,
+            6 * PAGE_TOKENS + 2,
+            Some(c1.key.consumed_tokens),
+            (0..6).map(crate::PageId).collect(),
+            2,
+            crate::StateSlotId(1),
+        );
+
+        let mut store = open_composite();
+        for c in [&c1, &c2] {
+            assert_eq!(store.store(c).unwrap(), StoreOutcome::Queued);
+            poll_until(&mut store, &mut Vec::new(), |s| s.memory.record(&c.key).is_some());
+            assert!(store.memory.record(&c.key).unwrap().packed.is_some());
+        }
+        store.spill(c1.key);
+        poll_until(&mut store, &mut Vec::new(), |s| {
+            s.disk.index().node(&c1.key).is_some_and(|n| n.ready)
+        });
+        store.spill(c2.key);
+        poll_until(&mut store, &mut Vec::new(), |s| {
+            s.disk.index().node(&c2.key).is_some_and(|n| n.ready)
+        });
+        assert!(store.disk.record(&c1.key).unwrap().header.packed.is_some());
+        assert!(store.disk.record(&c2.key).unwrap().header.packed.is_some());
+        store.close().unwrap();
+        drop(store);
+
+        // Restart CompositeStore over the v4 files on disk (memory starts empty),
+        // promote from disk into packed DRAM slabs, and restore to GPU bit-identical.
+        let mut store = open_composite();
+        assert_eq!(store.memory.index().len(), 0);
+        assert_eq!(store.disk.index().len(), 2);
+        let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, c2.key);
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: c2.key,
+                    pages: (100..106).map(crate::PageId).collect(),
+                    slot: crate::StateSlotId(9),
+                },
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |s| s.inbound.is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StoreEvent::Fetched { result: Ok(_), .. }))
+        );
+        assert!(store.memory.record(&c1.key).unwrap().packed.is_some());
+        assert!(store.memory.record(&c2.key).unwrap().packed.is_some());
+        for i in 0..6usize {
+            assert_eq!(gpu.pages.lock().unwrap()[&(100 + i as u32)], expected_pages[i]);
+        }
+        assert_eq!(gpu.rows.lock().unwrap()[&9], expected_row);
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();
