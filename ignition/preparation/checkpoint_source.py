@@ -97,11 +97,12 @@ class Channel:
             raise ValueError("checkpoint message authentication failed")
         if message.get("sequence") != self.received:
             raise ValueError("checkpoint message sequence differs")
+        if message.get("kind") == "error":
+            self.received += 1
+            raise RuntimeError(f"checkpoint source rejected access: {message.get('error')}")
         if expected is not None and message.get("kind") != expected:
             raise ValueError(f"expected checkpoint {expected}, received {message.get('kind')}")
         self.received += 1
-        if message.get("kind") == "error":
-            raise RuntimeError(f"checkpoint source rejected access: {message.get('error')}")
         return message, payload
 
 
@@ -164,10 +165,17 @@ class HeldFile:
     path: Path
     descriptor: int
     identity: tuple
+    name: str
 
     def validate(self):
-        if file_identity(self.descriptor) != self.identity or file_identity_path(self.path) != self.identity:
-            raise RuntimeError("checkpoint source changed after admission")
+        try:
+            if file_identity(self.descriptor) == self.identity and file_identity_path(self.path) == self.identity:
+                return
+            cause = None
+        except OSError as error:
+            # The error text carries the absolute path and is sent to the peer.
+            cause = error
+        raise RuntimeError(f"checkpoint source changed after admission: {self.name}") from cause
 
 
 def file_identity_path(path):
@@ -198,7 +206,7 @@ class RootSource:
                     continue
                 name = relative_name(path.relative_to(self.snapshot).as_posix())
                 descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
-                held = HeldFile(path, descriptor, file_identity(descriptor))
+                held = HeldFile(path, descriptor, file_identity(descriptor), name)
                 self.files[name] = held
                 # Selective reads release their completed ranges; read-ahead outside those ranges
                 # would remain cached in the same DRAM needed by the integrated GPU.
@@ -262,6 +270,7 @@ class SourceServer:
         self.thread = threading.Thread(target=self.run, name=f"flare-checkpoint-rank{rank}", daemon=True)
 
     def run(self):
+        channel = None
         try:
             channel, _ = authenticate(self.connection, self.key, rank=self.rank, identity=self.identity,
                                       catalog=self.source.catalog)
@@ -295,6 +304,17 @@ class SourceServer:
                     raise ValueError(f"unknown checkpoint source operation {kind}")
         except BaseException as error:
             self.error = error
+            # The peer exits on this error and closes its control socket, and _watch_until_closed in
+            # host_ranks.py then ends this process; print the reason first.
+            try:
+                print(f"flare: checkpoint source for rank {self.rank} failed: {error}", flush=True)
+            except (OSError, ValueError):
+                pass
+            if channel is not None:
+                try:
+                    channel.send("error", error=str(error)[:4096])
+                except (OSError, ValueError):
+                    pass
             try:
                 self.connection.shutdown(socket.SHUT_RDWR)
             except OSError:

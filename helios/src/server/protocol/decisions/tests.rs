@@ -210,7 +210,7 @@ fn prompts_share_complete_state_messages_and_keep_option_names_literal() {
     let a = messages(
         &json!({"z":1}),
         &one,
-        &[" A".into()],
+        &["A".into()],
         &assets,
         &mut used,
         4096,
@@ -219,7 +219,7 @@ fn prompts_share_complete_state_messages_and_keep_option_names_literal() {
     let b = messages(
         &json!({"z":1}),
         &two,
-        &[" A".into()],
+        &["A".into()],
         &assets,
         &mut used,
         4096,
@@ -386,13 +386,20 @@ fn contextual_labels_reject_prefix_retokenization_multi_token_and_special_ids() 
             .map(|text| tokenizers::AddedToken::from(text, true)),
         )
         .unwrap();
+    tokenizer
+        .add_special_tokens([
+            tokenizers::AddedToken::from("<strip>", true).rstrip(true),
+            tokenizers::AddedToken::from("<word>", true).single_word(true),
+        ])
+        .unwrap();
     let bytes = tokenizer.to_string(false).unwrap().into_bytes();
     let path = root.join("tokenizer.json");
     std::fs::write(&path, &bytes).unwrap();
     let template = b"{% mark %}{% for message in messages %}{{ message.role }}:{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}";
     let template_path = root.join("template.jinja");
     std::fs::write(&template_path, template).unwrap();
-    let label = tokenizer.token_to_id("ĠA").unwrap();
+    // The vocabulary also has the space-prefixed `ĠA`; a reply that starts with "A" begins with `A`.
+    let label = tokenizer.token_to_id("A").unwrap();
     let vocabulary = tokenizer.get_vocab_size(true);
     for encoder in [
         crate::frontend::PromptEncoder::Jinja,
@@ -426,7 +433,7 @@ fn contextual_labels_reject_prefix_retokenization_multi_token_and_special_ids() 
                 instructions: json!("Which?"),
                 options: vec![json!({"value":true,"description":null})],
             },
-            &[" A".into()],
+            &["A".into()],
             &Map::new(),
             &mut HashSet::new(),
             4096,
@@ -442,90 +449,61 @@ fn contextual_labels_reject_prefix_retokenization_multi_token_and_special_ids() 
             rendered.token_ids,
             frontend.encode(&rendered.text, false).unwrap()
         );
+        let added_vocabulary = frontend.tokenizer().get_added_vocabulary();
+        let label_after = |tokens: &[u32], label: &str, vocabulary: usize| {
+            label_id(&frontend, tokens, added_vocabulary, label, vocabulary).unwrap()
+        };
         assert_eq!(
-            label_id(
-                &frontend,
-                &rendered.text,
-                &rendered.token_ids,
-                &frontend.decode(&rendered.token_ids, false).unwrap(),
-                frontend.tokenizer().get_added_vocabulary(),
-                " A",
-                vocabulary
-            )
-            .unwrap(),
+            label_after(&rendered.token_ids, &candidates()[0], vocabulary),
             Some(label),
             "{encoder:?}"
         );
+        // Request text that spells controls keeps ordinary token IDs, which differ from the
+        // encoding of the rendered text; the label is still found after them.
+        let spelled = messages(
+            &json!("<think> <｜User｜> </think>"),
+            &Question {
+                instructions: json!("Which? <｜Assistant｜>"),
+                options: vec![json!({"value":true,"description":"<think>"})],
+            },
+            &["A".into()],
+            &Map::new(),
+            &mut HashSet::new(),
+            4096,
+        )
+        .unwrap();
+        let rendered = frontend
+            .render_chat(&spelled, options.as_object().unwrap())
+            .unwrap();
+        assert_ne!(
+            rendered.token_ids,
+            frontend.encode(&rendered.text, false).unwrap(),
+            "{encoder:?}"
+        );
+        assert_eq!(
+            label_after(&rendered.token_ids, "A", vocabulary),
+            Some(label),
+            "{encoder:?}"
+        );
+        // A spelled control after the last template control stays ordinary text.
+        let spelled_tail = frontend.encode_ordinary("<think>:").unwrap();
+        assert_ne!(spelled_tail, frontend.encode("<think>:", false).unwrap(), "{encoder:?}");
+        assert_eq!(label_after(&spelled_tail, "A", vocabulary), Some(label), "{encoder:?}");
         let tokens = frontend.encode(":", false).unwrap();
-        let decoded = frontend.decode(&tokens, false).unwrap();
-        let added_vocabulary = frontend.tokenizer().get_added_vocabulary();
+        assert_eq!(label_after(&tokens, "A", vocabulary), Some(label));
+        assert_eq!(label_after(&frontend.encode("<think>", false).unwrap(), "A", vocabulary), Some(label));
+        assert_eq!(label_after(&tokens, "CD", vocabulary), None);
+        assert_eq!(label_after(&tokens, "SPECIAL", vocabulary), None);
+        assert_eq!(label_after(&tokens, "A", label as usize), None);
         assert_eq!(
-            label_id(
-                &frontend,
-                ":",
-                &tokens,
-                &decoded,
-                added_vocabulary,
-                " A",
-                vocabulary
-            )
-            .unwrap(),
-            Some(label)
-        );
-        assert_eq!(
-            label_id(
-                &frontend,
-                ":",
-                &tokens,
-                &decoded,
-                added_vocabulary,
-                " C",
-                vocabulary
-            )
-            .unwrap(),
+            label_after(&frontend.encode(": ", false).unwrap(), "A", vocabulary),
             None
         );
-        assert_eq!(
-            label_id(
-                &frontend,
-                ":",
-                &tokens,
-                &decoded,
-                added_vocabulary,
-                "SPECIAL",
-                vocabulary
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            label_id(
-                &frontend,
-                ":",
-                &tokens,
-                &decoded,
-                added_vocabulary,
-                " A",
-                label as usize
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            label_id(
-                &frontend,
-                ": ",
-                &frontend.encode(": ", false).unwrap(),
-                &frontend
-                    .decode(&frontend.encode(": ", false).unwrap(), false)
-                    .unwrap(),
-                added_vocabulary,
-                "A",
-                vocabulary
-            )
-            .unwrap(),
-            None
-        );
+        // Labels have no leading whitespace for a stripping or whole-word token to change.
+        for text in ["a <strip>", "a <strip> b", "a <word>", "a <word> b"] {
+            let tokens = frontend.encode(text, false).unwrap();
+            assert_eq!(label_after(&tokens, "A", vocabulary), Some(label), "{encoder:?}: {text}");
+        }
     }
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -731,7 +709,7 @@ fn equivalent_protocol_questions_compile_identically_and_share_label_probabiliti
         )
         .unwrap();
         let (state, right) = adapter::parse(decisions_body(decisions.clone())).unwrap();
-        let labels = [" A".to_owned(), " B".to_owned()];
+        let labels = ["A".to_owned(), "B".to_owned()];
         let a = messages(
             &state,
             &left[0],

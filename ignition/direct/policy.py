@@ -212,6 +212,7 @@ class Policy:
         self.packed_catalog = tuple(key for key in layout.packed_shapes
                                     if key[1] <= self.capacity and layout.fixed_width in (None, key[2]))
         self.prefill_catalog = tuple(layout.capacities("prefill"))
+        self.terminal_prefill_catalog = tuple(layout.capacities("terminal_prefill"))
         self.now_ns = 0
 
     def advance_to(self, now_ns):
@@ -271,7 +272,8 @@ class Policy:
                 if work == 0:
                     continue
                 first = request.consumed + work == prompt
-                consider("prefill", 1, capacity, work + float(first), False)
+                kind = self.layout.prefill_kind(request.consumed, work, prompt)
+                consider(kind, 1, capacity, work + float(first), False)
         else:
             for batch in self.batches:
                 if generated == 0:

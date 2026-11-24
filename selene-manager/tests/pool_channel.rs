@@ -10,7 +10,7 @@
 mod support;
 
 use selene_manager::{Key, proto::v2};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::{
     channel::{self, Ended, Security},
     content_for, descriptor, key,
@@ -169,6 +169,39 @@ async fn d1_a_remote_instance_stores_and_restores_a_chain_over_tcp() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d1_a_remote_put_with_an_absent_parent_stores_and_restores_a_root() {
+    let net = net();
+    let mut tcp = net.tcp().await;
+    let mut writer = open(&mut tcp, "writer").await;
+    match channel::put_record(
+        &mut writer,
+        &Security::Plain,
+        1,
+        key(2048),
+        Some(key(1024)),
+        Damage::default(),
+    )
+    .await
+    {
+        PutResult::Stored(bytes) => assert!(bytes > 0),
+        other => panic!("put failed: {other:?}"),
+    }
+    let mut reader = open(&mut tcp, "reader").await;
+    let candidate = reader.manager_candidate(1, 2048).await;
+    let (got, granted) = restore(&mut reader, &Security::Plain, 1, &candidate, 1).await;
+    assert_eq!(granted.records.len(), 1);
+    assert_eq!(granted.records[0].first_page, 0);
+    assert_eq!(granted.total_pages, 32);
+    assert!(granted.row);
+    assert_eq!(got, expected(&[2048], 0, 0, true));
+    reader.copy_result(1, v2::CopyOutcome::CopyOk).await;
+    assert_eq!(
+        reader.claim_terminal(1).await.state,
+        v2::ClaimState::Copied as i32
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn d1_a_restore_may_start_mid_record() {
     let net = net();
     let mut tcp = net.tcp().await;
@@ -296,9 +329,14 @@ async fn d6_a_put_whose_writer_dies_mid_window_fails_and_the_same_record_stores_
     // Begin a put, take its grant, send half of the first window and die.
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: 1,
             key: Some(pool::pkey(2048)),
             chain_pages: 32,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: false,
             published_parent: None,
@@ -394,19 +432,34 @@ async fn d7_a_corrupt_put_and_a_cancelled_put_over_the_channel() {
         PutResult::Refused(_) => {}
         other => panic!("{other:?}"),
     }
-    // Both ended; the record stores cleanly.
-    match channel::put_record(
-        &mut writer,
-        &Security::Plain,
-        3,
-        key(1024),
-        None,
-        Damage::default(),
-    )
-    .await
-    {
-        PutResult::Stored(bytes) => assert!(bytes > 0),
-        other => panic!("{other:?}"),
+    // Both ended; the record stores cleanly. A store pump admits a queued Begin before it
+    // releases the keys of cancelled puts, so a Begin queued with the cancel is refused
+    // Inflight; the writer retries with a new put id, since put ids must increase.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for id in 3.. {
+        match channel::put_record(
+            &mut writer,
+            &Security::Plain,
+            id,
+            key(1024),
+            None,
+            Damage::default(),
+        )
+        .await
+        {
+            PutResult::Stored(bytes) => {
+                assert!(bytes > 0);
+                break;
+            }
+            PutResult::Refused(refused) if refused.reason == v2::Reason::Inflight as i32 => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the cancelled put did not settle"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
 
@@ -491,7 +544,11 @@ mod over_rdma {
 
     fn rdma_net() -> Net {
         Net::start_with(
-            |config| config.rdma = true,
+            |config| {
+                config.rdma = true;
+                let ip = selene_manager::testing::rdma_address().expect("no local RoCE v2 address");
+                config.listen_data = Some(selene_manager::testing::free_address_on(ip));
+            },
             |store| store.limits.progress_timeout_ms = 600,
         )
     }

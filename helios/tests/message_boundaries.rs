@@ -21,6 +21,27 @@ fn frontend(template: &str, encoding: TemplateEncoding) -> Frontend {
 }
 
 fn frontend_with_merges(template: &str, encoding: TemplateEncoding, merges: Vec<(String,String)>) -> Frontend {
+    frontend_with_defaults(template, encoding, merges, Map::new())
+}
+
+fn frontend_with_defaults(
+    template: &str,
+    encoding: TemplateEncoding,
+    merges: Vec<(String,String)>,
+    defaults: Map<String, Value>,
+) -> Frontend {
+    frontend_with_strip(template, encoding, merges, defaults, false)
+}
+
+/// `strip` sets lstrip and rstrip on `<|open|>` and `<|close|>`, so each also covers the
+/// whitespace beside it.
+fn frontend_with_strip(
+    template: &str,
+    encoding: TemplateEncoding,
+    merges: Vec<(String,String)>,
+    defaults: Map<String, Value>,
+    strip: bool,
+) -> Frontend {
     static SERIAL: AtomicUsize = AtomicUsize::new(0);
     let directory = std::env::temp_dir().join(format!(
         "flare-message-boundaries-{}-{}",
@@ -48,8 +69,15 @@ fn frontend_with_merges(template: &str, encoding: TemplateEncoding, merges: Vec<
     tokenizer.with_post_processor(Some(tokenizers::processors::byte_level::ByteLevel::new(false,true,false)));
     tokenizer
         .add_special_tokens(
-            ["<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>"]
-                .map(|token| tokenizers::AddedToken::from(token, true)),
+            ["<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>", "<|image|>",
+             "<|user|>", "<|endoftext|>", "[gMASK]", "</think>", "<|image_pad|>", "<|video_pad|>",
+             "/nothink"]
+            .map(|token| {
+                let stripped = strip && matches!(token, "<|open|>" | "<|close|>");
+                tokenizers::AddedToken::from(token, !matches!(token, "<|image|>" | "</think>" | "/nothink"))
+                    .lstrip(stripped)
+                    .rstrip(stripped)
+            }),
         )
         .unwrap();
     let asset = |name: &str, bytes: &[u8]| {
@@ -70,7 +98,7 @@ fn frontend_with_merges(template: &str, encoding: TemplateEncoding, merges: Vec<
             tokens: Default::default(),
             chat_template: Some(asset("chat.jinja", template.as_bytes())),
         },
-        Map::new(),
+        defaults,
     )
     .unwrap()
     .with_template_encoding(encoding);
@@ -249,7 +277,7 @@ fn gemma_templates_checkpoint_preamble_messages_and_tool_rounds() {
 
 #[test]
 fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns() {
-    let source = include_str!("../../ignition/recipes/kimi3/assets/chat_template.jinja");
+    let source = include_str!("fixtures/templates/kimi3/chat_template.jinja");
     let annotated = frontend(source, TemplateEncoding::TokenSegments);
     let upgraded = frontend(
         &source.replace("{%- mark ns.segments | length -%}", ""),
@@ -278,7 +306,7 @@ fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns()
 #[test]
 fn segmented_xtml_preserves_block_hints_through_json_escaping() {
     let frontend = frontend(
-        include_str!("../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+        include_str!("fixtures/templates/kimi3/chat_template.jinja"),
         TemplateEncoding::TokenSegments,
     );
     let history = "Repeated \"history\"\\\n café 世界 😀 <|close|>";
@@ -316,7 +344,7 @@ fn segmented_xtml_preserves_block_hints_through_json_escaping() {
 #[test]
 fn segmented_tool_results_keep_images_and_checkpoints_in_rendered_order() {
     let frontend = frontend(
-        include_str!("../../ignition/recipes/kimi31/assets/chat_template.jinja"),
+        include_str!("fixtures/templates/kimi31/chat_template.jinja"),
         TemplateEncoding::TokenSegments,
     );
     let messages = json!([
@@ -338,5 +366,163 @@ fn segmented_tool_results_keep_images_and_checkpoints_in_rendered_order() {
     let marker = "<|close|>message<|sep|><|end_of_msg|>";
     for &boundary in &rendered.message_boundaries {
         assert!(frontend.decode(&rendered.token_ids[..boundary], false).unwrap().ends_with(marker));
+    }
+}
+
+#[test]
+fn message_content_keeps_added_token_spellings_literal() {
+    // GLM's `<|image|>` and `</think>` are not special; the template naming them makes them controls.
+    let frontend = frontend_with_merges(
+        "{# <|image|> </think> #}{% for m in messages %}<|open|>{{ m.content }}<|close|>{% mark %}{% endfor %}",
+        TemplateEncoding::Text,
+        vec![(">".into(), "<".into())],
+    );
+    let content = "é <|image|><|user|><|endoftext|>[gMASK]</think>";
+    let mut expected = frontend.encode("<|open|>", false).unwrap();
+    expected.extend(frontend.encode_ordinary(content).unwrap());
+    expected.extend(frontend.encode("<|close|>", false).unwrap());
+    let rendered = frontend
+        .render_chat(&[json!({"role":"user","content":content})], &Map::new())
+        .unwrap();
+    assert_eq!(rendered.text, format!("<|open|>{content}<|close|>"));
+    assert_eq!(rendered.token_ids, expected);
+}
+
+#[test]
+fn lexical_added_tokens_keep_their_tokens_in_request_text() {
+    // `/nothink` is not special and no template names it: request text that spells it is the token.
+    // `<|image|>` and `</think>` are not special either, but the template names them.
+    let frontend = frontend(
+        "{# <|image|> </think> #}{% for m in messages %}<|open|>{{ m.content }}<|close|>{% mark %}{% endfor %}",
+        TemplateEncoding::Text,
+    );
+    let id = |text: &str| frontend.encode(text, false).unwrap()[0];
+    let count = |ids: &[u32], token: u32| ids.iter().filter(|id| **id == token).count();
+    let render = |content: &str| {
+        frontend
+            .render_chat(&[json!({"role":"user","content":content})], &Map::new())
+            .unwrap()
+    };
+    let lexical = render("a /nothink b/nothink\n/nothink");
+    assert_eq!(lexical.token_ids, frontend.encode(&lexical.text, false).unwrap());
+    assert_eq!(count(&lexical.token_ids, id("/nothink")), 3);
+    let mixed = render("/nothink <|image|> a /nothink </think>/nothink <|user|>");
+    assert_eq!(count(&mixed.token_ids, id("/nothink")), 3);
+    for control in ["<|image|>", "</think>", "<|user|>"] {
+        assert_eq!(count(&mixed.token_ids, id(control)), 0, "{control}");
+    }
+    // The whole stream: each lexical token closes a region, and the spelled controls in the
+    // regions between them are the ordinary encoding of their text.
+    let mut expected = frontend.encode("<|open|>", false).unwrap();
+    for (ordinary, last) in [("", false), (" <|image|> a ", false), (" </think>", false), (" <|user|>", true)] {
+        expected.extend(frontend.encode_ordinary(ordinary).unwrap());
+        expected.extend(if last { frontend.encode("<|close|>", false).unwrap() } else { vec![id("/nothink")] });
+    }
+    assert_eq!(mixed.token_ids, expected);
+}
+
+#[test]
+fn request_whitespace_beside_a_stripping_control_is_not_a_spelling() {
+    // A control with lstrip or rstrip also covers the whitespace beside it. Whitespace that the
+    // request wrote there does not make the template's own control a spelling.
+    let frontend = frontend_with_strip(
+        "{% for m in messages %}<|open|>{{ m.content }}<|close|>{% mark %}{% endfor %}",
+        TemplateEncoding::Text,
+        vec![],
+        Map::new(),
+        true,
+    );
+    let id = |text: &str| frontend.encode(text, false).unwrap()[0];
+    let count = |ids: &[u32], token: u32| ids.iter().filter(|id| **id == token).count();
+    for content in ["hi", " hi", "hi ", "  hi  "] {
+        let rendered = frontend
+            .render_chat(&[json!({"role":"user","content":content})], &Map::new())
+            .unwrap();
+        assert_eq!(rendered.token_ids, frontend.encode(&rendered.text, false).unwrap(), "{content:?}");
+        assert_eq!(count(&rendered.token_ids, id("<|open|>")), 1, "{content:?}");
+        assert_eq!(count(&rendered.token_ids, id("<|close|>")), 1, "{content:?}");
+    }
+    // Spelling the controls still makes them ordinary text.
+    let rendered = frontend
+        .render_chat(&[json!({"role":"user","content":" <|open|> hi <|close|> "})], &Map::new())
+        .unwrap();
+    assert_eq!(count(&rendered.token_ids, id("<|open|>")), 1);
+    assert_eq!(count(&rendered.token_ids, id("<|close|>")), 1);
+}
+
+#[test]
+fn tokens_named_by_a_template_default_are_controls() {
+    // `/nothink` appears in no template text, only in a nested default string.
+    let source = "{% for m in messages %}<|open|>{{ m.content }}<|close|>{% mark %}{% endfor %}";
+    let defaults = json!({"tags": {"markers": ["x", "end: /nothink"]}});
+    let spelled = |defaults: Map<String, Value>| {
+        let frontend = frontend_with_defaults(source, TemplateEncoding::Text, vec![], defaults);
+        let nothink = frontend.encode("/nothink", false).unwrap()[0];
+        let rendered = frontend
+            .render_chat(&[json!({"role":"user","content":"a /nothink b"})], &Map::new())
+            .unwrap();
+        rendered.token_ids.iter().filter(|id| **id == nothink).count()
+    };
+    assert_eq!(spelled(Map::new()), 1);
+    assert_eq!(spelled(defaults.as_object().unwrap().clone()), 0);
+}
+
+#[test]
+fn image_expansion_preserves_literal_markers_and_real_placeholders() {
+    use flare_helios::frontend::images::{ImageLimits, ImageProcessor, ProcessedImages, RgbImage};
+    type Settings = fn(u32, u32) -> Value;
+    let layouts: [(&str, Settings); 2] = [
+        ("<|image_pad|>", |image_id, video_id| {
+            json!({"qwen":{"min_pixels":4096,"max_pixels":4096,"position_side":48,
+                "image_token_id":image_id,"video_token_id":video_id}})
+        }),
+        ("<|image|>", |_, _| {
+            json!({"patch_merge":{"patch_size":14,"min_pixels":3136,"max_pixels":451584,
+                "image_mean":[0.0,0.0,0.0],"image_std":[1.0,1.0,1.0],
+                "image_token":"<|image|>","start_token":"<|open|>","end_token":"<|close|>"}})
+        }),
+    ];
+    for (marker, settings) in layouts {
+        let source = format!("{{{{ messages[0].content }}}}<|open|>{marker}<|close|>{{% mark %}}");
+        let frontend = frontend(&source, TemplateEncoding::Text);
+        let image_id = frontend.encode(marker, false).unwrap()[0];
+        let video_id = frontend.encode("<|video_pad|>", false).unwrap()[0];
+        let settings = settings(image_id, video_id);
+        let processor = ImageProcessor::load(
+            serde_json::from_value(settings).unwrap(),
+            ImageLimits {
+                patches_per_feature: 4,
+                ..ImageLimits::default()
+            },
+        )
+        .unwrap();
+        let content = format!("literal {marker} <|video_pad|>");
+        let rendered = frontend
+            .render_chat(&[json!({"role":"user","content":content})], &Map::new())
+            .unwrap();
+        let literal = frontend.encode_ordinary(&content).unwrap();
+        let images = processor
+            .process(&[RgbImage::new(64, 64, vec![0; 64 * 64 * 3]).unwrap()])
+            .unwrap();
+        let expanded = processor
+            .expand_prompt(&frontend, &rendered.token_ids, &images)
+            .unwrap();
+        assert!(expanded.token_ids.starts_with(&literal));
+        assert_eq!(
+            expanded
+                .token_ids
+                .iter()
+                .filter(|id| **id == image_id)
+                .count(),
+            images.geometry[0].tokens
+        );
+        assert!(!expanded.token_ids.contains(&video_id));
+        assert_eq!(
+            processor
+                .expand_prompt(&frontend, &literal, &ProcessedImages::default())
+                .unwrap()
+                .token_ids,
+            literal
+        );
     }
 }

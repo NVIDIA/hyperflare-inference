@@ -60,7 +60,7 @@ A multi-host instance can use a Selene prefix cache pool (see
 
 - Pass the same `--prefix-cache-pool` setting to every rank, or to none.
 - Local retention is disk only; `--prefix-cache-memory` is rejected.
-- If any rank's registration is refused, every rank uses its local tiers.
+- If any rank's registration or attachment fails, every rank fails startup.
 - The pool and record links connect to rank zero's ephemeral TCP port and carry
   session secrets in plaintext, so secure the cluster fabric.
 - Build with `rdma` only if the manager offers RDMA.
@@ -94,8 +94,47 @@ also listen on their fabric addresses. Flare does not configure interfaces,
 addresses, routes, switches, or firewalls.
 
 The serving ranks select up to two rails per peer from active devices. The
-core does not pin the physical fabric used during preparation. For direct
-cabling and neighbor forwarding, see [experimental rings](#experimental-rings).
+core does not pin the physical fabric used during preparation. On a switch,
+rail `h` uses device `h` on every rank. Hosts can also add direct cables beside
+the switch, for example DGX Sparks whose second port is cabled to one partner:
+each rank then reaches a cabled peer over the cable's devices and every other
+peer over the switch. The planner identifies a cable as an IPv4 subnet that only
+the two cabled ranks hold, so every cable needs subnets of its own, distinct from
+the switch's and from every other cable's. The two ranks of a group on one
+cabled pair hold every subnet in common, so the planner also identifies a cable
+by LLDP: each rank records its devices' MAC addresses and, when lldpd runs on the
+host, the port MAC addresses that `lldpctl` reports for their neighbors. LLDP
+frames do not cross a switch, so devices of two ranks share a cable when either
+lists the other; lldpd on one host of the pair is enough. Without LLDP data, a
+two-rank group on a cabled pair has no evidence of its cable: its rails take one
+device behind each PCIe link and then the lowest-numbered network, which is the
+switch only when the switch's subnets sort below the cable's. IPv4 link-local
+addresses (169.254.0.0/16) never identify a cable, and two link-local addresses
+form a link only between LLDP neighbors. A device whose only RoCE address is
+link-local therefore carries rails only over a cable that LLDP identifies; LLDP
+does not cross a switch, so switch ports need configured subnets. Among equally
+verified links, a peer's two rails use devices behind different PCIe links: a
+DGX Spark's two ConnectX-7 functions behind one PCIe x4 link share its
+bandwidth, so a two-rank group on a cabled pair uses one function behind each
+link. Core distribution
+and Orbit prestaging connect each pair of ranks over the same devices as its RDMA
+rails.
+
+`--roce-switch-only` routes every peer over subnets every rank holds between
+devices that are not LLDP neighbors, as on the switch alone, for example to
+measure a switch-only baseline or to keep traffic off a faulty cable. With two
+ranks every subnet joins both, so the option leaves a cable unused only where
+LLDP identifies it. Peers started without it follow rank zero's
+choice for core distribution, and ranks that still disagree stop when the
+transport connects, naming the rank. Every rank's `Connect RoCE transport`
+startup phase lists each peer's local devices in rail order and marks a peer
+reached over a direct cable, for example
+`2 rails per peer: rank 0 roceP2p1s0f0,rocep1s0f0; rank 2 direct roceP2p1s0f1,rocep1s0f1; rank 3 roceP2p1s0f0,rocep1s0f0`,
+so a cable that is down or unaddressed appears as its partner routed without
+`direct`. The marker reports the topology inferred from subnets and LLDP, not
+verified reachability; only a connected transport shows that the devices reach
+each other. For direct cabling and neighbor forwarding, see
+[experimental rings](#experimental-rings).
 
 ## Manual serving
 
@@ -316,6 +355,13 @@ admits each peer once, serves checkpoint metadata and selected byte ranges,
 and coordinates preparation. Peers do not create full checkpoint shards.
 Keep checkpoint source files unchanged during loading.
 
+RoCEnante collectives give up on a peer after about 20 s, which suits serving.
+While compiled forwards warm, the rank that compiled a forward meets its Triton
+kernels already built and its peer builds them on first use, so one rank can
+trail the other by minutes inside one forward. Preparation widens the wait to
+about ten minutes for compiled warmup only; captured graphs keep the 20 s wait,
+so serving still reports a lost peer promptly.
+
 For a physical ring, add `--roce-ring` to rank zero's `export` or `debug-serve` command;
 for hosts cabled as a chain with no link between the first and last rank, add
 `--roce-chain` instead. The peers' `--rank` values define physical order. Preparation does not
@@ -418,9 +464,9 @@ fails. Restart the group after a record-connection failure.
 
 The startup phase `Join host prefix stores` reports how many records every rank
 holds. In `/metrics`, `flare_host_cache_stored_total` counts copy-outs,
-`flare_host_cache_hits_total` counts restores, and
-`flare_host_cache_reused_tokens_total` counts the tokens those restores
-covered. See
+`flare_host_cache_hits_total` counts requests served by a successful restore, and
+`flare_host_cache_reused_tokens_total` counts the tokens those restores added
+beyond each request's GPU prefix. See
 [prefix cache offload](prefix-cache-offload.md#214-ranks-on-separate-hosts).
 
 A printed URL or successful `--detach` means rank processes started; wait for
@@ -498,7 +544,8 @@ check `orbit status` and restart saved groups explicitly.
 | Checkpoint source changed | Keep source checkpoint files unchanged through loading. |
 | Rank identity or graph I/O schema differs | Matching export, prepared world size, serving options, and compatible executables. |
 | Core RoCE proxy ABI mismatch | Align preparation and serving dependencies; re-export when the executable cannot load that ABI. |
-| Missing GID or rail/queue-pair error | Active ports, IPv4 RoCEv2 GIDs, reachable endpoints, and the intended rank order. |
+| Missing GID or rail/queue-pair error | Active ports, IPv4 RoCEv2 GIDs, reachable endpoints, and the intended rank order. Link-local addresses link only LLDP neighbors; configure subnets on switch ports. |
+| `RoCE endpoint record has no PCIe link field` | A rank runs a build that plans rails from addresses alone; run builds with the same route planner on every rank. |
 
 Inspect rank output and `journalctl --user -u flare-agent` before restarting a
 failed group. A collective failure invalidates the serving run; the agent does

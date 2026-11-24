@@ -660,3 +660,63 @@ def test_core_token_capacity_bounds_packed_upload_and_publication(width):
     assert requests[1].generated == [42] + tokens[:9] and requests[1].done
     assert requests[0].acceptance.expected(width) == width
     assert len(requests[0].acceptance.expectations(width)) == width + 1
+
+
+def test_terminal_prefill_selects_last_chunk_and_tail_window_with_fallback():
+    base = layout()
+    # Without terminal_prefill graphs, all chunks fall back to normal prefill.
+    assert base.terminal_prefill_window == 0
+    assert base.prefill_kind(0, 512, 512) == "prefill"
+
+    graphs = dict(base.graphs)
+    graphs[("terminal_prefill", 1, 256)] = "terminal_prefill256"
+    graphs[("terminal_prefill", 1, 512)] = "terminal_prefill512"
+    with_terminal = layout(graphs=graphs)
+    assert with_terminal.terminal_prefill_window == 128
+    # 1536 = 3 * 512: chunks 0 and 1 are prefill, chunk 2 is terminal_prefill.
+    assert with_terminal.prefill_kind(0, 512, 1536) == "prefill"
+    assert with_terminal.prefill_kind(512, 512, 1536) == "prefill"
+    assert with_terminal.prefill_kind(1024, 512, 1536) == "terminal_prefill"
+    # 640 = 512 + 128: chunk 0 leaves 128 <= window -> terminal_prefill; chunk 1 falls back to prefill128.
+    assert with_terminal.prefill_kind(0, 512, 640) == "terminal_prefill"
+    assert with_terminal.prefill_kind(512, 128, 640) == "prefill"
+    # 641 = 512 + 129: chunk 0 leaves 129 > window -> prefill; chunk 1 uses terminal_prefill256.
+    assert with_terminal.prefill_kind(0, 512, 641) == "prefill"
+    assert with_terminal.prefill_kind(512, 129, 641) == "terminal_prefill"
+
+    scheduler = Scheduler(with_terminal, prefix_cache=False)
+    req = request(1, [i % VOCABULARY for i in range(1536)], limit=2, seed=1)
+    scheduler.submit(req)
+    init = scheduler.plan()
+    scheduler.complete(init, records(scheduler, init, {req: (1, 0, [], 0)}))
+    observed = []
+    for consumed, emitted in ((512, []), (1024, []), (1536, [42])):
+        step = scheduler.plan()
+        observed.append((step.kind, step.graph, step.lanes[0].tokens, uploads(scheduler, step)["sample_enabled"][0][0]))
+        scheduler.complete(step, records(scheduler, step, {req: (1, consumed, emitted, 0)}))
+    assert observed == [
+        ("prefill", "prefill512", 512, 0),
+        ("prefill", "prefill512", 512, 0),
+        ("terminal_prefill", "terminal_prefill512", 512, 1),
+    ]
+    assert req.phase == "decode" and req.generated == [42]
+
+
+def test_terminal_prefill_contract_and_signature():
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
+    from ignition.preparation.execution import GraphSignature
+
+    sig = GraphSignature("terminal_prefill", 1, 256, ("token_ids", "sample_enabled", "query_lengths"))
+    assert sig.kind == "terminal_prefill"
+    inputs = {"terminal_prefill": c.text_inputs("terminal_prefill")}
+    contracts = c.graph_contracts(
+        {"terminal_prefill256": sig},
+        inputs,
+        continuation=c.state_view("state_pool", 64),
+        pending=c.state_view("request_pending_token", 8),
+        embedding_tables=(0, 1),
+    )
+    assert len(contracts) == 1
+    assert contracts[0]["kind"] == p.TERMINAL_PREFILL == 14
+    assert contracts[0]["embedding_tables"] == [0, 1]
+    assert contracts[0]["pending_token"] is not None

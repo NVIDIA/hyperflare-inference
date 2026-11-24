@@ -48,6 +48,8 @@ pub enum Part {
     },
     ToolResult {
         id: Option<String>,
+        /// The tool name a client gave the result, independent of its call.
+        name: Option<String>,
         content: Vec<Part>,
         is_error: bool,
     },
@@ -58,6 +60,10 @@ pub struct Tool {
     pub namespace: Option<String>,
     pub description: String,
     pub parameters: Value,
+    /// Whether the client declared `parameters`; `parameters` holds an empty
+    /// object schema otherwise.
+    pub declared_parameters: bool,
+    pub strict: bool,
     pub custom: bool,
     pub grammar: Option<ToolGrammar>,
 }
@@ -108,6 +114,8 @@ pub enum Constraint {
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Effort {
+    /// Below low. Prompt formats without a minimal level render low effort.
+    Minimal,
     Low,
     High,
     Max,
@@ -170,6 +178,12 @@ impl Request {
                     "tool names must be nonempty and unambiguous, with object schemas".into(),
                 );
             }
+            if tool.strict && (tool.custom || !tool.declared_parameters) {
+                return Err(
+                    "strict function tools must declare an explicit object parameters schema"
+                        .into(),
+                );
+            }
         }
         if self.tool_choice == ToolChoice::Required && self.tools.is_empty() {
             return Err("required tool choice needs at least one tool".into());
@@ -217,10 +231,14 @@ fn content(parts: &[Part]) -> Result<Value> {
 }
 
 /// Converts semantic parts to the message context consumed by prepared templates.
+/// `failure_text` begins each failed tool result with a text part saying it
+/// failed, for prompt formats that have no tool-error syntax; every result keeps
+/// its `is_error` flag.
 pub fn template_messages(
     messages: &[Message],
     tool_choice: ToolChoice,
     hints: &[(usize, usize)],
+    failure_text: bool,
 ) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     let lower_instructions = messages
@@ -331,18 +349,22 @@ pub fn template_messages(
                 }
                 Part::ToolResult {
                     id,
+                    name,
                     content: parts,
                     is_error,
                 } => {
                     flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
                     let mut parts = parts.clone();
-                    if *is_error {
+                    if *is_error && failure_text {
                         parts.insert(0, Part::Text("Tool execution failed:".into()));
                     }
                     let mut result =
                         json!({"role":"tool","content":content(&parts)?,"is_error":is_error});
                     if let Some(id) = id {
                         result["tool_call_id"] = json!(id);
+                    }
+                    if let Some(name) = name {
+                        result["name"] = json!(name);
                     }
                     if hints.contains(&(message_index, part_index + 1)) {
                         // Zero denotes a complete tool result, including its wrapper.
@@ -463,6 +485,7 @@ mod tool_result_order_tests {
             role: Role::Tool,
             parts: vec![Part::ToolResult {
                 id: id.map(str::to_owned),
+                name: None,
                 content: vec![
                     Part::Text(label.into()),
                     Part::Image(format!("image:{label}:1")),
@@ -483,7 +506,7 @@ mod tool_result_order_tests {
     }
 
     fn lower(messages: &[Message]) -> Vec<Value> {
-        template_messages(messages, ToolChoice::Auto, &[]).unwrap()
+        template_messages(messages, ToolChoice::Auto, &[], true).unwrap()
     }
 
     #[test]

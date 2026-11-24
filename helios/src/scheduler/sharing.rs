@@ -43,6 +43,7 @@ impl RequestScheduler {
 
     pub(super) fn record_evictions(&mut self, report: &EvictionReport) {
         for retired in &report.retired {
+            self.pending_reoffers.remove(&retired.checkpoint);
             self.offered_publications.remove(&retired.checkpoint);
         }
         if self.track_evictions {
@@ -63,7 +64,7 @@ impl RequestScheduler {
                             if !self.publications.contains(child)
                                 && self
                                     .publication(*child)
-                                    .is_some_and(|node| node.parent == Some(key))
+                                    .is_some_and(|node| node.parent() == Some(key))
                             {
                                 self.publications.push(*child);
                             }

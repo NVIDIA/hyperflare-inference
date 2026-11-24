@@ -77,6 +77,23 @@ impl PoolBuilder<'_> {
         self,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
     ) -> Result<(PreparedPool, Vec<u64>)> {
+        self.start_wait(registrar, super::STARTUP_WAIT)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start_with_wait(
+        self,
+        registrar: Arc<dyn HostRegistrar + Send + Sync>,
+        wait: std::time::Duration,
+    ) -> Result<(PreparedPool, Vec<u64>)> {
+        self.start_wait(registrar, wait)
+    }
+
+    fn start_wait(
+        self,
+        registrar: Arc<dyn HostRegistrar + Send + Sync>,
+        wait: std::time::Duration,
+    ) -> Result<(PreparedPool, Vec<u64>)> {
         let Self {
             options,
             identity,
@@ -145,12 +162,12 @@ impl PoolBuilder<'_> {
                     copier.clone(),
                     registrar,
                     super::Roots::System,
-                    super::STARTUP_WAIT,
+                    wait,
                 )?;
                 (Some(client), None, None)
             }
         };
-        let mut prepared = PreparedPool {
+        let prepared = PreparedPool {
             client,
             agent,
             records,
@@ -159,10 +176,6 @@ impl PoolBuilder<'_> {
             copier: copier.clone(),
             identity,
         };
-        if prepared.registered_regions().is_empty() {
-            // Finish attachment before caches consume its startup allowance.
-            prepared.close()?;
-        }
         let (host, device) = prepared.registration_costs()?;
         let charges = Budget {
             host: Ok(0),
@@ -223,11 +236,7 @@ impl PreparedPool {
     }
     pub fn summary(&self) -> Result<String> {
         let (host, device) = self.registration_costs()?;
-        Ok(if self.approved() {
-            format!("{host} host bytes · {device} device bytes per GPU")
-        } else {
-            "local tiers only".into()
-        })
+        Ok(format!("{host} host bytes · {device} device bytes per GPU"))
     }
     fn registered_regions(&self) -> &[RegisteredRegion] {
         match (&self.client, &self.agent) {
@@ -254,14 +263,17 @@ impl PreparedPool {
     pub fn attach(
         self,
         local: Option<Box<dyn crate::store::TierStore>>,
+        drain_on_shutdown: std::time::Duration,
     ) -> Result<Box<dyn HostStore>> {
-        Ok(Box::new(PooledStore::new(
+        let mut store = PooledStore::new(
             super::local::Tiers::new(local),
             self.client
                 .ok_or("a pool rank agent cannot serve rank zero's store")?,
             self.identity,
             &self.layout,
-        )))
+        );
+        store.drain_on_shutdown = drain_on_shutdown;
+        Ok(Box::new(store))
     }
 }
 

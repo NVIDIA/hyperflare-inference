@@ -54,7 +54,7 @@ pub fn unverified_metadata_selected(
         ));
     }
     let path = &primary;
-    let (file, _, payload_bytes, bytes) = Archive::envelope(path)?;
+    let (file, _, payload_bytes, bytes, _) = Archive::envelope(path)?;
     let envelope = wire::ProtectedIndex::decode(bytes.as_slice())
         .map_err(|e| invalid(format!("invalid signed envelope: {e}")))?;
     super::protection::ExecutableEncoding::from_version(envelope.version)?;
@@ -243,6 +243,7 @@ fn unverified_payload(
         };
         deployment_values.push(json!({
             "id": body.deployment_id,
+            "rebuild": body.rebuild,
             "frontend": frontend_detail,
             "vision": vision_detail,
             "tensor_parallel": body.tensor_parallel,
@@ -377,6 +378,7 @@ fn unverified_payload(
                 "development": publisher.development,
             })),
         },
+        "rebuild": capacity("rebuild"),
         "model": {
             "model_id": core.model_identity,
             "identity": core.model_identity,

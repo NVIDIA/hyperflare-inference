@@ -38,12 +38,30 @@ CONTAINER_TUNED: dict[str, frozenset[str]] = {}
 MODULE_BUFFER_FIELDS: dict[str, frozenset[str]] = {}
 
 
-def declare_container_fields(type_key, fields, *, tuned=()):
+def declare_container_fields(type_key, field_names, *, tuned=()):
     """Declare the weight-bearing fields of an external container type."""
     if not isinstance(type_key, str) or not type_key:
         raise ValueError('declared container types need a module-qualified name')
-    CONTAINER_FIELDS[type_key] = tuple(fields)
+    CONTAINER_FIELDS[type_key] = tuple(field_names)
     CONTAINER_TUNED[type_key] = frozenset(tuned)
+
+
+def weight_container(field_names, *, tuned=()):
+    """Register the weight-bearing fields of a container class at definition time."""
+    names = tuple(field_names)
+
+    def decorator(cls):
+        if is_dataclass(cls):
+            defined = {item.name for item in fields(cls)}
+            absent = [name for name in names if name not in defined]
+            if absent:
+                raise ValueError(
+                    f'{cls.__module__}.{cls.__qualname__}: unknown declared weight fields {absent}'
+                )
+        declare_container_fields(f'{cls.__module__}.{cls.__qualname__}', names, tuned=tuned)
+        return cls
+
+    return decorator
 
 
 def declare_module_buffers(type_key, fields):
@@ -210,7 +228,97 @@ def _members(value):
     return [(f'.{field.name}', getattr(value, field.name)) for field in fields(value)]
 
 
-def from_plan(model, plan, *, compiled_forwards):
+def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
+    """Build canonical `ignition export` arguments reproducing `plan` without host-local paths."""
+    from pathlib import Path
+
+    if model.directory is not None:
+        target = Path(model.directory).name
+    elif plan.checkpoint.revision:
+        target = f'{plan.checkpoint.repository}@{plan.checkpoint.revision}'
+    else:
+        target = plan.checkpoint.repository
+    args = ['ignition', 'export', target]
+    if multi_host:
+        args.extend(['--ranks', str(plan.world_size)])
+        if plan.roce_ring:
+            args.append('--roce-ring')
+        if plan.roce_chain:
+            args.append('--roce-chain')
+    else:
+        gpus = '0' if plan.world_size == 1 else f'0-{plan.world_size - 1}'
+        args.extend(['--gpus', gpus])
+    supports_cp = any(costs.page_tokens for costs in plan.recipe.ranks.values())
+    if not plan.context_parallel:
+        if supports_cp:
+            args.append('--no-context-parallel')
+    elif plan.context_parallel_size is not None and plan.context_parallel_size != plan.world_size:
+        args.extend(['--dcp-size', str(plan.context_parallel_size)])
+    args.extend(['--max-concurrency', str(plan.concurrency)])
+    if plan.recipe.max_images:
+        if plan.language_model_only:
+            args.append('--language-model-only')
+        else:
+            args.extend(['--image-concurrency', str(plan.image_concurrency)])
+    args.extend(['--prefill-chunk-size', str(plan.prefill_chunk)])
+    if plan.expert_scale_compression is not None:
+        args.extend(['--expert-scale-compression', plan.expert_scale_compression])
+    if getattr(plan, 'prompt_logprobs', False):
+        args.append('--prompt-logprobs')
+    if plan.mixed_prefill:
+        args.append('--mixed-prefill')
+    if plan.recipe.speculation is not None:
+        if (s := plan.speculation) is None:
+            args.append('--no-mtp')
+        else:
+            if s.method is not None:
+                args.extend(['--speculative-method', s.method])
+            args.extend(['--mtp-draft-tokens', str(s.draft_tokens)])
+            if s.mtp_only:
+                args.append('--mtp-only')
+            if not s.adaptive:
+                args.append('--no-mtp-adaptive-verification')
+            if s.draft_tokens > 0:
+                if plan.speculative_token_capacity:
+                    args.extend(['--speculative-token-capacity', str(plan.speculative_token_capacity)])
+                if s.packed_verification and s.graph_budget is not None:
+                    args.extend(['--speculative-graph-budget', str(s.graph_budget)])
+                if s.draft_body_quantization is not None:
+                    args.extend(['--draft-body-quantization', s.draft_body_quantization])
+                if s.draft_head_quantization is not None:
+                    args.extend(['--draft-head-quantization', s.draft_head_quantization])
+                if s.markov_head_quantization is not None:
+                    args.extend(['--markov-head-quantization', s.markov_head_quantization])
+                if s.vocabulary_parallel_sampling:
+                    args.append('--vocabulary-parallel-sampling')
+    if plan.online_mxfp8:
+        args.append('--online-mxfp8')
+        if plan.online_mxfp8_scope:
+            args.extend(['--online-mxfp8-scope', plan.online_mxfp8_scope])
+    if plan.mla_compute_mode and plan.mla_compute_mode != 'auto':
+        args.extend(['--mla-compute-mode', plan.mla_compute_mode])
+    if plan.force_moe_decode_a16:
+        args.append('--force-moe-decode-a16')
+    if getattr(plan, 'native_dense_activations', False):
+        args.append('--native-dense-activations')
+    if plan.shard_hyperconnections:
+        args.append('--shard-hyperconnections')
+    if plan.joint_tuning:
+        args.append('--joint-tuning')
+    if not plan.stream_overlap and plan.recipe.stream_overlap:
+        args.append('--no-stream-overlap')
+    if plan.collective_tuning:
+        args.extend(['--collective-tuning', plan.collective_tuning])
+    if effort := getattr(plan, 'autotune_effort', ''):
+        args.extend(['--autotune-effort', effort])
+    if getattr(plan, 'lock_gpu_clocks', False):
+        args.append('--lock-gpu-clocks')
+    if not compiled_forwards:
+        args.append('--no-compile')
+    return args
+
+
+def from_plan(model, plan, *, compiled_forwards, multi_host=False):
     from .source_identity import source_identity
 
     result = dict(version=1, recipe=plan.recipe.name, source_identity=source_identity(),
@@ -219,11 +327,18 @@ def from_plan(model, plan, *, compiled_forwards):
         local_checkpoint=model.directory is not None, tensor_parallel=plan.world_size,
         max_concurrency=plan.concurrency, prefill_chunk=plan.prefill_chunk,
         image_concurrency=plan.image_concurrency, context_parallel=plan.context_parallel,
+        context_parallel_size=(plan.context_parallel_size or plan.world_size) if plan.context_parallel else 0,
         stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
+        prompt_logprobs=bool(getattr(plan, 'prompt_logprobs', False)),
         mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope, language_model_only=plan.language_model_only,
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
-        collective_tuning=plan.collective_tuning)
+        collective_tuning=plan.collective_tuning,
+        autotune_effort=getattr(plan, 'autotune_effort', ''),
+        native_dense_activations=bool(getattr(plan, 'native_dense_activations', False)),
+        lock_gpu_clocks=bool(getattr(plan, 'lock_gpu_clocks', False)),
+        reproduction_args=reproduction_arguments(
+            model, plan, compiled_forwards=compiled_forwards, multi_host=multi_host))
     if plan.collective_ladder is not None:
         import json
 
@@ -249,7 +364,7 @@ def from_plan(model, plan, *, compiled_forwards):
             raise ValueError('packed speculative rebuild metadata requires an explicit graph budget')
         if s.graph_budget is not None:
             result['speculation']['graph_budget'] = s.graph_budget
-        for field in ('draft_head_quantization', 'markov_head_quantization'):
+        for field in ('draft_body_quantization', 'draft_head_quantization', 'markov_head_quantization'):
             if (value := getattr(s, field)) is not None:
                 result['speculation'][field] = value
     return result

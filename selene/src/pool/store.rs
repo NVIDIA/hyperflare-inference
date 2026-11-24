@@ -117,6 +117,7 @@ struct Planned {
     candidate: PoolCandidate,
 }
 struct Restore {
+    tier: Tier,
     ticket: InboundTicket,
     local: Option<HostHit>,
     id: Option<u64>,
@@ -142,8 +143,10 @@ pub struct PooledStore<S: crate::store::TierStore, P: PoolPort = PoolClient> {
     puts: Vec<(u64, PutOutcome)>,
     /// Moves of the last local tier's records to the manager.
     cascade: Cascade,
+    pub(crate) drain_on_shutdown: Duration,
+    collect_cascade_puts: bool,
     /// Restores that were wholly from the pool, which the local tiers did not count.
-    pool_fetched: u64,
+    pool_fetched: [u64; 3],
     /// Restores that failed in the pool part.
     pool_fetch_failed: u64,
     /// Bytes the pool parts copied into the device.
@@ -197,7 +200,9 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
             pool_events: Vec::new(),
             puts: Vec::new(),
             cascade: Cascade::new(layout),
-            pool_fetched: 0,
+            drain_on_shutdown: Duration::ZERO,
+            collect_cascade_puts: false,
+            pool_fetched: [0; 3],
             pool_fetch_failed: 0,
             pool_bytes_in: 0,
         }
@@ -279,6 +284,72 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
 }
 
 impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
+    fn drain_memory(&mut self) {
+        let timeout = std::mem::take(&mut self.drain_on_shutdown);
+        if timeout.is_zero() {
+            return;
+        }
+        let Some((records, bytes)) = self.inner.begin_pool_drain() else {
+            return;
+        };
+        eprintln!("prefix cache shutdown drain: records={records} bytes={bytes}");
+        let started = Instant::now();
+        self.collect_cascade_puts = true;
+        let before = self.inner.stats();
+        let mut moved = 0;
+        let mut events = Vec::new();
+        let mut skipped = 0;
+        let mut failed = 0;
+        let mut stats = before;
+        let mut stopped = "done";
+        // The index keeps copying, hashing and export-pinned records until retirement.
+        while stats.memory_records != 0 || stats.outbound_in_flight != 0 || self.cascade.in_progress() != 0 {
+            if started.elapsed() >= timeout {
+                stopped = "deadline";
+                break;
+            }
+            // A pool that cannot accept puts retires nothing, so waiting would last the whole drain time.
+            if !self.pool.ready() {
+                stopped = "pool_unavailable";
+                break;
+            }
+            let progress = stats.progress;
+            let result = self.poll(&mut events);
+            for event in events.drain(..) {
+                match event {
+                    StoreEvent::Deferred { .. } => skipped += 1,
+                    StoreEvent::ExportRequested { export, .. } => {
+                        self.pool.export_refused(export, ExportRefusal::Busy);
+                    }
+                    _ => {}
+                }
+            }
+            for (_, outcome) in self.puts.drain(..) {
+                match outcome {
+                    PutOutcome::Stored { .. } => moved += 1,
+                    PutOutcome::Present => skipped += 1,
+                    _ => failed += 1,
+                }
+            }
+            stats = self.inner.stats();
+            if result.is_err() {
+                failed += 1;
+                stopped = "poll_failed";
+                break;
+            }
+            if stats.progress == progress || self.cascade.in_progress() != 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        self.collect_cascade_puts = false;
+        let left = self.inner.begin_pool_drain().map_or(0, |(left, _)| left);
+        skipped += stats.expired[0] - before.expired[0] + stats.dropped[0] - before.dropped[0];
+        failed += stats.store_failed - before.store_failed;
+        eprintln!(
+            "prefix cache shutdown drain: moved={moved} skipped={skipped} failed={failed} left={left} stopped={stopped}"
+        );
+    }
+
     fn pool_finished(
         &mut self,
         id: u64,
@@ -300,7 +371,7 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
                     self.rates
                         .observe(restore.level, restore.bytes, restore.started.elapsed());
                 }
-                self.pool_fetched += 1;
+                self.pool_fetched[restore.tier as usize] += 1;
                 self.pool_bytes_in += bytes;
                 events.push(StoreEvent::Fetched {
                     key,
@@ -424,6 +495,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         let bytes = hit.bytes;
         let started = Instant::now();
         self.rates.started(level);
+        let tier = planned.candidate.tier;
         let id = self.pool.fetch(PoolFetch {
             id: 0,
             page_tokens: self.page_tokens,
@@ -437,6 +509,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         self.restores.insert(
             hit.key,
             Restore {
+                tier,
                 ticket,
                 local: planned.local,
                 id: Some(id),
@@ -492,7 +565,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
                 }
                 PoolEvent::Fetched { id, result } => self.pool_finished(id, result, events),
                 PoolEvent::Put { id, outcome } => {
-                    if !self.cascade.ended(&mut self.inner, id, &outcome) {
+                    if !self.cascade.ended(&mut self.inner, id, &outcome) || self.collect_cascade_puts {
                         self.puts.push((id, outcome));
                     }
                 }
@@ -510,7 +583,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
             &self.pool,
             IndexEntry {
                 key: checkpoint.key,
-                parent: checkpoint.parent,
+                parent: checkpoint.parent(),
                 bucket: checkpoint.bucket,
                 tail_pages: checkpoint.tail_pages as u32,
                 row: true,
@@ -524,14 +597,33 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
 
     fn stats(&self) -> StoreStats {
         let mut stats = self.inner.stats();
-        stats.fetched += self.pool_fetched;
+        stats.fetched += self.pool_fetched.iter().sum::<u64>();
+        for (count, pool) in stats.restores_by_tier.iter_mut().zip(self.pool_fetched) {
+            *count += pool;
+        }
+        stats.refusal_drops = self.cascade.refusal_drops;
+        stats.retirement_paths = self.cascade.paths;
+        stats.retirement_latency_buckets = self.cascade.latency_buckets;
+        stats.retirement_max_depth = self.cascade.max_depth;
+        stats.retirement_ns = self.cascade.latency_ns;
+        stats.retirement_max_ns = self.cascade.max_latency_ns;
+        stats.deeper_link_records[1] += self.cascade.deeper_link_records;
+        stats.deeper_link_pages[1] += self.cascade.deeper_link_pages;
+        for reason in 0..crate::RootReason::COUNT {
+            stats.root_records[1][reason] += self.cascade.root_records[reason];
+            stats.root_pages[1][reason] += self.cascade.root_pages[reason];
+        }
         stats.fetch_failed += self.pool_fetch_failed;
         stats.bytes_in += self.pool_bytes_in;
+        for (index, count) in self.cascade.dropped.iter().enumerate() {
+            stats.dropped[6 + index] += count;
+        }
         stats
     }
 
     fn close(&mut self) -> Result<()> {
         self.inner.drain_on_shutdown();
+        self.drain_memory();
         let pool = PoolPort::close(&mut self.pool);
         let inner = self.inner.close();
         pool.and(inner)
@@ -557,7 +649,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
             Tier::Gpu,
             heir.map(|heir| IndexEntry {
                 key: heir.key,
-                parent: heir.parent,
+                parent: heir.parent(),
                 bucket: heir.bucket,
                 tail_pages: heir.tail_pages as u32,
                 row: true,

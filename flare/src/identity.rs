@@ -52,7 +52,7 @@ pub fn resolve(claim: &CoreClaim, options: &HubOptions) -> Result<Resolution> {
     classify(claim, &url, fetched)
 }
 
-fn fetch(url: &str, token: Option<&str>) -> Fetched {
+pub(crate) fn fetch(url: &str, token: Option<&str>) -> Fetched {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(10)))

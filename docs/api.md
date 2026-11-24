@@ -52,7 +52,9 @@ The additional `flare` object reports prepared and selected serving metadata:
 | `output_modalities` | `text` |
 
 Generation requests always use the loaded model, regardless of the request's
-`model` string. Returned generation objects identify the loaded model.
+`model` string. Returned generation objects carry the first non-empty served
+name when one is configured, and the loaded model's identifier otherwise;
+`/v1/models` advertises that same name.
 
 ## Ollama model discovery
 
@@ -335,8 +337,8 @@ without the `flare_` prefix, such as `input_decoded_images_total`.
 | `free_pages` | KV pages reusable after completed GPU fences | `flare_free_kv_pages` |
 | `total_pages` | Pages in the per-rank KV pool | `flare_total_kv_pages` |
 | `page_tokens` | Logical history tokens per KV page | `flare_kv_page_tokens` |
-| `host_hits` | Host prefix-store lookups whose chain admission fetched | `flare_host_cache_hits_total` |
-| `host_reused_tokens` | Tokens covered by host prefix-store chains beyond the GPU checkpoint | `flare_host_cache_reused_tokens_total` |
+| `host_hits` | Requests attached to a successfully restored host prefix | `flare_host_cache_hits_total` |
+| `host_reused_tokens` | Successfully restored tokens beyond each request's admission GPU prefix | `flare_host_cache_reused_tokens_total` |
 | `host_memory_records` | Checkpoint records in the host store's registered memory | `flare_host_cache_memory_records` |
 | `host_disk_records` | Checkpoint records in the host store's record directory | `flare_host_cache_disk_records` |
 | `host_bytes_out` | Bytes copied from GPU checkpoints to the host store | `flare_host_cache_bytes_out_total` |
@@ -356,7 +358,25 @@ deferred by the GPU headroom check before acquiring checkpoint pins.
 
 Host retention also exports `flare_host_cache_held_total{tier}` and
 `flare_host_cache_dropped_total{tier,reason}`, with `dram` and `nvme` tiers and
-`end_of_chain`, `oversize`, `io_error` drop reasons. The gauge
+`end_of_chain`, `oversize`, `io_error`, and `pool_refused` (pooled deployments only)
+drop reasons.
+
+`flare_host_cache_root_records_total{tier,reason}` and
+`flare_host_cache_root_pages_total{tier,reason}` count roots and their pages.
+`first` means the checkpoint offered no ancestor. `no_held_ancestor` means
+the tier stored a root despite receiving candidates.
+`flare_host_cache_deeper_link_records_total{tier}` and
+`flare_host_cache_deeper_link_pages_total{tier}` count records linked under a
+later offered ancestor and the tail pages they carried. The scheduler offers
+up to 256 ancestors per publication. A pool put offers up to 4096 candidates,
+including local parents and the nearer ancestors offered along the chain.
+
+For these four counters, `dram` counts copies started from the GPU and
+`pool` counts puts the manager stored. `pool` is the shared manager, not this
+process's local disk tier, which other `flare_host_cache_` families label
+`nvme`. Pool root counters cover local roots
+that the manager also stored as roots. A `Present` outcome and
+a disk-only store's local writes contribute zero. The gauge
 `flare_host_cache_parked_records` counts complete DRAM copies awaiting disk
 writes. `flare_host_cache_store_skipped_total` includes duplicates and
 retries; it is not a dropped-record counter. Local checkpoint pool capacity is
@@ -390,6 +410,31 @@ blank lines. The leading system message and preceding conversation remain
 unchanged. This conversion supplies a textual role cue; it does not provide a
 native system role to models whose templates cannot represent one inline.
 
+Text that a request supplies is ordinary text. A message, instruction, tool
+schema, tool argument or object key that spells a control token of the model
+(`<think>`, a role marker, an image placeholder) is tokenized as the characters
+it spells; only controls the chat template writes keep their token IDs. A
+control is an added token that is special, or that the chat template or one of
+its defaults names (a role, reasoning, tool or image marker), or that the
+model's prepared syntax names as a marker: its reasoning delimiters and terminal
+markers, the markers of its tool-call parser (its delimiters and, for GLM, its
+argument tags), and its image tokens. Every other added token is lexical text,
+for example GLM's `/nothink` or a fill-in-the-middle marker, and request text
+that spells one tokenizes to that token. Request text is ordinary text with one
+exception: the RADIO image layout (the C-RADIO encoder of Nemotron) lets message
+text place `<image>` placeholders, so text that spells `<image>` positions an
+attached image when the spelled placeholders and the ones the template writes
+together account for every attached image, and is ordinary text otherwise. Text
+that spells a control counts more tokens in `usage.prompt_tokens` than the
+single control token would, and its prefix-cache keys differ from those of a
+prompt that holds the token. On models with a Jinja chat template, prefilling an
+assistant message with `<think>` or a DSML opener through
+`continue_final_message` or Anthropic continuation therefore does not start the
+reply in reasoning or in a tool call. Generated control text that a client
+echoes back as plain text in a later turn re-enters as ordinary tokens, so the
+prefix cache does not cover that turn. DeepSeek and Inkling prompts use native
+encoders that tokenize request text as ordinary text.
+
 Model output parsers emit neutral semantic events. The ordered accumulator in
 `server/output.rs` retains text, reasoning, and tool blocks. Protocol encoders use
 the same accumulated output for buffered responses and SSE. Tool arguments are
@@ -401,8 +446,14 @@ its output limit; recognized but incomplete calls at natural completion are erro
 DeepSeek reasoning and both DSML tool syntaxes use the pinned official
 `deepseek-recipe` state machine. Helios adapts its actions into the same neutral
 events, validates nonempty tool names and JSON objects with nonempty, unique
-argument names, and publishes each call when its arguments complete. Closing the
-outer calls block ends parsed output; subsequent generated text is discarded.
+argument names, and publishes each call when its arguments complete. A parameter
+marked `string="false"` keeps its JSON type if its text decodes as one value
+inside the argument object. If decoding fails, Helios retains the original
+text as a JSON string. This includes valid JSON exceeding 126 levels of array
+or object nesting within the parameter. The combined size of the UTF-8 tool
+name and complete JSON argument object is limited to 1 MiB, including escapes
+and delimiters. Helios rejects a larger call before publishing it. Closing the
+outer calls block ends parsed output and discards subsequent generated text.
 The official parser owns markup recognition, including its tolerance of omitted
 or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
@@ -472,7 +523,7 @@ Named selection presents only the selected tool definition to the model, retaini
 conversation history and adding no instructions or decoding constraints.
 Buffered and streaming responses omit ordinary assistant answer text while
 preserving reasoning and tool arguments. Usage includes all generated tokens,
-including omitted answer text. Every emitted call must target the selected tool,
+including omitted answer text. Every returned call must target the selected tool,
 and at least one completed call is required. A call to another tool fails before
 that call is emitted. Missing and incomplete calls fail as in required mode.
 
@@ -481,8 +532,11 @@ undeclared tools are returned with their generated names and arguments in both
 buffered and streaming responses across all three chat APIs. Clients can repair
 or reject these calls and provide feedback in a subsequent turn. Declared schemas
 guide argument conversion where the tool syntax requires it; unknown tools have
-no schema for that conversion. Malformed envelopes, empty names, and invalid
-argument syntax still fail parsing. Required mode needs at least one declared
+no schema for that conversion. Malformed envelopes and empty names still fail
+parsing. Tagged parameters, as in GLM, retain malformed JSON values as strings.
+DeepSeek retains the original text of a `string="false"` parameter that cannot
+be decoded inside the argument object. Invalid JSON in a whole argument document
+or a typed XTML value fails parsing. Required mode needs at least one declared
 tool, adds an instruction to call a tool to the prompt, and validates that
 generation produced at least one
 completed call to a declared tool. Sampling is unchanged; no calls are fabricated
@@ -504,10 +558,22 @@ bounded llguidance compiler as structured output.
 
 `parallel_tool_calls: false` permits at most one tool call per response.
 Anthropic's `tool_choice.disable_parallel_tool_use: true` applies the same limit.
-The output validator fails the response when a second call begins, before emitting
-that call. Buffered requests receive HTTP 500; streams receive a terminal error
-and may already have delivered the first call. Combined with required mode, a
-successful response contains exactly one call. Generation uses ordinary sampling.
+When a second call begins, the server discards it and cancels further generation.
+The response completes normally with the first call and usage: Chat uses
+`finish_reason: "tool_calls"`, Messages uses `stop_reason: "tool_use"`, and
+Responses emits a completed response containing the first tool call.
+This applies to buffered and streamed requests. Combined with required mode, a
+successful response contains exactly one call. The limit is checked before
+validating the discarded call's name. The call-count limit alone does not enable constrained sampling.
+Usage counts every generated token, including discarded output. Detection follows
+the HTTP reader's pace: a slow or paused client delays cancellation while the
+worker continues decoding. Cancellation is processed at submission boundaries;
+already queued work retains its normal fences. If the worker processes
+cancellation before natural completion, runtime metrics count the request as
+cancelled rather than completed, despite the successful API response.
+Raw token IDs and Chat logprobs published before the parser recognizes the second
+call can include its opening tokens. Buffered token IDs can contain fewer entries
+than the generated-token usage count.
 
 Parallel tool results with unique IDs matching the preceding assistant's calls
 are normalized to call order before chat-template rendering. Each result's text
@@ -516,9 +582,58 @@ Missing, duplicate, or unknown IDs leave that group in its supplied order.
 Results never move across another
 assistant message.
 
-Strict function schemas (`strict: true`) are rejected. Hosted search,
+Chat Completions and Responses accept `strict: true` for function tools when the
+core declares a DeepSeek DSML, Qwen/ChatML function-tag, GLM argument-tag or
+TMLv0 tool parser. Strict schemas must declare `"type": "object"` with
+`"additionalProperties": false` at the root and on every nested object, list
+every declared property in `"required"`, and use supported bounded JSON-schema
+keywords (`properties`, `required`, `additionalProperties`, `items`,
+`prefixItems`, `minItems`, `maxItems`, `enum`, `const`, `anyOf`, local `$ref`
+to `#`, `#/$defs/<name>`, or `#/definitions/<name>`, numeric bounds,
+`multipleOf`, `minLength`, `maxLength`, and `pattern`). Function-tag and GLM
+argument-tag syntaxes reject top-level properties that mix `"string"` with
+any non-string type, including `"null"`. `enum` and `const` may specify a
+compatible `type` but cannot be combined with other assertions; numeric `enum`
+and `const` literals are parsed at IEEE 754 binary64 precision and must have
+magnitude strictly below `2^53` (`9,007,199,254,740,992`, so integer literals
+lie in `[-9,007,199,254,740,991, 9,007,199,254,740,991]`; pass larger exact
+identifiers or higher-precision decimals as strings). With an active strict
+tool, TMLv0 recognizes only declared tool names, including under
+`tool_choice: "auto"`.
+
+Object property names cannot contain `<`, `>`, or whitespace. Top-level property
+names also exclude control characters, `"`, `'`, `&`, `\`, and `｜`.
+Tag-delimited parsers reserve the following delimiters in top-level raw string
+parameters:
+
+| Tool syntax | Reserved delimiters |
+| --- | --- |
+| DeepSeek DSML | `｜DSML｜` control token (schema literals also exclude `｜DSML｜` text) |
+| Qwen function tags | `</parameter>`, `<parameter=`, `</function>`, `</tool_call>` |
+| GLM argument tags | `</arg_value>`, `</tool_call>` |
+
+Admission rejects `const` and `enum` values containing a reserved delimiter in
+such a parameter. For open strings (including `pattern`-constrained strings),
+Qwen and GLM wire grammars intersect with a delimiter exclusion during
+generation; a DSML value ends only at the `｜DSML｜` control token, so the same
+characters emitted as ordinary text remain in the value.
+
+Helios buffers a strict call until its arguments are complete and validated.
+Even in a streaming response the client does not receive partial strict arguments.
+An output limit or user stop omits a strict call that began but did not finish;
+EOS inside such a call produces an error. A required or named tool choice
+still fails if no qualifying call completed.
+An active strict function tool attaches a request grammar for the entire
+generation, including reasoning, prose, and tool calls. For as long as the
+request decodes, its MTP width is one and any decode batch containing it keeps
+one step in flight rather than two. This also applies when `tool_choice: "auto"`
+produces only prose. See the [native replay loop](core-design.md#native-replay-loop).
+Active strict tools on unsupported parsers, `strict: true` on custom or
+Messages tools, and invalid strict schemas return HTTP 400. Custom Lark
+answer grammars cannot be combined with active strict tools on DSML, Qwen
+function-tag, or GLM argument-tag parsers. Hosted search,
 computer execution, file stores, audio, and remote image downloads are unsupported. Images must be
-base64 PNG, JPEG, or static WebP data. Images are encoded sequentially into
+base64 PNG, JPEG, static WebP, or non-animated GIF data. Images are encoded sequentially into
 bounded feature windows. Chunked prefill consumes each window before its storage
 is reused; the total image tokens across a conversation may exceed
 `image_feature_window_tokens`. Image count is bounded only by
@@ -624,7 +739,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `glm53` | 1 | 0.95 | Disabled | Temperature [0.95, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) |
 | `deepseek4` | 1 | 0.95 | Disabled | None | [DeepSeek-V4-Flash-Vision-Exp agent evaluations](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction) |
 | `deepseek41` | 1 | 1 | Disabled | Repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 recommendations](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference) |
-| `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment) |
+| `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment); [MiMo-V2.6-Flash-RL deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL#5-deployment) |
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |
 | `nemotron_h` | 1 | 0.95 | Disabled | None | [Nemotron-3.5-Bolt text recommendations](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB#model-summary) |
@@ -865,7 +980,9 @@ actual generated read tokens. No prose or streaming is returned. Dropping a
 request cancels its current child through the ordinary generation lifetime.
 
 The scorer uses the normal assistant generation prompt with thinking disabled
-where supported and an `Answer:` cue in the final user turn. Labels are verified
+where supported and an `Answer:` cue in the final user turn. Labels are the
+letters `A` through `Z`, then `AA` through `ZZ`, written without a leading space
+because they are read as the start of the assistant reply. Labels are verified
 as the first assistant token against the actual rendered prompt, including with
 the native DeepSeek encoders. A core without the explicit-ID logprob inputs that
 `logprob_token_ids` uses returns HTTP 400 and requires re-export.
@@ -922,3 +1039,9 @@ and `total_tokens`. Cache writes are not measured and are reported as zero.
 The route shares System One's prompt compilation, exact-ID reads, sequential
 child lifetime, template constraints and rejection of cores without explicit-ID
 logprob inputs; it adds no second scoring path.
+
+Input and instruction text that spells a control token is scored as ordinary
+text, as in chat requests. Each label is checked against the token IDs of the
+rendered prompt: the text after the prompt's last added token, encoded as
+ordinary text, must take the label as exactly one new non-special token, and a
+label that fails the check is unavailable.

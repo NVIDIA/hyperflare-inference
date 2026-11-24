@@ -10,6 +10,12 @@ identity through `publisher.json` at the root of the core's official source
 repository. Execution requires first-use acceptance. Private keys never belong
 in source control, cores, or publisher profiles.
 
+The Windows desktop client can review and import a public profile published with
+a payload-format core at its acquisition commit. This permits downloading cores
+signed with a development key from another preparation host. The dialog verifies
+the signed catalog and requires explicit key import; execution acceptance remains
+separate. See [desktop acquisition](../flare-winui/README.md#use).
+
 ## Publish the verification key
 
 Upload the `publisher.json` that key creation wrote, unchanged, to the root of

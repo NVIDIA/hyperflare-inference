@@ -6,30 +6,34 @@
 
 import argparse
 
-from ignition.recipes import recipes
 
-
-def recipe_help(model=None):
-    catalog = [(recipe, checkpoint) for recipe in recipes() for checkpoint in recipe.checkpoints]
+def recipe_help(model=None, *, recipes=(), prog="ignition"):
+    catalog = [(recipe, checkpoint) for recipe in recipes for checkpoint in recipe.checkpoints]
     selected = next(((recipe, checkpoint) for recipe, checkpoint in catalog
                      if model in (checkpoint.alias, checkpoint.repository)), None)
     if selected is None:
+        if not catalog:
+            return (
+                "No model recipes are registered in this CLI.\n"
+                "Core publishing and rank-join commands (keygen, key-password, sign, edit, combine, convert, join)\n"
+                "work without recipes. Build a recipe CLI with ignition.cli.main(recipes=...)."
+            )
         lines = ["Available model recipes:",
                  f"  {'MODEL':<26}{'GPUs':<14}Drafts (default/max)"]
         for recipe, checkpoint in catalog:
-            gpus = ",".join(map(str, recipe.tensor_parallel))
+            gpus = ",".join(map(str, recipe.checkpoint_tensor_parallel(checkpoint)))
             drafts = ("none" if recipe.speculation is None else
                       f"{recipe.speculation.draft_tokens}/{recipe.max_draft_tokens}")
             lines.append(f"  {checkpoint.alias:<26}{gpus:<14}{drafts}")
         lines.extend(("", "Show a recipe's defaults, limits, and optional features:",
-                      "  ignition export MODEL --help",
+                      f"  {prog} export MODEL --help",
                       "MODEL also accepts org/repository[@revision] or a checkpoint directory.",
                       "GPU counts are supported tensor-parallel sizes; memory must still fit."))
         return "\n".join(lines)
 
     recipe, checkpoint = selected
     lines = [f"Model recipe: {checkpoint.alias}", f"  Checkpoint: {checkpoint.repository}",
-             f"  --gpus: select {', '.join(map(str, recipe.tensor_parallel))} GPUs",
+             f"  --gpus: select {', '.join(map(str, recipe.checkpoint_tensor_parallel(checkpoint)))} GPUs",
              f"  --max-concurrency: 1..{recipe.max_concurrency}; recipe default {recipe.concurrency}",
              f"  --prefill-chunk-size: 64..{recipe.context}, multiple of 64; default {recipe.prefill_chunk}"]
     if recipe.max_images:
@@ -41,9 +45,10 @@ def recipe_help(model=None):
                      f" default {recipe.expert_scale_compression or 'native'}.")
     speculation = recipe.speculation
     if speculation is not None:
+        methods = tuple(dict.fromkeys(name for name in (speculation.method, *recipe.speculative_methods) if name))
+        if methods:
+            lines.append(f"  --speculative-method: {', '.join(methods)}; default {speculation.method or 'recipe draft'}")
         lines.extend((
-            *([] if speculation.method is None else [
-                f"  --speculative-method: {', '.join(dict.fromkeys((speculation.method, *recipe.speculative_methods)))}; default {speculation.method}"]),
             f"  --mtp-draft-tokens: 0..{recipe.max_draft_tokens}; default {speculation.draft_tokens}",
             f"  Verification: {'adaptive' if speculation.adaptive else 'fixed width'} by default;"
             " --no-mtp excludes draft weights and state.",
@@ -93,10 +98,13 @@ def recipe_help(model=None):
 class RecipeHelp(argparse.Action):
     """Show settings for a MODEL preceding --help without resolving or loading it."""
 
-    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None,
+                 recipes=(), prog="ignition"):
+        self._recipes = tuple(recipes)
+        self._prog = prog
         super().__init__(option_strings=option_strings, dest=dest, nargs=0, default=default, help=help)
 
     def __call__(self, parser, namespace, values, option_string=None):
-        parser.epilog = recipe_help(getattr(namespace, "model", None))
+        parser.epilog = recipe_help(getattr(namespace, "model", None), recipes=self._recipes, prog=self._prog)
         parser.print_help()
         parser.exit()

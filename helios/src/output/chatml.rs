@@ -9,9 +9,9 @@
 pub use crate::output::tagged::OutputConfig;
 use crate::{
     Result,
-    output::tagged::{TaggedOutput, ToolDialect},
+    output::tagged::{RawArguments, TaggedOutput, ToolDialect, strict_nonstring_raw},
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 pub struct FunctionTags<const WRAPPING_NEWLINES: bool>;
 impl<const WRAPPING_NEWLINES: bool> ToolDialect for FunctionTags<WRAPPING_NEWLINES> {
@@ -23,6 +23,9 @@ impl<const WRAPPING_NEWLINES: bool> ToolDialect for FunctionTags<WRAPPING_NEWLIN
     const TOOL_ENDS_REASONING: bool = true;
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>> {
         Ok(vec![parse_tool(body, tools, WRAPPING_NEWLINES)?])
+    }
+    fn parse_candidate(body: &str, tools: &[Value]) -> Result<Option<Vec<(String, String)>>> {
+        Ok(parse_tool_candidate(body, tools, WRAPPING_NEWLINES)?.map(|call| vec![call]))
     }
     fn starts_call(text: &str) -> Option<bool> {
         // Calls continue with `<function=NAME>` and a parameter or closing tag; quoted
@@ -36,6 +39,9 @@ impl<const WRAPPING_NEWLINES: bool> ToolDialect for FunctionTags<WRAPPING_NEWLIN
             };
         };
         let end = header.find(|c: char| c == '>' || c == '<' || c.is_whitespace())?;
+        if end == 0 {
+            return Some(false);
+        }
         let Some(body) = header[end..].strip_prefix('>') else {
             return Some(false);
         };
@@ -43,29 +49,46 @@ impl<const WRAPPING_NEWLINES: bool> ToolDialect for FunctionTags<WRAPPING_NEWLIN
         if body.is_empty() {
             return None;
         }
-        let Some(tag) = body.strip_prefix('<') else {
-            return Some(false);
-        };
-        let tag = tag.trim_start();
-        if ["parameter", "/function>"]
-            .iter()
-            .any(|next| tag.starts_with(next))
-        {
+        if parameter_start(body).is_some() || body.starts_with("</function>") {
             Some(true)
-        } else if ["parameter", "/function>"]
-            .iter()
-            .any(|next| next.starts_with(tag))
-        {
+        } else if possible_parameter_start(body) || "</function>".starts_with(body) {
             None
         } else {
             Some(false)
         }
     }
 }
+
+/// Whether incomplete `text` can still become a parameter opener accepted by
+/// `parameter_start`.
+fn possible_parameter_start(text: &str) -> bool {
+    let Some(text) = text.strip_prefix('<') else {
+        return false;
+    };
+    let text = text.trim_start();
+    if "parameter".starts_with(text) {
+        return true;
+    }
+    let Some(text) = text.strip_prefix("parameter") else {
+        return false;
+    };
+    let text = text.trim_start();
+    text.is_empty() || text.starts_with('=')
+}
+
 pub type ChatMlOutput = TaggedOutput<FunctionTags<true>>;
 pub type CompactChatMlOutput = TaggedOutput<FunctionTags<false>>;
 
 fn parse_tool(body: &str, tools: &[Value], wrapped_parameters: bool) -> Result<(String, String)> {
+    parse_tool_candidate(body, tools, wrapped_parameters)?
+        .ok_or_else(|| "incomplete JSON parameter".into())
+}
+
+fn parse_tool_candidate(
+    body: &str,
+    tools: &[Value],
+    wrapped_parameters: bool,
+) -> Result<Option<(String, String)>> {
     let body = body
         .trim()
         .strip_prefix("<function=")
@@ -78,11 +101,12 @@ fn parse_tool(body: &str, tools: &[Value], wrapped_parameters: bool) -> Result<(
         .iter()
         .filter_map(|tool| tool.get("function"))
         .find(|function| function.get("name").and_then(Value::as_str) == Some(name));
+    let strict = function.is_some_and(|f| f["strict"].as_bool() == Some(true));
     let properties = function
         .and_then(|function| function.get("parameters"))
         .and_then(|parameters| parameters.get("properties"))
         .and_then(Value::as_object);
-    let mut arguments = Map::new();
+    let mut arguments = RawArguments::new();
     loop {
         rest = rest.trim_start();
         if let Some(tail) = rest.strip_prefix("</function>") {
@@ -95,6 +119,21 @@ fn parse_tool(body: &str, tools: &[Value], wrapped_parameters: bool) -> Result<(
             parameter_start(rest).ok_or("tool function requires parameter or closing tag")?;
         if parameter.is_empty() || arguments.contains_key(parameter) {
             return Err("tool parameter names must be nonempty and unique".into());
+        }
+        let schema = properties.and_then(|properties| properties.get(parameter));
+        let Ok(container) = super::tagged::container_parameter(tail, schema.filter(|_| strict))
+        else {
+            return Ok(None);
+        };
+        if let Some((value, remaining)) = container
+            && let Some(next) = parameter_end(remaining).or_else(|| {
+                (remaining.starts_with("</function>") || parameter_start(remaining).is_some())
+                    .then_some(remaining)
+            })
+        {
+            arguments.insert(parameter.into(), value);
+            rest = next;
+            continue;
         }
         let (end, consumed) = tail
             .match_indices('<')
@@ -116,16 +155,14 @@ fn parse_tool(body: &str, tools: &[Value], wrapped_parameters: bool) -> Result<(
         } else {
             value
         };
-        let schema = properties.and_then(|properties| properties.get(parameter));
-        arguments.insert(parameter.into(), parameter_value(value, schema)?);
+        if let Some(raw_json) = strict_nonstring_raw(value, schema.filter(|_| strict)) {
+            arguments.insert(parameter.into(), raw_json);
+        } else {
+            arguments.insert_value(parameter.into(), &parameter_value(value, schema)?)?;
+        }
         rest = tail;
     }
-    Ok((
-        name.into(),
-        serde_json::to_string(&arguments).map_err(|error| {
-            crate::FrontendError::Input(crate::Failure::caused_by(error.to_string(), error))
-        })?,
-    ))
+    Ok(Some((name.into(), arguments.to_json_string()?)))
 }
 
 fn parameter_start(text: &str) -> Option<(&str, &str)> {
@@ -483,7 +520,9 @@ mod tests {
             OutputConfig {
                 structured: false,
                 start: crate::output::tagged::OutputStart::Content,
-                tools: vec![json!({"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"},"yield_time_ms":{"type":"number"}}}}})],
+                tools: vec![
+                    json!({"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"},"yield_time_ms":{"type":"number"}}}}}),
+                ],
             },
             "number".into(),
         );
@@ -495,7 +534,10 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        assert!(arguments.contains(r#""yield_time_ms":25000"#), "{arguments}");
+        assert!(
+            arguments.contains(r#""yield_time_ms":25000"#),
+            "{arguments}"
+        );
         assert!(!arguments.contains("25000.0"), "{arguments}");
     }
 
@@ -578,6 +620,106 @@ mod tests {
                     "{text:?} at {split}"
                 );
             }
+        }
+    }
+    #[test]
+    fn parameterized_tag_after_function_mention_remains_prose() {
+        let prose = "Use <function=weather> <parameterized> literally.";
+        for split in prose.char_indices().map(|(at, _)| at).chain([prose.len()]) {
+            let mut parser = Harness::new(
+                OutputConfig {
+                    start: crate::output::tagged::OutputStart::Content,
+                    ..config()
+                },
+                "prose".into(),
+            );
+            parser.push(&prose[..split]).unwrap();
+            parser.push(&prose[split..]).unwrap();
+            parser.finish().unwrap();
+            assert_eq!(parser.message()["content"], prose, "split {split}");
+            assert!(!parser.has_tools(), "split {split}");
+        }
+
+        let call = "<function=lookup> <parameter=city>Paris</parameter></function>";
+        let mut parser = Harness::new(
+            OutputConfig {
+                start: crate::output::tagged::OutputStart::Content,
+                ..config()
+            },
+            "call".into(),
+        );
+        parser.push(call).unwrap();
+        parser.finish().unwrap();
+        let arguments: Value = serde_json::from_str(
+            parser.message()["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arguments, json!({"city":"Paris"}));
+    }
+    #[test]
+    fn qwen_call_detection_keeps_unknown_prefixes_distinct_from_prose() {
+        type Dialect = FunctionTags<true>;
+        for (text, expected) in [
+            ("<function=>", Some(false)),
+            ("<function=weather extra>", Some(false)),
+            ("<function=weather> <parameter name=q>", Some(false)),
+            ("<function=weather> <parameterized>", Some(false)),
+            ("<function=weather> <3", Some(false)),
+            ("<tool_call><3", Some(false)),
+            ("<function=weather> <param", None),
+            ("<function=weather> <parameter=q", None),
+            ("<function=weather> <parameter=bad literally.", None),
+            ("<function=weather> <parameter=q>", Some(true)),
+            ("<function=weather> < parameter =q>", Some(true)),
+            ("<function=weather> </function>", Some(true)),
+        ] {
+            assert_eq!(
+                <Dialect as ToolDialect>::starts_call(text),
+                expected,
+                "{text}"
+            );
+        }
+
+        for prose in [
+            "<function=>",
+            "<function=weather extra>",
+            "<function=weather> <parameter name=q>",
+            "<function=weather> <parameterized>",
+            "<function=weather> <3",
+            "<tool_call><3",
+        ] {
+            let mut parser = ChatMlOutput::new(OutputConfig {
+                start: crate::output::tagged::OutputStart::Content,
+                ..config()
+            });
+            let mut events = parser.push(Input::Text(prose)).unwrap();
+            events.extend(parser.finish(Termination::OutputLimit).unwrap());
+            assert_eq!(events, [crate::output::Event::Content(prose.into())]);
+        }
+
+        for partial in [
+            "<function=lookup>",
+            "<tool_call>",
+            "<function=lookup><param",
+            "<function=lookup><parameter=q",
+            "<function=lookup><parameter=bad literally.",
+            "<function=lookup><parameter=city>Paris",
+        ] {
+            let make = || {
+                ChatMlOutput::new(OutputConfig {
+                    start: crate::output::tagged::OutputStart::Content,
+                    ..config()
+                })
+            };
+            let mut parser = make();
+            assert!(parser.push(Input::Text(partial)).unwrap().is_empty());
+            assert!(parser.finish(Termination::OutputLimit).unwrap().is_empty());
+
+            let mut parser = make();
+            assert!(parser.push(Input::Text(partial)).unwrap().is_empty());
+            assert!(parser.finish(Termination::Eos).is_err());
         }
     }
     #[test]

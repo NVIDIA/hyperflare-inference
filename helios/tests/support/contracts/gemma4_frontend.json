@@ -1,0 +1,39 @@
+{
+ "tools": {
+  "kind": 6,
+  "wrapping_newlines": 0,
+  "tag_separator": ""
+ },
+ "reasoning": {
+  "kind": 4,
+  "open": "<|channel>thought",
+  "close": "<channel|>",
+  "wrapping_newlines": 1,
+  "terminal_markers": [
+   "<|tool_call>"
+  ]
+ },
+ "image_preparation": null,
+ "image_layout": null,
+ "position_dimensions": 0,
+ "rejected_tokens": [],
+ "assistant_marker": "<|turn>model\n",
+ "message_end_markers": [
+  "<turn|>",
+  "<|tool_response>",
+  "<eos>"
+ ],
+ "prefix_boundary": {
+  "roles": [
+   "system",
+   "developer"
+  ],
+  "append_role": "user",
+  "continue_final_message": true,
+  "minimum_messages": 0,
+  "required_start": "<bos><|turn>system\n",
+  "required_end": "",
+  "required_marker": "<turn|>"
+ },
+ "image_tokens": null
+}

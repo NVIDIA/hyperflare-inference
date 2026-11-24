@@ -17,7 +17,7 @@ from pathlib import Path
 from ignition.errors import CapacityError, UsageError
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.preparation.selection import BenchmarkSelection
-from ignition.recipes.declaration import Checkpoint, Recipe, Speculation
+from ignition.declaration import Checkpoint, Recipe, Speculation
 
 # Free memory kept after the final KV allocation during preparation. Headroom
 # covers the transient working memory of compiled warm-up and graph capture,
@@ -175,6 +175,8 @@ class Plan:
     graph_bytes: int
     # Ranks shard each page's context when the recipe declares context-parallel page costs.
     context_parallel: bool = True
+    # TP16 Kimi may use one DCP16 group or two independent DCP8 context/head groups.
+    context_parallel_size: int | None = None
     # Captured graphs run independent branches on an auxiliary stream when the recipe declares
     # stream overlap; otherwise every branch runs serially on the main stream.
     stream_overlap: bool = True
@@ -196,6 +198,7 @@ class Plan:
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
+    # Image request slots. Zero prepares no vision encoder, image graphs, or image storage.
     image_concurrency: int = 0
     # The recipe's eligible BF16 projections load as MXFP8 when the plan asks for it.
     online_mxfp8: bool = False
@@ -205,6 +208,16 @@ class Plan:
     benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
+        if self.context_parallel_size is not None:
+            if (type(self.context_parallel_size) is not int or not 1 <= self.context_parallel_size <= self.world_size
+                    or self.world_size % self.context_parallel_size):
+                raise UsageError("context parallel size must divide the selected tensor parallel size")
+            if (self.context_parallel_size != self.world_size
+                    and (self.world_size, self.context_parallel_size) not in self.recipe.hybrid_context_parallel):
+                raise UsageError(
+                    f"hybrid context parallelism is not supported for {self.checkpoint.alias} "
+                    f"at TP{self.world_size} DCP{self.context_parallel_size}"
+                )
         if self.online_mxfp8_scope is None:
             object.__setattr__(self, "online_mxfp8_scope",
                                self.recipe.online_mxfp8_scope if self.online_mxfp8 else "all")
@@ -216,10 +229,12 @@ class Plan:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
                 raise UsageError("benchmark selection requires explicit complete-round geometry")
-            if (self.recipe.name, self.world_size) not in (("qwen38_dense", 1), ("kimi31", 16), ("nemotron_h", 1)):
-                raise UsageError("benchmark graph preparation requires Qwen3.8-27B or Nemotron Bolt on one GPU, or Kimi K3.1 Pro on sixteen GPUs")
-            if selection.speculation_study and self.recipe.name != "qwen38_dense":
-                raise UsageError("speculation studies require Qwen3.8-27B DFlash2")
+            if self.world_size not in self.recipe.benchmark_world_sizes:
+                raise UsageError(
+                    f"benchmark graph preparation is not supported for {self.checkpoint.alias} on {self.world_size} GPUs"
+                )
+            if selection.speculation_study and not self.recipe.speculation_study:
+                raise UsageError(f"speculation studies require a recipe that declares speculation_study ({self.checkpoint.alias} does not)")
             required_widths = (8,) if selection.speculation_study else selection.selected_verification_widths
             if not selection.prefill_chunk and (self.speculation is None
                     or not set(required_widths) <= set(self.speculation.widths)):
@@ -248,22 +263,23 @@ class Plan:
                     tuple(gpu.capability) != tuple(ladder["compute_capability"]) for gpu in self.gpus):
                 raise UsageError("collective ladder does not match selected TP size or GPU compute capability")
         if self.force_moe_decode_a16:
-            if self.recipe.name != "qwen38":
-                raise UsageError("--force-moe-decode-a16 requires Qwen3.8 Flash NVFP4")
+            intermediate = self.recipe.moe_decode_a16_intermediate_width
+            if intermediate is None:
+                raise UsageError(f"--force-moe-decode-a16 is not supported by {self.checkpoint.alias}")
             if any(gpu.capability not in ((12, 0), (12, 1)) for gpu in self.gpus):
                 raise UsageError("--force-moe-decode-a16 requires SM120/121 packed NVFP4 experts")
-            if (640 // self.world_size) % 64:
+            if (intermediate // self.world_size) % 64:
                 raise UsageError("--force-moe-decode-a16 requires rank-local expert intermediate width divisible by 64")
             if self.mixed_prefill:
                 raise UsageError("--force-moe-decode-a16 cannot accompany --mixed-prefill: combined rows share one expert precision")
         if self.shard_hyperconnections:
-            if self.recipe.name != "qwen38":
-                raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
+            if not self.recipe.shard_hyperconnections:
+                raise UsageError(f"--shard-hyperconnections is not supported by {self.checkpoint.alias}")
             if self.world_size < 2:
                 raise UsageError("--shard-hyperconnections requires tensor parallelism")
         if self.joint_tuning:
-            if self.recipe.name != "deepseek41":
-                raise UsageError("--joint-tuning requires DeepSeek V4.1")
+            if not self.recipe.joint_tuning:
+                raise UsageError(f"--joint-tuning is not supported by {self.checkpoint.alias}")
             if self.autotune_effort == "off":
                 raise UsageError("--joint-tuning requires --autotune-effort default or audit")
 
@@ -284,7 +300,8 @@ class Plan:
 
     @property
     def costs(self):
-        return self.recipe.costs(self.world_size, self.speculation, self.checkpoint)
+        return self.recipe.costs(self.world_size, self.speculation, self.checkpoint).with_image_slots(
+            self.image_concurrency)
 
     @property
     def live_rows(self) -> int:
@@ -304,7 +321,9 @@ class Plan:
 
     @property
     def page_tokens(self) -> int:
-        return (self.costs.page_tokens if self.context_parallel else None) or self.recipe.page_tokens
+        if not self.context_parallel or self.costs.page_tokens is None:
+            return self.recipe.page_tokens
+        return self.recipe.page_tokens * (self.context_parallel_size or self.world_size)
 
     @property
     def minimum_pages(self) -> int:
@@ -364,7 +383,9 @@ class Plan:
                       "total_bytes": gpu.total_bytes} for gpu in self.gpus],
             "tensor_parallel": self.world_size, "max_concurrency": self.concurrency,
             "image_concurrency": self.image_concurrency,
-            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "roce_chain": self.roce_chain, "context_parallel": self.context_parallel,
+            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "roce_chain": self.roce_chain,
+            "context_parallel": self.context_parallel,
+            "context_parallel_size": self.context_parallel_size or self.world_size,
             "stream_overlap": self.stream_overlap,
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
@@ -389,6 +410,8 @@ class Plan:
                 "packed_verification": self.speculation.packed_verification,
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,
                 "draft_head_quantization": self.speculation.draft_head_quantization,
+                **({} if self.speculation.draft_body_quantization is None else {
+                    "draft_body_quantization": self.speculation.draft_body_quantization}),
                 "markov_head_quantization": self.speculation.markov_head_quantization,
                 "vocabulary_parallel_sampling": self.speculation.vocabulary_parallel_sampling,
                 **({"graph_budget": self.speculation.graph_budget}
@@ -411,7 +434,7 @@ class Plan:
 
 def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concurrency: int, reserve_bytes: int,
         speculation: Speculation | None, prefill_chunk: int | None = None,
-        context_parallel: bool = True, stream_overlap: bool = True, cache_states: int | None = None,
+        context_parallel: bool = True, context_parallel_size: int | None = None, stream_overlap: bool = True, cache_states: int | None = None,
         mixed_prefill: bool = False, prompt_logprobs: bool = False,
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
@@ -436,8 +459,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         if (speculation.method is not None and speculation.method != default_method
                 and speculation.method not in recipe.speculative_methods):
             raise UsageError(f"--speculative-method {speculation.method}: {checkpoint.alias} does not prepare this proposal method")
-        if speculation.vocabulary_parallel_sampling and recipe.name != "deepseek41":
-            raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
+        if speculation.vocabulary_parallel_sampling and not recipe.vocabulary_parallel_world_sizes:
+            raise UsageError(f"--vocabulary-parallel-sampling is not supported by {checkpoint.alias}")
         sampling = recipe.sampling_defaults
         # Vocabulary-parallel distributions invalidate rows whose requests filter tokens.
         if speculation.vocabulary_parallel_sampling and (
@@ -445,13 +468,22 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 or {"top_p", "top_k", "min_p"} & sampling.ranges.keys()):
             raise UsageError("--vocabulary-parallel-sampling requires a sampling policy without"
                              " top-k, top-p, or min-p filtering")
-        if speculation.vocabulary_parallel_sampling and len(gpus) == 3:
-            raise UsageError("--vocabulary-parallel-sampling has no TP3 gather; select four GPUs")
+        if speculation.vocabulary_parallel_sampling and len(gpus) not in recipe.vocabulary_parallel_world_sizes:
+            allowed = " or ".join(map(str, recipe.vocabulary_parallel_world_sizes))
+            raise UsageError(
+                f"--vocabulary-parallel-sampling has no TP{len(gpus)} gather; select {allowed} GPUs"
+            )
         for head in ("draft", "markov"):
             value = getattr(speculation, f"{head}_head_quantization")
             if value is not None and value not in getattr(recipe, f"{head}_head_quantizations"):
                 raise UsageError(f"--{head}-head-quantization {value}: {checkpoint.alias}"
                                  " does not prepare this proposal head format")
+        body = speculation.draft_body_quantization
+        if body is not None and body not in recipe.draft_body_quantizations:
+            raise UsageError(f"--draft-body-quantization {body}: {checkpoint.alias}"
+                             " does not prepare this draft body format")
+        if body is not None and speculation.method != "dflash2":
+            raise UsageError("--draft-body-quantization requires --speculative-method dflash2")
     if expert_scale_compression is not None and expert_scale_compression not in checkpoint.scale_compressed_device_bytes:
         raise UsageError(f"--expert-scale-compression {expert_scale_compression}: {checkpoint.alias}"
                          " does not prepare this scale encoding")
@@ -467,17 +499,26 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                                       speculation.token_capacity, speculation.graph_budget)
         except ValueError as error:
             raise UsageError(f"--speculative-graph-budget: {error}") from error
+    # Language-only plans prepare no vision encoder, so no image feature slots.
+    images = (0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
+              if image_concurrency is None else image_concurrency)
     costs = recipe.costs(len(gpus), speculation, checkpoint)
+    graph_credit = recipe.hybrid_context_parallel_graph_credits.get((len(gpus), context_parallel_size))
+    if graph_credit is not None:
+        max_bytes, max_pages = graph_credit
+        credit = min(max_bytes, max_pages * costs.page_bytes)
+        costs = replace(costs, graph_bytes=costs.graph_bytes - credit)
+    # A plan with image slots uses the recipe's image continuation row and vision storage.
+    costs = costs.with_image_slots(images)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
                 recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
+                context_parallel_size=context_parallel_size,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 mla_compute_mode=mla_compute_mode,
-                # Language-only plans prepare no vision encoder, so no image feature slots.
-                image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
-                    if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
+                image_concurrency=images, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -528,7 +569,8 @@ def host_shape_error(roce_ring: bool, roce_chain: bool, hosts: int | None) -> st
 
 def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selected: tuple[int, ...] | None,
          concurrency: int, reserve_bytes: int, speculation: Speculation | None,
-         prefill_chunk: int | None = None, context_parallel: bool = True, stream_overlap: bool = True,
+         prefill_chunk: int | None = None, context_parallel: bool = True, context_parallel_size: int | None = None,
+         stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
@@ -565,11 +607,11 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if chunk % 64 or not 64 <= chunk <= recipe.context:
         raise UsageError(f"--prefill-chunk-size for {checkpoint.alias} must be a multiple of 64"
                          f" from 64 through {recipe.context:,}")
-    world_sizes = recipe.tensor_parallel
+    world_sizes = recipe.checkpoint_tensor_parallel(checkpoint)
     if speculation is not None and speculation.vocabulary_parallel_sampling:
-        if recipe.name != "deepseek41":
-            raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
-        world_sizes = tuple(size for size in world_sizes if size != 3)
+        if not recipe.vocabulary_parallel_world_sizes:
+            raise UsageError(f"--vocabulary-parallel-sampling is not supported by {checkpoint.alias}")
+        world_sizes = tuple(size for size in world_sizes if size in recipe.vocabulary_parallel_world_sizes)
     sizes = " or ".join(map(str, world_sizes))
     supported = [gpu for gpu in gpus if gpu.supported]
     chosen = None
@@ -578,8 +620,12 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
             raise UsageError(f"--gpus {format_gpus(selected)} names a GPU this host does not have;"
                              f" it has {len(gpus)}")
         chosen = tuple(gpus[index] for index in selected)
-        if speculation is not None and speculation.vocabulary_parallel_sampling and len(chosen) == 3:
-            raise UsageError("--vocabulary-parallel-sampling has no TP3 gather; select four GPUs")
+        if (speculation is not None and speculation.vocabulary_parallel_sampling
+                and len(chosen) not in recipe.vocabulary_parallel_world_sizes):
+            allowed = " or ".join(map(str, recipe.vocabulary_parallel_world_sizes))
+            raise UsageError(
+                f"--vocabulary-parallel-sampling has no TP{len(chosen)} gather; select {allowed} GPUs"
+            )
         if len(chosen) not in world_sizes:
             size = min(world_sizes, key=lambda size: (size < len(chosen), size))
             first = max(0, min(selected[0], len(gpus) - size))
@@ -591,13 +637,16 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     elif len(supported) < world_sizes[0]:
         raise CapacityError(f"{checkpoint.alias} needs {sizes} {SUPPORTED_ARCHITECTURES} GPUs; this host has {len(supported)}")
 
-    def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation):
+    def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation,
+               language_model_only=language_model_only, image_concurrency=image_concurrency):
         return fit(recipe, checkpoint, group, concurrency=concurrency, reserve_bytes=reserve_bytes,
                    speculation=speculation, prefill_chunk=chunk, context_parallel=context_parallel,
+                   context_parallel_size=context_parallel_size,
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
-                   image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
+                   image_concurrency=(None if language_model_only
+                                      else (None if image_concurrency is None else min(image_concurrency, concurrency))),
                    online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 
@@ -636,8 +685,16 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         if attempt(concurrency=limit) is not None:
             options.append(f"--max-concurrency {limit}")
             break
+    if image_concurrency is not None:
+        for slots in range(min(image_concurrency, concurrency) - 1, 0, -1):
+            if attempt(image_concurrency=slots) is not None:
+                options.append(f"--image-concurrency {slots}")
+                break
     if speculation is not None and attempt(speculation=None) is not None:
         options.append("--no-mtp")
+    if (not language_model_only and recipe.language_model_only and image_concurrency is None
+            and attempt(language_model_only=True) is not None):
+        options.append("--language-model-only")
     if chosen is not None:
         for size in world_sizes:
             if len(chosen) < size <= len(supported) and (larger := automatic(size)).fits:

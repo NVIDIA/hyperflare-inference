@@ -112,6 +112,14 @@ fn expressions_and_python_methods_match_minijinja() {
         "d|dictsort",
         "d|dictsort(case_sensitive=true)",
         "d|dictsort(by='value',reverse=true)",
+        "['a', 'A', 'b', 'a']|unique|list",
+        "['a', 'A', 'b', 'a']|unique(case_sensitive=true)|list",
+        "['a', 'A', 'b', 'a']|unique(case_sensitive=true)|list|length",
+        "[3, 1, 3, 2, 1]|unique|list",
+        "[1, 1]|unique(true)|list",
+        "[{'id':'a'}, {'id':'A'}, {'id':'b'}]|unique(attribute='id')|list",
+        "['b', 'B', 'a', 'A']|sort(case_sensitive=true)",
+        "[{'id':'a'}, {'id':'A'}]|sort(attribute='id',case_sensitive=true)",
         "'a' \"b\" 'c'|upper",
         "['a' 'b', 'c']",
     ] {
@@ -166,6 +174,7 @@ fn marks_are_zero_output_and_cannot_escape_captures() {
         template.render(&Map::new(), &[]).unwrap(),
         RenderedTemplate {
             text: "éa👋".into(),
+            ordinary: vec![],
             marks: vec![
                 Mark::Byte(2),
                 Mark::Byte(3),
@@ -258,7 +267,7 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
         ),
         (
             "kimi",
-            include_str!("../../../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+            include_str!("../../../tests/fixtures/templates/kimi3/chat_template.jinja"),
         ),
         (
             "gemma",
@@ -405,6 +414,63 @@ fn block_hints_preserve_byte_offsets_through_captures_trim_and_concatenation() {
 }
 
 #[test]
+fn checkpoint_hints_are_dropped_by_operations_that_return_part_of_a_string() {
+    let hints = |content: &str, expression: &str| {
+        let context = json!({"messages":[{"content":content}]});
+        CompiledTemplate::compile(&format!("{{{{ {expression} }}}}"))
+            .unwrap()
+            .render(context.as_object().unwrap(), &[(0, 1)])
+            .unwrap()
+            .marks
+            .iter()
+            .filter(|mark| matches!(mark, Mark::Hint(_)))
+            .count()
+    };
+    for (expression, expected) in [
+        ("messages[0].content", 1),
+        ("messages[0].content|trim", 1),
+        ("messages[0].content.split('</think>')[0]", 0),
+        ("messages[0].content.split('</think>')[-1]", 0),
+        ("messages[0].content.rsplit('</think>', 1)[1]", 0),
+        ("messages[0].content.split()[0]", 0),
+        ("messages[0].content.strip()", 0),
+        ("messages[0].content.lstrip()", 0),
+        ("messages[0].content.rstrip()", 0),
+        ("messages[0].content[0]", 0),
+        ("messages[0].content[2:]", 0),
+        ("messages[0].content|list|join", 0),
+        ("[messages[0].content]|join(',')", 0),
+    ] {
+        let content = "reasoning</think>\n answer \n";
+        assert_eq!(hints(content, expression), expected, "{expression}");
+    }
+    // A result that is the whole message string is not the hinted string.
+    for expression in ["strip()", "split()[0]", "split(',')[0]", "[0]", "[0:]"] {
+        let expression = format!("messages[0].content.{expression}").replace(".[", "[");
+        assert_eq!(hints("a", &expression), 0, "{expression}");
+    }
+}
+
+#[test]
+fn recipe_defaults_are_controls_and_request_values_are_ordinary() {
+    let context = json!({
+        "bos_token": "<s>",
+        "extras": ["<a>", {"key": "<b>"}],
+        "overridden": "<c>",
+        "messages": [{"content": "<d>"}],
+    });
+    let rendered = CompiledTemplate::compile(
+        "{{ bos_token }}{{ extras[0] }}{% for key, text in extras[1].items() %}{{ text }}{% endfor %}\
+         {{ overridden }}{{ messages[0].content }}",
+    )
+    .unwrap()
+    .render_with_defaults(context.as_object().unwrap(), &[], &["bos_token", "extras"])
+    .unwrap();
+    assert_eq!(rendered.text, "<s><a><b><c><d>");
+    assert_eq!(rendered.ordinary, [9..15]);
+}
+
+#[test]
 fn qwen_content_macro_keeps_hints_only_when_its_result_is_emitted() {
     let context = json!({"messages":[{"role":"user","content":[
         {"type":"text","text":"  Earlier history.\n"},
@@ -475,4 +541,303 @@ fn json_object_members_preserves_literals_order_and_duplicate_keys() {
         assert!(template.render(context.as_object().unwrap(), &[]).is_err(), "{source}");
     }
     assert!(CompiledTemplate::compile("{{ json_object_members([]) }}").unwrap().render(&Map::new(), &[]).is_err());
+}
+
+/// Every occurrence of `marker` in the rendered text must lie in request text.
+fn assert_ordinary(rendered: &RenderedTemplate, marker: &str, label: impl std::fmt::Display) {
+    for (start, _) in rendered.text.match_indices(marker) {
+        assert!(
+            rendered.ordinary.iter().any(|r| start < r.end && start + marker.len() > r.start),
+            "{label}, byte={start}: {:?}",
+            &rendered.text[start.saturating_sub(30)..start + marker.len()]
+        );
+    }
+}
+
+#[test]
+fn request_keys_and_builtin_results_keep_provenance() {
+    let marker = "<|image|>";
+    let context = json!({"key":marker,"object":{marker:"x"},"text":"{\"<|image|>\": {\"<|image|>\": \"x\"}}"});
+    for expression in [
+        "(object|items)[0][0]",
+        "(object|dictsort)[0][0]",
+        "object.keys()[0]",
+        "object.items()[0][0]",
+        "(text|fromjson|items)[0][0]",
+        "((text|fromjson)[key]|items)[0][0]",
+        "{object: 1}",
+        "{object: 1}|tojson",
+        "({object: 1}|items|first)[0]",
+        "{[key]: 1}",
+        "{key: none}|items",
+        "{key: none}|list",
+        "{key: none}|tojson",
+        "namespace(object)",
+        "[key, '<|image|>']|trim",
+        "[key, '<|image|>']|string",
+        "json_object_members(text)",
+    ] {
+        let rendered = CompiledTemplate::compile(&format!("{{{{ {expression} }}}}"))
+            .unwrap()
+            .render(context.as_object().unwrap(), &[])
+            .unwrap();
+        assert!(rendered.text.contains(marker), "{expression}");
+        assert_ordinary(&rendered, marker, expression);
+    }
+}
+
+#[test]
+fn sliced_request_text_coalesces_ordinary_ranges() {
+    let context = json!({"body":"x".repeat(1000)});
+    let rendered = CompiledTemplate::compile("{{ body[:0] }}{{ body[1:] }}")
+        .unwrap().render(context.as_object().unwrap(), &[]).unwrap();
+    assert_eq!(rendered.ordinary, vec![0..999]);
+}
+
+/// Runs filters, methods and builtin functions over operands that mix template text
+/// (`<control>`) with request text (`<|image|>`). The first run takes the request text from the
+/// context; the second spells the same bytes as a template literal.
+///
+/// An exact builtin returns its operands' own characters: request characters stay ordinary and
+/// template characters do not. Any other builtin marks its whole result ordinary. With
+/// template text alone, nothing is ordinary in either case.
+#[test]
+fn builtins_keep_provenance_over_mixed_operands() {
+    let context = json!({"r": "<|image|>"});
+    // Each expression names its operands `{m}` (a string), `{l}` (a list) and `{d}` (a mapping),
+    // which mix `<control>` text with the request text `{r}`.
+    let expand = |expression: &str, request: &str| {
+        expression
+            .replace("{m}", "('<control>' + {r} + '</control>')")
+            .replace("{l}", "['<control>', {r}, '</control>']")
+            .replace("{d}", "{'<control>': {r}}")
+            .replace("{r}", request)
+    };
+    let render = |expression: &str, request: &str| {
+        CompiledTemplate::compile(&format!("{{{{ {} }}}}", expand(expression, request)))
+            .unwrap_or_else(|error| panic!("{expression}: {error}"))
+            .render(context.as_object().unwrap(), &[])
+            .unwrap_or_else(|error| panic!("{expression}: {error}"))
+    };
+    let overlaps = |rendered: &RenderedTemplate, at: usize, length: usize| {
+        rendered.ordinary.iter().any(|r| at < r.end && at + length > r.start)
+    };
+    // (expression, whether the result still holds the template's `<control>`)
+    let exact = [
+        ("{m}|safe", true),
+        ("{m}|trim", true),
+        ("{m}|string", true),
+        ("{m}|default('unused')", true),
+        ("{m}|d('unused')", true),
+        ("{l}|join", true),
+        ("{l}|join(',')", true),
+        ("{l}|list|join", true),
+        ("{l}|sort|join", true),
+        ("{l}|unique|join", true),
+        ("([{r}, '<control>']|last) + ([{r}, '<control>']|first)", true),
+        ("{d}|items|first|join", true),
+        ("{d}|dictsort|first|join", true),
+        ("({m}).strip()", true),
+        ("({m}).lstrip()", true),
+        ("({m}).rstrip()", true),
+        ("({m}).split('!')|join", true),
+        ("({m}).rsplit('!', 1)|join", true),
+        ("({m}).split('<control>')|join", false),
+        ("({d}).get('<control>')", false),
+        ("(({d}).keys()|first) + (({d}).values()|first)", true),
+        ("({d}).items()|first|join", true),
+        ("dict(a={m}).a", true),
+        ("namespace(a={m}).a", true),
+    ];
+    for (expression, control) in exact {
+        let rendered = render(expression, "r");
+        assert!(rendered.text.contains("<|image|>"), "{expression}: {rendered:?}");
+        assert_eq!(rendered.text.contains("<control>"), control, "{expression}: {rendered:?}");
+        for (at, _) in rendered.text.match_indices("<control>") {
+            assert!(!overlaps(&rendered, at, "<control>".len()), "{expression}: {rendered:?}");
+        }
+        for (at, _) in rendered.text.match_indices("<|image|>") {
+            assert!(overlaps(&rendered, at, "<|image|>".len()), "{expression}: {rendered:?}");
+        }
+        let literal = render(expression, "'<|image|>'");
+        assert_eq!(literal.text, rendered.text, "{expression}");
+        assert!(literal.ordinary.is_empty(), "{expression}: {literal:?}");
+    }
+    let whole = [
+        "{m}|upper",
+        "{m}|lower",
+        "{m}|capitalize",
+        "{m}|replace('x', 'y')",
+        "({m}).upper()",
+        "({m}).lower()",
+        "({m}).capitalize()",
+        "({m}).replace('x', 'y')",
+        "{l}|string",
+        "{l}|tojson",
+        "{m}|tojson",
+        "{d}|tojson",
+        "('\"' + {r} + '\"')|fromjson",
+        "json_object_members('{\"k\": \"' + {r} + '\"}')|first|join",
+    ];
+    for expression in whole {
+        let rendered = render(expression, "r");
+        let mut covered = vec![false; rendered.text.len()];
+        for range in &rendered.ordinary {
+            covered[range.clone()].fill(true);
+        }
+        assert!(!covered.is_empty() && covered.iter().all(|byte| *byte), "{expression}: {rendered:?}");
+        let literal = render(expression, "'<|image|>'");
+        assert_eq!(literal.text, rendered.text, "{expression}");
+        assert!(literal.ordinary.is_empty(), "{expression}: {literal:?}");
+    }
+}
+
+#[test]
+fn exact_string_operations_preserve_template_controls() {
+    let context = json!({"body":"  é<|image|>  "});
+    for expression in [
+        "['<control>', body|trim, '</control>']|join",
+        "['<control>', body|trim, '<control>', '</control>']|unique|join",
+        "['<control>', body|trim, '</control>']|sort|join",
+        "('<control>' + body + '</control>').strip()",
+        "('<control>' + body + '</control>').split('!')[0]",
+        "('<control>' + body + '</control>')[:]",
+        "dict(body=body, control='<control>').get('control') + body",
+    ] {
+        let rendered = CompiledTemplate::compile(&format!("{{{{ {expression} }}}}"))
+            .unwrap()
+            .render(context.as_object().unwrap(), &[])
+            .unwrap();
+        let marker = rendered.text.find("<|image|>").unwrap();
+        assert!(
+            rendered.ordinary.iter().any(|r| r.contains(&marker)),
+            "{expression}"
+        );
+        assert!(
+            !rendered
+                .ordinary
+                .iter()
+                .any(|r| r.start < "<control>".len()),
+            "{expression}: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn prepared_templates_mark_request_strings_and_object_keys_ordinary() {
+    let marker = "<|image|>";
+    fn mutations(value: &Json, marker: &str) -> Vec<Json> {
+        let mut cases = Vec::new();
+        match value {
+            Json::String(_) => cases.push(json!(marker)),
+            Json::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    for replacement in mutations(value, marker) {
+                        let mut copy = values.clone();
+                        copy[index] = replacement;
+                        cases.push(Json::Array(copy));
+                    }
+                }
+            }
+            Json::Object(values) => {
+                for (key, value) in values {
+                    let mut copy = values.clone();
+                    copy.remove(key);
+                    copy.insert(marker.into(), value.clone());
+                    cases.push(Json::Object(copy));
+                    for replacement in mutations(value, marker) {
+                        let mut copy = values.clone();
+                        copy.insert(key.clone(), replacement);
+                        cases.push(Json::Object(copy));
+                    }
+                }
+            }
+            _ => {}
+        }
+        cases
+    }
+    for (recipe, name, _) in PREPARED_TEMPLATES {
+        let compiled =
+            CompiledTemplate::compile(&crate::template_fixtures::template(recipe, name)).unwrap();
+        for serialized in [false, true] {
+            if serialized && !matches!(recipe, "step5" | "mimo_v2") {
+                continue;
+            }
+            let context = prepared_context(marker, serialized);
+            // Mutate structural fields too: invalid requests may fail template validation.
+            for mutated in mutations(&context, marker) {
+                if let Ok(rendered) = compiled.render(mutated.as_object().unwrap(), &[]) {
+                    assert_ordinary(&rendered, marker, format!("{recipe}/{name}, context={mutated}"));
+                }
+            }
+            let rendered = compiled.render(context.as_object().unwrap(), &[]).unwrap();
+            assert_ordinary(&rendered, marker, format!("{recipe}/{name}, serialized={serialized}"));
+            let count = rendered.text.matches(marker).count();
+            assert!(count >= 5, "{recipe}/{name}: only {count} markers emitted");
+        }
+    }
+}
+
+/// Request text that spells no control leaves every control the template writes outside the
+/// ordinary ranges, so an ordinary request tokenizes as it does without provenance. A builtin that
+/// mixes template controls with request text and marks the whole result ordinary fails here.
+#[test]
+fn prepared_templates_keep_their_own_controls_for_ordinary_requests() {
+    for (recipe, name, controls) in PREPARED_TEMPLATES {
+        let compiled =
+            CompiledTemplate::compile(&crate::template_fixtures::template(recipe, name)).unwrap();
+        for serialized in [false, true] {
+            if serialized && !matches!(recipe, "step5" | "mimo_v2") {
+                continue;
+            }
+            let context = prepared_context("plain", serialized);
+            let rendered = compiled.render(context.as_object().unwrap(), &[]).unwrap();
+            assert!(!rendered.ordinary.is_empty(), "{recipe}/{name}: no request text recorded");
+            let mut written = 0;
+            for control in controls {
+                for (at, _) in rendered.text.match_indices(control) {
+                    written += 1;
+                    assert!(
+                        !crate::frontend::overlaps_ordinary(&rendered.ordinary, at, at + control.len()),
+                        "{recipe}/{name}: {control} at {at} is ordinary in {rendered:?}"
+                    );
+                }
+            }
+            assert!(written >= 4, "{recipe}/{name}: only {written} controls written");
+        }
+    }
+}
+
+/// Prepared templates, with the control spellings each one writes for the roles, reasoning and
+/// tool calls of `prepared_context` (the markers of the recipe contracts, and the other added
+/// tokens the template emits).
+const PREPARED_TEMPLATES: [(&str, &str, &[&str]); 9] = [
+    ("glm53", "chat_template", &["<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
+    ("qwen38", "chat_template", &["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
+    ("step5", "chat_template", &["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
+    ("mimo_v2", "chat_template", &["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
+    ("mimo_v2", "chat_template.flash-rl", &["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
+    ("minimax_m3", "chat_template", &["]~b]", "]~!b[", "[e~[", "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>"]),
+    ("nemotron_h", "chat_template", &["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
+    ("gemma4", "chat_template.google", &["<|turn>", "<turn|>", "<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>"]),
+    ("gemma4", "chat_template.google-e2b-e4b", &["<|turn>", "<turn|>", "<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>"]),
+];
+
+/// A conversation, tools and documents in which every request string is `marker`.
+fn prepared_context(marker: &str, serialized: bool) -> Json {
+    let tools = json!([{"type":"function","function":{"name":marker,"description":marker,
+        "parameters":{"type":"object","properties":{marker:{"type":"string","description":marker,"enum":[marker]}},"required":[marker]}}}]);
+    let mut arguments = json!({marker:marker,"nested":{marker:null}});
+    if serialized {
+        arguments = Json::String(arguments.to_string());
+    }
+    json!({"messages":[
+        {"role":"system","content":marker},
+        {"role":"user","content":marker},
+        {"role":"assistant","content":marker,"reasoning_content":marker,"tool_calls":[
+            {"id":marker,"type":"function","function":{"name":marker,"arguments":arguments}}]},
+        {"role":"tool","tool_call_id":marker,"name":marker,"content":marker},
+        {"role":"user","content":[{"type":"text","text":marker}]}],
+        "tools":tools,"documents":[{"title":marker,"text":marker}],
+        "bos_token":"<s>","eos_token":"</s>","add_generation_prompt":true,"preserve_thinking":true})
 }

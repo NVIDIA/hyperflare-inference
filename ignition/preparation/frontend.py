@@ -6,6 +6,7 @@
 
 import json
 import hashlib
+import math
 from enum import IntEnum
 from pathlib import Path
 
@@ -14,6 +15,7 @@ class PromptEncoder(IntEnum):
     PROMPT_JINJA = 0
     DEEPSEEK_V4 = 1
     DEEPSEEK_V41 = 2
+    TML_V0 = 3
 
 
 TOKEN_FIELDS = ("bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token")
@@ -22,8 +24,10 @@ TOKEN_FIELDS = ("bos_token", "eos_token", "unk_token", "sep_token", "pad_token",
 def annotated_template_asset(source: bytes, patch_path: Path):
     """Insert message marks into exact checkpoint bytes, without bundling that source."""
     patch = json.loads(patch_path.read_text())
-    if hashlib.sha256(source).hexdigest() != patch["source_sha256"]:
-        raise ValueError(f"checkpoint chat template does not match {patch_path}")
+    digest = hashlib.sha256(source).hexdigest()
+    if digest != patch["source_sha256"]:
+        raise ValueError(f"checkpoint chat template does not match {patch_path}: its SHA-256 is {digest},"
+                         f" and the patch applies to {patch['source_sha256']}")
     parts, previous = [], 0
     for offset in patch["insertions"]:
         if type(offset) is not int or not previous <= offset <= len(source):
@@ -40,9 +44,19 @@ def downloaded_template_asset(patch_path: Path, *, cache_dir=None):
     """Fetch a canonical template at its pinned HF revision, then annotate it."""
     from huggingface_hub import hf_hub_download
 
+    from ignition.errors import FetchError
+
     source = json.loads(patch_path.read_text())["source"]
-    path = hf_hub_download(source["repository"], source["filename"],
-                           revision=source["revision"], cache_dir=cache_dir)
+    try:
+        path = hf_hub_download(source["repository"], source["filename"],
+                               revision=source["revision"], cache_dir=cache_dir)
+    except Exception as error:  # noqa: BLE001 - Network, authorization, and disk failures share one exit code.
+        raise FetchError(
+            f"cannot read {source['filename']} of {source['repository']} at revision {source['revision']}: {error}."
+            f" This chat template is not part of the checkpoint snapshot, so preparation needs it in the hub cache."
+            f" On a host without network access, run `hf download {source['repository']} {source['filename']}"
+            f" --revision {source['revision']} --cache-dir <hub cache>` on a connected host and copy the"
+            f" downloaded cache entries to the hub cache of this host.") from error
     return annotated_template_asset(Path(path).read_bytes(), patch_path)
 
 
@@ -75,7 +89,27 @@ def _expected(config, values, label):
             raise ValueError(f"unsupported {label} {key}")
 
 
-def image_settings(config, model, profile):
+def image_settings(config, model, profile, qwen_model_type="qwen4_exp"):
+    """Resolve the image settings the native frontend consumes for ``profile``.
+
+    The Qwen profile serves two checkpoint families with one processor; ``qwen_model_type``
+    is the ``model_type`` the preparing recipe requires of its checkpoint.
+    """
+    if profile == "padded_grid":
+        # Inkling 2 ships the processor in processor_config.json; `size` is the token cell, not a resize target.
+        _expected(config, {"processor_class": "Inkling2Processor"}, "padded-grid processor")
+        image = config.get("image_processor")
+        expected = {"image_processor_type": "Inkling2ImageProcessor", "size": {"height": 40, "width": 40},
+            "image_mean": [0.5] * 3, "image_std": [0.5] * 3, "rescale_factor": 1 / 255,
+            "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
+        if not isinstance(image, dict) or set(image) != set(expected):
+            raise ValueError("unsupported padded-grid image processor fields")
+        _expected(image, expected, "padded-grid image processor")
+        if model.get("model_type") not in ("inkling2", "inkling2_loop"):
+            raise ValueError("unsupported padded-grid model configuration model_type")
+        _expected(model["vision_config"], {"native_patch_size": 20, "adapter_merge_size": 2,
+            "posemb_grid_size": 32, "temporal_patch_size": 2}, "padded-grid vision configuration")
+        return {"padded_grid": {}}
     if profile == "glm":
         _expected(config, {"processor_class": "Glm5NextProcessor"}, "GLM processor")
         image = config["image_processor"]
@@ -130,16 +164,15 @@ def image_settings(config, model, profile):
     if profile not in ("qwen", "mimo"):
         raise ValueError("unsupported image preprocessing profile")
     qwen = profile == "qwen"
-    mean = [0.5] * 3 if qwen else [0.48145466, 0.4578275, 0.40821073]
-    std = [0.5] * 3 if qwen else [0.26862954, 0.26130258, 0.27577711]
+    if qwen:
+        _expected(config, {"image_mean": [0.5] * 3, "image_std": [0.5] * 3}, "image processor")
     _expected(config, {"processor_class": "Qwen3VLProcessor" if qwen else "Qwen2_5_VLProcessor",
         "image_processor_type": "Qwen2VLImageProcessorFast" if qwen else "Qwen2VLImageProcessor",
-        "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
-        "image_mean": mean, "image_std": std}, "image processor")
+        "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2}, "image processor")
     optional = {"resample": 3, "rescale_factor": 1 / 255,
         "do_resize": True, "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
     _expected(config, {key: value for key, value in optional.items() if key in config}, "image processor")
-    _expected(model, {"model_type": "qwen4_exp" if qwen else "mimo_v2"}, "model configuration")
+    _expected(model, {"model_type": qwen_model_type if qwen else "mimo_v2"}, "model configuration")
     vision = model["vision_config"]
     _expected(vision, {"patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2}, "vision configuration")
     if qwen:
@@ -152,9 +185,21 @@ def image_settings(config, model, profile):
                 raise ValueError(f"invalid model {name}")
             result[name] = value
     else:
-        _expected(config, {"min_pixels": 3136, "max_pixels": 12845056}, "resize area")
+        # MiMo checkpoints publish their own resize area and normalization; the native frontend
+        # consumes the packaged values, so preparation validates their form rather than fixing them.
         _expected(model, {"image_token_id": 151655}, "model configuration")
-        result = dict(min_pixels=3136, max_pixels=12845056, image_mean=mean, image_std=std)
+        result = dict(min_pixels=config.get("min_pixels"), max_pixels=config.get("max_pixels"),
+                      image_mean=config.get("image_mean"), image_std=config.get("image_std"))
+        if (any(type(result[key]) is not int for key in ("min_pixels", "max_pixels"))
+                or not 0 < result["min_pixels"] <= result["max_pixels"]):
+            raise ValueError("unsupported image processor resize area")
+        for key in ("image_mean", "image_std"):
+            values = result[key]
+            if (not isinstance(values, list) or len(values) != 3
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)
+                    or key == "image_std" and any(v <= 0 for v in values)):
+                raise ValueError(f"unsupported image processor {key}")
+            result[key] = [float(v) for v in values]
     return {profile: result}
 
 
@@ -176,7 +221,7 @@ def _native_image_placeholder(snapshot, model, encoder):
 
 
 def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocessor=None,
-                     prompt_encoder=PromptEncoder.PROMPT_JINJA):
+                     prompt_encoder=PromptEncoder.PROMPT_JINJA, qwen_model_type="qwen4_exp"):
     """Resolve checkpoint structure during preparation; sampling is recipe-owned."""
     if not isinstance(prompt_encoder, PromptEncoder):
         raise ValueError("prompt_encoder must be a PromptEncoder")
@@ -201,5 +246,6 @@ def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocesso
                 snapshot, json.loads((snapshot / "config.json").read_text()), prompt_encoder)
         path = snapshot / "preprocessor_config.json" if preprocessor is None else Path(preprocessor)
         result["image"] = image_settings({} if image_profile == "deepseek_row_major" else json.loads(path.read_text()),
-            json.loads((snapshot / "config.json").read_text()), image_profile)
+            json.loads((snapshot / "config.json").read_text()), image_profile,
+            qwen_model_type=qwen_model_type)
     return result

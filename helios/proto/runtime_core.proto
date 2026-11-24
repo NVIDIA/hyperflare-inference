@@ -116,6 +116,19 @@ message RebuildManifest {
   bool force_moe_decode_a16 = 27;
   // Preparation-only online conversion group; omitted means all eligible projections.
   string online_mxfp8_scope = 30;
+  // Preparation context group size; zero/absent retains full-TP context sharding when enabled.
+  uint32 context_parallel_size = 31;
+  // Preparation-only prompt-logprob prefill graph capture.
+  bool prompt_logprobs = 32;
+  // Preparation-only kernel search effort: off, default, or audit.
+  string autotune_effort = 33;
+  // Preparation-only quantized dense activations (A8/A4) instead of auto precision.
+  bool native_dense_activations = 34;
+  // Preparation-only GPU clock locking during autotuning.
+  bool lock_gpu_clocks = 35;
+  // Canonical `ignition export` arguments reproducing this deployment's preparation inputs,
+  // without host-local paths or secrets.
+  repeated string reproduction_args = 36;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;
@@ -134,6 +147,8 @@ message RebuildSpeculation {
   string method = 12;
   // Preparation-only omission of ordinary graphs; width-one draft-state rounds remain.
   bool mtp_only = 13;
+  // Preparation-only DFlash2 body conversion; absent retains the target-scope behavior.
+  optional string draft_body_quantization = 14;
 }
 // Views of retained prepared weight storage, with no additional payload copies.
 // Names are paths in the recipe's weight objects, not original checkpoint keys.
@@ -320,7 +335,7 @@ enum GraphOperation {
   reserved 10, 11, 13;
   reserved "PROPOSAL", "VERIFICATION", "PACKED_SPECULATIVE";
   SCORED_PREFILL = 12;
-
+  TERMINAL_PREFILL = 14;
 }
 message TunedBinding { string buffer = 1; string tuning_graph = 2; }
 message GraphContract {
@@ -345,6 +360,7 @@ enum ToolParserKind {
   MINIMAX_XML = 5;
   GEMMA_CALL = 6;
   ATEM = 7;
+  TML_JSON = 8;
 }
 enum ReasoningParserKind {
   REASONING_PARSER_UNSPECIFIED = 0;
@@ -353,6 +369,7 @@ enum ReasoningParserKind {
   MM_THINK = 3;
   CHANNEL_THOUGHT = 4;
   RECIPIENT_HEADERS = 5;
+  CONTENT_HEADERS = 6;
 }
 enum ImagePreparationKind {
   IMAGE_PREPARATION_UNSPECIFIED = 0;
@@ -365,6 +382,7 @@ enum ImagePreparationKind {
   DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION = 7;
   GLM_IMAGE_PREPARATION = 8;
   PATCH_MERGE_IMAGE_PREPARATION = 9;
+  PADDED_GRID_IMAGE_PREPARATION = 10;
 }
 enum ImageLayoutKind {
   IMAGE_LAYOUT_UNSPECIFIED = 0;
@@ -377,6 +395,7 @@ enum ImageLayoutKind {
   DEEPSEEK_ROW_MAJOR_IMAGE_LAYOUT = 7;
   GLM_IMAGE_LAYOUT = 8;
   BRACKETED_IMAGE_LAYOUT = 9;
+  CLASS_TOKEN_IMAGE_LAYOUT = 10;
 }
 message ToolParser {
   ToolParserKind kind = 1;
@@ -469,6 +488,8 @@ enum PromptEncoder {
   PROMPT_JINJA = 0;
   DEEPSEEK_V4 = 1;
   DEEPSEEK_V41 = 2;
+  // TMLv0 message frames: role and content-kind control tokens around ordinary text.
+  TML_V0 = 3;
 }
 enum TemplateEncoding {
   TEMPLATE_TEXT = 0;
@@ -496,6 +517,7 @@ message ImageSettings {
     DeepseekRowMajorImageSettings deepseek_row_major = 7;
     Empty glm = 8;
     PatchMergeImageSettings patch_merge = 9;
+    Empty padded_grid = 10;
   }
 }
 message PatchMergeImageSettings {
@@ -727,6 +749,13 @@ message Execution {
   repeated ExecutionGraph graphs = 5;
   repeated TuningGraph tuning_graphs = 6;
   uint32 completion_token_capacity = 7;
+  // Optional dedicated worker graphs launched once on partitioned CUDA green contexts.
+  repeated PersistentWorker persistent_workers = 8;
+}
+message PersistentWorker {
+  uint32 worker_sm_count = 1;
+  string graph = 2;
+  Reference stop_flag = 3;
 }
 message TuningGraph {
   string name = 1;

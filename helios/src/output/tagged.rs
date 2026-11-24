@@ -36,6 +36,10 @@ pub trait ToolDialect {
     const FUNCTION: Option<(&'static str, &'static str)> = None;
     const TOOL_ENDS_REASONING: bool = false;
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>>;
+    /// `None` means the apparent closing tag is text inside a JSON string.
+    fn parse_candidate(body: &str, tools: &[Value]) -> Result<Option<Vec<(String, String)>>> {
+        Self::parse(body, tools).map(Some)
+    }
     /// Whether text beginning with `OPEN` or the function opener starts a call
     /// rather than mentioning the tag in prose; `None` until more text decides.
     fn starts_call(_text: &str) -> Option<bool> {
@@ -206,6 +210,9 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
 pub struct TaggedTools<D: ToolDialect> {
     dialect: std::marker::PhantomData<D>,
     buffer: String,
+    search_from: usize,
+    in_json_string: bool,
+    escaped: bool,
     tools: Arc<[Value]>,
     index: usize,
 }
@@ -218,22 +225,44 @@ impl<D: ToolDialect> ToolCallParser for TaggedTools<D> {
         if self.buffer.len() > 1024 * 1024 {
             return Err("tool call exceeds the 1 MiB parser bound".into());
         }
-        let mut boundary = self
-            .buffer
-            .find(D::CLOSE)
-            .map(|at| (at, at + D::CLOSE.len()));
-        if let Some((_, close)) = D::FUNCTION {
-            if let Some(at) = self.buffer.find(close) {
-                if boundary.is_none_or(|(end, _)| at < end) {
-                    boundary = Some((at + close.len(), at + close.len()));
+        let calls = loop {
+            if self.in_json_string {
+                while self.search_from < self.buffer.len() {
+                    let b = self.buffer.as_bytes()[self.search_from];
+                    self.search_from += 1;
+                    if self.escaped {
+                        self.escaped = false;
+                    } else if b == b'\\' {
+                        self.escaped = true;
+                    } else if b == b'"' {
+                        self.in_json_string = false;
+                        break;
+                    }
+                }
+                if self.in_json_string {
+                    return Ok(Progress::default());
                 }
             }
-        }
-        let Some((end, consumed)) = boundary else {
-            return Ok(Progress::default());
+            let tail = &self.buffer[self.search_from..];
+            let mut candidate = tail.find(D::CLOSE).map(|at| (at, at + D::CLOSE.len()));
+            if let Some((_, close)) = D::FUNCTION
+                && let Some(at) = tail.find(close)
+                && candidate.is_none_or(|(end, _)| at < end)
+            {
+                candidate = Some((at + close.len(), at + close.len()));
+            }
+            let Some((end, consumed)) = candidate else {
+                return Ok(Progress::default());
+            };
+            let end = self.search_from + end;
+            self.search_from += consumed;
+            if let Some(calls) = D::parse_candidate(&self.buffer[..end], &self.tools)? {
+                self.buffer.drain(..self.search_from);
+                self.search_from = 0;
+                break calls;
+            }
+            self.in_json_string = true;
         };
-        let calls = D::parse(&self.buffer[..end], &self.tools)?;
-        self.buffer.drain(..consumed);
         let events = calls
             .into_iter()
             .enumerate()
@@ -346,7 +375,9 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             reasoning_enabled: true,
             initial_close: false,
             mode: match config.start {
-                OutputStart::Content | OutputStart::RecipientHeader | OutputStart::RecipientFrame => Mode::Content,
+                OutputStart::Content
+                | OutputStart::RecipientHeader
+                | OutputStart::RecipientFrame => Mode::Content,
                 OutputStart::Reasoning => Mode::Reasoning,
                 OutputStart::ToolBody => Mode::Tool,
             },
@@ -374,6 +405,9 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             tool: (config.start == OutputStart::ToolBody).then(|| TaggedTools {
                 dialect: std::marker::PhantomData,
                 buffer: String::new(),
+                search_from: 0,
+                in_json_string: false,
+                escaped: false,
                 tools: definitions,
                 index: 0,
             }),
@@ -687,6 +721,9 @@ impl<D: ToolDialect> TaggedOutput<D> {
                             self.tool = Some(TaggedTools {
                                 dialect: std::marker::PhantomData,
                                 buffer: String::new(),
+                                search_from: 0,
+                                in_json_string: false,
+                                escaped: false,
                                 tools: self.tools.clone(),
                                 index: self.calls,
                             });
@@ -764,6 +801,109 @@ fn partial_marker(text: &str, markers: &[&str]) -> usize {
         .max()
         .unwrap_or(0)
 }
+
+/// Insertion-ordered argument map that preserves raw JSON tokens.
+pub(super) struct RawArguments(Vec<(String, Box<serde_json::value::RawValue>)>);
+
+impl RawArguments {
+    pub(super) fn new() -> Self {
+        Self(Vec::new())
+    }
+    pub(super) fn contains_key(&self, key: &str) -> bool {
+        self.0.iter().any(|(k, _)| k == key)
+    }
+    pub(super) fn insert(&mut self, key: String, value: Box<serde_json::value::RawValue>) {
+        self.0.push((key, value));
+    }
+    pub(super) fn insert_value(&mut self, key: String, value: &Value) -> Result<()> {
+        let raw = serde_json::value::to_raw_value(value).map_err(|error| {
+            crate::FrontendError::Input(crate::Failure::caused_by(error.to_string(), error))
+        })?;
+        self.0.push((key, raw));
+        Ok(())
+    }
+    pub(super) fn to_json_string(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            crate::FrontendError::Input(crate::Failure::caused_by(error.to_string(), error)).into()
+        })
+    }
+}
+
+impl serde::Serialize for RawArguments {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in &self.0 {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+/// Preserve exact raw JSON tokens (such as >64-bit integers) on strict non-string scalars.
+pub(super) fn strict_nonstring_raw(
+    raw: &str,
+    schema: Option<&Value>,
+) -> Option<Box<serde_json::value::RawValue>> {
+    let kinds = schema?.get("type")?;
+    let is_nonstring = kinds.as_str().is_some_and(|t| t != "string")
+        || kinds
+            .as_array()
+            .is_some_and(|a| !a.is_empty() && !a.iter().any(|k| k.as_str() == Some("string")));
+    if !is_nonstring {
+        return None;
+    }
+    serde_json::from_str::<Box<serde_json::value::RawValue>>(raw.trim()).ok()
+}
+
+/// Parse a declared JSON container before interpreting tag text inside it.
+/// Raw strings and malformed non-strict values retain their dialect's fallback.
+pub(super) fn container_parameter<'a>(
+    raw: &'a str,
+    schema: Option<&Value>,
+) -> std::result::Result<Option<(Box<serde_json::value::RawValue>, &'a str)>, InJsonString> {
+    let trimmed = raw.trim_start();
+    let first = trimmed.as_bytes().first().copied();
+    let expected = match first {
+        Some(b'[') => "array",
+        Some(b'{') => "object",
+        _ => return Ok(None),
+    };
+    let kinds = schema.and_then(|s| s.get("type"));
+    if !kinds.is_some_and(|t| {
+        t.as_str() == Some(expected)
+            || t.as_array().is_some_and(|a| {
+                a.iter().any(|k| k.as_str() == Some(expected))
+                    && !a.iter().any(|k| k.as_str() == Some("string"))
+            })
+    }) {
+        return Ok(None);
+    }
+    let mut stream =
+        serde_json::Deserializer::from_str(trimmed).into_iter::<Box<serde_json::value::RawValue>>();
+    match stream.next() {
+        Some(Ok(value)) => Ok(Some((value, trimmed[stream.byte_offset()..].trim_start()))),
+        Some(Err(e)) if e.is_eof() => {
+            let (mut quoted, mut escaped) = (false, false);
+            for b in trimmed.bytes() {
+                if escaped {
+                    escaped = false;
+                } else if quoted && b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    quoted = !quoted;
+                }
+            }
+            if quoted { Err(InJsonString) } else { Ok(None) }
+        }
+        _ => Ok(None),
+    }
+}
+
+pub(super) struct InJsonString;
 
 pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
     // Tool schemas guide tag-to-JSON conversion; non-strict calls retain invalid values.

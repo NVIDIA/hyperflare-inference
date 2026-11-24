@@ -96,6 +96,23 @@ _CONTRACT = TuningContract(
 )
 
 
+def trial_session(session, *, device, coordinator, **overrides):
+    """Open the private preparation session in which a composition trial tunes its own child plans.
+
+    The trial inherits the model session's checkpoint identity, namespace, effort and memory
+    limits so that its selections share the model's cache; `overrides` adjust other arguments.
+    """
+    from .tuning import RecordedPreparationSession
+
+    namespace = session.namespace.to_dict()
+    checkpoint, schema, numerics = (namespace.pop(key) for key in (
+        "checkpoint", "workload_schema", "numerical_policy"))
+    return RecordedPreparationSession(device=device, checkpoint=checkpoint, workload_schema=schema,
+        numerical_policy=numerics, namespace=namespace, coordinator=coordinator,
+        compile_workers=session.requested_compile_workers, autotune_effort=session.autotune_effort,
+        headroom_bytes=session.headroom_bytes, lock_gpu_clocks=session.lock_gpu_clocks, **overrides)
+
+
 def race_compositions(candidates, *, operation, geometry, numerics, workload, default,
                       session, coordinator, cache_policy, resident_bytes=0):
     """Select complete compiled work using b12x's coordinated race and cache.

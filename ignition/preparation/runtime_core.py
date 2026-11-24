@@ -116,8 +116,8 @@ class RuntimeCore:
         if any(isinstance(module, bytes) for module in self.modules.values()):
             raise ValueError("module images must be native recorder handles or cubin file paths")
         context, _ = flare_heliopause.current_context()
-        from ignition.components.weights import record_final_fp4_expert_provenance_all
-        record_final_fp4_expert_provenance_all()
+        from . import provenance
+        provenance.flush_finalizers()
         # Absent cache configuration stays absent: the native exporter owns
         # default destination and cache selection.
         cache = _OPTIONS.get()
@@ -325,8 +325,8 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
     numeric, parameter_layouts = live_metadata(
         numeric_bounds, storage.numeric_storage, prepared.buffers, zero_ranges=zero_ranges)
     # Warmup/binding has finalized expert storage by export time.
-    from ignition.components.weights import record_final_fp4_expert_provenance_all
-    record_final_fp4_expert_provenance_all()
+    from . import provenance
+    provenance.flush_finalizers()
     context, _ = flare_heliopause.current_context()
     # Absent cache configuration stays absent; the native exporter decides.
     cache = _OPTIONS.get()

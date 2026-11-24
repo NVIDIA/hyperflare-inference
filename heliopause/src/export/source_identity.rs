@@ -147,4 +147,17 @@ mod tests {
             format!("{:x}", Sha256::digest(b"link.pypayload"))
         );
     }
+
+    #[test]
+    fn build_time_source_identities_match_runtime_hashing() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            env!("FLARE_HELIOPAUSE_SOURCE_IDENTITY"),
+            source_identity(&[manifest_dir.join("src")]).unwrap()
+        );
+        assert_eq!(
+            env!("FLARE_HELIOS_SOURCE_IDENTITY"),
+            source_identity(&[manifest_dir.join("../helios/src")]).unwrap()
+        );
+    }
 }

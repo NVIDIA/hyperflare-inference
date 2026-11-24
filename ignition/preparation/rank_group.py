@@ -93,6 +93,7 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
                     os.close(descriptor)
             control.send("embedding_tables_ready")
             command = control.recv()
+        release_export = False
         if isinstance(command, tuple) and command[0] == "export":
             from .runtime_core import export_model
 
@@ -110,7 +111,9 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
             control.send({"peer_memory": list(storage.peer_storage.owned.items()),
                           "memory_inventory": core.memory_inventory})
             command = control.recv()
-        control.close()
+            release_export = command == "release_export"
+        if not release_export:
+            control.close()
         if command == "serve":
             model.serve_rank(connection, rank=rank, world=len(config.devices))
         elif isinstance(command, tuple) and command[0] == "direct":
@@ -121,13 +124,18 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
             from ignition.bench.executor import serve_peer
 
             serve_peer(model, connection)
-        elif command != "close":
+        elif command != "close" and not release_export:
             raise RuntimeError("invalid prepared rank handoff")
         connection.close()
         model.close()
         if storage is not None:
             for region in storage.host_regions:
                 region.close()
+        if release_export:
+            control.send("export_released")
+            if control.recv() != "close":
+                raise RuntimeError("expected coordinated shutdown after export resource release")
+            control.close()
         dist.destroy_process_group()
     except TuningComplete:
         control.send("tuning_complete")
@@ -222,16 +230,25 @@ class PreparedRankGroup:
         self._started = True
         return list(self.connections)
 
-    def close(self):
+    def close(self, *, after_export=False):
         if self._closed:
             return
         try:
+            if after_export:
+                # Peers stay under live-process supervision while every rank releases its graphs.
+                for control in self.controls:
+                    control.send("release_export")
+                self.model.close()
+                for control in self.controls:
+                    if control.recv() != "export_released":
+                        raise RuntimeError("peer did not confirm export resource release")
             self.supervisor.begin_shutdown(60000)
             if not self._started:
                 for control in self.controls:
                     control.send("close")
                     control.close()
-            self.model.close()
+            if not after_export:
+                self.model.close()
             dist.destroy_process_group()
             self.supervisor.finish_shutdown()
             for process in self.processes:

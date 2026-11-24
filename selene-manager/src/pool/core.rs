@@ -9,10 +9,10 @@ use flare_selene::shared::Limits;
 
 use super::{
     Violation,
-    claims::{Claim, ClaimKey},
+    claims::{Claim, ClaimKey, Participant, Party},
     index::{InstanceId, ScopeIndex, SourceId},
     ranks::{Agent, Ranks},
-    store_bridge::{Link, PutKey, PutRec, StoreHandle},
+    store_bridge::{Link, PutKey, PutPhase, PutRec, StoreHandle},
     validate_scope,
 };
 use crate::{
@@ -20,6 +20,7 @@ use crate::{
     data::channel::{self, Hub},
     local::{pidfd_exited, watch_pid},
     proto::v2::{self, server_message::M},
+    record::Descriptor,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -55,6 +56,51 @@ fn export_tokens(staging: u64, page_bytes: u64, row_bytes: u64, page_tokens: u64
     staging.saturating_sub(row_bytes) / page_bytes.max(1) * page_tokens
 }
 
+/// The smallest `--staging` that can serve a restore of records that are not in the arena.
+/// Such a restore reads the endpoint's row as one window, a row is never split, and the
+/// staging allocator hands out power-of-two blocks. A page is also one window at least.
+fn restore_staging_bytes(page_bytes: u64, row_bytes: u64) -> u64 {
+    page_bytes
+        .max(row_bytes)
+        .max(4096)
+        .checked_next_power_of_two()
+        .unwrap_or(u64::MAX)
+}
+
+/// What to tell the operator when `staging` bytes of staging cannot serve a scope with
+/// this geometry well.
+fn staging_warnings(staging: u64, geometry: &Descriptor) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let tokens = export_tokens(
+        staging,
+        geometry.page_bytes(),
+        geometry.row_bytes(),
+        geometry.page_tokens,
+    );
+    if tokens < REFERENCE_CONTEXT_TOKENS {
+        warnings.push(format!(
+            "--staging {staging} holds one export of about {tokens} tokens for the \
+             scope that just opened (a page is {} bytes, the row {}); longer contexts are \
+             refused as NO_WINDOWS and recomputed. Use at least {} for {REFERENCE_CONTEXT_TOKENS} tokens.",
+            geometry.page_bytes(),
+            geometry.row_bytes(),
+            REFERENCE_CONTEXT_TOKENS.div_ceil(geometry.page_tokens.max(1)) * geometry.page_bytes()
+                + geometry.row_bytes(),
+        ));
+    }
+    let window = restore_staging_bytes(geometry.page_bytes(), geometry.row_bytes());
+    if staging < window {
+        warnings.push(format!(
+            "--staging {staging} cannot hold the endpoint row of the scope that just opened \
+             (the row is {} bytes and is read as one window of {window} bytes of staging), so a \
+             restore of a record that is not in the arena is refused as BUDGET and recomputed. \
+             Use at least {window}.",
+            geometry.row_bytes(),
+        ));
+    }
+    warnings
+}
+
 #[cfg(test)]
 mod staging_tests {
     use super::*;
@@ -68,6 +114,50 @@ mod staging_tests {
         );
         assert_eq!(export_tokens(1 << 20, 2 << 20, 0, 64), 0);
         assert_eq!(export_tokens(10, 0, 0, 64), 10 * 64);
+    }
+
+    fn geometry(page_bytes: u64, row_bytes: u64) -> Descriptor {
+        Descriptor {
+            identity: [1; 32],
+            fingerprint: [2; 16],
+            page_tokens: 64,
+            ranks: vec![flare_selene::shared::record::RankSizes {
+                planes: vec![page_bytes],
+                row_bytes,
+            }],
+            pool_name: String::new(),
+        }
+    }
+
+    fn budget_warnings(staging: u64, geometry: &Descriptor) -> Vec<String> {
+        staging_warnings(staging, geometry)
+            .into_iter()
+            .filter(|warning| warning.contains("BUDGET"))
+            .collect()
+    }
+
+    #[test]
+    fn staging_that_cannot_hold_the_row_window_warns_of_refused_restores() {
+        // A 160 MiB row is one window, which the allocator serves from a 256 MiB block.
+        let value = geometry(1 << 20, 160 << 20);
+        assert_eq!(restore_staging_bytes(1 << 20, 160 << 20), 256 << 20);
+        let warnings = budget_warnings(192 << 20, &value);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--staging 201326592 "), "{warnings:?}");
+        assert!(
+            warnings[0].contains("Use at least 268435456."),
+            "{warnings:?}"
+        );
+        // A region of exactly the block, or a larger one, serves the restore.
+        assert!(budget_warnings(256 << 20, &value).is_empty());
+        assert!(budget_warnings(4 << 30, &value).is_empty());
+    }
+
+    #[test]
+    fn a_small_row_needs_no_restore_warning() {
+        let value = geometry(4000, 1000);
+        assert_eq!(restore_staging_bytes(4096, 4096), 4096);
+        assert!(budget_warnings(8 << 20, &value).is_empty());
     }
 }
 
@@ -116,13 +206,20 @@ pub struct Shared {
 }
 
 /// What the connection said about its peer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct OpenPeer {
     /// A Unix-domain connection (the only kind whose credentials are meaningful).
     pub unix: bool,
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
+    pub pidfd: Option<Arc<OwnedFd>>,
+}
+
+impl OpenPeer {
+    pub(super) fn shared_memory(&self, uid: u32, gid: u32) -> bool {
+        self.unix && self.uid == uid && self.gid == gid && (self.pid != 0 || self.pidfd.is_some())
+    }
 }
 
 pub enum Event {
@@ -219,7 +316,7 @@ pub(super) struct Instance {
 
 pub(super) struct Proc {
     pub pid: Option<u32>,
-    pub pidfd: Option<OwnedFd>,
+    pub pidfd: Option<Arc<OwnedFd>>,
     pub exited: bool,
     pub claim_hw: u64,
     pub put_hw: u64,
@@ -231,14 +328,17 @@ pub(super) struct Proc {
 }
 
 impl Proc {
-    pub(super) fn watch(&mut self, pid: Option<u32>) {
+    pub(super) fn watch(&mut self, peer: &OpenPeer) {
+        let started_pid = peer.unix.then_some(peer.pid).filter(|pid| *pid != 0);
         if self.pid.is_none()
-            && let Some(pid) = pid
+            && let Some(pid) = started_pid
         {
             self.pid = Some(pid);
             let (pidfd, exited) = watch_pid(pid);
-            self.pidfd = pidfd;
+            self.pidfd = pidfd.map(Arc::new);
             self.exited |= exited;
+        } else if self.pid.is_none() && self.pidfd.is_none() {
+            self.pidfd = peer.pidfd.clone();
         }
     }
 }
@@ -254,6 +354,7 @@ pub struct Core {
     pub(super) self_tx: mpsc::Sender<Event>,
     pub(super) puts: HashMap<PutKey, PutRec>,
     pub(super) present_puts: u64,
+    pub(super) unlinked_puts: u64,
     /// Open data-channel transfers by id.
     pub(super) channels: HashMap<u64, ChanOwner>,
     pub(super) catalogs: HashSet<ScopeId>,
@@ -325,6 +426,7 @@ impl Core {
             self_tx: events.clone(),
             puts: HashMap::new(),
             present_puts: 0,
+            unlinked_puts: 0,
             channels: HashMap::new(),
             catalogs: HashSet::new(),
             shared: shared.clone(),
@@ -352,29 +454,12 @@ impl Core {
     }
 
     /// Says once per scope, when its geometry first arrives, whether the staging region
-    /// can hold one export of a long context. A GPU export reserves staging for the
-    /// whole export, so a longer context than this is refused and recomputed.
+    /// can hold one export of a long context and the largest window a restore reads. A
+    /// GPU export reserves staging for the whole export, so a longer context than this is
+    /// refused and recomputed.
     fn check_staging(&self, scope: &super::ValidScope) {
-        let geometry = &scope.descriptor;
-        let staging = self.staging.capacity() as u64;
-        let tokens = export_tokens(
-            staging,
-            geometry.page_bytes(),
-            geometry.row_bytes(),
-            geometry.page_tokens,
-        );
-        if tokens < REFERENCE_CONTEXT_TOKENS {
-            eprintln!(
-                "selene: warning: --staging {} holds one export of about {tokens} tokens for the \
-                 scope that just opened (a page is {} bytes, the row {}); longer contexts are \
-                 refused as NO_WINDOWS and recomputed. Use at least {} for {REFERENCE_CONTEXT_TOKENS} tokens.",
-                staging,
-                geometry.page_bytes(),
-                geometry.row_bytes(),
-                REFERENCE_CONTEXT_TOKENS.div_ceil(geometry.page_tokens.max(1))
-                    * geometry.page_bytes()
-                    + geometry.row_bytes(),
-            );
+        for warning in staging_warnings(self.staging.capacity() as u64, &scope.descriptor) {
+            eprintln!("selene: warning: {warning}");
         }
     }
 
@@ -550,7 +635,7 @@ impl Core {
             }
         };
         let limits = &self.cfg.limits;
-        let shm = peer.unix && peer.uid == self.euid && peer.gid == self.egid;
+        let shm = peer.shared_memory(self.euid, self.egid);
         // A session without shared memory serves exports over the data channel.
         let export_slots = if shm || self.cfg.channel.is_some() {
             open.export_slots.min(limits.max_export_slots)
@@ -573,7 +658,6 @@ impl Core {
         self.next_session += 1;
         let sid = self.next_session;
         let proc_key = (instance, nonce);
-        let started_pid = peer.unix.then_some(peer.pid).filter(|pid| *pid != 0);
         let entry = self.procs.entry(proc_key).or_insert_with(|| Proc {
             pid: None,
             pidfd: None,
@@ -584,7 +668,7 @@ impl Core {
             link: None,
         });
         entry.idle_since = None;
-        entry.watch(started_pid);
+        entry.watch(&peer);
         let fresh = !self.scopes.contains_key(&scope.id);
         self.scopes.entry(scope.id).or_insert_with(|| ScopeState {
             valid: scope.clone(),
@@ -596,10 +680,10 @@ impl Core {
         }
         // Opening the session is the process telling the manager it is back: the store's
         // connection for it is made now, not at its first window, because a restarted manager
-        // holds its shared regions until every process of the previous run has made one (and a
-        // process that is refused claims for the hold would never get to its first window).
-        if let Some(pid) = started_pid {
-            self.link_for(proc_key, scope.id, pid);
+        // holds its shared regions for previous-run processes (PROTOCOL.md 8.6), and a
+        // process refused claims for the hold would never get to its first window.
+        if peer.unix && (peer.pid != 0 || shm) {
+            self.link_for(proc_key, scope.id, peer.pid, shm);
         }
         self.instances.insert(
             instance,
@@ -930,7 +1014,17 @@ impl Core {
     }
 
     fn drained(&self) -> bool {
-        self.claims.values().all(|claim| claim.is_terminal()) && self.channels.is_empty()
+        self.claims.values().all(|claim| claim.is_terminal())
+            && self.channels.is_empty()
+            && self.puts.values().all(|put| {
+                put.phase == PutPhase::Finished
+                    && put.mp.passes == 0
+                    // Only a connected owner with a pending fence can still attest.
+                    && !put.parties.iter()
+                        .filter(|party| party.state == Party::Pending)
+                        .filter_map(Participant::window_holder)
+                        .any(|proc| self.process_connected(proc))
+            })
     }
 
     fn finish_shutdown(&mut self) {
@@ -944,6 +1038,23 @@ impl Core {
                 v2::ClosingReason::ClosingShutdown,
                 "the manager is shutting down",
             );
+        }
+        // Keep unfenced processes in the holder file when the next manager reuses the regions.
+        let holders: HashSet<_> = self
+            .puts
+            .values()
+            .flat_map(|put| &put.parties)
+            .chain(self.claims.values().flat_map(|claim| &claim.parties))
+            .filter_map(Participant::window_holder)
+            .collect();
+        let settled: Vec<_> = self
+            .procs
+            .keys()
+            .filter(|proc| !holders.contains(*proc))
+            .copied()
+            .collect();
+        for proc in settled {
+            self.drop_link(proc);
         }
         if let Some(done) = self.shutting_down.take() {
             let _ = done.send(());

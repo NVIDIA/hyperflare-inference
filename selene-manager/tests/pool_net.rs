@@ -118,9 +118,14 @@ async fn a_remote_session_cannot_use_shared_windows() {
     );
     // The same for a put, with the reason in the detail.
     far.send(c::M::PutBegin(v2::PutBegin {
+        ancestor_keys: Vec::new(),
         put_id: 1,
         key: Some(pool::pkey(1024)),
         chain_pages: 16,
+        capture_role: Default::default(),
+        child_paths: 0,
+        descendant_row: false,
+        next_child: None,
         row: true,
         has_published_parent: false,
         published_parent: None,

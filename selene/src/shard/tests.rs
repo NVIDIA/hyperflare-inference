@@ -313,7 +313,29 @@ use std::net::TcpListener;
         transport
             .truncate(JobId(2), kept_ours.clone(), 4096)
             .unwrap();
-        let mut events = events(&mut transport, 2);
+        let capture = key(134, 0x5a);
+        let header = Header::new(
+            &[geometry(64, &[("kv", 4096)], 4096)],
+            [7; 32],
+            [2; 16],
+            capture,
+            Some(key(128, 0x5a)),
+            [0; 16],
+            0,
+            SystemTime::now(),
+        )
+        .unwrap()
+        .with_capture_role(crate::CaptureRole::Endpoint);
+        let file = record::file_name(&capture);
+        transport
+            .store_empty(
+                JobId(3),
+                header.clone(),
+                zero_directory.join(record::temporary_name(&capture)),
+                zero_directory.join(&file),
+            )
+            .unwrap();
+        let mut events = events(&mut transport, 3);
         events.sort_by_key(|event| Kind::of(event).1);
         assert!(matches!(
             events.as_slice(),
@@ -326,8 +348,21 @@ use std::net::TcpListener;
                     id: JobId(2),
                     result: Ok(())
                 },
+                TransportEvent::Stored {
+                    id: JobId(3),
+                    result: Ok(_),
+                    ..
+                },
             ]
         ));
+        for (directory, fingerprint) in [(&zero_directory, [2; 16]), (&peer_directory, [3; 16])] {
+            let bytes = std::fs::read(directory.join(&file)).unwrap();
+            assert_eq!(bytes.len() as u64, header.length(false));
+            let stored = Header::decode(&bytes).unwrap();
+            assert_eq!(stored.parent, header.parent);
+            assert_eq!(stored.capture_role(), crate::CaptureRole::Endpoint);
+            assert_eq!(stored.fingerprint, fingerprint);
+        }
         assert!(!ours.exists() && !theirs.exists());
         assert_eq!(std::fs::metadata(&kept_ours).unwrap().len(), 4096);
         assert_eq!(std::fs::metadata(&kept_theirs).unwrap().len(), 4096);
@@ -561,13 +596,23 @@ use std::net::TcpListener;
             kind.event(id, result),
             TransportEvent::StoreInvalidated { id: JobId(11), .. }
         ));
-        for result in [Ok(42u64), Err(invalid("disk full"))] {
+        for result in [
+            Ok(42u64),
+            Err(invalid("disk full")),
+            Err(Error::caused_by(
+                "rank 1: page checksum mismatch",
+                invalid("page checksum mismatch").with_record_read(),
+            )),
+        ] {
             let frame = encode_event(Kind::Fetched, JobId(9), &result);
             let (kind, id, decoded) = decode_event(&frame[5..]).unwrap();
             assert_eq!((kind, id), (Kind::Fetched, JobId(9)));
             match (result, decoded) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b),
-                (Err(a), Err(b)) => assert!(b.to_string().contains(&a.to_string())),
+                (Err(a), Err(b)) => {
+                    assert!(b.to_string().contains(&a.to_string()));
+                    assert_eq!(a.is_record_read(), b.is_record_read());
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -591,6 +636,39 @@ use std::net::TcpListener;
             assert!(file(directory, name).is_err(), "{name:?}");
         }
     }
+
+#[test]
+fn record_read_failure_survives_rank_events_and_aggregation() {
+    let results = [
+        Err(invalid("copy cancelled")),
+        Err(invalid("page checksum mismatch").with_record_read()),
+    ]
+    .into_iter()
+    .map(|result| {
+        let frame = encode_event(Kind::Fetched, JobId(9), &result);
+        let (kind, id, result) = decode_event(&frame[5..]).unwrap();
+        assert_eq!((kind, id), (Kind::Fetched, JobId(9)));
+        Some(result)
+    })
+    .collect();
+    let mut transport = Sharded::new(staged(), Vec::new()).unwrap();
+    transport.finish(
+        JobId(9),
+        Pending {
+            kind: Kind::Fetched,
+            results,
+            path: None,
+            cleanup: None,
+            started: Instant::now(),
+        },
+    );
+    assert!(matches!(
+        &transport.events[..],
+        [TransportEvent::Fetched { id: JobId(9), result: Err(error) }]
+            if error.is_record_read() && error.to_string().contains("rank 1: page checksum mismatch")
+    ));
+    transport.close().unwrap();
+}
 
 #[test]
 fn space_pressure_survives_rank_events_and_aggregation() {

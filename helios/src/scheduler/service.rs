@@ -143,6 +143,13 @@ impl RequestScheduler {
         let mut token_rate = 0.0f64;
         let mut delivery_rate = 0.0f64;
         let prefill = request.consumed_tokens < request.prompt_tokens as u64;
+        // A prefill stops at the same estimated cut whatever capacity is tried, so it is
+        // selected once here rather than once per capacity and mixed shape.
+        let cut = if prefill {
+            self.estimated_checkpoint_cut(request)
+        } else {
+            None
+        };
         let mut consider = |kind, batch, capacity, tokens: f64, delivery: bool| {
             let ns = if kind == GraphKind::Speculative {
                 self.speculative_duration(request, batch, capacity)
@@ -164,15 +171,25 @@ impl RequestScheduler {
                 consider(GraphKind::Snapshot, batch, 1, 0.0, true);
             }
         } else if prefill {
-            for &capacity in &self.prefill_catalog {
-                let work = self.prefill_work(request, capacity);
+            let catalog = if request.prompt_logprobs {
+                &self.scored_prefill_catalog
+            } else {
+                &self.prefill_catalog
+            };
+            let terminal_only = self.prefill_requires_terminal_completion(request, cut);
+            for &capacity in catalog {
+                let work = self.prefill_work_through(request, capacity, cut);
                 if work == 0 {
                     continue;
                 }
                 let first_output =
                     request.consumed_tokens + work as u64 == request.prompt_tokens as u64;
+                let kind = self.resolve_prefill_kind(request, capacity, work, cut);
+                if terminal_only && kind == GraphKind::Prefill {
+                    continue;
+                }
                 consider(
-                    GraphKind::Prefill,
+                    kind,
                     1,
                     capacity,
                     work as f64 + f64::from(first_output),
@@ -219,7 +236,7 @@ impl RequestScheduler {
                 };
                 let per_ms = 1e6 / ns as f64;
                 if prefill {
-                    let work = self.prefill_work(request, capacity);
+                    let work = self.prefill_work_through(request, capacity, cut);
                     if work > 0 {
                         let first =
                             request.consumed_tokens + work as u64 == request.prompt_tokens as u64;
@@ -264,7 +281,7 @@ impl RequestScheduler {
                 .iter()
                 .find(|l| l.request == request.handle);
             let (tokens, delivery) = match (submission.kind, lane) {
-                (GraphKind::Prefill | GraphKind::ScoredPrefill, Some(l)) => (l.tokens as f64, 0.0),
+                (GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill, Some(l)) => (l.tokens as f64, 0.0),
                 (GraphKind::Decode | GraphKind::Speculative, Some(_)) =>
                     (submission.expected_tokens[request.handle.slot as usize], 1.0),
                 _ => (0.0, 0.0),

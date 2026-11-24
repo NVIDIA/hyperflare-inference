@@ -28,6 +28,10 @@ const CONNECTED: &[u8] = b"connected";
 // Transport records and refusal reasons are small; a larger frame is a protocol error.
 const FRAME_LIMIT: usize = 1 << 20;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+// Post-admission capacity and transport-record exchanges span rank weight loading; keep
+// bounded deadlines so a lost or stalled peer fails startup instead of hanging indefinitely.
+const EXCHANGE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+const EXCHANGE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn failure(message: impl Into<String>) -> Error {
     Error::execution(ExecutionError::Worker, message)
@@ -114,6 +118,7 @@ pub fn accept(
         stream
             .set_nonblocking(false)
             .and_then(|_| stream.set_read_timeout(Some(HELLO_TIMEOUT)))
+            .and_then(|_| stream.set_write_timeout(Some(HELLO_TIMEOUT)))
             .and_then(|_| stream.set_nodelay(true))
             .map_err(|e| io("rendezvous connection", e))?;
         let Ok(bytes) = read_frame(&mut stream) else {
@@ -149,7 +154,8 @@ pub fn accept(
                 let (rank, _, _) = parse_hello(&bytes).unwrap();
                 write_frame(&mut stream, &[ADMITTED])?;
                 stream
-                    .set_read_timeout(None)
+                    .set_read_timeout(Some(EXCHANGE_READ_TIMEOUT))
+                    .and_then(|_| stream.set_write_timeout(Some(EXCHANGE_WRITE_TIMEOUT)))
                     .map_err(|e| io("rendezvous connection", e))?;
                 peers[rank] = Some(stream);
                 admitted += 1;
@@ -185,13 +191,15 @@ pub fn knock(
             stream
                 .set_nodelay(true)
                 .and_then(|_| stream.set_read_timeout(Some(HELLO_TIMEOUT)))
+                .and_then(|_| stream.set_write_timeout(Some(HELLO_TIMEOUT)))
                 .map_err(|e| io("rendezvous connection", e))?;
             write_frame(&mut stream, &hello(rank, world, export_id))?;
             let reply = read_frame(&mut stream)?;
             return match reply.split_first() {
                 Some((&ADMITTED, [])) => {
                     stream
-                        .set_read_timeout(None)
+                        .set_read_timeout(Some(EXCHANGE_READ_TIMEOUT))
+                        .and_then(|_| stream.set_write_timeout(Some(EXCHANGE_WRITE_TIMEOUT)))
                         .map_err(|e| io("rendezvous connection", e))?;
                     Ok(RankStream::from(stream))
                 }
@@ -460,5 +468,33 @@ mod tests {
             old[..8].copy_from_slice(version);
             assert!(parse_hello(&old).is_none());
         }
+    }
+
+    #[test]
+    fn admitted_streams_keep_bounded_read_and_write_timeouts() {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let target = address.clone();
+        let peer = std::thread::spawn(move || {
+            knock(&target, 1, 2, "export-timeout", Duration::from_secs(5)).unwrap()
+        });
+        let accepted = accept(&address, 2, "export-timeout", Duration::from_secs(5), |_| {}).unwrap();
+        let peer_stream = peer.join().unwrap();
+        for stream in [&accepted[0], &peer_stream] {
+            let RankStream::Tcp(tcp) = stream else {
+                panic!("expected TCP rendezvous stream");
+            };
+            assert_eq!(tcp.read_timeout().unwrap(), Some(EXCHANGE_READ_TIMEOUT));
+            assert_eq!(tcp.write_timeout().unwrap(), Some(EXCHANGE_WRITE_TIMEOUT));
+        }
+
+        // Verify a stalled peer fails exchange cleanly once the stream read deadline elapses.
+        let (mut root, _silent_peer) = super::super::rank_stream::test_pair().unwrap();
+        root.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let error = agree_capacity(std::slice::from_mut(&mut root), (80, 100))
+            .err()
+            .expect("stalled peer must time out instead of hanging");
+        assert!(error.to_string().contains("rendezvous read failed"), "{error}");
     }
 }

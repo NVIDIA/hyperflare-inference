@@ -19,8 +19,18 @@ fn main() {
             .field_attribute(".flare.runtime.RebuildSpeculation.vocabulary_parallel_sampling", "#[serde(default)]")
             .field_attribute(".flare.runtime.RebuildSpeculation.mtp_only", "#[serde(default)]")
             .field_attribute(".flare.runtime.RebuildManifest.online_mxfp8_scope", "#[serde(default)]")
+            .field_attribute(".flare.runtime.RebuildManifest.context_parallel_size", "#[serde(default)]")
+            .field_attribute(".flare.runtime.RebuildManifest.prompt_logprobs", "#[serde(default)]")
+            .field_attribute(".flare.runtime.RebuildManifest.autotune_effort", "#[serde(default)]")
+            .field_attribute(".flare.runtime.RebuildManifest.native_dense_activations", "#[serde(default)]")
+            .field_attribute(".flare.runtime.RebuildManifest.lock_gpu_clocks", "#[serde(default)]")
+            .field_attribute(".flare.runtime.RebuildManifest.reproduction_args", "#[serde(default)]")
             .field_attribute(
                 ".flare.runtime.ExecutionGraph.packed_token_capacity",
+                "#[serde(default)]",
+            )
+            .field_attribute(
+                ".flare.runtime.Execution.persistent_workers",
                 "#[serde(default)]",
             )
             .compile_protos(&["proto/runtime_core.proto"], &["proto"])

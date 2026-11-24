@@ -21,6 +21,9 @@ use flare_helios::{
     runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit},
 };
 
+/// The serving option that routes every peer over subnets every rank holds.
+pub const ROCE_SWITCH_ONLY: &str = "--roce-switch-only";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "flare",
@@ -44,6 +47,8 @@ pub enum Command {
     Download(Download),
     /// Summarize a core's metadata, with optional memory, graph, and frontend details.
     Inspect(Inspect),
+    /// Check Linux host PCIe, NVIDIA driver, IOMMU, and ACS settings for TP>1 serving.
+    Doctor(Doctor),
     #[command(hide = true)]
     HardwareRevision {
         #[arg(value_parser = clap::value_parser!(i32).range(1..))]
@@ -167,7 +172,7 @@ pub struct CacheGc {
 
 #[derive(Debug, Args, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HubOptions {
-    /// Hub revision; uses the model origin when cached, otherwise detects gb10, gb202, or gb300.
+    /// Hub revision; uses the model origin when cached, otherwise detects ga102, gb10, gb202, or gb300.
     #[arg(long, value_name = "REVISION", help_heading = "Download options")]
     pub revision: Option<String>,
 
@@ -181,7 +186,7 @@ pub struct HubOptions {
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub cache_dir: Option<PathBuf>,
 
-    /// Hugging Face access token file; omit for public repositories.
+    /// Hugging Face access token file [default: HF_TOKEN, else ~/.cache/huggingface/token].
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub token_file: Option<PathBuf>,
 
@@ -189,7 +194,8 @@ pub struct HubOptions {
     #[arg(long, help_heading = "Download options")]
     pub offline: bool,
 
-    /// Tensor-parallel sizes to prepare, as N[,N...]; defaults to the requested GPU count.
+    /// Tensor-parallel sizes to prepare, as N[,N...]; defaults to the requested GPU count,
+    /// or the core's sole deployment when neither is given.
     #[arg(
         long,
         value_name = "N[,N...]",
@@ -283,15 +289,32 @@ pub struct Inspect {
 }
 
 #[derive(Debug, Args)]
+pub struct Doctor {
+    /// GPUs to check, relative to CUDA_VISIBLE_DEVICES when set [default: all visible GPUs].
+    #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
+        value_parser = clap::value_parser!(i32).range(0..))]
+    pub gpus: Vec<i32>,
+
+    /// Print the diagnostic report as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Disable terminal styling.
+    #[arg(long, conflicts_with = "json")]
+    pub plain: bool,
+}
+
+#[derive(Debug, Args)]
 #[command(args_override_self = true)]
 pub struct Download {
     /// Hugging Face repository containing prepared Flare cores, optionally ORG/NAME@REVISION.
     #[arg(value_name = "REPOSITORY")]
     pub repository: String,
 
-    /// GPUs used to detect the hardware revision; unnecessary with --revision.
+    /// GPUs used to detect the hardware revision (first visible GPU when omitted) and default
+    /// tensor-parallel size; unnecessary with --revision.
     #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
-        default_value = "0", value_parser = clap::value_parser!(i32).range(0..))]
+        value_parser = clap::value_parser!(i32).range(0..))]
     pub gpus: Vec<i32>,
 
     /// Additional publisher verification profiles (JSON); repeatable.
@@ -484,6 +507,7 @@ impl OrbitPush {
             scheduler_terminal_value: None,
             scheduler_terminal_age_price: None,
             scheduler_checkpoint_extra_work_fraction: None,
+            bypass_performance_check: false,
             serving: self.serving.clone(),
         }
     }
@@ -672,6 +696,7 @@ impl OrbitRun {
             scheduler_terminal_value: self.scheduler_terminal_value,
             scheduler_terminal_age_price: self.scheduler_terminal_age_price,
             scheduler_checkpoint_extra_work_fraction: self.scheduler_checkpoint_extra_work_fraction,
+            bypass_performance_check: false,
             serving: self.serving.clone(),
         }
     }
@@ -819,6 +844,10 @@ pub struct Run {
     #[arg(long, value_name = "FRACTION", value_parser = checkpoint_extra_work_fraction, help_heading = "Serving options")]
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
 
+    /// Skip Linux PCIe TP>1 host performance checks (NVIDIA driver params and IOMMU) after GPU init.
+    #[arg(long, help_heading = "Serving options")]
+    pub bypass_performance_check: bool,
+
     #[command(flatten)]
     pub serving: ServingOptions,
 }
@@ -882,6 +911,11 @@ pub struct ServingOptions {
         help_heading = "Serving options"
     )]
     pub memory_limit: Option<MemoryLimit>,
+
+    /// Route RoCE rails and fabric transfers only over subnets every rank holds, as on a switch
+    /// alone, leaving direct cables between ranks unused.
+    #[arg(long, help_heading = "Multi-host options")]
+    pub roce_switch_only: bool,
 
     /// Maximum simultaneous requests [default: model/default configuration, then core setting].
     #[arg(long, value_name = "N", help_heading = "Serving options")]
@@ -991,7 +1025,7 @@ pub struct ServingOptions {
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_disk_limit: Option<u64>,
 
-    /// Drain DRAM to local disk at shutdown, optionally for 90s or 2m; off disables [default: prefix_cache.drain_on_shutdown, else off].
+    /// Drain DRAM to local disk or the pool at shutdown. Use 90s or 2m to limit the drain, or off to disable it [default: prefix_cache.drain_on_shutdown, else off].
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "on",
         value_name = "DURATION|on|off", value_parser = parse_drain_on_shutdown, help_heading = "Prefix cache options")]
     pub prefix_cache_drain_on_shutdown: Option<std::time::Duration>,
@@ -1000,7 +1034,9 @@ pub struct ServingOptions {
     #[arg(long, value_name = "DURATION|off", value_parser = parse_max_age, help_heading = "Prefix cache options")]
     pub prefix_cache_max_age: Option<std::time::Duration>,
 
-    /// Share prefix checkpoints at `unix:PATH`, plain TCP `HOST:PORT`, or TLS `tls:HOST:PORT` [default: not shared].
+    /// Share prefix checkpoints at `unix:PATH`, plain TCP `HOST:PORT`, or TLS `tls:HOST:PORT`.
+    /// Without a local tier, ranks in one process send records through a capture buffer.
+    /// Across rank processes, a pool without a local tier only restores [default: not shared].
     #[arg(long, value_name = "ADDRESS", value_parser = parse_pool_address,
         help_heading = "Prefix cache options")]
     pub prefix_cache_pool: Option<String>,
@@ -1091,6 +1127,9 @@ impl ServingOptions {
             Shape::Mesh => {}
             Shape::Ring => options.push("--roce-ring".into()),
             Shape::Chain => options.push("--roce-chain".into()),
+        }
+        if self.roce_switch_only {
+            options.push(ROCE_SWITCH_ONLY.into());
         }
         if self.verify_weights {
             options.push("--verify-weights".into());
@@ -1288,6 +1327,33 @@ mod tests {
         };
         assert!(args.tensor_request.is_none());
         assert!(args.tensor_output.is_none());
+    }
+
+    #[test]
+    fn doctor_parses_gpus_json_and_plain_conflicts() {
+        let cli = Cli::try_parse_from(["flare", "doctor"]).unwrap();
+        let Command::Doctor(doctor) = cli.command else {
+            panic!("expected doctor");
+        };
+        assert!(doctor.gpus.is_empty());
+        assert!(!doctor.json);
+        assert!(!doctor.plain);
+
+        let cli = Cli::try_parse_from(["flare", "doctor", "--gpus", "0,2,3", "--json"]).unwrap();
+        let Command::Doctor(doctor) = cli.command else {
+            panic!("expected doctor");
+        };
+        assert_eq!(doctor.gpus, vec![0, 2, 3]);
+        assert!(doctor.json);
+        assert!(!doctor.plain);
+
+        assert!(Cli::try_parse_from(["flare", "doctor", "--json", "--plain"]).is_err());
+        assert!(Cli::try_parse_from(["flare", "doctor", "--gpus", "-1"]).is_err());
+
+        let default_run = run(&["flare", "run", "model.safetensors"]);
+        assert!(!default_run.bypass_performance_check);
+        let bypassed = run(&["flare", "run", "model.safetensors", "--bypass-performance-check"]);
+        assert!(bypassed.bypass_performance_check);
     }
 
     #[test]
@@ -1499,6 +1565,21 @@ mod tests {
             "4,7"
         );
         assert!(crate::environment::visibility(&args.gpus, Some("4")).is_err());
+
+        let Command::Download(download) =
+            Cli::try_parse_from(["flare", "download", "org/model"]).unwrap().command
+        else {
+            panic!("expected download")
+        };
+        assert!(download.gpus.is_empty());
+        let Command::Download(download) =
+            Cli::try_parse_from(["flare", "download", "org/model", "--gpus", "0,1"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected download")
+        };
+        assert_eq!(download.gpus, vec![0, 1]);
     }
 
     #[test]
@@ -1831,6 +1912,21 @@ mod tests {
         let args = run(&["flare", "run", "model.safetensors", "--roce-ring"]);
         assert!(args.roce_ring);
         assert_eq!(args.rank_options(), vec!["--roce-ring"]);
+    }
+
+    #[test]
+    fn switch_only_flag_is_forwarded_to_every_agent_started_rank() {
+        let args = run(&["flare", "run", "model.safetensors", "--roce-switch-only"]);
+        assert!(args.serving.roce_switch_only);
+        assert_eq!(args.rank_options(), vec![ROCE_SWITCH_ONLY]);
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--roce-chain",
+            "--roce-switch-only",
+        ]);
+        assert_eq!(args.rank_options(), vec!["--roce-chain", ROCE_SWITCH_ONLY]);
     }
 
     #[test]

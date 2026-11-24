@@ -84,7 +84,7 @@ class PreparedEngramLookup:
         output = self.output
         if output is None:
             shape, dtype = self.output_layout
-            output = torch.zeros(shape, dtype=dtype, device=source.device)
+            output = torch.empty(shape, dtype=dtype, device=source.device)
         barrier_input, barrier_output = self.wait.operands(source)
         _lookup(source, self.weights, self.scales, self.hashes, self.count if count is None else count,
                 output, self.wait.timings.timestamps, self.wait.timings.frame,

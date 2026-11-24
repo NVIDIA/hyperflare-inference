@@ -71,6 +71,14 @@ pub fn catalog(body: &wire::RankBody) -> Result<Option<Cow<'_, wire::PreparedWei
     if let Some(catalog) = &body.prepared_weights {
         return Ok(Some(Cow::Borrowed(catalog)));
     }
+    decode_compressed_catalog(body).map(|catalog| catalog.map(Cow::Owned))
+}
+
+/// Decode a compressed catalog whose reconstructed rank size was already bounded.
+pub(crate) fn decode_compressed_catalog(
+    body: &wire::RankBody,
+) -> Result<Option<wire::PreparedWeightCatalog>> {
+    validate_wrapper(body)?;
     let Some(compressed) = &body.compressed_prepared_weights else {
         return Ok(None);
     };
@@ -102,7 +110,7 @@ pub fn catalog(body: &wire::RankBody) -> Result<Option<Cow<'_, wire::PreparedWei
     }
     let catalog = wire::PreparedWeightCatalog::decode(decoded.as_slice())
         .map_err(|error| invalid(format!("invalid prepared weight catalog: {error}")))?;
-    Ok(Some(Cow::Owned(catalog)))
+    Ok(Some(catalog))
 }
 
 /// Replace an inline catalog with its zstd encoding when that reduces signed metadata.

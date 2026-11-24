@@ -436,6 +436,7 @@ const UNLINK: u8 = 7;
 const CLOSE: u8 = 8;
 const EVENT: u8 = 9;
 const CLOSED: u8 = 10;
+const STORE_EMPTY: u8 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Kind {
@@ -629,13 +630,12 @@ impl Sharded {
             .results
             .iter()
             .enumerate()
-            .find_map(|(rank, result)| match result {
-                Some(Err(error)) => Some(Error::caused_by(
-                    format!("rank {rank}: {error}"),
-                    error.clone(),
-                )),
+            .filter_map(|(rank, result)| match result {
+                Some(Err(error)) => Some((rank, error)),
                 _ => None,
-            });
+            })
+            .min_by_key(|(_, error)| !error.is_record_read())
+            .map(|(rank, error)| Error::caused_by(format!("rank {rank}: {error}"), error.clone()));
         if let Some((store, error)) = pending.cleanup {
             // Preserve cleanup failures alongside the write failure.
             let leftover =
@@ -795,9 +795,16 @@ fn encode_event(kind: Kind, id: JobId, result: &Result<u64>) -> Vec<u8> {
     writer.u8(kind.code()).u64(id.0);
     match result {
         Ok(value) => writer.u8(1).u64(*value),
-        Err(error) => writer
-            .u8(if error.no_space() { 2 } else { 0 })
-            .text(&error.to_string()),
+        Err(error) => {
+            let code = if error.is_record_read() {
+                3
+            } else if error.no_space() {
+                2
+            } else {
+                0
+            };
+            writer.u8(code).text(&error.to_string())
+        }
     };
     writer.finish()
 }
@@ -813,6 +820,7 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
             reader.text()?.to_owned(),
             std::io::Error::from(ErrorKind::StorageFull),
         )),
+        3 => Err(invalid(reader.text()?.to_owned()).with_record_read()),
         _ => return Err(invalid("invalid prefix record event result")),
     };
     reader.end()?;
@@ -822,6 +830,26 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
 impl DiskTransport for Sharded {
     fn staged(&self) -> Option<&Staged> {
         Some(&self.local)
+    }
+
+    fn store_empty(
+        &mut self,
+        id: JobId,
+        header: Header,
+        temporary: PathBuf,
+        path: PathBuf,
+    ) -> Result<()> {
+        self.accept()?;
+        let mut writer = Writer::new(STORE_EMPTY);
+        writer
+            .u64(id.0)
+            .header(&header)?
+            .text(name(&temporary)?)
+            .text(name(&path)?);
+        self.local
+            .store_empty(id, header, temporary, path.clone())?;
+        self.begin(Kind::Stored, id, Some(path), &writer.finish());
+        Ok(())
     }
 
     fn store(
@@ -1038,10 +1066,15 @@ impl Peer {
     fn dispatch(&mut self, tag: u8, payload: &[u8]) -> Result<Option<(Kind, JobId, Error)>> {
         let mut reader = Reader(payload);
         let id = JobId(reader.u64()?);
-        if tag == STORE {
+        if tag == STORE || tag == STORE_EMPTY {
             let header = self.own(reader.header()?)?;
             let temporary = file(&self.directory, reader.text()?)?;
             let path = file(&self.directory, reader.text()?)?;
+            if tag == STORE_EMPTY {
+                reader.end()?;
+                let result = self.staged.store_empty(id, header, temporary, path);
+                return Ok(result.err().map(|error| (Kind::Stored, id, error)));
+            }
             let slot = StateSlotId(reader.u32()?);
             let count = reader.count(4)?;
             let pages = (0..count)

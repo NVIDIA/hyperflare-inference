@@ -67,6 +67,7 @@ pub const IN_FLIGHT_WINDOWS: usize = crate::shared::WINDOW_CREDITS as usize;
 /// copy is complete; a standalone memory store treats every record as durable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecord {
+    pub capture_role: crate::CaptureRole,
     pub pages: Vec<Slot>,
     pub row: Option<Vec<Slot>>,
     pub durable: bool,
@@ -155,6 +156,7 @@ impl Pending {
 
 #[derive(Debug)]
 struct Outbound {
+    refill: bool,
     checkpoint: CheckpointId,
     key: PrefixKey,
     pending: Pending,
@@ -203,6 +205,17 @@ struct Core {
     thinning: HashSet<PrefixKey>,
     /// Checksum-backed holdings announced to the pool.
     announced: std::collections::HashSet<PrefixKey>,
+}
+
+/// Where a standalone store puts a publication, from its offered ancestors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentChoice<'a> {
+    /// The nearest known ancestor is ready: link under it.
+    Ready(PrefixKey, &'a [PageId]),
+    /// The nearest known ancestor is still copying out: wait for it.
+    Waiting(PrefixKey),
+    /// No offered ancestor is known: store a root holding the whole chain.
+    Root,
 }
 
 fn evictable(node: &Node<MemoryRecord>, spill: bool, announced: bool) -> bool {
@@ -275,16 +288,65 @@ impl Core {
         self.index.node(key).is_some_and(|node| !node.ready) || self.deferred_key(key)
     }
 
-    /// The record shape for a standalone store: a child of a ready parent, or
-    /// a root holding the whole chain.
-    fn shape<'a>(&self, checkpoint: &'a PublishedCheckpoint) -> (Option<PrefixKey>, &'a [PageId]) {
-        match checkpoint
-            .parent
-            .filter(|parent| self.index.node(parent).is_some_and(|node| node.ready))
-        {
-            Some(parent) => (Some(parent), checkpoint.tail()),
-            None => (None, &checkpoint.chain_pages),
+    /// The one parent choice for a standalone store, used by the store, its
+    /// preflight and the retry of a deferred publication. It walks the offered
+    /// ancestors nearest first, skipping keys this index does not know, and stops
+    /// at the first known one: ready, the record links under it; still copying
+    /// out, the record waits for it. With none known it is a root.
+    fn select_parent<'a>(&self, checkpoint: &'a PublishedCheckpoint) -> ParentChoice<'a> {
+        for key in checkpoint.offered() {
+            if self.index.node(&key).is_some_and(|node| node.ready)
+                && let Some(tail) = checkpoint.tail_below(&key, self.layout.page_tokens)
+            {
+                return ParentChoice::Ready(key, tail);
+            }
+            if self.copying_out(&key) {
+                return ParentChoice::Waiting(key);
+            }
         }
+        ParentChoice::Root
+    }
+
+    /// The record shape for a standalone store: a child of the selected ready
+    /// ancestor holding the pages after it, or a root holding the whole chain.
+    /// A publication that waits for an ancestor is sized as a root.
+    fn shape<'a>(&self, checkpoint: &'a PublishedCheckpoint) -> (Option<PrefixKey>, &'a [PageId]) {
+        match self.select_parent(checkpoint) {
+            ParentChoice::Ready(parent, tail) => (Some(parent), tail),
+            ParentChoice::Waiting(_) | ParentChoice::Root => (None, &checkpoint.chain_pages),
+        }
+    }
+
+    /// Count a record that was not linked under the nearest offered ancestor.
+    fn count_copy(
+        &mut self,
+        checkpoint: &PublishedCheckpoint,
+        parent: Option<PrefixKey>,
+        pages: usize,
+    ) {
+        if parent.is_none() {
+            let reason = crate::RootReason::from_nearest(checkpoint.parent());
+            self.stats.root_records[0][reason as usize] += 1;
+            self.stats.root_pages[0][reason as usize] += pages as u64;
+        } else if parent != checkpoint.parent() {
+            self.stats.deeper_link_records[0] += 1;
+            self.stats.deeper_link_pages[0] += pages as u64;
+        }
+    }
+
+    fn needs_row(&self, checkpoint: &PublishedCheckpoint, parent: Option<PrefixKey>) -> bool {
+        let old = self.index.node(&checkpoint.key);
+        let role = old.map_or(checkpoint.capture_role, |n| {
+            n.location.capture_role.merge(checkpoint.capture_role)
+        });
+        self.flat
+            || !self.index.covered_endpoint(
+                checkpoint.key,
+                parent,
+                role,
+                old.map_or(0, |n| n.children()),
+                |n| n.ready,
+            )
     }
 
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool> {
@@ -301,10 +363,9 @@ impl Core {
             return Ok(false);
         }
         if !self.flat
-            && let Some(parent) = checkpoint.parent
-            && self.copying_out(&parent)
+            && let ParentChoice::Waiting(ancestor) = self.select_parent(checkpoint)
         {
-            self.deferred.push((parent, checkpoint.clone()));
+            self.deferred.push((ancestor, checkpoint.clone()));
             return Ok(true);
         }
         let (parent, tail) = self.shape(checkpoint);
@@ -319,9 +380,15 @@ impl Core {
         tail: &[PageId],
         durable: bool,
     ) -> Result<bool> {
-        let result = self.start_record(checkpoint, parent, tail, durable);
+        let result = self.start_record(
+            checkpoint,
+            parent,
+            tail,
+            durable,
+            self.needs_row(checkpoint, parent),
+        );
         match &result {
-            Ok(true) => {}
+            Ok(true) => self.count_copy(checkpoint, parent, tail.len()),
             Ok(false) => self.stats.store_skipped += 1,
             Err(_) => self.stats.store_failed += 1,
         }
@@ -336,42 +403,48 @@ impl Core {
         parent: Option<PrefixKey>,
         tail: &[PageId],
         durable: bool,
+        row: bool,
     ) -> Result<bool> {
         if self.known(&checkpoint.key) {
             return Ok(false);
         }
-        let parent = if self.flat { None } else { parent };
+        let indexed_parent = if self.flat { None } else { parent };
         // Eviction during allocation must not remove the record being extended.
-        if let Some(parent) = &parent
+        if let Some(parent) = &indexed_parent
             && self.pin_record(parent).is_err()
         {
             return Err(invalid("host record parent is not indexed"));
         }
         let allocated = self.allocate(
             checkpoint.key,
-            parent,
+            indexed_parent,
             checkpoint.bucket,
             tail.len(),
-            true,
+            row,
             durable,
         );
-        if let Some(parent) = &parent {
+        if let Some(parent) = &indexed_parent {
             let _ = self.unpin_record(parent);
         }
         let Some(record) = allocated? else {
             return Ok(false);
         };
-        let row = record.row.as_ref().expect("allocated with a row");
+        self.index[&checkpoint.key].location.capture_role = checkpoint.capture_role;
+        self.index.set_published_ancestors(&checkpoint.key, parent, &checkpoint.ancestors);
         let id = self.next_job();
         let pages = tail
             .iter()
             .zip(&record.pages)
             .map(|(page, slot)| (*page, self.pool.slot_address(*slot)));
-        let row = Some((checkpoint.slot, self.pool.addresses(row)));
+        let row = record
+            .row
+            .as_ref()
+            .map(|slots| (checkpoint.slot, self.pool.addresses(slots)));
         let queued = windows(id, Direction::Out, pages, row);
         self.outbound.insert(
             id,
             Outbound {
+                refill: false,
                 checkpoint: checkpoint.id,
                 key: checkpoint.key,
                 pending: Pending::new(queued),
@@ -393,47 +466,12 @@ impl Core {
         durable: bool,
     ) -> Result<Option<MemoryRecord>> {
         let needed = self.layout.record_slots(tail_pages, row);
-        if !self.fits(needed) {
-            return Ok(None);
-        }
-        if self
-            .pool
-            .free_slots()
-            .saturating_sub(self.pool.intake_slots())
-            < needed
-        {
-            self.thin_rows_for(needed);
-        }
-        if self.spill && self.retire_for(self.shortfall(needed)) {
-            return Ok(None);
-        }
-        while self.pool.free_slots() < needed + self.pool.intake_slots() {
-            let announced = &self.announced;
-            let spill = self.spill;
-            match self.index.evict(row, |node| {
-                evictable(node, spill, announced.contains(&node.key))
-            }) {
-                Some(Eviction::Leaves(nodes)) => {
-                    self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
-                    for node in &nodes {
-                        self.thinning.remove(&node.key);
-                        self.clean_slots -= self.clean_slots(node);
-                        self.release(&node.location);
-                    }
-                }
-                Some(Eviction::Compacted(compacted)) => {
-                    self.stats.dropped[0] += u64::from(!self.flat);
-                    let dropped = self.drop_row(&compacted);
-                    debug_assert!(dropped);
-                }
-                None => return Ok(None),
-            }
-        }
-        let Some(mut slots) = self.pool.allocate(needed) else {
+        let Some(mut slots) = self.allocate_slots(needed, row) else {
             return Ok(None);
         };
         let row_slots = slots.split_off(tail_pages);
         let record = MemoryRecord {
+            capture_role: crate::CaptureRole::Endpoint,
             pages: slots,
             row: row.then_some(row_slots),
             durable,
@@ -458,6 +496,78 @@ impl Core {
         Ok(Some(record))
     }
 
+    fn allocate_slots(&mut self, needed: usize, row: bool) -> Option<Vec<Slot>> {
+        if !self.fits(needed) {
+            return None;
+        }
+        if self.free_retention_slots() < needed {
+            self.thin_rows_for(needed);
+        }
+        if self.spill && self.retire_for(self.shortfall(needed)) {
+            return None;
+        }
+        while self.pool.free_slots() < needed + self.pool.intake_slots() {
+            let announced = &self.announced;
+            let spill = self.spill;
+            match self.index.evict(
+                row,
+                |node| {
+                    evictable(node, spill, announced.contains(&node.key))
+                        && (node.children() == 0
+                            || (node.parent.is_some()
+                                && node.ready_children() == 1
+                                && node.location.capture_role == crate::CaptureRole::Endpoint))
+                },
+                |_| false,
+            ) {
+                Some(Eviction::Leaves(nodes)) => {
+                    self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
+                    for node in &nodes {
+                        self.thinning.remove(&node.key);
+                        self.clean_slots -= self.clean_slots(node);
+                        self.release(&node.location);
+                    }
+                }
+                Some(Eviction::Compacted(compacted)) => {
+                    self.stats.dropped[0] += u64::from(!self.flat);
+                    let dropped = self.drop_row(&compacted);
+                    debug_assert!(dropped);
+                }
+                None => return None,
+            }
+        }
+        self.pool.allocate(needed)
+    }
+
+    fn refill_row(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        let key = checkpoint.key;
+        self.pin_record(&key)?;
+        let Some(slots) = self.allocate_slots(self.layout.row_slots(), true) else {
+            self.unpin_record(&key)?;
+            return Ok(StoreOutcome::Retry(StoreReason::Slabs));
+        };
+        self.index.set_ready(&key, false)?;
+        let addresses = self.pool.addresses(&slots);
+        self.index[&key].location.row = Some(slots);
+        let id = self.next_job();
+        let queued = windows(
+            id,
+            Direction::Out,
+            std::iter::empty(),
+            Some((checkpoint.slot, addresses)),
+        );
+        self.outbound.insert(
+            id,
+            Outbound {
+                checkpoint: checkpoint.id,
+                key,
+                refill: true,
+                pending: Pending::new(queued),
+            },
+        );
+        Ok(StoreOutcome::Queued)
+    }
+
     /// Hold bounded cold leaves until they cover the missing slots.
     /// A full tier waits while any such records remain held.
     fn retire_for(&mut self, need_slots: usize) -> bool {
@@ -479,14 +589,8 @@ impl Core {
                 break;
             };
             let held_slots = node.location.slots();
-            let retiring = Retiring {
-                tier: PoolTier::Dram,
-                key,
-                parent: node.parent,
-                bucket: node.bucket,
-                tail_pages: node.tail_pages,
-                row: node.row,
-            };
+            let mut retiring = self.retirement_record(key).unwrap();
+            retiring.ancestor_keys = self.index.ancestor_keys(&key);
             if self.pin_record(&key).is_err() {
                 break;
             }
@@ -495,6 +599,35 @@ impl Core {
             self.retiring.push(retiring);
         }
         !self.held.is_empty()
+    }
+
+    fn retirement_record(&self, key: PrefixKey) -> Option<Retiring> {
+        let node = self.index.node(&key)?;
+        Some(Retiring {
+            tier: PoolTier::Dram,
+            capture_role: node.location.capture_role,
+            child_paths: node.children(),
+            key,
+            parent: node.parent,
+            ancestor_keys: Vec::new(),
+            bucket: node.bucket,
+            tail_pages: node.tail_pages,
+            row: self.offers_row(node),
+            descendant_row: self
+                .index
+                .has_row_below(&key, |n| n.ready && self.offers_row(n)),
+        })
+    }
+
+    fn offers_row(&self, node: &Node<MemoryRecord>) -> bool {
+        node.row
+            && !self.index.covered_endpoint(
+                node.key,
+                node.parent,
+                node.location.capture_role,
+                node.children(),
+                |n| n.ready,
+            )
     }
 
     fn clean_slots(&self, node: &Node<MemoryRecord>) -> usize {
@@ -519,6 +652,9 @@ impl Core {
     }
 
     fn unpin_record(&mut self, key: &PrefixKey) -> Result<()> {
+        if self.held.contains_key(key) && self.index[key].pins() == 1 {
+            return Err(invalid("the retirement still holds this host record"));
+        }
         self.index.unpin(key)?;
         self.clean_slots += self.clean_slots(&self.index[key]);
         Ok(())
@@ -561,7 +697,15 @@ impl Core {
         self.stats.held[0] += u64::from(how == Retirement::Failed);
         self.stats.progress += 1;
         if how != Retirement::Failed {
-            self.finishing.push(*key);
+            let mut cursor = Some(*key);
+            while let Some(k) = cursor {
+                self.finishing.push(k);
+                cursor = self
+                    .index
+                    .node(&k)
+                    .and_then(|node| node.parent)
+                    .filter(|p| how == Retirement::Moved && self.index[p].children() == 1);
+            }
             self.finish_retired();
         }
     }
@@ -570,11 +714,20 @@ impl Core {
     /// them. A record that gained a child meanwhile stays.
     fn finish_retired(&mut self) {
         let mut finishing = std::mem::take(&mut self.finishing);
+        finishing.sort_unstable_by_key(|key| std::cmp::Reverse(key.consumed_tokens));
+        finishing.dedup();
+        let mut waiting = HashSet::new();
         finishing.retain(|key| {
-            if self.index.node(key).is_some_and(|node| node.pinned()) {
+            let Some(node) = self.index.node(key) else {
+                return false;
+            };
+            if node.pinned() || waiting.contains(key) {
+                if let Some(parent) = node.parent {
+                    waiting.insert(parent);
+                }
                 return true;
             }
-            if self.remove_record(key).is_ok() {
+            if node.children() == 0 && self.remove_record(key).is_ok() {
                 self.stats.progress += 1;
             }
             false
@@ -709,25 +862,44 @@ impl Core {
         self.thin_rows_for(self.layout.row_slots().saturating_mul(2));
     }
 
+    fn free_retention_slots(&self) -> usize {
+        self.pool
+            .free_slots()
+            .saturating_sub(self.pool.intake_slots())
+    }
+
     fn thin_rows_for(&mut self, headroom: usize) {
         // Intake slots belong to transfers, not checkpoint retention. Reclaim
         // redundant rows before an incoming record evicts reusable endpoints.
-        if self
-            .pool
-            .free_slots()
-            .saturating_sub(self.pool.intake_slots())
-            > headroom
-        {
+        if self.free_retention_slots() > headroom {
             return;
         }
-        for key in std::mem::take(&mut self.thinning) {
-            if !self.index.row_redundant(&key, false) {
+        // A single child does not prove its parent's row useless: a request that
+        // branches from the parent (a side request, or history the client renders
+        // differently) leaves the parent as the only resume point of the main
+        // conversation. Reclaim the least recently used rows first, and only as
+        // many as the headroom needs, so recently used parents keep theirs.
+        let mut queued = self.index.thinning_order(&mut self.thinning);
+        for key in queued.by_ref() {
+            if !self.index[&key].row
+                || self.index[&key].location.capture_role != crate::CaptureRole::Endpoint
+                || !self.index.row_redundant(&key, false)
+                || self.index[&key].ready_children() != 1
+            {
+                continue;
+            }
+            if !self.index.has_row_below(&key, |n| n.ready && n.row) {
+                self.thinning.insert(key);
                 continue;
             }
             if !self.thin(&key) {
                 self.thinning.insert(key);
             }
+            if self.free_retention_slots() > headroom {
+                break;
+            }
         }
+        self.thinning.extend(queued);
     }
 
     fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
@@ -751,7 +923,7 @@ impl Core {
     }
 
     fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
-        for node in self.index.remove(key)? {
+        for node in self.index.remove(key, |_| false)? {
             self.thinning.remove(&node.key);
             self.clean_slots -= self.clean_slots(&node);
             self.release(&node.location);
@@ -967,22 +1139,45 @@ impl Core {
             checkpoint,
             key,
             pending,
+            refill,
         } = outbound;
-        let result = match pending.error {
-            None => match self.complete_record(&key, true) {
-                Ok(()) => {
-                    self.stats.stored += 1;
+        let result = if refill {
+            let result = match pending.error {
+                None => {
+                    self.index[&key].row = true;
+                    self.stats.row_refills += 1;
                     self.stats.bytes_out += pending.bytes;
                     Ok(pending.bytes)
                 }
-                Err(error) => Err(error),
-            },
-            Some(error) => {
-                self.stats.store_failed += 1;
-                if let Err(removal) = self.complete_record(&key, false) {
-                    Err(invalid(format!("{error}; {removal}")))
-                } else {
+                Some(error) => {
+                    self.pool
+                        .release(self.index[&key].location.row.take().unwrap());
+                    self.stats.store_failed += 1;
                     Err(error)
+                }
+            };
+            self.index
+                .set_ready(&key, true)
+                .expect("refill holds the indexed record");
+            self.unpin_record(&key).expect("refill owns a pin");
+            result
+        } else {
+            match pending.error {
+                None => match self.complete_record(&key, true) {
+                    Ok(()) => {
+                        self.stats.stored += 1;
+                        self.stats.bytes_out += pending.bytes;
+                        Ok(pending.bytes)
+                    }
+                    Err(error) => Err(error),
+                },
+                Some(error) => {
+                    self.stats.store_failed += 1;
+                    if let Err(removal) = self.complete_record(&key, false) {
+                        Err(invalid(format!("{error}; {removal}")))
+                    } else {
+                        Err(error)
+                    }
                 }
             }
         };
@@ -1010,9 +1205,24 @@ impl Core {
                 }
             });
             for checkpoint in waiting {
+                // The ancestor that finished may have failed, leaving a deeper one
+                // still copying out to wait for.
+                if let ParentChoice::Waiting(ancestor) = self.select_parent(&checkpoint) {
+                    self.deferred.push((ancestor, checkpoint));
+                    continue;
+                }
                 let (parent, tail) = self.shape(&checkpoint);
-                let result = match self.start_record(&checkpoint, parent, tail, true) {
-                    Ok(true) => continue,
+                let result = match self.start_record(
+                    &checkpoint,
+                    parent,
+                    tail,
+                    true,
+                    self.needs_row(&checkpoint, parent),
+                ) {
+                    Ok(true) => {
+                        self.count_copy(&checkpoint, parent, tail.len());
+                        continue;
+                    }
                     Ok(false) => {
                         events.push(StoreEvent::Deferred {
                             checkpoint: checkpoint.id,
@@ -1054,6 +1264,7 @@ impl Core {
                     self.index.touch_ancestors(key);
                 }
                 self.stats.fetched += 1;
+                self.stats.restores_by_tier[crate::Tier::Dram as usize] += 1;
                 self.stats.bytes_in += pending.bytes;
                 self.stats.reused_tokens += tokens;
                 Ok(pending.bytes)
@@ -1069,9 +1280,11 @@ impl Core {
     /// Drop every transfer in progress: unready records leave the index and
     /// pinned chains are released. No event follows.
     fn abandon(&mut self) {
+        self.deferred.clear();
         let outbound = std::mem::take(&mut self.outbound);
-        for (_, outbound) in outbound {
-            let _ = self.complete_record(&outbound.key, false);
+        for (_, mut outbound) in outbound {
+            outbound.pending.error = Some(invalid("host copy abandoned"));
+            self.finish_outbound(outbound, &mut Vec::new());
         }
         let inbound = std::mem::take(&mut self.inbound);
         for (_, inbound) in inbound {
@@ -1079,7 +1292,6 @@ impl Core {
                 let _ = self.unpin_record(node);
             }
         }
-        self.deferred.clear();
     }
 
     fn resident_bytes(&self) -> u64 {
@@ -1088,7 +1300,22 @@ impl Core {
     }
 
     fn stats(&self) -> StoreStats {
+        let mut path = HashSet::new();
+        for tip in self.held.keys() {
+            let mut cursor = Some(*tip);
+            while let Some(key) = cursor {
+                if !path.insert(key) {
+                    break;
+                }
+                cursor = self.index[&key].parent;
+            }
+        }
+        let slots: usize = path
+            .iter()
+            .map(|key| self.index[key].location.slots())
+            .sum();
         StoreStats {
+            retirement_pinned_bytes: slots as u64 * self.pool.page_bytes() as u64,
             outbound_in_flight: self.outbound.len() + self.deferred.len(),
             inbound_in_flight: self.inbound.len(),
             memory_records: self.index.len(),
@@ -1104,8 +1331,8 @@ impl Core {
 }
 
 /// Split a record into transfer windows of at most [`WINDOW_PAGES`] pages,
-/// attaching the row to the last one. A record without pages is one window
-/// holding only the row.
+/// attaching the row to the last one. A row alone needs one window. An empty
+/// link needs none.
 fn windows(
     id: JobId,
     direction: Direction,
@@ -1157,6 +1384,7 @@ impl Drop for Announce {
 }
 
 pub struct MemoryStore {
+    pass_through: bool,
     // Dropped first: the checksum thread reads slots the core frees.
     announce: Option<Announce>,
     core: Core,
@@ -1170,20 +1398,21 @@ pub struct MemoryStore {
 impl MemoryStore {
     /// A standalone store whose index mirrors the GPU checkpoint tree.
     pub fn new(identity: [u8; 32], pool: SlabPool, transfers: SharedCopier) -> Result<Self> {
-        Self::open(identity, pool, transfers, false)
+        Self::open(identity, pool, transfers, false, false)
     }
 
     /// A store inside a composite: every node is a root and the composite's
     /// disk index owns parent links.
     pub fn new_flat(identity: [u8; 32], pool: SlabPool, transfers: SharedCopier) -> Result<Self> {
-        Self::open(identity, pool, transfers, true)
+        Self::open(identity, pool, transfers, true, false)
     }
 
-    fn open(
+    pub(crate) fn open(
         identity: [u8; 32],
         pool: SlabPool,
         transfers: SharedCopier,
         flat: bool,
+        pass_through: bool,
     ) -> Result<Self> {
         let layout = transfers
             .lock()
@@ -1194,6 +1423,7 @@ impl MemoryStore {
             return Err(invalid("slot size disagrees with the record layout"));
         }
         Ok(Self {
+            pass_through,
             core: Core::new(identity, pool, layout, flat),
             announce: None,
             transfers,
@@ -1263,6 +1493,15 @@ impl MemoryStore {
         Ok(accepted)
     }
 
+    /// Index the zero-page link without allocating a row or starting a device copy.
+    pub(crate) fn store_empty(
+        &mut self,
+        checkpoint: &PublishedCheckpoint,
+        parent: Option<PrefixKey>,
+    ) -> Result<bool> {
+        self.core.start_record(checkpoint, parent, &[], false, false)
+    }
+
     /// Allocate slots for a record read in from elsewhere, evicting under the
     /// policy, and index it unready and pinned; `None` when no slots can be
     /// freed. The record is durable: it exists outside this store already.
@@ -1303,6 +1542,12 @@ impl MemoryStore {
         self.announce.as_ref()?.sums.get(key).cloned()
     }
 
+    pub(crate) fn promote_role(&mut self, key: PrefixKey, role: crate::CaptureRole) {
+        if let Some(node) = self.core.index.node_mut(&key) {
+            node.location.capture_role = node.location.capture_role.merge(role);
+        }
+    }
+
     /// The slots of a ready record.
     pub fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
         self.core.record(key)
@@ -1310,6 +1555,10 @@ impl MemoryStore {
 
     pub(crate) fn drop_row(&mut self, key: &PrefixKey) -> bool {
         self.core.thin(key)
+    }
+
+    pub(crate) fn free_retention_slots(&self) -> usize {
+        self.core.free_retention_slots()
     }
 
     /// Remove an unpinned childless record and release its slots.
@@ -1580,8 +1829,14 @@ impl HostStore for MemoryStore {
             self.core.stats.store_skipped += 1;
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
-        if let Some(node) = self.core.index.node(&checkpoint.key) {
-            if node.ready && node.row {
+        let covered = self
+            .core
+            .index
+            .node(&checkpoint.key)
+            .is_some_and(|node| !self.core.needs_row(checkpoint, node.parent));
+        if let Some(node) = self.core.index.node_mut(&checkpoint.key) {
+            node.location.capture_role = node.location.capture_role.merge(checkpoint.capture_role);
+            if node.ready && (node.row || covered) {
                 self.core.stats.store_skipped += 1;
                 self.core.index.touch_ancestors(&checkpoint.key);
                 return Ok(StoreOutcome::Present);
@@ -1590,18 +1845,15 @@ impl HostStore for MemoryStore {
                 self.core.stats.store_skipped += 1;
                 return Ok(StoreOutcome::Retry(StoreReason::Inflight));
             }
-            // Memory-only rows can be republished as complete roots after compaction.
-            // A node with descendants must retain its page chain until they are evicted.
-            if node.children() != 0 {
-                self.core.stats.store_skipped += 1;
-                return Ok(StoreOutcome::Retry(StoreReason::Slabs));
-            }
-            self.core.remove_record(&checkpoint.key)?;
+            let result = self.core.refill_row(checkpoint)?;
+            self.pump();
+            return Ok(result);
         }
-        let (_, tail) = self.core.shape(checkpoint);
+        let (parent, tail) = self.core.shape(checkpoint);
+        let row = self.core.needs_row(checkpoint, parent);
         if !self
             .core
-            .fits(self.core.layout.record_slots(tail.len(), true))
+            .fits(self.core.layout.record_slots(tail.len(), row))
         {
             self.core.stats.store_skipped += 1;
             self.core.stats.dropped[1] += 1;
@@ -1643,8 +1895,12 @@ impl HostStore for MemoryStore {
             }
             self.flush_announcements(&|_, parent| parent, &|_| None);
             if self.core.spill {
-                self.core
-                    .retire_for(self.reserve(2 * self.core.pool.intake_slots()));
+                let target = if self.pass_through {
+                    self.pool().slot_count()
+                } else {
+                    2 * self.pool().intake_slots()
+                };
+                self.core.retire_for(self.reserve(target));
             }
         }
         Ok(())
@@ -1682,6 +1938,16 @@ impl HostStore for MemoryStore {
 }
 
 impl crate::store::TierStore for MemoryStore {
+    fn begin_pool_drain(&mut self) -> Option<(usize, u64)> {
+        self.pass_through = true;
+        let core = &self.core;
+        let record_bytes = |pages: usize, row: bool| {
+            pages as u64 * core.layout.page_record_bytes + u64::from(row) * core.layout.row_record_bytes
+        };
+        let resident: u64 = core.index.nodes().map(|node| record_bytes(node.tail_pages, node.row)).sum();
+        let deferred: u64 = core.deferred.iter().map(|(_, copy)| record_bytes(copy.tail_pages, true)).sum();
+        Some((core.index.len() + core.deferred.len(), resident + deferred))
+    }
     fn announce_to(&mut self, announcer: Announcer) {
         if let Err(error) = self.announce_records(announcer) {
             eprintln!("warning: host memory records will not be shared: {error}");
@@ -1704,6 +1970,13 @@ impl crate::store::TierStore for MemoryStore {
         let enabled = enabled && !self.core.flat && self.announce.is_some();
         self.core.stats.progress += u64::from(self.core.spill != enabled);
         self.core.set_spill(enabled);
+    }
+    fn retirement_predecessor(&self, key: PrefixKey, candidates: bool) -> Option<Retiring> {
+        let mut record = self.core.retirement_record(key)?;
+        if candidates {
+            record.ancestor_keys = self.core.index.ancestor_keys(&key);
+        }
+        Some(record)
     }
     fn take_retiring(&mut self) -> Vec<Retiring> {
         std::mem::take(&mut self.core.retiring)
@@ -1770,10 +2043,12 @@ mod tests {
     ) -> PublishedCheckpoint {
         let chain = (consumed / PT) as u32;
         let tail = chain - parent.map_or(0, |p| (p / PT) as u32);
+        let parent = parent.map(|tokens| history.key_at(tokens).unwrap());
         PublishedCheckpoint {
+            capture_role: crate::CaptureRole::Endpoint,
             id: checkpoint_id(slot),
             key: history.key_at(consumed).unwrap(),
-            parent: parent.map(|p| history.key_at(p).unwrap()),
+            ancestors: parent.into_iter().collect(),
             bucket: history.bucket_at(consumed).unwrap(),
             chain_pages: (first_page..first_page + chain).map(PageId).collect(),
             tail_pages: tail as usize,
@@ -1856,13 +2131,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(turn, vec![turn as u8; ROW as usize]);
-            let checkpoint = published(
+            let mut checkpoint = published(
                 &full,
                 u64::from(turn) * PT,
                 (turn > 1).then(|| u64::from(turn - 1) * PT),
                 0,
                 turn,
             );
+            checkpoint.capture_role = crate::CaptureRole::Message;
             assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
             store.poll(&mut events).unwrap();
             assert_eq!(
@@ -1972,38 +2248,132 @@ mod tests {
     }
 
     #[test]
+    fn pressure_keeps_the_last_row_above_a_covered_tip() {
+        let mut core = store_core(32, 8, false);
+        let full = history(192, 1);
+        let parent = published(&full, 128, Some(64), 0, 2);
+        let tip = published(&full, 134, Some(128), 0, 3);
+        for cp in [
+            published(&full, 64, None, 0, 1),
+            parent.clone(),
+            tip.clone(),
+        ] {
+            assert!(core.store(&cp).unwrap());
+            finish(&mut core);
+        }
+        assert!(!core.index[&tip.key].row);
+        core.thin_rows_for(usize::MAX);
+        assert_eq!(core.lookup(&full, 0, u64::MAX).unwrap().key, parent.key);
+        assert!(
+            core.index
+                .candidate(true, |n| n.key == parent.key)
+                .is_none()
+        );
+        let deep = published(&full, 192, Some(134), 0, 4);
+        assert!(core.store(&deep).unwrap());
+        finish(&mut core);
+        core.thin_rows_for(usize::MAX);
+        assert!(!core.index[&parent.key].row);
+        assert_eq!(core.lookup(&full, 0, u64::MAX).unwrap().key, deep.key);
+    }
+
+    #[test]
+    fn same_page_endpoint_replays_from_the_exact_message_boundary() {
+        use crate::CaptureRole::{Anchor, Message};
+        let mut core = store_core(64, 16, false);
+        let full = history(134, 1);
+        let mut branch = history(64, 1);
+        branch.append(&[42; 71], &[]).unwrap();
+        let root = published(&full, 64, None, 0, 1);
+        let mut anchor = published(&full, 128, Some(64), 0, 2);
+        anchor.capture_role = Anchor;
+        let mut message = published(&full, 129, Some(128), 0, 3);
+        message.capture_role = Message;
+        let endpoint = published(&full, 134, Some(129), 0, 4);
+        let sibling = published(&branch, 135, Some(64), 0, 5);
+        for record in [&root, &anchor, &message, &sibling] {
+            assert!(core.store(record).unwrap());
+            finish(&mut core);
+        }
+        core.store(&endpoint).unwrap();
+        finish(&mut core);
+        assert_eq!(core.lookup(&full, 0, 129).unwrap().key, anchor.key);
+        assert_eq!(core.lookup(&full, 0, 130).unwrap().key, message.key);
+        assert!(core.index.node(&endpoint.key).is_none_or(|node| !node.row));
+        let hit = core.lookup(&full, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, message.key);
+        assert_eq!(endpoint.key.consumed_tokens - hit.consumed_tokens, 5);
+        assert_eq!(core.lookup(&branch, 0, u64::MAX).unwrap().key, sibling.key);
+    }
+
+    #[test]
+    fn retirement_offers_a_covered_endpoint_row_only_if_it_becomes_a_fork() {
+        let mut core = store_core(64, 16, false);
+        let full = history(192, 1);
+        let root = published(&full, 128, None, 0, 1);
+        let endpoint = published(&full, 134, Some(128), 0, 2);
+        for record in [&root, &endpoint] {
+            assert!(core.store(record).unwrap());
+            finish(&mut core);
+        }
+        // An existing holder can still have a row from an earlier capture.
+        assert_eq!(core.refill_row(&endpoint).unwrap(), StoreOutcome::Queued);
+        finish(&mut core);
+        assert!(core.index[&endpoint.key].row);
+        assert!(!core.retirement_record(endpoint.key).unwrap().row);
+        let child = published(&full, 192, Some(134), 0, 3);
+        assert!(core.store(&child).unwrap());
+        finish(&mut core);
+        assert!(!core.retirement_record(endpoint.key).unwrap().row);
+        let mut branch = history(134, 1);
+        branch.append(&[42; 58], &[]).unwrap();
+        let sibling = published(&branch, 192, Some(134), 0, 4);
+        assert!(core.store(&sibling).unwrap());
+        finish(&mut core);
+        let offered = core.retirement_record(endpoint.key).unwrap();
+        assert_eq!(offered.child_paths, 2);
+        assert!(offered.row);
+        assert!(core.retirement_record(root.key).unwrap().row);
+    }
+
+    #[test]
     fn row_thinning_uses_warm_headroom_for_each_row_geometry() {
-        for row_slots in [1, 3] {
-            for headroom in [2 * row_slots, 2 * row_slots + 1] {
-                let layout =
-                    Layout::new(&[geometry(PT, &[("kv", PAGE)], row_slots as u64 * PAGE)]).unwrap();
-                assert_eq!(layout.row_slots(), row_slots);
-                let intake = crate::offload::intake_slots(&layout, 1);
-                let warm = 3 * (1 + row_slots) + headroom;
-                let pool = SlabPool::new(PAGE, warm + intake, intake).unwrap();
-                let mut core = Core::new(IDENTITY, pool, layout, false);
-                let full = history(192, 1);
-                let checkpoints = [
-                    published(&full, 64, None, 0, 1),
-                    published(&full, 128, Some(64), 0, 2),
-                    published(&full, 192, Some(128), 0, 3),
-                ];
-                for checkpoint in &checkpoints {
-                    assert!(core.store(checkpoint).unwrap());
-                    finish(&mut core);
+        use crate::CaptureRole::{Anchor, Endpoint, Message};
+        for role in [Endpoint, Message, Anchor] {
+            for row_slots in [1, 3] {
+                for headroom in [2 * row_slots, 2 * row_slots + 1] {
+                    let layout =
+                        Layout::new(&[geometry(PT, &[("kv", PAGE)], row_slots as u64 * PAGE)])
+                            .unwrap();
+                    assert_eq!(layout.row_slots(), row_slots);
+                    let intake = crate::offload::intake_slots(&layout, 1);
+                    let warm = 3 * (1 + row_slots) + headroom;
+                    let pool = SlabPool::new(PAGE, warm + intake, intake).unwrap();
+                    let mut core = Core::new(IDENTITY, pool, layout, false);
+                    let full = history(192, 1);
+                    let mut checkpoints = [
+                        published(&full, 64, None, 0, 1),
+                        published(&full, 128, Some(64), 0, 2),
+                        published(&full, 192, Some(128), 0, 3),
+                    ];
+                    checkpoints[1].capture_role = role;
+                    for checkpoint in &checkpoints {
+                        assert!(core.store(checkpoint).unwrap());
+                        finish(&mut core);
+                    }
+                    let thinned = role == Endpoint && headroom == 2 * row_slots;
+                    assert_eq!(
+                        core.index[&checkpoints[1].key].row, !thinned,
+                        "role={role:?}, row_slots={row_slots}, warm headroom={headroom}, intake={intake}"
+                    );
+                    assert_eq!(
+                        core.pool.free_slots(),
+                        intake + headroom + usize::from(thinned) * row_slots
+                    );
+                    assert!(core.index[&checkpoints[0].key].row);
+                    assert!(core.index[&checkpoints[2].key].row);
+                    assert_clean_slots(&core);
                 }
-                let thinned = headroom == 2 * row_slots;
-                assert_eq!(
-                    core.index[&checkpoints[1].key].row, !thinned,
-                    "row_slots={row_slots}, warm headroom={headroom}, intake={intake}"
-                );
-                assert_eq!(
-                    core.pool.free_slots(),
-                    intake + headroom + usize::from(thinned) * row_slots
-                );
-                assert!(core.index[&checkpoints[0].key].row);
-                assert!(core.index[&checkpoints[2].key].row);
-                assert_clean_slots(&core);
             }
         }
     }
@@ -2030,6 +2400,46 @@ mod tests {
             assert!(core.pool.free_slots() >= core.pool.intake_slots());
             assert_clean_slots(&core);
         }
+    }
+
+    #[test]
+    fn pressure_keeps_the_row_of_a_recently_used_parent_whose_child_branched_away() {
+        let mut core = store_core(4, 6, false);
+        let main = history(256, 1);
+        let root = published(&main, 64, None, 0, 1);
+        let older = published(&main, 128, Some(64), 0, 2);
+        let resume = published(&main, 192, Some(128), 0, 3);
+        for checkpoint in [&root, &older, &resume] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        // A side request reuses the main conversation's last checkpoint and
+        // then diverges, so its record cannot resume the main conversation.
+        core.reused(&resume.key);
+        let mut branch = PrefixHistory::new(IDENTITY);
+        let shared: Vec<u32> = (0..192u32)
+            .map(|t| t.wrapping_mul(2654435761).wrapping_add(1))
+            .collect();
+        branch.append(&shared, &[]).unwrap();
+        branch
+            .append(&(0..64u32).map(|t| 7_000_000 + t).collect::<Vec<_>>(), &[])
+            .unwrap();
+        let side = published(&branch, 256, Some(192), 0, 4);
+        assert!(core.store(&side).unwrap());
+        finish(&mut core);
+        assert!(
+            !core.index[&older.key].row,
+            "the older redundant row is reclaimed first"
+        );
+        assert!(
+            core.index[&resume.key].row,
+            "the recently used parent keeps its row"
+        );
+        assert_eq!(
+            core.lookup(&main, 0, u64::MAX).map(|hit| hit.key),
+            Some(resume.key)
+        );
+        assert_clean_slots(&core);
     }
 
     #[test]
@@ -2196,23 +2606,429 @@ mod tests {
 
     #[test]
     fn gpu_reuse_cannot_prevent_row_compaction_or_recreate_a_host_copy() {
-        let mut core = store_core(3, 2, false);
+        let mut core = store_core(3, 3, false);
         let full = history(128, 1);
-        let root = published(&full, 64, None, 0, 1);
+        let root = published(&full, 1, None, 0, 99);
+        assert!(core.store(&root).unwrap());
+        finish(&mut core);
+        let interior = published(&full, 64, Some(1), 0, 1);
         let child = published(&full, 128, Some(64), 0, 2);
         let stranger = published(&history(64, 2), 64, None, 2, 3);
-        assert!(core.store(&root).unwrap());
+        assert!(core.store(&interior).unwrap());
         finish(&mut core);
         assert!(core.store(&child).unwrap());
         finish(&mut core);
         core.pin_record(&child.key).unwrap();
-        core.reused(&root.key);
+        core.reused(&interior.key);
         assert!(core.store(&stranger).unwrap());
         finish(&mut core);
-        assert!(!core.index.node(&root.key).unwrap().row);
-        core.reused(&root.key);
-        assert!(core.lookup(&full, 0, 128).is_none());
+        assert!(!core.index.node(&interior.key).unwrap().row);
+        core.reused(&interior.key);
+        assert_eq!(core.lookup(&full, 0, 128).unwrap().key, root.key);
         core.unpin_record(&child.key).unwrap();
+    }
+
+    #[test]
+    fn a_stored_root_keeps_its_offered_ancestors_for_the_pool_put() {
+        let mut core = store_core(32, 4, false);
+        let full = history(1200, 1);
+        // No ancestor is indexed, so the record is a root that still names them all.
+        let mut root = published(&full, 400, Some(200), 10, 1);
+        root.ancestors.push(full.key_at(128).unwrap());
+        assert!(core.store(&root).unwrap());
+        assert_eq!(
+            core.index.ancestor_keys(&root.key),
+            [full.key_at(200).unwrap(), full.key_at(128).unwrap()]
+        );
+    }
+
+    /// A publication at `consumed` whose offered ancestors are `ancestors`, nearest
+    /// first, the nearest being its `parent`.
+    fn published_under(
+        history: &PrefixHistory,
+        consumed: u64,
+        ancestors: &[u64],
+        first_page: u32,
+        slot: u32,
+    ) -> PublishedCheckpoint {
+        let mut checkpoint = published(
+            history,
+            consumed,
+            ancestors.first().copied(),
+            first_page,
+            slot,
+        );
+        checkpoint.ancestors = ancestors
+            .iter()
+            .map(|tokens| history.key_at(*tokens).unwrap())
+            .collect();
+        checkpoint
+    }
+
+    /// The pages the queued copy of `key` reads, in order.
+    fn queued_pages(core: &Core, key: PrefixKey) -> Vec<PageId> {
+        let (_, outbound) = core
+            .outbound
+            .iter()
+            .find(|(_, outbound)| outbound.key == key)
+            .expect("the record is copying out");
+        outbound
+            .pending
+            .queued
+            .iter()
+            .flat_map(|job| job.pages.iter().map(|(page, _)| *page))
+            .collect()
+    }
+
+    /// Poll `store` until every copy-out it accepted has finished.
+    fn settle_store(store: &mut MemoryStore) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut events = Vec::new();
+        while !store.core.outbound.is_empty() {
+            assert!(Instant::now() < deadline, "copy-outs did not finish");
+            store.poll(&mut events).unwrap();
+            std::thread::yield_now();
+        }
+    }
+
+    /// Store `checkpoint` as an Anchor and finish its copy.
+    fn store_anchor(core: &mut Core, history: &PrefixHistory, consumed: u64, slot: u32) {
+        let mut anchor = published(history, consumed, None, 0, slot);
+        anchor.capture_role = crate::CaptureRole::Anchor;
+        assert!(core.store(&anchor).unwrap());
+        finish(core);
+    }
+
+    #[test]
+    fn a_terminal_endpoint_links_under_the_held_anchor_past_an_unstored_prompt_end() {
+        // Anchor A (a row, held) at 10 pages; the prompt-end Endpoint B shares A's
+        // page and is never stored; the terminal Endpoint C is 7 pages past A.
+        let mut core = store_core(64, 8, false);
+        let full = history(1200, 1);
+        store_anchor(&mut core, &full, 640, 1);
+        let anchor = full.key_at(640).unwrap();
+        let terminal = published_under(&full, 1098, &[642, 640], 0, 3);
+        assert_eq!(terminal.parent(), Some(full.key_at(642).unwrap()));
+        assert!(core.store(&terminal).unwrap());
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, Some(anchor));
+        assert_eq!(node.tail_pages, 7);
+        assert!(node.location.row.is_some());
+        let copied = queued_pages(&core, terminal.key);
+        assert_eq!(copied, (10..17).map(PageId).collect::<Vec<_>>());
+        // The Anchor was the lineage's first root; C is the one linked deeper than its
+        // nearest offered ancestor, and copied only its seven pages.
+        assert_eq!(core.stats().root_records[0], [1, 0]);
+        assert_eq!(core.stats().deeper_link_records[0], 1);
+        assert_eq!(core.stats().root_pages[0], [10, 0]);
+        assert_eq!(core.stats().deeper_link_pages[0], 7);
+        finish(&mut core);
+        // The chain restores whole: A's ten pages, then the seven.
+        let hit = core.lookup(&full, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, terminal.key);
+        assert_eq!(hit.pages, 17);
+    }
+
+    #[test]
+    fn root_copies_count_pages_by_whether_ancestors_were_offered() {
+        let mut core = store_core(64, 8, false);
+        let full = history(1200, 1);
+        let terminal = published_under(&full, 1098, &[642, 640], 0, 3);
+        assert!(core.store(&terminal).unwrap());
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, None);
+        assert_eq!(node.tail_pages, 17);
+        assert_eq!(
+            queued_pages(&core, terminal.key),
+            (0..17).map(PageId).collect::<Vec<_>>()
+        );
+        assert_eq!(core.stats().root_records[0], [0, 1]);
+        assert_eq!(core.stats().deeper_link_records[0], 0);
+        assert_eq!(core.stats().root_pages[0], [0, 17]);
+        assert_eq!(core.stats().deeper_link_pages[0], 0);
+        // Without any offered ancestor the reason is the first of its lineage.
+        let first = published(&full, 1200, None, 100, 4);
+        assert!(core.store(&first).unwrap());
+        assert_eq!(core.stats().root_records[0], [1, 1]);
+        assert_eq!(core.stats().deeper_link_records[0], 0);
+        assert_eq!(core.stats().root_pages[0], [18, 17]);
+        assert_eq!(core.stats().deeper_link_pages[0], 0);
+        // The offered ancestors are the hint a pool put carries for the root.
+        assert_eq!(
+            core.index.ancestor_keys(&terminal.key),
+            [full.key_at(642).unwrap(), full.key_at(640).unwrap()]
+        );
+    }
+
+    #[test]
+    fn the_deepest_held_ancestor_wins_over_a_shallower_one() {
+        let mut core = store_core(96, 8, false);
+        let full = history(1200, 1);
+        store_anchor(&mut core, &full, 320, 1);
+        let shallow = full.key_at(320).unwrap();
+        let deep = published_under(&full, 640, &[320], 0, 2);
+        assert!(core.store(&deep).unwrap());
+        finish(&mut core);
+        assert_eq!(core.index[&deep.key].parent, Some(shallow));
+        let terminal = published_under(&full, 1098, &[642, 640, 320], 0, 3);
+        assert!(core.store(&terminal).unwrap());
+        assert_eq!(core.index[&terminal.key].parent, Some(deep.key));
+        assert_eq!(core.index[&terminal.key].tail_pages, 7);
+        finish(&mut core);
+    }
+
+    #[test]
+    fn a_held_same_page_message_ahead_of_an_unheld_anchor_is_the_parent() {
+        // The Anchor X is not held. The Message M shares X's page, is held, and is
+        // nearer: M is the only held key.
+        let mut core = store_core(64, 8, false);
+        let full = history(1200, 1);
+        let mut message = published(&full, 330, None, 0, 1);
+        message.capture_role = crate::CaptureRole::Message;
+        assert!(core.store(&message).unwrap());
+        finish(&mut core);
+        let terminal = published_under(&full, 522, &[340, 330, 320], 0, 2);
+        assert!(core.store(&terminal).unwrap());
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, Some(message.key));
+        assert_eq!(node.tail_pages, 3);
+        assert_eq!(
+            queued_pages(&core, terminal.key),
+            (5..8).map(PageId).collect::<Vec<_>>()
+        );
+        finish(&mut core);
+    }
+
+    #[test]
+    fn a_publication_waits_for_the_first_known_ancestor_still_copying_out() {
+        // The nearest ancestor was never stored. The next copy-out is in flight and a
+        // deeper one is ready: the publication waits for the nearer one rather than
+        // copying pages the nearer one will hold.
+        let mut core = store_core(96, 8, false);
+        let full = history(1200, 1);
+        store_anchor(&mut core, &full, 320, 1);
+        let held = published_under(&full, 640, &[320], 0, 2);
+        assert!(core.store(&held).unwrap());
+        let terminal = published_under(&full, 1098, &[700, 640, 320], 0, 3);
+        assert!(core.store(&terminal).unwrap());
+        assert!(!core.index.contains(&terminal.key));
+        assert_eq!(core.deferred.len(), 1);
+        assert_eq!(core.deferred[0].0, held.key);
+        finish(&mut core);
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, Some(held.key));
+        assert_eq!(node.tail_pages, 7);
+        assert!(core.deferred.is_empty());
+        finish(&mut core);
+    }
+
+    #[test]
+    fn a_failed_copy_defers_its_child_until_the_next_ancestor_is_ready() {
+        let mut core = store_core(96, 8, false);
+        let full = history(1200, 1);
+        let near = published_under(&full, 640, &[], 0, 1);
+        let far = published_under(&full, 320, &[], 100, 2);
+        assert!(core.store(&far).unwrap());
+        assert!(core.store(&near).unwrap());
+        let terminal = published_under(&full, 1098, &[640, 320], 0, 3);
+        assert!(core.store(&terminal).unwrap());
+        assert_eq!(core.deferred[0].0, near.key);
+        // The nearer copy-out fails while the farther is still in flight.
+        let mut submitted = Vec::new();
+        pump_into(&mut core, &mut submitted);
+        let (failing, running): (Vec<_>, Vec<_>) = submitted
+            .iter()
+            .partition(|job| job.pages.first().map(|(page, _)| *page) == Some(PageId(0)));
+        let mut events = Vec::new();
+        for job in &failing {
+            core.absorb(reply(job, Err(invalid("copy engine fault"))));
+        }
+        core.settle(&mut events);
+        assert!(!core.index.contains(&near.key));
+        // It waits on the farther ancestor, which is still copying out.
+        assert_eq!(core.deferred.len(), 1);
+        assert_eq!(core.deferred[0].0, far.key);
+        assert!(!core.index.contains(&terminal.key));
+        for job in &running {
+            core.absorb(reply(job, Ok(())));
+        }
+        core.settle(&mut events);
+        finish(&mut core);
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, Some(far.key));
+        assert_eq!(node.tail_pages, 12);
+    }
+
+    /// An Endpoint that shares its page with a held Anchor keeps no row of its own:
+    /// the Anchor's row and an in-page replay restore it. That holds only when the
+    /// record is stored under the Anchor, so the row and the parent must agree.
+    fn assert_row_follows_parent(core: &Core, key: PrefixKey, anchor: PrefixKey) {
+        let node = core.index.node(&key).expect("the endpoint is stored");
+        if !node.row {
+            assert_eq!(
+                node.parent,
+                Some(anchor),
+                "an endpoint without a row must hang under the row that covers it"
+            );
+            assert!(core.index.covered_endpoint(
+                key,
+                node.parent,
+                crate::CaptureRole::Endpoint,
+                node.children(),
+                |n| n.ready
+            ));
+        }
+    }
+
+    #[test]
+    fn store_links_a_covered_endpoint_to_its_covering_row() {
+        let full = history(1200, 1);
+        // The Anchor at 640 tokens holds a row; the unstored prompt-end sits at 642 and
+        // the terminal Endpoint at 650 shares their page, so the Anchor covers it.
+        let covered = published_under(&full, 650, &[642, 640], 0, 3);
+        let anchor = full.key_at(640).unwrap();
+
+        let mut core = store_core(64, 8, false);
+        store_anchor(&mut core, &full, 640, 1);
+        assert!(core.store(&covered).unwrap());
+        assert!(!core.index[&covered.key].row);
+        assert_row_follows_parent(&core, covered.key, anchor);
+        finish(&mut core);
+    }
+
+    #[test]
+    fn deferred_retry_links_a_covered_endpoint_to_its_covering_row() {
+        let full = history(1200, 1);
+        let covered = published_under(&full, 650, &[642, 640], 0, 3);
+        let anchor = full.key_at(640).unwrap();
+        let mut core = store_core(64, 8, false);
+        let mut first = published(&full, 640, None, 0, 1);
+        first.capture_role = crate::CaptureRole::Anchor;
+        assert!(core.store(&first).unwrap());
+        assert!(core.store(&covered).unwrap());
+        assert_eq!(core.deferred.len(), 1);
+        finish(&mut core);
+        assert!(!core.index[&covered.key].row);
+        assert_row_follows_parent(&core, covered.key, anchor);
+    }
+
+    #[test]
+    fn preflight_links_a_covered_endpoint_to_its_covering_row() {
+        let full = history(1200, 1);
+        let covered = published_under(&full, 650, &[642, 640], 0, 3);
+        let anchor = full.key_at(640).unwrap();
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, host_pool(64), copier).unwrap();
+        let mut first = published(&full, 640, None, 0, 1);
+        first.capture_role = crate::CaptureRole::Anchor;
+        assert_eq!(store.store(&first).unwrap(), StoreOutcome::Queued);
+        settle_store(&mut store);
+        assert_eq!(store.store(&covered).unwrap(), StoreOutcome::Queued);
+        assert!(!store.core.index[&covered.key].row);
+        assert_row_follows_parent(&store.core, covered.key, anchor);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn terminal_anchor_and_branch_restore_exact_bytes() {
+        // Two ranks, each with its own planes and row share.
+        let geometry = [
+            geometry(PT, &[("kv", PAGE)], ROW),
+            geometry(PT, &[("kv", PAGE)], ROW),
+        ];
+        let layout = Layout::new(&geometry).unwrap();
+        let (page_bytes, row_bytes) = (
+            layout.page_record_bytes as usize,
+            layout.row_record_bytes as usize,
+        );
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let intake = crate::offload::intake_slots(&layout, 1);
+        let pool = SlabPool::new(page_bytes as u64, 64 + intake, intake).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        let page = |index: u32| -> Vec<u8> {
+            (0..page_bytes)
+                .map(|byte| (index as usize * 29 + byte / PAGE as usize * 71 + byte % 251) as u8)
+                .collect()
+        };
+        let row = |slot: u32| -> Vec<u8> {
+            (0..row_bytes)
+                .map(|byte| (slot as usize * 17 + byte / ROW as usize * 91 + byte % 251) as u8)
+                .collect()
+        };
+        for index in 0..17 {
+            gpu.pages.lock().unwrap().insert(index, page(index));
+        }
+        gpu.rows.lock().unwrap().insert(1, row(1));
+        gpu.rows.lock().unwrap().insert(3, row(3));
+        let full = history(1200, 1);
+        let mut anchor = published(&full, 640, None, 0, 1);
+        anchor.capture_role = crate::CaptureRole::Anchor;
+        // The prompt-end shares the Anchor's page and is never stored.
+        let terminal = published_under(&full, 1098, &[642, 640], 0, 3);
+        assert_eq!(store.store(&anchor).unwrap(), StoreOutcome::Queued);
+        settle_store(&mut store);
+        assert_eq!(store.store(&terminal).unwrap(), StoreOutcome::Queued);
+        settle_store(&mut store);
+        assert_eq!(
+            store.core.index[&terminal.key].parent,
+            Some(anchor.key),
+            "the terminal links under the Anchor"
+        );
+
+        let mut branch = history(640, 1);
+        branch.append(&[99; 300], &[]).unwrap();
+        let mut scratch = 100u32;
+        for (history, key, pages, slot) in [
+            (history(1098, 1), terminal.key, 17u32, 3u32),
+            (history(640, 1), anchor.key, 10, 1),
+            (branch, anchor.key, 10, 1),
+        ] {
+            let hit = store.lookup(&history, 0, u64::MAX).unwrap();
+            assert_eq!((hit.key, hit.pages), (key, pages as usize));
+            store
+                .fetch(
+                    hit,
+                    InboundTicket {
+                        key,
+                        pages: (scratch..scratch + pages).map(PageId).collect(),
+                        slot: StateSlotId(scratch),
+                    },
+                )
+                .unwrap();
+            crate::testing::poll_until(&mut store, Instant::now() + Duration::from_secs(20), |event| {
+                matches!(event, StoreEvent::Fetched { result: Ok(_), .. })
+            });
+            for index in 0..pages {
+                assert_eq!(
+                    gpu.pages.lock().unwrap()[&(scratch + index)],
+                    page(index),
+                    "page {index} of the restore of {key:?}"
+                );
+            }
+            assert_eq!(gpu.rows.lock().unwrap()[&scratch], row(slot));
+            scratch += 100;
+        }
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn the_preflight_sizes_a_record_under_the_ancestor_the_store_will_choose() {
+        // The chain is too large to hold as a root, but the Anchor holds its first two
+        // pages, so the record is stored under it. The preflight must not call it
+        // oversize because it priced the whole chain.
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, host_pool(12), copier).unwrap();
+        let full = history(1200, 1);
+        let mut anchor = published(&full, 128, None, 0, 1);
+        anchor.capture_role = crate::CaptureRole::Anchor;
+        assert_eq!(store.store(&anchor).unwrap(), StoreOutcome::Queued);
+        settle_store(&mut store);
+        // 12 pages and a row cannot be a root in 12 slots; 10 pages and a row can.
+        let terminal = published_under(&full, 12 * PT + 5, &[130, 128], 0, 2);
+        assert_ne!(store.store(&terminal).unwrap(), StoreOutcome::Oversize);
+        store.close().unwrap();
     }
 
     #[test]
@@ -2486,54 +3302,64 @@ mod tests {
 
     #[test]
     fn eviction_releases_the_slabs_of_durable_leaves_and_compacts_rows() {
-        let mut core = store_core(9, 2, false);
+        let mut core = store_core(9, 3, false);
         let full = history(1200, 5);
         let other = history(300, 6);
-        let root = published(&full, 200, None, 0, 1);
-        let child = published(&full, 400, Some(200), 0, 2);
+        let root = published(&full, 1, None, 0, 99);
         assert!(core.store(&root).unwrap());
+        finish(&mut core);
+        let interior = published(&full, 200, Some(1), 0, 1);
+        let child = published(&full, 400, Some(200), 0, 2);
+        assert!(core.store(&interior).unwrap());
         finish(&mut core);
         assert!(core.store(&child).unwrap());
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 3);
 
-        // The child is in flight and the root has that child: no leaf
-        // qualifies, so the root's row is compacted away for the stranger.
+        // The parent keeps its row until the child successfully commits.
         let stranger = published(&other, 250, None, 20, 3);
+        assert!(!core.store(&stranger).unwrap());
+        assert!(core.record(&interior.key).unwrap().row.is_some());
+        assert_eq!(stored(&finish(&mut core)).len(), 1);
+        core.pin_record(&child.key).unwrap();
         assert!(core.store(&stranger).unwrap());
-        let root_node = core.index.node(&root.key).unwrap();
-        assert!(!root_node.row);
-        assert_eq!(root_node.location.row, None);
-        assert_eq!(root_node.location.pages.len(), 3);
+        let interior_node = core.index.node(&interior.key).unwrap();
+        assert!(!interior_node.row);
+        assert_eq!(interior_node.location.row, None);
+        assert_eq!(interior_node.location.pages.len(), 3);
         assert!(core.index.contains(&child.key));
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
 
         // Nothing is evictable for the pages a further record needs: it is skipped.
         let late = published(&other, 64, None, 30, 4);
         assert!(!core.store(&late).unwrap());
-        assert_eq!(core.stats().store_skipped, 1);
+        assert_eq!(core.stats().store_skipped, 2);
         assert!(!core.index.contains(&late.key));
-        assert_eq!(stored(&finish(&mut core)).len(), 2);
+        assert_eq!(stored(&finish(&mut core)).len(), 1);
+        core.unpin_record(&child.key).unwrap();
 
-        // The compacted root no longer matches but still supplies its pages.
-        assert!(core.lookup(&history(250, 5), 0, u64::MAX).is_none());
+        // The compacted interior record no longer matches but still supplies its pages.
+        assert_eq!(
+            core.lookup(&history(250, 5), 0, u64::MAX).unwrap().key,
+            root.key
+        );
         let found = core.lookup(&full, 0, u64::MAX).unwrap();
-        assert_eq!(found.chain.nodes, [root.key, child.key]);
+        assert_eq!(found.chain.nodes, [root.key, interior.key, child.key]);
 
         // With every record ready, the least recently used leaf goes first;
         // the lookup touched the child, so the stranger is older.
         assert!(core.store(&late).unwrap());
         assert!(!core.index.contains(&stranger.key));
         assert!(core.index.contains(&child.key));
-        assert!(core.index.contains(&root.key));
+        assert!(core.index.contains(&interior.key));
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
         finish(&mut core);
 
-        // Removing the child leaves the page-only root childless: both go.
+        // Removing the child leaves the page-only parent childless: both go.
         core.index.touch(&late.key);
         let wide = published(&other, 300, None, 40, 5);
         assert!(core.store(&wide).unwrap());
         assert!(!core.index.contains(&child.key));
-        assert!(!core.index.contains(&root.key));
+        assert!(!core.index.contains(&interior.key));
         assert!(core.index.contains(&late.key));
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 4);
         finish(&mut core);
@@ -2566,21 +3392,26 @@ mod tests {
         let layout = Layout::new(&[geometry(PT, &[("kv", 4096)], 12288)]).unwrap();
         let pool = SlabPool::new(
             layout.page_record_bytes,
-            12 + crate::offload::intake_slots(&layout, 1),
+            15 + crate::offload::intake_slots(&layout, 1),
             crate::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         let mut core = Core::new(IDENTITY, pool, layout, false);
         let full = history(128, 1);
-        let root = full.key_at(64).unwrap();
+        let interior = full.key_at(64).unwrap();
         let child = full.key_at(128).unwrap();
         let fresh = history(64, 2).key_at(64).unwrap();
-        let old = core
-            .allocate(root, None, [1; 16], 1, true, true)
+        let root = full.key_at(1).unwrap();
+        core.allocate(root, None, [1; 16], 0, true, true)
             .unwrap()
             .unwrap();
         core.complete_record(&root, true).unwrap();
-        core.allocate(child, Some(root), [1; 16], 1, true, true)
+        let old = core
+            .allocate(interior, Some(root), [1; 16], 1, true, true)
+            .unwrap()
+            .unwrap();
+        core.complete_record(&interior, true).unwrap();
+        core.allocate(child, Some(interior), [1; 16], 1, true, true)
             .unwrap()
             .unwrap();
         core.complete_record(&child, true).unwrap();
@@ -2588,14 +3419,8 @@ mod tests {
             .unwrap()
             .unwrap();
         core.complete_record(&fresh, true).unwrap();
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
-        let next = history(1, 3).key_at(1).unwrap();
-        let allocated = core
-            .allocate(next, None, [3; 16], 0, true, true)
-            .unwrap()
-            .unwrap();
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 3);
         assert_eq!(old.row.as_ref().unwrap().len(), 3);
-        assert_eq!(allocated.row.as_ref().unwrap().len(), 3);
         let free = core.pool.allocate(core.pool.free_slots()).unwrap();
         assert!(
             old.row
@@ -2605,8 +3430,15 @@ mod tests {
                 .all(|slot| free.contains(slot))
         );
         core.pool.release(free);
+        let next = history(1, 3).key_at(1).unwrap();
+        let allocated = core
+            .allocate(next, None, [3; 16], 0, true, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(allocated.row.as_ref().unwrap().len(), 3);
+        assert!(core.index[&root].row);
         assert_clean_slots(&core);
-        assert!(core.index.node(&root).unwrap().location.row.is_none());
+        assert!(core.index.node(&interior).unwrap().location.row.is_none());
         assert!(core.index.contains(&fresh));
         assert!(core.index.contains(&child));
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
@@ -2652,13 +3484,15 @@ mod tests {
 
         // A child record under flat links is a root holding only its tail.
         let child = published(&full, 400, Some(200), 10, 2);
+        let parent = child.parent().unwrap();
+        let tail = child.tail_below(&parent, PT).unwrap();
         assert!(
-            core.store_record(&child, child.parent, child.tail(), false)
+            core.store_record(&child, Some(parent), tail, false)
                 .unwrap()
         );
         assert!(
             !core
-                .store_record(&child, child.parent, child.tail(), false)
+                .store_record(&child, Some(parent), tail, false)
                 .unwrap()
         );
         let node = core.index.node(&child.key).unwrap();
@@ -2764,7 +3598,7 @@ mod tests {
             ))
         );
         // While the chain is pinned, eviction cannot take it.
-        assert!(core.index.evict(true, |_| true).is_none());
+        assert!(core.index.evict(true, |_| true, |_| false).is_none());
         let mut events = Vec::new();
         core.absorb(reply(job, Ok(())));
         core.settle(&mut events);
@@ -2906,19 +3740,19 @@ mod tests {
         let parent = core.index.node(&child.key).unwrap();
         assert!(!parent.pinned());
         assert_eq!(parent.children(), 1);
-        // Allocation compacted the older root before evicting the stranger.
-        assert!(core.record(&root.key).unwrap().row.is_none());
+        // Admission preserves the root row and the parent being extended.
+        assert!(core.record(&root.key).unwrap().row.is_some());
         assert!(core.record(&child.key).unwrap().row.is_some());
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
         assert_eq!(
             stored(&finish(&mut core)),
             [(grandchild.key, Some(3 * PAGE + ROW))]
         );
-        // With only one warm slot free, commit thins the redundant child row.
-        // Its pages remain available and the grandchild retains its endpoint.
+        // Commit frees the former tip's row and retains its pages.
+        assert_eq!(core.record(&child.key).unwrap().pages.len(), 3);
         assert!(core.record(&child.key).unwrap().row.is_none());
         assert!(core.record(&grandchild.key).unwrap().row.is_some());
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
 
         // With nothing else evictable the publication is skipped rather than
         // stored at its parent's expense, and the parent's pin is released.
@@ -2930,7 +3764,7 @@ mod tests {
         assert!(core.index.contains(&grandchild.key));
         assert!(!core.index.node(&grandchild.key).unwrap().pinned());
         assert_eq!(core.index.len(), 3);
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
         assert_clean_slots(&core);
     }
 
@@ -3271,6 +4105,93 @@ mod tests {
     }
 
     #[test]
+    fn recapture_refills_only_the_row_of_an_interior_key() {
+        let mut core = store_core(32, 8, false);
+        let h = history(512, 1);
+        let mut middle = published(&h, 128, Some(64), 0, 2);
+        for cp in [
+            published(&h, 64, None, 0, 1),
+            middle.clone(),
+            published(&h, 192, Some(128), 0, 3),
+        ] {
+            assert!(core.store(&cp).unwrap());
+            finish(&mut core);
+        }
+        core.drop_row(&middle.key);
+        assert!(!core.index[&middle.key].row);
+        let pages = core.index[&middle.key].location.pages.clone();
+        middle.capture_role = crate::CaptureRole::Message;
+        core.index[&middle.key].location.capture_role = middle.capture_role;
+        assert_eq!(core.refill_row(&middle).unwrap(), StoreOutcome::Queued);
+        finish(&mut core);
+        let node = &core.index[&middle.key];
+        assert!(node.ready && node.row);
+        assert_eq!(node.location.pages, pages);
+        assert_eq!(node.children(), 1);
+        assert_eq!(core.stats.row_refills, 1);
+    }
+
+    #[test]
+    fn a_refused_leaf_preserves_its_unconfirmed_ancestors() {
+        let mut core = store_core(32, 8, false);
+        let full = history(192, 1);
+        let parent = published(&full, 128, Some(64), 0, 2);
+        let leaf = published(&full, 192, Some(128), 0, 3);
+        for cp in [
+            published(&full, 64, None, 0, 1),
+            parent.clone(),
+            leaf.clone(),
+        ] {
+            assert!(core.store(&cp).unwrap());
+            finish(&mut core);
+        }
+        announce_all(&mut core);
+        core.set_spill(true);
+        assert!(core.retire_for(1));
+        let tip = core.retiring.pop().unwrap().key;
+        assert_eq!(tip, leaf.key);
+        core.retired(&tip, Retirement::Dropped);
+        assert!(!core.index.contains(&tip));
+        assert_eq!(core.lookup(&full, 0, u64::MAX).unwrap().key, parent.key);
+    }
+
+    #[test]
+    fn a_failed_handoff_and_a_racing_claim_preserve_the_shared_fork() {
+        let mut core = store_core(32, 8, false);
+        let history = history(512, 1);
+        let root = published(&history, 64, None, 0, 1);
+        let fork = published(&history, 128, Some(64), 0, 2);
+        let left = published(&history, 192, Some(128), 0, 3);
+        let right = published(&history, 193, Some(128), 0, 4);
+        for cp in [&root, &fork, &left, &right] {
+            assert!(core.store(cp).unwrap());
+            finish(&mut core);
+            if cp.key == fork.key {
+                core.pin_record(&fork.key).unwrap();
+            }
+        }
+        core.unpin_record(&fork.key).unwrap();
+        core.settle(&mut Vec::new());
+        announce_all(&mut core);
+        core.set_spill(true);
+        assert!(core.retire_for(1));
+        let tip = core.retiring.pop().unwrap().key;
+        core.retired(&tip, Retirement::Failed);
+        assert_eq!(core.index.len(), 4);
+        assert!(core.retire_for(1));
+        let tip = core.retiring.pop().unwrap().key;
+        core.pin_record(&tip).unwrap();
+        core.retired(&tip, Retirement::Moved);
+        assert!(core.index.contains(&tip));
+        core.unpin_record(&tip).unwrap();
+        core.finish_retired();
+        assert!(!core.index.contains(&tip));
+        assert_eq!(core.index.len(), 3);
+        assert!(core.index[&fork.key].row);
+        assert_eq!(core.index[&fork.key].children(), 1);
+    }
+
+    #[test]
     fn retirement_counts_slots_including_rows() {
         let mut core = store_core(100, 4, false);
         for salt in 1..=3 {
@@ -3282,6 +4203,81 @@ mod tests {
         core.set_spill(true);
         assert!(core.retire_for(2 * core.layout.record_slots(2, true)));
         assert_eq!(core.held.len(), 2);
+    }
+
+    #[test]
+    fn pass_through_retires_each_leaf_once_across_poll_batches() {
+        use crate::store::TierStore;
+
+        for pass_through in [false, true] {
+            let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+            let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+            let intake = crate::offload::intake_slots(&layout(), 1);
+            let reserve = if pass_through { 0 } else { intake };
+            let pool = SlabPool::new(PAGE, 3 * intake, reserve).unwrap();
+            let mut store = MemoryStore::open(IDENTITY, pool, copier, false, pass_through).unwrap();
+            store.announce_to(Announcer::new(Arc::new(tokio::sync::Notify::new())));
+            let mut leaves = HashSet::new();
+            for salt in 1..=7 {
+                let h = history(2 * PT, salt);
+                let root = published(&h, PT, None, 0, salt);
+                assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+                if salt == 7 {
+                    let child = published(&h, 2 * PT, Some(PT), 0, 8);
+                    assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+                    leaves.insert(child.key);
+                } else {
+                    leaves.insert(root.key);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while store.core.announced.len() != 8 {
+                assert!(Instant::now() < deadline);
+                store.poll(&mut Vec::new()).unwrap();
+            }
+            store.set_spill(true);
+            for count in [4, 3] {
+                store.poll(&mut Vec::new()).unwrap();
+                let offers = store.take_retiring();
+                assert_eq!(offers.len(), if pass_through { count } else { 0 });
+                store.poll(&mut Vec::new()).unwrap();
+                assert!(store.take_retiring().is_empty());
+                for offer in offers {
+                    assert!(leaves.remove(&offer.key));
+                    store.retired(offer.key, PoolTier::Dram, Retirement::Moved);
+                }
+            }
+            assert_eq!(store.index().len(), if pass_through { 0 } else { 8 });
+            store.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn full_capture_buffer_retries_without_ownership_except_for_a_copying_parent() {
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let pool = SlabPool::new(PAGE, 3, 0).unwrap();
+        let mut store = MemoryStore::open(IDENTITY, pool, copier, false, true).unwrap();
+        let h = history(3 * PT, 1);
+        let root = published(&h, 2 * PT, None, 0, 1);
+        let other = published(&history(PT, 2), PT, None, 0, 2);
+        let mut child = published(&h, 2 * PT + 1, Some(2 * PT), 0, 3);
+        child.capture_role = crate::CaptureRole::Anchor;
+        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.pool().free_slots(), 0);
+        assert_eq!(store.store(&other).unwrap(), StoreOutcome::Retry(StoreReason::Slabs));
+        assert_eq!(store.stats().store_skipped, 1);
+        assert_eq!(store.stats().outbound_in_flight, 1);
+        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.stats().outbound_in_flight, 2);
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(events.as_slice(), [
+            StoreEvent::Stored { checkpoint, result: Ok(_), .. },
+            StoreEvent::Deferred { checkpoint: deferred, reason: StoreReason::Slabs },
+        ] if *checkpoint == root.id && *deferred == child.id));
+        assert_eq!(store.stats().outbound_in_flight, 0);
+        store.close().unwrap();
     }
 
     #[test]

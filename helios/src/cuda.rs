@@ -165,6 +165,7 @@ struct Driver {
     event_destroy: StreamOperation,
     stream_wait: StreamWait,
     wait_value: WaitValue,
+    write_value: WaitValue,
     host_pointer: HostPointer,
     pointer_attribute: PointerAttribute,
     stream_create_priority: StreamCreatePriority,
@@ -229,6 +230,7 @@ impl Driver {
                 event_destroy: symbol!("cuEventDestroy_v2"),
                 stream_wait: symbol!("cuStreamWaitEvent"),
                 wait_value: symbol!("cuStreamWaitValue32_v2"),
+                write_value: symbol!("cuStreamWriteValue32_v2"),
                 host_pointer: symbol!("cuMemHostGetDevicePointer_v2"),
                 pointer_attribute: symbol!("cuPointerGetAttribute"),
                 stream_create_priority: symbol!("cuStreamCreateWithPriority"),
@@ -316,6 +318,7 @@ pub(crate) fn device_uuid(device: i32) -> Result<[u8; 16]> {
 /// Page-locked registration of process memory, released on drop.
 pub(crate) struct HostRegistration {
     driver: Arc<Driver>,
+    context: usize,
     address: usize,
     device_address: u64,
     #[cfg(all(test, feature = "runtime-core"))]
@@ -338,16 +341,40 @@ impl HostRegistration {
 
 impl Drop for HostRegistration {
     fn drop(&mut self) {
-        // SAFETY: The registration was made by `register_host` on this range.
-        unsafe {
-            (self.driver.host_unregister)(self.address as Handle);
+        // SAFETY: The registration's context and mapped range outlive this drop.
+        let result = unsafe {
+            let mut previous: Handle = std::ptr::null_mut();
+            let had_previous = (self.driver.get_context)(&mut previous) == 0;
+            let outcome = self
+                .driver
+                .check(
+                    "cuCtxSetCurrent",
+                    (self.driver.set_context)(self.context as Handle),
+                )
+                .and_then(|()| {
+                    self.driver.check(
+                        "cuMemHostUnregister",
+                        (self.driver.host_unregister)(self.address as Handle),
+                    )
+                });
+            if had_previous && previous != self.context as Handle {
+                let _ = (self.driver.set_context)(previous);
+            }
+            outcome
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "warning: cannot unregister host memory at {:#x}: {error}",
+                self.address
+            );
         }
     }
 }
 
 /// Register `nbytes` at `address`, which must be page aligned, as portable
 /// page-locked memory with `context` current. The range stays mapped and
-/// unchanged in size until the registration is dropped.
+/// unchanged in size until the registration is dropped. The context must stay live
+/// through unregistration.
 pub(crate) unsafe fn register_host(
     context: usize,
     address: usize,
@@ -378,6 +405,7 @@ pub(crate) unsafe fn register_host(
     // addresses, including on Windows WDDM.
     let mut registration = HostRegistration {
         driver,
+        context,
         address,
         device_address: 0,
         #[cfg(all(test, feature = "runtime-core"))]
@@ -775,6 +803,15 @@ impl Stream {
         })
     }
 
+    /// Write `value` to a mapped host word once all prior work on this stream completed.
+    /// The default flags order the stream's earlier memory operations before the write.
+    /// The mapped word remains allocated until this stream drains.
+    pub(crate) unsafe fn write_value(&self, word: usize, value: u32) -> Result<()> {
+        self.driver.check("cuStreamWriteValue32_v2", unsafe {
+            (self.driver.write_value)(self.handle as Handle, word as u64, value, 0)
+        })
+    }
+
     pub(crate) fn mapped_address(&self, host: &PinnedHost) -> Result<usize> {
         let mut address = 0;
         self.driver.check("cuMemHostGetDevicePointer", unsafe {
@@ -1139,6 +1176,64 @@ mod tests {
         assert!(read[..FILE_BYTES] == content[..]);
         assert!(read[FILE_BYTES..].iter().all(|byte| *byte == 0xA5));
         true
+    }
+
+    #[cfg(feature = "runtime-core")]
+    #[test]
+    #[ignore = "requires CUDA device 0"]
+    fn host_registration_unregisters_when_dropped_on_another_thread() {
+        use crate::runtime_core::driver::Driver as Loader;
+        let loader = Loader::load().unwrap();
+        let mut context = std::ptr::null_mut();
+        // SAFETY: Driver signatures match cuda.h and the output pointers are valid.
+        unsafe {
+            loader.check("cuInit", (loader.init)(0)).unwrap();
+            let mut device = 0;
+            loader
+                .check("cuDeviceGet", (loader.device)(&mut device, 0))
+                .unwrap();
+            loader
+                .check(
+                    "cuCtxCreate_v2",
+                    (loader.context_create)(&mut context, 0, device),
+                )
+                .unwrap();
+        }
+        let context = context as usize;
+        let bytes = crate::os::page_size();
+        let address = crate::os::map_host(bytes).unwrap();
+        let registration = std::thread::spawn(move || {
+            // SAFETY: The context and mapping remain live until both threads join.
+            unsafe { register_host(context, address, bytes) }.unwrap()
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            let driver = Driver::load().unwrap();
+            // SAFETY: A null context clears this thread's current context.
+            driver
+                .check("cuCtxSetCurrent", unsafe {
+                    (driver.set_context)(std::ptr::null_mut())
+                })
+                .unwrap();
+            drop(registration);
+            // SAFETY: The context and mapping remain live; re-registration proves drop succeeded.
+            let registration = unsafe { register_host(context, address, bytes) }
+                .expect("drop left the range registered");
+            drop(registration);
+        })
+        .join()
+        .unwrap();
+        // SAFETY: Registration ended and both worker threads have joined.
+        unsafe {
+            crate::os::unmap_host(address, bytes);
+            loader
+                .check(
+                    "cuCtxDestroy_v2",
+                    (loader.context_destroy)(context as Handle),
+                )
+                .unwrap();
+        }
     }
 
     #[cfg(feature = "runtime-core")]

@@ -830,20 +830,31 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 name = "flare"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "flare-helios",
  "hf-hub 0.5.0",
+ "http",
+ "http-body-util",
  "httpdate",
+ "hyper",
+ "hyper-util",
  "libc",
  "libloading",
  "log",
  "ring",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tokio-rustls",
  "toml",
+ "tower-service",
  "ureq 3.4.2",
  "url",
+ "webpki-roots 1.0.9",
  "windows-sys 0.61.2",
 ]
 
@@ -873,6 +884,7 @@ dependencies = [
  "flare-selene",
  "flate2",
  "futures-util",
+ "gif",
  "httpdate",
  "image-webp",
  "io-uring",
@@ -921,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "flare-winui-bridge"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "flare",
  "tempfile",
@@ -1108,6 +1120,15 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+]
+
+[[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "weezl",
 ]
 
 [[package]]
@@ -3476,6 +3497,12 @@ checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
+
+[[package]]
+name = "weezl"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "winapi"

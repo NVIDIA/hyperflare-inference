@@ -149,6 +149,10 @@ pub(super) async fn await_admission(generations: &mut [Generation]) -> Result<()
 }
 
 impl Generation {
+    pub(super) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
     pub(super) async fn wait_for_first_token(&mut self) -> Result<()> {
         (&mut self.first_token)
             .await
@@ -170,7 +174,7 @@ impl Generation {
 }
 impl Drop for Generation {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancel();
     }
 }
 
@@ -194,13 +198,41 @@ struct Incoming {
     prompt_scored: usize,
     /// Retry capacity admission only after the scheduler's resources change.
     blocked: Option<(crate::cache::Fence, usize, usize, usize)>,
-    /// Pool lookup started on arrival, retained until its answer or the first
-    /// prefill submission. Cancellation drops it with the `Incoming`.
+    /// Pool lookup started on arrival. A ticket that will never be answered is
+    /// replaced when next selected for admission; pending tickets survive until
+    /// prefill submission.
+    /// Cancellation drops the ticket with the `Incoming`.
     pool_lookup: Option<flare_selene::pool::LookupTicket>,
+    /// Start of the pending ticket's admission grace period; reset on replacement.
     pool_lookup_started: Option<std::time::Instant>,
     /// Replaced on readmission and counted once when this request ends.
     host_lookup_outcome: Option<crate::offload::LookupOutcome>,
     pool_plan: Option<crate::scheduler::AdmissionPlan>,
+    restore_wait: RestoreWait,
+}
+
+/// Capacity waiting is charged once per admission episode. Expiry wakes a blocked request
+/// once; a failed recompute admission still waits for resources instead of polling lookups.
+#[derive(Default)]
+struct RestoreWait {
+    started: Option<std::time::Instant>,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl RestoreWait {
+    fn defer(&mut self, gained: u64, transfer_seconds: f64, prefill_rate: f64) -> bool {
+        let now = std::time::Instant::now();
+        let started = *self.started.get_or_insert(now);
+        let waited = now.duration_since(started).as_secs_f64();
+        let budget = 0.5 * gained as f64 / prefill_rate.max(1.0) - transfer_seconds;
+        self.retry_at = None;
+        if flare_selene::worth_transfer(gained, transfer_seconds + waited, prefill_rate)
+            && let Ok(remaining) = std::time::Duration::try_from_secs_f64(budget - waited)
+        {
+            self.retry_at = now.checked_add(remaining);
+        }
+        self.retry_at.is_some()
+    }
 }
 impl Drop for Incoming {
     fn drop(&mut self) {
@@ -235,6 +267,13 @@ impl Incoming {
         }
     }
 
+    fn poll_restore_wait(&mut self, now: std::time::Instant) {
+        if self.restore_wait.retry_at.is_some_and(|deadline| now >= deadline) {
+            self.restore_wait.retry_at = None;
+            self.blocked = None;
+        }
+    }
+
     fn awaits_pool(&self, now: std::time::Instant) -> bool {
         self.pool_lookup.as_ref().is_some_and(|ticket| {
             matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
@@ -247,6 +286,17 @@ impl Incoming {
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
         let first = (if start == 0 { 0 } else { start + 1 }).max(self.prompt_scored);
         first..(start + tokens + 1).min(self.prompt_score_end)
+    }
+
+    fn finish_cancelled(&self, carried: Carried) {
+        self.emit(GenerationEvent::Finished {
+            prompt_tokens: carried.prompt_tokens.unwrap_or(self.prompt.tokens.len()),
+            generated_tokens: carried.generated_tokens,
+            reused_prompt_tokens: carried.reused_prompt_tokens.unwrap_or(0),
+            reason: "stop",
+            termination: crate::output::Termination::Cancelled,
+            stop_sequence: None,
+        });
     }
 
     fn notify_admission(&self, result: Result<()>) {
@@ -589,6 +639,8 @@ impl ModelRuntime {
                     .and_then(|()| {
                         scheduler.scored_prefill_graphs(&executor.manifest().graphs.iter()
                             .filter(|g| g.kind == GraphKind::ScoredPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
+                        scheduler.terminal_prefill_graphs(&executor.manifest().graphs.iter()
+                            .filter(|g| g.kind == GraphKind::TerminalPrefill).map(|g| g.token_capacity).collect::<Vec<_>>())?;
                         scheduler.prefill_graphs(
                             &executor
                                 .manifest()
@@ -853,6 +905,7 @@ impl ModelRuntime {
                 pool_lookup_started: None,
                 host_lookup_outcome: None,
                 pool_plan: None,
+                restore_wait: RestoreWait::default(),
             };
             let enqueue_ns = observation
                 .filter(|timestamps| *timestamps)
@@ -952,7 +1005,15 @@ impl ImagePreparation {
                 let prepared = if cancelled.load(Ordering::Acquire) {
                     Ok(None)
                 } else {
-                    image.materialize_cached(store.as_ref()).map(Some)
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        image.materialize_cached(store.as_ref()).map(Some)
+                    })) {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::execution(
+                            ExecutionError::Worker,
+                            "image preparation panicked",
+                        )),
+                    }
                 };
                 if results.send((handle, prepared)).is_err() {
                     break;
@@ -1104,7 +1165,10 @@ impl<'a> Worker<'a> {
             });
             if !progress {
                 if executor.outstanding() > 0 {
-                    std::hint::spin_loop();
+                    // A park is bounded; the yield keeps the old loop's cooperative handoff.
+                    if !executor.park() {
+                        std::hint::spin_loop();
+                    }
                     thread::yield_now();
                 } else {
                     self.scheduler.idle()?;
@@ -1254,9 +1318,10 @@ impl<'a> Worker<'a> {
                 }
             }
         }
-        self.parked.retain(|(incoming, _)| {
+        self.parked.retain(|(incoming, parked)| {
             let cancelled = incoming.cancelled.load(Ordering::Acquire);
             if cancelled {
+                incoming.finish_cancelled(parked.carried);
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 progress = true;
             }
@@ -1271,6 +1336,13 @@ impl<'a> Worker<'a> {
                 if active.prepared_image.is_some() {
                     self.preparing_image = None;
                 }
+                let live = self.scheduler.request(active.request)?;
+                active.incoming.finish_cancelled(Carried {
+                    prompt_tokens: Some(active.carried.prompt_tokens.unwrap_or(live.prompt_tokens)),
+                    generated_tokens: active.carried.generated_tokens + live.generated_tokens,
+                    reused_prompt_tokens: Some(active.carried.reused_prompt_tokens.unwrap_or(live.reused_prompt_tokens())),
+                    ..active.carried
+                });
                 self.scheduler.cancel(active.request)?;
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 self.admissions[slot] = None;
@@ -1278,18 +1350,22 @@ impl<'a> Worker<'a> {
             }
         }
         while self.scheduler.has_available_slot() {
+            let now = std::time::Instant::now();
             for incoming in self.pending.iter_mut().chain(self.parked.iter_mut().map(|(incoming, _)| incoming)) {
-                if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
+                if incoming.pool_plan.is_none()
+                    && let Some(store) = self.store.as_mut().filter(|store| store.pooled())
+                {
                     begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
                 }
                 incoming.poll_pool_lookup();
+                incoming.poll_restore_wait(now);
             }
-            let stats = self.scheduler.stats();
+            // Full scheduler stats would scan every cached checkpoint on each pass.
             let resources = (
                 self.scheduler.completed(),
-                stats.free_pages,
-                stats.free_snapshots,
-                stats.free_slots,
+                self.scheduler.free_page_count(),
+                self.scheduler.free_snapshot_count(),
+                self.scheduler.free_slot_count(),
             );
             let now = std::time::Instant::now();
             let eligible = |incoming: &Incoming| {
@@ -1312,11 +1388,24 @@ impl<'a> Worker<'a> {
                 }
             };
             if incoming.cancelled.load(Ordering::Acquire) {
+                if let Some(parked) = &parked {
+                    incoming.finish_cancelled(parked.carried);
+                }
                 self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if incoming.prompt.logprobs && self.config.max_top_logprobs == 0 {
                 incoming.reject_admission("logprobs are not available in this model core".into());
+                continue;
+            }
+            if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
+                begin_pool_lookup(&mut self.scheduler, store.as_mut(), &mut incoming);
+            }
+            if incoming.awaits_pool(std::time::Instant::now()) {
+                match parked {
+                    Some(parked) => self.parked.insert(position, (incoming, parked)),
+                    None => self.pending.insert(position, incoming),
+                }
                 continue;
             }
             let pending_pool_answer = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
@@ -1338,6 +1427,7 @@ impl<'a> Worker<'a> {
                     checkpoint_accounting,
                     self.prefill_rate,
                     self.metrics,
+                    &mut incoming.restore_wait,
                 )
                 .map(|(handle, outcome)| {
                     if outcome.is_some() {
@@ -1455,6 +1545,7 @@ impl<'a> Worker<'a> {
                 incoming.pool_lookup = None;
                 incoming.pool_plan = None;
             }
+            incoming.restore_wait = RestoreWait::default();
             incoming.notify_admission(Ok(()));
             self.active[slot] = Some(Active {
                 request: handle,
@@ -1521,8 +1612,8 @@ impl<'a> Worker<'a> {
         kind: GraphKind,
         mut completion: crate::execution::FrameCompletion,
     ) -> Result<()> {
-        self.scheduler
-            .advance_to(super::observation::monotonic_ns())?;
+        let completed_at_ns = super::observation::monotonic_ns();
+        self.scheduler.advance_to(completed_at_ns)?;
         let measured_step = self.scheduler.submitted_step(completion.fence)?.clone();
         let selection = self.scheduler.submitted_timing(completion.fence)?;
         if measured_step.kind != kind {
@@ -1550,6 +1641,7 @@ impl<'a> Worker<'a> {
         if matches!(
             kind,
             GraphKind::Prefill
+                | GraphKind::TerminalPrefill
                 | GraphKind::ScoredPrefill
                 | GraphKind::Decode
                 | GraphKind::Speculative
@@ -1598,7 +1690,7 @@ impl<'a> Worker<'a> {
         self.metrics
             .progress(prefill, generated.len(), accepted, draft_rounds,
                 verification_drafts, verification_rounds);
-        self.metrics.replay_completed(completion.timing);
+        self.metrics.replay_completed(completed_at_ns, completion.timing, prefill);
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
         }
@@ -1834,7 +1926,10 @@ impl<'a> Worker<'a> {
                                     .fetch_add(1, Ordering::Relaxed);
                                 self.metrics.progress(0, 1, 0, 0, 0, 0);
                             }
-                            if abandon || request.incoming.cancelled.load(Ordering::Acquire) {
+                            if !abandon && request.incoming.cancelled.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            if abandon {
                                 self.scheduler.cancel(request.request)?;
                                 self.active[slot] = None;
                                 self.admissions[slot] = None;
@@ -2264,6 +2359,9 @@ impl<'a> Worker<'a> {
                 }
                 StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
+                    // A ticket without waiters can become an evictable checkpoint without
+                    // changing free counts. Its completion must still wake admissions.
+                    released = true;
                 }
                 StoreEvent::ExportRequested {
                     export,
@@ -2298,6 +2396,9 @@ impl<'a> Worker<'a> {
         }
         if self.scheduler.take_evictions_lost() {
             store.evictions_lost();
+        }
+        for key in self.scheduler.take_reused() {
+            store.reused(key);
         }
         if released {
             for incoming in self
@@ -2361,6 +2462,19 @@ impl<'a> Worker<'a> {
             progress = true;
             self.scheduler.pin_checkpoint(publication.id)?;
             let outcome = store.store(&publication);
+            if self.scheduler.submitted_reoffer(
+                publication.id,
+                matches!(outcome, Ok(StoreOutcome::Retry(_))),
+            ) {
+                self.metrics
+                    .host_reoffer_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                if matches!(outcome, Ok(StoreOutcome::Present)) {
+                    self.metrics
+                        .host_reoffer_present
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
             if !matches!(outcome, Ok(StoreOutcome::Queued)) {
                 self.scheduler.unpin_checkpoint(publication.id)?;
             }
@@ -2524,12 +2638,11 @@ fn next_admission(
     parked: &VecDeque<(Incoming, Parked<'_>)>,
     pending: &VecDeque<Incoming>,
 ) -> Option<crate::scheduler::NextAdmission> {
-    let stats = scheduler.stats();
     let resources = (
         scheduler.completed(),
-        stats.free_pages,
-        stats.free_snapshots,
-        stats.free_slots,
+        scheduler.free_page_count(),
+        scheduler.free_snapshot_count(),
+        scheduler.free_slot_count(),
     );
     parked
         .iter()
@@ -2587,15 +2700,28 @@ fn begin_pool_lookup(
     store: &mut dyn flare_selene::HostStore,
     incoming: &mut Incoming,
 ) {
-    if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end || incoming.pool_plan.is_some() {
+    if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end {
         return;
     }
-    let Ok(plan) = scheduler.plan_admission(&incoming.spec()) else {
+    let retry = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
+        matches!(ticket.state(), flare_selene::pool::LookupState::None)
+    });
+    if incoming.pool_plan.is_some() && !retry {
+        return;
+    }
+    let plan = match incoming.pool_plan.as_ref() {
+        Some(plan) => scheduler.refresh_admission_plan(plan),
+        None => scheduler.plan_admission(&incoming.spec()),
+    };
+    let Ok(plan) = plan else {
         return;
     };
     if plan.resident_tokens() < incoming.prompt.tokens.len() as u64 {
-        incoming.pool_lookup_started = Some(std::time::Instant::now());
         incoming.pool_lookup = store.begin_lookup(plan.history());
+        incoming.pool_lookup_started = incoming.pool_lookup.as_ref().and_then(|ticket| {
+            matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+                .then(std::time::Instant::now)
+        });
     }
     incoming.pool_plan = Some(plan);
 }
@@ -2620,6 +2746,7 @@ fn admit_with_host_store(
     accounting: Option<crate::scheduler::CheckpointAccounting>,
     prefill_rate: f64,
     metrics: &super::metrics::Metrics,
+    restore_wait: &mut RestoreWait,
 ) -> Result<(RequestHandle, Option<crate::offload::LookupOutcome>)> {
     let plan = match queued_plan {
         Some(plan) => scheduler.refresh_admission_plan(plan)?,
@@ -2659,9 +2786,18 @@ fn admit_with_host_store(
             consumed_tokens: hit.consumed_tokens,
             pages: hit.pages,
         };
+        let gained = hit.consumed_tokens - plan.resident_tokens();
         let admitted = match scheduler.admit_planned_with_checkpoint_accounting(spec.clone(), plan, Some(inbound), accounting.clone()) {
             Ok(admitted) => admitted,
-            Err(Error::Admission(AdmissionError::Capacity(_))) => {
+            Err(Error::Admission(AdmissionError::Capacity(failure))) => {
+                // Resource holders may release snapshot backing without another admission.
+                // Bound that wait by the restore's estimated advantage over prefill.
+                if scheduler.resources_in_flight()
+                    && restore_wait.defer(gained, hit.estimated_seconds, prefill_rate)
+                {
+                    return Err(Error::Admission(AdmissionError::Capacity(failure)));
+                }
+                restore_wait.retry_at = None;
                 let handle = admit_with_checkpoint_accounting(scheduler, spec, accounting.clone())?;
                 scheduler.record_host_lookup();
                 return Ok((handle, Some(LookupOutcome::CapacityRejected)));
@@ -3085,6 +3221,7 @@ mod tests {
             pool_lookup_started: None,
             host_lookup_outcome: None,
             pool_plan: None,
+            restore_wait: RestoreWait::default(),
         };
         (
             incoming,

@@ -72,6 +72,8 @@ def expert_format(layers, prefix):
     fmt = linear_format(layers, prefix)
     if fmt in ("iq2_xxs", "q8_0"):
         return fmt, "a16"
+    if fmt == "mxfp8":
+        return fmt, "a8"
     if fmt not in ("nvfp4", "mxfp4"):
         raise ValueError(f"{prefix}: expected FP4 or GGML block-quantized experts")
     mode = "a16" if entry["quant_algo"] == "W4A16_NVFP4" else "a8" if fmt == "mxfp4" else "a4"

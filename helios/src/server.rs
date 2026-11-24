@@ -126,6 +126,7 @@ struct HttpState {
     thinking_token_budget: Option<u32>,
     context_hint: String,
     capacity_hint: String,
+    response_model: String,
     started: Instant,
     generated: Mutex<VecDeque<(Instant, u64)>>,
     accepting: Mutex<bool>,
@@ -280,6 +281,7 @@ impl Server {
             thinking_token_budget: config.thinking_token_budget,
             context_hint: config.context_hint.clone(),
             capacity_hint: config.capacity_hint.clone(),
+            response_model: models::response_name(model.config(), &config.served_names).to_owned(),
             started: Instant::now(),
             generated: Mutex::new(VecDeque::new()),
             accepting: Mutex::new(true),
@@ -319,7 +321,15 @@ impl Server {
                         }
                     };
                     let address = listener.local_addr().map_err(|error| Error::Execution(ExecutionError::Worker(Failure::caused_by(error.to_string(), error))))?;
-                    let listener = listener::HttpListener::with_diagnostics(listener, config.log_to_stderr);
+                    let max_connections = ingress_capacity
+                        .max(64)
+                        .saturating_mul(4)
+                        .min(4096);
+                    let listener = listener::HttpListener::with_limits(
+                        listener,
+                        config.log_to_stderr,
+                        max_connections,
+                    );
                     worker_alive.store(true, Ordering::Release);
                     let _ = ready_tx.send(Ok(address));
                     let (drain_tx, drain_rx) = oneshot::channel();

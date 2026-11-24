@@ -84,6 +84,55 @@ configurations. Outputs remain fixed during serving. Core graph selection
 retains referenced producers and their executable resources and removes unused
 producers. Tuning storage remains owned through execution drain.
 
+## Persistent worker graphs
+
+An execution catalog may optionally declare `Execution.persistent_workers`
+(repeated Protobuf message `PersistentWorker`, field 8) to run a dedicated
+graph concurrently with serving graphs on a spatially partitioned CUDA Green
+Context. Helios currently supports at most one persistent worker entry on
+single-rank cores; cores declaring more than one entry, multi-rank cores, and
+multi-host cluster cores declaring a persistent worker fail validation before
+execution. Each `PersistentWorker` carries:
+
+- `worker_sm_count`: positive streaming-multiprocessor count requested for the
+  worker partition; `cuDevSmResourceSplit` rounds the worker group up to the
+  device's co-scheduled SM alignment and assigns all remaining co-scheduled SMs
+  to an explicit structured compute group.
+- `graph`: name of a dedicated prepared graph in the rank bundle, disjoint from
+  all serving graphs and startup tuning graphs.
+- `stop_flag`: a `Reference` (`allocation` and `offset`) naming a
+  4-byte-aligned, in-bounds 32-bit word inside a fixed `Memory::MappedHost`
+  allocation.
+
+`NativeResources` retains the device's primary CUDA context, partitions SMs
+through `cuDevSmResourceSplit` into explicit structured worker and compute
+green contexts (preserving co-scheduled SM alignment on the compute partition),
+applies the core's recorded CUDA context limits and cache configuration to the
+primary context and both green contexts, and loads all modules and instantiates
+and uploads every graph executable under its partition's green context and
+non-blocking stream (clamping cooperative launch grids to that partition's SM
+count) before the persistent worker starts. Serving and copy streams open on
+the compute green context obtained through `cuCtxFromGreenCtx`, while the
+worker graph launches once on a dedicated non-blocking stream created inside
+the worker green context after startup tuning finishes
+(`GraphExecutor::finish_startup` or `NativeResources::start_persistent_worker`).
+Launch is idempotent and zeroes the stop flag with release semantics before
+invoking `cuGraphLaunch`.
+
+During shutdown, `GraphExecutor::close` drains the compute and copy streams
+first, then signals `1u32` (release) to the stop flag and polls `cuStreamQuery`
+on the worker stream against a bounded timeout with CUDA context save/restore
+before releasing pinned host buffers (`cuMemFreeHost`) and execution streams.
+If the worker stream does not complete within the drain timeout or reports a
+CUDA driver error, shutdown returns `ExecutionError::Drain` and marks the
+worker `WorkerState::FailedDrain`. Resource teardown stops any still-running
+worker, synchronizes the primary context, destroys worker and compute streams
+only after context synchronization succeeds, destroys executables, modules, and
+mappings, and destroys both green contexts before releasing virtual-address
+reservations and the primary context. A failed worker drain follows the
+standard failed-drain invariant: the driver and GPU resources remain retained
+until process exit.
+
 Execution ABI numbers are descriptive metadata and do not gate loading or rank
 agreement. Every engine version loads the core layouts that earlier versions
 supported. The
@@ -109,8 +158,8 @@ lists. Graph executable handles are nonzero and unique. Registered device
 spans do not overlap; captured weights and scratch need not appear in this I/O
 manifest but must remain in the resource owner.
 
-Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `scored_prefill`,
-`decode`, `speculative`, `mixed`, `resume`, and `vision`. Decode and speculative
+Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `terminal_prefill`,
+`scored_prefill`, `decode`, `speculative`, `mixed`, `resume`, and `vision`. Decode and speculative
 batch capacities are powers of two through 64. Decode has one token per lane.
 A speculative graph performs complete proposal, optional confidence/allocation,
 verification, and commit work. It declares B/D/W/P explicitly: request capacity,
@@ -126,7 +175,7 @@ A mixed graph has a power-of-two batch capacity from 2 through the request
 storage capacity, W from 1 through T, and a `prefill_capacity` that is a positive
 multiple of 64. It binds the `int32[1]` `prefill_row` input. Every other kind
 sets `prefill_capacity` to zero.
-Prefill and scored prefill have batch capacity 1. Their token capacities are 1,
+Prefill, terminal prefill, and scored prefill have batch capacity 1. Their token capacities are 1,
 16, or a positive multiple of 64. The model configuration separately requires the captured
 catalog for its `prefill_chunk_size`; transport validation does not infer a
 scheduling policy or substitute a missing graph.

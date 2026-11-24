@@ -63,11 +63,11 @@ contract_enum!(ValueSource {
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
-contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6, Atem = 7 });
-contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5 });
-contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
-contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
-contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
+contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6, Atem = 7, TmlJson = 8 });
+contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5, ContentHeaders = 6 });
+contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9, PaddedGrid = 10 });
+contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9, ClassToken = 10 });
+contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12, TerminalPrefill = 14 });
 
 impl TryFrom<GraphKind> for GraphOperation {
     type Error = crate::Error;
@@ -78,6 +78,7 @@ impl TryFrom<GraphKind> for GraphOperation {
             GraphKind::Restore => Self::Restore,
             GraphKind::Snapshot => Self::Snapshot,
             GraphKind::Prefill => Self::Prefill,
+            GraphKind::TerminalPrefill => Self::TerminalPrefill,
             GraphKind::ScoredPrefill => Self::ScoredPrefill,
             GraphKind::Decode => Self::Decode,
             GraphKind::Resume => Self::Resume,
@@ -339,6 +340,19 @@ pub struct ImageSpan {
     pub unscoped_tokens: Vec<u32>,
 }
 
+impl ImageTokenLayout {
+    /// The feature token and every token that the image span writes.
+    pub fn token_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        let span = self.span.iter().flat_map(|span| {
+            [span.start_token, span.end_token]
+                .into_iter()
+                .chain(span.interior_tokens.iter().copied())
+                .chain(span.unscoped_tokens.iter().copied())
+        });
+        std::iter::once(self.feature_token).chain(span)
+    }
+}
+
 impl PreparedContract {
     pub fn graph(&self, name: &str) -> Result<&GraphContract> {
         self.graphs
@@ -532,6 +546,7 @@ impl PreparedContract {
                     GraphOperation::Init,
                     GraphOperation::Restore,
                     GraphOperation::Prefill,
+                    GraphOperation::TerminalPrefill,
                     GraphOperation::ScoredPrefill,
                     GraphOperation::Resume,
                     GraphOperation::Decode,
@@ -634,6 +649,11 @@ impl FrontendContract {
         {
             return Err("ATEM recipient framing requires recipient-header reasoning syntax".into());
         }
+        if self.tools.as_ref().is_some_and(|t| t.kind == ToolParserKind::TmlJson)
+            != self.reasoning.as_ref().is_some_and(|r| r.kind == ReasoningParserKind::ContentHeaders)
+        {
+            return Err("TML JSON framing requires content-header reasoning syntax".into());
+        }
         if let Some(reasoning) = &self.reasoning {
             let (open, close) = match reasoning.kind {
                 ReasoningParserKind::ThinkTags => ("<think>", "</think>"),
@@ -641,6 +661,7 @@ impl FrontendContract {
                 ReasoningParserKind::MmThink => ("<mm:think>", "</mm:think>"),
                 ReasoningParserKind::ChannelThought => ("<|channel>thought", "<channel|>"),
                 ReasoningParserKind::RecipientHeaders => ("<|start|>assistant to=self<|message|>", "<|eom|>"),
+                ReasoningParserKind::ContentHeaders => ("<|content_thinking|>", "<|end_message|>"),
             };
             let tool_open = self.tools.as_ref().and_then(|tool| match tool.kind {
                 ToolParserKind::QwenCoder | ToolParserKind::GlmArgumentTags => Some("<tool_call>"),
@@ -656,7 +677,7 @@ impl FrontendContract {
                             .tools
                             .as_ref()
                             .is_none_or(|tool| tool.kind != ToolParserKind::Xtml)))
-                || (reasoning.kind == ReasoningParserKind::RecipientHeaders
+                || (matches!(reasoning.kind, ReasoningParserKind::RecipientHeaders | ReasoningParserKind::ContentHeaders)
                     && (reasoning.wrapping_newlines != 0 || !reasoning.terminal_markers.is_empty()))
                 || reasoning.wrapping_newlines > 1
                 || reasoning
@@ -716,7 +737,7 @@ mod tests {
             buffers: vec![BufferDescriptor {
                 name: "other".into(), shape: vec![], ..buffer.clone()
             }, buffer],
-            graphs: vec![], tuning_graphs: vec![],
+            graphs: vec![], tuning_graphs: vec![], persistent_workers: vec![],
         };
         view.validate(&manifest).unwrap();
         let mut missing = view.clone();
@@ -761,8 +782,8 @@ mod tests {
     fn recipient_syntax_requires_matching_typed_parsers_and_known_identifiers() {
         assert_eq!(ToolParserKind::try_from(7).unwrap(), ToolParserKind::Atem);
         assert_eq!(ReasoningParserKind::try_from(5).unwrap(), ReasoningParserKind::RecipientHeaders);
-        for value in [0, 8, 999] { assert!(ToolParserKind::try_from(value).is_err()); }
-        for value in [0, 6, 999] { assert!(ReasoningParserKind::try_from(value).is_err()); }
+        for value in [0, 9, 999] { assert!(ToolParserKind::try_from(value).is_err()); }
+        for value in [0, 7, 999] { assert!(ReasoningParserKind::try_from(value).is_err()); }
         let mut syntax = crate::model::testing::metadata().frontend;
         syntax.tools = Some(ToolParser {kind: ToolParserKind::Atem, wrapping_newlines: 0, tag_separator: String::new()});
         assert!(syntax.validate().is_err());
@@ -775,6 +796,45 @@ mod tests {
         reasoning.terminal_markers.clear();
         syntax.tools.as_mut().unwrap().wrapping_newlines = 0;
         assert!(syntax.validate().is_ok());
+    }
+
+    #[test]
+    fn content_header_syntax_requires_matching_json_tools_and_delimiters() {
+        assert_eq!(ToolParserKind::try_from(8).unwrap(), ToolParserKind::TmlJson);
+        assert_eq!(ReasoningParserKind::try_from(6).unwrap(), ReasoningParserKind::ContentHeaders);
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser { kind: ToolParserKind::TmlJson,
+            wrapping_newlines: 0, tag_separator: String::new() });
+        assert!(syntax.validate().is_err());
+        syntax.reasoning = Some(ReasoningParser { kind: ReasoningParserKind::ContentHeaders,
+            open: "<|content_thinking|>".into(), close: "<|end_message|>".into(),
+            wrapping_newlines: 0, terminal_markers: vec![] });
+        assert!(syntax.validate().is_ok());
+        syntax.reasoning.as_mut().unwrap().close = "</think>".into();
+        assert!(syntax.validate().is_err());
+        syntax.reasoning.as_mut().unwrap().close = "<|end_message|>".into();
+        syntax.tools = None;
+        assert!(syntax.validate().is_err());
+    }
+
+    #[test]
+    #[cfg(any(feature = "frontend", feature = "runtime-core"))]
+    fn inkling2_recipe_frontend_declares_valid_content_header_syntax() {
+        // tests/recipes/test_inkling2_frontend.py checks that the recipe declares this fixture.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/support/contracts/inkling2_frontend.json");
+        let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for (variant, preparation, layout) in [
+            ("text", None, None),
+            ("vision", Some(ImagePreparationKind::PaddedGrid), Some(ImageLayoutKind::ClassToken)),
+        ] {
+            let frontend: FrontendContract = serde_json::from_value(fixture[variant].clone()).unwrap();
+            frontend.validate().unwrap();
+            assert_eq!(frontend.tools.as_ref().unwrap().kind, ToolParserKind::TmlJson);
+            assert_eq!(frontend.reasoning.as_ref().unwrap().kind, ReasoningParserKind::ContentHeaders);
+            assert_eq!((frontend.image_preparation, frontend.image_layout), (preparation, layout));
+            assert_eq!(frontend.image_tokens.is_some(), layout.is_some());
+        }
     }
 
     #[test]

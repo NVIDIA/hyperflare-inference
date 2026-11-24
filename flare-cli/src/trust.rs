@@ -47,13 +47,22 @@ fn load_with(
         root,
         &ReviewOptions {
             publisher_keys: args.publisher_keys.clone(),
+            profiles: Vec::new(),
             hub: (&args.hub).into(),
             trust_store: args.trust_store.clone(),
             rank: args.rank.filter(|&rank| rank != 0),
             tensor_parallel,
         },
     )?;
-    phase.finish("signatures");
+    let signatures = review.core().signature_count();
+    phase.finish(format!(
+        "{signatures} {}",
+        if signatures == 1 {
+            "signature"
+        } else {
+            "signatures"
+        }
+    ));
     let disclosure = &review.disclosure;
     if let Some(origin) = origin {
         let downloaded = format!("https://huggingface.co/{origin}");

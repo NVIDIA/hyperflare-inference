@@ -506,6 +506,9 @@ impl Core {
                 return Err(invalid("invalid graph resource or function dependency"));
             }
         }
+        if let Some(execution) = self.execution.as_ref() {
+            super::protobuf::validate_persistent_workers(self, execution)?;
+        }
         Ok(())
     }
     pub fn validate_reference(&self, r: &Reference, size: usize) -> Result<()> {

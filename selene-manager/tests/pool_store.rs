@@ -212,9 +212,14 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
     }
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: 6,
             key: Some(pool::pkey(4096)),
             chain_pages: 64,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: false,
             published_parent: None,
@@ -225,9 +230,14 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
         .await;
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: 7,
             key: Some(pool::pkey(5120)),
             chain_pages: 80,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: false,
             published_parent: None,
@@ -251,6 +261,63 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
 
 // ---------------------------------------------------------------- recovered records (NVMe)
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn puts_reroot_at_half_the_chain_limit_and_restore_through_the_next_tail() {
+    let bound = selene_manager::store::REROOT_DEPTH as u64;
+    let mut host = Host::with_storage(64 << 20, 128 << 20);
+    let descriptor = descriptor();
+    let directory = host.config.root.as_ref().unwrap().join(descriptor.name());
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut parent = None;
+    for depth in 1..bound {
+        let record = key(depth * 64);
+        let (_, bytes, _) = content_for(&descriptor, record, parent, (depth - 1) as u32);
+        std::fs::write(
+            directory.join(selene_manager::record::file_name(&record)),
+            bytes,
+        )
+        .unwrap();
+        parent = Some(record);
+    }
+    host.run();
+    let mut writer = host.client().await;
+    let at_bound = key(bound * 64);
+    let root = key((bound + 1) * 64);
+    let child = key((bound + 2) * 64);
+    writer.store(at_bound, parent).await;
+    writer.store(root, Some(at_bound)).await;
+    writer.store(child, Some(root)).await;
+    let metrics = host.metrics();
+    assert!(metrics.contains("selene_put_links_total{parent=\"root\"} 1\n"));
+    assert!(metrics.contains("selene_put_links_total{parent=\"linked\"} 2\n"));
+    drop(writer);
+    host.restart();
+    host.durable(bound as usize + 2);
+    for (record, expected_parent) in [(at_bound, parent), (root, None), (child, Some(root))] {
+        let bytes =
+            std::fs::read(directory.join(selene_manager::record::file_name(&record))).unwrap();
+        let header = flare_selene::shared::record::Header::decode(&bytes[..4096]).unwrap();
+        assert_eq!(header.parent, expected_parent);
+    }
+    let (_, root_bytes, _) = content_for(&descriptor, root, None, 0);
+    let root_header = flare_selene::shared::record::Header::decode(&root_bytes[..4096]).unwrap();
+    let (_, child_bytes, _) = content_for(&descriptor, child, Some(root), (bound + 1) as u32);
+    let child_header = flare_selene::shared::record::Header::decode(&child_bytes[..4096]).unwrap();
+    let mut reader = host.client().await;
+    assert_eq!(
+        reader.fetch(&[root], 0, (bound + 1) as u32).await,
+        vec![root_bytes[root_header.page_segment as usize..].to_vec()]
+    );
+    assert_eq!(
+        reader.fetch(&[root, child], 0, (bound + 2) as u32).await,
+        vec![
+            root_bytes[root_header.page_segment as usize..root_header.row_segment as usize]
+                .to_vec(),
+            child_bytes[child_header.page_segment as usize..].to_vec(),
+        ]
+    );
+}
+
 fn rooted(label: &str) -> (std::path::PathBuf, selene_manager::store::Config) {
     let base = std::env::temp_dir().join(format!("selene-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -273,7 +340,6 @@ async fn first_life(config: &selene_manager::store::Config, tokens: &[u64]) {
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut writer = open(&mut pool, "writer").await;
     store_chain(&mut writer, 1, tokens).await;
-    host.durable(tokens.len());
     host.stop();
     host.base = std::env::temp_dir().join(format!("selene-unused-{}", std::process::id()));
 }
@@ -389,6 +455,58 @@ async fn a_requesters_stream_that_blips_keeps_the_manager_windows_until_it_repor
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_naming_the_arena_tier_is_served_from_disk_after_write_back_releases_the_arena() {
+    let (base, mut config) = rooted("released");
+    // An arena that holds four of these records, so later puts force write-back of the first.
+    config.memory = 512 * 1024;
+    let mut host = Host::open_config(config);
+    host.run();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut writer = open(&mut pool, "writer").await;
+    let mut reader = open(&mut pool, "reader").await;
+    let first = 1024u64;
+    store_chain(&mut writer, 1, &[first]).await;
+    let stale = reader.manager_candidate(1, first).await;
+    assert_eq!(stale.tier, v2::Tier::Dram as i32);
+    // Fill the arena with other roots until the first record's arena copy is released.
+    let mut next_put = 2;
+    let mut tokens = first + 64;
+    let mut current = stale.clone();
+    for _ in 0..40 {
+        if current.tier == v2::Tier::Nvme as i32 {
+            break;
+        }
+        store_chain(&mut writer, next_put, &[tokens]).await;
+        next_put += 1;
+        tokens += 64;
+        current = reader.manager_candidate(next_put, first).await;
+    }
+    assert_eq!(
+        current.tier,
+        v2::Tier::Nvme as i32,
+        "write-back never released the arena copy"
+    );
+    // The requester still holds the lookup that named the arena tier.
+    let (windows, granted) = read_claim(&mut reader, &stale, 1).await;
+    assert_eq!(granted.total_pages, 16);
+    let got: Vec<u8> = windows
+        .iter()
+        .flat_map(|(_, bytes, _)| bytes.clone())
+        .collect();
+    assert_eq!(vec![got], expected(&[first], 0, 0, true));
+    reader.barrier().await;
+    reader.copy_result(1, v2::CopyOutcome::CopyOk).await;
+    assert_eq!(
+        reader.claim_terminal(1).await.state,
+        v2::ClaimState::Copied as i32
+    );
+    reader.fence(1, v2::FenceOutcome::Drained).await;
+    host.stop();
+    host.base = std::env::temp_dir().join(format!("selene-unused4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a8_damage_at_rest_never_reaches_a_restore() {
     let (base, config) = rooted("a8");
     first_life(&config, &[1024]).await;
@@ -421,9 +539,9 @@ async fn a8_damage_at_rest_never_reaches_a_restore() {
         byte[0] ^= 0xff;
         handle.write_all_at(&byte, at).unwrap();
     }
-    // The store reads whole records back with their checksums: damage found on the way
-    // fails the claim before any window carries it. A copy of it that did get out would
-    // carry the persisted checksums, so the requester's own check would catch it too.
+    // A restore reads its windows straight from the file and serves them with the
+    // checksums persisted with the record, so damaged bytes reach the requester
+    // with checksums they do not match, and the requester's own check fails the copy.
     reader.claim(reader.claim_for(1, &candidate, 0, true)).await;
     let granted = reader.claim_granted(1).await;
     assert_eq!(granted.total_pages, 16);
@@ -471,9 +589,14 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
     let mut writer = open(&mut pool, "writer").await;
     writer
         .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: 1,
             key: Some(pool::pkey(1024)),
             chain_pages: 16,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
             has_published_parent: false,
             published_parent: None,
@@ -585,4 +708,58 @@ async fn a_freed_window_credit_is_granted_without_waiting_for_the_clock() {
         t1 < 2 * t32,
         "32 windows took {t1:?} on one credit and {t32:?} on 32"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_grants_are_record_relative_when_the_published_parent_is_stored() {
+    use v2::{client_message::M as C, server_message::M};
+    let mut host = host();
+    host.run();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut writer = open(&mut pool, "writer-relative-grants").await;
+    store_chain(&mut writer, 1, &[1024]).await;
+    writer
+        .send(C::PutBegin(v2::PutBegin {
+            put_id: 2,
+            key: Some(selene_manager::pool::key_to(key(2048))),
+            chain_pages: 32,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
+            row: true,
+            has_published_parent: true,
+            published_parent: Some(selene_manager::pool::key_to(key(1024))),
+            published_tail_pages: 16,
+            bucket: pool::bucket_of(2048),
+            mode: v2::CopyMode::SharedWindows as i32,
+            ..Default::default()
+        }))
+        .await;
+    let accept = writer
+        .take_within(Duration::from_secs(5), &mut |message| match message {
+            M::PutAccept(accept) if accept.put_id == 2 => Some(accept.clone()),
+            _ => None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(accept.first_page, 16);
+    let window = writer
+        .take_within(Duration::from_secs(5), &mut |message| match message {
+            M::PutGrant(grant) if grant.put_id == 2 => grant.window,
+            _ => None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        window.first_page, 0,
+        "grant coordinates start at the accepted record"
+    );
+    writer.send(C::PutCancel(v2::PutCancel { put_id: 2 })).await;
+    writer
+        .send(C::FenceAck(v2::FenceAck {
+            subject: Some(v2::fence_ack::Subject::PutId(2)),
+            outcome: v2::FenceOutcome::Drained as i32,
+        }))
+        .await;
 }

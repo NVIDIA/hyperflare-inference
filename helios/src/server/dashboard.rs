@@ -6,7 +6,10 @@
 
 //! Terminal rendering consumes bounded telemetry independently of execution.
 
+mod prefill;
 mod scheduler;
+
+pub(super) use prefill::PrefillPlot;
 
 use std::{
     collections::VecDeque,
@@ -118,6 +121,7 @@ impl Dashboard {
                     let mut scheduler = scheduler::SchedulerView::default();
                     let mut pane = Pane::Overview;
                     let _telemetry = Telemetry(&metrics);
+                    metrics.prefill_plot.get_or_init(Box::default);
                     metrics.scheduler_trace.start();
                     let mut sampled = start - REFRESH;
                     let mut redraw = true;
@@ -322,7 +326,7 @@ fn render_pane(
         rows[1],
     );
     match pane {
-        Pane::Overview => render_overview(frame, history, rows[2]),
+        Pane::Overview => render_overview(frame, history, metrics, rows[2]),
         Pane::Scheduler => {
             scheduler.render(frame, rows[2], history.snapshot, &metrics.scheduler_trace)
         }
@@ -504,7 +508,7 @@ fn render_header(frame: &mut Frame, title: &str, history: &History, area: Rect) 
     );
 }
 
-fn render_overview(frame: &mut Frame, history: &History, area: Rect) {
+fn render_overview(frame: &mut Frame, history: &History, metrics: &Metrics, area: Rect) {
     frame.render_widget(
         Block::default().style(Style::default().bg(BACKGROUND).fg(TEXT)),
         area,
@@ -544,12 +548,14 @@ fn render_overview(frame: &mut Frame, history: &History, area: Rect) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[0]);
     let bottom =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
-    plot(
+    let prefill = metrics.prefill_plot.get().map_or_else(Vec::new, |plot| {
+        plot.points(super::observation::monotonic_ns())
+    });
+    draw_plot(
         frame,
         top[0],
         &format!(" PREFILL  {} tok/s ", rate(r.prefill)),
-        history,
-        &[("", CYAN, |r| r.prefill)],
+        &[("", CYAN, prefill)],
     );
     plot(
         frame,
@@ -610,19 +616,24 @@ pub type Series = (&'static str, Color, fn(Rates) -> f64);
 /// The upper label shows the observed maximum across the series.
 pub fn plot(frame: &mut Frame, area: Rect, title: &str, history: &History, series: &[Series]) {
     let now = history.points.back().map_or(0.0, |(time, _)| *time);
-    let points: Vec<Vec<_>> = series
+    let data: Vec<_> = series
         .iter()
-        .map(|(_, _, value)| {
-            history
+        .map(|&(name, color, value)| {
+            let points = history
                 .points
                 .iter()
                 .map(|(time, rates)| (time - now, value(*rates)))
-                .collect()
+                .collect();
+            (name, color, points)
         })
         .collect();
-    let peak = points
+    draw_plot(frame, area, title, &data);
+}
+
+fn draw_plot(frame: &mut Frame, area: Rect, title: &str, series: &[(&str, Color, Vec<(f64, f64)>)]) {
+    let peak = series
         .iter()
-        .flatten()
+        .flat_map(|(_, _, points)| points)
         .map(|(_, value)| *value)
         .fold(0.0, f64::max);
     // Borders, the x-axis and its labels occupy four rows outside the plot.
@@ -632,8 +643,7 @@ pub fn plot(frame: &mut Frame, area: Rect, title: &str, history: &History, serie
     labels[label_rows - 2] = "max".into();
     let datasets = series
         .iter()
-        .zip(&points)
-        .map(|((name, color, _), data)| {
+        .map(|(name, color, data)| {
             let dataset = Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
@@ -836,7 +846,7 @@ mod tests {
         for (width, height) in [(120, 35), (80, 24), (80, 20), (40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| render_overview(frame, &history, frame.area()))
+                .draw(|frame| render_overview(frame, &history, &metrics, frame.area()))
                 .unwrap();
             let content: String = terminal
                 .backend()

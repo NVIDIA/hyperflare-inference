@@ -65,7 +65,10 @@ def export_core(prepared, images, storage, path, *, options, publisher, progress
         # preparation leases can drop before combine reads them.
         with phase(progress, "Release preparation resources"):
             native_stage.retain_sources(roots)
-            prepared.close()
+            if storage.world > 1:
+                prepared.close(after_export=True)
+            else:
+                prepared.close()
             for region in storage.host_regions:
                 region.close()
         result = combine(None if cache_only else path, roots, peers,

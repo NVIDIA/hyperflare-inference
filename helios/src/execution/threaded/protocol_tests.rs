@@ -255,12 +255,23 @@ fn rank_coordinator_matches_model_completion_identity() {
         pop_completed_front(&mut pending).is_none(),
         "later completion cannot publish ahead of the queue front"
     );
+    let mut uncommitted = VecDeque::from([frame(1, 0, false)]);
+    error(
+        record_local_completion(&mut uncommitted, completion(1, 0)),
+        "rank-zero completion identity or state differs",
+    );
+    assert!(uncommitted[0].completions[0].is_none());
+
     record_local_completion(&mut pending, completion(1, 0)).unwrap();
     error(
         record_local_completion(&mut pending, completion(1, 1)),
+        "rank-zero completion identity or state differs",
+    );
+    error(
+        record_local_completion(&mut pending, completion(1, 0)),
         "duplicate rank-zero completion",
     );
-    assert_eq!(pending[0].completions[0].as_ref().unwrap().graph_index, 1);
+    assert_eq!(pending[0].completions[0].as_ref().unwrap().graph_index, 0);
     record_peer_completion(&mut pending, 0, completion(1, 0)).unwrap();
     error(
         record_peer_completion(&mut pending, 0, completion(1, 0)),
@@ -279,13 +290,14 @@ fn rank_coordinator_matches_model_completion_identity() {
             removed.completions[0].as_ref().unwrap(),
             removed.completions[1].as_ref().unwrap()
         )
-        .is_err()
+        .is_ok(),
+        "rejected duplicate rank-zero completion must not overwrite stored payload"
     );
-    assert_eq!(
-        pending.len(),
-        1,
-        "agreement errors occur after removing the completed frame"
+    assert!(
+        super::super::parallel::agree(&completion(1, 0), &completion(1, 1)).is_err(),
+        "mismatched rank completions must fail agreement"
     );
+    assert_eq!(pending.len(), 1);
 }
 
 #[test]

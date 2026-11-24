@@ -260,9 +260,13 @@ format; incompatible cores must be exported again with Ignition.
 
 Each preparation rank writes its resource file before the model file is
 assembled. After all ranks finish exporting and peer ownership is recorded,
-Ignition drains and closes the prepared models, joins peer processes, and
-releases registered host buffers. Final file assembly requires only rank files
-and their indexes. N-gram table payloads are appended directly from checkpoint
+Ignition leases the payloads referenced by the rank files. In a single-host
+tensor-parallel export, the supervisor monitors peer liveness while the ranks
+close their prepared models. Each peer also releases its registered host buffers
+and acknowledges completion. Rank zero then starts the 60-second deadline for
+Gloo shutdown and peer exit. It joins the peers and releases its host buffers
+before assembly. Final file assembly requires only rank files and their indexes.
+N-gram table payloads are appended directly from checkpoint
 file ranges during rank export, without materializing their contents in
 preparation memory.
 
@@ -340,12 +344,15 @@ canonical forms, packing, publication, locations, and conversion.
 
 ### Preparation rebuild metadata
 
-Exports through `ignition export` record an optional `RebuildManifest`. Export
+Exports through `ignition export` record `RebuildManifest`. Export
 staging carries it as `ModelIndex.rebuild`, and the published payload core
 signs it as `DeploymentBody.rebuild`.
 It identifies the recipe, preparation source identity, qualified checkpoint
 repository and revision, tensor-parallel size, concurrency, chunk size,
-speculation, and selected preparation settings. A local checkpoint override
+speculation, selected preparation settings (including prompt logprobs,
+autotune effort, native dense activations, and GPU clock locking), and
+canonical `ignition export` reproduction arguments in `reproduction_args`
+without host-local paths or secrets. A local checkpoint override
 is marked explicitly and carries no asserted upstream revision. Runtime
 collective preparation records the complete offline ladder as
 `RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
@@ -357,6 +364,16 @@ independently of the recipe's preparation default. Explicit `all` and `kda-input
 values retain their meanings. Weight reuse and core combination reject
 different conversion groups; changing a recipe default never changes stored
 weights or the serving behavior of an exported core.
+
+For DFlash2, an omitted `RebuildSpeculation.draft_body_quantization` inherits
+MXFP8 body conversion when `online_mxfp8` is true and the stored scope is `all`
+(including an absent or empty scope). Otherwise omission retains checkpoint
+precision. Core combination and cached-weight reuse compare this effective
+format, so an explicit `mxfp8` override remains compatible with inherited MXFP8.
+They still reject checkpoint-precision versus MXFP8 body mismatches. With
+`--reuse-weights --no-mtp`, only target views are consumed, so draft-body settings
+do not constrain reuse. Normalizing a comparison does not rewrite the recorded
+metadata or change stored weight bytes.
 
 Each recipe also supplies its named weight owners. After reachability pruning,
 the exporter records retained tensor views in `BundleIndex.rebuild_weights`:
@@ -396,9 +413,12 @@ execution catalog; this preparation setting adds no runtime policy.
 
 `flare inspect --json` reports the manifest as `rebuild` and per-rank tensor
 counts as `rebuild_weights` for logical-resource cores; `--all` includes the
-tensor catalogs. Absent manifests are reported as null. For payload cores both
-fields are null even when `DeploymentBody.rebuild` and a rank catalog are
-present. Designed, not implemented: reporting them for payload cores.
+tensor catalogs. Absent manifests are reported as null. For payload cores
+`rebuild` is the selected deployment's `DeploymentBody.rebuild`, read after the
+signatures verify, or from the bounded primary-file metadata with
+`--unverified`. With `--unverified` it is null when no single deployment is
+selected, and each `deployments[]` entry carries its own `rebuild`.
+`rebuild_weights` is null for payload cores.
 Helios ignores rebuild metadata during loading and replay, including unfamiliar
 catalog versions. Serving validates the execution layout and prepared model contract independently.
 Changing signed rebuild metadata requires signing the core again.
@@ -438,7 +458,9 @@ controllers must speak the same agent protocol version (`PROTOCOL_VERSION` in
 before files are sent.
 Resource classification follows actual consumers in the signed index. Missing,
 overlapping, unclassified, or incorrectly classified spans fail loading. The
-128 MiB metadata limit applies to the complete signed envelope. The core
+128 MiB metadata limit applies to the complete signed envelope and to each reconstructed rank body.
+The verifier accepts up to 1 GiB of reconstructed metadata across the selected ranks and checks
+the aggregate before decoding compressed weight catalogs. The core
 contains the signing-key fingerprint, not the verification key. Keys come from
 Helios's embedded publisher profiles or explicitly supplied profile files.
 
@@ -563,6 +585,32 @@ then rebased onto the live addresses and validated, and the server starts
 from this reconstructed contract. `flare run CORE` in
 `flare-cli/src/main.rs` starts the shared server directly from the typed contract.
 
+When a single-rank core declares an entry in `Execution.persistent_workers`
+(repeated field 8; at most one entry is currently accepted, and multi-rank or
+multi-host cluster cores declaring a persistent worker are rejected),
+`NativeResources` resolves the CUDA driver Green Context entrypoints optionally
+at driver load (failing load explicitly only when a core requires them on an
+unsupported driver), retains the device's primary context, partitions device
+SMs with `cuDevSmResourceSplit` into two explicit structured SM resource groups
+(a worker green context aligned to the device's co-scheduled SM alignment and a
+compute green context preserving co-scheduled SM alignment for multi-CTA
+cluster launches), applies the core's recorded CUDA context limits and cache
+configuration to the primary context and both green contexts, and opens
+non-blocking streams for each. All modules, kernels, and graph executables are
+loaded, instantiated under their partition's green context (clamping
+cooperative grids to that partition's SM count), and uploaded on their
+partition's non-blocking stream before the persistent worker starts; the
+executor launches the worker graph once on its worker stream only after startup
+completes, while compute graphs replay on the compute green context. Shutdown
+drains compute and copy streams first, writes `1u32` (release) to the
+mapped-host `stop_flag` reference, and polls `cuStreamQuery` on the worker
+stream against a bounded drain timeout with context save/restore (returning
+`ExecutionError::Drain` and retaining GPU resources on timeout). Resource
+teardown stops any still-running worker, synchronizes the primary context, and
+only after context synchronization succeeds destroys worker and compute
+streams, executables, modules, mappings, green contexts, virtual-address
+reservations, and the primary context.
+
 Before CUDA initialization or serving worker threads, Flare restricts
 `CUDA_VISIBLE_DEVICES` to `--gpus`, resolving indices within an inherited mask.
 When omitted, the list contains the first N visible GPUs for the core's N
@@ -662,6 +710,75 @@ the recipe's execution rows per request. KV pages receive the remaining budget,
 within their virtual maximum. The planner accounts for mapping alignment and
 requires at least 8,192 cached tokens per active request.
 
+The number of physical allocation handles and device mappings is also a driver
+resource constraint. Linux UVM duplicates external mappings into a shared RM
+client whose automatic handle range is 524,288 entries (`RS_UNIQUE_HANDLE_RANGE`
+in NVIDIA drivers
+[580.105.08](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.105.08/src/nvidia/inc/libraries/resserv/rs_client.h)
+and [615.71.10](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/615.71.10/src/nvidia/generated/g_rs_client_nvoc.h)).
+Exhaustion returns `NV_ERR_INSUFFICIENT_RESOURCES`, which CUDA can expose as
+`CUDA_ERROR_OUT_OF_MEMORY` despite free framebuffer memory. Combining access
+calls alone does not remove the underlying allocation and mapping objects.
+
+The native cache layout reduces those objects without reducing KV pages or
+snapshot rows. It first permutes the backing-plane assignment of chunks with
+identical bytes per page, byte offset within the plane, and mapped length. Their
+row positions and logical page coverage stay the same. It then reorders whole chunks inside an
+uninterrupted interval of one snapshot row, merging adjacent spans of the same
+KV plane into one backing allocation and one alias mapping. Only complete chunks
+wholly contained in one row are reordered or merged. A plane span whose prefix
+backs the final snapshot uses two physical handles. The snapshot maps the whole
+first handle and the remaining bytes have only their KV mapping.
+
+These transformations preserve every plane's byte coverage, physical byte
+count, snapshot address and stride, and the exact set of KV pages conflicting
+with each snapshot. The scheduler consumes the same exclusion ranges. Reader
+permissions remain allocation-specific. The layout uses ordinary CUDA VMM
+allocations at the recorded core addresses and requires no core re-export,
+additional framebuffer reserve, allocation retry, or reduced cache capacity.
+
+On a single Linux host, before allocating backing, Helios counts one physical handle for each fixed
+allocation or cache chunk and one mapping for each actual device reader of each
+virtual address. If the estimated total reaches the NVIDIA GPU kernel Resource
+Manager (RM) automatic handle range (`RS_UNIQUE_HANDLE_RANGE`, 524,288 handles
+shared across the host's Linux UVM client), the planner
+packs the longest contiguous span available in a single plane at each snapshot
+address, stopping once the aggregate estimate drops below the limit. A row can
+extend toward high page IDs already covered by preceding rows. Each snapshot
+retains its admissible low KV prefix, and each prefix of snapshot slots excludes
+a subset of its previous pages. Individually retained snapshots can exclude
+additional pages when active KV is fragmented.
+
+If those spans still exceed the mapping range, the planner groups KV pages in
+successively wider bands derived from CUDA allocation granularity and bytes per
+page, stopping as soon as the aggregate fits. It measures each geometry's handle
+count before creating any GPU backing and keeps reductions in that count. If
+even whole-plane grouping remains at or above the limit, startup fails
+explicitly with the handle shortfall before creating GPU allocations. The
+scheduler receives the actual intersection of each snapshot with its KV planes
+as an enclosing page range. Wider bands can exclude more pages while a snapshot
+is retained. Both policies keep the planned number of KV pages, snapshot slots
+and physical bytes. The RM estimate covers the model's VMM objects; other driver
+objects share the same 524,288-handle range, so deployments near the limit
+(such as the 518,232-handle 3,103-page DCP16 layout, leaving 6,056 handles /
+1.2%) rely on that remaining headroom.
+
+Multi-host cache agreement exchanges page and row counts. Each host uses the
+same canonical layout and includes its snapshot conflict ranges in the
+scheduler contract hash. Other operating systems also retain canonical
+placement.
+
+Native startup and C1/C4 generation with 32K prefill are qualified for Kimi K3.1
+Pro TP16 cores using DCP8 and DCP16 on one Linux configuration (sixteen RTX PRO
+6000 Blackwell GPUs with NVIDIA driver 615.71.10), with default memory sizing
+and explicit reserves of zero and 1 GiB. Prefix-compacted placements are
+qualified on that configuration; wide-group compaction is verified by CPU unit
+tests only and has not been mapped through a GPU driver. KV and snapshot
+capacities match the physical-memory plan in all six configurations. CPU layout
+tests compare every row's exact conflict set and complete byte coverage; GPU
+tests preserve snapshot bytes while released KV pages are overwritten. These
+checks do not constitute model-quality evaluation.
+
 Immutable snapshot capacity is bounded by borrowable KV backing and the prepared
 virtual extent. At load, CUDA virtual mappings expose the same allocation chunks
 through the page planes and the snapshot part of the continuation range. Small
@@ -681,8 +798,12 @@ Admission reserves the request's KV pages. System, prompt, and terminal snapshot
 acquire backing at their capture boundaries, evicting unpinned checkpoints when
 needed. If active requests or transfers hold all suitable backing, optional
 retention is skipped. An inbound host restore reserves both its row and pages
-before transfer; if its snapshot prevents admission, the request recomputes its
-prompt. Snapshot and page ownership remain exclusive through graph
+before transfer. A capacity-blocked restore waits while requests, transfers,
+or fenced retirement may release backing and its accumulated wait plus estimated
+transfer time remains below half the estimated prefill time it replaces. Wait-budget expiry
+permits a recompute attempt even without resource progress. With no remaining
+resource holder, admission tries recomputation immediately.
+Snapshot and page ownership remain exclusive through graph
 and transfer completion, including cancellation and duplicate publication.
 Once generation drains, unused output-page reservations are released before
 retaining the final checkpoint.
@@ -812,9 +933,34 @@ Collective signals and generation-tagged payloads are reset after all ranks
 drain. Imported mappings are recorded as peer dependencies and stored only in
 the owning rank's bundle.
 
-Helios checks that rank allocations do not overlap, creates every device
-context, loads rank storage, and grants the declared peer access through
-`cuMemSetAccess` before loading modules and instantiating execution state.
+Helios checks that rank allocations do not overlap and creates every device
+context before mapping storage. Each mapping receives one `cuMemSetAccess`
+grant containing its owner and the ranks whose bundles import that allocation
+as peer memory. The signed reader declaration must include these ranks but may
+contain unused ranks; cores with all-rank reader declarations therefore retain
+compatibility without granting access outside the actual import group. Static
+mappings receive access during allocation. Runtime-sized cache mappings receive
+access after backing is mapped, before zeroing or graph use. Continuation aliases
+have their own access permissions, independent of the KV plane they borrow.
+
+For shared cache allocations, startup logs each reader GPU's `cuMemGetInfo_v2`
+free bytes before and after its mapping grants, the signed used-byte delta,
+owner, address, backed size, backing mapping count, and reader rank/device pairs.
+Physical backing is already allocated at the first sample; no cache backing is
+allocated between these samples. These observations include driver access state
+and may include other processes' memory activity. They do not measure transient
+peaks inside a driver call or establish a safe planning reserve. Remote KV bytes are
+not charged as duplicated physical storage. A failed grant reports the exact
+mapping range and readers while retaining the CUDA status.
+
+Cache backing and access grants are attempted once. Allocation and access errors
+abort startup with their original CUDA status; the loader does not reduce cache
+capacity and retry. Capacities are published only after all ranks have mapped
+and granted their cache. The fixed model and communication buffers are allocated
+before cache sizing. Access to the runtime-sized cache itself follows its
+physical mapping, so its mapping resources must fit alongside the chosen backing.
+CUDA free bytes do not describe every driver resource limit.
+
 Address reservations are established before allocation. Allocation, payload
 loading, kernel loading, and execution preparation each run concurrently across
 ranks, joining all rank threads between stages. Loading retains a process-wide

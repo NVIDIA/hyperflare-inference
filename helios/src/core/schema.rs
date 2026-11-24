@@ -25,8 +25,11 @@ pub const FORMAT_VERSION: u32 = 2;
 pub const MAX_BODY: usize = 128 << 20;
 /// Bound on the complete serialized envelope.
 pub const MAX_ENVELOPE: usize = 128 << 20;
-/// Bound on reconstructed rank metadata selected by one verification.
-pub const MAX_SELECTED_RANK_METADATA: u64 = 512 << 20;
+/// Bound on all selected, reconstructed rank bodies before inflating their
+/// compressed weight catalogs. Limits aggregate host memory committed during
+/// verification while allowing 16-rank MoE cores (~37 MiB per rank, each
+/// within `MAX_BODY`).
+pub const MAX_SELECTED_RANK_METADATA: u64 = 1 << 30;
 /// Executable compressed chunk size. Authentication covers chunks of exactly this size.
 pub const MAX_CHUNK: usize = 4 << 20;
 /// Bound on compressed chunks for one executable resource (4 TiB at the fixed chunk size).
@@ -494,6 +497,37 @@ fn allocation_extent(allocation: &wire::Allocation) -> Result<u64> {
     }
 }
 
+fn validate_relocation(
+    relocation: &runtime::Relocation,
+    owner_extent: u64,
+    extents: &BTreeMap<&str, u64>,
+    owner_label: &str,
+) -> Result<()> {
+    let target = relocation
+        .target
+        .as_ref()
+        .ok_or_else(|| invalid("relocation has no target"))?;
+    let target_extent = extents
+        .get(target.allocation.as_str())
+        .ok_or_else(|| invalid("relocation names an absent allocation"))?;
+    if target.offset >= *target_extent {
+        return Err(invalid("relocation target is outside its allocation"));
+    }
+    let width = match runtime::RelocationKind::try_from(relocation.kind) {
+        Ok(runtime::RelocationKind::Pointer) => 8,
+        Ok(runtime::RelocationKind::TensorMap) => 128,
+        Err(_) => return Err(invalid("unknown relocation kind")),
+    };
+    if relocation
+        .offset
+        .checked_add(width)
+        .is_none_or(|end| end > owner_extent)
+    {
+        return Err(invalid(format!("relocation is outside its {owner_label}")));
+    }
+    Ok(())
+}
+
 /// Validate one rank body against the authenticated catalog and core-wide resource ids.
 pub fn validate_rank(
     body: &wire::RankBody,
@@ -545,28 +579,7 @@ pub fn validate_rank(
     for (name, &extent) in &extents {
         if let Some(allocation) = body.allocations.iter().find(|a| a.name == *name) {
             for relocation in &allocation.relocations {
-                let target = relocation
-                    .target
-                    .as_ref()
-                    .ok_or_else(|| invalid("relocation has no target"))?;
-                let target_extent = extents
-                    .get(target.allocation.as_str())
-                    .ok_or_else(|| invalid("relocation names an absent allocation"))?;
-                if target.offset >= *target_extent {
-                    return Err(invalid("relocation target is outside its allocation"));
-                }
-                let width = match runtime::RelocationKind::try_from(relocation.kind) {
-                    Ok(runtime::RelocationKind::Pointer) => 8,
-                    Ok(runtime::RelocationKind::TensorMap) => 128,
-                    Err(_) => return Err(invalid("unknown relocation kind")),
-                };
-                if relocation
-                    .offset
-                    .checked_add(width)
-                    .is_none_or(|end| end > extent)
-                {
-                    return Err(invalid("relocation is outside its allocation"));
-                }
+                validate_relocation(relocation, extent, &extents, "allocation")?;
             }
         }
     }
@@ -611,6 +624,9 @@ pub fn validate_rank(
                 return Err(invalid(
                     "module global length differs from its payload slice",
                 ));
+            }
+            for relocation in &global.relocations {
+                validate_relocation(relocation, global.nbytes, &extents, "module global")?;
             }
         }
     }
@@ -791,7 +807,7 @@ fn validate_prepared_weights(
     if catalog.version == 0 {
         return Err(invalid("prepared weight catalog has no version"));
     }
-    let mut names = BTreeSet::new();
+    let mut names = std::collections::HashSet::with_capacity(catalog.views.len());
     for view in &catalog.views {
         bounded_name(&view.name, 256, "weight view name")?;
         if !names.insert(view.name.as_str()) {
@@ -887,14 +903,6 @@ fn validate_prepared_weights(
                 .is_none_or(|end| end > view.nbytes)
             {
                 return Err(invalid("weight padding is outside its view"));
-            }
-        }
-        for source in &view.sources {
-            bounded_name(&source.tensor, 512, "weight source tensor")?;
-            for range in &source.ranges {
-                if range.begin >= range.end {
-                    return Err(invalid("weight source range is empty"));
-                }
             }
         }
     }
@@ -1763,5 +1771,24 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn validate_rank_rejects_out_of_bounds_module_global_relocations() {
+        let (mut rank, mut catalog) = module_rank();
+        let offset = rank.modules[0].globals[0].nbytes;
+        let allocation = rank.allocations[0].name.clone();
+        rank.modules[0].globals[0].relocations.push(runtime::Relocation {
+            offset,
+            kind: runtime::RelocationKind::Pointer as i32,
+            target: Some(runtime::Reference {
+                allocation,
+                offset: 0,
+            }),
+        });
+        let error = validate_rank(&rank, 1, &mut catalog, &mut BTreeSet::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("relocation is outside its module global"), "{error}");
     }
 }

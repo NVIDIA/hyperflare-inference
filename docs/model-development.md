@@ -1,12 +1,16 @@
 # Model development
 
-Recipes in `ignition/recipes/` own model composition, checkpoint mapping, state
-layouts, and graph preparation. Shared execution mechanisms belong in
-`ignition/components/`. Each recipe package's `recipe.py` defines `RECIPE`, a
-`Recipe` from [the declaration module](../ignition/recipes/declaration.py) that
-names its checkpoints, serving range, memory costs, speculation, and sampling
-defaults; `recipes()` in `ignition/recipes/__init__.py` lists the declarations
-the Ignition CLI offers. Follow [repository guidance](../AGENTS.md),
+Official model recipes live in
+[`local-inference-lab/hyperflare-recipes`](https://github.com/local-inference-lab/hyperflare-recipes)
+under `hyperflare_recipes/recipes/` and own model composition, checkpoint
+mapping, state layouts, and graph preparation. Reusable model execution
+mechanisms belong in `hyperflare_recipes/components/`; Helios-ABI interface
+modules stay in `ignition/components/` in this repository. Each recipe
+package's `recipe.py` defines a `Recipe` from
+[the declaration module](../ignition/declaration.py) that names its checkpoints,
+serving range, memory costs, speculation, and sampling defaults, and passes its
+recipe tuple into `ignition.cli.main(...)`. Follow
+[repository guidance](../AGENTS.md),
 [preparation development](preparation-development.md), and the relevant
 [model preparation and serving instructions](model-preparation.md).
 Performance changes also require [GPU performance work](performance-work.md).
@@ -61,18 +65,20 @@ offsets and exact source/result SHA-256 hashes, plus the pinned HF source locati
 They contain no upstream template text. `annotated_template_asset` in
 `ignition/preparation/frontend.py` rejects changed source bytes
 and supplies the annotated text to native export without modifying the checkpoint.
-Step's inference transformation (`ignition/recipes/step5/frontend.py`) replaces
-the template's `generation`/`endgeneration` training-span tags before applying
-its insertion patch. Kimi K3 and K3.1 bundle their segmented XTML templates as
-project code in `ignition/recipes/kimi3/assets/chat_template.jinja` and
-`ignition/recipes/kimi31/assets/chat_template.jinja`;
+Step's inference transformation (`hyperflare_recipes/recipes/step5/frontend.py`)
+replaces the template's `generation`/`endgeneration` training-span tags before
+applying its insertion patch. Kimi K3 and K3.1 bundle their segmented XTML
+templates as project code in `hyperflare_recipes/recipes/kimi3/assets/chat_template.jinja`
+and `hyperflare_recipes/recipes/kimi31/assets/chat_template.jinja` (mirrored for
+Helios Rust frontend tests under `helios/tests/fixtures/templates/`);
 their upstream reference is a Python encoder, not a Jinja template. DeepSeek V4
 and V4.1 use programmatic Rust encoders and have no template asset.
 
 Gemma 4 fetches Google's canonical chat templates for every supported publisher
 and quantization using the configured hub cache.
-`ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.patch.json`
-serves E2B/E4B; `chat_template.google.patch.json` serves 12B/26B-A4B/31B. The sources are
+`hyperflare_recipes/recipes/gemma4/assets/chat_template.google-e2b-e4b.patch.json`
+serves E2B/E4B; `chat_template.google.patch.json` serves 12B/26B-A4B/31B (with
+matching descriptors in `helios/tests/fixtures/templates/gemma4/` for Helios tests). The sources are
 [Google E4B at ee0ef602](https://huggingface.co/google/gemma-4-E4B-it/blob/ee0ef6023621cff504d758262d4e04895a5af4a2/chat_template.jinja)
 and [Google 26B-A4B at 4d7ae498](https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/chat_template.jinja),
 with message-boundary annotations. Preparation selects by model hidden size:
@@ -129,9 +135,11 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
 ### Complete-message endpoints
 
 - Render the conversation once and record endpoints while producing its output.
-  Tokenize each required text or ordinary/special-token segment once. Do not
-  recover boundaries by rendering or tokenizing every conversation prefix,
-  searching for message text, or inserting marker text into the prompt.
+  Tokenize each required text or ordinary/special-token segment once, except that
+  a Jinja prompt region whose request text spells a control token is encoded a
+  second time. Do not recover boundaries by rendering or tokenizing every
+  conversation prefix, searching for message text, or inserting marker text into
+  the prompt.
 - Record the completed preamble and every completed normalized message in output
   order, including system, assistant, and tool messages where supported. A merged
   user run has the endpoint of the merged message; reordered results have
@@ -168,6 +176,13 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
   Marks inside macros, captured assignments, or filter blocks are forbidden;
   mark the root call site after the helper returns. Handle each output branch,
   including tool-only messages and empty content with nonempty framing.
+- Name in the template text or in a recipe default every control token the
+  template writes. An added token that is neither special, named there, nor a
+  marker the recipe's prepared frontend contract names (its reasoning
+  delimiters and terminal markers, the markers of its tool-call parser kind,
+  and its image tokens) is lexical: request text that spells it tokenizes to
+  that token. A control assembled from request fields (for example
+  `'<|' + role + '|>'`) counts as request text.
 - Verify the recipe exports the annotated asset and Helios loads it through the
   shared compiler. Do not bypass the missing-annotation error or add a broad
   template fallback. Compatibility substitutions must match the exact template
@@ -258,7 +273,7 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   Never silently rescale or requantize weights to make a fusion possible.
 - **Separate weight storage from arithmetic precision.** Keep BF16 weights in
   BF16 when the required accumulation/output is FP32; use
-  [UnquantizedProjection](../ignition/components/linear.py) for that contract. Do not
+  [UnquantizedProjection](https://github.com/local-inference-lab/hyperflare-recipes/blob/main/hyperflare_recipes/components/linear.py) for that contract. Do not
   expand router weights to FP32 merely because routing requires FP32 logits.
   Preserve genuinely FP32 checkpoint weights and model-required arithmetic.
 - **Let b12x select activation precision and kernels.** Use
@@ -293,8 +308,8 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
 - **Overlap independent branches.** Shared experts should be considered for
   overlap with routing and routed experts; recurrent output-gate projections
   can overlap independent input projections. Use
-  [ConcurrentSharedExpert](../ignition/components/expert_overlap.py) and
-  [ConcurrentProjectionChain](../ignition/components/projection_overlap.py) where their
+  [ConcurrentSharedExpert](https://github.com/local-inference-lab/hyperflare-recipes/blob/main/hyperflare_recipes/components/expert_overlap.py) and
+  [ConcurrentProjectionChain](https://github.com/local-inference-lab/hyperflare-recipes/blob/main/hyperflare_recipes/components/projection_overlap.py) where their
   contracts fit. Measure the relevant row capacities: branches competing for
   bandwidth or SM capacity can make overlap slower. Graph node construction
   order also affects scheduling. `ConcurrentSharedExpert(..., defer_launch=True)`
@@ -313,7 +328,7 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   [ScratchArena.register_parallel](../ignition/preparation/scratch.py) to size
   concurrent preparation workspaces. Allocate serving temporaries in the forward.
 - **Shard the vocabulary projection under TP.** Use
-  [PreparedVocabularyProjection](../ignition/components/vocabulary.py) to project
+  [PreparedVocabularyProjection](https://github.com/local-inference-lab/hyperflare-recipes/blob/main/hyperflare_recipes/components/vocabulary.py) to project
   contiguous vocabulary partitions and gather logits before designated-rank
   sampling. Keep all ranks participating, including resume and other paths
   that produce logits. Respect the collective's supported geometry and retain
@@ -322,7 +337,7 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
 - **Fuse residual and normalization boundaries.** Use b12x fused residual,
   normalization, activation, and mHC operations when their rounding matches the
   model contract. Consider adjacent layers as well as operations within a
-  layer; [PreparedMHC](../ignition/components/mhc.py) supports fused post/pre mixing.
+  layer; [PreparedMHC](https://github.com/local-inference-lab/hyperflare-recipes/blob/main/hyperflare_recipes/components/mhc.py) supports fused post/pre mixing.
   Avoid materializing an intermediate solely because a Python module ends.
 
 ## Speculative decode

@@ -17,13 +17,20 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JobId(pub u64);
 
+/// Upper bounds in milliseconds for completed DRAM retirement paths.
+pub const RETIREMENT_LATENCY_MS: [u64; 8] = [10, 50, 100, 500, 1000, 5000, 15000, 30000];
+
 /// A GPU checkpoint the scheduler published, as the worker reports it to the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedCheckpoint {
+    pub capture_role: crate::CaptureRole,
     pub id: CheckpointId,
     pub key: PrefixKey,
-    /// Key of the GPU parent checkpoint, or `None` at the root.
-    pub parent: Option<PrefixKey>,
+    /// Every offered GPU ancestor on the checkpoint's parent chain, nearest first
+    /// with strictly decreasing consumed tokens, at most [`MAX_PUBLISHED_ANCESTORS`].
+    /// A tier links the record under the first ancestor it holds, so a skipped
+    /// same-page Endpoint does not force a copy of the whole chain.
+    pub ancestors: Vec<PrefixKey>,
     /// Digest of the aligned hash-block boundary at or below the endpoint.
     pub bucket: [u8; 16],
     /// Every page of the checkpoint's chain from the root in ascending order.
@@ -34,9 +41,48 @@ pub struct PublishedCheckpoint {
     pub slot: StateSlotId,
 }
 
+/// Limits the length and memory of each publication's ancestor list.
+/// 256 leaves ample room for offered conversation boundaries and is well
+/// below the manager's limit of 4096 candidates per put.
+pub const MAX_PUBLISHED_ANCESTORS: usize = 256;
+
+/// Why a tier stored a root record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootReason {
+    /// The checkpoint offered no ancestor.
+    First = 0,
+    /// The tier stored a root despite receiving candidate ancestors.
+    NoHeldAncestor = 1,
+}
+
+impl RootReason {
+    pub const COUNT: usize = 2;
+
+    pub(crate) fn from_nearest(nearest: Option<PrefixKey>) -> Self {
+        if nearest.is_some() {
+            Self::NoHeldAncestor
+        } else {
+            Self::First
+        }
+    }
+}
+
 impl PublishedCheckpoint {
-    pub fn tail(&self) -> &[PageId] {
-        &self.chain_pages[self.chain_pages.len() - self.tail_pages..]
+    /// Key of the nearest offered GPU ancestor, if any.
+    pub fn parent(&self) -> Option<PrefixKey> {
+        self.ancestors.first().copied()
+    }
+
+    /// Offered GPU ancestors, nearest first.
+    pub fn offered(&self) -> impl Iterator<Item = PrefixKey> + '_ {
+        self.ancestors.iter().copied()
+    }
+
+    /// The pages after `ancestor`'s own: what a record linked under it copies.
+    /// `None` when `ancestor` is not below the checkpoint's chain.
+    pub fn tail_below(&self, ancestor: &PrefixKey, page_tokens: u64) -> Option<&[PageId]> {
+        let first = usize::try_from(ancestor.consumed_tokens / page_tokens).ok()?;
+        self.chain_pages.get(first..)
     }
 }
 
@@ -139,6 +185,14 @@ pub enum StoreEvent {
 /// Counters every store maintains; rates are bytes per second of completed transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoreStats {
+    pub retirement_paths: u64,
+    pub retirement_max_depth: u64,
+    pub retirement_ns: u64,
+    pub retirement_max_ns: u64,
+    pub retirement_latency_buckets: [u64; 8],
+    pub retirement_pinned_bytes: u64,
+    /// Completed restores by GPU, DRAM and NVMe source tier.
+    pub restores_by_tier: [u64; 3],
     pub lookups: u64,
     pub hits: u64,
     pub reused_tokens: u64,
@@ -148,9 +202,13 @@ pub struct StoreStats {
     pub progress: u64,
     pub store_skipped: u64,
     pub store_failed: u64,
-    /// DRAM, NVMe holding events. Drops: each tier, then end_of_chain/oversize/io_error.
+    /// DRAM, NVMe holding events.
     pub held: [u64; 2],
-    pub dropped: [u64; 6],
+    /// Each tier's end_of_chain/oversize/io_error, then DRAM/NVMe pool_refused.
+    pub dropped: [u64; 8],
+    /// Discarded leaves and exhausted ancestor retries, by refusal reason:
+    /// invalid, unlinked, oversize, budget, inflight.
+    pub refusal_drops: [u64; 5],
     pub expired: [u64; 2],
     /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
     pub rows_thinned: [u64; 2],
@@ -159,6 +217,13 @@ pub struct StoreStats {
     pub per_rank_records: [u64; 2],
     /// Disk-only stores abandoned when later pages disagree with the initial packed decision.
     pub abandoned_stores: u64,
+    /// Root records by tier (GPU-to-DRAM copy or stored pool put) and [`RootReason`].
+    pub root_records: [[u64; RootReason::COUNT]; 2],
+    /// Pages those copies carried, by the same indexes.
+    pub root_pages: [[u64; RootReason::COUNT]; 2],
+    /// Records linked under a later offered ancestor and their tail pages, by tier.
+    pub deeper_link_records: [u64; 2],
+    pub deeper_link_pages: [u64; 2],
     pub fetched: u64,
     pub fetch_failed: u64,
     pub bytes_out: u64,
@@ -199,9 +264,13 @@ pub enum StoreReason {
 /// chain it needs, until [`TierStore::retired`] says what became of its move.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retiring {
+    pub descendant_row: bool,
+    pub capture_role: crate::CaptureRole,
+    pub child_paths: u32,
     pub tier: PoolTier,
     pub key: PrefixKey,
     pub parent: Option<PrefixKey>,
+    pub ancestor_keys: Vec<PrefixKey>,
     pub bucket: [u8; 16],
     /// Pages the record owns, counted from its parent.
     pub tail_pages: usize,
@@ -213,7 +282,9 @@ pub struct Retiring {
 pub enum Retirement {
     /// The next tier holds a committed copy: the tier drops its own.
     Moved,
-    /// A terminal I/O failure permits discarding the source.
+    /// The leaf moved after an ancestor was refused. Its ancestors stay local.
+    MovedLeaf,
+    /// The move cannot be completed; discard the source.
     Dropped,
     /// Keep the source and retry after progress.
     Failed,
@@ -249,7 +320,8 @@ pub trait HostStore {
     /// Copy a published checkpoint. Only Queued promises an event and retains
     /// its GPU copy-out pin until Stored or Deferred.
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
-    /// A request reused this GPU checkpoint: refresh any retained host record.
+    /// Refresh the indexed host record for a GPU checkpoint used at admission
+    /// or refreshed on request completion. An absent key needs no copy-out.
     fn reused(&mut self, _key: PrefixKey) {}
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
@@ -263,7 +335,8 @@ pub trait HostStore {
     /// reference its registered host buffers and GPU destinations.
     fn close(&mut self) -> Result<()>;
 
-    /// Whether request lookups should start while queued for this shared store.
+    /// Whether pool lookups start while queued and replace a ticket that will
+    /// never be answered when the request is next selected for admission.
     fn pooled(&self) -> bool {
         false
     }
@@ -282,8 +355,9 @@ pub trait HostStore {
     /// worker delivered them, so the announced holdings may be stale and must be
     /// announced again in full.
     fn evictions_lost(&mut self) {}
-    /// Start looking for pool candidates for a request that just queued. `None`
-    /// when no lookup is wanted or possible.
+    /// Start looking for pool candidates when a request queues, or replace a
+    /// ticket that will never be answered when the request is next selected for
+    /// admission. `None` when no lookup is wanted or possible.
     fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {
         None
     }
@@ -304,6 +378,10 @@ pub trait HostStore {
 pub trait TierStore: HostStore {
     /// Persist optional host records before pool teardown, retaining transfer owners.
     fn drain_on_shutdown(&mut self) {}
+    /// Switch direct DRAM retention to pass-through and count resident and deferred captures.
+    fn begin_pool_drain(&mut self) -> Option<(usize, u64)> {
+        None
+    }
     /// Announce what this store's tiers hold, now and as they change, through
     /// `announcer`, and serve them as exports. Nothing is recorded before this.
     fn announce_to(&mut self, _announcer: Announcer) {}
@@ -326,6 +404,10 @@ pub trait TierStore: HostStore {
     /// Each stays in place until [`TierStore::retired`] reports its move.
     fn take_retiring(&mut self) -> Vec<Retiring> {
         Vec::new()
+    }
+    /// Retained DRAM record on the selected path, with pool candidates when preparing its put.
+    fn retirement_predecessor(&self, _key: PrefixKey, _candidates: bool) -> Option<Retiring> {
+        None
     }
     /// The move of a retiring record ended.
     fn retired(&mut self, _key: PrefixKey, _tier: PoolTier, _how: Retirement) {}

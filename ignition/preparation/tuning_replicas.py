@@ -125,7 +125,21 @@ class ReplicaPreparation:
             raise
 
 
-def _replica(parent, prepare, snapshot, values, gpu_uuids, options):
+def _resolve_recipe(prepare, recipe_name):
+    from ignition.declaration import Recipe
+    from ignition.registry import current_recipes
+
+    for recipe in current_recipes():
+        if recipe.name == recipe_name:
+            return recipe
+    module = importlib.import_module(prepare.__module__)
+    for value in vars(module).values():
+        if isinstance(value, Recipe) and value.name == recipe_name:
+            return value
+    return module.RECIPE
+
+
+def _replica(parent, prepare, recipe_name, snapshot, values, gpu_uuids, options):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_uuids)
     from ignition import runtime_patches
 
@@ -137,7 +151,7 @@ def _replica(parent, prepare, snapshot, values, gpu_uuids, options):
     from ignition.planning import Plan
     from .core_storage import CoreStorage
 
-    recipe = importlib.import_module(prepare.__module__).RECIPE
+    recipe = _resolve_recipe(prepare, recipe_name)
     plan = Plan(recipe=recipe, **values)
     torch.cuda.set_device(0)
     with CoreStorage(world=plan.world_size) as storage:
@@ -170,7 +184,8 @@ def prepare_recipe(prepare, snapshot, plan, **options):
                 gpus = plan.tuning_gpus[replica * plan.world_size:(replica + 1) * plan.world_size]
                 peer = dict(values, gpus=gpus, tuning_replica=replace(role, index=replica))
                 worker = context.Process(target=_replica,
-                    args=(os.getpid(), prepare, snapshot, peer, tuple(gpu.uuid for gpu in gpus),
+                    args=(os.getpid(), prepare, plan.recipe.name, snapshot, peer,
+                          tuple(gpu.uuid for gpu in gpus),
                           {"kernel_cache": options.get("kernel_cache")}), name=f"flare-tuning-{replica}")
                 worker.start()
                 processes.append(worker)

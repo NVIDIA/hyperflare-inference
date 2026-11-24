@@ -16,12 +16,16 @@ use tokenizers::Tokenizer;
 
 use crate::{AdmissionError, Error, Failure, Result};
 
+#[cfg(feature = "server")]
+pub(crate) mod strict;
+
 const MAX_GRAMMAR_BYTES: usize = 262_144;
 const MAX_SCHEMA_NODES: usize = 8_192;
 const MAX_SCHEMA_DEPTH: usize = 64;
 
 /// Assistant recipient framing and the registered tool recipient names.
 pub struct RecipientEnvelope {
+    pub syntax: crate::model::contract::ToolParserKind,
     pub start: crate::output::tagged::OutputStart,
     pub tools: Vec<String>,
 }
@@ -235,7 +239,11 @@ impl GrammarCompiler {
             return self.compile(grammar);
         };
         if let Some(recipient) = &envelope.recipient {
-            return self.compile_recipient(grammar, recipient);
+            return if recipient.syntax == crate::model::contract::ToolParserKind::TmlJson {
+                self.compile_content_headers(grammar, recipient)
+            } else {
+                self.compile_recipient(grammar, recipient)
+            };
         }
         if envelope.reasoning_end.is_none()
             && envelope.tool.is_none()
@@ -361,6 +369,42 @@ impl GrammarCompiler {
         self.compile(grammar)
     }
 
+    fn compile_content_headers(&self, mut grammar: TopLevelGrammar, envelope: &RecipientEnvelope) -> Result<RequestGrammar> {
+        use crate::output::tagged::OutputStart;
+        let restart = self.marker("<|message_model|>");
+        let end = self.marker("<|end_message|>");
+        let mut rules = self.region("thinking_body", "<|end_message|>");
+        rules.push_str(&format!("thinking: {} thinking_body {restart}\nanswer: {} @answer {end}\n",
+            self.marker("<|content_thinking|>"), self.marker("<|content_text|>")));
+        grammar.grammars[0].name = Some("answer".into());
+        let mut tools = vec![];
+        for (index, name) in envelope.tools.iter().enumerate() {
+            let mut payload = TopLevelGrammar::from_json_schema(serde_json::json!({
+                "type":"object", "properties":{"name":{"const":name},"args":{"type":"object"}},
+                "required":["name","args"], "additionalProperties":false,
+            })).grammars.remove(0);
+            payload.name = Some(format!("payload_{index}"));
+            grammar.grammars.push(payload);
+            rules.push_str(&format!("tool_{index}: {} {} @payload_{index} {end}\n",
+                self.marker(name), self.marker("<|content_invoke_tool_json|>")));
+            tools.push(format!("tool_{index}"));
+        }
+        let ending = if tools.is_empty() { "answer" } else {
+            rules.push_str(&format!("tool: {}\ntools: tool ({restart} thinking* tool)* ({restart} thinking* answer)?\n", tools.join(" | ")));
+            "(answer | tools)"
+        };
+        rules.push_str(&format!("tail: thinking* {ending}\n"));
+        match envelope.start {
+            OutputStart::RecipientHeader => rules.push_str("start: tail\n"),
+            OutputStart::RecipientFrame => rules.push_str(&format!("start: {restart} tail\n")),
+            OutputStart::Reasoning => rules.push_str(&format!("start: thinking_body {restart} tail\n")),
+            OutputStart::Content => rules.push_str(&format!("start: @answer {end}\n")),
+            OutputStart::ToolBody => return Err("structured output cannot continue a TML tool body".into()),
+        }
+        grammar.grammars.insert(0, GrammarWithLexer::from_lark(rules));
+        self.compile(grammar)
+    }
+
     fn marker(&self, text: &str) -> String {
         if text.is_empty() {
             String::new()
@@ -481,6 +525,14 @@ impl GrammarCompiler {
         format!("{terminal}: {text}\n{ending}{name}: {prefix}{name}_end\n")
     }
 
+    /// Compile a complete JSON byte language without sampling masks.
+    pub(crate) fn compile_json_schema_text(&self, schema: &Value) -> Result<TextGrammar> {
+        self.compile_text_grammar(
+            TopLevelGrammar::from_json_schema(schema.clone()),
+            "strict tool JSON schema",
+        )
+    }
+
     /// Compile a complete custom-tool input contract without sampling masks.
     pub(crate) fn compile_text(&self, syntax: &str, source: &str) -> Result<TextGrammar> {
         let grammar = match syntax {
@@ -498,11 +550,16 @@ impl GrammarCompiler {
                 ));
             }
         };
+        self.compile_text_grammar(grammar, "custom tool grammar")
+    }
+
+    fn compile_text_grammar(
+        &self,
+        grammar: TopLevelGrammar,
+        description: &'static str,
+    ) -> Result<TextGrammar> {
         let parser = self.factory.create_parser(grammar).map_err(|e| {
-            Error::admission(
-                AdmissionError::Grammar,
-                format!("invalid custom tool grammar: {e:#}"),
-            )
+            Error::admission(AdmissionError::Grammar, format!("invalid {description}: {e:#}"))
         })?;
         let mut matcher = Matcher::new(Ok(parser));
         let warnings = matcher.grammar_warnings();
@@ -510,12 +567,12 @@ impl GrammarCompiler {
             return Err(Error::admission(
                 AdmissionError::Grammar,
                 format!(
-                    "invalid custom tool grammar: {}",
+                    "invalid {description}: {}",
                     matcher.get_error().unwrap_or_else(|| warnings.join("; "))
                 ),
             ));
         }
-        Ok(TextGrammar { matcher })
+        Ok(TextGrammar { matcher, description })
     }
 
     fn compile(&self, grammar: TopLevelGrammar) -> Result<RequestGrammar> {
@@ -568,26 +625,32 @@ fn validate_lark(grammar: &str) -> Result<()> {
 
 pub(crate) struct TextGrammar {
     matcher: Matcher,
+    description: &'static str,
 }
 impl TextGrammar {
     pub fn validate(&self, text: &str) -> Result<()> {
+        let subject = match self.description {
+            "custom tool grammar" => "custom tool input",
+            "strict tool JSON schema" => "strict tool arguments",
+            description => description,
+        };
         let mut matcher = self.matcher.clone();
         let environment = matcher
             .tok_env()
-            .map_err(|e| format!("custom tool grammar: {e}"))?;
+            .map_err(|e| format!("{}: {e}", self.description))?;
         let trie = environment.tok_trie();
         // Greedy tokenization preserves the exact bytes, without checkpoint normalization.
         let tokens = trie.greedy_tokenize(text.as_bytes());
         if trie.decode_raw(&tokens) != text.as_bytes() {
-            return Err(
-                "custom tool input cannot be represented by the tokenizer byte trie".into(),
-            );
+            return Err(format!("{subject} cannot be represented by the tokenizer byte trie").into());
         }
         let consumed = matcher
             .try_consume_tokens(&tokens)
-            .map_err(|e| format!("custom tool input failed grammar validation: {e}"))?;
-        if consumed != tokens.len() || !matcher.is_accepting().map_err(|e| e.to_string())? {
-            return Err("custom tool input does not match its grammar".into());
+            .map_err(|e| format!("{subject} failed grammar validation: {e}"))?;
+        if consumed != tokens.len()
+            || !matcher.is_accepting().map_err(|e| format!("{subject} failed grammar validation: {e}"))?
+        {
+            return Err(format!("{subject} does not match its grammar").into());
         }
         Ok(())
     }
@@ -850,16 +913,16 @@ fn validate_schema_nodes(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    fn byte_tokenizer() -> Tokenizer {
+    pub(crate) fn byte_tokenizer() -> Tokenizer {
         byte_tokenizer_with(&[])
     }
 
     /// Adds non-special tokens from 258, as checkpoints declare reasoning delimiters.
-    fn byte_tokenizer_with(added: &[&str]) -> Tokenizer {
+    pub(crate) fn byte_tokenizer_with(added: &[&str]) -> Tokenizer {
         let mut vocab = serde_json::Map::new();
         let mut extra = 256;
         for byte in 0..=255_u32 {
@@ -1869,7 +1932,7 @@ mod recipient_tests {
         let controls=["<|start|>","<|message|>","<|eom|>","<|eot|>"].map(|s|(tokenizer.token_to_id(s).unwrap(),s.to_owned()));
         let compiler=GrammarCompiler::new(&tokenizer,tokenizer.get_vocab_size(true),&[200001,200008],&controls).unwrap();
         let envelope=|start,tools:Vec<String>| OutputEnvelope {
-            recipient:Some(RecipientEnvelope{start,tools}),reasoning_end:None,tool:None,function:None,
+            recipient:Some(RecipientEnvelope{syntax:crate::model::contract::ToolParserKind::Atem,start,tools}),reasoning_end:None,tool:None,function:None,
             tool_ends_reasoning:false,tool_body_start:false,response:None,message_close:None,
         };
         let answer=r#"{"ok":true}"#;

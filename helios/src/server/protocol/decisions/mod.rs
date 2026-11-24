@@ -163,6 +163,10 @@ pub(in crate::server) async fn generate(
         .headers()
         .get("typesafe-danger-zone-images")
         .is_some_and(|value| value == "true");
+    let raw = match read_raw_body(state.max_body_bytes, request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let permit = match state.frontend_slots.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -174,13 +178,15 @@ pub(in crate::server) async fn generate(
         }
     };
     let permit = Arc::new(permit);
-    let (body, parts) = match read_body(state.max_body_bytes, request, permit.clone()).await {
+    let (body, parts) = match decode_raw_body(state.max_body_bytes, raw, permit.clone()).await {
         Ok(value) => value,
         Err(response) => return response,
     };
     let prepare_state = state.clone();
+    let preparation_ingress = ingress.clone();
     let prepared = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _ingress = preparation_ingress;
         let response_questions = body["questions"].clone();
         let (input, questions, assets) = if decisions {
             let (input, questions) = adapter::parse(body).map_err(|error| {
@@ -285,11 +291,14 @@ fn failure(error: Error) -> Response {
         .into_response()
 }
 
-async fn read_body(
-    limit: usize,
-    request: Request,
-    permit: Arc<OwnedSemaphorePermit>,
-) -> std::result::Result<(Value, Map<String, Value>), Response> {
+struct RawBody {
+    parts: axum::http::request::Parts,
+    bytes: axum::body::Bytes,
+    multipart: bool,
+    encoding: String,
+}
+
+async fn read_raw_body(limit: usize, request: Request) -> std::result::Result<RawBody, Response> {
     let content_type = request
         .headers()
         .get("content-type")
@@ -303,13 +312,57 @@ async fn read_body(
         .unwrap_or("identity")
         .to_owned();
     let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, limit).await.map_err(|error| {
-        http::error(
-            protocol::Protocol::Chat,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            error,
-        )
-    })?;
+    let bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        axum::body::to_bytes(body, limit),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            return Err(http::error(
+                protocol::Protocol::Chat,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                error,
+            ));
+        }
+        Err(_) => {
+            return Err(http::error(
+                protocol::Protocol::Chat,
+                StatusCode::REQUEST_TIMEOUT,
+                "request body read timed out",
+            ));
+        }
+    };
+    Ok(RawBody {
+        parts,
+        bytes,
+        multipart,
+        encoding,
+    })
+}
+
+#[cfg(test)]
+async fn read_body(
+    limit: usize,
+    request: Request,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> std::result::Result<(Value, Map<String, Value>), Response> {
+    let raw = read_raw_body(limit, request).await?;
+    decode_raw_body(limit, raw, permit).await
+}
+
+async fn decode_raw_body(
+    limit: usize,
+    raw: RawBody,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> std::result::Result<(Value, Map<String, Value>), Response> {
+    let RawBody {
+        parts,
+        bytes,
+        multipart,
+        encoding,
+    } = raw;
     if !multipart {
         return tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -586,7 +639,7 @@ fn messages(
     )?;
     text(&mut question_parts, "\nOptions:\n");
     for (label, option) in labels.iter().zip(&question.options) {
-        text(&mut question_parts, label.trim_start());
+        text(&mut question_parts, label);
         text(&mut question_parts, ": ");
         text(&mut question_parts, "{\"value\":");
         text(&mut question_parts, &option["value"].to_string());
@@ -610,39 +663,45 @@ fn messages(
     ])
 }
 
+/// Label candidates in preference order. A label is read as the first token of the assistant reply,
+/// which follows the generation prompt directly, so labels have no leading space.
 fn candidates() -> Vec<String> {
     let mut candidates = Vec::new();
     for a in b'A'..=b'Z' {
-        candidates.push(format!(" {}", a as char));
+        candidates.push((a as char).to_string());
     }
     for a in b'A'..=b'Z' {
         for b in b'A'..=b'Z' {
-            candidates.push(format!(" {}{}", a as char, b as char));
+            candidates.push(format!("{}{}", a as char, b as char));
         }
     }
     candidates
 }
 
+/// The token `label` becomes when it follows the rendered prompt, or `None` when it would not be a
+/// single ordinary token there. Text on either side of an added token tokenizes separately, so only
+/// the text after the prompt's last added token can change how the label tokenizes: the prompt's
+/// tokens from there on must stay as they are when the label is appended. That text is encoded as
+/// ordinary text, because request text that spells a control holds ordinary token IDs in `tokens`.
 fn label_id(
     frontend: &crate::frontend::Frontend,
-    prompt: &str,
     tokens: &[u32],
-    decoded: &str,
     added_vocabulary: &tokenizers::tokenizer::AddedVocabulary,
     label: &str,
     vocabulary: usize,
 ) -> Result<Option<u32>> {
-    let extended = frontend.encode(&format!("{prompt}{label}"), false)?;
+    let added = added_vocabulary.get_added_tokens_decoder();
+    let last = tokens.iter().rposition(|id| added.contains_key(id));
+    let tail = &tokens[last.map_or(0, |at| at + 1)..];
+    let decoded = frontend.decode(tail, false)?;
+    let extended = frontend.encode_ordinary(&format!("{decoded}{label}"))?;
     let Some(&id) = extended.last() else {
         return Ok(None);
     };
-    if extended.len() != tokens.len() + 1
-        || !extended.starts_with(tokens)
+    if extended.len() != tail.len() + 1
+        || !extended.starts_with(tail)
         || id as usize >= vocabulary
-        || added_vocabulary
-            .get_added_tokens_decoder()
-            .get(&id)
-            .is_some_and(|token| token.special)
+        || added.get(&id).is_some_and(|token| token.special)
         || frontend.decode(&extended, false)? != format!("{decoded}{label}")
     {
         return Ok(None);
@@ -700,6 +759,7 @@ fn prepare_questions(
                 conversation,
                 decoded.request.tool_choice.clone(),
                 &decoded.request.checkpoint_hints,
+                !state.frontend.prompt_encoder().renders_tool_errors(),
             )?;
             state
                 .frontend
@@ -707,22 +767,13 @@ fn prepare_questions(
             let rendered = state
                 .frontend
                 .render_chat(&normalized, &decoded.request.options.template)?;
-            let tokens = state.frontend.encode(&rendered.text, false)?;
-            if tokens != rendered.token_ids {
-                return Err(
-                    "chat template encoding cannot verify contextual decision labels".into(),
-                );
-            }
-            let decoded_tokens = state.frontend.decode(&tokens, false)?;
             let mut ids = Vec::new();
             let mut selected = Vec::new();
             let choices = if pass == 0 { &candidates } else { &labels };
             for label in choices {
                 if let Some(id) = label_id(
                     &state.frontend,
-                    &rendered.text,
-                    &tokens,
-                    &decoded_tokens,
+                    &rendered.token_ids,
                     added_vocabulary,
                     label,
                     config.contract.vocabulary,

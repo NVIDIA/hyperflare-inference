@@ -8,7 +8,6 @@
 
 use super::{
     AuthorizedCore, LoadOptions, NativeResources,
-    driver::{Access, Location},
     format::{Memory, Core, Reservation, invalid},
     payload::Files,
     protection::AuthorizedKind,
@@ -109,6 +108,23 @@ fn roce_spec(
         ));
     }
     Ok(spec)
+}
+
+fn validate_persistent_worker_topology(
+    cores: &[Core],
+    cluster: Option<&ClusterRank>,
+) -> Result<()> {
+    let has_worker = cores.iter().any(|core| {
+        core.execution
+            .as_ref()
+            .is_some_and(|execution| !execution.persistent_workers.is_empty())
+    });
+    if has_worker && (cores.len() > 1 || cluster.is_some()) {
+        return Err(invalid(
+            "persistent workers are only supported on single-rank cores",
+        ));
+    }
+    Ok(())
 }
 
 /// The cluster an authorized core's ranks form: (world, export id), or None
@@ -212,6 +228,12 @@ pub trait CacheAgreement {
     fn pool_approved(&mut self, approved: bool, _world: usize) -> Result<bool> {
         Ok(approved)
     }
+
+    /// Called immediately after local GPUs finish CUDA initialization and before
+    /// model memory allocation or weight loading, with each rank's PCI bus ID.
+    fn after_gpu_init(&mut self, _pci_bus_ids: &[String]) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<F: FnMut((u64, u64)) -> Result<(u64, u64)>> CacheAgreement for F {
@@ -277,12 +299,15 @@ impl NativeModel {
             return Err(invalid("GPU label count must match selected devices"));
         }
         let phase = progress.phase("Prepare model", None);
-        let (mut descriptor, mut ready_cores, files) = match authorized.kind {
-            AuthorizedKind::Legacy { archive, index } => (index, None, FilesRef::Legacy(archive)),
+        let (mut descriptor, mut legacy_bundles, mut ready_cores, files) = match authorized.kind {
+            AuthorizedKind::Legacy { archive, index } => {
+                let (descriptor, bundles) = super::protection::LoadedModelDescriptor::from_legacy(index);
+                (descriptor, Some(bundles), None, FilesRef::Legacy(archive))
+            }
             AuthorizedKind::Payload(core) => {
-                let descriptor = core.descriptor()?;
+                let descriptor = core.loaded_descriptor()?;
                 let (source, cores) = core.into_parts();
-                (descriptor, Some(cores), FilesRef::Payload(source))
+                (descriptor, None, Some(cores), FilesRef::Payload(source))
             }
         };
         let root = files.path();
@@ -298,14 +323,20 @@ impl NativeModel {
                     ));
                 }
                 let position = files.rank_position(rank)?;
-                if rank >= c.world as usize || position >= descriptor.ranks.len() {
+                if rank >= c.world as usize || position >= descriptor.rank_roce.len() {
                     return Err(invalid(format!(
                         "rank {rank} is outside the core's {} ranks",
                         c.world
                     )));
                 }
-                let bundle = descriptor.ranks.swap_remove(position);
-                descriptor.ranks = vec![bundle];
+                let selected_roce = descriptor.rank_roce.swap_remove(position);
+                descriptor.rank_roce = vec![selected_roce];
+                if let Some(bundles) = legacy_bundles.as_mut()
+                    && position < bundles.len()
+                {
+                    let bundle = bundles.swap_remove(position);
+                    *bundles = vec![bundle];
+                }
                 if let Some(cores) = ready_cores.as_mut()
                     && position < cores.len()
                 {
@@ -324,12 +355,8 @@ impl NativeModel {
             }
             (None, None) => None,
         };
-        let transports: Vec<_> = descriptor
-            .ranks
-            .iter_mut()
-            .map(|bundle| bundle.roce.take())
-            .collect();
-        if devices.len() != descriptor.ranks.len()
+        let transports = std::mem::take(&mut descriptor.rank_roce);
+        if devices.len() != transports.len()
             || devices.iter().collect::<HashSet<_>>().len() != devices.len()
         {
             return Err(invalid(
@@ -338,9 +365,9 @@ impl NativeModel {
         }
         let mut cores = match ready_cores {
             Some(cores) => cores,
-            None => descriptor
-                .ranks
-                .drain(..)
+            None => legacy_bundles
+                .unwrap_or_default()
+                .into_iter()
                 .map(protobuf::decode)
                 .collect::<Result<Vec<_>>>()?,
         };
@@ -351,6 +378,7 @@ impl NativeModel {
             core.validate()?;
             Files::validate(&files, core)?;
         }
+        validate_persistent_worker_topology(&cores, cluster.as_ref())?;
         let roce = transports
             .into_iter()
             .zip(&cores)
@@ -581,6 +609,7 @@ impl NativeModel {
         }
         cores[0].reservations = merged;
         validate_peer_memory(&cores, &descriptor.peer_memory)?;
+        let peer_readers = actual_peer_readers(&cores, &descriptor.peer_memory);
         // Distribution and verification can fill shared DRAM before CUDA creates its context.
         Files::release_page_cache(&files);
         phase.finish(format!(
@@ -628,6 +657,19 @@ impl NativeModel {
                     .ranks
                     .push(NativeResources::initialize(core, *device)?);
             }
+            let rank_devices: Vec<_> = model.ranks.iter().map(|rank| rank.device).collect();
+            for (owner, rank) in model.ranks.iter_mut().enumerate() {
+                rank.rank = owner;
+                for (&address, readers) in &peer_readers[owner] {
+                    rank.peer_readers.insert(
+                        address,
+                        readers
+                            .iter()
+                            .map(|&reader| (reader, rank_devices[reader]))
+                            .collect(),
+                    );
+                }
+            }
             phase.finish(
                 cores
                     .iter()
@@ -641,6 +683,12 @@ impl NativeModel {
                     .collect::<Vec<_>>()
                     .join(" / "),
             );
+            let pci_bus_ids = model
+                .ranks
+                .iter()
+                .map(NativeResources::pci_bus_id)
+                .collect::<Result<Vec<_>>>()?;
+            agree.after_gpu_init(&pci_bus_ids)?;
             let embedding_table_resident_scales = options.embedding_resident_scales(
                 !engram.is_empty(),
                 model.ranks.iter().any(|rank| rank.integrated),
@@ -696,6 +744,11 @@ impl NativeModel {
                 gpu_bytes as f64 / (1u64 << 30) as f64,
                 host_bytes as f64 / (1u64 << 30) as f64,
             ));
+            if let Some(pool) = &options.prefix_cache.pool {
+                let phase = progress.phase("Reach prefix cache pool", None);
+                pool.reach(flare_selene::pool::STARTUP_WAIT)?;
+                phase.finish("manager reached");
+            }
             let phase = progress.phase("Load weights", Some(payload_bytes));
             phase.advance_bytes(0);
             model.parallel(&cores, &files, |rank, core, path| {
@@ -705,7 +758,6 @@ impl NativeModel {
                 "{:.1} GiB",
                 payload_bytes as f64 / (1u64 << 30) as f64
             ));
-            model.grant_peer_access(&descriptor.peer_memory)?;
             let kernels = cores
                 .iter()
                 .map(|p| p.functions.len() as u64)
@@ -730,13 +782,33 @@ impl NativeModel {
                 let phase = progress.phase("Prepare embedding tables", None);
                 let storage = options.embedding_table_storage.unwrap_or_default();
                 let group_budget = embedding_table_cache_bytes / engram.len() as u64;
-                let files = files.direct_files().collect::<Result<Vec<_>>>()?;
+                // Open direct-I/O handles only for containers that actually carry embedding
+                // planes rather than every weight companion in the deployment.
+                let mut mapped_files = std::collections::BTreeMap::new();
+                let mut direct_files = Vec::new();
+                for (index, _) in &mut engram {
+                    for table in &mut index.tables {
+                        for plane in &mut table.planes {
+                            let target = match mapped_files.entry(plane.file) {
+                                std::collections::btree_map::Entry::Occupied(entry) => {
+                                    *entry.get()
+                                }
+                                std::collections::btree_map::Entry::Vacant(slot) => {
+                                    let next = direct_files.len();
+                                    direct_files.push(files.direct_file(plane.file)?);
+                                    *slot.insert(next)
+                                }
+                            };
+                            plane.file = target;
+                        }
+                    }
+                }
                 let mut bindings = Vec::new();
                 for ((index, ranks), tokens) in engram.into_iter().zip(engram_tokens) {
                     let first = ranks[0];
                     let shared = crate::engram::Shared::new(
                         index,
-                        &files,
+                        &direct_files,
                         ranks.len(),
                         tokens,
                         model.ranks[first].context as usize,
@@ -787,7 +859,6 @@ impl NativeModel {
                 &initial,
                 embedding_host_bytes,
             )?;
-            model.grant_peer_access(&descriptor.peer_memory)?;
             model.prepare_offload(root, options, progress, active)?;
         }
         Ok(model)
@@ -848,45 +919,6 @@ impl NativeModel {
         )?;
         let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
         phase.finish(summary);
-        Ok(())
-    }
-
-    unsafe fn grant_peer_access(&self, peers: &[protobuf::wire::PeerMemory]) -> Result<()> {
-        for peer in peers {
-            let rank = &self.ranks[peer.owner as usize];
-            let allocation = rank
-                .allocations
-                .values()
-                .find(|a| a.address == peer.address && matches!(a.memory, Memory::Device))
-                .ok_or_else(|| invalid("shared allocation is missing from its owner"))?;
-            if allocation.nbytes == 0 {
-                continue;
-            }
-            let access: Vec<_> = peer
-                .readers
-                .iter()
-                .map(|reader| Access {
-                    location: Location {
-                        kind: 1,
-                        device: self.ranks[*reader as usize].device,
-                    },
-                    flags: 3,
-                })
-                .collect();
-            unsafe {
-                rank.driver
-                    .check("cuCtxSetCurrent", (rank.driver.context_set)(rank.context))?;
-                rank.driver.check(
-                    "cuMemSetAccess",
-                    (rank.driver.access)(
-                        peer.address,
-                        allocation.nbytes,
-                        access.as_ptr(),
-                        access.len(),
-                    ),
-                )?;
-            }
-        }
         Ok(())
     }
 
@@ -977,8 +1009,22 @@ impl Drop for NativeModel {
     fn drop(&mut self) {
         self.offload.reset();
         self.engram.clear();
-        // Rank zero owns the shared reservations and releases them after every peer.
-        while self.ranks.pop().is_some() {}
+        // Phase 1: destroy graphs, modules, and peer-accessible mappings across every rank
+        // before any rank releases shared VA reservations or destroys its CUDA context.
+        let mut all_drained = true;
+        for rank in self.ranks.iter_mut().rev() {
+            all_drained &= rank.release_execution_resources();
+        }
+        // Phase 2: release shared VA reservations and destroy CUDA contexts (rank zero last).
+        // If any rank failed context drain, retain remaining contexts until process exit.
+        if all_drained {
+            while let Some(mut rank) = self.ranks.pop() {
+                rank.release_reservations_and_context();
+            }
+        } else {
+            let retained = std::mem::take(&mut self.ranks);
+            std::mem::forget(retained);
+        }
     }
 }
 
@@ -1015,6 +1061,31 @@ pub(super) fn offload_identity(config: &serde_json::Value) -> Result<[u8; 32]> {
     hash.update(digest);
     hash.update([state]);
     Ok(hash.finalize().into())
+}
+
+/// Validated imports determine access; reader declarations may include unused ranks.
+fn actual_peer_readers(
+    cores: &[Core],
+    peers: &[protobuf::wire::PeerMemory],
+) -> Vec<std::collections::HashMap<u64, Vec<usize>>> {
+    let mut readers = vec![std::collections::HashMap::new(); cores.len()];
+    for peer in peers {
+        let owner = peer.owner as usize;
+        let actual = cores
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, core)| {
+                (rank == owner
+                    || core.allocations.iter().any(|allocation| {
+                        matches!(allocation.memory, Memory::Peer)
+                            && allocation.address == Some(peer.address)
+                    }))
+                .then_some(rank)
+            })
+            .collect();
+        readers[owner].insert(peer.address, actual);
+    }
+    readers
 }
 
 fn validate_peer_memory(cores: &[Core], peers: &[protobuf::wire::PeerMemory]) -> Result<()> {
@@ -1064,6 +1135,88 @@ fn validate_peer_memory(cores: &[Core], peers: &[protobuf::wire::PeerMemory]) ->
 mod tests {
     use super::*;
     use protobuf::wire;
+
+    #[test]
+    fn actual_imports_preserve_tp16_static_access_and_scope_dcp_cache_access() {
+        for group_size in [8, 16] {
+            for overdeclared in [false, true] {
+                let address = |owner: usize, dynamic: bool| {
+                    0x200000000000 + ((owner * 2 + usize::from(dynamic)) as u64) * (1 << 30)
+                };
+                let mut peers = Vec::new();
+                for owner in 0..16 {
+                    for dynamic in [false, true] {
+                        peers.push(wire::PeerMemory {
+                            owner: owner as u32,
+                            address: address(owner, dynamic),
+                            nbytes: 8 << 20,
+                            readers: (0..16)
+                                .filter(|rank| {
+                                    overdeclared
+                                        || !dynamic
+                                        || rank / group_size == owner / group_size
+                                })
+                                .map(|rank| rank as u32)
+                                .collect(),
+                        });
+                    }
+                }
+                let cores: Vec<_> = (0..16)
+                    .map(|rank| {
+                        let allocations = peers
+                            .iter()
+                            .filter(|peer| {
+                                let dynamic = peer.address == address(peer.owner as usize, true);
+                                !dynamic || rank / group_size == peer.owner as usize / group_size
+                            })
+                            .map(|peer| {
+                                let owned = peer.owner as usize == rank;
+                                let dynamic = peer.address == address(peer.owner as usize, true);
+                                wire::Allocation {
+                                    name: format!("allocation-{:x}", peer.address),
+                                    address: Some(peer.address),
+                                    alignment: 2 << 20,
+                                    nbytes: if owned && dynamic { 0 } else { peer.nbytes },
+                                    memory: if owned {
+                                        wire::Memory::Device
+                                    } else {
+                                        wire::Memory::Peer
+                                    } as i32,
+                                    sizing: (owned && dynamic).then_some(wire::Sizing {
+                                        capacity: 1,
+                                        unit_bytes: 2 << 20,
+                                        maximum: 4,
+                                    }),
+                                    ..Default::default()
+                                }
+                            })
+                            .collect();
+                        protobuf::decode(wire::BundleIndex {
+                            architecture: vec![12, 0],
+                            context: Some(Default::default()),
+                            allocations,
+                            ..Default::default()
+                        })
+                        .unwrap()
+                    })
+                    .collect();
+                validate_peer_memory(&cores, &peers).unwrap();
+                let actual = actual_peer_readers(&cores, &peers);
+                for owner in 0..16 {
+                    assert_eq!(actual[owner].len(), 2);
+                    assert_eq!(
+                        actual[owner][&address(owner, false)],
+                        (0..16).collect::<Vec<_>>()
+                    );
+                    let first = owner / group_size * group_size;
+                    assert_eq!(
+                        actual[owner][&address(owner, true)],
+                        (first..first + group_size).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn disabled_offload_needs_no_model_metadata_or_cuda_resources() {
@@ -1156,11 +1309,15 @@ mod tests {
                 readers: vec![0, 1],
             }];
             validate_peer_memory(&cores, &peers).unwrap();
+            assert_eq!(actual_peer_readers(&cores, &peers)[0][&address], [0, 1]);
             peers[0].nbytes /= 2;
             assert!(validate_peer_memory(&cores, &peers).is_err());
             peers[0].nbytes = extent;
             peers[0].readers.pop();
             assert!(validate_peer_memory(&cores, &peers).is_err());
+            let owner_only = &cores[..1];
+            validate_peer_memory(owner_only, &peers).unwrap();
+            assert_eq!(actual_peer_readers(owner_only, &peers)[0][&address], [0]);
         }
     }
 }
@@ -1485,5 +1642,55 @@ mod identity_tests {
             }
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn persistent_worker_topology_rejects_multi_rank_and_cluster_cores() {
+        let worker_core = || Core {
+            tensor_contract: None,
+            resources: std::collections::HashMap::new(),
+            events: vec![],
+            architecture: [10, 3],
+            allocations: vec![],
+            modules: vec![],
+            functions: vec![],
+            graphs: vec![],
+            reservations: vec![],
+            execution: Some(protobuf::wire::Execution {
+                persistent_workers: vec![protobuf::wire::PersistentWorker {
+                    worker_sm_count: 8,
+                    graph: "worker_loop".into(),
+                    stop_flag: Some(protobuf::wire::Reference {
+                        allocation: "worker_ctrl".into(),
+                        offset: 0,
+                    }),
+                }],
+                ..Default::default()
+            }),
+            context: super::super::format::Context::default(),
+        };
+        let plain_core = || Core {
+            execution: Some(protobuf::wire::Execution::default()),
+            ..worker_core()
+        };
+        let cluster = ClusterRank {
+            world: 2,
+            rank: 0,
+            export_id: "cluster-export".into(),
+        };
+
+        validate_persistent_worker_topology(&[worker_core()], None).unwrap();
+        validate_persistent_worker_topology(&[plain_core(), plain_core()], None).unwrap();
+        validate_persistent_worker_topology(&[plain_core()], Some(&cluster)).unwrap();
+
+        let multi_err = validate_persistent_worker_topology(&[worker_core(), worker_core()], None)
+            .unwrap_err()
+            .to_string();
+        assert!(multi_err.contains("single-rank"), "{multi_err}");
+
+        let cluster_err = validate_persistent_worker_topology(&[worker_core()], Some(&cluster))
+            .unwrap_err()
+            .to_string();
+        assert!(cluster_err.contains("single-rank"), "{cluster_err}");
     }
 }

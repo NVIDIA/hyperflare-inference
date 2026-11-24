@@ -1850,7 +1850,7 @@ mod tests {
     #[test]
     fn tensor_parallel_requests_default_deduplicate_and_reject_zero() {
         assert_eq!(requested_tensor_parallel(&[], 2).unwrap(), vec![2]);
-        assert_eq!(requested_tensor_parallel(&[], 0).unwrap(), vec![1]);
+        assert_eq!(requested_tensor_parallel(&[], 0).unwrap(), Vec::<u32>::new());
         assert_eq!(
             requested_tensor_parallel(&[2, 1, 2], 8).unwrap(),
             vec![1, 2]

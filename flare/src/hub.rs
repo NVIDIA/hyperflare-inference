@@ -14,14 +14,86 @@ use std::{
 
 use hf_hub::{
     Cache, Repo, RepoType,
-    api::sync::{Api, ApiBuilder},
+    api::{
+        RepoInfo,
+        sync::{Api, ApiBuilder, ApiError},
+    },
 };
 use sha2::Digest as _;
 use flare_helios::core::progress::AcquisitionPhase;
 
+use crate::http_client::{HttpClient, HttpError, HttpResponse};
 use crate::options::HubOptions;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Acquisition cannot verify the core until a matching public profile is supplied.
+#[derive(Debug)]
+pub struct PublisherKeyRequired {
+    primary: PathBuf,
+    profile_url: String,
+}
+
+impl std::fmt::Display for PublisherKeyRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "core signer is not a configured publisher; supply its public profile with --publisher-keys"
+        )
+    }
+}
+
+impl std::error::Error for PublisherKeyRequired {}
+
+#[derive(Clone, Debug)]
+pub struct PublisherKeyReview {
+    pub profile: flare_helios::runtime_core::Publisher,
+    pub disclosure: crate::trust::Disclosure,
+    pub profile_url: String,
+}
+
+impl PublisherKeyRequired {
+    /// Fetch a candidate from the pinned acquisition commit and verify signed metadata.
+    /// The repository supplying this profile does not establish publisher identity.
+    pub fn review(&self, options: &crate::trust::ReviewOptions) -> Result<PublisherKeyReview> {
+        if options.hub.offline {
+            return Err(
+                "publisher profiles cannot be fetched offline; supply --publisher-keys".into(),
+            );
+        }
+        let bytes = match crate::identity::fetch(&self.profile_url, token(&options.hub)?.as_deref()) {
+            crate::identity::Fetched::Body(bytes) => bytes,
+            crate::identity::Fetched::Status(status) => return Err(format!("cannot retrieve the publisher profile at {}: HTTP {status}; supply --publisher-keys", self.profile_url).into()),
+            crate::identity::Fetched::Failed(reason) => return Err(format!("cannot retrieve the publisher profile at {}: {reason}", self.profile_url).into()),
+        };
+        let profiles: Vec<flare_helios::runtime_core::Publisher> =
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid publisher profile: {error}"))?;
+        for profile in &profiles {
+            profile.validate()?;
+        }
+        let claim = flare_helios::runtime_core::CoreClaim::read(&self.primary)?;
+        let mut matches = profiles.into_iter().filter(|profile| {
+            profile.fingerprint() == claim.signer
+                && profile.namespace == claim.namespace
+                && profile.development == claim.development
+        });
+        let profile = matches.next().ok_or(
+            "repository publisher profile does not match the core's signing key and namespace",
+        )?;
+        if matches.any(|other| other != profile) {
+            return Err("conflicting publisher profiles for the core's signing key".into());
+        }
+        let mut options = options.clone();
+        options.profiles.push(profile.clone());
+        let disclosure = crate::trust::review_key_profile(&self.primary, &options)?;
+        Ok(PublisherKeyReview {
+            profile,
+            disclosure,
+            profile_url: self.profile_url.clone(),
+        })
+    }
+}
 
 fn check_cancel(
     progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
@@ -241,7 +313,7 @@ fn download_for_model_at(
     let (id, given_revision) = repository(source)?;
     let revision = match options.revision.as_deref().or(given_revision) {
         Some(revision) => revision.to_owned(),
-        None => crate::hardware::detect(gpu_count)?.to_owned(),
+        None => crate::hardware::detect(gpu_count.max(1))?.to_owned(),
     };
     validate_relative(&revision)?;
     if let Some(filename) = &options.filename {
@@ -254,6 +326,43 @@ fn download_for_model_at(
         let (entry, expected_envelope) =
             offline_entry_with_expected(&model_root, id, &revision, options, gpu_count)?;
         let primary = entry_primary(&entry)?;
+        if flare_helios::core::conversion::form(&primary)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            let metadata = flare_helios::core::reader::Metadata::open(&primary)?;
+            let claim = payload_core_claim(&metadata.envelope)?;
+            let resolved = crate::trust::resolve_identity_for_claim(
+                claim,
+                publisher_keys,
+                supplied_profiles,
+                options,
+                trust_store,
+            )?;
+            let actual = *flare_helios::core::PayloadId::of(&metadata.envelope).as_bytes();
+            if actual != expected_envelope {
+                return Err(format!(
+                    "cached core for {id}@{revision} does not match the signed envelope recorded for its source; refresh source online or load cached entry by explicit path"
+                )
+                .into());
+            }
+            let sizes =
+                crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
+                    .map_err(|error| error.to_string())?;
+            let source = crate::cache_support::select_bound_core_source(
+                metadata,
+                expected_envelope,
+                &resolved.profiles,
+                &sizes,
+            )
+            .map_err(|error| error.to_string())?;
+            let store = flare_helios::core::cache::Root::open(&model_root)?;
+            store.check_ready_installed(&entry, &source)?;
+            if select_default {
+                store.publish_entry(&entry)?;
+            }
+            return Ok(entry);
+        }
         let resolved = crate::trust::resolve_identity_with(
             &primary,
             publisher_keys,
@@ -283,7 +392,7 @@ fn download_for_model_at(
     let cache = Cache::new(transport.root().to_owned());
     let repo = Repo::with_revision(id.to_owned(), RepoType::Model, revision.clone());
     log::info!("Core source: {id}@{revision}");
-    let (path, installed_folder, installed_commit) = {
+    let (path, installed_folder, installed_commit, fetched_transport) = {
         let api = ApiBuilder::from_cache(cache)
             .with_token(access_token.clone())
             .with_endpoint(endpoint.into())
@@ -293,191 +402,14 @@ fn download_for_model_at(
         let token = access_token.as_deref();
         check_cancel(Some(&report.progress))?;
 
-        report.progress.set_phase(AcquisitionPhase::Downloading);
-        let (primary, pinned) = fetch_primary_with_progress(
+        report.progress.set_phase(AcquisitionPhase::Checking);
+        let (pinned, filename) = resolve_primary_target(
             &api,
-            &transport,
             &repo,
             options.filename.as_deref(),
-            token,
             Some(&report.progress),
         )?;
-        let filename = primary
-            .strip_prefix(transport.snapshot_dir(&pinned.folder_name(), pinned.revision()))?
-            .to_str()
-            .ok_or("core filename is not UTF-8")?
-            .to_owned();
-        report.progress.set_phase(AcquisitionPhase::Checking);
-        // The shared resolver supplies remembered and explicit profiles plus the
-        // established identity; download never accepts terms or decodes executables.
-        let resolved = crate::trust::resolve_identity_with(
-            &primary,
-            publisher_keys,
-            supplied_profiles,
-            options,
-            trust_store,
-        )
-        .map_err(|error| transport_hint(transport.root(), error))?;
-        let publishers = resolved.profiles;
-        let legacy = flare_helios::core::conversion::form(&primary)
-            .map_err(|error| error.to_string())?
-            .is_none();
-        if let Some(expected) = expected_model.filter(|_| !legacy) {
-            use flare_helios::core::{cache, protection, reader};
-            let metadata = reader::Metadata::open(&primary)?;
-            let catalog = protection::verify(
-                &metadata.envelope,
-                &publishers,
-                protection::Selection::Catalog,
-            )?;
-            let identity = catalog.core().model_identity.as_str();
-            let model = cache::model_key(if identity.is_empty() { id } else { identity })
-                .map_err(|error| error.to_string())?;
-            if model != expected {
-                return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
-            }
-        }
-        let entry = if legacy {
-            match legacy_warm_entry(
-                &primary,
-                options,
-                &id,
-                &revision,
-                pinned.revision(),
-                &filename,
-                gpu_count,
-                &publishers,
-                &model_root,
-            )? {
-                Some(entry) => entry,
-                None => {
-                    let names = dependency_files(&primary, options, gpu_count, &publishers)?;
-                    let planned = plan_dependency_download(
-                        &api, &transport, &pinned, &primary, &names, token,
-                        Some(&report.progress),
-                    )?;
-                    let pending = planned.pending.as_ref();
-                    let remaining = pending.and_then(|pending| pending.total);
-                    report
-                        .progress
-                        .record_network_total(remaining.map(|remaining| {
-                            report
-                                .progress
-                                .snapshot()
-                                .network_bytes
-                                .saturating_add(remaining)
-                        }));
-                    announce_space(
-                        &transport,
-                        &model_root,
-                        pending.map(|pending| pending.bound),
-                    );
-                    if !names.is_empty() {
-                        check_cancel(Some(&report.progress))?;
-                    }
-                    report.progress.set_phase(AcquisitionPhase::Downloading);
-                    for (index, name) in names.iter().enumerate() {
-                        fetch_dependency_with_identity(
-                            &api,
-                            &transport,
-                            &pinned,
-                            &primary,
-                            name,
-                            token,
-                            Some(&report.progress),
-                            planned.identities[index].as_ref(),
-                        )?;
-                    }
-                    // A completed transfer ends at exactly the bytes it pulled,
-                    // even when adoption saved more or less than predicted.
-                    report
-                        .progress
-                        .record_network_total(Some(report.progress.snapshot().network_bytes));
-                    check_cancel(Some(&report.progress))?;
-
-                    report.progress.set_phase(AcquisitionPhase::Installing);
-                    install_ready(&id, &primary, options, &model_root, gpu_count, &publishers)
-                        .map_err(|error| transport_hint(transport.root(), error))?
-                }
-            }
-        } else {
-            // Planning validates cached entries and relocates sources; install
-            // materializes and verifies payloads. Each row meters one counter, so
-            // verification is presented while planning and materialization while
-            // installing.
-            check_cancel(Some(&report.progress))?;
-
-            match plan_payload_acquisition(
-                &primary,
-                options,
-                &id,
-                &revision,
-                pinned.revision(),
-                &filename,
-                gpu_count,
-                &publishers,
-                &model_root,
-                Some(&report.progress),
-            )? {
-                PayloadAcquisition::Ready(entry) => entry,
-                PayloadAcquisition::Planned { plan, staging } => {
-                    let names = plan.remote_files();
-                    let planned = plan_dependency_download(
-                        &api, &transport, &pinned, &primary, &names, token,
-                        Some(&report.progress),
-                    )?;
-                    let pending = planned.pending.as_ref();
-                    let remaining = pending.and_then(|pending| pending.total);
-                    report
-                        .progress
-                        .record_network_total(remaining.map(|remaining| {
-                            report
-                                .progress
-                                .snapshot()
-                                .network_bytes
-                                .saturating_add(remaining)
-                        }));
-                    announce_space(
-                        &transport,
-                        &model_root,
-                        pending.map(|pending| pending.bound),
-                    );
-                    if !names.is_empty() {
-                        check_cancel(Some(&report.progress))?;
-                    }
-                    report.progress.set_phase(AcquisitionPhase::Downloading);
-                    for (index, name) in names.iter().enumerate() {
-                        fetch_dependency_with_identity(
-                            &api,
-                            &transport,
-                            &pinned,
-                            &primary,
-                            name,
-                            token,
-                            Some(&report.progress),
-                            planned.identities[index].as_ref(),
-                        )?;
-                    }
-                    // A completed transfer ends at exactly the bytes it pulled,
-                    // even when adoption saved more or less than predicted.
-                    report
-                        .progress
-                        .record_network_total(Some(report.progress.snapshot().network_bytes));
-                    check_cancel(Some(&report.progress))?;
-
-                    report.progress.set_phase(AcquisitionPhase::Installing);
-                    finish_payload_acquisition(&primary, &names, plan, staging, &model_root)
-                        .map_err(|error| transport_hint(transport.root(), error))?
-                }
-            }
-        };
-        if expected_model.is_some_and(|model| model != entry.model()) {
-            return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
-        }
-        let expected_envelope =
-            authenticated_source_envelope(&primary, options, gpu_count, &publishers)?;
-        check_cancel(Some(&report.progress))?;
-        remember_download(
+        if let Some((entry, expected_envelope, resolved_sizes)) = warm_entry_for_commit(
             &model_root,
             id,
             &revision,
@@ -485,15 +417,235 @@ fn download_for_model_at(
             &filename,
             options,
             gpu_count,
-            &entry,
-            expected_envelope,
-        )?;
-        // The default switches only after the source mapping is durable; a failed
-        // source recording must not leave a different model version selected.
-        if select_default {
-            flare_helios::core::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+            publisher_keys,
+            trust_store,
+            supplied_profiles,
+            expected_model,
+        )? {
+            transport.record_ref(&repo.folder_name(), repo.revision(), pinned.revision());
+            check_cancel(Some(&report.progress))?;
+            remember_download_sizes(
+                &model_root,
+                id,
+                &revision,
+                pinned.revision(),
+                &filename,
+                options,
+                &resolved_sizes,
+                &entry,
+                expected_envelope,
+            )?;
+            if select_default {
+                flare_helios::core::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+            }
+            (entry, pinned.folder_name(), pinned.revision().to_owned(), false)
+        } else {
+            report.progress.set_phase(AcquisitionPhase::Downloading);
+            let primary = fetch_resolved_primary(
+                &api,
+                &transport,
+                &repo,
+                &pinned,
+                &filename,
+                token,
+                Some(&report.progress),
+            )?;
+            let filename = primary
+                .strip_prefix(transport.snapshot_dir(&pinned.folder_name(), pinned.revision()))?
+                .to_str()
+                .ok_or("core filename is not UTF-8")?
+                .to_owned();
+            report.progress.set_phase(AcquisitionPhase::Checking);
+            // The shared resolver supplies remembered and explicit profiles plus the
+            // established identity; download never accepts terms or decodes executables.
+            let resolved = crate::trust::resolve_identity_with(
+                &primary,
+                publisher_keys,
+                supplied_profiles,
+                options,
+                trust_store,
+            )
+            .map_err(|error| transport_hint(transport.root(), error))?;
+            let publishers = resolved.profiles;
+            if !publishers.iter().any(|publisher| {
+                publisher.fingerprint() == resolved.claim.signer
+                    && publisher.namespace == resolved.claim.namespace
+            }) {
+                return Err(Box::new(PublisherKeyRequired {
+                    primary,
+                    profile_url: api.repo(pinned.clone()).url("publisher.json"),
+                }));
+            }
+            let legacy = flare_helios::core::conversion::form(&primary)
+                .map_err(|error| error.to_string())?
+                .is_none();
+            if let Some(expected) = expected_model.filter(|_| !legacy) {
+                use flare_helios::core::{cache, protection, reader};
+                let metadata = reader::Metadata::open(&primary)?;
+                let catalog = protection::verify(
+                    &metadata.envelope,
+                    &publishers,
+                    protection::Selection::Catalog,
+                )?;
+                let identity = catalog.core().model_identity.as_str();
+                let model = cache::model_key(if identity.is_empty() { id } else { identity })
+                    .map_err(|error| error.to_string())?;
+                if model != expected {
+                    return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
+                }
+            }
+            let entry = if legacy {
+                match legacy_warm_entry(
+                    &primary,
+                    options,
+                    &id,
+                    &revision,
+                    pinned.revision(),
+                    &filename,
+                    gpu_count,
+                    &publishers,
+                    &model_root,
+                )? {
+                    Some(entry) => entry,
+                    None => {
+                        let names = dependency_files(&primary, options, gpu_count, &publishers)?;
+                        let planned = plan_dependency_download(
+                            &api, &transport, &pinned, &primary, &names, token,
+                            Some(&report.progress),
+                        )?;
+                        let pending = planned.pending.as_ref();
+                        let remaining = pending.and_then(|pending| pending.total);
+                        report
+                            .progress
+                            .record_network_total(remaining.map(|remaining| {
+                                report
+                                    .progress
+                                    .snapshot()
+                                    .network_bytes
+                                    .saturating_add(remaining)
+                            }));
+                        announce_space(
+                            &transport,
+                            &model_root,
+                            pending.map(|pending| pending.bound),
+                        );
+                        if !names.is_empty() {
+                            check_cancel(Some(&report.progress))?;
+                        }
+                        report.progress.set_phase(AcquisitionPhase::Downloading);
+                        fetch_dependencies_parallel(
+                            &api,
+                            &transport,
+                            &pinned,
+                            &primary,
+                            &names,
+                            &planned.identities,
+                            token,
+                            Some(&report.progress),
+                        )?;
+                        // A completed transfer ends at exactly the bytes it pulled,
+                        // even when adoption saved more or less than predicted.
+                        report
+                            .progress
+                            .record_network_total(Some(report.progress.snapshot().network_bytes));
+                        check_cancel(Some(&report.progress))?;
+
+                        report.progress.set_phase(AcquisitionPhase::Installing);
+                        install_ready(&id, &primary, options, &model_root, gpu_count, &publishers)
+                            .map_err(|error| transport_hint(transport.root(), error))?
+                    }
+                }
+            } else {
+                // Planning checks signed metadata and cached payload geometry;
+                // installation materializes and verifies missing payloads.
+                check_cancel(Some(&report.progress))?;
+
+                match plan_payload_acquisition(
+                    &primary,
+                    options,
+                    &id,
+                    &revision,
+                    pinned.revision(),
+                    &filename,
+                    gpu_count,
+                    &publishers,
+                    &model_root,
+                    Some(&report.progress),
+                )? {
+                    PayloadAcquisition::Ready(entry) => entry,
+                    PayloadAcquisition::Planned { plan, staging } => {
+                        let names = plan.remote_files();
+                        let planned = plan_dependency_download(
+                            &api, &transport, &pinned, &primary, &names, token,
+                            Some(&report.progress),
+                        )?;
+                        let pending = planned.pending.as_ref();
+                        let remaining = pending.and_then(|pending| pending.total);
+                        report
+                            .progress
+                            .record_network_total(remaining.map(|remaining| {
+                                report
+                                    .progress
+                                    .snapshot()
+                                    .network_bytes
+                                    .saturating_add(remaining)
+                            }));
+                        announce_space(
+                            &transport,
+                            &model_root,
+                            pending.map(|pending| pending.bound),
+                        );
+                        if !names.is_empty() {
+                            check_cancel(Some(&report.progress))?;
+                        }
+                        report.progress.set_phase(AcquisitionPhase::Downloading);
+                        fetch_dependencies_parallel(
+                            &api,
+                            &transport,
+                            &pinned,
+                            &primary,
+                            &names,
+                            &planned.identities,
+                            token,
+                            Some(&report.progress),
+                        )?;
+                        // A completed transfer ends at exactly the bytes it pulled,
+                        // even when adoption saved more or less than predicted.
+                        report
+                            .progress
+                            .record_network_total(Some(report.progress.snapshot().network_bytes));
+                        check_cancel(Some(&report.progress))?;
+
+                        report.progress.set_phase(AcquisitionPhase::Installing);
+                        finish_payload_acquisition(&primary, &names, plan, staging, &model_root)
+                            .map_err(|error| transport_hint(transport.root(), error))?
+                    }
+                }
+            };
+            if expected_model.is_some_and(|model| model != entry.model()) {
+                return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
+            }
+            let (expected_envelope, resolved_sizes) =
+                authenticated_source(&primary, options, gpu_count, &publishers)?;
+            check_cancel(Some(&report.progress))?;
+            remember_download_sizes(
+                &model_root,
+                id,
+                &revision,
+                pinned.revision(),
+                &filename,
+                options,
+                &resolved_sizes,
+                &entry,
+                expected_envelope,
+            )?;
+            // The default switches only after the source mapping is durable; a failed
+            // source recording must not leave a different model version selected.
+            if select_default {
+                flare_helios::core::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+            }
+            (entry, pinned.folder_name(), pinned.revision().to_owned(), true)
         }
-        (entry, pinned.folder_name(), pinned.revision().to_owned())
     };
     let mut report = report;
     report.success = true;
@@ -505,20 +657,22 @@ fn download_for_model_at(
     let root = transport.root().to_owned();
     let scope = transport.scope(&installed_folder);
     drop(transport);
-    match crate::download_cache::reclaim_installed(
-        &root,
-        &scope,
-        &installed_folder,
-        &installed_commit,
-    ) {
-        Ok(consumed) if consumed.complete_bytes > 0 => log::info!(
-            "Reclaimed {} bytes of consumed Hugging Face transport content",
-            consumed.complete_bytes
-        ),
-        Ok(_) => {}
-        Err(error) => log::info!(
-            "Warning: the core is installed, but its transport content was not reclaimed: {error}"
-        ),
+    if fetched_transport {
+        match crate::download_cache::reclaim_installed(
+            &root,
+            &scope,
+            &installed_folder,
+            &installed_commit,
+        ) {
+            Ok(consumed) if consumed.complete_bytes > 0 => log::info!(
+                "Reclaimed {} bytes of consumed Hugging Face transport content",
+                consumed.complete_bytes
+            ),
+            Ok(_) => {}
+            Err(error) => log::info!(
+                "Warning: the core is installed, but its transport content was not reclaimed: {error}"
+            ),
+        }
     }
     Ok(path)
 }
@@ -577,6 +731,27 @@ const TRANSFER_BACKOFF_LIMIT: Duration = Duration::from_secs(10);
 /// misconfigured `Retry-After` cannot stall an acquisition indefinitely.
 const TRANSFER_RETRY_AFTER_LIMIT: Duration = Duration::from_secs(60);
 const TRANSFER_BUFFER: usize = 1 << 20;
+/// Bounded range size for parallel chunked transfers of large files.
+const TRANSFER_CHUNK_SIZE: u64 = 4 << 20;
+/// Minimum remaining file bytes before splitting one transfer across parallel ranges.
+const TRANSFER_PARALLEL_MIN_BYTES: u64 = 8 << 20;
+/// Maximum files downloaded concurrently within one acquisition.
+const TRANSFER_FILE_WORKERS: usize = 8;
+/// Maximum concurrent HTTP range streams across all active file workers.
+const TRANSFER_MAX_STREAMS: usize = 64;
+/// Maximum concurrent HTTP range streams for a single large file.
+const TRANSFER_SINGLE_FILE_STREAMS: usize = 32;
+/// Independent HTTP/2 + HTTP/1.1 connection pools striped across CDN edge IPs.
+const TRANSFER_HTTP_STRIPES: usize = 32;
+const METADATA_HTTP_STRIPES: usize = 2;
+/// Grace period before migrating a head-of-line chunk onto a fresh HTTP/2 stripe
+/// once at least two later chunks in the same file have already completed.
+const STRAGGLER_GRACE: Duration = Duration::from_secs(2);
+const MAX_CHUNK_MIGRATIONS: usize = 3;
+/// Maximum pages fetched from the Hugging Face recursive tree API.
+const TREE_MAX_PAGES: usize = 64;
+/// Maximum bytes accepted for one tree API page.
+const TREE_PAGE_LIMIT: u64 = 16 << 20;
 /// A long response syncs its partial at these intervals so a crash keeps the
 /// bytes the server already sent.
 const PART_SYNC_BYTES: u64 = 64 << 20;
@@ -611,7 +786,8 @@ struct Transport {
     /// User Hugging Face cache that complete core files may be borrowed from
     /// read-only. Selected by `[paths].hub_cache` or the standard default.
     hub_cache: Option<PathBuf>,
-    agent: ureq::Agent,
+    agent: HttpClient,
+    metadata_agent: HttpClient,
     /// Shared lease for this acquisition. Reclamation takes the same inode
     /// exclusively, so repository snapshot metadata cannot be removed while an
     /// acquisition still opens files through it.
@@ -736,10 +912,21 @@ struct PlannedDownload {
     identities: Vec<Option<FileIdentity>>,
 }
 
-const METADATA_WORKERS: usize = 8;
+const METADATA_WORKERS: usize = 16;
 
-/// Resolve only metadata concurrently; payload transfers remain serial.
+/// Resolve file metadata concurrently using a shared pooled client.
+#[cfg(test)]
 fn resolve_file_identities(
+    urls: &[String],
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<Vec<Option<FileIdentity>>> {
+    let agent = metadata_agent();
+    resolve_file_identities_with_agent(&agent, urls, token, progress)
+}
+
+fn resolve_file_identities_with_agent(
+    agent: &HttpClient,
     urls: &[String],
     token: Option<&str>,
     progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
@@ -761,7 +948,7 @@ fn resolve_file_identities(
                     let Some(url) = urls.get(index) else { break };
                     // A failed advisory probe leaves the total unknown. The
                     // transfer still resolves its identity with normal retries.
-                    let identity = file_identity(url, token).ok();
+                    let identity = file_identity_with_agent(agent, url, token).ok();
                     if let Some(progress) = progress {
                         progress.record_planned_file();
                     }
@@ -782,6 +969,182 @@ fn resolve_file_identities(
     })?;
     check_cancel(progress)?;
     Ok(identities)
+}
+
+#[derive(serde::Deserialize)]
+struct TreeLfs {
+    oid: String,
+    size: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct TreeEntry {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    oid: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    lfs: Option<TreeLfs>,
+}
+
+/// Extract the `rel="next"` target from an HTTP `Link` header when it stays on
+/// the same origin without embedded credentials.
+fn next_link_url(header: &str, origin: &str, current: &str) -> Option<String> {
+    for part in header.split(',') {
+        let mut segments = part.split(';');
+        let Some(link) = segments.next().map(str::trim) else {
+            continue;
+        };
+        let Some(target) = link
+            .strip_prefix('<')
+            .and_then(|rest| rest.strip_suffix('>'))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        let is_next = segments.any(|param| {
+            let Some((key, value)) = param.split_once('=') else {
+                return false;
+            };
+            key.trim().eq_ignore_ascii_case("rel")
+                && value.trim().trim_matches('"').eq_ignore_ascii_case("next")
+        });
+        if !is_next {
+            continue;
+        }
+        let resolved = redirect_target(current, target)?;
+        if authenticated_redirect(origin, &resolved) {
+            return Some(resolved);
+        }
+        return None;
+    }
+    None
+}
+
+fn origin_from_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let mut origin = format!("{}://{host}", parsed.scheme());
+    if let Some(port) = parsed.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    Some(origin)
+}
+
+/// Batch-resolve file identities for a pinned commit through the Hub tree API.
+///
+/// Any missing entry or non-200 response falls back cleanly to per-file
+/// `Range: bytes=0-0` probes in the caller.
+fn fetch_tree_identities(
+    agent: &HttpClient,
+    origin: &str,
+    repository: &str,
+    commit: &str,
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> std::collections::BTreeMap<String, FileIdentity> {
+    let mut map = std::collections::BTreeMap::new();
+    let start_url = format!(
+        "{}/api/models/{repository}/tree/{commit}?recursive=true&limit=1000",
+        origin.trim_end_matches('/')
+    );
+    let mut current = start_url.clone();
+    for _ in 0..TREE_MAX_PAGES {
+        if progress.is_some_and(|progress| progress.is_cancelled()) {
+            break;
+        }
+        let mut response = None;
+        for attempt in 1..=3usize {
+            if progress.is_some_and(|progress| progress.is_cancelled()) {
+                break;
+            }
+            let auth_header = token
+                .filter(|_| authenticated_redirect(&start_url, &current))
+                .map(|token| format!("Bearer {token}"));
+            let mut headers = Vec::with_capacity(1);
+            if let Some(ref auth) = auth_header {
+                headers.push(("Authorization", auth.as_str()));
+            }
+            match agent.get(&current, &headers) {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status == 200 {
+                        response = Some(resp);
+                        break;
+                    }
+                    if matches!(status, 408 | 429 | 500..=599) && attempt < 3 {
+                        let wait = retry_delay(attempt, retry_after(&resp));
+                        if sleep_retry_abortable(wait, progress, &|| false).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                Err(error) if error.is_retryable() && attempt < 3 => {
+                    let wait = retry_delay(attempt, None);
+                    if sleep_retry_abortable(wait, progress, &|| false).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let Some(response) = response else {
+            break;
+        };
+        let next = response
+            .header("link")
+            .and_then(|header| next_link_url(header, &start_url, &current));
+        let Ok(body) = response.read_to_string_limit(TREE_PAGE_LIMIT) else {
+            break;
+        };
+        let Ok(entries) = serde_json::from_str::<Vec<TreeEntry>>(&body) else {
+            break;
+        };
+        for entry in entries {
+            if entry.kind != "file" || entry.path.is_empty() {
+                continue;
+            }
+            let (etag, size) = match (entry.lfs, entry.size) {
+                (Some(lfs), _) => {
+                    let oid = lfs.oid.trim().trim_matches('"').to_owned();
+                    if oid.is_empty() {
+                        continue;
+                    }
+                    (oid, lfs.size)
+                }
+                (None, Some(size)) => {
+                    let oid = entry.oid.trim().trim_matches('"').to_owned();
+                    if oid.is_empty() {
+                        continue;
+                    }
+                    (oid, size)
+                }
+                _ => continue,
+            };
+            if blob_key(&etag).is_err() {
+                continue;
+            }
+            map.insert(
+                entry.path,
+                FileIdentity {
+                    commit: commit.to_owned(),
+                    etag,
+                    size,
+                },
+            );
+        }
+        match next {
+            Some(next_url) if next_url != current => current = next_url,
+            _ => break,
+        }
+    }
+    map
 }
 
 fn plan_dependency_download(
@@ -806,11 +1169,46 @@ fn plan_dependency_download(
         .iter()
         .map(|name| base.join(name).to_string_lossy().replace('\\', "/"))
         .collect();
-    let urls: Vec<_> = relatives
-        .iter()
-        .map(|relative| remote.url(relative))
-        .collect();
-    let identities = resolve_file_identities(&urls, token, progress)?;
+    let tree = if relatives.is_empty() {
+        std::collections::BTreeMap::new()
+    } else if let Some(origin) = origin_from_url(&remote.url("")) {
+        fetch_tree_identities(
+            &transport.metadata_agent,
+            &origin,
+            &pinned.url(),
+            pinned.revision(),
+            token,
+            progress,
+        )
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    check_cancel(progress)?;
+    let mut identities = vec![None; relatives.len()];
+    let mut missing_indices = Vec::new();
+    let mut missing_urls = Vec::new();
+    for (index, relative) in relatives.iter().enumerate() {
+        if let Some(identity) = tree.get(relative) {
+            identities[index] = Some(identity.clone());
+            if let Some(progress) = progress {
+                progress.record_planned_file();
+            }
+        } else {
+            missing_indices.push(index);
+            missing_urls.push(remote.url(relative));
+        }
+    }
+    if !missing_urls.is_empty() {
+        let probed = resolve_file_identities_with_agent(
+            &transport.metadata_agent,
+            &missing_urls,
+            token,
+            progress,
+        )?;
+        for (index, identity) in missing_indices.into_iter().zip(probed) {
+            identities[index] = identity;
+        }
+    }
     let pending = pending_network_from_identities(transport, pinned, &relatives, &identities);
     Ok(PlannedDownload {
         pending,
@@ -966,6 +1364,7 @@ impl Transport {
             explicit: explicit.map(Path::to_owned),
             hub_cache: None,
             agent: transfers(),
+            metadata_agent: metadata_agent(),
             _lease: lease,
         })
     }
@@ -1252,18 +1651,25 @@ impl std::fmt::Debug for Transport {
     }
 }
 
-/// One request per transfer attempt, with the Hub's authentication header and
-/// without forwarding that header across a redirect to a content host.
-fn transfers() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_recv_response(Some(Duration::from_secs(120)))
-        .timeout_recv_body(Some(TRANSFER_BODY_DEADLINE))
-        .build()
-        .into()
+/// Striped HTTP/2 + HTTP/1.1 client for content transfers. Auth headers are
+/// attached explicitly per hop and never forwarded across redirects to content hosts.
+fn transfers() -> HttpClient {
+    HttpClient::new(
+        TRANSFER_HTTP_STRIPES,
+        Duration::from_secs(30),
+        Duration::from_secs(120),
+        TRANSFER_BODY_DEADLINE,
+    )
+}
+
+/// Striped HTTP/2 + HTTP/1.1 client for Hub tree and file-identity probes.
+fn metadata_agent() -> HttpClient {
+    HttpClient::new(
+        METADATA_HTTP_STRIPES,
+        Duration::from_secs(30),
+        Duration::from_secs(120),
+        Duration::from_secs(120),
+    )
 }
 
 /// Content namespace for one endpoint and repository folder.
@@ -1611,18 +2017,9 @@ fn refresh_model_at(
         .build()?;
     let revision = requested.revision.as_deref().unwrap();
     log::info!("Checking model origin: {}@{revision}", origin.repository);
-    let info = with_transient_retry(|| {
-        api.repo(Repo::with_revision(
-            origin.repository.clone(),
-            RepoType::Model,
-            revision.into(),
-        ))
-        .info()
-    })
-    .map_err(|error| format!("cannot check {}@{revision} for updates: {error}; the local version is unchanged (use --offline to skip the check)", origin.repository))?;
-    if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Hugging Face returned an invalid commit ID".into());
-    }
+    let repo = Repo::with_revision(origin.repository.clone(), RepoType::Model, revision.into());
+    let info = resolve_revision(&api, &repo, None)
+        .map_err(|error| format!("cannot check {}@{revision} for updates: {error}; the local version is unchanged (use --offline to skip the check)", origin.repository))?;
     if info.sha == origin.commit
         && revision == origin.revision
         && requested.filename == origin.filename
@@ -1646,36 +2043,72 @@ fn refresh_model_at(
     )
 }
 
-fn authenticated_source_envelope(
+fn authenticated_source(
     primary: &Path,
     options: &HubOptions,
     gpu_count: usize,
     publishers: &[flare_helios::runtime_core::Publisher],
-) -> Result<[u8; 32]> {
+) -> Result<([u8; 32], Vec<u32>)> {
     use flare_helios::core::{conversion, reader};
     use flare_helios::runtime_core::VerifiedCore;
     if conversion::form(primary)
         .map_err(|error| error.to_string())?
         .is_none()
     {
-        return Ok(VerifiedCore::open(primary, publishers, None)?.envelope_digest());
+        let verified = VerifiedCore::open(primary, publishers, None)?;
+        let ranks = verified
+            .identity()
+            .map_err(|error| error.to_string())?
+            .tensor_parallel;
+        return Ok((verified.envelope_digest(), vec![ranks]));
     }
     let metadata = reader::Metadata::open(primary)?;
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
-    let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
+    let source = crate::cache_support::select_core_source(metadata, publishers, &sizes)
         .map_err(|error| error.to_string())?;
-    let selection = *selections
-        .first()
-        .ok_or("authenticated source has no selected deployment")?;
-    // The signed envelope and selected deployment are sufficient to establish the
-    // identity. Opening payload companions here would require materializing the
-    // Hub snapshot and duplicate the acquisition's closure work.
-    Ok(
-        flare_helios::core::protection::verify(&metadata.envelope, publishers, selection)?
-            .envelope_digest(),
-    )
+    source_envelope_and_sizes(&source)
+}
+
+fn source_envelope_and_sizes(
+    source: &flare_helios::core::cache::CoreSource<'_>,
+) -> Result<([u8; 32], Vec<u32>)> {
+    let mut envelope = None;
+    let mut resolved = std::collections::BTreeSet::new();
+    for verified in source.verified() {
+        if envelope.is_none() {
+            envelope = Some(verified.envelope_digest());
+        }
+        let deployment = verified
+            .deployment()
+            .ok_or("authenticated source deployment has no body")?;
+        resolved.insert(deployment.tensor_parallel);
+    }
+    let envelope = envelope.ok_or("authenticated source has no selected deployment")?;
+    Ok((envelope, resolved.into_iter().collect()))
+}
+
+fn payload_core_claim(
+    envelope: &[u8],
+) -> Result<flare_helios::runtime_core::CoreClaim> {
+    let claim = flare_helios::core::protection::Claim::read(envelope)?;
+    Ok(flare_helios::runtime_core::CoreClaim {
+        signer: claim.signer,
+        namespace: claim.namespace,
+        official_source: claim.official_source,
+        development: claim.development,
+    })
+}
+
+#[cfg(test)]
+fn authenticated_source_envelope(
+    primary: &Path,
+    options: &HubOptions,
+    gpu_count: usize,
+    publishers: &[flare_helios::runtime_core::Publisher],
+) -> Result<[u8; 32]> {
+    Ok(authenticated_source(primary, options, gpu_count, publishers)?.0)
 }
 
 pub fn remember_download(
@@ -1689,10 +2122,35 @@ pub fn remember_download(
     entry: &flare_helios::core::cache::Entry,
     expected_envelope: [u8; 32],
 ) -> Result<()> {
-    let store = flare_helios::core::cache::Root::open(root)?;
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
+    remember_download_sizes(
+        root,
+        repository,
+        revision,
+        commit,
+        filename,
+        options,
+        &sizes,
+        entry,
+        expected_envelope,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remember_download_sizes(
+    root: &Path,
+    repository: &str,
+    revision: &str,
+    commit: &str,
+    filename: &str,
+    options: &HubOptions,
+    sizes: &[u32],
+    entry: &flare_helios::core::cache::Entry,
+    expected_envelope: [u8; 32],
+) -> Result<()> {
+    let store = flare_helios::core::cache::Root::open(root)?;
     let mut filenames = vec![Some(filename)];
     if options.filename.is_none() {
         filenames.push(None);
@@ -1701,7 +2159,7 @@ pub fn remember_download(
         for filename in &filenames {
             // The exact selection retains earlier TP entries; the unqualified
             // selector also permits subsets of the most recently acquired union.
-            for selection in [sizes.as_slice(), &[]] {
+            for selection in [sizes, &[]] {
                 store.publish_source_ref(
                     &source_selector(repository, revision, *filename, selection),
                     commit,
@@ -1712,7 +2170,7 @@ pub fn remember_download(
         }
     }
     store.publish_entry_source(
-        &source_selector(repository, revision, Some(filename), &sizes),
+        &source_selector(repository, revision, Some(filename), sizes),
         commit,
         entry,
         expected_envelope,
@@ -1814,8 +2272,13 @@ fn missing_source(
     sizes: &[u32],
     root: &Path,
 ) -> String {
+    let tp = if sizes.is_empty() {
+        "automatic".to_owned()
+    } else {
+        format!("{sizes:?}")
+    };
     format!(
-        "core {repository}@{revision} (filename: {}, TP: {sizes:?}) is not available in the Flare cache {}; download it online first",
+        "core {repository}@{revision} (filename: {}, TP: {tp}) is not available in the Flare cache {}; download it online first",
         options.filename.as_deref().unwrap_or("automatic"),
         root.display(),
     )
@@ -1845,7 +2308,7 @@ fn verify_offline_entry(
     publishers: &[flare_helios::runtime_core::Publisher],
 ) -> Result<()> {
     use flare_helios::{
-        core::{conversion, reader},
+        core::{cache, conversion, reader},
         runtime_core::VerifiedCore,
     };
     let primary = entry_primary(entry)?;
@@ -1859,15 +2322,13 @@ fn verify_offline_entry(
         if !options.tensor_parallel.is_empty() || gpu_count > 0 {
             enforce_legacy_tensor_parallel(&verified, &sizes)?;
         }
-        verified.verify_stored_data()?;
     } else {
         let metadata = reader::Metadata::open(&primary)?;
-        let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
+        let source = crate::cache_support::select_core_source(metadata, publishers, &sizes)
             .map_err(|error| error.to_string())?;
-        for selection in selections {
-            VerifiedCore::open_selected(&primary, publishers, selection)?
-                .verify_stored_data()?;
-        }
+        let model_root = crate::cache_support::model_root(options.core_cache.as_deref())
+            .map_err(|error| error.to_string())?;
+        cache::Root::open(&model_root)?.check_ready_installed(entry, &source)?;
     }
     Ok(())
 }
@@ -2062,6 +2523,180 @@ fn acquisition_candidate(platform: Option<&str>, sizes: &[u32]) -> Result<String
     .ok_or_else(|| "acquisition naming requires at least one non-zero TP size".into())
 }
 
+fn is_fd_exhaustion_message(text: &str) -> bool {
+    text.contains("Too many open files")
+        || text.contains("(os error 24)")
+        || text.contains("(os error 23)")
+}
+
+fn is_fd_exhaustion_error(error: &flare_helios::Error) -> bool {
+    is_fd_exhaustion_message(&error.to_string())
+}
+
+/// Reuse an already-installed, signed-envelope-bound cache entry for the exact
+/// resolved Hub commit before downloading the primary file again.
+///
+/// Any missing, unbound, tampered, or mismatched entry returns `Ok(None)` so
+/// online acquisition falls through to fetch the primary and repair or update
+/// the cache.
+#[allow(clippy::too_many_arguments)]
+fn warm_entry_for_commit(
+    model_root: &Path,
+    repository: &str,
+    revision: &str,
+    commit: &str,
+    filename: &str,
+    options: &HubOptions,
+    gpu_count: usize,
+    publisher_keys: &[PathBuf],
+    trust_store: Option<&Path>,
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
+    expected_model: Option<&str>,
+) -> Result<Option<(flare_helios::core::cache::Entry, [u8; 32], Vec<u32>)>> {
+    let store = flare_helios::core::cache::Root::open(model_root)?;
+    let sizes =
+        crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
+            .map_err(|error| error.to_string())?;
+    let mut filenames = vec![Some(filename)];
+    if options.filename.is_none() {
+        filenames.push(None);
+    }
+    let mut selectors = Vec::new();
+    for source_revision in [revision, commit] {
+        for source_filename in &filenames {
+            for selection in [sizes.as_slice(), &[]] {
+                selectors.push(source_selector(
+                    repository,
+                    source_revision,
+                    *source_filename,
+                    selection,
+                ));
+            }
+        }
+    }
+    for selector in selectors {
+        let (reference, entry) = match store.resolve_source_ref_record(&selector) {
+            Ok(Some(found)) => found,
+            Ok(None) => continue,
+            Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+            Err(_) => continue,
+        };
+        if reference.revision() != commit {
+            continue;
+        }
+        let Some(expected_envelope) = reference.expected_envelope() else {
+            continue;
+        };
+        if expected_model.is_some_and(|model| model != entry.model()) {
+            continue;
+        }
+        match store.entry_source(&entry) {
+            Ok(Some(origin)) if origin.revision() != commit => continue,
+            Ok(_) => {}
+            Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+            Err(_) => continue,
+        }
+        let Ok(primary) = entry_primary(&entry) else {
+            continue;
+        };
+        let is_payload = match flare_helios::core::conversion::form(&primary) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+            Err(_) => continue,
+        };
+        if is_payload {
+            let metadata = match flare_helios::core::reader::Metadata::open(&primary) {
+                Ok(metadata) => metadata,
+                Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+                Err(_) => continue,
+            };
+            // Check the signed root envelope hash before contacting the publisher
+            // repository or authenticating selected deployments.
+            if *flare_helios::core::PayloadId::of(&metadata.envelope).as_bytes()
+                != expected_envelope
+            {
+                continue;
+            }
+            let Ok(claim) = payload_core_claim(&metadata.envelope) else {
+                continue;
+            };
+            let Ok(resolved) = crate::trust::resolve_identity_for_claim(
+                claim,
+                publisher_keys,
+                supplied_profiles,
+                options,
+                trust_store,
+            ) else {
+                continue;
+            };
+            let publishers = resolved.profiles;
+            if !publishers.iter().any(|publisher| {
+                publisher.fingerprint() == resolved.claim.signer
+                    && publisher.namespace == resolved.claim.namespace
+            }) {
+                continue;
+            }
+            let Ok(source) = crate::cache_support::select_bound_core_source(
+                metadata,
+                expected_envelope,
+                &publishers,
+                &sizes,
+            ) else {
+                continue;
+            };
+            match store.check_ready_installed(&entry, &source) {
+                Ok(()) => {}
+                Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+                Err(_) => continue,
+            }
+            let Ok((actual_envelope, resolved_sizes)) = source_envelope_and_sizes(&source) else {
+                continue;
+            };
+            if actual_envelope != expected_envelope {
+                continue;
+            }
+            return Ok(Some((entry, actual_envelope, resolved_sizes)));
+        }
+        let Ok(resolved) = crate::trust::resolve_identity_with(
+            &primary,
+            publisher_keys,
+            supplied_profiles,
+            options,
+            trust_store,
+        ) else {
+            continue;
+        };
+        let publishers = resolved.profiles;
+        if !publishers.iter().any(|publisher| {
+            publisher.fingerprint() == resolved.claim.signer
+                && publisher.namespace == resolved.claim.namespace
+        }) {
+            continue;
+        }
+        if verify_offline_binding(&entry, expected_envelope, repository, revision, &publishers)
+            .is_err()
+        {
+            continue;
+        }
+        match verify_offline_entry(&entry, options, gpu_count, &publishers) {
+            Ok(()) => {}
+            Err(error) if is_fd_exhaustion_message(&error.to_string()) => return Err(error),
+            Err(_) => continue,
+        }
+        let Ok((actual_envelope, resolved_sizes)) =
+            authenticated_source(&primary, options, gpu_count, &publishers)
+        else {
+            continue;
+        };
+        if actual_envelope != expected_envelope {
+            continue;
+        }
+        return Ok(Some((entry, actual_envelope, resolved_sizes)));
+    }
+    Ok(None)
+}
+
 /// Build the shared payload acquisition plan before any dependency fetch.
 ///
 /// The returned plan owns cached object leases and the minimal remote file set.
@@ -2091,19 +2726,23 @@ fn plan_payload_acquisition<'a>(
     let (resolved, cleanup) = resolve_transport(primary, &[], model_root)?;
     let result = (|| {
         let metadata = reader::Metadata::open(&resolved)?;
-        let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
+        let source = crate::cache_support::select_core_source(metadata, publishers, &sizes)
             .map_err(|error| error.to_string())?;
-        let source = cache::CoreSource::open(&resolved, publishers, selections[0])?
-            .union(publishers, &selections)?;
         let model_key = acquisition_model_key(&source, repository)?;
         let store = cache::Root::open(model_root)?;
+        let (platform, signed_sizes) = signed_hardware(&source)?;
+        let lookup_sizes = if sizes.is_empty() {
+            signed_sizes.as_slice()
+        } else {
+            sizes.as_slice()
+        };
 
         // Warm reuse is keyed by the private source selector, then checked
         // against the signed primary and selected deployments before the hit.
         let mut selectors = Vec::new();
         for source_revision in [revision, commit] {
             for source_filename in [Some(filename), None] {
-                for selection in [sizes.as_slice(), &[]] {
+                for selection in [lookup_sizes, &[]] {
                     selectors.push(source_selector(
                         repository,
                         source_revision,
@@ -2114,17 +2753,21 @@ fn plan_payload_acquisition<'a>(
             }
         }
         for selector in selectors {
-            let Ok(Some((stored_revision, entry))) = store.resolve_source_ref(&selector) else {
-                continue;
+            let (stored_revision, entry) = match store.resolve_source_ref(&selector) {
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+                Err(_) => continue,
             };
-            if stored_revision == commit
-                && store.verify_ready_with(&entry, &source, progress).is_ok()
-            {
-                return Ok(PayloadAcquisition::Ready(entry));
+            if stored_revision == commit {
+                match store.check_ready(&entry, &source) {
+                    Ok(()) => return Ok(PayloadAcquisition::Ready(entry)),
+                    Err(error) if is_fd_exhaustion_error(&error) => return Err(error.into()),
+                    Err(_) => {}
+                }
             }
         }
 
-        let (platform, signed_sizes) = signed_hardware(&source)?;
         let candidate = acquisition_candidate(platform.as_deref(), &signed_sizes)?;
         let staging = store.stage_named(&model_key, &candidate)?;
         let plan = store.plan_acquisition_with(source, &derivation::Limits::default(), progress)?;
@@ -2211,7 +2854,7 @@ fn legacy_warm_entry(
                             || entry_verified
                                 .identity()
                                 .is_ok_and(|identity| sizes == [identity.tensor_parallel]);
-                        if tp_ok && entry_verified.verify_stored_data().is_ok() {
+                        if tp_ok {
                             return Ok(Some(entry));
                         }
                     }
@@ -2256,7 +2899,7 @@ fn legacy_warm_entry(
                 || entry_verified
                     .identity()
                     .is_ok_and(|identity| sizes == [identity.tensor_parallel]);
-            if tp_ok && entry_verified.verify_stored_data().is_ok() {
+            if tp_ok {
                 return Ok(Some(entry));
             }
         }
@@ -2348,21 +2991,104 @@ fn install_ready(
     install
 }
 
-/// The access token named by `--token-file`, for private repositories.
-pub fn token(options: &HubOptions) -> Result<Option<String>> {
-    options
-        .token_file
-        .as_ref()
-        .map(|path| {
-            let value = std::fs::read_to_string(path)
-                .map_err(|error| format!("cannot read token file {}: {error}", path.display()))?;
-            let token = value.trim();
-            if token.is_empty() {
-                return Err("Hugging Face token file is empty".into());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenSource {
+    ExplicitFile,
+    EnvVar,
+    DefaultFile,
+}
+
+fn default_hf_token_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HF_TOKEN_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(home) = std::env::var("HF_HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join("token"));
+        }
+    }
+    crate::environment::home_directory()
+        .ok()
+        .map(|home| home.join(".cache/huggingface/token"))
+}
+
+fn env_hf_token() -> Option<String> {
+    for name in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
             }
-            Ok(token.to_owned())
-        })
-        .transpose()
+        }
+    }
+    None
+}
+
+fn resolve_token(
+    token_file: Option<&Path>,
+    env_token: Option<&str>,
+    default_token_path: Option<&Path>,
+) -> Result<Option<(String, TokenSource)>> {
+    if let Some(path) = token_file {
+        let value = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read token file {}: {error}", path.display()))?;
+        let token = value.trim();
+        if token.is_empty() {
+            return Err("Hugging Face token file is empty".into());
+        }
+        return Ok(Some((token.to_owned(), TokenSource::ExplicitFile)));
+    }
+    if let Some(value) = env_token {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some((trimmed.to_owned(), TokenSource::EnvVar)));
+        }
+    }
+    if let Some(path) = default_token_path
+        && let Ok(value) = std::fs::read_to_string(path)
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some((trimmed.to_owned(), TokenSource::DefaultFile)));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve the Hugging Face access token for authenticated Hub connections.
+///
+/// Precedence: explicit `--token-file` (must exist and be non-empty), then
+/// `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`), then the stored CLI token at
+/// `$HF_TOKEN_PATH`, `$HF_HOME/token`, or `~/.cache/huggingface/token`.
+pub fn token(options: &HubOptions) -> Result<Option<String>> {
+    let env = env_hf_token();
+    let default_path = default_hf_token_path();
+    let resolved = resolve_token(
+        options.token_file.as_deref(),
+        env.as_deref(),
+        default_path.as_deref(),
+    )?;
+    match &resolved {
+        Some((_, TokenSource::ExplicitFile)) => {
+            log::info!("Using Hugging Face access token from --token-file");
+        }
+        Some((_, TokenSource::EnvVar)) => {
+            log::info!("Using Hugging Face access token from environment");
+        }
+        Some((_, TokenSource::DefaultFile)) => {
+            log::info!("Using Hugging Face access token from stored Hub credentials");
+        }
+        None => {
+            log::info!(
+                "Connecting to Hugging Face without an access token; authenticate with `hf auth login`, `HF_TOKEN`, or `--token-file` for higher rate limits"
+            );
+        }
+    }
+    Ok(resolved.map(|(value, _)| value))
 }
 
 #[cfg(test)]
@@ -2375,6 +3101,70 @@ fn fetch_primary(
     fetch_primary_with_progress(api, transport, repo, requested, None, None)
 }
 
+fn resolve_revision(
+    api: &Api,
+    repo: &Repo,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<RepoInfo> {
+    check_cancel(progress)?;
+    let revision = repo.revision();
+    let info = match with_transient_retry(|| api.repo(repo.clone()).info()) {
+        Err(ApiError::RequestError(error))
+            if matches!(error.as_ref(), ureq::Error::StatusCode(404))
+                && revision.starts_with("gb")
+                && flare_helios::core::naming::PLATFORMS.contains(&revision) =>
+        {
+            check_cancel(progress)?;
+            let alias = format!("{revision}-tp1");
+            log::info!("Hugging Face revision {revision} returned 404, trying {alias}");
+            let repo = Repo::with_revision(repo.url(), RepoType::Model, alias);
+            with_transient_retry(|| api.repo(repo.clone()).info())?
+        }
+        result => result?,
+    };
+    if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Hugging Face returned an invalid commit ID".into());
+    }
+    Ok(info)
+}
+
+fn resolve_primary_target(
+    api: &Api,
+    repo: &Repo,
+    requested: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<(Repo, String)> {
+    let info = resolve_revision(api, repo, progress)?;
+    let filename = choose_file(
+        info.siblings.into_iter().map(|file| file.rfilename),
+        requested,
+    )?;
+    let pinned = Repo::with_revision(repo.url(), RepoType::Model, info.sha.clone());
+    log::info!("Resolved core: {}@{} / {filename}", repo.url(), info.sha);
+    Ok((pinned, filename))
+}
+
+fn fetch_resolved_primary(
+    api: &Api,
+    transport: &Transport,
+    repo: &Repo,
+    pinned: &Repo,
+    filename: &str,
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<PathBuf> {
+    let recovered = transport.adopt_legacy(&pinned.folder_name());
+    if recovered > 0 {
+        log::info!(
+            "Recovered {recovered} bytes of interrupted Hugging Face transfers from an older staging tree"
+        );
+    }
+    let path = fetch_file_with_progress(api, transport, pinned, filename, token, progress)?;
+    transport.record_ref(&repo.folder_name(), repo.revision(), pinned.revision());
+    Ok(path)
+}
+
+#[cfg(test)]
 fn fetch_primary_with_progress(
     api: &Api,
     transport: &Transport,
@@ -2383,25 +3173,8 @@ fn fetch_primary_with_progress(
     token: Option<&str>,
     progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<(PathBuf, Repo)> {
-    check_cancel(progress)?;
-    let info = with_transient_retry(|| api.repo(repo.clone()).info())?;
-    if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Hugging Face returned an invalid commit ID".into());
-    }
-    let filename = choose_file(
-        info.siblings.into_iter().map(|file| file.rfilename),
-        requested,
-    )?;
-    let pinned = Repo::with_revision(repo.url(), RepoType::Model, info.sha.clone());
-    log::info!("Resolved core: {}@{} / {filename}", repo.url(), info.sha);
-    let recovered = transport.adopt_legacy(&pinned.folder_name());
-    if recovered > 0 {
-        log::info!(
-            "Recovered {recovered} bytes of interrupted Hugging Face transfers from an older staging tree"
-        );
-    }
-    let path = fetch_file_with_progress(api, transport, &pinned, &filename, token, progress)?;
-    transport.record_ref(&repo.folder_name(), repo.revision(), &info.sha);
+    let (pinned, filename) = resolve_primary_target(api, repo, requested, progress)?;
+    let path = fetch_resolved_primary(api, transport, repo, &pinned, &filename, token, progress)?;
     Ok((path, pinned))
 }
 
@@ -2430,6 +3203,8 @@ fn fetch_dependency_with_progress(
     fetch_dependency_with_identity(api, transport, repo, primary, name, token, progress, None)
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn fetch_dependency_with_identity(
     api: &Api,
     transport: &Transport,
@@ -2441,12 +3216,182 @@ fn fetch_dependency_with_identity(
     identity: Option<&FileIdentity>,
 ) -> Result<()> {
     check_cancel(progress)?;
+    let relative = dependency_relative(transport, repo, primary, name);
+    fetch_file_with_identity_and_streams(
+        api,
+        transport,
+        repo,
+        &relative,
+        token,
+        progress,
+        identity,
+        TRANSFER_SINGLE_FILE_STREAMS,
+        None,
+    )?;
+    Ok(())
+}
+
+fn dependency_relative(transport: &Transport, repo: &Repo, primary: &Path, name: &str) -> String {
     let filename = primary
         .strip_prefix(transport.snapshot_dir(&repo.folder_name(), repo.revision()))
         .unwrap_or(primary);
     let base = Path::new(filename).parent().unwrap_or(Path::new(""));
-    let relative = base.join(name).to_string_lossy().replace('\\', "/");
-    fetch_file_with_identity(api, transport, repo, &relative, token, progress, identity)?;
+    base.join(name).to_string_lossy().replace('\\', "/")
+}
+
+/// Fetch dependency files concurrently across bounded file workers, deduplicating
+/// paths that share a planned content identity and scheduling largest files first.
+#[allow(clippy::too_many_arguments)]
+fn fetch_dependencies_parallel(
+    api: &Api,
+    transport: &Transport,
+    pinned: &Repo,
+    primary: &Path,
+    names: &[String],
+    identities: &[Option<FileIdentity>],
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<()> {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    if names.is_empty() {
+        return Ok(());
+    }
+    check_cancel(progress)?;
+    struct WorkItem {
+        primary_relative: String,
+        alias_relatives: Vec<String>,
+        identity: Option<FileIdentity>,
+        sort_size: u64,
+    }
+    let folder = pinned.folder_name();
+    let snapshot_dir = transport.snapshot_dir(&folder, pinned.revision());
+    let mut keyed: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut work: Vec<WorkItem> = Vec::with_capacity(names.len());
+    for (index, name) in names.iter().enumerate() {
+        let relative = dependency_relative(transport, pinned, primary, name);
+        let identity = identities.get(index).and_then(Option::as_ref).cloned();
+        if let Some(ref id) = identity
+            && id.commit_hash() == pinned.revision()
+            && let Ok(key) = blob_key(id.etag())
+        {
+            if let Some(&slot) = keyed.get(&key) {
+                work[slot].alias_relatives.push(relative);
+                continue;
+            }
+            let slot = work.len();
+            keyed.insert(key, slot);
+            work.push(WorkItem {
+                primary_relative: relative,
+                alias_relatives: Vec::new(),
+                sort_size: id.size(),
+                identity,
+            });
+            continue;
+        }
+        work.push(WorkItem {
+            primary_relative: relative,
+            alias_relatives: Vec::new(),
+            sort_size: u64::MAX,
+            identity,
+        });
+    }
+    // Start the largest files first so a single huge companion never drags out
+    // the tail after small companions finish.
+    work.sort_by(|left, right| {
+        right
+            .sort_size
+            .cmp(&left.sort_size)
+            .then_with(|| left.primary_relative.cmp(&right.primary_relative))
+    });
+    let worker_count = work.len().min(TRANSFER_FILE_WORKERS).max(1);
+    let streams_per_worker =
+        (TRANSFER_MAX_STREAMS / worker_count).clamp(1, TRANSFER_SINGLE_FILE_STREAMS);
+    if worker_count == 1 {
+        let item = &work[0];
+        let path = fetch_file_with_identity_and_streams(
+            api,
+            transport,
+            pinned,
+            &item.primary_relative,
+            token,
+            progress,
+            item.identity.as_ref(),
+            streams_per_worker,
+            None,
+        )?;
+        for alias in &item.alias_relatives {
+            link_snapshot(&snapshot_dir, alias, &path)?;
+        }
+        return Ok(());
+    }
+    let next = AtomicUsize::new(0);
+    let aborted = AtomicBool::new(false);
+    let first_error: Mutex<Option<String>> = Mutex::new(None);
+    let work_ref = &work;
+    let snapshot_ref = &snapshot_dir;
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let next = &next;
+            let aborted = &aborted;
+            let first_error = &first_error;
+            scope.spawn(move || loop {
+                if aborted.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Err(error) = check_cancel(progress) {
+                    aborted.store(true, Ordering::Release);
+                    let mut slot = first_error
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(error.to_string());
+                    }
+                    return;
+                }
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = work_ref.get(index) else {
+                    return;
+                };
+                let step = (|| -> Result<()> {
+                    let path = fetch_file_with_identity_and_streams(
+                        api,
+                        transport,
+                        pinned,
+                        &item.primary_relative,
+                        token,
+                        progress,
+                        item.identity.as_ref(),
+                        streams_per_worker,
+                        Some(aborted),
+                    )?;
+                    for alias in &item.alias_relatives {
+                        link_snapshot(snapshot_ref, alias, &path)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = step {
+                    aborted.store(true, Ordering::Release);
+                    let mut slot = first_error
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(error.to_string());
+                    }
+                    return;
+                }
+            });
+        }
+    });
+    if let Some(error) = first_error
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner())
+    {
+        return Err(error.into());
+    }
+    check_cancel(progress)?;
     Ok(())
 }
 
@@ -2461,7 +3406,7 @@ fn dependency_files(
     gpu_count: usize,
     publishers: &[flare_helios::runtime_core::Publisher],
 ) -> Result<Vec<String>> {
-    use flare_helios::core::{derivation, protection, reader};
+    use flare_helios::core::{derivation, reader};
 
     let Ok(metadata) = reader::Metadata::open(primary) else {
         return Ok(flare_helios::runtime_core::core_companions(primary)?);
@@ -2469,9 +3414,10 @@ fn dependency_files(
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
-    let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
+    let source = crate::cache_support::select_core_source(metadata, publishers, &sizes)
         .map_err(|error| error.to_string())?;
-    let placed: std::collections::BTreeMap<Vec<u8>, String> = metadata
+    let placed: std::collections::BTreeMap<Vec<u8>, String> = source
+        .metadata()
         .locations
         .locations
         .iter()
@@ -2480,16 +3426,9 @@ fn dependency_files(
     // The shared cache closure decides which payload identities this selection
     // needs: its required payloads plus the derivation sources they depend on,
     // authorized only by the selected deployments' catalogs.
-    let mut selected = Vec::with_capacity(selections.len());
-    for selection in &selections {
-        selected.push(
-            protection::verify(&metadata.envelope, publishers, *selection)
-                .map_err(|error| error.to_string())?,
-        );
-    }
     let needed = flare_helios::core::cache::selected_derivation_closure(
-        &metadata,
-        &selected,
+        source.metadata(),
+        source.verified(),
         &derivation::Limits::default(),
     )
     .map_err(|error| error.to_string())?;
@@ -2531,6 +3470,31 @@ fn fetch_file_with_identity(
     progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
     identity: Option<&FileIdentity>,
 ) -> Result<PathBuf> {
+    fetch_file_with_identity_and_streams(
+        api,
+        transport,
+        pinned,
+        filename,
+        token,
+        progress,
+        identity,
+        TRANSFER_SINGLE_FILE_STREAMS,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_file_with_identity_and_streams(
+    api: &Api,
+    transport: &Transport,
+    pinned: &Repo,
+    filename: &str,
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    identity: Option<&FileIdentity>,
+    max_streams: usize,
+    abort: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<PathBuf> {
     check_cancel(progress)?;
     let path = transport
         .snapshot_dir(&pinned.folder_name(), pinned.revision())
@@ -2547,7 +3511,7 @@ fn fetch_file_with_identity(
                     "model acquisition cancelled; partial transport content is retained",
                 ));
             }
-            file_identity(&remote.url(filename), token)
+            file_identity_with_agent(&transport.metadata_agent, &remote.url(filename), token)
         })?,
     };
     if metadata.commit_hash() != pinned.revision() {
@@ -2578,7 +3542,7 @@ fn fetch_file_with_identity(
                     "Discarded corrupt transport content for {filename}: its bytes do not match the Hub digest"
                 );
                 log::info!("Downloading model file: {filename}...");
-                transfer_blob(
+                transfer_blob_with_streams(
                     &transport.agent,
                     &transport.part(&folder, &key),
                     &blob,
@@ -2587,6 +3551,8 @@ fn fetch_file_with_identity(
                     filename,
                     &metadata,
                     progress,
+                    max_streams,
+                    abort,
                 )?;
             } else {
                 log::info!("Reusing cached model file: {filename}");
@@ -2609,7 +3575,7 @@ fn fetch_file_with_identity(
             };
             if !adopted {
                 log::info!("Downloading model file: {filename}...");
-                transfer_blob(
+                transfer_blob_with_streams(
                     &transport.agent,
                     &transport.part(&folder, &key),
                     &blob,
@@ -2618,6 +3584,8 @@ fn fetch_file_with_identity(
                     filename,
                     &metadata,
                     progress,
+                    max_streams,
+                    abort,
                 )?;
             }
         }
@@ -2937,6 +3905,7 @@ impl Resume {
 }
 
 /// Why one transfer attempt ended without completing the file.
+#[derive(Debug)]
 enum Attempt {
     /// The server or content cannot satisfy the request; retrying cannot help.
     Fatal(String),
@@ -2976,8 +3945,8 @@ fn part_sync_due(synced: u64, offset: u64, since_sync: Duration) -> bool {
 
 /// The delay a `Retry-After` header requests: either delta-seconds or an
 /// HTTP-date. A date at or before now requests no wait.
-fn retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
-    let value = response.headers().get("retry-after")?.to_str().ok()?;
+fn retry_after(response: &HttpResponse) -> Option<Duration> {
+    let value = response.header("retry-after")?;
     let value = value.trim();
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
@@ -3004,14 +3973,11 @@ fn retry_after_date(value: &str, now_unix: i64) -> Option<Duration> {
     ))
 }
 
-fn attempt_error(error: ureq::Error) -> Attempt {
-    use ureq::Error;
-    match error {
-        Error::Timeout(_) | Error::Io(_) | Error::HostNotFound | Error::ConnectionFailed => {
-            Attempt::retry(transport_error(&error))
-        }
-        Error::BadUri(_) => Attempt::Fatal(transport_error(&error)),
-        error => Attempt::Fatal(transport_error(&error)),
+fn attempt_error(error: HttpError) -> Attempt {
+    if error.is_retryable() {
+        Attempt::retry(transport_error(&error))
+    } else {
+        Attempt::Fatal(transport_error(&error))
     }
 }
 
@@ -3019,11 +3985,8 @@ fn attempt_error(error: ureq::Error) -> Attempt {
 ///
 /// Request URLs can carry presigned query strings or embedded credentials, so a
 /// rejected URI is reported by category rather than by value.
-fn transport_error(error: &ureq::Error) -> String {
-    match error {
-        ureq::Error::BadUri(_) => "invalid request URL".to_owned(),
-        error => error.to_string(),
-    }
+fn transport_error(error: &HttpError) -> String {
+    error.to_string()
 }
 
 fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
@@ -3073,34 +4036,45 @@ fn redirect_target(current: &str, location: &str) -> Option<String> {
 
 /// One ranged request, following redirects itself so authentication is explicit:
 /// the token goes to the original host only and is never sent to a content host.
+#[cfg(test)]
 fn ranged_get(
-    agent: &ureq::Agent,
+    agent: &HttpClient,
     url: &str,
     token: Option<&str>,
     offset: u64,
-) -> std::result::Result<ureq::http::Response<ureq::Body>, Attempt> {
+) -> std::result::Result<HttpResponse, Attempt> {
+    ranged_get_resolved(agent, url, token, offset, None).map(|(response, _)| response)
+}
+
+fn ranged_get_resolved(
+    agent: &HttpClient,
+    url: &str,
+    token: Option<&str>,
+    start: u64,
+    end: Option<u64>,
+) -> std::result::Result<(HttpResponse, String), Attempt> {
+    let range = match end {
+        Some(end) => format!("bytes={start}-{end}"),
+        None => format!("bytes={start}-"),
+    };
     let mut current = url.to_owned();
     for redirect in 0..=5 {
-        let mut request = agent
-            .get(&current)
-            .header("Range", &format!("bytes={offset}-"))
-            .header("Accept-Encoding", "identity");
-        if let Some(token) = token
-            && authenticated_redirect(url, &current)
-        {
-            request = request.header("Authorization", &format!("Bearer {token}"));
+        let auth_header = token
+            .filter(|_| authenticated_redirect(url, &current))
+            .map(|token| format!("Bearer {token}"));
+        let mut headers = Vec::with_capacity(3);
+        headers.push(("Range", range.as_str()));
+        headers.push(("Accept-Encoding", "identity"));
+        if let Some(ref auth) = auth_header {
+            headers.push(("Authorization", auth.as_str()));
         }
-        let response = request.call().map_err(attempt_error)?;
-        let status = response.status().as_u16();
+        let response = agent.get(&current, &headers).map_err(attempt_error)?;
+        let status = response.status();
         if (300..400).contains(&status) {
             if redirect == 5 {
                 return Err(Attempt::retry("too many redirects while fetching content"));
             }
-            let Some(location) = response
-                .headers()
-                .get("location")
-                .and_then(|value| value.to_str().ok())
-            else {
+            let Some(location) = response.header("location") else {
                 return Err(Attempt::retry(
                     "server returned a redirect without a Location header",
                 ));
@@ -3113,49 +4087,36 @@ fn ranged_get(
             current = target;
             continue;
         }
-        return Ok(response);
+        return Ok((response, current));
     }
     Err(Attempt::retry("too many redirects while fetching content"))
 }
 
-/// Fetch the missing suffix of one content file and append it to its partial.
-///
-/// The response must describe exactly the bytes it contains: a resumed request
-/// requires `206` with a `Content-Range` that starts at the current offset and
-/// names the file's declared length. A response that cannot be appended is
-/// reported with the saved offset; the partial bytes are never discarded here.
-fn attempt_transfer(
-    agent: &ureq::Agent,
-    url: &str,
-    token: Option<&str>,
-    resume: &mut Resume,
-    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
-) -> std::result::Result<(), Attempt> {
-    if progress.is_some_and(|progress| progress.is_cancelled()) {
-        return Err(Attempt::Fatal(
-            "model acquisition cancelled; partial transport content is retained".into(),
-        ));
-    }
-    let offset = resume.offset;
-    let local = |error: String| Attempt::Fatal(format!("cannot write the partial file: {error}"));
-    let response = ranged_get(agent, url, token, offset)?;
-    let status = response.status().as_u16();
-    let body_length = match status {
+enum ValidatedRange {
+    Partial { end: u64, body_length: u64 },
+    Full { body_length: u64 },
+}
+
+fn validate_range_response(
+    response: &HttpResponse,
+    offset: u64,
+    expected_total: u64,
+    max_end: Option<u64>,
+) -> std::result::Result<ValidatedRange, Attempt> {
+    let status = response.status();
+    let result = match status {
         206 => {
             let header = response
-                .headers()
-                .get("content-range")
-                .and_then(|value| value.to_str().ok())
+                .header("content-range")
                 .ok_or_else(|| Attempt::retry("206 response without Content-Range"))?;
             let Some((start, end, total)) = parse_content_range(header) else {
                 return Err(Attempt::retry(format!(
                     "malformed Content-Range {header:?}"
                 )));
             };
-            if total != resume.size {
+            if total != expected_total {
                 return Err(Attempt::retry(format!(
-                    "server declared {total} bytes for content declared as {} bytes",
-                    resume.size
+                    "server declared {total} bytes for content declared as {expected_total} bytes"
                 )));
             }
             if end < start || end >= total {
@@ -3168,19 +4129,25 @@ fn attempt_transfer(
                     "server answered with bytes {start}-{end} of {total} instead of resuming at the requested byte {offset}; kept {offset} saved bytes"
                 )));
             }
-            end - start + 1
+            if let Some(limit) = max_end
+                && end > limit
+            {
+                return Err(Attempt::retry(format!(
+                    "server answered with bytes {start}-{end} beyond the requested range end {limit}"
+                )));
+            }
+            ValidatedRange::Partial {
+                end,
+                body_length: end - start + 1,
+            }
         }
         200 => {
-            let declared = response.headers().get("content-length").and_then(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .and_then(|text| text.parse::<u64>().ok())
-            });
-            if declared != Some(resume.size) {
+            let declared = response
+                .header("content-length")
+                .and_then(|text| text.trim().parse::<u64>().ok());
+            if declared != Some(expected_total) {
                 return Err(Attempt::retry(format!(
-                    "server sent the complete content without a declared length of {} bytes",
-                    resume.size
+                    "server sent the complete content without a declared length of {expected_total} bytes"
                 )));
             }
             if offset > 0 {
@@ -3188,7 +4155,9 @@ fn attempt_transfer(
                     "server sent the complete {declared:?}-byte body instead of resuming at byte {offset}; kept {offset} saved bytes"
                 )));
             }
-            resume.size
+            ValidatedRange::Full {
+                body_length: expected_total,
+            }
         }
         416 => {
             return Err(Attempt::retry(format!(
@@ -3200,27 +4169,58 @@ fn attempt_transfer(
         429 | 503 => {
             return Err(Attempt::Retry {
                 message: format!("HTTP {status}"),
-                retry_after: retry_after(&response),
+                retry_after: retry_after(response),
             });
         }
         408 | 500..=599 => return Err(Attempt::retry(format!("HTTP {status}"))),
         status => return Err(Attempt::Fatal(format!("HTTP {status}"))),
     };
-    if status == 206
-        && let Some(length) = response.headers().get("content-length").and_then(|value| {
-            value
-                .to_str()
-                .ok()
-                .and_then(|text| text.parse::<u64>().ok())
-        })
+    if let ValidatedRange::Partial { body_length, .. } = result
+        && let Some(length) = response
+            .header("content-length")
+            .and_then(|text| text.trim().parse::<u64>().ok())
         && length != body_length
     {
         return Err(Attempt::retry(format!(
             "Content-Length {length} does not match the declared range of {body_length} bytes"
         )));
     }
-    let body = response.into_body();
-    let mut reader = body.into_reader();
+    Ok(result)
+}
+
+enum StreamOutcome {
+    Complete,
+    Migrated,
+}
+
+fn stream_response_into_resume(
+    response: HttpResponse,
+    body_length: u64,
+    resume: &mut Resume,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    abort: Option<&std::sync::atomic::AtomicBool>,
+) -> std::result::Result<(), Attempt> {
+    let _ = stream_response_into_resume_with_migrate(
+        response,
+        body_length,
+        resume,
+        progress,
+        abort,
+        &|| false,
+    )?;
+    Ok(())
+}
+
+fn stream_response_into_resume_with_migrate(
+    response: HttpResponse,
+    body_length: u64,
+    resume: &mut Resume,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    abort: Option<&std::sync::atomic::AtomicBool>,
+    should_migrate: &impl Fn() -> bool,
+) -> std::result::Result<StreamOutcome, Attempt> {
+    let local = |error: String| Attempt::Fatal(format!("cannot write the partial file: {error}"));
+    let mut reader = response.into_reader();
     let mut buffer = vec![0u8; TRANSFER_BUFFER];
     let mut written = 0u64;
     let mut synced = resume.offset;
@@ -3231,9 +4231,30 @@ fn attempt_transfer(
                 "model acquisition cancelled; partial transport content is retained".into(),
             ));
         }
+        if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(Attempt::Fatal("transfer aborted after sibling failure".into()));
+        }
+        if should_migrate() && written < body_length {
+            return Ok(StreamOutcome::Migrated);
+        }
 
-        let count = match reader.read(&mut buffer) {
+        let count = match reader.read_poll(&mut buffer, &|| {
+            progress.is_some_and(|progress| progress.is_cancelled())
+                || abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                || should_migrate()
+        }) {
             Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                if progress.is_some_and(|progress| progress.is_cancelled()) {
+                    return Err(Attempt::Fatal(
+                        "model acquisition cancelled; partial transport content is retained".into(),
+                    ));
+                }
+                if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                    return Err(Attempt::Fatal("transfer aborted after sibling failure".into()));
+                }
+                return Ok(StreamOutcome::Migrated);
+            }
             Err(error) => {
                 return Err(Attempt::retry(format!(
                     "body interrupted after {written} of {body_length} bytes: {error}"
@@ -3265,6 +4286,680 @@ fn attempt_transfer(
         return Err(Attempt::retry(format!(
             "body ended after {written} of {body_length} bytes"
         )));
+    }
+    Ok(StreamOutcome::Complete)
+}
+
+/// Fetch the missing suffix of one content file and append it to its partial.
+///
+/// The response must describe exactly the bytes it contains: a resumed request
+/// requires `206` with a `Content-Range` that starts at the current offset and
+/// names the file's declared length. A response that cannot be appended is
+/// reported with the saved offset; the partial bytes are never discarded here.
+fn attempt_transfer(
+    agent: &HttpClient,
+    url: &str,
+    token: Option<&str>,
+    resume: &mut Resume,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    abort: Option<&std::sync::atomic::AtomicBool>,
+) -> std::result::Result<(), Attempt> {
+    if progress.is_some_and(|progress| progress.is_cancelled()) {
+        return Err(Attempt::Fatal(
+            "model acquisition cancelled; partial transport content is retained".into(),
+        ));
+    }
+    if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(Attempt::Fatal("transfer aborted after sibling failure".into()));
+    }
+    let offset = resume.offset;
+    let (response, _) = ranged_get_resolved(agent, url, token, offset, None)?;
+    let body_length = match validate_range_response(&response, offset, resume.size, None)? {
+        ValidatedRange::Partial { body_length, .. } | ValidatedRange::Full { body_length } => {
+            body_length
+        }
+    };
+    stream_response_into_resume(response, body_length, resume, progress, abort)
+}
+
+struct ResolvedTarget {
+    url: String,
+    send_token: bool,
+    generation: u64,
+}
+
+fn sleep_retry_abortable(
+    delay: Duration,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    is_aborted: &impl Fn() -> bool,
+) -> std::result::Result<(), Attempt> {
+    let deadline = std::time::Instant::now() + delay;
+    while std::time::Instant::now() < deadline {
+        if progress.is_some_and(|progress| progress.is_cancelled()) {
+            return Err(Attempt::Fatal(
+                "model acquisition cancelled; partial transport content is retained".into(),
+            ));
+        }
+        if is_aborted() {
+            return Err(Attempt::Fatal("transfer aborted".into()));
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(100)),
+        );
+    }
+    Ok(())
+}
+
+/// Download one bounded byte range `[chunk_start..=chunk_end]` into memory,
+/// resuming within the chunk on interrupted bodies, migrating off slow
+/// head-of-line streams onto a fresh HTTP/2 stripe, and refreshing an expired
+/// off-origin CDN URL transparently from `origin_url`.
+#[allow(clippy::too_many_arguments)]
+fn fetch_chunk_bytes(
+    agent: &HttpClient,
+    origin_url: &str,
+    target: &std::sync::Mutex<ResolvedTarget>,
+    token: Option<&str>,
+    chunk_start: u64,
+    chunk_end: u64,
+    file_size: u64,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    is_aborted: impl Fn() -> bool,
+    migrate: Option<&std::sync::atomic::AtomicBool>,
+) -> std::result::Result<Vec<u8>, Attempt> {
+    use std::sync::atomic::Ordering;
+    let expected_len = (chunk_end - chunk_start + 1) as usize;
+    let mut out = Vec::with_capacity(expected_len);
+    let mut scratch = vec![0u8; 256 << 10];
+    let mut stalled = 0usize;
+    let mut migrations = 0usize;
+
+    while out.len() < expected_len {
+        if progress.is_some_and(|progress| progress.is_cancelled()) {
+            return Err(Attempt::Fatal(
+                "model acquisition cancelled; partial transport content is retained".into(),
+            ));
+        }
+        if is_aborted() {
+            return Err(Attempt::Fatal("transfer aborted".into()));
+        }
+        let current_start = chunk_start + out.len() as u64;
+        let (target_url, send_token, seen_gen) = {
+            let guard = target.lock().unwrap_or_else(|error| error.into_inner());
+            (guard.url.clone(), guard.send_token, guard.generation)
+        };
+        let effective_token = send_token.then_some(token).flatten();
+        let before = out.len();
+        let allow_migrate = migrations < MAX_CHUNK_MIGRATIONS;
+        let attempt = (|| -> std::result::Result<StreamOutcome, Attempt> {
+            let mut response_pair = ranged_get_resolved(
+                agent,
+                &target_url,
+                effective_token,
+                current_start,
+                Some(chunk_end),
+            )?;
+            let status = response_pair.0.status();
+            // A presigned off-origin CDN URL can expire during a long download.
+            // Re-resolve from the Hub origin once per generation and retry.
+            if matches!(status, 401 | 403 | 410) && !send_token {
+                let already_refreshed = {
+                    let guard = target.lock().unwrap_or_else(|error| error.into_inner());
+                    guard.generation != seen_gen
+                };
+                if already_refreshed {
+                    return Err(Attempt::retry(format!("HTTP {status} on stale CDN URL")));
+                }
+                let refreshed = ranged_get_resolved(
+                    agent,
+                    origin_url,
+                    token,
+                    current_start,
+                    Some(chunk_end),
+                )?;
+                {
+                    let mut guard = target.lock().unwrap_or_else(|error| error.into_inner());
+                    if guard.generation == seen_gen {
+                        guard.send_token = authenticated_redirect(origin_url, &refreshed.1);
+                        guard.url = refreshed.1.clone();
+                        guard.generation += 1;
+                    }
+                }
+                response_pair = refreshed;
+            }
+            let (response, _) = response_pair;
+            let body_length = match validate_range_response(
+                &response,
+                current_start,
+                file_size,
+                Some(chunk_end),
+            )? {
+                ValidatedRange::Partial { body_length, .. } => body_length,
+                ValidatedRange::Full { .. } => {
+                    return Err(Attempt::retry(
+                        "server answered a bounded range with a complete 200 response",
+                    ));
+                }
+            };
+            let mut reader = response.into_reader();
+            let mut received = 0u64;
+            loop {
+                if progress.is_some_and(|progress| progress.is_cancelled()) {
+                    return Err(Attempt::Fatal(
+                        "model acquisition cancelled; partial transport content is retained".into(),
+                    ));
+                }
+                if is_aborted() {
+                    return Err(Attempt::Fatal("transfer aborted".into()));
+                }
+                if allow_migrate
+                    && migrate.is_some_and(|flag| flag.swap(false, Ordering::AcqRel))
+                {
+                    return Ok(StreamOutcome::Migrated);
+                }
+                let count = match reader.read_poll(&mut scratch, &|| {
+                    progress.is_some_and(|progress| progress.is_cancelled())
+                        || is_aborted()
+                        || (allow_migrate
+                            && migrate.is_some_and(|flag| flag.load(Ordering::Acquire)))
+                }) {
+                    Ok(count) => count,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        if progress.is_some_and(|progress| progress.is_cancelled()) {
+                            return Err(Attempt::Fatal(
+                                "model acquisition cancelled; partial transport content is retained"
+                                    .into(),
+                            ));
+                        }
+                        if is_aborted() {
+                            return Err(Attempt::Fatal("transfer aborted".into()));
+                        }
+                        if let Some(flag) = migrate {
+                            flag.store(false, Ordering::Release);
+                        }
+                        return Ok(StreamOutcome::Migrated);
+                    }
+                    Err(error) => {
+                        return Err(Attempt::retry(format!(
+                            "body interrupted after {received} of {body_length} bytes: {error}"
+                        )));
+                    }
+                };
+                if count == 0 {
+                    break;
+                }
+                if received + count as u64 > body_length {
+                    return Err(Attempt::retry(format!(
+                        "body exceeds the {body_length} bytes its response declared"
+                    )));
+                }
+                out.extend_from_slice(&scratch[..count]);
+                received += count as u64;
+                if let Some(progress) = progress {
+                    progress.record_network_bytes(count as u64);
+                }
+            }
+            if received != body_length {
+                return Err(Attempt::retry(format!(
+                    "body ended after {received} of {body_length} bytes"
+                )));
+            }
+            Ok(StreamOutcome::Complete)
+        })();
+
+        match attempt {
+            Ok(StreamOutcome::Complete) => {
+                if out.len() > before {
+                    stalled = 0;
+                }
+            }
+            Ok(StreamOutcome::Migrated) => {
+                migrations += 1;
+                if out.len() > before {
+                    stalled = 0;
+                }
+            }
+            Err(Attempt::Fatal(message)) => return Err(Attempt::Fatal(message)),
+            Err(Attempt::Retry {
+                message,
+                retry_after,
+            }) => {
+                if out.len() > before {
+                    stalled = 0;
+                } else {
+                    stalled += 1;
+                    if stalled >= TRANSFER_STALLED_ATTEMPTS {
+                        return Err(Attempt::Retry {
+                            message,
+                            retry_after,
+                        });
+                    }
+                    sleep_retry_abortable(
+                        retry_delay(stalled, retry_after),
+                        progress,
+                        &is_aborted,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Transfer `[resume.offset .. resume.size)` across parallel bounded HTTP range
+/// requests, appending completed chunks sequentially into `resume` so `.part`
+/// stays a valid contiguous prefix and RAM remains strictly bounded.
+fn attempt_transfer_parallel(
+    agent: &HttpClient,
+    origin_url: &str,
+    token: Option<&str>,
+    resume: &mut Resume,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    max_streams: usize,
+    abort: Option<&std::sync::atomic::AtomicBool>,
+) -> std::result::Result<(), Attempt> {
+    attempt_transfer_parallel_with_chunk_size(
+        agent,
+        origin_url,
+        token,
+        resume,
+        progress,
+        max_streams,
+        abort,
+        TRANSFER_CHUNK_SIZE,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attempt_transfer_parallel_with_chunk_size(
+    agent: &HttpClient,
+    origin_url: &str,
+    token: Option<&str>,
+    resume: &mut Resume,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    max_streams: usize,
+    abort: Option<&std::sync::atomic::AtomicBool>,
+    chunk_size: u64,
+) -> std::result::Result<(), Attempt> {
+    use std::sync::{Condvar, Mutex, atomic::Ordering};
+    if progress.is_some_and(|progress| progress.is_cancelled()) {
+        return Err(Attempt::Fatal(
+            "model acquisition cancelled; partial transport content is retained".into(),
+        ));
+    }
+    if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(Attempt::Fatal("transfer aborted after sibling failure".into()));
+    }
+    let start_offset = resume.offset;
+    let size = resume.size;
+    let chunk_size = chunk_size.max(1);
+    let chunk0_end = (start_offset + chunk_size - 1).min(size - 1);
+    let (chunk0_response, resolved_url) =
+        ranged_get_resolved(agent, origin_url, token, start_offset, Some(chunk0_end))?;
+    log::debug!(
+        "Parallel transfer negotiated {:?} ({max_streams} streams)",
+        chunk0_response.version()
+    );
+    match validate_range_response(&chunk0_response, start_offset, size, None)? {
+        ValidatedRange::Full { body_length } => {
+            return stream_response_into_resume(
+                chunk0_response,
+                body_length,
+                resume,
+                progress,
+                abort,
+            );
+        }
+        ValidatedRange::Partial { end, body_length } => {
+            if end != chunk0_end || chunk0_end + 1 >= size {
+                return stream_response_into_resume(
+                    chunk0_response,
+                    body_length,
+                    resume,
+                    progress,
+                    abort,
+                );
+            }
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let mut cursor = chunk0_end + 1;
+    while cursor < size {
+        let end = (cursor + chunk_size - 1).min(size - 1);
+        chunks.push((cursor, end));
+        cursor = end + 1;
+    }
+    let total_chunks = chunks.len();
+    let worker_count = max_streams.min(total_chunks).max(1);
+    let window_limit = (max_streams * 2).max(1);
+
+    struct ParallelState {
+        next_dispatch: usize,
+        write_index: usize,
+        completed: std::collections::BTreeMap<usize, Vec<u8>>,
+        error: Option<Attempt>,
+        aborted: bool,
+    }
+
+    let target = Mutex::new(ResolvedTarget {
+        send_token: authenticated_redirect(origin_url, &resolved_url),
+        url: resolved_url,
+        generation: 0,
+    });
+    let shared = Mutex::new(ParallelState {
+        next_dispatch: 0,
+        write_index: 0,
+        completed: std::collections::BTreeMap::new(),
+        error: None,
+        aborted: false,
+    });
+    let migrate_flags: Vec<std::sync::atomic::AtomicBool> = (0..total_chunks)
+        .map(|_| std::sync::atomic::AtomicBool::new(false))
+        .collect();
+    let worker_cv = Condvar::new();
+    let writer_cv = Condvar::new();
+    let chunks_ref = &chunks;
+    let target_ref = &target;
+    let shared_ref = &shared;
+    let migrate_ref = &migrate_flags;
+    let worker_cv_ref = &worker_cv;
+    let writer_cv_ref = &writer_cv;
+    let mut chunk0_complete = false;
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(move || loop {
+                let chunk_index = {
+                    let mut state = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if state.aborted
+                            || abort.is_some_and(|flag| flag.load(Ordering::Acquire))
+                            || state.next_dispatch >= total_chunks
+                        {
+                            if abort.is_some_and(|flag| flag.load(Ordering::Acquire))
+                                && !state.aborted
+                            {
+                                state.aborted = true;
+                                if state.error.is_none() {
+                                    state.error = Some(Attempt::Fatal(
+                                        "transfer aborted after sibling failure".into(),
+                                    ));
+                                }
+                                worker_cv_ref.notify_all();
+                                writer_cv_ref.notify_all();
+                            }
+                            break None;
+                        }
+                        if progress.is_some_and(|progress| progress.is_cancelled()) {
+                            state.aborted = true;
+                            if state.error.is_none() {
+                                state.error = Some(Attempt::Fatal(
+                                    "model acquisition cancelled; partial transport content is retained"
+                                        .into(),
+                                ));
+                            }
+                            worker_cv_ref.notify_all();
+                            writer_cv_ref.notify_all();
+                            break None;
+                        }
+                        if state.next_dispatch < state.write_index + window_limit {
+                            let idx = state.next_dispatch;
+                            state.next_dispatch += 1;
+                            break Some(idx);
+                        }
+                        let (guard, _) = worker_cv_ref
+                            .wait_timeout(state, Duration::from_millis(100))
+                            .unwrap_or_else(|e| e.into_inner());
+                        state = guard;
+                    }
+                };
+                let Some(chunk_index) = chunk_index else {
+                    break;
+                };
+                let (chunk_start, chunk_end) = chunks_ref[chunk_index];
+                match fetch_chunk_bytes(
+                    agent,
+                    origin_url,
+                    target_ref,
+                    token,
+                    chunk_start,
+                    chunk_end,
+                    size,
+                    progress,
+                    || {
+                        abort.is_some_and(|flag| flag.load(Ordering::Acquire))
+                            || shared_ref.lock().unwrap_or_else(|e| e.into_inner()).aborted
+                    },
+                    Some(&migrate_ref[chunk_index]),
+                ) {
+                    Ok(bytes) => {
+                        let mut state = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                        state.completed.insert(chunk_index, bytes);
+                        writer_cv_ref.notify_one();
+                    }
+                    Err(attempt) => {
+                        let mut state = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                        state.aborted = true;
+                        if state.error.is_none() {
+                            state.error = Some(attempt);
+                        }
+                        worker_cv_ref.notify_all();
+                        writer_cv_ref.notify_all();
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Stream chunk 0 directly into `resume` while workers fetch chunks 1.. in parallel.
+        // If chunk 0 lags behind while at least two later chunks already finished, migrate
+        // its remaining suffix onto a fresh HTTP/2 stripe without losing received bytes.
+        let chunk0_len = chunk0_end - start_offset + 1;
+        let chunk0_hol_since: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let chunk0_outcome = stream_response_into_resume_with_migrate(
+            chunk0_response,
+            chunk0_len,
+            resume,
+            progress,
+            abort,
+            &|| {
+                let completed = shared_ref
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .completed
+                    .len();
+                if completed >= 2 {
+                    let mut since = chunk0_hol_since.lock().unwrap_or_else(|e| e.into_inner());
+                    let start = since.get_or_insert_with(std::time::Instant::now);
+                    start.elapsed() >= STRAGGLER_GRACE
+                } else {
+                    false
+                }
+            },
+        );
+        match chunk0_outcome {
+            Ok(StreamOutcome::Complete) => {
+                chunk0_complete = true;
+            }
+            Ok(StreamOutcome::Migrated) => {
+                if resume.offset <= chunk0_end {
+                    let tail = fetch_chunk_bytes(
+                        agent,
+                        origin_url,
+                        target_ref,
+                        token,
+                        resume.offset,
+                        chunk0_end,
+                        size,
+                        progress,
+                        || {
+                            abort.is_some_and(|flag| flag.load(Ordering::Acquire))
+                                || shared_ref.lock().unwrap_or_else(|e| e.into_inner()).aborted
+                        },
+                        None,
+                    );
+                    match tail {
+                        Ok(bytes) => {
+                            if let Err(error) = resume.append(&bytes) {
+                                let mut state =
+                                    shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                                state.aborted = true;
+                                if state.error.is_none() {
+                                    state.error = Some(Attempt::Fatal(format!(
+                                        "cannot write the partial file: {error}"
+                                    )));
+                                }
+                                worker_cv_ref.notify_all();
+                                writer_cv_ref.notify_all();
+                                return;
+                            }
+                            chunk0_complete = true;
+                        }
+                        Err(attempt) => {
+                            let mut state = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                            state.aborted = true;
+                            if state.error.is_none() {
+                                state.error = Some(attempt);
+                            }
+                            worker_cv_ref.notify_all();
+                            writer_cv_ref.notify_all();
+                            return;
+                        }
+                    }
+                } else {
+                    chunk0_complete = true;
+                }
+            }
+            Err(attempt) => {
+                let mut state = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                state.aborted = true;
+                if state.error.is_none() {
+                    state.error = Some(attempt);
+                }
+                worker_cv_ref.notify_all();
+                writer_cv_ref.notify_all();
+                return;
+            }
+        }
+
+        let mut synced = resume.offset;
+        let mut synced_at = std::time::Instant::now();
+        let mut hol_wait: Option<(usize, std::time::Instant)> = None;
+        loop {
+            let next_chunk = {
+                let mut state = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    let write_index = state.write_index;
+                    if let Some(bytes) = state.completed.remove(&write_index) {
+                        state.write_index += 1;
+                        hol_wait = None;
+                        worker_cv_ref.notify_all();
+                        break Some((write_index, bytes));
+                    }
+                    if state.write_index >= total_chunks || state.aborted {
+                        break None;
+                    }
+                    if progress.is_some_and(|progress| progress.is_cancelled()) {
+                        state.aborted = true;
+                        if state.error.is_none() {
+                            state.error = Some(Attempt::Fatal(
+                                "model acquisition cancelled; partial transport content is retained"
+                                    .into(),
+                            ));
+                        }
+                        worker_cv_ref.notify_all();
+                        break None;
+                    }
+                    if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                        state.aborted = true;
+                        if state.error.is_none() {
+                            state.error = Some(Attempt::Fatal(
+                                "transfer aborted after sibling failure".into(),
+                            ));
+                        }
+                        worker_cv_ref.notify_all();
+                        break None;
+                    }
+                    if state.completed.len() >= 2 && write_index < state.next_dispatch {
+                        match hol_wait {
+                            Some((idx, since)) if idx == write_index => {
+                                if since.elapsed() >= STRAGGLER_GRACE {
+                                    migrate_ref[write_index].store(true, Ordering::Release);
+                                    hol_wait = Some((write_index, std::time::Instant::now()));
+                                }
+                            }
+                            _ => {
+                                hol_wait = Some((write_index, std::time::Instant::now()));
+                            }
+                        }
+                    } else {
+                        hol_wait = None;
+                    }
+                    let (guard, _) = writer_cv_ref
+                        .wait_timeout(state, Duration::from_millis(100))
+                        .unwrap_or_else(|e| e.into_inner());
+                    state = guard;
+                }
+            };
+            let Some((write_index, bytes)) = next_chunk else {
+                break;
+            };
+            debug_assert_eq!(resume.offset, chunks[write_index].0);
+            if let Err(error) = resume.append(&bytes) {
+                let mut state = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                state.aborted = true;
+                if state.error.is_none() {
+                    state.error = Some(Attempt::Fatal(format!(
+                        "cannot write the partial file: {error}"
+                    )));
+                }
+                worker_cv_ref.notify_all();
+                break;
+            }
+            if part_sync_due(synced, resume.offset, synced_at.elapsed()) {
+                if let Err(error) = resume.sync() {
+                    let mut state = shared_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    state.aborted = true;
+                    if state.error.is_none() {
+                        state.error = Some(Attempt::Fatal(format!(
+                            "cannot write the partial file: {error}"
+                        )));
+                    }
+                    worker_cv_ref.notify_all();
+                    break;
+                }
+                synced = resume.offset;
+                synced_at = std::time::Instant::now();
+            }
+        }
+    });
+
+    let mut state = shared.into_inner().unwrap_or_else(|e| e.into_inner());
+    // Drain any final contiguous completed chunks before reporting an abort,
+    // only when chunk 0 completed and the next chunk matches `resume.offset`.
+    if chunk0_complete {
+        loop {
+            let write_index = state.write_index;
+            let Some(&(expected_start, _)) = chunks.get(write_index) else {
+                break;
+            };
+            if resume.offset != expected_start {
+                break;
+            }
+            let Some(bytes) = state.completed.remove(&write_index) else {
+                break;
+            };
+            if resume.append(&bytes).is_err() {
+                break;
+            }
+            state.write_index += 1;
+        }
+    }
+    if let Some(error) = state.error {
+        return Err(error);
     }
     Ok(())
 }
@@ -3317,50 +5012,46 @@ impl IdentityFailure {
 /// from the final response's `Content-Range`. A redirect without `Location` is
 /// reported as an error rather than trusted, and the token is only sent to the
 /// original host.
+#[cfg(test)]
 fn file_identity(
     url: &str,
     token: Option<&str>,
 ) -> std::result::Result<FileIdentity, IdentityFailure> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_recv_response(Some(Duration::from_secs(120)))
-        .timeout_global(Some(Duration::from_secs(120)))
-        .build()
-        .into();
+    let agent = metadata_agent();
+    file_identity_with_agent(&agent, url, token)
+}
+
+fn file_identity_with_agent(
+    agent: &HttpClient,
+    url: &str,
+    token: Option<&str>,
+) -> std::result::Result<FileIdentity, IdentityFailure> {
     let base = url::Url::parse(url).map_err(|error| {
         IdentityFailure::permanent(format!("invalid file identity URL: {error}"))
     })?;
     let mut current = url.to_owned();
     let mut commit = None;
     let mut etag = None;
+    let mut linked_size = None;
     let mut identity_captured = false;
     for redirect in 0..=5 {
-        let mut request = agent
-            .get(&current)
-            .header("Range", "bytes=0-0")
-            .header("Accept-Encoding", "identity");
-        if current
+        let auth_header = current
             .parse::<url::Url>()
             .is_ok_and(|target| same_origin(&base, &target))
-            && let Some(token) = token
-        {
-            request = request.header("Authorization", &format!("Bearer {token}"));
+            .then_some(token)
+            .flatten()
+            .map(|token| format!("Bearer {token}"));
+        let mut headers = Vec::with_capacity(3);
+        headers.push(("Range", "bytes=0-0"));
+        headers.push(("Accept-Encoding", "identity"));
+        if let Some(ref auth) = auth_header {
+            headers.push(("Authorization", auth.as_str()));
         }
-        let response = request.call().map_err(|error| {
-            use ureq::Error;
-            let transient = matches!(
-                error,
-                Error::Timeout(_) | Error::Io(_) | Error::HostNotFound | Error::ConnectionFailed
-            ) || matches!(error, Error::StatusCode(status) if matches!(status, 408 | 429 | 500..=599));
-            IdentityFailure {
-                message: format!("file identity request failed: {}", transport_error(&error)),
-                transient,
-            }
+        let response = agent.get(&current, &headers).map_err(|error| IdentityFailure {
+            transient: error.is_retryable(),
+            message: format!("file identity request failed: {}", transport_error(&error)),
         })?;
-        let status = response.status().as_u16();
+        let status = response.status();
         // Only the repository response states the canonical identity. Content
         // hosts (and off-origin redirect targets) may send their own ETag.
         if !identity_captured
@@ -3368,18 +5059,18 @@ fn file_identity(
                 .parse::<url::Url>()
                 .is_ok_and(|target| same_origin(&base, &target))
             && let Some(value) = response
-                .headers()
-                .get("x-linked-etag")
-                .or_else(|| response.headers().get("etag"))
-                .and_then(|value| value.to_str().ok())
+                .header("x-linked-etag")
+                .or_else(|| response.header("etag"))
         {
             etag = Some(value.trim().replace('"', ""));
-            if let Some(value) = response
-                .headers()
-                .get("x-repo-commit")
-                .and_then(|value| value.to_str().ok())
-            {
+            if let Some(value) = response.header("x-repo-commit") {
                 commit = Some(value.trim().to_owned());
+            }
+            if let Some(value) = response
+                .header("x-linked-size")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            {
+                linked_size = Some(value);
             }
             identity_captured = true;
         }
@@ -3389,11 +5080,7 @@ fn file_identity(
                     "Hugging Face redirected too many times while resolving a file identity",
                 ));
             }
-            let Some(location) = response
-                .headers()
-                .get("location")
-                .and_then(|value| value.to_str().ok())
-            else {
+            let Some(location) = response.header("location") else {
                 return Err(IdentityFailure::permanent(
                     "Hugging Face returned a redirect without a Location header while resolving a file identity",
                 ));
@@ -3403,6 +5090,15 @@ fn file_identity(
                     "Hugging Face redirected a file identity to an unsupported target",
                 ));
             };
+            if let (Some(commit), Some(etag), Some(size)) =
+                (commit.as_ref(), etag.as_ref(), linked_size)
+            {
+                return Ok(FileIdentity {
+                    commit: commit.clone(),
+                    etag: etag.clone(),
+                    size,
+                });
+            }
             current = target;
             continue;
         }
@@ -3413,15 +5109,14 @@ fn file_identity(
             });
         }
         let size = response
-            .headers()
-            .get("content-range")
-            .and_then(|value| value.to_str().ok())
+            .header("content-range")
             .and_then(|value| {
                 value
                     .rsplit_once('/')
                     .map(|(_, total)| total.trim().to_owned())
             })
-            .and_then(|total| total.parse::<u64>().ok());
+            .and_then(|total| total.parse::<u64>().ok())
+            .or(linked_size);
         let (Some(commit), Some(etag), Some(size)) = (commit, etag, size) else {
             return Err(IdentityFailure::permanent(
                 "Hugging Face returned an incomplete file identity",
@@ -3458,8 +5153,7 @@ fn with_identity_retry(
 /// Errors from Hub resolution or file identity that may succeed when retried.
 /// Authentication, missing repositories, missing files, and malformed responses
 /// are permanent and are never retried, so the signed binding is unchanged.
-fn transient_hub_error(error: &hf_hub::api::sync::ApiError) -> bool {
-    use hf_hub::api::sync::ApiError;
+fn transient_hub_error(error: &ApiError) -> bool {
     let ApiError::RequestError(request) = error else {
         return false;
     };
@@ -3476,8 +5170,8 @@ fn transient_hub_error(error: &hf_hub::api::sync::ApiError) -> bool {
 /// Run one Hub metadata operation with bounded backoff. The operation is
 /// idempotent: resolution and file identity are read-only requests.
 fn with_transient_retry<T>(
-    mut operation: impl FnMut() -> std::result::Result<T, hf_hub::api::sync::ApiError>,
-) -> Result<T> {
+    mut operation: impl FnMut() -> std::result::Result<T, ApiError>,
+) -> std::result::Result<T, ApiError> {
     let mut attempt = 0usize;
     loop {
         match operation() {
@@ -3485,7 +5179,7 @@ fn with_transient_retry<T>(
             Err(error) => {
                 attempt += 1;
                 if attempt >= TRANSFER_STALLED_ATTEMPTS || !transient_hub_error(&error) {
-                    return Err(error.into());
+                    return Err(error);
                 }
                 log::info!("Retrying after a transient Hugging Face error: {error}");
                 std::thread::sleep(retry_delay(attempt, None));
@@ -3580,8 +5274,10 @@ fn quarantine(part: &Path) -> Result<PathBuf> {
 
 /// Complete one content file, resuming its partial and validating its length
 /// and, when the Hub publishes a SHA-256 ETag, its content digest.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn transfer_blob(
-    agent: &ureq::Agent,
+    agent: &HttpClient,
     part: &Path,
     blob: &Path,
     url: &str,
@@ -3589,6 +5285,33 @@ fn transfer_blob(
     filename: &str,
     metadata: &FileIdentity,
     progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<()> {
+    transfer_blob_with_streams(
+        agent,
+        part,
+        blob,
+        url,
+        token,
+        filename,
+        metadata,
+        progress,
+        TRANSFER_SINGLE_FILE_STREAMS,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_blob_with_streams(
+    agent: &HttpClient,
+    part: &Path,
+    blob: &Path,
+    url: &str,
+    token: Option<&str>,
+    filename: &str,
+    metadata: &FileIdentity,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    max_streams: usize,
+    abort: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let size = metadata.size();
     let expected = content_digest(metadata.etag());
@@ -3607,6 +5330,10 @@ fn transfer_blob(
         if let Err(error) = check_cancel(progress) {
             resume.sync()?;
             return Err(error);
+        }
+        if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            resume.sync()?;
+            return Err(format!("{filename}: transfer aborted after sibling failure").into());
         }
 
         if resume.offset == resume.size {
@@ -3646,7 +5373,13 @@ fn transfer_blob(
         }
         let before = resume.offset;
         let mut retry_after = None;
-        match attempt_transfer(agent, url, token, &mut resume, progress) {
+        let remaining = resume.size.saturating_sub(resume.offset);
+        let outcome = if max_streams > 1 && remaining >= TRANSFER_PARALLEL_MIN_BYTES {
+            attempt_transfer_parallel(agent, url, token, &mut resume, progress, max_streams, abort)
+        } else {
+            attempt_transfer(agent, url, token, &mut resume, progress, abort)
+        };
+        match outcome {
             Ok(()) => {}
             Err(Attempt::Fatal(message)) => {
                 resume.sync()?;
@@ -3672,6 +5405,9 @@ fn transfer_blob(
         let deadline = std::time::Instant::now() + retry_delay(stalled, retry_after);
         while std::time::Instant::now() < deadline {
             check_cancel(progress)?;
+            if abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(format!("{filename}: transfer aborted after sibling failure").into());
+            }
             std::thread::sleep(
                 deadline
                     .saturating_duration_since(std::time::Instant::now())
@@ -4207,9 +5943,13 @@ pub(crate) mod tests {
         let version = entry.id().to_owned();
         let response =
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
-        let (endpoint, worker) = mock_hub(
-            HubRoutes::default().document("/api/models/publisher/prepared/revision/gb10", response),
-        );
+        let routes = HubRoutes::default()
+            .document(
+                "/api/models/publisher/prepared/revision/gb10",
+                response.clone(),
+            )
+            .document("/api/models/publisher/prepared/revision/gb10-tp1", response);
+        let (endpoint, worker) = mock_hub(routes);
         let error = refresh_model_at(
             &endpoint,
             &store,
@@ -4487,11 +6227,19 @@ pub(crate) mod tests {
         }
         let planned = {
             let mut routes = routes.lock().unwrap();
-            match routes
-                .0
-                .get_mut(&path)
-                .unwrap_or_else(|| panic!("unexpected request {path}"))
-            {
+            let route = match routes.0.get_mut(&path) {
+                Some(route) => route,
+                None if path.starts_with("/api/models/") && path.contains("/tree/") => {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    return;
+                }
+                None => panic!("unexpected request {path}"),
+            };
+            match route {
                 HubRoute::Document(responses) => {
                     if let Some(log) = log {
                         *log.lock()
@@ -4753,6 +6501,144 @@ pub(crate) mod tests {
         walk(root, root, &mut files);
         files.sort();
         files
+    }
+
+    fn publisher_response(bytes: &[u8]) -> Vec<u8> {
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
+        response.extend_from_slice(bytes);
+        response
+    }
+
+    #[test]
+    fn publisher_key_review_verifies_before_import_and_does_not_accept_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, publisher, _) = signed_payload_fixture(temp.path());
+        let empty_profiles = temp.path().join("empty-profiles.json");
+        std::fs::write(&empty_profiles, b"[]").unwrap();
+        let trust = temp.path().join("trust.toml");
+        let repository = "publisher/prepared";
+        let profile_path = format!("/{repository}/resolve/{COMMIT}/publisher.json");
+        let routes = core_routes(&core, repository, "gb10-tp1").document(
+            &profile_path,
+            publisher_response(&serde_json::to_vec(&[&publisher]).unwrap()),
+        );
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let options = HubOptions {
+            revision: Some("gb10-tp1".into()),
+            core_cache: Some(temp.path().join("models")),
+            ..Default::default()
+        };
+        let keys = std::slice::from_ref(&empty_profiles);
+        let failure = download_with_token_at(
+            &endpoint,
+            repository,
+            &options,
+            1,
+            None,
+            keys,
+            Some(&trust),
+            &[],
+            None,
+        )
+        .err()
+        .expect("a key must be supplied before acquisition");
+        let required = failure.downcast_ref::<PublisherKeyRequired>().unwrap();
+        assert_eq!(log.lock().unwrap().files.len(), 1);
+        let review = required
+            .review(&crate::trust::ReviewOptions {
+                publisher_keys: vec![empty_profiles.clone()],
+                hub: options.clone(),
+                trust_store: Some(trust.clone()),
+                tensor_parallel: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(review.profile, publisher);
+        assert_eq!(review.disclosure.fingerprint, publisher.fingerprint());
+        assert_eq!(review.profile_url, format!("{endpoint}{profile_path}"));
+        assert!(matches!(
+            review.disclosure.identity,
+            crate::trust::Identity::Development
+        ));
+        assert!(!review.disclosure.remembered);
+        assert!(!trust.exists());
+        assert_eq!(log.lock().unwrap().files.len(), 1);
+        let entry = download_with_token_at(
+            &endpoint,
+            repository,
+            &options,
+            1,
+            None,
+            keys,
+            Some(&trust),
+            &[review.profile],
+            None,
+        )
+        .unwrap();
+        assert!(entry.directory().exists());
+        assert!(!trust.exists());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn publisher_key_review_rejects_mismatched_malformed_and_oversized_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, mut publisher, _) = signed_payload_fixture(temp.path());
+        publisher.public_key = [1; 32];
+        let invalid_profiles = [
+            (serde_json::to_vec(&[publisher]).unwrap(), "does not match"),
+            (b"not JSON".to_vec(), "invalid publisher profile"),
+            (vec![b' '; 65537], "cannot retrieve"),
+        ];
+        for (bytes, expected) in invalid_profiles {
+            let (endpoint, worker) = mock_hub(
+                HubRoutes::default().document("/publisher.json", publisher_response(&bytes)),
+            );
+            let required = PublisherKeyRequired {
+                primary: core.join("model.safetensors"),
+                profile_url: format!("{endpoint}/publisher.json"),
+            };
+            let error = required
+                .review(&crate::trust::ReviewOptions::default())
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn publisher_key_review_rejects_a_matching_key_with_an_invalid_signature() {
+        use prost::Message;
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, publisher, _) = signed_payload_fixture(temp.path());
+        let primary = core.join("model.safetensors");
+        let mut bytes = std::fs::read(&primary).unwrap();
+        let header_length = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&bytes[8..8 + header_length]).unwrap();
+        let offsets = &header["flare.manifest"]["data_offsets"];
+        let start = 8 + header_length + offsets[0].as_u64().unwrap() as usize;
+        let end = 8 + header_length + offsets[1].as_u64().unwrap() as usize;
+        let mut envelope =
+            flare_helios::core::schema::wire::ProtectedCore::decode(&bytes[start..end]).unwrap();
+        envelope.core_signature[0] ^= 1;
+        let encoded = envelope.encode_to_vec();
+        assert_eq!(encoded.len(), end - start);
+        bytes[start..end].copy_from_slice(&encoded);
+        std::fs::write(&primary, bytes).unwrap();
+        let (endpoint, worker) = mock_hub(HubRoutes::default().document(
+            "/publisher.json",
+            publisher_response(&serde_json::to_vec(&[publisher]).unwrap()),
+        ));
+        let required = PublisherKeyRequired {
+            primary,
+            profile_url: format!("{endpoint}/publisher.json"),
+        };
+        let error = required
+            .review(&crate::trust::ReviewOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("signature"), "{error}");
+        worker.join().unwrap();
     }
 
     fn core_routes(root: &Path, repository: &str, revision: &str) -> HubRoutes {
@@ -5042,6 +6928,39 @@ pub(crate) mod tests {
             worker.join().unwrap();
             let _ = cold;
         }
+    }
+
+    #[test]
+    fn warm_payload_download_does_not_rehash_installed_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
+        let options = HubOptions {
+            revision: Some("gb10".into()),
+            tensor_parallel: vec![1],
+            core_cache: Some(temp.path().join("models")),
+            ..Default::default()
+        };
+        let (_, selected) =
+            counted_download(&core, "owner/reuse", "gb10", &options, &publisher);
+        let routes = core_routes(&core, "owner/reuse", "gb10");
+        let (endpoint, worker, _log) = mock_hub_counted(routes);
+        let progress = flare_helios::core::progress::AcquisitionProgress::new();
+        let entry = download_with_token_at(
+            &endpoint,
+            "owner/reuse@gb10",
+            &options,
+            1,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            Some(progress.clone()),
+        )
+        .unwrap();
+        assert_eq!(entry.id(), selected);
+        assert_eq!(progress.snapshot().verification_bytes, 0);
+        drop(entry);
+        worker.join().unwrap();
     }
 
     #[test]
@@ -6174,24 +8093,25 @@ pub(crate) mod tests {
 
     #[test]
     fn permanent_resolution_failures_are_not_retried() {
-        let routes = HubRoutes::default().scripted_document(
-            "/api/models/owner/model/revision/gb10",
-            vec![
-                b"HTTP/1.1 404 Missing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-            ],
-        );
-        let (endpoint, worker, log) = mock_hub_counted(routes);
-        let (_temp, transport) = transport_fixture();
-        let repo = Repo::with_revision("owner/model".into(), RepoType::Model, "gb10".into());
-        let error = fetch_primary(&transport_api(endpoint), &transport, &repo, None)
-            .unwrap_err()
-            .to_string();
-        worker.join().unwrap();
-        assert!(error.contains("404"), "{error}");
-        assert_eq!(
-            log.lock().unwrap().documents["/api/models/owner/model/revision/gb10"],
-            1
-        );
+        for (revision, status) in [("gb10", 401), ("gb10-tp1", 404), ("custom", 404)] {
+            let route = format!("/api/models/owner/model/revision/{revision}");
+            let routes = HubRoutes::default().document(
+                &route,
+                format!(
+                    "HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes(),
+            );
+            let (endpoint, worker, log) = mock_hub_counted(routes);
+            let (_temp, transport) = transport_fixture();
+            let repo = Repo::with_revision("owner/model".into(), RepoType::Model, revision.into());
+            let error = fetch_primary(&transport_api(endpoint), &transport, &repo, None)
+                .unwrap_err()
+                .to_string();
+            worker.join().unwrap();
+            assert!(error.contains(&status.to_string()), "{error}");
+            assert_eq!(log.lock().unwrap().documents[&route], 1);
+        }
     }
 
     #[test]
@@ -7156,12 +9076,8 @@ pub(crate) mod tests {
             "warm download did not reuse the ready entry"
         );
         assert!(
-            !warm.files.keys().any(|name| name.contains("/weights/")),
-            "warm download transferred companions {warm:?}"
-        );
-        assert!(
-            !warm.files.keys().any(|name| name.contains("deployments/")),
-            "warm download transferred executables {warm:?}"
+            warm.files.is_empty() && warm.bytes == 0,
+            "warm download at an unchanged commit must not re-fetch core bytes: {warm:?}"
         );
         let key = flare_helios::core::cache::model_key("owner/offline").unwrap();
         assert_eq!(
@@ -7515,6 +9431,287 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn omitted_tp_and_gpu_count_defaults_to_sole_deployment_and_rejects_ambiguous_cores() {
+        use flare_helios::core::{PayloadId, container, export, schema::wire};
+        use flare_helios::runtime_core::Publisher;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        // Multi-deployment core: omitting both --tensor-parallel and --gpus rejects with available sizes.
+        {
+            let (_scratch, primary, publishers) = selected_tp_core();
+            let source_root = primary.parent().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let model_root = temp.path().join("models");
+            let options = HubOptions {
+                revision: Some("gb202".into()),
+                core_cache: Some(model_root.clone()),
+                ..Default::default()
+            };
+            let routes = core_routes(source_root, "sel/multi", "gb202");
+            let (endpoint, worker, _log) = mock_hub_counted(routes);
+            let error = match download_with_token_at(
+                &endpoint,
+                "sel/multi",
+                &options,
+                0,
+                None,
+                &[],
+                None,
+                &publishers,
+                None,
+            ) {
+                Ok(_) => panic!("multi-deployment core without TP or GPU count should error"),
+                Err(error) => error.to_string(),
+            };
+            worker.join().unwrap();
+            assert!(
+                error.contains("core holds 2 deployments") && error.contains("[1, 2]"),
+                "{error}"
+            );
+        }
+
+        // Single-deployment TP2 core: omitting both --tensor-parallel and --gpus selects TP2.
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source-tp2");
+        std::fs::create_dir_all(&source).unwrap();
+        let weights = b"sole tp2 deployment weights".repeat(4);
+        let id = PayloadId::of(&weights);
+        let raw = temp.path().join("weights.bin");
+        std::fs::write(&raw, &weights).unwrap();
+        let graph = temp.path().join("graph.bin");
+        std::fs::write(&graph, b"graph-bytes").unwrap();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "TP2".into(),
+            namespace: "tp2".into(),
+            public_key,
+            development: false,
+        };
+        let contract = flare_helios::runtime_core::wire::ServingContract {
+            model_id: "tp2-only".into(),
+            identity: "tp2-only-gb202".into(),
+            max_sequence_tokens: 8,
+            prefill_chunk_size: 1,
+            pages: 1,
+            state_rows: 1,
+            page_tokens: 1,
+            model_contract: Some(flare_helios::runtime_core::wire::ModelContract {
+                vocabulary: 8,
+                graphs: vec![flare_helios::runtime_core::wire::GraphContract {
+                    graph: "decode".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rank0 = wire::RankBody {
+            rank: 0,
+            deployment_id: "gb202-tp2".into(),
+            context: Some(Default::default()),
+            allocations: vec![wire::Allocation {
+                name: "device-0".into(),
+                nbytes: weights.len() as u64,
+                alignment: 4096,
+                ..Default::default()
+            }],
+            initializers: vec![wire::Initializer {
+                allocation: "device-0".into(),
+                destination_offset: 0,
+                source: Some(wire::PayloadUse {
+                    slice: Some(wire::PayloadSlice {
+                        payload_id: id.as_bytes().to_vec(),
+                        offset: 0,
+                        nbytes: weights.len() as u64,
+                    }),
+                    role: wire::PayloadRole::Weights as i32,
+                }),
+            }],
+            graphs: vec![wire::Graph {
+                name: "decode".into(),
+                resource: 0,
+                node_count: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rank1 = wire::RankBody {
+            rank: 1,
+            deployment_id: "gb202-tp2".into(),
+            context: Some(Default::default()),
+            allocations: vec![wire::Allocation {
+                name: "device-1".into(),
+                nbytes: weights.len() as u64,
+                alignment: 4096,
+                ..Default::default()
+            }],
+            graphs: vec![wire::Graph {
+                name: "decode".into(),
+                resource: 0,
+                node_count: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = export::PublishRequest {
+            core: wire::CoreBody {
+                model_identity: "tp2/only".into(),
+                hardware_identity: "gb202".into(),
+                frontend: Some(flare_helios::runtime_core::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    flare_helios::runtime_core::wire::DefaultSamplingParameters::default(),
+                ),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "tp2".into(),
+                    official_source: "https://huggingface.co/tp2/only".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payloads: vec![],
+            deployments: vec![export::PublishDeployment {
+                payloads: vec![],
+                body: wire::DeploymentBody {
+                    deployment_id: "gb202-tp2".into(),
+                    architecture: vec![12, 0],
+                    tensor_parallel: 2,
+                    contract: Some(contract),
+                    ..Default::default()
+                },
+                ranks: vec![
+                    export::PublishRank {
+                        body: rank0,
+                        payloads: vec![export::PublishPayload {
+                            role: wire::PayloadRole::Weights,
+                            relative: "weights/tp2/rank-0/layer-000.safetensors".into(),
+                            tensor: Some(container::COMPANION_TENSOR.into()),
+                            source: container::Slice::new(
+                                std::sync::Arc::new(std::fs::File::open(&raw).unwrap()),
+                                0,
+                                weights.len() as u64,
+                            )
+                            .unwrap(),
+                            id,
+                        }],
+                        resources: vec![export::PublishResource {
+                            kind: wire::ExecutableKind::Graph,
+                            path: graph.clone(),
+                            nbytes: 11,
+                        }],
+                    },
+                    export::PublishRank {
+                        body: rank1,
+                        payloads: vec![],
+                        resources: vec![export::PublishResource {
+                            kind: wire::ExecutableKind::Graph,
+                            path: graph,
+                            nbytes: 11,
+                        }],
+                    },
+                ],
+            }],
+            core_id: [44u8; 32],
+            public_key,
+            accepted: "tp2".into(),
+            no_weights: false,
+        };
+        export::publish(&request, &key, export::Destination::Directory(&source)).unwrap();
+
+        let model_root = temp.path().join("models");
+        let options = HubOptions {
+            revision: Some("gb202".into()),
+            core_cache: Some(model_root.clone()),
+            ..Default::default()
+        };
+        let routes = core_routes(&source, "tp2/only", "gb202");
+        let (endpoint, worker, _log) = mock_hub_counted(routes);
+        let entry = download_with_token_at(
+            &endpoint,
+            "tp2/only",
+            &options,
+            0,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            None,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        let installed_id = entry.id().to_owned();
+        assert!(installed_id.contains("-tp2-"), "{installed_id}");
+        drop(entry);
+
+        // Warm online reuse with omitted TP/GPU count transfers only the primary.
+        let routes = core_routes(&source, "tp2/only", "gb202");
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let warm = download_with_token_at(
+            &endpoint,
+            "tp2/only",
+            &options,
+            0,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            None,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(warm.id(), installed_id);
+        let transfers = log.lock().unwrap();
+        assert!(
+            transfers.files.keys().all(|file| file.ends_with("/model.safetensors")),
+            "warm reuse fetched dependencies: {transfers:?}"
+        );
+        drop(transfers);
+        drop(warm);
+
+        // Offline resolution works both with omitted TP/GPU count and with explicit TP2.
+        let offline = HubOptions {
+            offline: true,
+            ..options.clone()
+        };
+        for gpu_count in [0usize, 2usize] {
+            let resolved = download_with_token_at(
+                "http://unused",
+                "tp2/only",
+                &offline,
+                gpu_count,
+                None,
+                &[],
+                None,
+                std::slice::from_ref(&publisher),
+                None,
+            )
+            .unwrap();
+            assert_eq!(resolved.id(), installed_id);
+        }
+
+        // Explicit mismatched GPU count (1) is still rejected.
+        let mismatch = download_with_token_at(
+            "http://unused",
+            "tp2/only",
+            &offline,
+            1,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            mismatch.contains("core exports no deployment with tensor-parallel size 1"),
+            "{mismatch}"
+        );
+    }
+
+    #[test]
     fn payload_download_fetches_only_the_selected_closure_over_http() {
         use flare_helios::core::{PayloadId, container, export, reader, schema::wire};
         use flare_helios::runtime_core::Publisher;
@@ -7791,7 +9988,18 @@ pub(crate) mod tests {
         let mut corrupted = std::fs::read(&payload).unwrap();
         *corrupted.last_mut().unwrap() ^= 1;
         std::fs::write(&payload, corrupted).unwrap();
-        assert!(verify_offline_entry(&entry, &offline, 1, &[publisher]).is_err());
+        verify_offline_entry(&entry, &offline, 1, std::slice::from_ref(&publisher)).unwrap();
+        let verified = flare_helios::runtime_core::VerifiedCore::open_selected(
+            &entry_primary(&entry).unwrap(),
+            &[publisher],
+            flare_helios::core::protection::Selection::Deployment {
+                deployment: 0,
+                rank: None,
+            },
+        )
+        .unwrap();
+        assert!(verified.verify_stored_data().is_err());
+        drop(verified);
 
         let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert!(store.evict(entry.model(), entry.id()).is_err());
@@ -8733,11 +10941,11 @@ pub(crate) mod tests {
         }
 
         // A URI rejected by the transport carries no user-visible value either.
-        let bad = ureq::Error::BadUri(format!("https://user:{SECRET}@host/file"));
+        let bad = HttpError::InvalidUri;
         let message = transport_error(&bad);
         assert!(!message.contains(SECRET), "{message}");
         assert_eq!(message, "invalid request URL");
-        match attempt_error(ureq::Error::BadUri(format!("https://host/{SECRET}"))) {
+        match attempt_error(HttpError::InvalidUri) {
             Attempt::Fatal(message) => assert!(!message.contains(SECRET), "{message}"),
             _ => panic!("an invalid URI must be fatal"),
         }
@@ -9880,6 +12088,10 @@ pub(crate) mod tests {
                 "/api/models/owner/model/revision/gb202",
                 metadata_response(),
             )
+            .document(
+                "/api/models/owner/model/revision/gb202-tp1",
+                revision_response("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
             .file(
                 format!("/owner/model/resolve/{COMMIT}/model.safetensors"),
                 MockFile::new(&etag, core.clone()),
@@ -9901,6 +12113,83 @@ pub(crate) mod tests {
             )
             .unwrap(),
             COMMIT
+        );
+    }
+
+    #[test]
+    fn blackwell_revision_alias_installs_and_refreshes_the_pinned_core() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, publisher, _) = signed_payload_fixture(temp.path());
+        let model_root = temp.path().join("models");
+        let repository = "publisher/prepared";
+        let missing = "/api/models/publisher/prepared/revision/gb10";
+        let alias = "/api/models/publisher/prepared/revision/gb10-tp1";
+        let routes = core_routes(&core, repository, "gb10-tp1").document(
+            missing,
+            b"HTTP/1.1 404 Missing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        );
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let options = HubOptions {
+            revision: Some("gb10".into()),
+            core_cache: Some(model_root.clone()),
+            ..Default::default()
+        };
+        let profiles = std::slice::from_ref(&publisher);
+        let entry = download_with_token_at(
+            &endpoint,
+            repository,
+            &options,
+            1,
+            None,
+            &[],
+            None,
+            profiles,
+            None,
+        )
+        .unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
+        let origin = entry_origin(&store, &entry).unwrap().unwrap();
+        assert_eq!(origin.revision, "gb10");
+        assert_eq!(origin.commit, COMMIT);
+        let offline_options = HubOptions {
+            offline: true,
+            ..options.clone()
+        };
+        let offline = download_with_token_at(
+            &endpoint,
+            repository,
+            &offline_options,
+            1,
+            None,
+            &[],
+            None,
+            profiles,
+            None,
+        )
+        .unwrap();
+        assert_eq!(offline.id(), entry.id());
+
+        let id = entry.id().to_owned();
+        let selected = refresh_model_at(
+            &endpoint,
+            &store,
+            entry,
+            false,
+            &options,
+            1,
+            &[],
+            None,
+            profiles,
+        )
+        .unwrap();
+        assert_eq!(selected.id(), id);
+        worker.join().unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.documents[missing], 2);
+        assert_eq!(log.documents[alias], 2);
+        assert_eq!(
+            log.files[&format!("/{repository}/resolve/{COMMIT}/model.safetensors")],
+            1
         );
     }
 
@@ -10229,6 +12518,879 @@ pub(crate) mod tests {
             bytes[..16]
         );
         assert!(!transport.blob(&retry_folder(), &key).exists());
+    }
+
+    #[test]
+    fn tree_api_plans_paginated_files_and_falls_back_for_missing_paths() {
+        let (_temp, transport) = transport_fixture();
+        let pinned = Repo::with_revision("owner/model".into(), RepoType::Model, COMMIT.into());
+        let primary = transport
+            .snapshot_dir(&pinned.folder_name(), COMMIT)
+            .join("model.safetensors");
+        let lfs_body = vec![0xABu8; 4096];
+        let lfs_oid = sha256_hex(&lfs_body);
+        let git_body = b"small-git-blob".to_vec();
+        let git_oid = "0123456789abcdef0123456789abcdef01234567";
+        let fallback_body = b"fallback-probe-bytes".to_vec();
+        let fallback_etag = sha256_hex(&fallback_body);
+
+        let page1_json = serde_json::json!([
+            {
+                "type": "directory",
+                "path": "weights"
+            },
+            {
+                "type": "file",
+                "path": "weights/a.safetensors",
+                "oid": "1111111111111111111111111111111111111111",
+                "size": lfs_body.len(),
+                "lfs": {
+                    "oid": lfs_oid,
+                    "size": lfs_body.len()
+                }
+            }
+        ])
+        .to_string();
+        let page2_path = format!("/api/models/owner/model/tree/{COMMIT}?recursive=true&cursor=page2");
+        let page1_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nLink: malformed, <{page2_path}>; rel=\"next\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page1_json}",
+            page1_json.len()
+        )
+        .into_bytes();
+
+        let page2_json = serde_json::json!([
+            {
+                "type": "file",
+                "path": "weights/b.safetensors",
+                "oid": git_oid,
+                "size": git_body.len()
+            }
+        ])
+        .to_string();
+        // Cross-origin next link must be ignored rather than followed.
+        let page2_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nLink: <http://127.0.0.1:1/evil>; rel=\"next\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page2_json}",
+            page2_json.len()
+        )
+        .into_bytes();
+
+        let tree_path = format!("/api/models/owner/model/tree/{COMMIT}?recursive=true&limit=1000");
+        let routes = HubRoutes::default()
+            .document(tree_path.clone(), page1_response)
+            .document(page2_path.clone(), page2_response)
+            .file(
+                format!("/owner/model/resolve/{COMMIT}/weights/c.safetensors"),
+                MockFile::new(&fallback_etag, fallback_body.clone()),
+            );
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let api = transport_api(endpoint);
+        let names = vec![
+            "weights/a.safetensors".to_owned(),
+            "weights/b.safetensors".to_owned(),
+            "weights/c.safetensors".to_owned(),
+        ];
+        let planned = plan_dependency_download(
+            &api,
+            &transport,
+            &pinned,
+            &primary,
+            &names,
+            Some("secret-token"),
+            None,
+        )
+        .unwrap();
+        worker.join().unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.metadata_requests, 1, "only omitted file falls back to bytes=0-0");
+        assert_eq!(
+            log.auth.get(&tree_path).map(String::as_str),
+            Some("Bearer secret-token")
+        );
+        assert_eq!(
+            log.auth.get(&page2_path).map(String::as_str),
+            Some("Bearer secret-token")
+        );
+        let a = planned.identities[0].as_ref().unwrap();
+        assert_eq!(a.etag(), lfs_oid);
+        assert_eq!(a.size(), lfs_body.len() as u64);
+        let b = planned.identities[1].as_ref().unwrap();
+        assert_eq!(b.etag(), git_oid);
+        assert_eq!(b.size(), git_body.len() as u64);
+        let c = planned.identities[2].as_ref().unwrap();
+        assert_eq!(c.etag(), fallback_etag);
+        assert_eq!(c.size(), fallback_body.len() as u64);
+        let expected_total = (lfs_body.len() + git_body.len() + fallback_body.len()) as u64;
+        assert_eq!(planned.pending.unwrap().total, Some(expected_total));
+    }
+
+    #[test]
+    fn file_identity_uses_linked_size_on_redirect_without_contacting_cdn() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let cdn_hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cdn_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        cdn_listener.set_nonblocking(true).unwrap();
+        let cdn_addr = cdn_listener.local_addr().unwrap();
+        let cdn_hits_ref = Arc::clone(&cdn_hits);
+        let cdn_stop = Arc::clone(&stop);
+        let cdn_thread = thread::spawn(move || {
+            while !cdn_stop.load(Ordering::Acquire) {
+                match cdn_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        cdn_hits_ref.fetch_add(1, Ordering::Relaxed);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 500 Unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let ok_redirect = format!(
+            "HTTP/1.1 302 Found\r\nX-Repo-Commit: {COMMIT}\r\nX-Linked-ETag: \"abc123\"\r\nX-Linked-Size: 98765\r\nLocation: http://{cdn_addr}/blob\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let bad_scheme_redirect = format!(
+            "HTTP/1.1 302 Found\r\nX-Repo-Commit: {COMMIT}\r\nX-Linked-ETag: \"abc123\"\r\nX-Linked-Size: 98765\r\nLocation: ftp://example.invalid/blob\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let routes = HubRoutes::default()
+            .document("/ok", ok_redirect)
+            .document("/bad-scheme", bad_scheme_redirect);
+        let (endpoint, worker) = mock_hub(routes);
+
+        let identity = file_identity(&format!("{endpoint}/ok"), Some("secret")).unwrap();
+        assert_eq!(identity.commit_hash(), COMMIT);
+        assert_eq!(identity.etag(), "abc123");
+        assert_eq!(identity.size(), 98765);
+        assert_eq!(cdn_hits.load(Ordering::Relaxed), 0);
+
+        let err = file_identity(&format!("{endpoint}/bad-scheme"), Some("secret")).unwrap_err();
+        assert!(err.message.contains("unsupported target"), "{}", err.message);
+
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+        cdn_thread.join().unwrap();
+    }
+
+    /// Parse HTTP request line and selected headers (`range`, `authorization`) from one connection.
+    fn read_http_request(
+        socket: &mut std::net::TcpStream,
+    ) -> Option<(String, Option<String>, Option<String>)> {
+        socket.set_nonblocking(false).ok()?;
+        socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut reader = BufReader::new(socket);
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let path = line.split_whitespace().nth(1)?.to_owned();
+        let mut range = None;
+        let mut auth = None;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).ok()? == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("range") {
+                    range = Some(value.trim().to_owned());
+                }
+                if name.eq_ignore_ascii_case("authorization") {
+                    auth = Some(value.trim().to_owned());
+                }
+            }
+        }
+        Some((path, range, auth))
+    }
+
+    fn parse_request_range(range: Option<&str>, total: usize) -> (usize, usize) {
+        let spec = range.and_then(|value| value.strip_prefix("bytes="));
+        match spec.and_then(|value| value.split_once('-')) {
+            Some((start, end)) => {
+                let s = start.parse::<usize>().unwrap_or(0);
+                let e = end
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(total - 1)
+                    .min(total - 1);
+                (s, e)
+            }
+            None => (0, total - 1),
+        }
+    }
+
+    #[test]
+    fn parallel_chunked_transfer_assembles_out_of_order_chunks_reuses_cdn_and_verifies_digest() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let payload: Vec<u8> = (0..(96 * 1024))
+            .map(|i| ((i * 31 + 17) & 0xFF) as u8)
+            .collect();
+        let expected_digest: [u8; 32] = sha2::Sha256::digest(&payload).into();
+        let stop = Arc::new(AtomicBool::new(false));
+        let origin_hits = Arc::new(AtomicUsize::new(0));
+        let origin_auth = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let cdn_hits = Arc::new(AtomicUsize::new(0));
+        let cdn_auth = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+
+        let cdn_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        cdn_listener.set_nonblocking(true).unwrap();
+        let cdn_addr = cdn_listener.local_addr().unwrap();
+        let origin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        origin_listener.set_nonblocking(true).unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+
+        let cdn_payload = Arc::new(payload.clone());
+        let cdn_stop = Arc::clone(&stop);
+        let cdn_hits_ref = Arc::clone(&cdn_hits);
+        let cdn_auth_ref = Arc::clone(&cdn_auth);
+        let cdn_thread = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !cdn_stop.load(Ordering::Acquire) {
+                match cdn_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let data = Arc::clone(&cdn_payload);
+                        let hits = Arc::clone(&cdn_hits_ref);
+                        let auths = Arc::clone(&cdn_auth_ref);
+                        handlers.push(thread::spawn(move || {
+                            let Some((_, range, auth)) = read_http_request(&mut stream) else {
+                                return;
+                            };
+                            hits.fetch_add(1, Ordering::Relaxed);
+                            auths.lock().unwrap().push(auth);
+                            let (start, end) = parse_request_range(range.as_deref(), data.len());
+                            // Delay lower offsets slightly so higher chunks complete out of order.
+                            let chunk_idx = start / 8192;
+                            if chunk_idx < 4 {
+                                std::thread::sleep(Duration::from_millis((4 - chunk_idx) as u64 * 15));
+                            }
+                            let slice = &data[start..=end];
+                            let header = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                data.len(),
+                                slice.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes());
+                            let _ = stream.write_all(slice);
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+
+        let origin_stop = Arc::clone(&stop);
+        let origin_hits_ref = Arc::clone(&origin_hits);
+        let origin_auth_ref = Arc::clone(&origin_auth);
+        let origin_thread = thread::spawn(move || {
+            while !origin_stop.load(Ordering::Acquire) {
+                match origin_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some((_, _, auth)) = read_http_request(&mut stream) else {
+                            continue;
+                        };
+                        origin_hits_ref.fetch_add(1, Ordering::Relaxed);
+                        origin_auth_ref.lock().unwrap().push(auth);
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{cdn_addr}/cdn/blob\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join("blob.part");
+        let progress = flare_helios::core::progress::AcquisitionProgress::new();
+        let mut resume = Resume::open(&part, payload.len() as u64, true, Some(&progress)).unwrap();
+        let agent = transfers();
+        attempt_transfer_parallel_with_chunk_size(
+            &agent,
+            &format!("http://{origin_addr}/origin/blob"),
+            Some("secret-token"),
+            &mut resume,
+            Some(&progress),
+            4,
+            None,
+            8192,
+        )
+        .unwrap();
+
+        stop.store(true, Ordering::Release);
+        origin_thread.join().unwrap();
+        cdn_thread.join().unwrap();
+
+        assert_eq!(resume.offset, payload.len() as u64);
+        assert_eq!(resume.take_digest(), Some(expected_digest));
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+        assert_eq!(progress.snapshot().network_bytes, payload.len() as u64);
+        assert_eq!(
+            origin_hits.load(Ordering::Relaxed),
+            1,
+            "only chunk 0 resolves through the origin"
+        );
+        assert_eq!(
+            *origin_auth.lock().unwrap(),
+            vec![Some("Bearer secret-token".to_owned())]
+        );
+        assert_eq!(cdn_hits.load(Ordering::Relaxed), 12);
+        assert!(
+            cdn_auth.lock().unwrap().iter().all(Option::is_none),
+            "Bearer token must never be sent to off-origin CDN"
+        );
+    }
+
+    #[test]
+    fn parallel_chunked_transfer_refreshes_expired_cdn_and_resumes_interrupted_chunk() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let payload: Vec<u8> = (0..(64 * 1024))
+            .map(|i| ((i * 73 + 11) & 0xFF) as u8)
+            .collect();
+        let expected_digest: [u8; 32] = sha2::Sha256::digest(&payload).into();
+        let stop = Arc::new(AtomicBool::new(false));
+        let origin_hits = Arc::new(AtomicUsize::new(0));
+        let v2_short_injected = Arc::new(AtomicBool::new(false));
+        let cdn_auth = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+
+        let cdn_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        cdn_listener.set_nonblocking(true).unwrap();
+        let cdn_addr = cdn_listener.local_addr().unwrap();
+        let origin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        origin_listener.set_nonblocking(true).unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+
+        let cdn_payload = Arc::new(payload.clone());
+        let cdn_stop = Arc::clone(&stop);
+        let short_flag = Arc::clone(&v2_short_injected);
+        let cdn_auth_ref = Arc::clone(&cdn_auth);
+        let cdn_thread = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !cdn_stop.load(Ordering::Acquire) {
+                match cdn_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let data = Arc::clone(&cdn_payload);
+                        let short = Arc::clone(&short_flag);
+                        let auths = Arc::clone(&cdn_auth_ref);
+                        handlers.push(thread::spawn(move || {
+                            let Some((path, range, auth)) = read_http_request(&mut stream) else {
+                                return;
+                            };
+                            auths.lock().unwrap().push(auth);
+                            let (start, end) = parse_request_range(range.as_deref(), data.len());
+                            // Simulate presigned v1 CDN expiring on chunks past 16 KiB.
+                            if path == "/cdn-v1/blob" && start >= 16384 {
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                );
+                                return;
+                            }
+                            let slice = &data[start..=end];
+                            let header = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                data.len(),
+                                slice.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes());
+                            // Truncate one v2 response mid-chunk to verify in-chunk resume.
+                            if path == "/cdn-v2/blob"
+                                && slice.len() > 3000
+                                && !short.swap(true, Ordering::AcqRel)
+                            {
+                                let _ = stream.write_all(&slice[..3000]);
+                                return;
+                            }
+                            let _ = stream.write_all(slice);
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+
+        let origin_stop = Arc::clone(&stop);
+        let origin_hits_ref = Arc::clone(&origin_hits);
+        let origin_thread = thread::spawn(move || {
+            while !origin_stop.load(Ordering::Acquire) {
+                match origin_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some(_) = read_http_request(&mut stream) else {
+                            continue;
+                        };
+                        let call = origin_hits_ref.fetch_add(1, Ordering::Relaxed);
+                        let target = if call == 0 {
+                            format!("http://{cdn_addr}/cdn-v1/blob")
+                        } else {
+                            format!("http://{cdn_addr}/cdn-v2/blob")
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join("blob.part");
+        let progress = flare_helios::core::progress::AcquisitionProgress::new();
+        let mut resume = Resume::open(&part, payload.len() as u64, true, Some(&progress)).unwrap();
+        let agent = transfers();
+        attempt_transfer_parallel_with_chunk_size(
+            &agent,
+            &format!("http://{origin_addr}/origin/blob"),
+            Some("secret-token"),
+            &mut resume,
+            Some(&progress),
+            4,
+            None,
+            8192,
+        )
+        .unwrap();
+
+        stop.store(true, Ordering::Release);
+        origin_thread.join().unwrap();
+        cdn_thread.join().unwrap();
+
+        assert_eq!(resume.offset, payload.len() as u64);
+        assert_eq!(resume.take_digest(), Some(expected_digest));
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+        assert!(v2_short_injected.load(Ordering::Acquire));
+        assert_eq!(
+            progress.snapshot().network_bytes,
+            payload.len() as u64,
+            "mid-chunk resume must not recount delivered bytes"
+        );
+        assert!(origin_hits.load(Ordering::Relaxed) >= 2);
+        assert!(cdn_auth.lock().unwrap().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn parallel_chunked_transfer_chunk0_failure_does_not_append_discontiguous_chunks() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let payload: Vec<u8> = (0..(32 * 1024))
+            .map(|i| ((i * 53 + 7) & 0xFF) as u8)
+            .collect();
+        let expected_digest: [u8; 32] = sha2::Sha256::digest(&payload).into();
+        let stop = Arc::new(AtomicBool::new(false));
+        let fail_chunk0 = Arc::new(AtomicBool::new(true));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let data_ref = Arc::new(payload.clone());
+        let stop_ref = Arc::clone(&stop);
+        let fail_ref = Arc::clone(&fail_chunk0);
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !stop_ref.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let data = Arc::clone(&data_ref);
+                        let fail0 = Arc::clone(&fail_ref);
+                        handlers.push(thread::spawn(move || {
+                            let Some((_, range, _)) = read_http_request(&mut stream) else {
+                                return;
+                            };
+                            let (start, end) = parse_request_range(range.as_deref(), data.len());
+                            let slice = &data[start..=end];
+                            let header = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                data.len(),
+                                slice.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes());
+                            if start == 0 && fail0.swap(false, Ordering::AcqRel) {
+                                // Send half of chunk 0 and wait briefly so chunk 1 finishes first.
+                                let _ = stream.write_all(&slice[..4000]);
+                                std::thread::sleep(Duration::from_millis(60));
+                                return;
+                            }
+                            let _ = stream.write_all(slice);
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join("blob.part");
+        let url = format!("http://{addr}/blob");
+        let agent = transfers();
+        let mut resume = Resume::open(&part, payload.len() as u64, true, None).unwrap();
+        let first = attempt_transfer_parallel_with_chunk_size(
+            &agent,
+            &url,
+            None,
+            &mut resume,
+            None,
+            3,
+            None,
+            8192,
+        );
+        assert!(matches!(first, Err(Attempt::Retry { .. })));
+        assert_eq!(resume.offset, 4000);
+        assert_eq!(std::fs::read(&part).unwrap(), payload[..4000]);
+
+        // Resuming from the exact contiguous 4000-byte prefix completes intact.
+        attempt_transfer_parallel_with_chunk_size(
+            &agent,
+            &url,
+            None,
+            &mut resume,
+            None,
+            3,
+            None,
+            8192,
+        )
+        .unwrap();
+
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+
+        assert_eq!(resume.offset, payload.len() as u64);
+        assert_eq!(resume.take_digest(), Some(expected_digest));
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+    }
+
+    #[test]
+    fn parallel_dependencies_deduplicate_shared_identities_and_abort_on_failure() {
+        let (_temp, transport) = transport_fixture();
+        let pinned = Repo::with_revision("owner/model".into(), RepoType::Model, COMMIT.into());
+        let primary = transport
+            .snapshot_dir(&pinned.folder_name(), COMMIT)
+            .join("model.safetensors");
+        let shared_body = b"shared-payload-bytes".repeat(16);
+        let shared_etag = sha256_hex(&shared_body);
+        let other_a = b"distinct-payload-a".repeat(16);
+        let other_a_etag = sha256_hex(&other_a);
+        let other_b = b"distinct-payload-b".repeat(16);
+        let other_b_etag = sha256_hex(&other_b);
+
+        let routes = HubRoutes::default()
+            .file(
+                format!("/owner/model/resolve/{COMMIT}/weights/alias-1.safetensors"),
+                MockFile::new(&shared_etag, shared_body.clone()),
+            )
+            .file(
+                format!("/owner/model/resolve/{COMMIT}/weights/alias-2.safetensors"),
+                MockFile::new(&shared_etag, shared_body.clone()),
+            )
+            .file(
+                format!("/owner/model/resolve/{COMMIT}/weights/a.safetensors"),
+                MockFile::new(&other_a_etag, other_a.clone()),
+            )
+            .file(
+                format!("/owner/model/resolve/{COMMIT}/weights/b.safetensors"),
+                MockFile::new(&other_b_etag, other_b.clone()),
+            );
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let api = transport_api(endpoint);
+        let names = vec![
+            "weights/alias-1.safetensors".to_owned(),
+            "weights/alias-2.safetensors".to_owned(),
+            "weights/a.safetensors".to_owned(),
+            "weights/b.safetensors".to_owned(),
+        ];
+        let identities = vec![
+            Some(FileIdentity {
+                commit: COMMIT.into(),
+                etag: shared_etag.clone(),
+                size: shared_body.len() as u64,
+            }),
+            Some(FileIdentity {
+                commit: COMMIT.into(),
+                etag: shared_etag.clone(),
+                size: shared_body.len() as u64,
+            }),
+            Some(FileIdentity {
+                commit: COMMIT.into(),
+                etag: other_a_etag.clone(),
+                size: other_a.len() as u64,
+            }),
+            Some(FileIdentity {
+                commit: COMMIT.into(),
+                etag: other_b_etag.clone(),
+                size: other_b.len() as u64,
+            }),
+        ];
+        fetch_dependencies_parallel(
+            &api,
+            &transport,
+            &pinned,
+            &primary,
+            &names,
+            &identities,
+            None,
+            None,
+        )
+        .unwrap();
+        worker.join().unwrap();
+
+        let snap = transport.snapshot_dir(&pinned.folder_name(), COMMIT);
+        assert_eq!(std::fs::read(snap.join("weights/alias-1.safetensors")).unwrap(), shared_body);
+        assert_eq!(std::fs::read(snap.join("weights/alias-2.safetensors")).unwrap(), shared_body);
+        assert_eq!(std::fs::read(snap.join("weights/a.safetensors")).unwrap(), other_a);
+        assert_eq!(std::fs::read(snap.join("weights/b.safetensors")).unwrap(), other_b);
+        assert_eq!(
+            log.lock().unwrap().requests,
+            3,
+            "shared ETag aliases must be fetched only once"
+        );
+        #[cfg(unix)]
+        assert_same_file(
+            &snap.join("weights/alias-1.safetensors"),
+            &snap.join("weights/alias-2.safetensors"),
+        );
+
+        // A permanent failure on one file aborts siblings cleanly and prevents queued work from starting.
+        let mut fail_routes = HubRoutes::default();
+        let mut fail_names = Vec::new();
+        let mut fail_ids = Vec::new();
+        for index in 1..TRANSFER_FILE_WORKERS {
+            let name = format!("weights/slow-{index}.safetensors");
+            let etag = format!("slow-{index}-etag");
+            fail_routes = fail_routes.file(
+                format!("/owner/model/resolve/{COMMIT}/{name}"),
+                MockFile::new(&etag, vec![index as u8; 100])
+                    .script([MockFault::Stall(Duration::from_millis(250))]),
+            );
+            fail_names.push(name);
+            fail_ids.push(Some(FileIdentity {
+                commit: COMMIT.into(),
+                etag,
+                size: 100,
+            }));
+        }
+        fail_routes = fail_routes
+            .file(
+                format!("/owner/model/resolve/{COMMIT}/weights/missing.safetensors"),
+                MockFile::new("missing-etag", vec![4u8; 50]).script([MockFault::Status(404)]),
+            )
+            .file(
+                format!("/owner/model/resolve/{COMMIT}/weights/queued.safetensors"),
+                MockFile::new("queued-etag", vec![5u8; 10]),
+            );
+        fail_names.push("weights/missing.safetensors".to_owned());
+        fail_ids.push(Some(FileIdentity {
+            commit: COMMIT.into(),
+            etag: "missing-etag".into(),
+            size: 50,
+        }));
+        fail_names.push("weights/queued.safetensors".to_owned());
+        fail_ids.push(Some(FileIdentity {
+            commit: COMMIT.into(),
+            etag: "queued-etag".into(),
+            size: 10,
+        }));
+        let (fail_endpoint, fail_worker, fail_log) = mock_hub_counted(fail_routes);
+        let fail_api = transport_api(fail_endpoint);
+        let err = fetch_dependencies_parallel(
+            &fail_api,
+            &transport,
+            &pinned,
+            &primary,
+            &fail_names,
+            &fail_ids,
+            None,
+            None,
+        )
+        .unwrap_err();
+        fail_worker.join().unwrap();
+        assert!(err.to_string().contains("404"), "{err}");
+        assert!(
+            !fail_log
+                .lock()
+                .unwrap()
+                .files
+                .contains_key(&format!("/owner/model/resolve/{COMMIT}/weights/queued.safetensors")),
+            "queued file must not be started after sibling failure"
+        );
+    }
+
+    #[test]
+    fn token_resolution_prefers_explicit_file_then_env_then_stored_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let explicit = temp.path().join("explicit.token");
+        let stored = temp.path().join("stored.token");
+        std::fs::write(&explicit, "  hf_explicit\n").unwrap();
+        std::fs::write(&stored, "hf_stored\n").unwrap();
+
+        assert_eq!(
+            resolve_token(Some(&explicit), Some("hf_env"), Some(&stored)).unwrap(),
+            Some(("hf_explicit".to_owned(), TokenSource::ExplicitFile))
+        );
+        assert_eq!(
+            resolve_token(None, Some("  hf_env  "), Some(&stored)).unwrap(),
+            Some(("hf_env".to_owned(), TokenSource::EnvVar))
+        );
+        assert_eq!(
+            resolve_token(None, Some("   "), Some(&stored)).unwrap(),
+            Some(("hf_stored".to_owned(), TokenSource::DefaultFile))
+        );
+        assert_eq!(
+            resolve_token(None, None, Some(&temp.path().join("missing.token"))).unwrap(),
+            None
+        );
+
+        let empty = temp.path().join("empty.token");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert!(resolve_token(Some(&empty), Some("hf_env"), Some(&stored)).is_err());
+        assert!(
+            resolve_token(Some(&temp.path().join("missing-explicit")), Some("hf_env"), Some(&stored))
+                .is_err()
+        );
+        // An empty default stored token file is ignored cleanly rather than failing public downloads.
+        assert_eq!(resolve_token(None, None, Some(&empty)).unwrap(), None);
+    }
+
+    #[test]
+    fn parallel_chunked_transfer_migrates_head_of_line_straggler_without_losing_bytes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let payload: Vec<u8> = (0..(48 * 1024))
+            .map(|i| ((i * 29 + 3) & 0xFF) as u8)
+            .collect();
+        let expected_digest: [u8; 32] = sha2::Sha256::digest(&payload).into();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stalled_once = Arc::new(AtomicBool::new(false));
+        let chunk1_requests = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let data_ref = Arc::new(payload.clone());
+        let stop_ref = Arc::clone(&stop);
+        let stalled_ref = Arc::clone(&stalled_once);
+        let chunk1_ref = Arc::clone(&chunk1_requests);
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !stop_ref.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let data = Arc::clone(&data_ref);
+                        let stalled = Arc::clone(&stalled_ref);
+                        let c1 = Arc::clone(&chunk1_ref);
+                        handlers.push(thread::spawn(move || {
+                            let Some((_, range, _)) = read_http_request(&mut stream) else {
+                                return;
+                            };
+                            let (start, end) = parse_request_range(range.as_deref(), data.len());
+                            let slice = &data[start..=end];
+                            let header = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                data.len(),
+                                slice.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes());
+                            if start >= 8192 && start < 16384 {
+                                c1.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // Stall chunk 1 halfway through on its first attempt so chunks 2..5
+                            // finish first and trigger head-of-line migration.
+                            if start == 8192 && !stalled.swap(true, Ordering::AcqRel) {
+                                let _ = stream.write_all(&slice[..2048]);
+                                let _ = stream.flush();
+                                std::thread::sleep(Duration::from_secs(10));
+                                return;
+                            }
+                            let _ = stream.write_all(slice);
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join("blob.part");
+        let progress = flare_helios::core::progress::AcquisitionProgress::new();
+        let mut resume = Resume::open(&part, payload.len() as u64, true, Some(&progress)).unwrap();
+        let started = std::time::Instant::now();
+        attempt_transfer_parallel_with_chunk_size(
+            &transfers(),
+            &format!("http://{addr}/blob"),
+            None,
+            &mut resume,
+            Some(&progress),
+            4,
+            None,
+            8192,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        stop.store(true, Ordering::Release);
+        drop(server);
+
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "straggler migration must finish well before the 10s stall ({elapsed:?})"
+        );
+        assert!(chunk1_requests.load(Ordering::Relaxed) >= 2);
+        assert_eq!(resume.offset, payload.len() as u64);
+        assert_eq!(resume.take_digest(), Some(expected_digest));
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+        assert_eq!(
+            progress.snapshot().network_bytes,
+            payload.len() as u64,
+            "migrating mid-chunk must not lose or double-count delivered bytes"
+        );
     }
 }
 

@@ -160,6 +160,27 @@ async fn h8_scopes_never_see_each_other() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_on_another_instances_missing_tier_is_refused_though_it_holds_the_other() {
+    let mut host = host();
+    host.run();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut a = source(&mut pool, &Ident::new("a")).await;
+    let mut b = source(&mut pool, &Ident::new("b")).await;
+    a.notices(vec![saved(entry(1024, None, v2::Tier::Nvme))])
+        .await;
+    let reply = b.lookup(1, 1024, 0).await;
+    let mut claim = b.claim_for(1, &reply.candidates[0], 0, true);
+    assert_eq!(claim.tier, v2::Tier::Nvme as i32);
+    // The announcement is a hint about that instance's own memory, so a claim naming the
+    // tier it does not hold is not served from the tier it does.
+    claim.tier = v2::Tier::Dram as i32;
+    b.claim(claim).await;
+    let terminal = b.claim_terminal(1).await;
+    assert_eq!(terminal.state, v2::ClaimState::Failed as i32);
+    assert_eq!(terminal.reason, v2::ClaimReason::UnknownSource as i32);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h10_a_reconnect_supersedes_the_old_stream() {
     let mut host = host();
     host.run();

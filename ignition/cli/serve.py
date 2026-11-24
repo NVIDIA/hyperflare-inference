@@ -62,7 +62,7 @@ def _server_options(configuration, model, plan) -> dict:
     """Derive native server settings independently of preparation's physical KV backing."""
     recipe, checkpoint = plan.recipe, plan.checkpoint
     return {
-        "model_id": model.model_id, "served_names": [recipe.served_model_name],
+        "model_id": model.model_id, "served_names": [recipe.served_name(checkpoint)],
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
         "queue_capacity": 4 * plan.concurrency, "frontend_workers": plan.concurrency,
@@ -192,13 +192,16 @@ def _export_hosts(args):
     gpus = tuple(topology_gpu(topology, index) for index, topology in enumerate(topologies))
     plan = planning.plan(model.recipe, model.checkpoint, gpus, selected=tuple(range(len(gpus))),
                          concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
-                         image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
+                         image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency,
+                                                                  language_model_only=args.language_model_only),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
-                         online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
+                         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
+                         language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
@@ -235,7 +238,8 @@ def _export_hosts(args):
             with phase(progress, "Export native cores", live=False) as stage:
                 from ignition.preparation.rebuild_manifest import from_plan
 
-                options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
+                options['rebuild_manifest'] = from_plan(
+                    model, plan, compiled_forwards=not args.no_compile, multi_host=True)
                 result = prepared.export(None, options=options, export_id=uuid.uuid4().hex, images=recorder,
                                 storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
                                 staging=configuration.directory("export_staging"),
@@ -277,11 +281,13 @@ def _prepare(args):
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                      context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                      context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                       roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
-                      online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
+                      online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
+                      language_model_only=args.language_model_only,
                       mla_compute_mode=args.mla_compute_mode)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
         # A caller's restriction changes which GPU each index names.
@@ -455,12 +461,15 @@ def debug_serve(args) -> int:
     plan = planning.plan(model.recipe, model.checkpoint, gpus,
                          selected=None if args.ranks == 1 and args.gpus is None else tuple(range(len(gpus))),
                          concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
-                         image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
+                         image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency,
+                                                                  language_model_only=args.language_model_only),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
+                         online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,

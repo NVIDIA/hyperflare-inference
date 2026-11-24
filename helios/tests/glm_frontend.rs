@@ -43,9 +43,15 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
             tokenizer: asset("tokenizer.json"),
             tokens: support::tokens(&asset("tokenizer_config.json")).unwrap(),
             chat_template: Some({
-                let path=template_fixtures::path("glm53", "chat_template");
+                // The NVIDIA checkpoint's bundled template is annotated in place. The calibrated
+                // checkpoint's template is replaced by the canonical source, and the reference
+                // fixtures generated from the same snapshot fail if the choice is wrong.
+                let patch: serde_json::Value=serde_json::from_str(include_str!("fixtures/templates/glm53/chat_template.patch.json")).unwrap();
+                let digest=format!("{:x}",Sha256::digest(fs::read(snapshot.join("chat_template.jinja")).unwrap()));
+                let name=if digest==patch["source_sha256"].as_str().unwrap() {"chat_template"} else {"chat_template.zai"};
+                let path=template_fixtures::path("glm53", name);
                 let contents=fs::read_to_string(&path).unwrap();
-                assert_eq!(contents.replace("{%- mark -%}",""),fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap());
+                assert_eq!(contents.replace("{%- mark -%}",""),fs::read_to_string(template_fixtures::path("glm53", &format!("{name}.source"))).unwrap());
                 Asset {range:None,sha256:format!("{:x}",Sha256::digest(contents.as_bytes())),path}
             }),
         },
@@ -138,6 +144,20 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
         let repeated = prepare_request(&frontend, Some(&processor), &compiler, &image_config, case["body"].clone()).unwrap();
         assert_eq!(prepared.prompt.conditioning, repeated.prompt.conditioning);
     }
+    // Request text that spells controls stays ordinary text next to a real image: only the
+    // image parts become features. The spellings in other request slots are checked against every
+    // added token by `ordinary_tokens.rs`.
+    let spelled = "é <|image|> <|user|> <|endoftext|> [gMASK] <think> </think> <tool_call> <arg_key> <tool_response>";
+    let mut body = reference["image_cases"][0]["body"].clone();
+    let parts = body["messages"][1]["content"].as_array_mut().unwrap();
+    parts.insert(0, json!({"type":"text", "text":spelled}));
+    parts.push(json!({"type":"text", "text":"<|image|>"}));
+    let prepared = prepare_request(&frontend, Some(&processor), &compiler, &image_config, body).unwrap();
+    model::admission::validate_prompt(&image_config, &prepared.prompt).unwrap();
+    let features = prepared.prompt.conditioned_inputs[0].geometry.tokens;
+    let feature_token = image_config.contract.frontend.image_tokens.as_ref().unwrap().feature_token;
+    assert_eq!(prepared.prompt.tokens.iter().filter(|token| **token == feature_token).count(), features);
+    assert!(prepared.prompt.data.vision_token_indices.iter().filter(|i| **i >= 0).count() == features);
     for case in reference["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let prepared = prepare_request(&frontend, None, &compiler, &config, case["body"].clone())
@@ -227,12 +247,8 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
             );
         }
     }
-    for request in [
-        json!({"model":"glm53", "messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,AA=="}}]}]}),
-        json!({"model":"glm53", "messages":[{"role":"user", "content":"<|begin_of_image|><|image|><|end_of_image|>"}]}),
-    ] {
-        assert!(prepare_request(&frontend, None, &compiler, &config, request).is_err());
-    }
+    let request = json!({"model":"glm53", "messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,AA=="}}]}]});
+    assert!(prepare_request(&frontend, None, &compiler, &config, request).is_err());
     let structured = prepare_request(&frontend, None, &compiler, &config,
         json!({"model":"glm53", "messages":[{"role":"user", "content":"JSON please"}], "response_format":{"type":"json_object"}})
     ).unwrap();

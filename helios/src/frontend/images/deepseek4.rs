@@ -79,15 +79,15 @@ pub(super) fn pad(image: &RgbImage, g: ImageGeometry) -> Result<(ImageGeometry, 
     let (width, height) = if source_ratio > target_ratio {
         (
             g.width,
-            (g.width as f64 / source_ratio).round_ties_even() as usize,
+            ((g.width as f64 / source_ratio).round_ties_even() as usize).max(1),
         )
     } else {
         (
-            (g.height as f64 * source_ratio).round_ties_even() as usize,
+            ((g.height as f64 * source_ratio).round_ties_even() as usize).max(1),
             g.height,
         )
     };
-    let resized = resize::pillow(image, width.max(1), height.max(1));
+    let resized = resize::pillow(image, width, height);
     let mut pixels = vec![127; g.width * g.height * 3];
     let x = ((g.width - width) as f64 / 2.).round_ties_even() as usize;
     let y = ((g.height - height) as f64 / 2.).round_ties_even() as usize;
@@ -160,4 +160,26 @@ pub(super) fn pack(
         output.geometry.push(g);
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pad_preserves_narrow_tall_image_pixels() {
+        let image = RgbImage::new(1, 20_000, vec![255; 20_000 * 3]).unwrap();
+        let target = ImageGeometry {
+            width: 42,
+            height: 7896,
+            grid_thw: [1, 188, 1],
+            patches: 188,
+            tokens: 188,
+        };
+        let (_, pixels) = pad(&image, target).unwrap();
+        assert!(
+            pixels.iter().any(|&byte| byte != 127),
+            "narrow image pixels must not be silently replaced with solid gray padding"
+        );
+    }
 }

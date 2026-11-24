@@ -236,6 +236,7 @@ pub struct LiveRequest {
     prefix: Option<CheckpointId>,
     prefix_tokens: u64,
     admission_reused_tokens: u64,
+    inbound_reused_tokens: u64,
     message_boundaries: Vec<usize>,
     checkpoints: CheckpointAccounting,
     anchor_guard: Option<SnapshotId>,
@@ -660,6 +661,7 @@ pub struct RequestScheduler {
     speculative_fixed_width: Option<usize>,
     speculative_catalog: [Vec<usize>; 7],
     prefill_catalog: Vec<usize>,
+    terminal_prefill_catalog: Vec<usize>,
     scored_prefill_catalog: Vec<usize>,
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
@@ -671,6 +673,10 @@ pub struct RequestScheduler {
     track_publications: bool,
     publications: Vec<CheckpointId>,
     offered_publications: BTreeSet<CheckpointId>,
+    pending_reoffers: BTreeSet<CheckpointId>,
+    /// Completion refreshes in retirement order, including repeated keys.
+    /// The worker drains them on each host-store service pass.
+    reused: Vec<PrefixKey>,
     track_evictions: bool,
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
@@ -751,6 +757,7 @@ impl RequestScheduler {
             speculative_fixed_width: None,
             speculative_catalog: Default::default(),
             prefill_catalog: prefill_capacities(limits.prefill_chunk_size).collect(),
+            terminal_prefill_catalog: Vec::new(),
             scored_prefill_catalog: Vec::new(),
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
@@ -762,6 +769,8 @@ impl RequestScheduler {
             track_publications: false,
             publications: Vec::new(),
             offered_publications: BTreeSet::new(),
+            pending_reoffers: BTreeSet::new(),
+            reused: Vec::new(),
             track_evictions: false,
             evictions: Vec::new(),
             evictions_lost: false,
@@ -817,6 +826,93 @@ impl RequestScheduler {
         }
         self.scored_prefill_catalog = catalog;
         Ok(())
+    }
+
+    pub fn terminal_prefill_graphs(&mut self, capacities: &[usize]) -> Result<()> {
+        if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
+            return Err("terminal prefill graphs must be selected before admission".into());
+        }
+        let mut catalog = capacities.to_vec();
+        catalog.sort_unstable();
+        if catalog.iter().any(|n| {
+            *n == 0 || !n.is_multiple_of(64) || *n > self.limits.prefill_chunk_size
+        }) || catalog.windows(2).any(|p| p[0] == p[1])
+        {
+            return Err(
+                "terminal prefill capacities must be distinct aligned capacities within the chunk size"
+                    .into(),
+            );
+        }
+        self.terminal_prefill_catalog = catalog;
+        Ok(())
+    }
+
+    pub(super) fn terminal_prefill_window(&self) -> usize {
+        if self.terminal_prefill_catalog.is_empty() {
+            return 0;
+        }
+        self.prefill_catalog
+            .iter()
+            .copied()
+            .filter(|capacity| self.terminal_prefill_catalog.binary_search(capacity).is_err())
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn resolve_prefill_kind(
+        &self,
+        request: &LiveRequest,
+        capacity: usize,
+        work: usize,
+        cut: Option<usize>,
+    ) -> GraphKind {
+        if request.prompt_logprobs {
+            return GraphKind::ScoredPrefill;
+        }
+        if self.terminal_prefill_catalog.binary_search(&capacity).is_err() {
+            return GraphKind::Prefill;
+        }
+        let next_stop = cut
+            .unwrap_or(request.prompt_tokens)
+            .min(request.prefill_limit())
+            .min(request.prompt_tokens);
+        let end = (request.consumed_tokens as usize).saturating_add(work);
+        let window = self.terminal_prefill_window();
+        if end >= next_stop || (window > 0 && next_stop.saturating_sub(end) <= window) {
+            GraphKind::TerminalPrefill
+        } else {
+            GraphKind::Prefill
+        }
+    }
+
+    pub(super) fn prefill_requires_terminal_completion(
+        &self,
+        request: &LiveRequest,
+        cut: Option<usize>,
+    ) -> bool {
+        if request.prompt_logprobs || self.terminal_prefill_catalog.is_empty() {
+            return false;
+        }
+        let next_stop = cut
+            .unwrap_or(request.prompt_tokens)
+            .min(request.prefill_limit())
+            .min(request.prompt_tokens);
+        let remaining = next_stop.saturating_sub(request.consumed_tokens as usize);
+        if remaining == 0 {
+            return false;
+        }
+        let Some(&max_capacity) = self.prefill_catalog.last() else {
+            return false;
+        };
+        if self.prefill_work_through(request, max_capacity, cut) < remaining {
+            return false;
+        }
+        let Some(&smallest_fit) = self.prefill_catalog.iter().find(|&&cap| cap >= remaining) else {
+            return false;
+        };
+        self.terminal_prefill_catalog
+            .binary_search(&smallest_fit)
+            .is_ok()
     }
 
     pub fn snapshot_slot(&self, snapshot: SnapshotId) -> StateSlotId {
@@ -1098,13 +1194,7 @@ impl RequestScheduler {
                 .iter()
                 .filter(|slot| slot.request.is_some())
                 .count(),
-            free_slots: self
-                .slots
-                .iter()
-                .filter(|slot| {
-                    slot.request.is_none() && !slot.retiring && slot.generation < i64::MAX as u64
-                })
-                .count(),
+            free_slots: self.free_slot_count(),
             retiring_slots: self.slots.iter().filter(|slot| slot.retiring).count(),
             free_pages: self.free_pages.len(),
             free_snapshots: self.free_snapshots.len(),
@@ -1135,6 +1225,24 @@ impl RequestScheduler {
     }
     pub fn free_snapshot_count(&self) -> usize {
         self.free_snapshots.len()
+    }
+    /// Slots a new request can take: empty, not retiring, with a generation left.
+    pub fn free_slot_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                slot.request.is_none() && !slot.retiring && slot.generation < i64::MAX as u64
+            })
+            .count()
+    }
+    /// Whether requests, transfers, or retirement fences may release admission resources.
+    #[cfg(feature = "server")]
+    pub(crate) fn resources_in_flight(&self) -> bool {
+        self.slots.iter().any(|slot| slot.request.is_some() || slot.retiring)
+            || !self.cache.pending_retirement().is_empty()
+            || !self.retired.is_empty()
+            || !self.tickets.is_empty()
+            || self.cache.has_pins()
     }
     pub fn has_available_slot(&self) -> bool {
         self.slots.iter().any(|slot| {
@@ -1581,8 +1689,6 @@ impl RequestScheduler {
                     .waiters
                     .push(handle);
             }
-            self.stats.host_hits += 1;
-            self.stats.host_reused_tokens += consumed - lookup.consumed_tokens;
         }
         let mut reserved_pages: Vec<_> = (0..reserved_count)
             .map(|_| self.free_pages.pop_first().unwrap())
@@ -1618,7 +1724,12 @@ impl RequestScheduler {
             window_snapshot_ready: false,
             window_restore: false,
             epoch: 0,
-            acceptance: speculation::AcceptanceProfile::new(self.capabilities.completion_token_capacity),
+            acceptance: if self.gpu_confidence() {
+                speculation::AcceptanceProfile::new(self.capabilities.completion_token_capacity)
+            } else {
+                speculation::AcceptanceProfile::seeded(
+                    self.capabilities.completion_token_capacity, &self.forecasts.population)
+            },
             accounting: self.accounting(),
             handle,
             state_slot: StateSlotId((1 + slot * execution_rows) as u32),
@@ -1639,6 +1750,7 @@ impl RequestScheduler {
             prefix,
             prefix_tokens: consumed,
             admission_reused_tokens: consumed,
+            inbound_reused_tokens: consumed - lookup.consumed_tokens,
             message_boundaries,
             checkpoints,
             anchor_guard: None,
@@ -1752,6 +1864,9 @@ impl RequestScheduler {
             request.prefix_snapshot = Some(snapshot);
             request.shared_pages = shared_pages.clone();
             request.phase = RequestPhase::Restore;
+            let reused = request.inbound_reused_tokens;
+            self.stats.host_hits += 1;
+            self.stats.host_reused_tokens += reused;
         }
         Ok(Vec::new())
     }
@@ -1782,23 +1897,26 @@ impl RequestScheduler {
             .collect()
     }
 
+    /// Takes all completion refreshes since the previous drain, in retirement order.
+    pub fn take_reused(&mut self) -> Vec<PrefixKey> {
+        std::mem::take(&mut self.reused)
+    }
+
     pub(crate) fn publication(&self, id: CheckpointId) -> Option<PublishedCheckpoint> {
         let checkpoint = self.cache.checkpoint(id).ok()?;
-        let mut ancestor = checkpoint.parent();
-        let mut parent = None;
-        while let Some(ancestor_id) = ancestor {
-            let node = self.cache.checkpoint(ancestor_id).ok()?;
-            if self.offered_publications.contains(&ancestor_id) {
-                parent = Some(node.prefix());
-                break;
-            }
-            ancestor = node.parent();
-        }
+        let ancestors =
+            self.offered_ancestors(checkpoint.parent(), checkpoint.prefix().consumed_tokens)?;
+        let parent = ancestors.first().copied();
         let page_tokens = self.capabilities.page_tokens as u64;
         Some(PublishedCheckpoint {
+            capture_role: match checkpoint.retention_rank().role {
+                RetentionRole::Endpoint => flare_selene::CaptureRole::Endpoint,
+                RetentionRole::Message => flare_selene::CaptureRole::Message,
+                RetentionRole::Anchor => flare_selene::CaptureRole::Anchor,
+            },
             id,
             key: checkpoint.prefix(),
-            parent,
+            ancestors,
             bucket: checkpoint.bucket(),
             chain_pages: self.cache.page_chain(id).ok()?,
             tail_pages: (checkpoint.prefix().consumed_tokens / page_tokens
@@ -1806,6 +1924,49 @@ impl RequestScheduler {
                 as usize,
             slot: self.snapshot_slot(checkpoint.snapshot()),
         })
+    }
+
+    fn offered_ancestors(
+        &self,
+        mut ancestor: Option<CheckpointId>,
+        mut below: u64,
+    ) -> Option<Vec<PrefixKey>> {
+        let mut ancestors = Vec::new();
+        while let Some(ancestor_id) = ancestor {
+            let node = match self.cache.checkpoint(ancestor_id) {
+                Ok(node) => node,
+                // Keep a publication that the nearest readable ancestor already permits.
+                Err(_) if !ancestors.is_empty() => break,
+                Err(_) => return None,
+            };
+            let key = node.prefix();
+            if self.offered_publications.contains(&ancestor_id) && key.consumed_tokens < below {
+                below = key.consumed_tokens;
+                ancestors.push(key);
+                if ancestors.len() == flare_selene::MAX_PUBLISHED_ANCESTORS {
+                    break;
+                }
+            }
+            ancestor = node.parent();
+        }
+        Some(ancestors)
+    }
+
+    pub(crate) fn reoffer_publication(&mut self, id: CheckpointId) {
+        if !self.publications.contains(&id) {
+            if self.offered_publications.remove(&id) {
+                self.pending_reoffers.insert(id);
+            }
+            self.record_publication(id);
+        }
+    }
+
+    pub(crate) fn submitted_reoffer(&mut self, id: CheckpointId, retry: bool) -> bool {
+        if retry {
+            self.pending_reoffers.contains(&id)
+        } else {
+            self.pending_reoffers.remove(&id)
+        }
     }
 
     fn record_publication(&mut self, id: CheckpointId) {
@@ -2477,6 +2638,9 @@ impl RequestScheduler {
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
+        // One population update per round: this path for host estimates, `observe_packed_forecasts` for GPU confidence.
+        let host_population = proposal_source == speculation::ProposalSource::Mtp && !self.gpu_confidence();
+        let mut population = Vec::new();
         let mut useful_tokens = [0u64; REQUEST_LANES];
         let mut generated = Vec::new();
         let mut boundaries = Vec::new();
@@ -2532,14 +2696,20 @@ impl RequestScheduler {
             {
                 let vector = record.vector.as_ref().unwrap();
                 let offered = vector.offered_drafts as usize;
+                let survival = survival.map(|rows| rows[lane.request.slot as usize].as_slice());
                 request.acceptance.observe(
                     proposal_source,
                     record.generated_tokens as u32,
                     offered,
                     vector.accepted_drafts as usize,
                     vector.emitted_count > vector.accepted_drafts,
-                    survival.map(|rows| rows[lane.request.slot as usize].as_slice()),
+                    survival,
                 );
+                // The population learns from the rounds the request's own profile learns from.
+                if host_population {
+                    population.extend(speculation::observed_prefixes(offered, vector.accepted_drafts as usize,
+                        vector.emitted_count > vector.accepted_drafts, survival));
+                }
             }
             if record.status == 3 {
                 request.error_code = Some(record.error_code);
@@ -2621,6 +2791,9 @@ impl RequestScheduler {
             if request.pending == 0 {
                 request.scheduled_consumed = request.consumed_tokens;
             }
+        }
+        for (depth, value) in population {
+            self.forecasts.observe_population(depth, value as f32);
         }
         for lane in &step.lanes {
             let pending = self.pending_token_ceiling(lane.request) as u64;
@@ -2741,6 +2914,9 @@ impl RequestScheduler {
             request.prefix_snapshot = Some(capture.snapshot);
             self.stats.snapshot_publications += 1;
         } else {
+            if let PublishResult::Existing { id, ready: true } = result {
+                self.reoffer_publication(id);
+            }
             self.release_snapshot(capture.snapshot);
             if let PublishResult::Existing { id, ready: true } = result
                 && matches!(capture.resume, RequestPhase::Snapshot | RequestPhase::Finishing)
@@ -2864,6 +3040,11 @@ impl RequestScheduler {
             },
             ready_after: request.last_use,
         });
+        let refresh_recency = !request.preempted
+            && request.error_code.is_none()
+            && (publish || request.consumed_tokens > request.admission_reused_tokens
+                || request.generated_tokens > 0);
+        let prefix = request.prefix;
         let result = match &publication {
             Some(proposal) => {
                 let history = request.history.clone();
@@ -2871,6 +3052,27 @@ impl RequestScheduler {
             }
             None => None,
         };
+        // Completed work is conversation activity, including a client stop after progress.
+        // Preemption and cancellation before inference must not advance cache recency.
+        if refresh_recency && let Some(id) = result.map(PublishResult::id).or(prefix) {
+            let epoch = self.cache.new_use_epoch()?;
+            self.cache.touch(id, epoch)?;
+            // Duplicate publication can retain a different parent than the request's prefix.
+            let parent = if result.is_some() {
+                self.cache.checkpoint(id)?.parent()
+            } else {
+                None
+            };
+            if let Some(parent) = parent {
+                self.cache.touch(parent, epoch)?;
+            }
+            if self.track_publications {
+                if let Some(parent) = parent {
+                    self.reused.push(self.cache.checkpoint(parent)?.prefix());
+                }
+                self.reused.push(self.cache.checkpoint(id)?.prefix());
+            }
+        }
         let mut request = self.slots[handle.slot as usize].request.take().unwrap();
         if let Some(guard) = request.anchor_guard.take() { self.release_snapshot(guard); }
         let mut snapshot = request.terminal_snapshot;

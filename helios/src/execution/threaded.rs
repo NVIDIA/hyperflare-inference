@@ -18,7 +18,7 @@ use std::{
 const TIMEOUT: Duration = Duration::from_secs(120);
 const HANDOFF_POLL: Duration = Duration::from_micros(500);
 
-mod protocol;
+pub(super) mod protocol;
 #[cfg(test)]
 mod protocol_tests;
 
@@ -104,6 +104,33 @@ struct Pending {
     completions: Vec<Option<FrameCompletion>>,
 }
 
+impl protocol::PendingFrame for Pending {
+    fn fence(&self) -> Fence {
+        self.step.fence
+    }
+    fn graph(&self) -> usize {
+        self.step.graph
+    }
+    fn grammar(&self) -> bool {
+        self.step.grammar
+    }
+    fn committed(&self) -> bool {
+        self.committed
+    }
+    fn ready(&self) -> &[bool] {
+        &self.ready
+    }
+    fn ready_mut(&mut self) -> &mut [bool] {
+        &mut self.ready
+    }
+    fn completions(&self) -> &[Option<FrameCompletion>] {
+        &self.completions
+    }
+    fn completions_mut(&mut self) -> &mut [Option<FrameCompletion>] {
+        &mut self.completions
+    }
+}
+
 pub(crate) struct ThreadedExecutor {
     local: GraphExecutor,
     peers: Vec<Peer>,
@@ -118,6 +145,13 @@ impl ThreadedExecutor {
         }
         if ranks.is_empty() {
             return Err(invalid("tensor parallelism requires at least two ranks"));
+        }
+        if !manifest.persistent_workers.is_empty()
+            || ranks.iter().any(|rank| !rank.persistent_workers.is_empty())
+        {
+            return Err(invalid(
+                "persistent workers are only supported on single-rank cores",
+            ));
         }
         for rank in &ranks {
             rank.validate()?;
@@ -181,7 +215,13 @@ impl ThreadedExecutor {
             };
             if !matches!(ready, Ok(Reply::Initialized)) {
                 drop(peer.sender);
-                let _ = peer.thread.take().unwrap().join();
+                match peer.thread.take().unwrap().join() {
+                    Ok(shutdown) if shutdown.drained => {}
+                    _ => {
+                        eprintln!("rank initialization thread did not confirm drain; terminating the CUDA process");
+                        std::process::abort();
+                    }
+                }
                 return Err(ready
                     .err()
                     .unwrap_or_else(|| invalid("rank startup did not report readiness")));
@@ -417,6 +457,35 @@ impl ThreadedExecutor {
             }
             Ok(())
         })();
+        if result.is_err() {
+            // Best-effort drain and join of any peers that can still exit cleanly so live
+            // peer threads are not detached on poisoned teardown.
+            for peer in &self.peers {
+                let _ = peer.sender.send(Command::Drain);
+            }
+            for peer in &mut self.peers {
+                if peer.thread.is_none() {
+                    continue;
+                }
+                let deadline = Instant::now() + TIMEOUT;
+                let mut exited = false;
+                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    match receive(&peer.receiver, Some(remaining)) {
+                        Ok(Ok(Reply::Drained)) | Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            exited = true;
+                            break;
+                        }
+                        Ok(Ok(_)) => continue,
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    }
+                }
+                if exited {
+                    if let Some(thread) = peer.thread.take() {
+                        let _ = thread.join();
+                    }
+                }
+            }
+        }
         let shutdown = match result {
             Ok(()) => self.local.close(),
             Err(error) => self.local.abandon(error),
@@ -461,7 +530,10 @@ fn rank_loop(
                 send(Reply::Tuned(index, status))?;
             }
             Some(Command::FinishStartup) => {
-                executor.finish_startup()?;
+                if let Err(error) = executor.finish_startup() {
+                    let _ = replies.send(Err(error));
+                    return Ok(());
+                }
                 send(Reply::Started)?;
             }
             Some(Command::Prepare(step)) => {
@@ -524,6 +596,14 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
         (Some(a), Some(b)) if !a.same_layout(b) => return false,
         (Some(_), None) | (None, Some(_)) => return false,
         _ => {}
+    }
+    if a.persistent_workers.len() != b.persistent_workers.len()
+        || a.persistent_workers
+            .iter()
+            .zip(&b.persistent_workers)
+            .any(|(a, b)| a.worker_sm_count != b.worker_sm_count || a.graph != b.graph)
+    {
+        return false;
     }
     a.completion_token_capacity == b.completion_token_capacity
         && a.max_active == b.max_active

@@ -85,9 +85,22 @@ prefixes, and committed state agree across ranks.
 Confidence forecasts and verified acceptance are separate observations.
 A request's forecast averages its completed joint-prefix probabilities,
 starting from a population prior. That prior begins at `0.5^d` for the `d`-th
-draft position and moves toward each completed prefix probability with weight
-one sixty-fourth. Forecast and acceptance prefix estimates start with
-weight two, cap at 128, and age with a half-life of 128 generated tokens.
+draft position and moves toward each observed prefix value with weight one
+sixty-fourth. It is one mean per position across all requests, so it follows
+whichever traffic ran most recently. A model whose graphs allocate prefix
+lengths on the GPU takes the value from the completed prefix probability of
+each lane in the round's confidence sidecar; a model with any such graph is
+treated this way for all its rounds. Every other model takes it from the
+verification outcome: for each position a completed MTP round determined, the
+value is the reported survival, or one for an accepted position and zero for a
+rejected one. On this path only lanes whose request is live and whose status
+is not an error count, which are the rounds the request's own acceptance
+profile learns from. Each round updates the population once, by one of the two
+sources. On a model without GPU confidence a new request's MTP acceptance
+estimates start at the population with weight two; with GPU confidence, and
+for copy proposals, they start at `0.5^d`. Forecast and acceptance prefix
+estimates start with weight two, cap at 128, and age with a half-life of 128
+generated tokens.
 Unobserved suffixes retain their means. Ordinary selection uses the historical
 means; funded acceptance learning uses the bounded optimistic estimate
 `min(1, mean + sqrt(ln(20) / (2 * aged_weight)))`.
@@ -125,7 +138,8 @@ output delivery: g/z
 Only decoding requests have a delivery coordinate or output-age cost. Normalized
 service prices follow the entropy-dual update in `scheduling-utility.md`. Actual
 service updates history; expected acceptance scores choices. Conditional
-acceptance is request-local and respects available proposals, grammar and stop
+acceptance is estimated per request, started from the population mean when the
+model reports no GPU confidence, and respects available proposals, grammar and stop
 restrictions, output limits, and remaining context.
 
 Let `T` be the graph duration in milliseconds and `A_i` the age of a decoding
@@ -171,11 +185,26 @@ candidate serving two requests. Bounded cost-refresh probes are separate
 from ordinary selection. Selection does not enumerate exponentially many
 request subsets.
 
-Each prefill capacity competes using the actual tokens it can consume. Atomic
-image spans, system boundaries, and prompt length restrict logical work. A
-4096-token graph processing a 64-token tail earns 64 prompt units and at most one
-output token. There is no smallest-fitting-shape filter, duration ceiling,
-forced oldest-request filter, or per-chunk prefill lateness cost.
+Each prefill capacity competes using the checkpoint selection loop's predicted
+work, including optional cuts and their split and copy budgets
+([checkpoint retention](#prerequisites-and-completion)), without quoting snapshot
+storage. Estimates and quoted selections are cached separately within each
+planning scope. Both paths reuse a stored selection when it contains any
+non-anchor cut. Submission quotes storage for the winning prompt row. When no
+quote fails, estimated and submitted work agree. Storage shortage can change
+which cuts fit the work budget, so the estimate and quoted selection can differ
+in either direction. If the quoted work differs from the winning estimate, an
+ordinary prefill or mixed plan advances toward the quoted cut up to the catalog
+maximum and uses the smallest catalog capacity covering that work, with duration
+and value recomputed. Mixed plans resize only the prompt capacity among shapes
+with the same batch capacity and decode width; decode lanes retain their token
+counts. If a required lookup is unavailable, it retains the winning candidate
+and clips work to that candidate's capacity. Refresh and discovery plans
+retain their capacities and clip work to fit. Atomic image spans, feature windows,
+and prompt length also restrict logical work. A graph with 64 useful prompt tokens
+earns 64 prompt units and at most one output token, regardless of physical capacity.
+Candidate scoring has no smallest-fitting-shape filter, duration ceiling, forced
+oldest-request filter, or per-chunk prefill lateness cost.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a
@@ -426,9 +455,11 @@ anchor; the prompt end substitutes when there is no eligible message. Earlier
 messages are considered in reverse order, followed by a distinct prompt end.
 Additional prefill splits and snapshot copies must fit a request-local allowance
 of `scheduler_checkpoint_extra_work_fraction` times estimated uncached prefill
-work, defaulting to 0.05. Unknown costs disable extras while preserving anchor
-eligibility. Productive completed decode earns the same fraction of measured
-time for a distinct terminal capture. There is no fixed capture count or
+work, defaulting to 0.05. Prefill predictions use measured costs, including stale
+estimates retained for dispatch ranking. Unknown prefill costs and unknown or
+stale snapshot-copy costs disable extras while preserving anchor eligibility.
+Productive completed decode earns the same fraction of measured time for a
+distinct terminal capture. There is no fixed capture count or
 concurrency-based snapshot share.
 
 An extra prefill cut is selected only with an obtainable snapshot destination.

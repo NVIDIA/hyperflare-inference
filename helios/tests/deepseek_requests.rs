@@ -304,7 +304,7 @@ fn typed_native_settings_do_not_require_jinja_and_legacy_settings_do() {
     std::fs::remove_file(asset.path).unwrap();
     assert!(
         serde_json::from_value::<FrontendSettings>(
-            json!({"prompt_encoder":3,"tokenizer":{},"eos_token_ids":[257]})
+            json!({"prompt_encoder":-1,"tokenizer":{},"eos_token_ids":[257]})
         )
         .is_err()
     );
@@ -707,5 +707,220 @@ fn required_and_named_tools_keep_the_thinking_prompt() {
             assert_eq!(named.output.content.tools[0]["function"]["name"], "lookup");
         }
         assert!(fixture.prepare(json!({"tool_choice":"required","tools":[]})).is_err());
+    }
+}
+
+
+#[test]
+fn strict_function_tools_constrain_dsml_for_v4_and_v41_and_parse_end_to_end() {
+    let weather_schema = json!({
+        "type": "object",
+        "properties": {
+            "location": {"type": "string", "minLength": 2},
+            "days": {"type": "integer", "minimum": 1, "maximum": 7},
+            "meta": {
+                "type": "object",
+                "properties": {
+                    "units": {"enum": ["celsius", "fahrenheit", "literal </｜DSML｜parameter>", "literal </｜DSML｜ parameter>"]}
+                },
+                "required": ["units"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["location", "days", "meta"],
+        "additionalProperties": false
+    });
+
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let f = Fixture::new(encoder);
+        let (block, invoke, parameter) = if encoder == PromptEncoder::DeepseekV4 {
+            ("tool_calls", "invoke", "parameter")
+        } else {
+            (" calls", " invoke", " parameter")
+        };
+
+        let tools = json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "strict": true,
+                    "parameters": weather_schema
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "free_note",
+                    "strict": false,
+                    "parameters": {"type": "object"}
+                }
+            }
+        ]);
+
+        let auto_opts = json!({
+            "tools": tools,
+            "tool_choice": "auto"
+        });
+        let valid_call = format!(
+            "<｜DSML｜{block}>\n<｜DSML｜{invoke} name=\"get_weather\">\n\
+             <｜DSML｜{parameter} name=\"location\" string=\"true\">Berlin</｜DSML｜{parameter}>\n\
+             <｜DSML｜{parameter} name=\"days\" string=\"false\">3</｜DSML｜{parameter}>\n\
+             <｜DSML｜{parameter} name=\"meta\" string=\"false\">{{\"units\":\"celsius\"}}</｜DSML｜{parameter}>\n\
+             </｜DSML｜{invoke}>\n</｜DSML｜{block}>"
+        );
+
+        // Auto allows plain prose, prose + strict call, non-strict tool, or undeclared tool
+        assert!(f.accepts(auto_opts.clone(), "Thinking.</think>It is sunny today."));
+        assert!(f.accepts(
+            auto_opts.clone(),
+            &format!("Thinking.</think>Checking weather.\n\n{valid_call}")
+        ));
+        assert!(f.accepts(
+            auto_opts.clone(),
+            &format!(
+                "Thinking.</think><｜DSML｜{block}><｜DSML｜{invoke} name=\"free_note\"><｜DSML｜{parameter} name=\"any\" string=\"true\">ok</｜DSML｜{parameter}></｜DSML｜{invoke}></｜DSML｜{block}>"
+            )
+        ));
+        assert!(f.accepts(
+            auto_opts.clone(),
+            &format!(
+                "Thinking.</think><｜DSML｜{block}><｜DSML｜{invoke} name=\"undeclared_helper\"><｜DSML｜{parameter} name=\"x\" string=\"false\">1</｜DSML｜{parameter}></｜DSML｜{invoke}></｜DSML｜{block}>"
+            )
+        ));
+
+        // Strict tool rejects wrong string="true"/"false" tag, missing required param, or extra param
+        let bad_string_flag = format!(
+            "Thinking.</think><｜DSML｜{block}><｜DSML｜{invoke} name=\"get_weather\">\
+             <｜DSML｜{parameter} name=\"location\" string=\"true\">Berlin</｜DSML｜{parameter}>\
+             <｜DSML｜{parameter} name=\"days\" string=\"true\">3</｜DSML｜{parameter}>\
+             <｜DSML｜{parameter} name=\"meta\" string=\"false\">{{\"units\":\"celsius\"}}</｜DSML｜{parameter}>\
+             </｜DSML｜{invoke}></｜DSML｜{block}>"
+        );
+        assert!(!f.accepts(auto_opts.clone(), &bad_string_flag));
+
+        let missing_param = format!(
+            "Thinking.</think><｜DSML｜{block}><｜DSML｜{invoke} name=\"get_weather\">\
+             <｜DSML｜{parameter} name=\"location\" string=\"true\">Berlin</｜DSML｜{parameter}>\
+             </｜DSML｜{invoke}></｜DSML｜{block}>"
+        );
+        assert!(!f.accepts(auto_opts.clone(), &missing_param));
+
+        // Required + parallel_tool_calls: false forbids plain prose and forbids a second invoke
+        let req_single = json!({
+            "tools": tools,
+            "tool_choice": "required",
+            "parallel_tool_calls": false
+        });
+        assert!(!f.accepts(req_single.clone(), "Thinking.</think>Just text."));
+        assert!(f.accepts(req_single.clone(), &format!("Thinking.</think>{valid_call}")));
+        let double_invoke = format!(
+            "Thinking.</think><｜DSML｜{block}>\n\
+             <｜DSML｜{invoke} name=\"get_weather\">\
+             <｜DSML｜{parameter} name=\"location\" string=\"true\">Berlin</｜DSML｜{parameter}>\
+             <｜DSML｜{parameter} name=\"days\" string=\"false\">3</｜DSML｜{parameter}>\
+             <｜DSML｜{parameter} name=\"meta\" string=\"false\">{{\"units\":\"celsius\"}}</｜DSML｜{parameter}>\
+             </｜DSML｜{invoke}>\n\
+             <｜DSML｜{invoke} name=\"free_note\"></｜DSML｜{invoke}>\n\
+             </｜DSML｜{block}>"
+        );
+        assert!(!f.accepts(req_single, &double_invoke));
+
+        // Non-thinking required mode (OutputStart::ToolBody, prompt already opened `<｜DSML｜...calls>`)
+        let nonthink_req = json!({
+            "enable_thinking": false,
+            "tools": [tools[0].clone()],
+            "tool_choice": "required"
+        });
+        let tail_only = format!(
+            "\n<｜DSML｜{invoke} name=\"get_weather\">\n\
+             <｜DSML｜{parameter} name=\"location\" string=\"true\">Tokyo</｜DSML｜{parameter}>\n\
+             <｜DSML｜{parameter} name=\"days\" string=\"false\">2</｜DSML｜{parameter}>\n\
+             <｜DSML｜{parameter} name=\"meta\" string=\"false\">{{\"units\":\"fahrenheit\"}}</｜DSML｜{parameter}>\n\
+             </｜DSML｜{invoke}>\n</｜DSML｜{block}>"
+        );
+        assert!(f.accepts(nonthink_req, &tail_only));
+
+        // Verify token masks and the exact arguments emitted by the output parser.
+        let value = format!("literal </｜DSML｜{parameter}>");
+        let completion = format!("Thinking.</think>Checking.\n\n{}", valid_call.replace("celsius", &value));
+        assert!(f.accepts(auto_opts.clone(), &completion));
+        let prepared = f.prepare(auto_opts.clone()).unwrap();
+        // Surface spelling alone cannot close a raw parameter. Replace just
+        // its DSML control ID with ordinary tokens decoding to the same text.
+        let marker = f.frontend.tokenizer().token_to_id("｜DSML｜").unwrap();
+        let pieces: Vec<_> = ["｜", "DSML", "｜"].into_iter().flat_map(|s| f.frontend.encode(s,false).unwrap()).collect();
+        let original = f.frontend.encode(&completion, false).unwrap();
+        for n in [0, 3] {
+            let at = original.iter().enumerate().filter(|(_, id)| **id == marker).nth(n).unwrap().0;
+            let mut ids = original.clone(); ids.splice(at..at+1, pieces.iter().copied());
+            let mut g = f.prepare(auto_opts.clone()).unwrap().prompt.grammar.unwrap();
+            assert!(!ids.into_iter().chain(f.config.eos_token_ids.iter().copied()).all(|id| g.advance(id).is_ok()), "split marker {n} was treated as control");
+        }
+        let parse_arguments = |completion: &str| {
+        let mut output = flare_helios::output::OutputPipeline::new(prepared.output.clone());
+        let mut decoder = f.frontend.incremental_decoder(false);
+        let mut events = Vec::new();
+        for id in f.frontend.encode(completion, false).unwrap() {
+            events.extend(output.push(flare_helios::output::Input::Token(id)).unwrap());
+            if let Some(text) = decoder.push(&[id]).unwrap() {
+                events.extend(output.push(flare_helios::output::Input::Text(&text)).unwrap());
+            }
+        }
+        let rest = decoder.finish().unwrap();
+        if !rest.is_empty() {
+            events.extend(output.push(flare_helios::output::Input::Text(&rest)).unwrap());
+        }
+        events.extend(output.finish(flare_helios::output::Termination::Eos).unwrap());
+        let args_str: String = events
+            .iter()
+            .filter_map(|e| match e {
+                flare_helios::output::Event::ToolArguments { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        serde_json::from_str::<Value>(&args_str).unwrap()
+        };
+        assert_eq!(parse_arguments(&completion),json!({"location":"Berlin","days":3,"meta":{"units":value}}));
+        let non_strict = format!("Thinking.</think><｜DSML｜{block}><｜DSML｜{invoke} name=\"free_note\"><｜DSML｜{parameter} name=\"x\" string=\"false\">5\" pipe</｜DSML｜{parameter}></｜DSML｜{invoke}></｜DSML｜{block}>");
+        assert_eq!(parse_arguments(&non_strict),json!({"x":"5\" pipe"}));
+        let big_int = "123456789012345678901234567890";
+        let big_opts = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "big_counter",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "n": { "type": "integer", "minimum": 1 } },
+                        "required": ["n"],
+                        "additionalProperties": false
+                    }
+                }
+            }]
+        });
+        let big_call = format!("Thinking.</think><｜DSML｜{block}><｜DSML｜{invoke} name=\"big_counter\"><｜DSML｜{parameter} name=\"n\" string=\"false\">{big_int}</｜DSML｜{parameter}></｜DSML｜{invoke}></｜DSML｜{block}>");
+        assert!(f.accepts(big_opts.clone(), &big_call));
+        let big_prepared = f.prepare(big_opts).unwrap();
+        let mut big_out = flare_helios::output::OutputPipeline::new(big_prepared.output);
+        let mut big_dec = f.frontend.incremental_decoder(false);
+        let mut big_events = Vec::new();
+        for id in f.frontend.encode(&big_call, false).unwrap() {
+            big_events.extend(big_out.push(flare_helios::output::Input::Token(id)).unwrap());
+            if let Some(txt) = big_dec.push(&[id]).unwrap() {
+                big_events.extend(big_out.push(flare_helios::output::Input::Text(&txt)).unwrap());
+            }
+        }
+        let tail = big_dec.finish().unwrap();
+        if !tail.is_empty() {
+            big_events.extend(big_out.push(flare_helios::output::Input::Text(&tail)).unwrap());
+        }
+        big_events.extend(big_out.finish(flare_helios::output::Termination::Eos).unwrap());
+        let big_args: String = big_events.iter().filter_map(|e| match e {
+            flare_helios::output::Event::ToolArguments { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(big_args, format!("{{\"n\": {big_int}}}"));
     }
 }

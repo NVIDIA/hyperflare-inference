@@ -127,6 +127,9 @@ impl RecipientOutput {
             match self.state {
                 State::Header => {
                     let Some(at) = self.buffer.find(MESSAGE) else {
+                        if self.buffer.len() + self.header.len() > 1 << 20 {
+                            return Err("recipient header exceeds the 1 MiB parser bound".into());
+                        }
                         break;
                     };
                     if self.buffer.starts_with(START) {
@@ -168,6 +171,9 @@ impl RecipientOutput {
                         .filter_map(|m| self.buffer.find(m).map(|at| (at, m)))
                         .min_by_key(|(at, _)| *at);
                     if matches!(self.state, State::Tool) {
+                        if self.buffer.len() > 1 << 20 {
+                            return Err("recipient tool call exceeds the 1 MiB parser bound".into());
+                        }
                         let Some((at, marker)) = boundary else { break };
                         let body = unescape(&self.buffer[..at]);
                         for (name, arguments) in self.parse_calls(&body)? {
@@ -606,5 +612,26 @@ mod tests {
         parser.push(Input::Token(2)).unwrap();
         parser.push(Input::Text("<|message|><atem:function_calls><atem:invoke name=\"lookup\"></atem:invoke><atem:invoke name=\"lookup\"></atem:invoke></atem:function_calls>")).unwrap();
         assert!(parser.finish(Termination::Eos).is_err());
+    }
+
+    #[test]
+    fn header_and_tool_buffers_enforce_one_mib_bound() {
+        let oversized = "x".repeat((1 << 20) + 1);
+        let mut header_parser = parser();
+        let error = header_parser
+            .push(Input::Text(&oversized))
+            .err()
+            .expect("oversized recipient header must fail");
+        assert!(error.to_string().contains("1 MiB"), "{error}");
+
+        let mut tool_parser = parser();
+        tool_parser.push(Input::Text(" to=tool")).unwrap();
+        tool_parser.push(Input::Token(2)).unwrap();
+        tool_parser.push(Input::Text("<|message|>")).unwrap();
+        let error = tool_parser
+            .push(Input::Text(&oversized))
+            .err()
+            .expect("oversized recipient tool call must fail");
+        assert!(error.to_string().contains("1 MiB"), "{error}");
     }
 }

@@ -9,7 +9,9 @@ use super::{
     ExportResult as Result,
     io::{self, Identity, Source},
 };
-use serde::{Deserialize, Serialize};
+pub(crate) use helios_core::runtime_core::{
+    LegacyLayout as Layout, MAX_LEGACY_HEADER as MAX_HEADER, is_snapshot_blob_name as blob_name,
+};
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
@@ -20,140 +22,11 @@ use std::{
     },
 };
 
-pub(crate) const MAX_INDEX: u64 = 128 << 20;
-const MAX_HEADER: u64 = 64 << 10;
-const MAX_PAYLOAD: u64 = (64u64 << 30) - 4096;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Layout {
-    pub(crate) version: u32,
-    #[serde(deserialize_with = "unique_files")]
-    pub(crate) files: BTreeMap<String, Vec<(u64, String)>>,
-}
-fn unique_files<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, Vec<(u64, String)>>, D::Error> {
-    struct Unique;
-    impl<'de> serde::de::Visitor<'de> for Unique {
-        type Value = BTreeMap<String, Vec<(u64, String)>>;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("unique logical core files")
-        }
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> std::result::Result<Self::Value, A::Error> {
-            let mut result = BTreeMap::new();
-            while let Some((name, parts)) = map.next_entry::<String, Vec<(u64, String)>>()? {
-                if result.insert(name, parts).is_some() {
-                    return Err(serde::de::Error::custom("duplicate logical core file"));
-                }
-            }
-            Ok(result)
-        }
-    }
-    deserializer.deserialize_map(Unique)
-}
-impl Layout {
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.version != 1 || !self.files.contains_key("") || self.files.len() > 100 {
-            return Err("invalid snapshot layout".into());
-        }
-        let mut count = 0;
-        let mut lengths = BTreeMap::new();
-        for (name, parts) in &self.files {
-            if !name.is_empty() {
-                validate_filename(name)?;
-            }
-            let mut total = 0u64;
-            for (size, blob) in parts {
-                count += 1;
-                if *size == 0
-                    || *size > MAX_PAYLOAD
-                    || count > 65536
-                    || (!blob.is_empty() && !blob_name(blob))
-                {
-                    return Err("invalid snapshot payload segment".into());
-                }
-                total = total
-                    .checked_add(*size)
-                    .ok_or("logical core length overflow")?;
-                if !blob.is_empty()
-                    && lengths
-                        .insert(blob, *size)
-                        .is_some_and(|previous| previous != *size)
-                {
-                    return Err("conflicting snapshot blob lengths".into());
-                }
-            }
-        }
-        Ok(())
-    }
-}
-pub(crate) fn blob_name(name: &str) -> bool {
-    name.len() == 76
-        && name.ends_with(".safetensors")
-        && name.as_bytes()[..64]
-            .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-}
 pub(crate) fn validate_filename(name: &str) -> Result<()> {
-    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-    if name.len() > 255
-        || !name.ends_with(".safetensors")
-        || name.contains("..")
-        || !name
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-        || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
-    {
-        return Err("invalid core companion filename".into());
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Format {
-    format: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Tensor {
-    dtype: String,
-    shape: [u64; 1],
-    data_offsets: [u64; 2],
-}
-impl Tensor {
-    fn length(&self) -> Result<u64> {
-        if self.dtype != "U8"
-            || self.data_offsets[1].checked_sub(self.data_offsets[0]) != Some(self.shape[0])
-        {
-            return Err("invalid core byte tensor".into());
-        }
-        Ok(self.shape[0])
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Header {
-    #[serde(rename = "__metadata__")]
-    metadata: Format,
-    #[serde(rename = "flare.payload")]
-    payload: Tensor,
-    #[serde(rename = "flare.metadata", default)]
-    index: Option<Tensor>,
-    #[serde(rename = "flare.layout", default)]
-    layout: Option<Tensor>,
+    helios_core::runtime_core::validate_companion_filename(name)
+        .map_err(|e| e.to_string().into())
 }
 
 pub(crate) struct Container {
@@ -171,75 +44,27 @@ impl Container {
     }
     pub(crate) fn from_file(file: Arc<File>) -> Result<Self> {
         let before = Identity::of(&file)?;
-        let mut prefix = [0; 8];
-        io::read_exact_at(&file, &mut prefix, 0)?;
-        let size = u64::from_le_bytes(prefix);
-        if size == 0 || size > MAX_HEADER || (size + 8) % 4096 != 0 {
-            return Err("invalid core header size".into());
-        }
-        let base = size + 8;
-        let mut bytes = vec![0; size as usize];
-        io::read_exact_at(&file, &mut bytes, 8)?;
-        let header: Header = serde_json::from_slice(&bytes)?;
-        let header_json = serde_json::from_slice(&bytes)?;
-        let payload_length = header.payload.length()?;
-        if header.payload.data_offsets[0] != 0 {
-            return Err("invalid core payload range".into());
-        }
-        let mut end = payload_length;
+        let header = helios_core::runtime_core::read_legacy_header(&file)
+            .map_err(|e| e.to_string())?;
+        let header_json = serde_json::from_slice(&header.raw_header)?;
         let mut envelope = Vec::new();
-        let mut layout = None;
-        match header.metadata.format.as_str() {
-            "flare-data" => {
-                if header.index.is_some() || header.layout.is_some() {
-                    return Err("unexpected companion metadata".into());
-                }
-            }
-            "flare" | "flare-staging" | "flare-snapshot" => {
-                let index = header.index.ok_or("missing model metadata")?;
-                let length = index.length()?;
-                if length == 0 || length > MAX_INDEX || index.data_offsets[0] != payload_length {
-                    return Err("invalid model index size or range".into());
-                }
-                end = index.data_offsets[1];
-                envelope.resize(length as usize, 0);
-                io::read_exact_at(&file, &mut envelope, base + payload_length)?;
-                if header.metadata.format == "flare-snapshot" {
-                    let tensor = header.layout.ok_or("missing snapshot layout")?;
-                    let count = tensor.length()?;
-                    if payload_length != 0
-                        || tensor.data_offsets[0] != end
-                        || count == 0
-                        || count > MAX_INDEX
-                    {
-                        return Err("invalid snapshot layout tensor".into());
-                    }
-                    let mut encoded = vec![0; count as usize];
-                    io::read_exact_at(&file, &mut encoded, base + end)?;
-                    let decoded: Layout = serde_json::from_slice(&encoded)?;
-                    decoded.validate()?;
-                    layout = Some(decoded);
-                    end = tensor.data_offsets[1];
-                } else if header.layout.is_some() {
-                    return Err("unexpected snapshot layout".into());
-                }
-            }
-            _ => return Err("not a Flare core".into()),
+        if let Some(length) = header.index_length {
+            envelope.resize(length as usize, 0);
+            io::read_exact_at(&file, &mut envelope, header.data_start + header.payload_length)?;
         }
-        if file.metadata()?.len() != base.checked_add(end).ok_or("container length overflow")? {
-            return Err("safetensors data length differs from model core".into());
-        }
+        let layout = Layout::read_from_header(&file, &header)
+            .map_err(|e| e.to_string())?;
         if before != Identity::of(&file)? {
             return Err("core metadata changed while reading".into());
         }
         Ok(Self {
             header_json,
             file,
-            base,
-            payload_length,
+            base: header.data_start,
+            payload_length: header.payload_length,
             envelope,
             layout,
-            format: header.metadata.format,
+            format: header.format,
         })
     }
 }

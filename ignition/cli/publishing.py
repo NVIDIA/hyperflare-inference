@@ -14,6 +14,13 @@ def validate_repository(repository):
         raise UsageError('export repository must be a portable namespace/repository identifier')
 
 
+def _embedded_profiles():
+    import json
+    import flare_heliopause
+
+    return json.loads(flare_heliopause.embedded_publishers())
+
+
 def convert(args):
     import json
     from pathlib import Path
@@ -28,8 +35,7 @@ def convert(args):
         kind = payload_form(args.core)
         if kind == 'legacy':
             raise UsageError('legacy core format is unsupported; re-export the model with Ignition')
-        embedded = Path(__file__).parents[2] / 'helios/src/runtime_core/publishers.json'
-        profiles = json.loads(embedded.read_text()) if embedded.is_file() else []
+        profiles = _embedded_profiles()
         paths = list(args.publisher_keys)
         development = configuration.path.parent / 'development-publisher.json'
         if development.is_file():
@@ -113,8 +119,7 @@ def key_password(args):
 def _public_profiles(args, configuration):
     import json
     from pathlib import Path
-    embedded = Path(__file__).parents[2] / 'helios/src/runtime_core/publishers.json'
-    profiles = json.loads(embedded.read_text()) if embedded.is_file() else []
+    profiles = _embedded_profiles()
     paths = list(getattr(args, 'publisher_keys', []) or [])
     development = getattr(args, 'development_publisher', None)
     if development is None:

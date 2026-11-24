@@ -25,8 +25,6 @@ def test_request_preserves_explicit_roots_and_allocation_granularity(monkeypatch
     from ignition.preparation import runtime_core
 
     monkeypatch.setitem(sys.modules, "flare_heliopause", SimpleNamespace(current_context=lambda: (123, 0)))
-    monkeypatch.setitem(sys.modules, "ignition.components.weights",
-                        SimpleNamespace(record_final_fp4_expert_provenance_all=lambda: None))
     monkeypatch.setitem(sys.modules, "ignition.preparation.rebuild_manifest",
                         SimpleNamespace(rebuild_weights_metadata=lambda value: None,
                                         weight_payload_request=lambda value: None))

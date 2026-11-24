@@ -18,6 +18,7 @@ use flare::download_cache;
 mod core_cache;
 #[cfg(unix)]
 mod distribution;
+mod doctor;
 mod environment;
 #[cfg(unix)]
 mod fabric;
@@ -56,7 +57,22 @@ extern "C" fn stop(_: libc::c_int) {
 #[cfg(all(feature = "roce", not(target_os = "linux")))]
 compile_error!("the roce feature requires Linux");
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Target soft `RLIMIT_NOFILE` raised at CLI startup when the hard limit allows it.
+/// Large TP directory cores and active serving connections exceed the common Unix 1024 default.
+const STARTUP_OPEN_FILE_LIMIT: u64 = 65_536;
+
+fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
+    flare_helios::raise_open_file_limit(STARTUP_OPEN_FILE_LIMIT);
     let matches = cli::Cli::command().get_matches();
     let mut parsed = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let home = environment::home_directory()?;
@@ -72,18 +88,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| error.to_string())?;
     let mut args = match parsed.command {
         cli::Command::Run(args) => *args,
-        cli::Command::Download(args) => return hub::run_download(args),
-        cli::Command::Inspect(args) => return inspect::run(args),
-        cli::Command::Models(args) => return cache_commands::run(args),
+        cli::Command::Download(args) => {
+            hub::run_download(args)?;
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        cli::Command::Inspect(args) => {
+            inspect::run(args)?;
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        cli::Command::Doctor(args) => {
+            return Ok(if doctor::run(args)? {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            });
+        }
+        cli::Command::Models(args) => {
+            cache_commands::run(args)?;
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
         cli::Command::HardwareRevision { gpu_count } => {
             let devices: Vec<_> = (0..gpu_count).collect();
             environment::configure(&devices)?;
             println!("{}", hardware::detect(gpu_count as usize)?);
-            return Ok(());
+            return Ok(std::process::ExitCode::SUCCESS);
         }
         #[cfg(unix)]
         cli::Command::CheckpointTransport { socket } => {
-            return fabric_transport::run(&socket).map_err(|e| e.to_string().into());
+            fabric_transport::run(&socket).map_err(|e| e.to_string())?;
+            return Ok(std::process::ExitCode::SUCCESS);
         }
         #[cfg(windows)]
         cli::Command::Agent(_) => {
@@ -95,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(unix)]
         cli::Command::Agent(agent_args) => {
-            return match agent_args.command {
+            match agent_args.command {
                 None => orbit::agent::serve(
                     &agent_args.listen,
                     orbit::store::AgentDir::new(orbit::store::AgentDir::default_root()),
@@ -118,12 +151,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|mut client| client.pair(&hosts, code.as_deref())),
                 Some(cli::AgentCommand::Reset) => orbit::agent::reset(),
             }
-            .map_err(|e| e.to_string().into());
+            .map_err(|e| e.to_string())?;
+            return Ok(std::process::ExitCode::SUCCESS);
         }
         #[cfg(unix)]
         cli::Command::Orbit(orbit_args) => {
-            return orbit_command(orbit_args, matches.subcommand_matches("orbit").unwrap())
-                .map_err(|e| e.to_string().into());
+            orbit_command(orbit_args, matches.subcommand_matches("orbit").unwrap())
+                .map_err(|e| e.to_string())?;
+            return Ok(std::process::ExitCode::SUCCESS);
         }
         cli::Command::Trust {
             command:
@@ -132,7 +167,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     trust_store,
                 },
         } => {
-            return trust::revoke(&fingerprint, trust_store.as_deref());
+            trust::revoke(&fingerprint, trust_store.as_deref())?;
+            return Ok(std::process::ExitCode::SUCCESS);
         }
     };
     if args.tensor_request.is_some() {
@@ -151,7 +187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         configure_core_devices(&mut args, &authorized, &mut progress)?;
         progress.finish_animation();
-        return tensors::run(&args, authorized);
+        tensors::run(&args, authorized)?;
+        return Ok(std::process::ExitCode::SUCCESS);
     }
     #[cfg(windows)]
     if args.rank.is_some()
@@ -255,18 +292,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(peers) = launched {
             peers.finish().map_err(|e| e.to_string())?;
         }
-        return Ok(());
+        return Ok(std::process::ExitCode::SUCCESS);
     }
     if membership.is_some() {
         cluster::require_transport()?;
     }
     let options = args.load_options();
     let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
-    let shape = cluster::Shape::from_flags(args.roce_ring, args.roce_chain);
+    let bypass_performance_check = args.bypass_performance_check;
+    let routing = cluster::Routing {
+        shape: cluster::Shape::from_flags(args.roce_ring, args.roce_chain),
+        links: cluster::Links::from_switch_only(args.serving.roce_switch_only),
+    };
     let rendezvous = args.rendezvous;
     // SAFETY: The trusted core owners remain live until every rank drains.
     let owner = unsafe {
-        let mut local = Ok;
+        struct LocalAgreement {
+            bypass_performance_check: bool,
+        }
+        impl flare_helios::runtime_core::CacheAgreement for LocalAgreement {
+            fn caches(&mut self, local: (u64, u64)) -> flare_helios::Result<(u64, u64)> {
+                Ok(local)
+            }
+
+            fn after_gpu_init(&mut self, pci_bus_ids: &[String]) -> flare_helios::Result<()> {
+                if !self.bypass_performance_check && pci_bus_ids.len() > 1 {
+                    doctor::check_pcie_tp_after_gpu_init(pci_bus_ids)
+                        .map_err(flare_helios::Error::from)?;
+                }
+                Ok(())
+            }
+        }
+        let mut local = LocalAgreement {
+            bypass_performance_check,
+        };
         let agreement: &mut dyn flare_helios::runtime_core::CacheAgreement =
             match membership.as_mut() {
                 Some(membership) => membership,
@@ -281,7 +340,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let cluster = match cluster {
         Some((cluster, cluster::Membership::Peer(stream), address)) => {
-            return serve_peer(owner, &cluster, stream, &address, progress, shape);
+            serve_peer(owner, &cluster, stream, &address, progress, routing)?;
+            return Ok(std::process::ExitCode::SUCCESS);
         }
         Some((cluster, cluster::Membership::Zero(streams), _)) => Some((cluster, streams)),
         None => None,
@@ -308,12 +368,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config["api_key"] = key.into();
     config["thinking_token_budget"] = serde_json::json!(configuration.thinking_token_budget());
     phase.finish(config["model_id"].as_str().unwrap_or_default());
-    serve(owner, config, progress, cluster, shape)?;
+    serve(owner, config, progress, cluster, routing)?;
     #[cfg(unix)]
     if let Some(peers) = launched {
         peers.finish().map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 fn configure_core_devices(
@@ -394,10 +454,11 @@ fn load_core(
         let entry = hub::download(
             text,
             &hub_options,
-            args.gpus.len().max(1),
+            args.gpus.len(),
             &args.publisher_keys,
             args.trust_store.as_deref(),
             &[],
+            progress,
         )?;
         let directory = entry.directory().to_path_buf();
         lease = Some(entry);
@@ -497,10 +558,10 @@ fn serve_peer(
     stream: flare_helios::execution::RankStream,
     address: &str,
     mut progress: StartupProgress,
-    shape: cluster::Shape,
+    routing: cluster::Routing,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut manifest = owner.manifests()?.remove(0);
-    let mut joined = cluster::peer(&owner, cluster, stream, &progress, shape)?;
+    let mut joined = cluster::peer(&owner, cluster, stream, &progress, routing)?;
     let records = joined.records.take();
     manifest.collectives = Some(cluster::health(&joined.transport));
     progress.finish_animation();
@@ -551,7 +612,7 @@ fn serve(
         flare_helios::runtime_core::ClusterRank,
         Vec<flare_helios::execution::RankStream>,
     )>,
-    shape: cluster::Shape,
+    routing: cluster::Routing,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if cluster.is_none() {
         return serve_local(owner, config, progress);
@@ -564,7 +625,7 @@ fn serve(
     let mut transport = None;
     let peers = match cluster {
         Some((_, streams)) => {
-            let joined = cluster::rank_zero(&owner, streams, &progress, shape)?;
+            let joined = cluster::rank_zero(&owner, streams, &progress, routing)?;
             manifest.collectives = Some(cluster::health(&joined.transport));
             transport = Some(joined.transport);
             Some(flare_helios::execution::RankPeers::Processes(

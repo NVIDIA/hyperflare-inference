@@ -17,6 +17,7 @@ fn main() {
 }
 
 fn start() -> std::io::Result<()> {
+    flare_eos::raise_open_file_limit(65_536);
     match config::parse_args(std::env::args().skip(1))? {
         Parsed::Help => {
             println!("{}", config::help_text());

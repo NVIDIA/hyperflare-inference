@@ -55,19 +55,35 @@ impl PrefixCacheOffload {
             || self.pool.is_some()
     }
 
+    pub fn pool_only(&self) -> bool {
+        self.pool.is_some() && self.memory_bytes.unwrap_or(0) == 0
+            && (self.disk.is_none() || self.disk_limit == Some(0))
+    }
+
+    /// `local_pages` is the largest GPU page capacity when all ranks share this process.
     pub fn headroom_with_inputs(
         &self,
         ranks: usize,
         layout: &Layout,
         max_active: usize,
         inputs: bool,
+        local_pages: Option<u64>,
     ) -> Result<(u64, u64)> {
         if !self.enabled() {
             return Ok((0, 0));
         }
         let memory = self.memory_bytes.unwrap_or(0);
         let disk = self.disk.is_some() && self.disk_limit != Some(0);
-        let intake = if memory != 0 || disk {
+        let capture = local_pages.filter(|_| self.pool_only());
+        let intake = if let Some(pages) = capture {
+            let chain = pages.checked_add(layout.row_slots() as u64)
+                .ok_or("pool capture slot count overflow")?;
+            let budget = host_pool_budget(0)? / layout.page_record_bytes;
+            if chain > budget {
+                return Err("host budget cannot hold a full pool capture".into());
+            }
+            chain.max(intake_slots(layout, max_active) as u64).min(budget)
+        } else if memory != 0 || disk {
             intake_slots(layout, max_active)
                 .min((host_pool_budget(memory)? / layout.page_record_bytes) as usize)
                 .max(intake_slots(layout, 1)) as u64
@@ -88,7 +104,7 @@ impl PrefixCacheOffload {
         };
         // Pool copy streams and events are fixed headroom. Hello's shared regions or
         // remote data staging are budgeted separately before sizing GPU caches.
-        let tiers = if memory != 0 || disk {
+        let tiers = if capture.is_some() || memory != 0 || disk {
             mapped.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES
         } else {
             0
@@ -193,6 +209,7 @@ pub struct Prepared {
     pub contexts: Vec<(usize, i32)>,
     pub memory_pool: Option<slab::SlabPool>,
     pub warm_bytes: u64,
+    rank_process: bool,
     pub scanned: Vec<record::Scanned>,
     pub directory_lock: Option<record::DirectoryLock>,
     /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
@@ -232,6 +249,9 @@ impl Preparation {
 impl Prepared {
     pub fn intake_warning(&self, max_concurrency: usize) -> Option<String> {
         let pool = self.memory_pool.as_ref()?;
+        if pool.intake_slots() == 0 {
+            return None;
+        }
         let required = intake_slots(&self.layout, max_concurrency);
         (pool.intake_slots() < required).then(|| {
             let bytes = required as u64 * self.layout.page_record_bytes;
@@ -250,6 +270,8 @@ impl Prepared {
                 "{} {} ({} slots{})",
                 if self.warm_bytes != 0 {
                     "memory"
+                } else if pool.intake_slots() == 0 {
+                    "pool only: capture buffer"
                 } else {
                     "intake"
                 },
@@ -261,6 +283,13 @@ impl Prepared {
                     ""
                 }
             ));
+        } else {
+            let mode = if self.rank_process {
+                "pool only across rank processes: restores only"
+            } else {
+                "no local prefix cache available: restores only"
+            };
+            parts.push(mode.to_owned());
         }
         if let Some(inputs) = &self.inputs {
             parts.push(format!(
@@ -359,7 +388,7 @@ impl std::fmt::Debug for Binding {
 
 /// Resolve the settings against the core and host, map and register the
 /// pools with rank zero's context current, and scan the record directory.
-/// Without a disk tier the CPU never reads a record, so the memory pool is
+/// Without a disk or pool tier the CPU never reads a record, so the memory pool is
 /// split by rank and each device maps only its part.
 ///
 /// `core` is the core file, beside which the default record directory
@@ -447,17 +476,20 @@ pub fn prepare_with_inputs(
         .0;
     let input_memory = input_memory_bytes(memory_bytes, input_staging != 0);
     let checkpoint_memory = memory_bytes - input_memory;
-    let memory_pool = (checkpoint_memory != 0 || directory.is_some())
+    let local_pages = geometry.iter().map(|rank| rank.page_capacity).max().filter(|_| shard.is_none());
+    let capture = local_pages.is_some() && options.pool_only();
+    let memory_pool = (capture || checkpoint_memory != 0 || directory.is_some())
         .then(|| {
             let (_, host) = options.headroom_with_inputs(
                 contexts.len(),
                 &layout,
                 max_active,
                 input_staging != 0,
+                local_pages,
             )?;
-            let intake = ((host - memory_bytes) / layout.page_record_bytes) as usize;
-            let bytes = (checkpoint_memory / layout.page_record_bytes + intake as u64)
-                * layout.page_record_bytes;
+            let transfer_slots = (host - memory_bytes) / layout.page_record_bytes;
+            let intake = if capture { 0 } else { transfer_slots as usize };
+            let bytes = (checkpoint_memory / layout.page_record_bytes + transfer_slots) * layout.page_record_bytes;
             // Shared records must be readable by the CPU.
             let pool = if directory.is_none() && options.pool.is_none() {
                 slab::SlabPool::sized_by_rank(&layout, bytes, intake, &contexts, registrar)?
@@ -504,6 +536,7 @@ pub fn prepare_with_inputs(
         contexts,
         memory_pool,
         warm_bytes: checkpoint_memory,
+        rank_process: shard.is_some(),
         scanned,
         directory_lock,
         shards: Vec::new(),
@@ -541,6 +574,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         contexts,
         memory_pool,
         warm_bytes,
+        rank_process: _,
         scanned,
         directory_lock,
         shards,
@@ -550,16 +584,15 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         pool.start_copies(&contexts, geometry.clone(), factory)?;
     }
     // Inside a composite the disk index owns the tree; memory nodes are flat.
+    let capture = pool.is_some() && warm_bytes == 0 && directory_lock.is_none();
     let memory = memory_pool
         .as_ref()
-        .filter(|_| warm_bytes != 0)
+        .filter(|_| warm_bytes != 0 || capture)
         .map(|pool| {
             let transfers = factory.mapped(&contexts, geometry.clone(), pool)?;
-            let mut store = if directory_lock.is_some() {
-                memory::MemoryStore::new_flat(identity, pool.clone(), transfers)?
-            } else {
-                memory::MemoryStore::new(identity, pool.clone(), transfers)?
-            };
+            let mut store = memory::MemoryStore::open(
+                identity, pool.clone(), transfers, directory_lock.is_some(), capture,
+            )?;
             store.index_mut().max_age = max_age;
             Ok::<_, crate::Error>(store)
         })
@@ -607,7 +640,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         (None, None) => None,
     };
     match pool {
-        Some(pool) => pool.attach(local),
+        Some(pool) => pool.attach(local, drain_on_shutdown),
         None => {
             let store = local.ok_or("no prefix store tier is configured")?;
             Ok(store)
@@ -684,14 +717,18 @@ impl Startup {
         registrar: std::sync::Arc<dyn crate::HostRegistrar + Send + Sync>,
         approve: impl FnOnce(bool) -> Result<bool>,
     ) -> Result<(String, Vec<u64>)> {
-        let (mut pool, mut charges) = builder.start(registrar)?;
-        let summary = if !approve(pool.approved())? {
-            pool.close()?;
-            charges.fill(0);
-            "local tiers only".into()
-        } else {
-            pool.summary()?
-        };
+        let prepared = builder.start(registrar);
+        let approved = approve(prepared.as_ref().is_ok_and(|(pool, _)| pool.approved()));
+        let (mut pool, charges) = prepared?;
+        if !approved? {
+            if let Err(error) = pool.close() {
+                eprintln!("warning: cannot close the failed pool: {error}");
+            }
+            return Err(pool::startup::attachment_error(
+                "a rank could not attach; check that rank's startup error",
+            ));
+        }
+        let summary = pool.summary()?;
         self.pool = Some(pool);
         Ok((summary, charges))
     }

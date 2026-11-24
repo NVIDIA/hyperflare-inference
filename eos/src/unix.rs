@@ -131,3 +131,60 @@ pub fn free_space(path: &Path) -> io::Result<u64> {
     }
     Ok(stats.f_bavail * stats.f_frsize)
 }
+
+/// Raise the process soft open-file limit (`RLIMIT_NOFILE`) toward `desired`,
+/// bounded by the current hard limit. Never lowers an existing higher soft
+/// limit. Returns the resulting soft limit when `getrlimit` succeeds.
+pub fn raise_open_file_limit(desired: u64) -> Option<u64> {
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: `getrlimit` writes into the provided `rlimit` struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    let current = limit.rlim_cur as u64;
+    if current >= desired {
+        return Some(current);
+    }
+    let max = if limit.rlim_max == libc::RLIM_INFINITY {
+        desired
+    } else {
+        limit.rlim_max as u64
+    };
+    let target = desired.min(max).min(libc::rlim_t::MAX as u64);
+    if target > current {
+        let updated = libc::rlimit {
+            rlim_cur: target as libc::rlim_t,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: `setrlimit` reads the provided `rlimit` struct.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &updated) } == 0 {
+            return Some(target);
+        }
+    }
+    Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raise_open_file_limit_never_lowers_and_respects_hard_limit() {
+        let mut before: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) }, 0);
+        let cur = before.rlim_cur as u64;
+        assert_eq!(raise_open_file_limit(0), Some(cur));
+        assert_eq!(raise_open_file_limit(cur), Some(cur));
+
+        let desired = cur.saturating_add(16);
+        let expected_max = if before.rlim_max == libc::RLIM_INFINITY {
+            desired
+        } else {
+            before.rlim_max as u64
+        };
+        let raised = raise_open_file_limit(desired).expect("getrlimit succeeded");
+        assert!(raised >= cur && raised <= desired.min(expected_max));
+        // Restore the prior soft limit so other tests in the process see the original value.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &before) };
+    }
+}

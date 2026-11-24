@@ -241,6 +241,64 @@ fn records(
     };
     records
 }
+
+#[test]
+fn waiting_prefills_do_not_simulate_checkpoint_storage() {
+    let mut scheduler = scheduler(4, 128, 16);
+    scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+    let mut graphs = duration_graphs(4);
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind.is_prefill() { 4000 + graph.token_capacity as u64 * 1000 } else { 1 };
+    }
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.configure_policy(PolicyConfig {
+        checkpoint_extra_work_fraction: 0.5,
+        ..Default::default()
+    }).unwrap();
+    for slot in 0..4 {
+        let mut request = spec(1024, 1);
+        request.prompt[0] += slot + 100;
+        request.message_boundaries = vec![100, 900];
+        scheduler.admit(request).unwrap();
+    }
+    let mut first_cuts = 0;
+    for sequence in 1..=64 {
+        cache_memory::STORAGE_SIMULATIONS.set(0);
+        let plan = scheduler.plan().unwrap();
+        let simulations = cache_memory::STORAGE_SIMULATIONS.get();
+        // Two optional-cut quotes and one capture quote each simulate at most twice.
+        assert!(simulations <= 6, "{simulations} storage simulations in one plan");
+        let mut completions = state_records(&scheduler, &plan, sequence);
+        for (row, lane) in plan.lanes.iter().enumerate() {
+            if !plan.lane_kind(row).is_prefill() {
+                continue;
+            }
+            let request = scheduler.request(lane.request).unwrap();
+            let cut = scheduler.checkpoint_cut(request).unwrap_or(request.prompt_tokens);
+            let end = lane.start_position as usize + lane.tokens;
+            assert_eq!(end, cut.min(lane.start_position as usize + plan.token_capacity));
+            assert_eq!(plan.token_capacity, *scheduler.prefill_catalog.iter().find(|&&c| c >= lane.tokens).unwrap());
+            first_cuts += usize::from(end == 100);
+            let output = end == request.prompt_tokens;
+            completions[lane.request.slot as usize] = records(
+                lane.request, sequence, end as i64, i64::from(output),
+                if output { 42 } else { -1 }, 1,
+            )[lane.request.slot as usize].clone();
+        }
+        scheduler.advance_to(scheduler.now_ns + plan.estimated_duration_ns).unwrap();
+        scheduler.commit(&plan, Fence(sequence)).unwrap();
+        let generated = scheduler.complete(Fence(sequence), &completions, Default::default()).unwrap();
+        for token in generated {
+            scheduler.published_output(token.request, Fence(sequence)).unwrap();
+        }
+        if scheduler.slots.iter().filter_map(|slot| slot.request.as_ref()).all(|r| r.consumed_tokens >= 1024) {
+            break;
+        }
+    }
+    assert_eq!(first_cuts, 4);
+    assert!(scheduler.slots.iter().filter_map(|slot| slot.request.as_ref()).all(|r| r.consumed_tokens >= 1024));
+}
+
 fn init(scheduler: &mut RequestScheduler, fence: u64) {
     let step = scheduler.plan().unwrap();
     assert!(matches!(step.kind, GraphKind::Init | GraphKind::Restore));
@@ -1143,6 +1201,7 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
     let second = scheduler.admit(spec(64, 1)).unwrap();
     init(&mut scheduler, 1);
     let mut checkpoint = None;
+    let mut completion_epoch = 0;
     for (handle, fence) in [(first, 2), (second, 4)] {
         let step = scheduler.plan().unwrap();
         assert_eq!(step.lanes[0].request, handle);
@@ -1156,6 +1215,9 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
             .unwrap();
         freeze(&mut scheduler, handle, fence + 1);
         let result = scheduler.finish(handle).unwrap();
+        let epoch = scheduler.cache().checkpoint(result.unwrap()).unwrap().retention_rank().use_epoch;
+        assert!(epoch > completion_epoch);
+        completion_epoch = epoch;
         if checkpoint.is_none() {
             checkpoint = result;
         } else {
@@ -1173,6 +1235,451 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
     assert_eq!(scheduler.stats().snapshot_evictions, 1);
     assert_eq!(scheduler.stats().cached_checkpoints, 0);
     scheduler.admit(unrelated).unwrap();
+}
+
+#[test]
+fn snapshot_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
+    capture_under_reused_chain_pressure(0);
+}
+
+#[test]
+fn page_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
+    capture_under_reused_chain_pressure(16);
+}
+
+fn capture_under_reused_chain_pressure(alias_pages: u32) {
+    let rows = if alias_pages == 0 { 9 } else { 10 };
+    let mut scheduler = scheduler(2, 64.max(32 + rows * alias_pages), rows);
+    scheduler.enable_publications();
+    scheduler.enable_evictions();
+    scheduler
+        .share_snapshot_pages(
+            &(0..rows)
+                .map(|row| 32 + row * alias_pages..32 + (row + 1) * alias_pages)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let long_history = history(512);
+    let mut chain = Vec::new();
+    for index in 0..8 {
+        let epoch = scheduler.cache.new_use_epoch().unwrap();
+        let snapshot = scheduler.reserve_snapshot(0).unwrap();
+        let page = scheduler.free_pages.pop_first().unwrap();
+        let consumed = (index + 1) * 64;
+        let id = scheduler
+            .cache
+            .publish_with_retention(
+                &long_history,
+                &Publication {
+                    parent: chain.last().copied(),
+                    consumed_tokens: consumed,
+                    tail_pages: vec![page],
+                    snapshot: StateSnapshot {
+                        id: snapshot,
+                        consumed_tokens: consumed,
+                    },
+                    ready_after: Fence(0),
+                },
+                RetentionRole::Anchor,
+                epoch,
+            )
+            .unwrap()
+            .id();
+        scheduler.record_publication(id);
+        chain.push(id);
+    }
+    let tip = *chain.last().unwrap();
+    let pages = scheduler.cache.page_chain(tip).unwrap();
+    let mut pending_spec = spec(64, 1);
+    pending_spec.prompt.fill(999);
+    let pending = scheduler.admit(pending_spec).unwrap();
+    let mut other_history = PrefixHistory::new([9; 32]);
+    other_history.append(&[888; 64], &[]).unwrap();
+    let epoch = scheduler.cache.new_use_epoch().unwrap();
+    let snapshot = scheduler.reserve_snapshot(0).unwrap();
+    let page = scheduler.free_pages.pop_first().unwrap();
+    let other = scheduler
+        .cache
+        .publish_with_retention(
+            &other_history,
+            &Publication {
+                parent: None,
+                consumed_tokens: 64,
+                tail_pages: vec![page],
+                snapshot: StateSnapshot {
+                    id: snapshot,
+                    consumed_tokens: 64,
+                },
+                ready_after: Fence(0),
+            },
+            RetentionRole::Endpoint,
+            epoch,
+        )
+        .unwrap()
+        .id();
+    let hot = scheduler.admit(spec(512, 1536)).unwrap();
+    assert_eq!(scheduler.request(hot).unwrap().prefix, Some(tip));
+    // The remaining free row aliases live output pages when rows share KV backing.
+    assert_eq!(
+        scheduler.free_snapshot_count(),
+        usize::from(alias_pages != 0)
+    );
+    assert!(scheduler.available_snapshot(0).is_none());
+    let capture = scheduler.allocate_terminal_capture(pending).unwrap();
+    assert!(
+        capture.is_some(),
+        "older interior rows must fund the pending capture"
+    );
+    assert_eq!(scheduler.stats().checkpoint_skip_storage, 0);
+    assert!(scheduler.cache.checkpoint(chain[0]).is_err());
+    assert!(scheduler.cache.checkpoint(other).is_ok());
+    assert_eq!(scheduler.cache.page_chain(tip).unwrap(), pages);
+    assert_eq!(
+        scheduler.cache.lookup(&long_history).unwrap().checkpoint,
+        Some(tip)
+    );
+    assert_eq!(
+        scheduler.cache.lookup(&other_history).unwrap().checkpoint,
+        Some(other)
+    );
+    let evictions = scheduler.take_evictions();
+    assert_eq!(evictions.len(), 1);
+    let heir = evictions[0].heir.as_ref().unwrap();
+    assert_eq!(heir.parent(), None);
+    assert_eq!(heir.chain_pages, pages[..2]);
+    scheduler.release_snapshot(capture.unwrap());
+    scheduler.cancel(pending).unwrap();
+    scheduler.cancel(hot).unwrap();
+}
+
+#[test]
+fn completion_refreshes_terminal_and_prompt_recency_after_other_requests_finish() {
+    let mut scheduler = scheduler(2, 8, 4);
+    let long = scheduler.admit(spec(64, 2)).unwrap();
+    let mut other = spec(64, 1);
+    other.prompt[0] = 999;
+    let short = scheduler.admit(other).unwrap();
+    init(&mut scheduler, 1);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Prefill, long)
+    );
+    scheduler.commit(&step, Fence(2)).unwrap();
+    scheduler
+        .complete(
+            Fence(2),
+            &records(long, 2, 64, 1, 88, 1),
+            Default::default(),
+        )
+        .unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Prefill, short)
+    );
+    scheduler.commit(&step, Fence(3)).unwrap();
+    scheduler
+        .complete(
+            Fence(3),
+            &records(short, 3, 64, 1, 89, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, short, 4);
+    let short_checkpoint = scheduler.finish(short).unwrap().unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Snapshot, long)
+    );
+    scheduler.commit(&step, Fence(5)).unwrap();
+    scheduler
+        .complete(
+            Fence(5),
+            &state_records(&scheduler, &step, 5),
+            Default::default(),
+        )
+        .unwrap();
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (step.kind, step.lanes[0].request),
+        (GraphKind::Decode, long)
+    );
+    scheduler.commit(&step, Fence(6)).unwrap();
+    scheduler
+        .complete(
+            Fence(6),
+            &records(long, 6, 65, 2, 90, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, long, 7);
+    let prompt = scheduler.request(long).unwrap().prefix.unwrap();
+    let prompt_epoch = scheduler
+        .cache()
+        .checkpoint(prompt)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    let long_checkpoint = scheduler.finish(long).unwrap().unwrap();
+    let pages = scheduler.cache().page_chain(long_checkpoint).unwrap();
+    let completed_epoch = scheduler
+        .cache()
+        .checkpoint(long_checkpoint)
+        .unwrap()
+        .retention_rank()
+        .use_epoch;
+    assert!(completed_epoch > prompt_epoch);
+    assert_eq!(
+        scheduler
+            .cache()
+            .checkpoint(prompt)
+            .unwrap()
+            .retention_rank()
+            .use_epoch,
+        completed_epoch
+    );
+    // Both useful endpoints outlive a conversation that completed while this request ran.
+    assert_eq!(
+        scheduler.cache().eviction_candidate(None, false),
+        Some(short_checkpoint)
+    );
+    assert!(
+        scheduler
+            .cache()
+            .checkpoint(long_checkpoint)
+            .unwrap()
+            .retention_rank()
+            > scheduler
+                .cache()
+                .checkpoint(short_checkpoint)
+                .unwrap()
+                .retention_rank()
+    );
+    let evicted = scheduler.evict(EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    });
+    assert_eq!(evicted.retired[0].checkpoint, short_checkpoint);
+    assert_eq!(
+        scheduler.cache().lookup(&history(64)).unwrap().checkpoint,
+        Some(prompt)
+    );
+    assert_eq!(
+        scheduler.cache().page_chain(long_checkpoint).unwrap(),
+        pages
+    );
+}
+
+#[test]
+fn cancellation_before_inference_and_preemption_preserve_checkpoint_demand_recency() {
+    for preempted in [false, true] {
+        let mut scheduler = host_scheduler(1, 8, 4);
+        let handle = scheduler.admit(spec(64, 4)).unwrap();
+        init(&mut scheduler, 1);
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(2)).unwrap();
+        scheduler
+            .complete(
+                Fence(2),
+                &records(handle, 2, 64, 1, 88, 1),
+                Default::default(),
+            )
+            .unwrap();
+        retain_prompt(&mut scheduler, 3);
+        let id = scheduler.request(handle).unwrap().prefix.unwrap();
+        let rank;
+        if preempted {
+            rank = scheduler.cache().checkpoint(id).unwrap().retention_rank();
+            scheduler.finish_early(handle, true).unwrap();
+            scheduler.finish(handle).unwrap();
+        } else {
+            scheduler.cancel(handle).unwrap();
+            // The setup request stopped after prefill; isolate the idle cancellation below.
+            let key = scheduler.cache().checkpoint(id).unwrap().prefix();
+            assert_eq!(scheduler.take_reused(), [key]);
+            let handle = scheduler.admit(spec(64, 4)).unwrap();
+            rank = scheduler.cache().checkpoint(id).unwrap().retention_rank();
+            scheduler.cancel(handle).unwrap();
+        }
+        assert!(scheduler.take_reused().is_empty());
+        assert_eq!(
+            scheduler.cache().checkpoint(id).unwrap().retention_rank(),
+            rank
+        );
+    }
+}
+
+#[test]
+fn completion_and_client_stop_refresh_the_retained_prefix_only_without_execution_errors() {
+    for (failed, cancelled) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut scheduler = host_scheduler(1, 8, 4);
+        let handle = scheduler.admit(spec(64, 4)).unwrap();
+        init(&mut scheduler, 1);
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(2)).unwrap();
+        scheduler
+            .complete(
+                Fence(2),
+                &records(handle, 2, 64, 1, 88, 1),
+                Default::default(),
+            )
+            .unwrap();
+        retain_prompt(&mut scheduler, 3);
+        let id = scheduler.request(handle).unwrap().prefix.unwrap();
+        let epoch = scheduler
+            .cache()
+            .checkpoint(id)
+            .unwrap()
+            .retention_rank()
+            .use_epoch;
+        if failed {
+            scheduler.request_mut(handle).unwrap().error_code = Some(1);
+        }
+        // Finishing at the retained endpoint needs no additional snapshot.
+        if cancelled {
+            scheduler.cancel(handle).unwrap();
+        } else {
+            scheduler.finish_early(handle, false).unwrap();
+            assert!(
+                scheduler
+                    .request(handle)
+                    .unwrap()
+                    .terminal_snapshot
+                    .is_none()
+            );
+            assert_eq!(scheduler.finish(handle).unwrap(), Some(id));
+        }
+        let completed_epoch = scheduler
+            .cache()
+            .checkpoint(id)
+            .unwrap()
+            .retention_rank()
+            .use_epoch;
+        assert_eq!(completed_epoch > epoch, !failed);
+        let prefix_key = scheduler.cache().checkpoint(id).unwrap().prefix();
+        assert_eq!(scheduler.take_reused(), if failed { vec![] } else { vec![prefix_key] });
+    }
+}
+
+#[test]
+fn completion_reused_notices_refresh_parent_and_terminal_without_earlier_ancestors() {
+    let mut scheduler = host_scheduler(2, 16, 6);
+    let grandparent = seed_checkpoint(&mut scheduler, 1);
+    let grandparent_key = scheduler.cache().checkpoint(grandparent).unwrap().prefix();
+    assert_eq!(scheduler.take_reused(), [grandparent_key]);
+
+    let long = scheduler.admit(spec(128, 2)).unwrap();
+    assert_eq!(scheduler.request(long).unwrap().prefix(), Some(grandparent));
+    init(&mut scheduler, 4);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Prefill);
+    scheduler.commit(&step, Fence(5)).unwrap();
+    scheduler.complete(Fence(5), &records(long, 5, 128, 1, 91, 1), Default::default()).unwrap();
+    retain_prompt(&mut scheduler, 6);
+    let parent = scheduler.request(long).unwrap().prefix().unwrap();
+    let parent_key = scheduler.cache().checkpoint(parent).unwrap().prefix();
+    assert!(scheduler.take_reused().is_empty());
+
+    let mut other = spec(64, 2);
+    other.prompt.fill(7);
+    let short = scheduler.admit(other).unwrap();
+    init(&mut scheduler, 7);
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(8)).unwrap();
+    scheduler.complete(Fence(8), &records(short, 8, 64, 1, 92, 1), Default::default()).unwrap();
+    retain_prompt(&mut scheduler, 9);
+    let short_parent = scheduler.request(short).unwrap().prefix().unwrap();
+    let short_parent_key = scheduler.cache().checkpoint(short_parent).unwrap().prefix();
+
+    let step = scheduler.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Decode);
+    scheduler.commit(&step, Fence(10)).unwrap();
+    let mut completions = records(long, 10, 129, 2, 94, 2);
+    completions[short.slot as usize] = CompletionRecord {
+        generation: short.generation as i64, submission_sequence: 10,
+        consumed_tokens: 65, generated_tokens: 2, token_id: 93, status: 2,
+        error_code: 0, reserved: 0, vector: None,
+    };
+    scheduler.complete(Fence(10), &completions, Default::default()).unwrap();
+    freeze(&mut scheduler, short, 11);
+    let short_terminal = scheduler.finish(short).unwrap().unwrap();
+    let short_key = scheduler.cache().checkpoint(short_terminal).unwrap().prefix();
+    freeze(&mut scheduler, long, 12);
+    let terminal = scheduler.finish(long).unwrap().unwrap();
+    let terminal_key = scheduler.cache().checkpoint(terminal).unwrap().prefix();
+    assert_eq!(scheduler.take_reused(), [short_parent_key, short_key, parent_key, terminal_key]);
+    assert!(scheduler.take_reused().is_empty());
+
+    // Reach the same terminal through a different prompt boundary. The retained
+    // terminal's parent, not this request's prompt, must receive the refresh.
+    let branch = scheduler.admit(spec(127, 3)).unwrap();
+    assert_eq!(scheduler.request(branch).unwrap().prefix(), Some(grandparent));
+    init(&mut scheduler, 13);
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(14)).unwrap();
+    scheduler.complete(Fence(14), &records(branch, 14, 127, 1, 127, 1), Default::default()).unwrap();
+    retain_prompt(&mut scheduler, 15);
+    assert_ne!(scheduler.request(branch).unwrap().prefix(), Some(parent));
+    for (fence, consumed, generated, token, status) in [(16, 128, 2, 91, 1), (17, 129, 3, 94, 2)] {
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(fence)).unwrap();
+        scheduler.complete(Fence(fence), &records(branch, fence, consumed, generated, token, status), Default::default()).unwrap();
+    }
+    freeze(&mut scheduler, branch, 18);
+    assert_eq!(scheduler.finish(branch).unwrap(), Some(terminal));
+    assert_eq!(scheduler.take_reused(), [parent_key, terminal_key]);
+}
+
+#[test]
+fn completion_refreshes_preserve_retirement_order_until_drained() {
+    // A page-aligned prompt still needs a snapshot to become a checkpoint.
+    // Stop after inference progress, without assuming there is a prefix to retain.
+    let mut page_only = host_scheduler(1, 8, 0);
+    let handle = page_only.admit(spec(64, 2)).unwrap();
+    init(&mut page_only, 1);
+    let step = page_only.plan().unwrap();
+    page_only.commit(&step, Fence(2)).unwrap();
+    page_only
+        .complete(
+            Fence(2),
+            &records(handle, 2, 64, 1, 90, 1),
+            Default::default(),
+        )
+        .unwrap();
+    assert!(page_only.request(handle).unwrap().prefix().is_none());
+    page_only.cancel(handle).unwrap();
+    assert!(page_only.take_reused().is_empty());
+
+    // Accumulate one delivery batch. Reclaim GPU storage between requests so
+    // five distinct keys can be refreshed with only two snapshot rows.
+    let mut scheduler = host_scheduler(1, 8, 2);
+    let mut expected = Vec::with_capacity(6);
+    for fill in [10u32, 11, 12, 13, 14, 13] {
+        let mut request = spec(64, 2);
+        request.prompt.fill(fill);
+        let handle = scheduler.admit(request).unwrap();
+        let base = scheduler.submitted.0 + 1;
+        init(&mut scheduler, base);
+        let step = scheduler.plan().unwrap();
+        scheduler.commit(&step, Fence(base + 1)).unwrap();
+        scheduler
+            .complete(
+                Fence(base + 1),
+                &records(handle, base + 1, 64, 1, 80 + i64::from(fill), 1),
+                Default::default(),
+            )
+            .unwrap();
+        retain_prompt(&mut scheduler, base + 2);
+        let id = scheduler.request(handle).unwrap().prefix().unwrap();
+        expected.push(scheduler.cache().checkpoint(id).unwrap().prefix());
+        scheduler.cancel(handle).unwrap();
+        scheduler.ensure_resources(8, 2).unwrap();
+    }
+    assert_eq!(expected[3], expected[5]);
+    assert_eq!(scheduler.take_reused(), expected);
+    assert!(scheduler.take_reused().is_empty());
 }
 
 #[test]
@@ -1958,6 +2465,37 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
 }
 
 #[test]
+fn copy_source_rounds_leave_the_mtp_population_alone() {
+    let mut s = scheduler(1, 32, 4);
+    s.enable_speculation(&(1..=16).collect::<Vec<_>>()).unwrap();
+    s.proposal_source(speculation::ProposalSource::Copy).unwrap();
+    s.fixed_speculative_width(Some(8)).unwrap();
+    let geometric = s.forecasts.population.clone();
+    let h = s.admit(spec(65, 32)).unwrap();
+    init(&mut s, 1);
+    let prefill = s.plan().unwrap();
+    s.commit(&prefill, Fence(2)).unwrap();
+    s.complete(Fence(2), &records(h, 2, 65, 1, 9, 1), Default::default()).unwrap();
+    retain_prompt(&mut s, 3);
+    s.set_copy_proposal(h, copied(65, 3, false)).unwrap();
+    let step = s.plan().unwrap();
+    assert_eq!(step.lanes[0].tokens, 4);
+    s.commit(&step, Fence(4)).unwrap();
+    let mut complete = bounded_vector_records(h, 4, 66, 2, &[40], 8, 1, 4);
+    complete[h.slot as usize].vector.as_mut().unwrap().draft_cache_consumed = -1;
+    s.complete(Fence(4), &complete, Default::default()).unwrap();
+    // The request's own copy estimates saw the round; the population did not move.
+    assert_eq!(s.request(h).unwrap().acceptance.rounds(), 1);
+    assert_eq!(s.forecasts.population, geometric);
+    s.cancel(h).unwrap();
+    let next = s.admit(spec(65, 32)).unwrap();
+    for depth in 0..15 {
+        assert_eq!(s.request(next).unwrap().acceptance.prefix_probability(speculation::ProposalSource::Mtp, depth),
+            Some(f64::from(geometric[depth])));
+    }
+}
+
+#[test]
 fn copy_source_uses_no_draft_page_and_fixed_graph_masks_host_stops() {
     let mut s = scheduler(1, 2, 2);
     s.limits.max_sequence_tokens = 128;
@@ -2198,7 +2736,9 @@ fn disabled_publication_tracking_keeps_gpu_reuse_without_allocating_a_notificati
         let checkpoint = seed_checkpoint(&mut scheduler, round * 3 + 1);
         assert_eq!(scheduler.stats().snapshot_publications, round + 1);
         assert_eq!(scheduler.publications.capacity(), 0);
+        assert_eq!(scheduler.reused.capacity(), 0);
         assert!(scheduler.take_publications().is_empty());
+        assert!(scheduler.take_reused().is_empty());
         let hit = scheduler.admit(spec(64, 2)).unwrap();
         let request = scheduler.request(hit).unwrap();
         assert_eq!(request.phase, RequestPhase::Restore);
@@ -2254,7 +2794,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
         (stats.cache_lookups, stats.cache_hits, stats.reused_tokens),
         (1, 0, 0)
     );
-    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 64));
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
     // The ticket holds one page and one snapshot; the request holds one reserved
     // page; checkpoint retention reserves no destination yet.
     assert_eq!(free(&scheduler), (6, 3));
@@ -2279,6 +2819,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
     assert_eq!(checkpoint.tail_pages(), &ticket.pages[..]);
     assert_eq!(checkpoint.pin_count(), 1);
     let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 64));
     assert_eq!(
         (
             stats.inbound_waiting,
@@ -2291,9 +2832,10 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
     assert_eq!(
         scheduler.take_publications(),
         vec![PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: restored,
             key,
-            parent: None,
+            ancestors: Vec::new(),
             bucket: key.digest,
             chain_pages: ticket.pages.clone(),
             tail_pages: 1,
@@ -2341,7 +2883,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
     assert_eq!(published.len(), 1);
     let prompt = &published[0];
     assert_eq!(prompt.key, history(65).key_at(65).unwrap());
-    assert_eq!(prompt.parent, Some(key));
+    assert_eq!(prompt.parent(), Some(key));
     assert_eq!(prompt.bucket, key.digest);
     assert_eq!(prompt.chain_pages, ticket.pages);
     assert_eq!(prompt.tail_pages, 0);
@@ -2405,7 +2947,7 @@ fn inbound_full_prompt_hit_resumes_without_prefill() {
         scheduler
             .take_publications()
             .iter()
-            .map(|p| (p.id, p.parent, p.tail_pages, p.chain_pages.clone()))
+            .map(|p| (p.id, p.parent(), p.tail_pages, p.chain_pages.clone()))
             .collect::<Vec<_>>(),
         [(restored, None, 1, ticket.pages.clone())]
     );
@@ -2422,7 +2964,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     let ancestor_key = history(64).key_at(64).unwrap();
     let notices = scheduler.take_publications();
     assert_eq!(notices.len(), 1);
-    assert_eq!((notices[0].id, notices[0].key, notices[0].parent, notices[0].tail_pages),
+    assert_eq!((notices[0].id, notices[0].key, notices[0].parent(), notices[0].tail_pages),
         (ancestor, ancestor_key, None, 1));
     assert_eq!(notices[0].chain_pages, ancestor_pages);
     assert_eq!(free(&scheduler), (7, 3));
@@ -2449,7 +2991,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
         (stats.cache_lookups, stats.cache_hits, stats.reused_tokens),
         (2, 1, 64)
     );
-    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 64));
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
     // Ticket: one page and one snapshot. Request: one page beyond the two
     // complete pages. Checkpoint retention has no reserved destination.
     assert_eq!(free(&scheduler), (5, 2));
@@ -2463,6 +3005,8 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     assert_eq!(free(&scheduler), (5, 2));
 
     scheduler.finish_inbound(key, true).unwrap();
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 64));
     let request = scheduler.request(handle).unwrap();
     let restored = request.prefix().unwrap();
     let mut chain = ancestor_pages.clone();
@@ -2483,9 +3027,10 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     assert_eq!(
         scheduler.take_publications(),
         vec![PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: restored,
             key,
-            parent: Some(ancestor_key),
+            ancestors: vec![ancestor_key],
             bucket: key.digest,
             chain_pages: chain.clone(),
             tail_pages: 1,
@@ -2516,7 +3061,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     assert_eq!(
         (
             published[0].key,
-            published[0].parent,
+            published[0].parent(),
             published[0].bucket,
             published[0].tail_pages,
             &published[0].chain_pages
@@ -2615,6 +3160,8 @@ fn inbound_alias_backing_survives_cancellation_until_transfer_completion() {
         assert_eq!(free(&scheduler), (11, 1));
         assert_eq!(scheduler.stats().snapshot_backing_pages, 4);
         scheduler.finish_inbound(ticket.key, success).unwrap();
+        let stats = scheduler.stats();
+        assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
         if success {
             assert_eq!(scheduler.stats().snapshot_backing_pages, 4);
             scheduler.ensure_resources(16, 0).unwrap();
@@ -2640,6 +3187,7 @@ fn failed_inbound_frees_the_ticket_and_returns_waiters_for_readmission() {
     assert!(scheduler.request(first.handle).is_err());
     assert!(scheduler.request(second.handle).is_err());
     let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
     assert_eq!(
         (
             stats.active_requests,
@@ -2661,6 +3209,24 @@ fn failed_inbound_frees_the_ticket_and_returns_waiters_for_readmission() {
 }
 
 #[test]
+fn inbound_waiters_count_only_the_tokens_above_their_admission_prefix() {
+    let mut scheduler = host_scheduler(2, 16, 6);
+    let first = inbound(&mut scheduler, spec(129, 2), 128);
+    let ticket = first.ticket.unwrap();
+    seed_checkpoint(&mut scheduler, 1);
+    let second = inbound(&mut scheduler, spec(130, 2), 128);
+    assert!(second.ticket.is_none());
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
+    scheduler.finish_inbound(ticket.key, true).unwrap();
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (2, 192));
+    for handle in [first.handle, second.handle] {
+        assert_eq!(scheduler.request(handle).unwrap().phase, RequestPhase::Restore);
+    }
+}
+
+#[test]
 fn waiters_sharing_one_ticket_restore_together_and_both_complete() {
     let mut scheduler = host_scheduler(2, 8, 4);
     let first = inbound(&mut scheduler, spec(65, 1), 64);
@@ -2674,11 +3240,16 @@ fn waiters_sharing_one_ticket_restore_together_and_both_complete() {
             stats.host_reused_tokens,
             stats.inbound_waiting
         ),
-        (2, 128, 2)
+        (0, 0, 2)
     );
     assert_eq!(free(&scheduler), (5, 3));
     assert!(scheduler.plan().is_none());
     scheduler.finish_inbound(ticket.key, true).unwrap();
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (2, 128));
+    assert!(scheduler.finish_inbound(ticket.key, true).is_err());
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (2, 128));
     let restored = scheduler.request(first.handle).unwrap().prefix().unwrap();
     assert_eq!(
         scheduler.request(second.handle).unwrap().prefix(),
@@ -2740,7 +3311,7 @@ fn waiters_sharing_one_ticket_restore_together_and_both_complete() {
         scheduler
             .take_publications()
             .iter()
-            .map(|p| (p.id, p.parent))
+            .map(|p| (p.id, p.parent()))
             .collect::<Vec<_>>(),
         [(restored, None),
             (first_terminal, Some(ticket.key)),
@@ -2902,27 +3473,32 @@ fn pinned_checkpoints_survive_eviction_pressure_until_unpinned() {
     assert_eq!(scheduler.stats().host_lookups, 2);
 }
 
-#[test]
-fn take_publications_reports_boundaries_and_defers_terminals() {
+fn prefill_to_publication_boundary(tokens: usize, boundary: usize) -> (RequestScheduler, RequestHandle) {
     let mut scheduler = host_scheduler(1, 8, 4);
     let handle = scheduler
         .admit(RequestSpec {
-            message_boundaries: vec![64],
-            ..spec(130, 2)
+            message_boundaries: vec![boundary],
+            ..spec(tokens, 2)
         })
         .unwrap();
-    let history = history(130);
     init(&mut scheduler, 1);
     let step = scheduler.plan().unwrap();
-    assert_eq!((step.kind, step.lanes[0].tokens), (GraphKind::Prefill, 64));
+    assert_eq!((step.kind, step.lanes[0].tokens), (GraphKind::Prefill, boundary));
     scheduler.commit(&step, Fence(2)).unwrap();
     scheduler
         .complete(
             Fence(2),
-            &records(handle, 2, 64, 0, -1, 1),
+            &records(handle, 2, boundary as i64, 0, -1, 1),
             Default::default(),
         )
         .unwrap();
+    (scheduler, handle)
+}
+
+#[test]
+fn take_publications_reports_boundaries_and_defers_terminals() {
+    let (mut scheduler, handle) = prefill_to_publication_boundary(130, 64);
+    let history = history(130);
     assert!(scheduler.take_publications().is_empty());
     let first_page = scheduler
         .request(handle)
@@ -2935,9 +3511,10 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
     assert_eq!(
         scheduler.take_publications(),
         vec![PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Anchor,
             id: system,
             key: history.key_at(64).unwrap(),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: history.key_at(64).unwrap().digest,
             chain_pages: first_page.clone(),
             tail_pages: 1,
@@ -2986,9 +3563,10 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
     assert_eq!(
         published,
         vec![PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: prompt,
             key: history.key_at(130).unwrap(),
-            parent: Some(history.key_at(64).unwrap()),
+            ancestors: vec![history.key_at(64).unwrap()],
             bucket: history.key_at(128).unwrap().digest,
             chain_pages: pages[..2].to_vec(),
             tail_pages: 1,
@@ -3003,6 +3581,53 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
     assert_eq!(free(&scheduler), (6, 1));
     scheduler.ensure_resources(8, 4).unwrap();
     assert_eq!(free(&scheduler), (8, 4));
+}
+
+#[test]
+fn a_publication_lists_a_same_page_prompt_end_ahead_of_its_anchor() {
+    // The Anchor at 70 tokens, the prompt-end Endpoint at 100 and the terminal at 101
+    // all lie on one page. A host tier that holds only the prompt-end, or only the
+    // Anchor, links under what it holds.
+    let (mut scheduler, handle) = prefill_to_publication_boundary(100, 70);
+    let history = history(100);
+    retain_prompt(&mut scheduler, 3);
+    let anchor = history.key_at(70).unwrap();
+    let published = scheduler.take_publications();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].key, anchor);
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(4)).unwrap();
+    scheduler
+        .complete(
+            Fence(4),
+            &records(handle, 4, 100, 1, 77, 1),
+            Default::default(),
+        )
+        .unwrap();
+    retain_prompt(&mut scheduler, 5);
+    let prompt_end = history.key_at(100).unwrap();
+    let published = scheduler.take_publications();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].key, prompt_end);
+    assert_eq!(published[0].ancestors, [anchor]);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Decode);
+    scheduler.commit(&step, Fence(6)).unwrap();
+    scheduler
+        .complete(
+            Fence(6),
+            &records(handle, 6, 101, 2, 78, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, handle, 7);
+    let terminal = scheduler.finish(handle).unwrap().unwrap();
+    let publication = scheduler.publication(terminal).unwrap();
+    assert_eq!(publication.key.consumed_tokens, 101);
+    assert_eq!(publication.parent(), Some(prompt_end));
+    // The prompt-end shares its parent's page and is still listed, before the Anchor.
+    assert_eq!(publication.ancestors, [prompt_end, anchor]);
+    assert_eq!(publication.tail_pages, 0);
 }
 
 #[test]

@@ -81,6 +81,7 @@ fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_retention() {
         panic!("no pool store")
     };
     assert_eq!(prepared.geometry.len(), 1);
+    assert!(prepared.summary().contains("across rank processes: restores only"));
     assert!(prepared.memory_pool.is_none());
     assert_eq!(prepared.warm_bytes, 0);
     assert_eq!(
@@ -111,7 +112,7 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     let layout = Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
     assert_eq!(
         PrefixCacheOffload::default()
-            .headroom_with_inputs(1, &layout, 1, false)
+            .headroom_with_inputs(1, &layout, 1, false, None)
             .unwrap(),
         (0, 0)
     );
@@ -123,16 +124,16 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
         pool: Some(pool("host:7000")),
         ..tiers.clone()
     };
-    let (device, host) = tiers.headroom_with_inputs(1, &layout, 1, false).unwrap();
+    let (device, host) = tiers.headroom_with_inputs(1, &layout, 1, false, None).unwrap();
     // Static headroom covers the copier; Hello's regions are budgeted at startup.
     assert_eq!(
-        pooled.headroom_with_inputs(1, &layout, 1, false).unwrap(),
+        pooled.headroom_with_inputs(1, &layout, 1, false, None).unwrap(),
         (device + STORE_DEVICE_MARGIN_BYTES, host)
     );
     // A pool shares what the CPU reads, so its memory is mapped whole by the device
     // instead of split across ranks.
-    let split = tiers.headroom_with_inputs(2, &layout, 1, false).unwrap().0;
-    let whole = pooled.headroom_with_inputs(2, &layout, 1, false).unwrap().0;
+    let split = tiers.headroom_with_inputs(2, &layout, 1, false, None).unwrap().0;
+    let whole = pooled.headroom_with_inputs(2, &layout, 1, false, None).unwrap().0;
     assert!(whole > split + STORE_DEVICE_MARGIN_BYTES, "{whole} {split}");
     let alone = PrefixCacheOffload {
         pool: Some(pool("host:7000")),
@@ -140,7 +141,7 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     };
     assert!(alone.enabled());
     assert_eq!(
-        alone.headroom_with_inputs(1, &layout, 1, false).unwrap(),
+        alone.headroom_with_inputs(1, &layout, 1, false, None).unwrap(),
         (STORE_DEVICE_MARGIN_BYTES, 0)
     );
 }
@@ -294,13 +295,13 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
     };
     let mut options = PrefixCacheOffload::default();
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        options.headroom_with_inputs(2, &layout, 1, false, None).unwrap(),
         (0, 0)
     );
     let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
     options.memory_bytes = Some(16 << 30);
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        options.headroom_with_inputs(2, &layout, 1, false, None).unwrap(),
         (
             ((16u64 << 30) + intake).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES,
             (16 << 30) + intake
@@ -309,19 +310,19 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
     options.disk = Some("records".into());
     let host = (16u64 << 30) + intake;
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        options.headroom_with_inputs(2, &layout, 1, false, None).unwrap(),
         (host.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, host)
     );
     options.memory_bytes = Some(0);
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        options.headroom_with_inputs(2, &layout, 1, false, None).unwrap(),
         (intake.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, intake)
     );
     options.memory_bytes = Some(16 << 30);
     options.disk_limit = Some(0);
     assert_eq!(
         options
-            .headroom_with_inputs(2, &layout, 1, false)
+            .headroom_with_inputs(2, &layout, 1, false, None)
             .unwrap()
             .1,
         (16 << 30) + intake
@@ -351,7 +352,7 @@ fn ordinary_input_share_preserves_mapping() {
         ..Default::default()
     };
     let ordinary = input_memory_bytes(1 << 30, true);
-    let (device, host) = options.headroom_with_inputs(2, &layout, 1, true).unwrap();
+    let (device, host) = options.headroom_with_inputs(2, &layout, 1, true, None).unwrap();
     let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
     assert_eq!(host, (1 << 30) + intake);
     assert_eq!(
@@ -361,10 +362,10 @@ fn ordinary_input_share_preserves_mapping() {
 }
 
 #[test]
-fn intake_warning_only_reports_shrinkage_and_the_required_memory() {
+fn intake_warning_reports_shrinkage_and_the_required_memory() {
     let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)];
     let layout = Layout::new(&geometry).unwrap();
-    let mut options = PrefixCacheOffload {
+    let options = PrefixCacheOffload {
         memory_bytes: Some(layout.page_record_bytes * 128),
         pool: Some(pool("unix:/run/selene.sock")),
         ..Default::default()
@@ -412,8 +413,38 @@ fn intake_warning_only_reports_shrinkage_and_the_required_memory() {
             }
         }
     }
-    options.memory_bytes = Some(0);
-    assert!(build(&options).intake_warning(32).is_none());
+}
+
+#[test]
+fn pool_only_sizes_registered_capture_and_headroom_for_local_ranks() {
+    let options = PrefixCacheOffload {
+        pool: Some(pool("unix:/run/selene.sock")),
+        ..Default::default()
+    };
+    for pages in [10, 512] {
+        let mut ranks = vec![crate::testing::geometry(64, &[("kv", 4096)], 8192); 2];
+        ranks[0].page_capacity = 8;
+        ranks[1].page_capacity = pages;
+        let registrar = crate::testing::TrackingRegistrar::default();
+        let Preparation::Store(prepared) = super::prepare_with_inputs(
+            &options, "unused".as_ref(), [0; 32], ranks, vec![(0, 0), (1, 1)],
+            4, 0, None, &registrar,
+        ).unwrap() else {
+            panic!("missing capture buffer");
+        };
+        let layout = &prepared.layout;
+        let slots = intake_slots(layout, 4).max(pages as usize + layout.row_slots());
+        let bytes = slots as u64 * layout.page_record_bytes;
+        let buffer = prepared.memory_pool.as_ref().unwrap();
+        assert_eq!((buffer.slot_count(), buffer.intake_slots()), (slots, 0));
+        assert!(buffer.rank_parts().is_none());
+        assert_eq!(registrar.calls.lock().unwrap().len(), 1);
+        assert_eq!(prepared.warm_bytes, 0);
+        assert!(prepared.intake_warning(4).is_none());
+        assert!(prepared.summary().contains(&format!("pool only: capture buffer {}", gibibytes(bytes))));
+        assert_eq!(options.headroom_with_inputs(2, layout, 4, false, Some(pages)).unwrap(),
+            (2 * STORE_DEVICE_MARGIN_BYTES + bytes.div_ceil(512), bytes));
+    }
 }
 
 struct RecordingFactory {
@@ -585,7 +616,7 @@ fn intake_shrinks_to_two_full_windows_without_refusing() {
         memory_bytes: Some(memory),
         ..Default::default()
     };
-    let (_, host) = options.headroom_with_inputs(1, &layout, 64, false).unwrap();
+    let (_, host) = options.headroom_with_inputs(1, &layout, 64, false, None).unwrap();
     assert_eq!(
         host - memory,
         intake_slots(&layout, 1) as u64 * layout.page_record_bytes

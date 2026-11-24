@@ -12,9 +12,63 @@ import torch
 from ignition.progress import graph_catalog, phase
 
 from .aot import ForwardCache
+from .collectives import warmup_wait
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
 from .runtime_core import capture_graph, instantiate_graph, record_export_graph
+
+
+_warmup_streams = {}
+_warmup_pools = {}
+
+
+def _warmup_stream(device):
+    """Return the per-device stream that eager warmups run on.
+
+    PyTorch caches one cuBLAS/cuBLASLt workspace per (handle, stream).
+    Warmups allocate inside transient storage, so their workspaces must
+    stay off the capture stream: the first capture then allocates the
+    stream's workspace inside the recording pool, and the cache retains
+    it for every graph the stream captures afterward.
+    """
+    # The stream must be created outside PyTorch's round-robin pool: a
+    # caller's later torch.cuda.Stream can alias a pool stream, and
+    # workspaces are cached per CUDA stream, so an aliased capture stream
+    # would reuse a warmup workspace's transient address. The stream and
+    # its CUDA handle live for the life of the process.
+    with torch.cuda.device(device):
+        index = torch.cuda.current_device()
+        stream = _warmup_streams.get(index)
+        if stream is None:
+            from cuda.bindings import driver as cuda
+
+            status, handle = cuda.cuStreamCreate(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING)
+            if status != cuda.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cannot create warmup stream: {status}")
+            stream = _warmup_streams[index] = torch.cuda.ExternalStream(int(handle), device=device)
+    return stream
+
+
+def _seed_warmup_workspaces(stream, device):
+    """Seed the calling thread's warmup-stream workspace in a dedicated pool.
+
+    Workspaces are cached per thread's cuBLAS handle, so seeding runs on
+    each capture call under the ambient BLAS backend, the backend the
+    warmups use. A workspace created inside transient storage keeps its
+    address in the cache after the transient backing is released, and a
+    later call could reuse it; a dedicated pool keeps the seed's backing
+    mapped for the life of the cache entry, outside transient storage,
+    any caller-owned pool, and the exported graph pool.
+    """
+    with torch.cuda.device(device):
+        index = torch.cuda.current_device()
+        pool = _warmup_pools.get(index)
+        if pool is None:
+            pool = _warmup_pools[index] = torch.cuda.MemPool()
+    with torch.cuda.device(index), torch.cuda.stream(stream), torch.cuda.use_mem_pool(pool):
+        operand = torch.empty((512, 512), dtype=torch.bfloat16, device=device)
+        torch.mm(operand, operand, out=torch.empty_like(operand))
+    stream.synchronize()
 
 
 def _capture_order(names, compiled, coordinator):
@@ -40,7 +94,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      progress=None, label="Prepare serving graphs", cache_root=None, retain_graphs=False,
                      warmup_storage=None, capture_names=None, before_run=None, compile_group=None,
                      report_catalog=True, retain_forwards=False,
-                     compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision")):
+                     compile_kinds=("prefill", "terminal_prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision")):
     """Retain compiled resources and capture with an optional b12x IPC runtime.
 
     Persistent state and graph outputs must live in caller-owned storage.
@@ -48,6 +102,10 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     serving replays variants serially and may choose them in any order.
     All eager warmups precede capture so their transient workspaces do not
     coexist with retained graph intermediates.
+    Graphs captured on one stream share that stream's cached workspace;
+    resetting any of them frees the workspace the others still reference.
+    Callers must reset all of a capture stream's graphs together or keep
+    separately reset groups on separate streams.
     ``retain_graphs`` keeps templates and executables for export when
     ``warmup_storage`` supplies external CUDA pool owners.
     ``before_run`` restores caller-owned trial inputs outside compiled warmup
@@ -69,6 +127,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         raise ValueError("grouped compilation requires a distinct name and selected compiled forwards")
     graphs, compiled = {}, {}
     warmup = nullcontext if warmup_storage is None else warmup_storage.transient
+    warm = _warmup_stream(device)
+    _seed_warmup_workspaces(warm, device)
     if compile_decoder:
         cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
@@ -83,10 +143,11 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             if any(type(forward) is not type(forwards[first]) or signatures[name] != signatures[first]
                    for name, forward in forwards.items()):
                 raise ValueError("grouped forwards require one type and graph signature")
-        stream.wait_stream(torch.cuda.current_stream(device))
+        warm.wait_stream(torch.cuda.current_stream(device))
+        warm.wait_stream(stream)
         retention = nullcontext() if warmup_storage is None else warmup_storage.retain_transient_backing()
-        with retention:
-            with torch.cuda.stream(stream):
+        with retention, warmup_wait(collective, coordinator):
+            with torch.cuda.stream(warm):
                 if compile_group is None:
                     compiled = cache.prepare_many(forwards, signatures, progress=progress,
                                                   coordinator=coordinator, materialize=materialize, warmup=warmup,
@@ -96,7 +157,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                     template = cache.prepare_many(representative, {compile_group: signatures[first]},
                         progress=progress, coordinator=coordinator, materialize=materialize,
                         warmup=warmup, before_run=None if before_run is None else lambda _: before_run(first))
-            stream.synchronize()
+            warm.synchronize()
         if compile_group is not None:
             compiled = cache.bind_group(template[compile_group], forwards,
                                         signature=signatures[first], coordinator=coordinator)
@@ -121,8 +182,9 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             function = functions[name]
             if coordinator is not None:
                 coordinator.barrier(f"capture warmup {name}", coordinator.ranks)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            with warmup(), torch.cuda.stream(stream):
+            warm.wait_stream(torch.cuda.current_stream(device))
+            warm.wait_stream(stream)
+            with warmup(), torch.cuda.stream(warm):
                 if before_run is not None:
                     before_run(name)
                 if name in compiled:
@@ -131,8 +193,9 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                         function()
                 else:
                     function()
-            stream.synchronize()
+            warm.synchronize()
             stage.update(advance=1)
+    stream.wait_stream(warm)
     ordered_names = _capture_order(names, compiled, coordinator)
     with phase(progress, label, total=len(names)) as stage:
         for name in ordered_names:
@@ -157,9 +220,10 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                 if progress is not None:
                     progress(f"capturing {name}: {memory_detail()}")
                 if before_run is not None:
-                    with torch.cuda.stream(stream):
+                    warm.wait_stream(stream)
+                    with torch.cuda.stream(warm):
                         before_run(name)
-                    stream.synchronize()
+                    stream.wait_stream(warm)
                 with capture_consumers(session, graph), communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
                     function()
                 if exporting:

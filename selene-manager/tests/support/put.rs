@@ -84,9 +84,14 @@ pub async fn put(
     let chain_pages = key.consumed_tokens / descriptor.page_tokens;
     session
         .send(c::M::PutBegin(v2::PutBegin {
+            ancestor_keys: Vec::new(),
             put_id: id,
             key: Some(key_to(key)),
             chain_pages,
+            capture_role: options.role as i32,
+            child_paths: options.child_paths,
+            descendant_row: options.descendant_row,
+            next_child: options.next_child.map(key_to),
             row: true,
             has_published_parent: parent.is_some(),
             published_parent: parent.map(key_to),
@@ -138,7 +143,16 @@ pub async fn put(
         }
     });
     let (header, mut bytes, _) = content_for(descriptor, key, parent, first);
-    let payload = header.length_with_row() - header.page_segment;
+    let mut header =
+        header.with_capture_role(flare_selene::CaptureRole::try_from(accept.capture_role).unwrap());
+    let row = accept.record_bytes == header.length_with_row();
+    assert_eq!(accept.record_bytes, header.length(row));
+    if !row {
+        header.row_checksum = 0;
+        bytes.truncate(header.row_segment as usize);
+    }
+    bytes[..4096].copy_from_slice(&header.encode().unwrap());
+    let payload = accept.record_bytes - header.page_segment;
     let page_bytes = header.page_record_bytes() as usize;
     let mut covered = 0;
     let mut grants = 0;
@@ -191,13 +205,13 @@ pub async fn put(
             return cancel(session, id, options.keep_windows).await;
         }
         let start = if window.page_count > 0 {
-            header.page_segment as usize + (window.first_page - first) as usize * page_bytes
+            header.page_segment as usize + window.first_page as usize * page_bytes
         } else {
             header.row_segment as usize
         };
         let mut hashes = Vec::new();
         for position in 0..window.page_count as usize {
-            let relative = (window.first_page - first) as usize + position;
+            let relative = window.first_page as usize + position;
             let page = header.page_segment as usize + relative * page_bytes;
             if options.corrupt_page == Some(relative) {
                 bytes[page] ^= 1;

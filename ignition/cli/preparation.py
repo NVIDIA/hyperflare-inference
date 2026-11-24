@@ -8,9 +8,9 @@ import os
 from dataclasses import dataclass, replace
 
 from ignition import planning
+from ignition.declaration import Speculation
 from ignition.errors import FetchError, UsageError
-from ignition.recipes import ResolvedModel, resolve
-from ignition.recipes.declaration import Speculation
+from ignition.registry import ResolvedModel, resolve
 
 from .config import AUTOTUNE_EFFORTS, Configuration, Setting
 
@@ -33,18 +33,19 @@ class Host:
         return cls(gpus, restriction)
 
 
-def resolve_model(configuration: Configuration, name: str | None) -> ResolvedModel:
+def resolve_model(configuration: Configuration, name: str | None, *, recipes=None) -> ResolvedModel:
     name = configuration.model if name is None else name
     if name is None:
         raise UsageError("no MODEL given and defaults.model is not set in the configuration file")
-    model = resolve(name, configuration.directory("hub_cache"))
+    model = resolve(name, configuration.directory("hub_cache"), recipes=recipes)
     model.verify(configuration.directory("hub_cache"))
     return model
 
 
 def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gpus: str | None,
            concurrency: Setting, speculation: Speculation | None, prefill_chunk: int | None = None,
-           context_parallel: bool = True, stream_overlap: bool = True, roce_ring: bool = False, roce_chain: bool = False,
+           context_parallel: bool = True, context_parallel_size: int | None = None,
+           stream_overlap: bool = True, roce_ring: bool = False, roce_chain: bool = False,
            mixed_prefill: bool = False, prompt_logprobs: bool = False, expert_scale_compression: str | None = None,
            online_mxfp8: bool = False, online_mxfp8_scope: str | None = None, language_model_only: bool = False,
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
@@ -61,9 +62,11 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
     result = planning.plan(
         model.recipe, model.checkpoint, host.gpus, selected=None if gpus is None else planning.parse_gpus(gpus),
         concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes, speculation=speculation,
-        prefill_chunk=prefill_chunk, context_parallel=context_parallel, stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
+        prefill_chunk=prefill_chunk, context_parallel=context_parallel, context_parallel_size=context_parallel_size,
+        stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
-        image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
+        image_concurrency=image_capacity_setting(configuration, model, image_concurrency,
+                                                 language_model_only=language_model_only),
         online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
@@ -74,8 +77,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
     return tuning_devices(result, host, tuning_gpus)
 
 
-def image_capacity_setting(configuration, model, flag=None):
-    if not model.recipe.max_images and flag is None:
+def image_capacity_setting(configuration, model, flag=None, *, language_model_only=False):
+    if (not model.recipe.max_images or language_model_only) and flag is None:
         return None
     return configuration.model_setting(model.checkpoint.alias, "image_concurrency", None, flag).value
 
@@ -172,6 +175,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         ("--mtp-draft-tokens", args.mtp_draft_tokens),
         ("--speculative-token-capacity", args.speculative_token_capacity),
         ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
+        ("--draft-body-quantization", getattr(args, "draft_body_quantization", None)),
         ("--draft-head-quantization", getattr(args, "draft_head_quantization", None)),
         ("--markov-head-quantization", getattr(args, "markov_head_quantization", None)),
         ("--vocabulary-parallel-sampling", getattr(args, "vocabulary_parallel_sampling", False) or None)) if value is not None]
@@ -212,13 +216,17 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     if budget is not None and (type(budget) is not int or budget < 1):
         raise UsageError("--speculative-graph-budget must be a positive integer")
     draft_head = getattr(args, "draft_head_quantization", None)
+    draft_body = getattr(args, "draft_body_quantization", None)
     markov_head = getattr(args, "markov_head_quantization", None)
     if (draft_head or markov_head) and drafts < 1:
         raise UsageError("draft head quantization requires positive learned draft depth")
+    if draft_body and drafts < 1:
+        raise UsageError("draft body quantization requires positive learned draft depth")
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
                        mtp_only=args.mtp_only,
                        draft_prefix_selection=prefix_selection, graph_budget=budget,
-                       draft_head_quantization=draft_head, markov_head_quantization=markov_head,
+                       draft_head_quantization=draft_head, draft_body_quantization=draft_body,
+                       markov_head_quantization=markov_head,
                        vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False), method=method)
 
 

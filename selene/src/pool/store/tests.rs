@@ -50,6 +50,7 @@ struct LocalState {
     announced: bool,
     /// What the last local tier offers for a move, coldest first.
     retiring: Vec<Retiring>,
+    ancestors: Vec<Retiring>,
     /// How each offered record's move ended, in order.
     retired: Vec<(PrefixKey, Retirement)>,
     spill: Option<bool>,
@@ -57,6 +58,8 @@ struct LocalState {
     stored: Vec<PrefixKey>,
     store_outcome: Option<StoreOutcome>,
     copies_in_flight: usize,
+    /// Records a shutdown drain finds resident and never sees retire.
+    drain_records: Option<usize>,
 }
 
 #[derive(Clone, Default)]
@@ -90,8 +93,10 @@ impl HostStore for FakeLocal {
         Ok(())
     }
     fn stats(&self) -> StoreStats {
+        let state = self.0.lock().unwrap();
         StoreStats {
-            outbound_in_flight: self.0.lock().unwrap().copies_in_flight,
+            outbound_in_flight: state.copies_in_flight,
+            memory_records: state.drain_records.unwrap_or(0),
             ..StoreStats::default()
         }
     }
@@ -101,6 +106,13 @@ impl HostStore for FakeLocal {
 }
 
 impl crate::store::TierStore for FakeLocal {
+    fn begin_pool_drain(&mut self) -> Option<(usize, u64)> {
+        self.0
+            .lock()
+            .unwrap()
+            .drain_records
+            .map(|records| (records, 0))
+    }
     fn announce_to(&mut self, _: Announcer) {
         self.0.lock().unwrap().announced = true;
     }
@@ -120,6 +132,15 @@ impl crate::store::TierStore for FakeLocal {
     }
     fn set_spill(&mut self, enabled: bool) {
         self.0.lock().unwrap().spill = Some(enabled);
+    }
+    fn retirement_predecessor(&self, key: PrefixKey, _candidates: bool) -> Option<Retiring> {
+        self.0
+            .lock()
+            .unwrap()
+            .ancestors
+            .iter()
+            .find(|r| r.key == key)
+            .cloned()
     }
     fn take_retiring(&mut self) -> Vec<Retiring> {
         std::mem::take(&mut self.0.lock().unwrap().retiring)
@@ -598,19 +619,20 @@ fn gpu_publications_are_announced_and_their_evictions_reported() {
     let mut rig = rig();
     let key = rig.key(160);
     let checkpoint = PublishedCheckpoint {
+        capture_role: crate::CaptureRole::Endpoint,
         id: CheckpointId::new(42),
         key,
-        parent: Some(rig.key(64)),
+        ancestors: vec![rig.key(64)],
         bucket: [4; 16],
-        chain_pages: vec![PageId(1), PageId(2)],
-        tail_pages: 2,
+        chain_pages: (0..10).map(PageId).collect(),
+        tail_pages: 6,
         slot: StateSlotId(1),
     };
     assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
     assert_eq!(rig.copies(), [checkpoint.key]);
     let saved = rig.pool.lock().unwrap().saved.clone();
     assert_eq!(saved.len(), 1);
-    assert_eq!((saved[0].tier, saved[0].tail_pages), (Tier::Gpu, 2));
+    assert_eq!((saved[0].tier, saved[0].tail_pages), (Tier::Gpu, 6));
     assert_eq!(saved[0].parent, Some(rig.key(64)));
     let mut heir = checkpoint.clone();
     heir.id = CheckpointId::new(43);
@@ -721,6 +743,10 @@ fn a_candidate_starting_after_the_resident_prefix_never_stitches_to_a_local_pref
 impl Rig {
     fn retiring(&self, page: u64) -> Retiring {
         Retiring {
+            descendant_row: false,
+            capture_role: crate::CaptureRole::Endpoint,
+            child_paths: 0,
+            ancestor_keys: Vec::new(),
             tier: Tier::Nvme,
             key: self.key(page * PT),
             parent: (page > 1).then(|| self.key((page - 1) * PT)),
@@ -805,7 +831,319 @@ fn a_retiring_record_is_put_and_released_only_when_the_manager_commits_it() {
     rig.poll();
     assert!(rig.retired().is_empty());
     let (id, _) = rig.started()[0];
-    rig.end(id, PutOutcome::Stored { bytes: 1 });
+    rig.end(id, stored());
+    rig.poll();
+    assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
+}
+
+fn stored() -> PutOutcome {
+    PutOutcome::Stored {
+        bytes: 1,
+        pages: 0,
+        linked: None,
+    }
+}
+
+#[test]
+fn a_page_only_local_root_is_sent_with_its_deeper_row() {
+    let mut rig = rig();
+    rig.ready(true);
+    let mut root = rig.retiring(1);
+    root.tier = Tier::Dram;
+    root.row = false;
+    let mut tip = root.clone();
+    tip.key = rig.key(root.key.consumed_tokens + 1);
+    tip.parent = Some(root.key);
+    tip.ancestor_keys = vec![root.key];
+    tip.row = true;
+    tip.tail_pages = 0;
+    rig.local.0.lock().unwrap().ancestors = vec![root.clone(), tip.clone()];
+    rig.offer(&[tip.clone()]);
+    rig.poll();
+    let started = rig.started();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].1, tip.key);
+    assert_eq!(rig.pool.lock().unwrap().puts[0].1.ancestor_keys, [root.key]);
+    rig.end(started[0].0, stored());
+    rig.poll();
+    assert_eq!(rig.retired(), [(tip.key, Retirement::Moved)]);
+}
+
+#[test]
+fn a_dram_leaf_retires_through_its_local_root_carrying_every_offered_ancestor() {
+    let mut rig = rig();
+    rig.ready(true);
+    // The local root was published under two ancestors the local tier does not hold.
+    let b = rig.key(3 * PT + 1);
+    let a = rig.key(2 * PT);
+    let mut root = rig.retiring(4);
+    root.tier = Tier::Dram;
+    root.parent = None;
+    root.ancestor_keys = vec![b, a];
+    let mut tip = rig.retiring(5);
+    tip.tier = Tier::Dram;
+    tip.parent = Some(root.key);
+    let nearer = rig.key(5 * PT - 1);
+    let next = rig.key(5 * PT - 2);
+    tip.ancestor_keys = vec![nearer, next, root.key, b, a];
+    rig.local.0.lock().unwrap().ancestors = vec![root.clone(), tip.clone()];
+    rig.offer(std::slice::from_ref(&tip));
+    rig.poll();
+    // The root goes first, and both ancestors travel as its candidates, nearest first.
+    assert_eq!(rig.started().len(), 1);
+    assert_eq!(rig.started()[0].1, root.key);
+    assert_eq!(rig.pool.lock().unwrap().puts[0].1.ancestor_keys, [b, a]);
+    rig.end(
+        rig.started()[0].0,
+        PutOutcome::Stored {
+            bytes: 1,
+            pages: 3,
+            linked: Some(a),
+        },
+    );
+    rig.poll();
+    assert_eq!(rig.started()[1].1, tip.key);
+    assert_eq!(rig.pool.lock().unwrap().puts[1].1.parent, Some(root.key));
+    rig.end(
+        rig.started()[1].0,
+        PutOutcome::Stored {
+            bytes: 1,
+            pages: 1,
+            linked: Some(next),
+        },
+    );
+    rig.poll();
+    assert_eq!(rig.retired(), [(tip.key, Retirement::Moved)]);
+    assert_eq!(rig.store.stats().deeper_link_records[1], 2);
+    assert_eq!(rig.store.stats().deeper_link_pages[1], 4);
+}
+
+#[test]
+fn a_local_root_outside_the_leafs_candidate_list_still_retires_first() {
+    let mut rig = rig();
+    rig.ready(true);
+    rig.history.append(&vec![1; 4200], &[]).unwrap();
+    let limit = crate::shared::MAX_CHAIN_NODES as usize;
+    let keys: Vec<_> = (0..limit + 2).map(|i| rig.key(32 + i as u64)).collect();
+    let template = rig.retiring(2);
+    let mut path = Vec::new();
+    for (i, key) in keys.iter().copied().enumerate() {
+        let mut record = template.clone();
+        record.tier = Tier::Dram;
+        record.key = key;
+        record.parent = path.last().map(|parent: &Retiring| parent.key);
+        record.tail_pages = (key.consumed_tokens / PT
+            - record.parent.map_or(0, |p| p.consumed_tokens / PT)) as usize;
+        if i == 0 {
+            record.ancestor_keys.push(rig.key(16));
+        }
+        path.push(record);
+    }
+    let leaf = path.last_mut().unwrap();
+    leaf.ancestor_keys = keys[1..keys.len() - 1].iter().rev().copied().collect();
+    rig.offer(std::slice::from_ref(leaf));
+    rig.local.0.lock().unwrap().ancestors = path;
+    rig.poll();
+    assert_eq!(rig.started()[0].1, keys[0]);
+    assert_eq!(rig.pool.lock().unwrap().puts[0].1.ancestor_keys, [rig.key(16)]);
+}
+
+#[test]
+fn pool_puts_count_roots_and_deeper_offered_links() {
+    let mut rig = rig();
+    rig.ready(true);
+    let b = rig.key(3 * PT + 1);
+    let a = rig.key(2 * PT);
+    // (candidate ancestors, the record the manager linked under, pages it carried).
+    let cases: [(Vec<PrefixKey>, Option<PrefixKey>, u64); 6] = [
+        (vec![], None, 9),
+        (vec![b, a], None, 8),
+        (vec![b, a], Some(a), 3),
+        (vec![b, a], Some(b), 2),
+        (vec![b, a], Some(a), 4),
+        (vec![b, a], Some(rig.key(PT)), 5),
+    ];
+    for (n, (hints, linked, pages)) in cases.into_iter().enumerate() {
+        let mut record = rig.retiring(6 + n as u64);
+        record.parent = None;
+        record.ancestor_keys = hints;
+        rig.offer(&[record]);
+        rig.poll();
+        rig.end(
+            rig.started()[n].0,
+            PutOutcome::Stored {
+                bytes: 1,
+                pages,
+                linked,
+            },
+        );
+        rig.poll();
+    }
+    rig.offer(&[rig.retiring(1)]);
+    rig.poll();
+    rig.end(rig.started().last().unwrap().0, PutOutcome::Present);
+    rig.poll();
+    let stats = rig.store.stats();
+    assert_eq!(stats.root_records[1], [1, 1]);
+    assert_eq!(stats.deeper_link_records[1], 2);
+    assert_eq!(stats.root_pages[1], [9, 8]);
+    assert_eq!(stats.deeper_link_pages[1], 7);
+    assert_eq!(stats.root_records[0], [0, 0]);
+    assert_eq!(stats.deeper_link_records[0], 0);
+}
+
+#[test]
+fn losing_the_descendant_row_before_retirement_keeps_the_source() {
+    let mut rig = rig();
+    rig.ready(true);
+    let mut path: Vec<_> = (1..=3).map(|n| rig.retiring(n)).collect();
+    let keys: Vec<_> = path.iter().map(|node| node.key).collect();
+    for (i, node) in path.iter_mut().enumerate() {
+        node.tier = Tier::Dram;
+        node.ancestor_keys = keys[..i].iter().rev().copied().collect();
+        node.child_paths = u32::from(i < 2);
+        node.descendant_row = i < 2;
+    }
+    rig.local.0.lock().unwrap().ancestors = path.clone();
+    rig.offer(&path[2..]);
+    for (i, key) in keys.iter().enumerate() {
+        rig.poll();
+        let (id, offered) = rig.started()[i];
+        assert_eq!(offered, *key);
+        if i == 1 {
+            let pool = rig.pool.lock().unwrap();
+            assert!(pool.puts[i].1.row && pool.puts[i].1.descendant_row);
+        }
+        if i == 2 {
+            let mut local = rig.local.0.lock().unwrap();
+            local.ancestors[1].descendant_row = false;
+            local.ancestors[2].row = false;
+        }
+        rig.end(id, stored());
+    }
+    rig.poll();
+    assert_eq!(rig.retired(), [(keys[2], Retirement::Failed)]);
+}
+
+#[test]
+fn a_permanent_middle_refusal_retries_only_the_leaf() {
+    for present in [false, true] {
+        let mut rig = rig();
+        rig.ready(true);
+        let mut path: Vec<_> = (1..=3).map(|n| rig.retiring(n)).collect();
+        let keys: Vec<_> = path.iter().map(|r| r.key).collect();
+        for (i, node) in path.iter_mut().enumerate() {
+            node.tier = Tier::Dram;
+            node.ancestor_keys = keys[..i].iter().rev().copied().collect();
+            node.child_paths = u32::from(i < 2);
+        }
+        rig.local.0.lock().unwrap().ancestors = path.clone();
+        let now = Instant::now();
+        rig.store.cascade.now = Some(now);
+        rig.offer(&path[2..]);
+        rig.poll();
+        assert_eq!(rig.started()[0].1, keys[0]);
+        rig.end(rig.started()[0].0, stored());
+        rig.poll();
+        assert_eq!(rig.started()[1].1, keys[1]);
+        rig.end(rig.started()[1].0, PutOutcome::Refused(PutRefusal::Invalid));
+        rig.poll();
+        assert_eq!(rig.started()[2].1, keys[2]);
+        assert_eq!(
+            rig.pool.lock().unwrap().puts[2].1.ancestor_keys,
+            [keys[1], keys[0]]
+        );
+        let (result, expected) = if present {
+            (PutOutcome::Present, Retirement::MovedLeaf)
+        } else {
+            (PutOutcome::Refused(PutRefusal::Invalid), Retirement::Dropped)
+        };
+        rig.end(rig.started()[2].0, result);
+        rig.poll();
+        assert_eq!(rig.retired(), [(keys[2], expected)]);
+        assert_eq!(rig.store.stats().dropped[6], u64::from(!present));
+    }
+}
+
+#[test]
+fn a_temporary_ancestor_refusal_retries_once_then_offers_the_leaf() {
+    for (reason, index) in [(PutRefusal::Budget, 3), (PutRefusal::Inflight, 4)] {
+        for exhausted in [false, true] {
+            let mut rig = rig();
+            rig.ready(true);
+            let mut path: Vec<_> = (1..=3).map(|n| rig.retiring(n)).collect();
+            let keys: Vec<_> = path.iter().map(|r| r.key).collect();
+            for (i, node) in path.iter_mut().enumerate() {
+                node.tier = Tier::Dram;
+                node.ancestor_keys = keys[..i].iter().rev().copied().collect();
+                node.child_paths = u32::from(i < 2);
+            }
+            rig.local.0.lock().unwrap().ancestors = path.clone();
+            let now = Instant::now();
+            rig.store.cascade.now = Some(now);
+            rig.offer(&path[2..]);
+            rig.poll();
+            assert_eq!(rig.started()[0].1, keys[0]);
+            rig.end(rig.started()[0].0, PutOutcome::Present);
+            rig.poll();
+            assert_eq!(rig.started()[1].1, keys[1]);
+            rig.end(rig.started()[1].0, PutOutcome::Refused(reason));
+            rig.poll();
+            assert!(
+                rig.retired().is_empty(),
+                "the retry must keep the selected leaf"
+            );
+            assert_eq!(rig.started().len(), 2);
+            assert_eq!(rig.store.stats().refusal_drops[index], 0);
+            rig.store.cascade.now = Some(now + Duration::from_millis(50));
+            rig.poll();
+            assert_eq!(rig.started()[2].1, keys[1]);
+            let outcome = if exhausted {
+                PutOutcome::Refused(reason)
+            } else {
+                PutOutcome::Present
+            };
+            rig.end(rig.started()[2].0, outcome);
+            rig.poll();
+            rig.store.cascade.now = Some(now + Duration::from_millis(100));
+            rig.poll();
+            assert_eq!(rig.started()[3].1, keys[2]);
+            assert_eq!(
+                rig.pool.lock().unwrap().puts[3].1.ancestor_keys,
+                [keys[1], keys[0]]
+            );
+            rig.end(rig.started()[3].0, PutOutcome::Present);
+            rig.poll();
+            let how = if exhausted {
+                Retirement::MovedLeaf
+            } else {
+                Retirement::Moved
+            };
+            assert_eq!(rig.retired(), [(keys[2], how)]);
+            assert_eq!(rig.started().len(), 4);
+            assert_eq!(rig.store.stats().refusal_drops[index], u64::from(exhausted));
+            assert_eq!(rig.store.stats().dropped[6], 0);
+        }
+    }
+}
+
+#[test]
+fn a_page_only_retirement_is_put_without_its_row() {
+    let mut rig = rig();
+    rig.ready(true);
+    let mut record = rig.retiring(3);
+    record.row = false;
+    rig.offer(std::slice::from_ref(&record));
+    rig.poll();
+    {
+        let state = rig.pool.lock().unwrap();
+        let [(_, request)] = &state.puts[..] else {
+            panic!("one page-only put expected");
+        };
+        assert!(!request.row);
+        assert_eq!(request.capture_role, crate::CaptureRole::Endpoint);
+    }
+    rig.end(rig.started()[0].0, stored());
     rig.poll();
     assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
 }
@@ -824,13 +1162,102 @@ fn a_record_the_manager_already_holds_is_released_without_another_copy() {
 }
 
 #[test]
+fn invalid_or_oversize_put_is_discarded() {
+    for refusal in [PutRefusal::Oversize, PutRefusal::Invalid] {
+        let mut rig = rig();
+        rig.ready(true);
+        let record = rig.retiring(4);
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        rig.end(rig.started()[0].0, PutOutcome::Refused(refusal));
+        rig.poll();
+        assert_eq!(
+            rig.retired(),
+            [(record.key, Retirement::Dropped)],
+            "{refusal:?}"
+        );
+    }
+}
+
+#[test]
+fn a_budget_or_inflight_refusal_waits_for_backoff_despite_progress() {
+    for refusal in [PutRefusal::Budget, PutRefusal::Inflight] {
+        let mut rig = rig();
+        let now = Instant::now();
+        rig.store.cascade.now = Some(now);
+        rig.ready(true);
+        let record = rig.retiring(4);
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        rig.end(rig.started()[0].0, PutOutcome::Refused(refusal));
+        rig.poll();
+        assert!(rig.retired().is_empty(), "{refusal:?}");
+        assert_eq!(rig.started().len(), 1);
+
+        rig.ready(true);
+        rig.poll();
+        assert_eq!(rig.started().len(), 1, "{refusal:?}");
+        rig.store.cascade.now = Some(now + Duration::from_millis(49));
+        rig.poll();
+        assert_eq!(rig.started().len(), 1, "{refusal:?}");
+        rig.store.cascade.now = Some(now + Duration::from_millis(50));
+        rig.poll();
+        assert_eq!(rig.started().len(), 2);
+        rig.end(rig.started()[1].0, PutOutcome::Refused(refusal));
+        rig.poll();
+        assert_eq!(
+            rig.retired(),
+            [(record.key, Retirement::Dropped)],
+            "{refusal:?}"
+        );
+    }
+}
+
+#[test]
+fn refusal_discards_count_the_source_tier() {
+    for (index, tier) in [Tier::Dram, Tier::Nvme].into_iter().enumerate() {
+        for (reason, refusal) in [
+            PutRefusal::Invalid,
+            PutRefusal::Unlinked,
+            PutRefusal::Oversize,
+            PutRefusal::Budget,
+            PutRefusal::Inflight,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut rig = rig();
+            let now = Instant::now();
+            rig.store.cascade.now = Some(now);
+            rig.ready(true);
+            let mut record = rig.retiring(4);
+            record.tier = tier;
+            rig.offer(std::slice::from_ref(&record));
+            rig.poll();
+            assert!(rig.store.stats().dropped.iter().all(|count| *count == 0));
+            rig.end(rig.started()[0].0, PutOutcome::Refused(refusal));
+            rig.poll();
+            if matches!(refusal, PutRefusal::Budget | PutRefusal::Inflight) {
+                assert!(rig.store.stats().dropped.iter().all(|count| *count == 0));
+                rig.store.cascade.now = Some(now + Duration::from_millis(50));
+                rig.poll();
+                rig.end(rig.started()[1].0, PutOutcome::Refused(refusal));
+                rig.poll();
+            }
+            assert_eq!(rig.retired(), [(record.key, Retirement::Dropped)]);
+            let stats = rig.store.stats();
+            assert_eq!(stats.refusal_drops[reason], 1);
+            assert_eq!(stats.dropped[6 + index], 1, "{tier:?} {refusal:?}");
+            assert_eq!(stats.dropped.iter().sum::<u64>(), 1);
+            rig.poll();
+            assert_eq!(rig.store.stats().dropped, stats.dropped);
+        }
+    }
+}
+
+#[test]
 fn refusals_keep_records_local_and_retry_only_after_progress() {
-    for refusal in [
-        PutRefusal::Budget,
-        PutRefusal::Queue,
-        PutRefusal::NotReady,
-        PutRefusal::Oversize,
-    ] {
+    for refusal in [PutRefusal::Queue, PutRefusal::NotReady] {
         let mut rig = rig();
         rig.ready(true);
         let record = rig.retiring(4);
@@ -863,8 +1290,6 @@ fn repeated_failures_keep_the_record_local() {
         PutOutcome::Failed("the session was lost".into()),
         PutOutcome::Cancelled,
         PutOutcome::Refused(PutRefusal::Io),
-        PutOutcome::Refused(PutRefusal::Invalid),
-        PutOutcome::Refused(PutRefusal::Inflight),
     ] {
         let mut rig = rig();
         rig.ready(true);
@@ -924,6 +1349,17 @@ fn a_source_that_cannot_be_pinned_counts_as_a_failed_write() {
         assert_eq!(rig.retired(), [(record.key, expected)]);
     }
     assert!(rig.started().is_empty());
+}
+
+#[test]
+fn a_shutdown_drain_ends_when_the_pool_cannot_accept_records() {
+    let mut rig = rig();
+    // The fake pool is not ready, so the resident record can never retire.
+    rig.local.0.lock().unwrap().drain_records = Some(1);
+    rig.store.drain_on_shutdown = Duration::from_secs(10);
+    let started = Instant::now();
+    rig.store.close().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
@@ -1013,7 +1449,7 @@ fn a_full_queue_stops_selection_and_keeps_every_record_local() {
     assert_eq!(rig.store.cascade.in_progress(), MOVES_MAX + PENDING_MAX);
     // As moves end, the waiting records start in order.
     let first = rig.started()[0];
-    rig.end(first.0, PutOutcome::Stored { bytes: 1 });
+    rig.end(first.0, stored());
     rig.poll();
     assert_eq!(rig.started().len(), MOVES_MAX + 1);
     assert_eq!(rig.started()[MOVES_MAX].1, records[MOVES_MAX].key);
@@ -1036,9 +1472,10 @@ impl Rig {
     fn publication(&self, end: u64) -> PublishedCheckpoint {
         let pages = (end / PT) as usize;
         PublishedCheckpoint {
+            capture_role: crate::CaptureRole::Endpoint,
             id: CheckpointId::new(5),
             key: self.key(end),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: [3; 16],
             chain_pages: (0..pages as u32).map(PageId).collect(),
             tail_pages: pages,
@@ -1076,7 +1513,7 @@ fn publication_copies_row_only_records_even_when_recompute_is_cheaper() {
     let parent = rig.publication(800);
     let mut child = rig.publication(800);
     child.key = rig.key(807);
-    child.parent = Some(parent.key);
+    child.ancestors.push(parent.key);
     child.tail_pages = 0;
     assert_eq!(rig.store.store(&child).unwrap(), StoreOutcome::Queued);
     assert_eq!(rig.copies(), [child.key]);

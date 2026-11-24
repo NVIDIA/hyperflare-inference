@@ -146,8 +146,82 @@ pub struct Claim {
 
 impl Claim {
     pub fn read(bytes: &[u8]) -> Result<Self> {
-        let envelope = envelope(bytes)?;
-        let body = wire::CoreBody::decode(envelope.core_body.as_slice())
+        if bytes.len() > schema::MAX_ENVELOPE {
+            return Err(invalid("core envelope exceeds its limit"));
+        }
+        // Scan top-level envelope fields without copying every rank's serialized body.
+        let mut cursor = bytes;
+        let mut version = 0u32;
+        let mut core_id_bytes = Vec::new();
+        let mut signer = Vec::new();
+        let mut core_body = Vec::new();
+        let mut deployments = 0usize;
+        let mut ranks = 0usize;
+        let context = prost::encoding::DecodeContext::default();
+        while !cursor.is_empty() {
+            let (tag, wire_type) = prost::encoding::decode_key(&mut cursor)
+                .map_err(|_| invalid("invalid payload core envelope"))?;
+            match tag {
+                1 => prost::encoding::uint32::merge(
+                    wire_type,
+                    &mut version,
+                    &mut cursor,
+                    context.clone(),
+                ),
+                2 => prost::encoding::bytes::merge(
+                    wire_type,
+                    &mut core_id_bytes,
+                    &mut cursor,
+                    context.clone(),
+                ),
+                3 => prost::encoding::bytes::merge(
+                    wire_type,
+                    &mut signer,
+                    &mut cursor,
+                    context.clone(),
+                ),
+                4 => prost::encoding::bytes::merge(
+                    wire_type,
+                    &mut core_body,
+                    &mut cursor,
+                    context.clone(),
+                ),
+                6 => {
+                    if wire_type != prost::encoding::WireType::LengthDelimited {
+                        return Err(invalid("invalid payload core envelope"));
+                    }
+                    deployments += 1;
+                    if deployments > 4096 {
+                        return Err(invalid("core envelope holds too many bodies"));
+                    }
+                    prost::encoding::skip_field(wire_type, tag, &mut cursor, context.clone())
+                }
+                7 => {
+                    if wire_type != prost::encoding::WireType::LengthDelimited {
+                        return Err(invalid("invalid payload core envelope"));
+                    }
+                    ranks += 1;
+                    if ranks > 65536 {
+                        return Err(invalid("core envelope holds too many bodies"));
+                    }
+                    prost::encoding::skip_field(wire_type, tag, &mut cursor, context.clone())
+                }
+                _ => prost::encoding::skip_field(wire_type, tag, &mut cursor, context.clone()),
+            }
+            .map_err(|_| invalid("invalid payload core envelope"))?;
+        }
+        if version != schema::FORMAT_VERSION {
+            return Err(invalid("unsupported payload core format version"));
+        }
+        if core_id_bytes.len() != 32 || signer.len() != 32 {
+            return Err(invalid(
+                "core identity or signer fingerprint is malformed",
+            ));
+        }
+        if core_body.len() > schema::MAX_BODY {
+            return Err(invalid("core body exceeds its limit"));
+        }
+        let body = wire::CoreBody::decode(core_body.as_slice())
             .map_err(|_| invalid("invalid core body"))?;
         let publisher = body
             .publisher
@@ -155,9 +229,9 @@ impl Claim {
             .ok_or_else(|| invalid("core has no publisher metadata"))?;
         schema::validate_publisher_metadata(publisher)?;
         let mut core_id = [0; 32];
-        core_id.copy_from_slice(&envelope.core_id);
+        core_id.copy_from_slice(&core_id_bytes);
         Ok(Self {
-            signer: hex(&envelope.signer),
+            signer: hex(&signer),
             core_id,
             namespace: publisher.namespace.clone(),
             official_source: publisher.official_source.clone(),
@@ -211,7 +285,7 @@ fn resolve_publisher<'a>(
             continue;
         }
         match found {
-            Some(previous) if previous.namespace != publisher.namespace => {
+            Some(previous) if previous != publisher => {
                 return Err(invalid(
                     "conflicting publisher profiles for the signing key",
                 ));
@@ -221,6 +295,13 @@ fn resolve_publisher<'a>(
         }
     }
     found.ok_or_else(|| invalid("core signer is not a configured publisher"))
+}
+
+/// True when `publishers` resolves unambiguously to `expected` for its key and namespace.
+pub(crate) fn publisher_authorized(publishers: &[Publisher], expected: &Publisher) -> Result<bool> {
+    let signer = fingerprint(&expected.public_key);
+    let resolved = resolve_publisher(publishers, &signer, Some(&expected.namespace))?;
+    Ok(resolved == expected)
 }
 
 /// A core whose shared body and selected deployment bodies are authenticated.
@@ -297,6 +378,118 @@ impl VerifiedCore {
         Ok(decoded)
     }
 
+    /// Promote a catalog-verified core into an authenticated deployment without
+    /// re-decoding the envelope or re-hashing its bytes.
+    pub fn into_deployment(self, index: usize, rank: Option<u32>) -> Result<VerifiedCore> {
+        self.into_deployment_inner(index, rank, true)
+    }
+
+    /// Promote a catalog-verified core whose exact root envelope hash matches
+    /// `expected_envelope` into an authenticated deployment without re-inflating
+    /// compressed prepared-weight provenance catalogs already validated at install.
+    pub fn into_bound_deployment(
+        self,
+        index: usize,
+        rank: Option<u32>,
+        expected_envelope: [u8; 32],
+    ) -> Result<VerifiedCore> {
+        if self.envelope_digest != expected_envelope {
+            return Err(invalid("core envelope differs from its expected digest"));
+        }
+        self.into_deployment_inner(index, rank, false)
+    }
+
+    fn into_deployment_inner(
+        self,
+        index: usize,
+        rank: Option<u32>,
+        validate_compressed_weights: bool,
+    ) -> Result<VerifiedCore> {
+        if self.selection != Selection::Catalog {
+            return Err(invalid(
+                "deployment promotion requires a catalog-verified core",
+            ));
+        }
+        let mut catalog = self.catalog;
+        let (deployment, ranks) = verify_deployment_bodies(
+            &self.envelope,
+            &self.core,
+            &self.publisher,
+            &mut catalog,
+            index,
+            rank,
+            validate_compressed_weights,
+        )?;
+        Ok(VerifiedCore {
+            envelope: self.envelope,
+            core: self.core,
+            catalog,
+            publisher: self.publisher,
+            deployment: Some(deployment),
+            ranks,
+            selection: Selection::Deployment {
+                deployment: index,
+                rank,
+            },
+            envelope_digest: self.envelope_digest,
+        })
+    }
+
+    /// Authenticate one deployment from an already decoded and verified envelope.
+    pub fn verify_deployment(&self, index: usize, rank: Option<u32>) -> Result<VerifiedCore> {
+        self.verify_deployment_inner(index, rank, true)
+    }
+
+    /// Authenticate one deployment from an envelope bound to `expected_envelope`
+    /// without re-inflating compressed prepared-weight provenance catalogs.
+    pub fn verify_bound_deployment(
+        &self,
+        index: usize,
+        rank: Option<u32>,
+        expected_envelope: [u8; 32],
+    ) -> Result<VerifiedCore> {
+        if self.envelope_digest != expected_envelope {
+            return Err(invalid("core envelope differs from its expected digest"));
+        }
+        self.verify_deployment_inner(index, rank, false)
+    }
+
+    fn verify_deployment_inner(
+        &self,
+        index: usize,
+        rank: Option<u32>,
+        validate_compressed_weights: bool,
+    ) -> Result<VerifiedCore> {
+        if self.selection != Selection::Catalog {
+            return Err(invalid(
+                "deployment selection requires a catalog-verified core",
+            ));
+        }
+        let mut catalog = self.catalog.clone();
+        let (deployment, ranks) = verify_deployment_bodies(
+            &self.envelope,
+            &self.core,
+            &self.publisher,
+            &mut catalog,
+            index,
+            rank,
+            validate_compressed_weights,
+        )?;
+        Ok(VerifiedCore {
+            envelope: self.envelope.clone(),
+            core: self.core.clone(),
+            catalog,
+            publisher: self.publisher.clone(),
+            deployment: Some(deployment),
+            ranks,
+            selection: Selection::Deployment {
+                deployment: index,
+                rank,
+            },
+            envelope_digest: self.envelope_digest,
+        })
+    }
+
     /// The digest of the exact envelope bytes this core was verified from.
     pub fn envelope_digest(&self) -> [u8; 32] {
         self.envelope_digest
@@ -325,6 +518,11 @@ impl VerifiedCore {
     /// True when a prepared deployment and at least one rank were authenticated.
     pub fn is_executable(&self) -> bool {
         self.deployment.is_some() && !self.ranks.is_empty()
+    }
+    /// Number of Ed25519 body signatures verified for this selection (the shared
+    /// core body, the selected deployment body when present, and each verified rank).
+    pub fn signature_count(&self) -> usize {
+        1 + usize::from(self.deployment.is_some()) + self.ranks.len()
     }
     /// Hash actual bytes against a signed payload digest. This is the authentication step for
     /// plaintext payloads that are not executable resources: module globals, frontend assets, and
@@ -373,7 +571,16 @@ pub fn verify(
     publishers: &[Publisher],
     selection: Selection,
 ) -> Result<VerifiedCore> {
-    let envelope = envelope(bytes)?;
+    let (envelope, envelope_digest) = if bytes.len() >= 1 << 20 {
+        std::thread::scope(|scope| {
+            let digest = scope.spawn(|| sha256(bytes));
+            let decoded = envelope(bytes);
+            let digest = digest.join().expect("envelope digest thread panicked");
+            decoded.map(|envelope| (envelope, digest))
+        })?
+    } else {
+        (envelope(bytes)?, sha256(bytes))
+    };
     let unsigned = wire::CoreBody::decode(envelope.core_body.as_slice())
         .map_err(|_| invalid("invalid core body"))?;
     let expected_namespace = unsigned
@@ -417,91 +624,17 @@ pub fn verify(
         rank,
     } = selection
     {
-        let commitment = core
-            .deployments
-            .get(index)
-            .ok_or_else(|| invalid("selected deployment is outside the core"))?
-            .clone();
-        let body = signed_deployment(&envelope, index)?;
-        check_commitment(&commitment.body_digest, body, "deployment body")?;
-        verify_signature(
-            &publisher.public_key,
-            &signature_message(
-                &envelope.core_id,
-                &envelope.signer,
-                KIND_DEPLOYMENT,
-                index as u32,
-                0,
-                body,
-            ),
-            signed_deployment_signature(&envelope, index)?,
+        let (decoded, verified_ranks) = verify_deployment_bodies(
+            &envelope,
+            &core,
+            &publisher,
+            &mut catalog,
+            index,
+            rank,
+            true,
         )?;
-        let decoded =
-            wire::DeploymentBody::decode(body).map_err(|_| invalid("invalid deployment body"))?;
-        schema::validate_deployment_contract(&core, &decoded)?;
-        let count = schema::validate_deployment(&decoded, &mut catalog)?;
-        if decoded.deployment_id != commitment.deployment_id {
-            return Err(invalid("deployment body disagrees with its commitment"));
-        }
-        let selected: Vec<u32> = match rank {
-            Some(rank) => {
-                if rank >= count {
-                    return Err(invalid("selected rank is outside the deployment"));
-                }
-                vec![rank]
-            }
-            None => (0..count).collect(),
-        };
-        // Freeze the shared and deployment catalogs before validating any rank. Each rank is
-        // checked against that frozen view plus its own descriptors, so an earlier rank's payload
-        // catalog can never authorize a later rank's slices.
-        let frozen = catalog.clone();
-        let mut resource_ids = BTreeSet::new();
-        let mut decoded_metadata_nbytes = 0u64;
-        for rank_id in selected {
-            let rank_commitment = decoded
-                .ranks
-                .get(rank_id as usize)
-                .ok_or_else(|| invalid("selected rank is outside the deployment"))?;
-            let body = signed_rank(&envelope, index, rank_id)?;
-            check_commitment(&rank_commitment.body_digest, body, "rank body")?;
-            verify_signature(
-                &publisher.public_key,
-                &signature_message(
-                    &envelope.core_id,
-                    &envelope.signer,
-                    KIND_RANK,
-                    index as u32,
-                    rank_id,
-                    body,
-                ),
-                signed_rank_signature(&envelope, index, rank_id)?,
-            )?;
-            let decoded_rank =
-                wire::RankBody::decode(body).map_err(|_| invalid("invalid rank body"))?;
-            if decoded_rank.rank != rank_id || decoded_rank.deployment_id != decoded.deployment_id {
-                return Err(invalid("rank body disagrees with its deployment"));
-            }
-            decoded_metadata_nbytes = decoded_metadata_nbytes.checked_add(
-                super::prepared_weights::reconstructed_rank_nbytes(&decoded_rank, body.len())?
-            ).ok_or_else(|| invalid("selected rank metadata length overflow"))?;
-            if decoded_metadata_nbytes > schema::MAX_SELECTED_RANK_METADATA {
-                return Err(invalid("selected reconstructed rank metadata exceeds its limit"));
-            }
-            ranks.push(decoded_rank);
-        }
-        for decoded_rank in &ranks {
-            let mut local = frozen.clone();
-            schema::validate_rank_contract(&decoded, decoded_rank)?;
-            schema::validate_rank(decoded_rank, count, &mut local, &mut resource_ids)?;
-            if decoded_rank.compressed_prepared_weights.is_some()
-                && let Some(weights) = super::prepared_weights::catalog(decoded_rank)?
-            {
-                schema::validate_rank_prepared_weights(decoded_rank, &weights)?;
-            }
-            catalog.insert_all(&decoded_rank.payloads)?;
-        }
         deployment = Some(decoded);
+        ranks = verified_ranks;
     }
 
     Ok(VerifiedCore {
@@ -512,8 +645,202 @@ pub fn verify(
         deployment,
         ranks,
         selection,
-        envelope_digest: sha256(bytes),
+        envelope_digest,
     })
+}
+
+const MAX_RANK_AUTH_WORKERS: usize = 16;
+const MAX_RANK_VALIDATE_WORKERS: usize = 8;
+
+fn verify_deployment_bodies(
+    envelope: &wire::ProtectedCore,
+    core: &wire::CoreBody,
+    publisher: &Publisher,
+    catalog: &mut schema::Catalog,
+    index: usize,
+    rank: Option<u32>,
+    validate_compressed_weights: bool,
+) -> Result<(wire::DeploymentBody, Vec<wire::RankBody>)> {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let commitment = core
+        .deployments
+        .get(index)
+        .ok_or_else(|| invalid("selected deployment is outside the core"))?
+        .clone();
+    let body = signed_deployment(envelope, index)?;
+    check_commitment(&commitment.body_digest, body, "deployment body")?;
+    verify_signature(
+        &publisher.public_key,
+        &signature_message(
+            &envelope.core_id,
+            &envelope.signer,
+            KIND_DEPLOYMENT,
+            index as u32,
+            0,
+            body,
+        ),
+        signed_deployment_signature(envelope, index)?,
+    )?;
+    let decoded =
+        wire::DeploymentBody::decode(body).map_err(|_| invalid("invalid deployment body"))?;
+    schema::validate_deployment_contract(core, &decoded)?;
+    let count = schema::validate_deployment(&decoded, catalog)?;
+    if decoded.deployment_id != commitment.deployment_id {
+        return Err(invalid("deployment body disagrees with its commitment"));
+    }
+    let selected: Vec<u32> = match rank {
+        Some(rank) => {
+            if rank >= count {
+                return Err(invalid("selected rank is outside the deployment"));
+            }
+            vec![rank]
+        }
+        None => (0..count).collect(),
+    };
+    let parallelism = std::thread::available_parallelism().map_or(1, |workers| workers.get());
+
+    // Phase 1: authenticate every selected rank commitment, signature, wire body, and
+    // reconstructed size bound before inflating any compressed prepared-weight catalog.
+    let auth_one = |rank_id: u32| -> Result<(wire::RankBody, u64)> {
+        let rank_commitment = decoded
+            .ranks
+            .get(rank_id as usize)
+            .ok_or_else(|| invalid("selected rank is outside the deployment"))?;
+        let signed = signed_rank_entry(envelope, index, rank_id)?;
+        let body = signed.body.as_slice();
+        check_commitment(&rank_commitment.body_digest, body, "rank body")?;
+        verify_signature(
+            &publisher.public_key,
+            &signature_message(
+                &envelope.core_id,
+                &envelope.signer,
+                KIND_RANK,
+                index as u32,
+                rank_id,
+                body,
+            ),
+            &signed.signature,
+        )?;
+        let decoded_rank =
+            wire::RankBody::decode(body).map_err(|_| invalid("invalid rank body"))?;
+        if decoded_rank.rank != rank_id || decoded_rank.deployment_id != decoded.deployment_id {
+            return Err(invalid("rank body disagrees with its deployment"));
+        }
+        let rank_nbytes =
+            super::prepared_weights::reconstructed_rank_nbytes(&decoded_rank, body.len())?;
+        Ok((decoded_rank, rank_nbytes))
+    };
+
+    let auth_workers = parallelism.min(MAX_RANK_AUTH_WORKERS).min(selected.len());
+    let auth_results: Vec<Result<(wire::RankBody, u64)>> = if auth_workers <= 1 {
+        selected.iter().copied().map(auth_one).collect()
+    } else {
+        let cursor = AtomicUsize::new(0);
+        let slots: Mutex<Vec<Option<Result<(wire::RankBody, u64)>>>> =
+            Mutex::new((0..selected.len()).map(|_| None).collect());
+        std::thread::scope(|scope| {
+            for _ in 0..auth_workers {
+                let cursor = &cursor;
+                let slots = &slots;
+                let selected = &selected;
+                scope.spawn(move || loop {
+                    let pos = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(&rank_id) = selected.get(pos) else {
+                        break;
+                    };
+                    let outcome = auth_one(rank_id);
+                    slots.lock().expect("rank auth mutex")[pos] = Some(outcome);
+                });
+            }
+        });
+        slots
+            .into_inner()
+            .expect("rank auth mutex")
+            .into_iter()
+            .map(|slot| slot.expect("every selected rank must produce an auth result"))
+            .collect()
+    };
+
+    let mut ranks = Vec::with_capacity(selected.len());
+    let mut decoded_metadata_nbytes = 0u64;
+    for (rank_id, outcome) in selected.iter().copied().zip(auth_results) {
+        let (decoded_rank, rank_nbytes) = outcome?;
+        decoded_metadata_nbytes = decoded_metadata_nbytes
+            .checked_add(rank_nbytes)
+            .ok_or_else(|| invalid("selected rank metadata length overflow"))?;
+        if decoded_metadata_nbytes > schema::MAX_SELECTED_RANK_METADATA {
+            return Err(invalid(format!(
+                "selected reconstructed rank metadata exceeds its limit through rank {rank_id}: {decoded_metadata_nbytes} bytes, maximum {}",
+                schema::MAX_SELECTED_RANK_METADATA
+            )));
+        }
+        ranks.push(decoded_rank);
+    }
+
+    // Freeze the shared and deployment catalogs before validating any rank. Each rank is
+    // checked against that frozen view plus its own descriptors, so an earlier rank's payload
+    // catalog can never authorize a later rank's slices.
+    let frozen = catalog.clone();
+    let validate_one = |decoded_rank: &wire::RankBody| -> Result<BTreeSet<u64>> {
+        let mut local = frozen.clone();
+        let mut local_resource_ids = BTreeSet::new();
+        schema::validate_rank_contract(&decoded, decoded_rank)?;
+        schema::validate_rank(decoded_rank, count, &mut local, &mut local_resource_ids)?;
+        if validate_compressed_weights
+            && decoded_rank.compressed_prepared_weights.is_some()
+            && let Some(weights) =
+                super::prepared_weights::decode_compressed_catalog(decoded_rank)?
+        {
+            schema::validate_rank_prepared_weights(decoded_rank, &weights)?;
+        }
+        Ok(local_resource_ids)
+    };
+
+    let validate_workers = parallelism.min(MAX_RANK_VALIDATE_WORKERS).min(ranks.len());
+    let validate_results: Vec<Result<BTreeSet<u64>>> = if validate_workers <= 1 {
+        ranks.iter().map(validate_one).collect()
+    } else {
+        let cursor = AtomicUsize::new(0);
+        let slots: Mutex<Vec<Option<Result<BTreeSet<u64>>>>> =
+            Mutex::new((0..ranks.len()).map(|_| None).collect());
+        std::thread::scope(|scope| {
+            for _ in 0..validate_workers {
+                let cursor = &cursor;
+                let slots = &slots;
+                let ranks = &ranks;
+                scope.spawn(move || loop {
+                    let pos = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(decoded_rank) = ranks.get(pos) else {
+                        break;
+                    };
+                    let outcome = validate_one(decoded_rank);
+                    slots.lock().expect("rank validate mutex")[pos] = Some(outcome);
+                });
+            }
+        });
+        slots
+            .into_inner()
+            .expect("rank validate mutex")
+            .into_iter()
+            .map(|slot| slot.expect("every selected rank must produce a validation result"))
+            .collect()
+    };
+
+    let mut resource_ids = BTreeSet::new();
+    for (decoded_rank, outcome) in ranks.iter().zip(validate_results) {
+        for resource_id in outcome? {
+            if !resource_ids.insert(resource_id) {
+                return Err(invalid("duplicate executable resource id"));
+            }
+        }
+        catalog.insert_all(&decoded_rank.payloads)?;
+    }
+
+    Ok((decoded, ranks))
 }
 
 fn signed_deployment_signature(envelope: &wire::ProtectedCore, index: usize) -> Result<&[u8]> {
@@ -545,20 +872,6 @@ fn signed_deployment_entry(
         return Err(invalid("malformed signed deployment body"));
     }
     Ok(signed)
-}
-
-fn signed_rank_signature(
-    envelope: &wire::ProtectedCore,
-    deployment: usize,
-    rank: u32,
-) -> Result<&[u8]> {
-    let signed = signed_rank_entry(envelope, deployment, rank)?;
-    Ok(&signed.signature)
-}
-
-fn signed_rank(envelope: &wire::ProtectedCore, deployment: usize, rank: u32) -> Result<&[u8]> {
-    let signed = signed_rank_entry(envelope, deployment, rank)?;
-    Ok(&signed.body)
 }
 
 fn signed_rank_entry<'a>(
@@ -1470,6 +1783,25 @@ mod tests {
             .err()
             .expect("inconsistent signed metadata must be rejected");
             assert!(error.to_string().contains(*message), "case {case}: {error}");
+            for promotion in 0..4 {
+                let error = verify(&fixture.envelope, &fixture.publishers, Selection::Catalog)
+                    .and_then(|catalog| {
+                        let digest = catalog.envelope_digest();
+                        match promotion {
+                            0 => catalog.verify_deployment(0, None),
+                            1 => catalog.verify_bound_deployment(0, None, digest),
+                            2 => catalog.into_deployment(0, None),
+                            3 => catalog.into_bound_deployment(0, None, digest),
+                            _ => unreachable!(),
+                        }
+                    })
+                    .err()
+                    .expect("deployment promotion must reject inconsistent serving metadata");
+                assert!(
+                    error.to_string().contains(*message),
+                    "case {case}, promotion {promotion}: {error}"
+                );
+            }
             if case < 6 {
                 let error = verify(&fixture.envelope, &fixture.publishers, Selection::Catalog)
                     .and_then(|catalog| catalog.deployment_body(0))
@@ -1496,6 +1828,20 @@ mod tests {
         assert_eq!(claim.core_id, fixture.core_id);
         assert_eq!(claim.model_identity, "model");
         assert!(!claim.development);
+    }
+
+    #[test]
+    fn bound_deployment_requires_exact_root_envelope_digest() {
+        let fixture = fixture();
+        let catalog = verify(&fixture.envelope, &fixture.publishers, Selection::Catalog).unwrap();
+        let digest = catalog.envelope_digest();
+        let mut wrong = digest;
+        wrong[0] ^= 1;
+        assert!(catalog.verify_bound_deployment(0, None, wrong).is_err());
+        let verified = catalog.into_bound_deployment(0, None, digest).unwrap();
+        assert_eq!(verified.ranks().len(), 2);
+        assert_eq!(verified.signature_count(), 4);
+        assert_eq!(verified.envelope_digest(), digest);
     }
 
     #[test]
@@ -2180,5 +2526,28 @@ mod tests {
         let mut bad_chunk = stored.clone();
         bad_chunk[0] ^= 1;
         assert!(authorized.open_resource(&resource, &bad_chunk).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_conflicting_duplicate_publisher_profiles() {
+        let fixture = fixture();
+        let original = fixture.publishers[0].clone();
+        let mut renamed = original.clone();
+        renamed.name = "Other Display Name".into();
+        let error = verify(
+            &fixture.envelope,
+            &[original.clone(), renamed],
+            Selection::Catalog,
+        )
+        .err()
+        .expect("conflicting display name must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting publisher profiles for the signing key"),
+            "{error}"
+        );
+
+        assert!(verify(&fixture.envelope, &[original.clone(), original], Selection::Catalog).is_ok());
     }
 }

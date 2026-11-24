@@ -142,11 +142,13 @@ def table(result):
 def run(args):
     settings = Settings.from_args(args)
     configuration = Configuration.load(args.config)
-    model = resolve_model(configuration, args.model or configuration.model or "qwen3.8-27b")
-    if model.recipe.name not in ("qwen38_dense", "kimi31", "nemotron_h"):
-        raise UsageError("ignition bench supports Qwen3.8-27B DFlash2, Kimi K3.1 Pro DSpark, and Nemotron Bolt LiLiCorr")
-    if settings.speculation_study and model.recipe.name != "qwen38_dense":
-        raise UsageError("--speculation-study requires Qwen3.8-27B DFlash2")
+    model = resolve_model(configuration, args.model)
+    if not model.recipe.benchmark_world_sizes:
+        raise UsageError(f"ignition bench is not supported by recipe {model.recipe.name!r}")
+    if settings.speculation_study and not model.recipe.speculation_study:
+        raise UsageError(f"--speculation-study is not supported by recipe {model.recipe.name!r}")
+    if model.recipe.benchmark_language_model_only and args.image_concurrency is not None:
+        raise UsageError(f"{model.recipe.name} benchmark graphs prepare no vision encoder; --image-concurrency does not apply")
     from ignition.preparation.selection import BenchmarkSelection
 
     concurrency = configuration.max_concurrency(model.checkpoint.alias, max(settings.batches), args.max_concurrency)
@@ -159,7 +161,8 @@ def run(args):
         args.mtp_draft_tokens = 7 if settings.speculation_study else settings.width - 1
     plan = derive(configuration, model, Host.discover(), gpus=args.gpus, concurrency=concurrency,
         speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-        context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+        context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+        stream_overlap=stream_overlap(args, model),
         compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
         autotune_effort=args.autotune_effort, collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
         lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
@@ -167,7 +170,8 @@ def run(args):
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
-        online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
+        online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
+        language_model_only=args.language_model_only or model.recipe.benchmark_language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(
         batches=settings.batches, contexts=settings.contexts, width=settings.width,
@@ -235,7 +239,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         "verification_prefixes": settings.verification_prefixes, "logical_verification_width": settings.width,
         "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
         "preparation": {key: preparation[key] for key in (
-            "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
+            "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
             "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
             "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}

@@ -52,6 +52,8 @@ def capture_rank(rank, world, store, warmed, finished, outcome, export_metadata)
 
         stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
         capture.torch.cuda.current_stream = lambda device: stream
+        capture._warmup_stream = lambda device: stream
+        capture._seed_warmup_workspaces = lambda stream, device: None
         capture.torch.cuda.stream = lambda stream: nullcontext()
         capture.torch.cuda.synchronize = lambda device: None
         capture.torch.cuda.CUDAGraph = Graph

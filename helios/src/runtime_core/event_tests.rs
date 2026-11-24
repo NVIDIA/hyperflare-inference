@@ -80,7 +80,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
         let AuthorizedKind::Payload(payload) = authorized.kind else {
             panic!("Engram fixture must use a payload core");
         };
-        let index = payload.descriptor().unwrap();
+        let index = payload.loaded_descriptor().unwrap();
         let (archive, mut cores) = payload.into_parts();
         let core = cores.remove(0);
         core.validate().unwrap();

@@ -12,7 +12,10 @@ mod wire;
 
 use std::{time::Instant, collections::VecDeque};
 
-use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, RankStream, Upload};
+use super::{
+    ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, RankStream, Upload,
+    threaded::protocol,
+};
 use crate::{Error, Result, Shutdown, cache::Fence};
 use wire::*;
 
@@ -38,15 +41,36 @@ impl Pending {
         }).collect()
     }
 }
-fn ready_frame(pending: &mut VecDeque<Pending>, rank: usize, fence: Fence, graph: usize) -> Result<()> {
-    let frame = pending.iter_mut().find(|frame| frame.fence == fence)
-        .ok_or_else(|| invalid("unexpected rank readiness fence"))?;
-    if frame.graph != graph || frame.ready[rank] || frame.committed {
-        return Err(invalid("rank readiness identity or state differs"));
+impl protocol::PendingFrame for Pending {
+    fn fence(&self) -> Fence {
+        self.fence
     }
-    frame.ready[rank] = true;
-    Ok(())
+    fn graph(&self) -> usize {
+        self.graph
+    }
+    fn grammar(&self) -> bool {
+        self.grammar
+    }
+    fn committed(&self) -> bool {
+        self.committed
+    }
+    fn ready(&self) -> &[bool] {
+        &self.ready
+    }
+    fn ready_mut(&mut self) -> &mut [bool] {
+        &mut self.ready
+    }
+    fn completions(&self) -> &[Option<FrameCompletion>] {
+        &self.completions
+    }
+    fn completions_mut(&mut self) -> &mut [Option<FrameCompletion>] {
+        &mut self.completions
+    }
 }
+fn ready_frame(pending: &mut VecDeque<Pending>, rank: usize, fence: Fence, graph: usize) -> Result<()> {
+    protocol::record_ready(pending, rank, fence, graph)
+}
+#[cfg(test)]
 fn completion_frame(pending: &mut VecDeque<Pending>, rank: usize, fence: Fence, graph: usize) -> Result<&mut Pending> {
     let frame = pending.iter_mut().find(|frame| frame.completions[rank + 1].is_none())
         .ok_or_else(|| invalid("unexpected rank completion"))?;
@@ -56,11 +80,7 @@ fn completion_frame(pending: &mut VecDeque<Pending>, rank: usize, fence: Fence, 
     Ok(frame)
 }
 fn window_available(pending: &VecDeque<Pending>, grammar: bool, manifest: &ExecutionManifest) -> bool {
-    pending.len() < 2
-        && pending.back().is_none_or(|frame| frame.committed)
-        && (!grammar || pending.is_empty())
-        && !pending.iter().any(|frame| frame.grammar || !matches!(
-            manifest.graphs[frame.graph].kind, super::GraphKind::Decode | super::GraphKind::Speculative))
+    protocol::can_submit_pending(pending, grammar, manifest)
 }
 
 fn identity(fence: Fence, graph: usize) -> Vec<u8> {
@@ -98,6 +118,11 @@ impl TensorParallelExecutor {
         }
         if world < 2 {
             return Err(invalid("tensor parallelism requires at least two ranks"));
+        }
+        if !manifest.persistent_workers.is_empty() {
+            return Err(invalid(
+                "persistent workers are only supported on single-rank cores",
+            ));
         }
         manifest.validate()?;
         wire::validate_completion_packet(&manifest)?;
@@ -192,6 +217,12 @@ impl TensorParallelExecutor {
         self.pending.len()
     }
 
+    /// Park on rank zero's own running frame; peers' completions arrive over their sockets
+    /// and are polled by the caller as before. See [`GraphExecutor::park`].
+    pub fn park(&self) -> bool {
+        self.local.park()
+    }
+
     pub fn manifest(&self) -> &ExecutionManifest {
         self.local.manifest()
     }
@@ -276,11 +307,7 @@ impl TensorParallelExecutor {
             return Err(invalid("tensor-parallel graph completion deadline expired"));
         }
         if let Some(completion) = self.local.poll()? {
-            let frame = self.pending.iter_mut().find(|frame| frame.fence == completion.fence)
-                .ok_or_else(|| invalid("unexpected rank-zero completion fence"))?;
-            if frame.completions[0].replace(completion).is_some() {
-                return Err(invalid("duplicate rank-zero completion"));
-            }
+            protocol::record_local_completion(&mut self.pending, completion)?;
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
             peer.channel.nonblocking(true)?;
@@ -293,19 +320,19 @@ impl TensorParallelExecutor {
                         let mut reader = Reader(&bytes);
                         let fence = Fence(reader.number()? as u64);
                         let graph = reader.number()?;
-                        let frame = completion_frame(&mut self.pending, index, fence, graph)?;
                         let timing = wire::timing(&mut reader)?;
                         let proposal_confidence = wire::proposal_confidence(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
                         let speculative_survival = wire::speculative_survival(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
                         if reader.0.len() != self.local.manifest().completion_bytes() {
                             return Err(invalid("rank completion size differs from its ABI"));
                         }
-                        frame.completions[index + 1] = Some(FrameCompletion {
+                        let completion = FrameCompletion {
                             logprobs: None, prompt_logprobs: None, proposal_confidence, speculative_survival,
                             fence, graph_index: graph, timing,
                             records: super::transport::decode_records(reader.0, fence,
                                 self.local.manifest().request_capacity(), self.local.manifest().completion_fields())?,
-                        });
+                        };
+                        protocol::record_peer_completion(&mut self.pending, index, completion)?;
                     } else { return Err(invalid("unexpected rank message")); }
                 }
                 Ok(())
@@ -315,7 +342,7 @@ impl TensorParallelExecutor {
         }
         for frame in &mut self.pending {
             if frame.committed { continue; }
-            if !frame.ready.iter().all(|ready| *ready) { break; }
+            if !protocol::ready_to_commit(frame) { break; }
             let uploads = frame.uploads();
             if self.local.validate_submission(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
@@ -328,10 +355,9 @@ impl TensorParallelExecutor {
             }
             frame.committed = true;
         }
-        if !self.pending.front().is_some_and(|frame| frame.completions.iter().all(Option::is_some)) {
+        let Some(mut frame) = protocol::pop_completed_front(&mut self.pending) else {
             return Ok(None);
-        }
-        let mut frame = self.pending.pop_front().unwrap();
+        };
         let mut root = frame.completions[0].take().unwrap();
         for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
             let completion = completion.unwrap();
@@ -501,6 +527,14 @@ pub unsafe fn serve_rank(
     rank: usize,
     world: usize,
 ) -> Shutdown {
+    if !manifest.persistent_workers.is_empty() {
+        return Shutdown {
+            drained: true,
+            error: Some(invalid(
+                "persistent workers are only supported on single-rank cores",
+            )),
+        };
+    }
     if let Err(error) = manifest.validate().and_then(|_| wire::validate_completion_packet(&manifest)) {
         return Shutdown { drained: true, error: Some(error) };
     }
@@ -607,7 +641,13 @@ pub unsafe fn serve_rank(
                 if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
                     return Err(invalid("rank graph completion deadline expired"));
                 }
-                if active { std::thread::yield_now(); }
+                // A peer waiting only on its own running frame parks on it; a prepared frame waits
+                // for rank zero's commit over the socket, which cannot end a park. The yield keeps
+                // the old loop's cooperative handoff after either.
+                if active {
+                    if prepared.is_none() { executor.park(); }
+                    std::thread::yield_now();
+                }
             }
         })();
         if let Err(error) = &result {

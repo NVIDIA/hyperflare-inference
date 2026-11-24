@@ -259,8 +259,7 @@ def test_persistent_destinations_reject_invalid_layouts(shape, stride, alignment
 
 def test_packed_mapping_is_exported_as_fixed_storage(monkeypatch, packed_storage, tmp_path):
     import flare_heliopause
-    from ignition.preparation import memory_inventory, runtime_core, tensor_metadata
-    from ignition.components import weights
+    from ignition.preparation import memory_inventory, provenance, runtime_core, tensor_metadata
 
     storage = packed_storage
     with storage:
@@ -272,7 +271,7 @@ def test_packed_mapping_is_exported_as_fixed_storage(monkeypatch, packed_storage
     monkeypatch.setattr(flare_heliopause, "current_context", lambda: (1, 0))
     monkeypatch.setattr(flare_heliopause, "export_synchronize", lambda *args: None)
     monkeypatch.setattr(tensor_metadata, "live_metadata", lambda *args, **kwargs: ([], {}))
-    monkeypatch.setattr(weights, "record_final_fp4_expert_provenance_all", lambda: None)
+    monkeypatch.setattr(provenance, "flush_finalizers", lambda: None)
     monkeypatch.setattr(memory_inventory, "collect_inventory", lambda *args, **kwargs: {})
     captured = []
     def capture(package, request, *args):

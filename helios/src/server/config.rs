@@ -276,6 +276,8 @@ impl Bootstrap {
             defaults,
             &frontend_settings,
         )?;
+        let declared = crate::model::declared_control_tokens(&frontend, &model.contract.frontend)?;
+        let frontend = frontend.with_controls(declared);
         if model.max_top_logprobs != 0 { frontend.prepare_token_bytes()?; }
         if frontend_settings
             .image
@@ -813,6 +815,59 @@ mod tests {
                 "{error}"
             );
         }
+        // The prepared syntax names `<think>`, `</think>`, `<tool_call>` and `</tool_call>`.
+        // This tokenizer marks them ordinary and the template names none, so only the contract
+        // makes request text that spells them literal. `/nothink` stays lexical.
+        let ascii: tokenizers::models::bpe::Vocab = (0..128)
+            .map(|id| ((id as u8 as char).to_string(), id))
+            .collect();
+        let mut ordinary = tokenizers::Tokenizer::new(
+            tokenizers::models::bpe::BPE::builder()
+                .vocab_and_merges(ascii, vec![])
+                .build()
+                .unwrap(),
+        );
+        ordinary
+            .add_tokens(
+                ["<think>", "</think>", "<tool_call>", "</tool_call>", "/nothink"]
+                    .map(|text| tokenizers::AddedToken::from(text, false))
+                    .to_vec(),
+            )
+            .unwrap();
+        let mut declared = config.clone();
+        declared["assets"] = json!({
+            "tokenizer": asset("declared-tokenizer.json", ordinary.to_string(false).unwrap().as_bytes()),
+            "chat_template": template_asset,
+        });
+        declared["model_contract"]["frontend"]["tools"] = json!(crate::model::contract::ToolParser {
+            kind: crate::model::contract::ToolParserKind::QwenCoder,
+            wrapping_newlines: 1,
+            tag_separator: String::new(),
+        });
+        declared["model_contract"]["frontend"]["reasoning"] =
+            json!(crate::model::contract::ReasoningParser {
+                kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+                open: "<think>".into(),
+                close: "</think>".into(),
+                wrapping_newlines: 1,
+                terminal_markers: vec![],
+            });
+        let loaded = Bootstrap::load(&declared.to_string(), &manifest).unwrap();
+        let rendered = loaded
+            .frontend
+            .render_chat(
+                &[json!({"role":"user","content":"a <think> </think> <tool_call> </tool_call> /nothink"})],
+                &serde_json::Map::new(),
+            )
+            .unwrap();
+        let count = |text: &str| {
+            let id = loaded.frontend.encode(text, false).unwrap()[0];
+            rendered.token_ids.iter().filter(|token| **token == id).count()
+        };
+        for marker in ["<think>", "</think>", "<tool_call>", "</tool_call>"] {
+            assert_eq!(count(marker), 0, "{marker}");
+        }
+        assert_eq!(count("/nothink"), 1);
         let mut unknown = config;
         unknown["frontend"]["prompt_encoder"] = 99.into();
         let error = Bootstrap::load(&unknown.to_string(), &manifest)

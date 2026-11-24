@@ -10,7 +10,10 @@ pub fn token(options: &HubOptions) -> Result<Option<String>> {
     flare::hub::token(&options.into())
 }
 pub fn run_download(args: crate::cli::Download) -> Result<()> {
-    crate::environment::configure(&args.gpus)?;
+    if !args.gpus.is_empty() {
+        crate::environment::configure(&args.gpus)?;
+    }
+    let startup = flare_helios::startup::StartupProgress::stderr_rows();
     let entry = download(
         &args.repository,
         &args.hub,
@@ -18,6 +21,7 @@ pub fn run_download(args: crate::cli::Download) -> Result<()> {
         &args.publisher_keys,
         args.trust_store.as_deref(),
         &[],
+        &startup,
     )?;
     println!("{}", entry.directory().display());
     Ok(())
@@ -30,27 +34,21 @@ pub fn download(
     publisher_keys: &[PathBuf],
     trust_store: Option<&Path>,
     profiles: &[flare_helios::runtime_core::Publisher],
+    startup: &flare_helios::startup::StartupProgress,
 ) -> Result<flare_helios::core::cache::Entry> {
     let mut resolved = flare::options::HubOptions::from(options);
     if resolved.revision.is_none() && repository(source)?.1.is_none() {
-        resolved.revision = Some(crate::hardware::detect_isolated(gpu_count)?);
+        resolved.revision = Some(crate::hardware::detect_isolated(gpu_count.max(1))?);
     }
+    let cache = flare::cache_support::model_root(options.core_cache.as_deref())
+        .map_err(|error| error.to_string())?;
     let progress = flare_helios::core::progress::AcquisitionProgress::new();
-    let startup = flare_helios::startup::StartupProgress::stderr_rows();
-    let display = flare_helios::core::progress::AcquisitionDisplay::new(&startup, &progress);
+    let display = flare_helios::core::progress::AcquisitionDisplay::new(startup, &progress);
     display.stage(
         "Acquire core",
         flare_helios::core::progress::Counter::Network,
         None,
     );
-    let cache = flare::cache_support::model_root(options.core_cache.as_deref())
-        .map_err(|error| error.to_string())?;
-    eprintln!("Prepared-model cache: {}", cache.display());
-    if !resolved.offline {
-        let (repository, source_revision) = repository(source)?;
-        let revision = resolved.revision.as_deref().or(source_revision).unwrap();
-        eprintln!("Core source: {repository}@{revision}");
-    }
     let result = (|| -> Result<flare_helios::core::cache::Entry> {
         let entry = flare::hub::acquire_watched(
             source,
@@ -64,22 +62,16 @@ pub fn download(
         flare_helios::core::cache::Root::open(cache)?.publish_entry(&entry)?;
         Ok(entry)
     })();
-    display.finish();
-    let snapshot = progress.snapshot();
-    let state = if result.is_ok() {
-        "completed"
-    } else {
-        "failed"
-    };
-    eprintln!(
-        "Acquisition {state}: network {} bytes, local source {} bytes, materialized {} bytes, verification {} bytes, elapsed {:.3}s",
-        snapshot.network_bytes,
-        snapshot.local_source_bytes,
-        snapshot.materialized_bytes(),
-        snapshot.verification_bytes,
-        snapshot.elapsed.as_secs_f64()
-    );
-    result
+    match result {
+        Ok(entry) => {
+            display.finish();
+            Ok(entry)
+        }
+        Err(error) => {
+            drop(display);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -115,7 +107,7 @@ pub fn refresh_model(
         entry,
         pinned,
         &(&args.hub).into(),
-        args.gpus.len().max(1),
+        args.gpus.len(),
         &args.publisher_keys,
         args.trust_store.as_deref(),
     )

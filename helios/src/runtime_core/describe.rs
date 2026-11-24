@@ -9,12 +9,13 @@
 //! alone. Nothing here authorizes the core, touches a GPU, or reads stored weights.
 
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 use super::{
-    format::invalid,
+    format::{Core, Memory as CoreMemory, invalid},
     protobuf::wire::{self, Memory},
 };
-use crate::Result;
+use crate::{Result, core::schema::wire as pwire};
 
 /// Detail sections included in core inspection output.
 #[derive(Clone, Copy, Debug, Default)]
@@ -68,31 +69,32 @@ impl super::protection::LegacyVerified {
     }
 }
 
-pub(super) fn describe_index(
-    index: &wire::ModelIndex,
-    options: InspectionOptions,
-    rank: Option<usize>,
-) -> Result<Value> {
-    let contract = index
-        .contract
-        .as_ref()
-        .ok_or_else(|| invalid("model core lacks a typed serving contract"))?;
+struct DescribeSections<'a> {
+    contract: &'a wire::ServingContract,
+    frontend: &'a wire::FrontendSettings,
+    sampling: &'a wire::DefaultSamplingParameters,
+    rebuild: Option<&'a wire::RebuildManifest>,
+    first_rank_max_active: Option<u64>,
+    kv_page_bytes: u64,
+    state_row_bytes: u64,
+    max_pages: Option<u64>,
+    assets: Vec<Value>,
+    engram: Option<Value>,
+    ranks: Vec<Value>,
+}
+
+fn describe_common(sections: DescribeSections<'_>, options: InspectionOptions) -> Result<Value> {
+    let contract = sections.contract;
     let model = contract
         .model_contract
         .as_ref()
         .ok_or_else(|| invalid("model core lacks a model contract"))?;
-    let frontend = index
-        .frontend
-        .as_ref()
-        .ok_or_else(|| invalid("model core lacks frontend settings"))?;
-    let sampling = index
-        .sampling_defaults
-        .as_ref()
-        .ok_or_else(|| invalid("model core lacks sampling defaults"))?;
+    let frontend = sections.frontend;
+    let sampling = sections.sampling;
     let mut value = json!({
         // Preparation metadata is optional and never supplies serving policy. Cores
         // without it, including version 4 exports, retain their complete serving contract.
-        "rebuild": index.rebuild,
+        "rebuild": sections.rebuild,
         "model": {
             "model_id": contract.model_id,
             "identity": contract.identity,
@@ -101,9 +103,7 @@ pub(super) fn describe_index(
             "input_vocabulary": model.input_vocabulary,
             "max_sequence_tokens": contract.max_sequence_tokens,
             "prefill_chunk_size": contract.prefill_chunk_size,
-            "max_active": contract.max_active.or_else(|| {
-                index.ranks.first().and_then(|r| r.execution.as_ref()).map(|e| e.max_active)
-            }),
+            "max_active": contract.max_active.or(sections.first_rank_max_active),
             "max_new_tokens": contract.max_new_tokens,
             "decode_weight_bytes": contract.decode_weight_bytes,
             "reserve_bytes": contract.reserve_bytes,
@@ -149,13 +149,9 @@ pub(super) fn describe_index(
             model.vision.as_ref(), frontend,
             (contract.max_sequence_tokens > 0).then_some(contract.max_sequence_tokens),
         ),
-        "assets": index.assets.iter().map(|a| json!({
-            "name": a.name,
-            "bytes": a.payload.as_ref().map_or(0, |p| p.nbytes),
-            "sha256": a.sha256,
-        })).collect::<Vec<_>>(),
-        "engram": index.engram.as_ref().map(engram_json),
-        "ranks": index.ranks.iter().enumerate().map(|(i, bundle)| rank_json(rank.unwrap_or(i), bundle, options)).collect::<Result<Vec<_>>>()?,
+        "assets": sections.assets,
+        "engram": sections.engram,
+        "ranks": sections.ranks,
         "graph_contracts": model.graphs.iter().map(|g| json!({
             "graph": g.graph,
             "kind": wire::GraphOperation::try_from(g.kind).map_or("UNKNOWN", |k| k.as_str_name()),
@@ -163,32 +159,9 @@ pub(super) fn describe_index(
             "embedding_tables": g.embedding_tables,
         })).collect::<Vec<_>>(),
     });
-    let mut kv_page_bytes = 0u64;
-    let mut state_row_bytes = 0u64;
-    let mut max_pages = None::<u64>;
-    for bundle in &index.ranks {
-        for allocation in &bundle.allocations {
-            if let Some(s) = &allocation.sizing {
-                match wire::Capacity::try_from(s.capacity) {
-                    Ok(wire::Capacity::KvPages) => {
-                        kv_page_bytes = kv_page_bytes
-                            .checked_add(s.unit_bytes)
-                            .ok_or_else(|| invalid("KV page size overflow"))?;
-                        max_pages = Some(max_pages.map_or(s.maximum, |n| n.min(s.maximum)));
-                    }
-                    Ok(wire::Capacity::StateRows) => {
-                        state_row_bytes = state_row_bytes
-                            .checked_add(s.unit_bytes)
-                            .ok_or_else(|| invalid("state row size overflow"))?;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    value["cache"]["kv_page_bytes"] = kv_page_bytes.into();
-    value["cache"]["state_row_bytes"] = state_row_bytes.into();
-    value["cache"]["max_pages"] = max_pages.unwrap_or(contract.pages).into();
+    value["cache"]["kv_page_bytes"] = sections.kv_page_bytes.into();
+    value["cache"]["state_row_bytes"] = sections.state_row_bytes.into();
+    value["cache"]["max_pages"] = sections.max_pages.unwrap_or(contract.pages).into();
     value["cache"]["history_kinds"] = json!(
         model
             .cache
@@ -212,6 +185,189 @@ pub(super) fn describe_index(
         value["cache"].as_object_mut().unwrap().remove("regions");
     }
     Ok(value)
+}
+
+fn accumulate_sizing(
+    sizing: Option<&wire::Sizing>,
+    kv_page_bytes: &mut u64,
+    state_row_bytes: &mut u64,
+    max_pages: &mut Option<u64>,
+) -> Result<()> {
+    if let Some(s) = sizing {
+        match wire::Capacity::try_from(s.capacity) {
+            Ok(wire::Capacity::KvPages) => {
+                *kv_page_bytes = kv_page_bytes
+                    .checked_add(s.unit_bytes)
+                    .ok_or_else(|| invalid("KV page size overflow"))?;
+                *max_pages = Some(max_pages.map_or(s.maximum, |n| n.min(s.maximum)));
+            }
+            Ok(wire::Capacity::StateRows) => {
+                *state_row_bytes = state_row_bytes
+                    .checked_add(s.unit_bytes)
+                    .ok_or_else(|| invalid("state row size overflow"))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn describe_index(
+    index: &wire::ModelIndex,
+    options: InspectionOptions,
+    rank: Option<usize>,
+) -> Result<Value> {
+    let contract = index
+        .contract
+        .as_ref()
+        .ok_or_else(|| invalid("model core lacks a typed serving contract"))?;
+    let frontend = index
+        .frontend
+        .as_ref()
+        .ok_or_else(|| invalid("model core lacks frontend settings"))?;
+    let sampling = index
+        .sampling_defaults
+        .as_ref()
+        .ok_or_else(|| invalid("model core lacks sampling defaults"))?;
+    let mut kv_page_bytes = 0u64;
+    let mut state_row_bytes = 0u64;
+    let mut max_pages = None::<u64>;
+    for bundle in &index.ranks {
+        for allocation in &bundle.allocations {
+            accumulate_sizing(
+                allocation.sizing.as_ref(),
+                &mut kv_page_bytes,
+                &mut state_row_bytes,
+                &mut max_pages,
+            )?;
+        }
+    }
+    let assets = index
+        .assets
+        .iter()
+        .map(|a| {
+            json!({
+                "name": a.name,
+                "bytes": a.payload.as_ref().map_or(0, |p| p.nbytes),
+                "sha256": a.sha256,
+            })
+        })
+        .collect();
+    let ranks = index
+        .ranks
+        .iter()
+        .enumerate()
+        .map(|(i, bundle)| rank_json(rank.unwrap_or(i), bundle, options))
+        .collect::<Result<Vec<_>>>()?;
+    describe_common(
+        DescribeSections {
+            contract,
+            frontend,
+            sampling,
+            rebuild: index.rebuild.as_ref(),
+            first_rank_max_active: index
+                .ranks
+                .first()
+                .and_then(|r| r.execution.as_ref())
+                .map(|e| e.max_active),
+            kv_page_bytes,
+            state_row_bytes,
+            max_pages,
+            assets,
+            engram: index.engram.as_ref().map(engram_json),
+            ranks,
+        },
+        options,
+    )
+}
+
+/// Describe an authenticated payload-format deployment directly from its verified
+/// schema records and decoded rank cores without synthesizing a legacy `ModelIndex`.
+pub(super) fn describe_payload(
+    core: &pwire::CoreBody,
+    deployment: &pwire::DeploymentBody,
+    selected_ranks: &[pwire::RankBody],
+    cores: &[Core],
+    locations: &pwire::LocationSet,
+    options: InspectionOptions,
+) -> Result<Value> {
+    let contract = deployment
+        .contract
+        .as_ref()
+        .ok_or_else(|| invalid("model core lacks a typed serving contract"))?;
+    let frontend = core
+        .frontend
+        .as_ref()
+        .ok_or_else(|| invalid("model core lacks frontend settings"))?;
+    let sampling = core
+        .sampling_defaults
+        .as_ref()
+        .ok_or_else(|| invalid("model core lacks sampling defaults"))?;
+    let mut kv_page_bytes = 0u64;
+    let mut state_row_bytes = 0u64;
+    let mut max_pages = None::<u64>;
+    for rank_core in cores {
+        for allocation in &rank_core.allocations {
+            accumulate_sizing(
+                allocation.sizing.as_ref(),
+                &mut kv_page_bytes,
+                &mut state_row_bytes,
+                &mut max_pages,
+            )?;
+        }
+    }
+    let assets = core
+        .assets
+        .iter()
+        .map(|asset| {
+            let bytes = asset
+                .payload
+                .as_ref()
+                .and_then(|use_| use_.slice.as_ref())
+                .map_or(0, |slice| slice.nbytes);
+            let sha256: String = asset.sha256.iter().map(|b| format!("{b:02x}")).collect();
+            json!({
+                "name": asset.name,
+                "bytes": bytes,
+                "sha256": sha256,
+            })
+        })
+        .collect();
+    let ranks = selected_ranks
+        .iter()
+        .zip(cores)
+        .map(|(body, rank_core)| {
+            payload_rank_json(
+                &deployment.architecture,
+                body,
+                rank_core,
+                locations,
+                options,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    describe_common(
+        DescribeSections {
+            contract,
+            frontend,
+            sampling,
+            rebuild: deployment.rebuild.as_ref(),
+            first_rank_max_active: cores
+                .first()
+                .and_then(|c| c.execution.as_ref())
+                .map(|e| e.max_active),
+            kv_page_bytes,
+            state_row_bytes,
+            max_pages,
+            assets,
+            engram: deployment
+                .engram
+                .as_ref()
+                .map(|e| payload_engram_json(e, selected_ranks)),
+            ranks,
+        },
+        options,
+    )
 }
 
 pub(super) fn frontend_json(
@@ -284,6 +440,7 @@ pub(super) fn vision_json(
             Profile::PatchMerge(c) => json!({"profile": "patch_merge", "patch_size": c.patch_size,
                 "min_pixels": c.min_pixels, "max_pixels": c.max_pixels}),
             Profile::Glm(_) => json!({"profile": "glm"}),
+            Profile::PaddedGrid(_) => json!({"profile": "padded_grid"}),
         }
     });
     json!({
@@ -438,6 +595,275 @@ fn allocation_json(a: &wire::Allocation, bundle: &wire::BundleIndex) -> Result<V
         "nbytes": a.nbytes, "virtual_bytes": virtual_bytes, "alignment": a.alignment,
         "stored_bytes": stored_bytes, "sizing": sizing, "data_spans": a.data_spans,
         "payload": a.file.as_ref().and_then(|name| bundle.resources.get(name)),
+    }))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn payload_engram_json(engram: &pwire::Engram, selected_ranks: &[pwire::RankBody]) -> Value {
+    let slice_bytes = |value: &Option<pwire::PayloadUse>| -> u64 {
+        value
+            .as_ref()
+            .and_then(|use_| use_.slice.as_ref())
+            .map_or(0, |slice| slice.nbytes)
+    };
+    json!({
+        "compressed_vocabulary": engram.compressed_vocabulary,
+        "pad_token_id": engram.pad_token_id,
+        "token_map_entries": engram.token_map.len(),
+        "tables": engram.tables.iter().map(|t| {
+            let owned_weight: u64 = t
+                .shards
+                .iter()
+                .filter(|shard| selected_ranks.iter().any(|rank| rank.rank == shard.rank))
+                .map(|shard| slice_bytes(&shard.weights))
+                .sum();
+            let owned_scale: u64 = t
+                .shards
+                .iter()
+                .filter(|shard| selected_ranks.iter().any(|rank| rank.rank == shard.rank))
+                .map(|shard| slice_bytes(&shard.scales))
+                .sum();
+            json!({
+                "layer": t.layer,
+                "rows": t.rows,
+                "embedding_width": t.embedding_width,
+                "encoding": wire::engram_table::Encoding::try_from(t.encoding)
+                    .map_or("UNKNOWN", |e| e.as_str_name()),
+                "weight_bytes": slice_bytes(&t.weights) + owned_weight,
+                "scale_bytes": slice_bytes(&t.scales) + owned_scale,
+                "shards": t.shards.len(),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn initializer_spans(body: &pwire::RankBody) -> BTreeMap<String, Vec<wire::Span>> {
+    let mut spans: BTreeMap<String, Vec<wire::Span>> = Default::default();
+    for initializer in &body.initializers {
+        let Some(slice) = initializer
+            .source
+            .as_ref()
+            .and_then(|use_| use_.slice.as_ref())
+        else {
+            continue;
+        };
+        if slice.nbytes == 0 {
+            continue;
+        }
+        spans
+            .entry(initializer.allocation.clone())
+            .or_default()
+            .push(wire::Span {
+                offset: initializer.destination_offset,
+                nbytes: slice.nbytes,
+                filename: String::new(),
+            });
+    }
+    spans
+}
+
+fn initializer_detail(body: &pwire::RankBody, locations: &pwire::LocationSet) -> Vec<Value> {
+    let placed: BTreeMap<&[u8], (&str, &str)> = locations
+        .locations
+        .iter()
+        .map(|location| {
+            (
+                location.payload_id.as_slice(),
+                (location.file.as_str(), location.tensor.as_str()),
+            )
+        })
+        .collect();
+    let mut detail = Vec::new();
+    for initializer in &body.initializers {
+        let Some(slice) = initializer
+            .source
+            .as_ref()
+            .and_then(|use_| use_.slice.as_ref())
+        else {
+            continue;
+        };
+        if slice.nbytes == 0 {
+            continue;
+        }
+        let (file, tensor) = placed
+            .get(slice.payload_id.as_slice())
+            .copied()
+            .unwrap_or(("", ""));
+        detail.push(json!({
+            "allocation": initializer.allocation,
+            "destination_offset": initializer.destination_offset,
+            "payload_id": hex_bytes(&slice.payload_id),
+            "source_offset": slice.offset,
+            "nbytes": slice.nbytes,
+            "file": file,
+            "tensor": tensor,
+        }));
+    }
+    detail
+}
+
+fn core_memory_wire(memory: CoreMemory) -> Memory {
+    match memory {
+        CoreMemory::Device => Memory::Device,
+        CoreMemory::MappedHost => Memory::MappedHost,
+        CoreMemory::Peer => Memory::Peer,
+    }
+}
+
+fn payload_rank_json(
+    architecture: &[i32],
+    body: &pwire::RankBody,
+    core: &Core,
+    locations: &pwire::LocationSet,
+    options: InspectionOptions,
+) -> Result<Value> {
+    let bytes = |memory: Memory| -> u64 {
+        core.allocations
+            .iter()
+            .filter(|a| core_memory_wire(a.memory) == memory)
+            .map(|a| a.nbytes as u64)
+            .sum()
+    };
+    let sized: Vec<Value> = core
+        .allocations
+        .iter()
+        .filter_map(|a| {
+            let sizing = a.sizing.as_ref()?;
+            Some(json!({
+                "name": a.name,
+                "capacity": wire::Capacity::try_from(sizing.capacity).map_or("UNKNOWN", |c| c.as_str_name()),
+                "unit_bytes": sizing.unit_bytes,
+                "maximum": sizing.maximum,
+                "memory": core_memory_wire(a.memory).as_str_name(),
+            }))
+        })
+        .collect();
+    let execution = core.execution.as_ref();
+    let mut value = json!({
+        "rank": body.rank,
+        "architecture": architecture,
+        "device_bytes": bytes(Memory::Device),
+        "mapped_host_bytes": bytes(Memory::MappedHost),
+        "peer_bytes": bytes(Memory::Peer),
+        "allocations": core.allocations.len(),
+        "capacity_allocations": sized,
+        "modules": core.modules.len(),
+        "functions": core.functions.len(),
+        "graphs": core.graphs.len(),
+        "events": core.events.len(),
+        "abi_version": execution.map_or(0, |e| e.abi_version),
+        "max_active": execution.map_or(0, |e| e.max_active),
+        "execution_graphs": execution.map(|e| e.graphs.iter().map(|g| json!({
+            "name": g.name,
+            "kind": g.kind,
+            "sampling_mode": g.sampling_mode,
+            "batch_capacity": g.batch_capacity,
+            "token_capacity": g.token_capacity,
+            "packed_tokens": g.packed_tokens(),
+            "prefill_capacity": g.prefill_capacity,
+            "draft_tokens": g.draft_tokens,
+            "verify_tokens": g.verify_tokens,
+            "draft_source": wire::DraftSource::try_from(g.draft_source).map_or("UNKNOWN", |d| d.as_str_name()),
+            "speculation_enabled": g.speculation_enabled,
+            "estimated_duration_ns": g.estimated_duration_ns,
+            "node_count": core.graphs.iter().find(|graph| graph.name == g.name).map(|graph| graph.node_count as u64),
+            "edge_count": core.graphs.iter().find(|graph| graph.name == g.name).map(|graph| graph.edge_count as u64),
+        })).collect::<Vec<_>>()).unwrap_or_default(),
+        "roce": body.roce.as_ref().map(|r| json!({
+            "world": r.world, "rank": r.rank, "proxy_abi": r.proxy_abi,
+            "region_bytes": r.region_bytes, "varlen_bytes": r.varlen_bytes,
+        })),
+        "rebuild_weights": Value::Null,
+    });
+    if !options.graphs && !options.all {
+        value.as_object_mut().unwrap().remove("execution_graphs");
+    }
+    if options.memory_map || options.all {
+        let spans = initializer_spans(body);
+        let allocations = core
+            .allocations
+            .iter()
+            .map(|a| {
+                let data_spans = spans.get(&a.name).map(Vec::as_slice).unwrap_or(&[]);
+                payload_allocation_json(a, core, data_spans)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let reservations: Vec<wire::Reservation> = core
+            .reservations
+            .iter()
+            .map(|r| wire::Reservation {
+                address: r.address,
+                nbytes: r.nbytes as u64,
+            })
+            .collect();
+        value["memory_map"] = json!({
+            "allocations": allocations,
+            "reservations": reservations,
+            "buffers": execution.map(|e| &e.buffers),
+            "initializers": initializer_detail(body, locations),
+        });
+    }
+    if !options.all {
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("capacity_allocations");
+    }
+    Ok(value)
+}
+
+fn payload_allocation_json(
+    a: &super::format::Allocation,
+    core: &Core,
+    data_spans: &[wire::Span],
+) -> Result<Value> {
+    let memory = core_memory_wire(a.memory);
+    let nbytes = a.nbytes as u64;
+    let alignment = a.alignment as u64;
+    let virtual_bytes = match &a.sizing {
+        Some(s) => {
+            if !alignment.is_power_of_two() {
+                return Err(invalid("invalid allocation alignment"));
+            }
+            s.unit_bytes
+                .checked_mul(s.maximum)
+                .and_then(|n| n.checked_add(alignment - 1))
+                .map(|n| n & !(alignment - 1))
+                .ok_or_else(|| invalid("allocation extent overflow"))?
+        }
+        None => nbytes,
+    };
+    let stored_bytes = data_spans.iter().try_fold(0u64, |n, s| {
+        n.checked_add(s.nbytes)
+            .ok_or_else(|| invalid("stored allocation size overflow"))
+    })?;
+    let sizing = a
+        .sizing
+        .as_ref()
+        .map(|s| -> Result<Value> {
+            let capacity = wire::Capacity::try_from(s.capacity)
+                .map_err(|_| invalid("unknown allocation capacity"))?;
+            Ok(json!({
+                "capacity": capacity.as_str_name(),
+                "unit_bytes": s.unit_bytes,
+                "maximum": s.maximum,
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
+        "name": a.name,
+        "memory": memory.as_str_name(),
+        "address": a.address,
+        "nbytes": nbytes,
+        "virtual_bytes": virtual_bytes,
+        "alignment": alignment,
+        "stored_bytes": stored_bytes,
+        "sizing": sizing,
+        "data_spans": data_spans,
+        "payload": a.file.as_ref().and_then(|name| core.resources.get(name)),
     }))
 }
 
@@ -618,6 +1044,7 @@ mod tests {
             reservations: vec![],
             execution: Some(wire::Execution {
                 tuning_graphs: vec![],
+                persistent_workers: vec![],
                 abi_version: 9,
                 completion_token_capacity: 0,
                 max_active: 32,
