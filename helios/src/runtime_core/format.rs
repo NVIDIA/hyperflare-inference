@@ -22,6 +22,7 @@ pub(super) struct Core {
     pub graphs: Vec<Graph>,
     pub reservations: Vec<Reservation>,
     pub execution: Option<super::protobuf::wire::Execution>,
+    pub tensor_contract: Option<super::tensor_contract::PreparedTensorContract>,
     pub context: Context,
     pub events: Vec<String>,
 }
@@ -652,6 +653,7 @@ mod tests {
             functions: vec![],
             reservations: vec![],
             execution: None,
+            tensor_contract: None,
             context: Context::default(),
             graphs: vec![Graph {
                 name: "copy".into(),

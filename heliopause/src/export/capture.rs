@@ -3085,6 +3085,14 @@ pub(crate) fn capture_rank(
         }
         output.index.ranks[0].execution = Some(execution);
     }
+    if let Some(source) = &request.tensor_contract {
+        let contract = super::binding::tensor_contract(source, &allocations)?;
+        for binding in contract.inputs.iter().chain(&contract.outputs) {
+            reach.reference(&binding.reference.as_ref()
+                .ok_or_else(|| invalid("tensor binding lacks allocation reference"))?.allocation)?;
+        }
+        output.index.ranks[0].tensor_contract = Some(contract);
+    }
     let mut other_resources = Vec::new();
     let graph_phase = progress.phase("Serialize CUDA graphs", Some(request.graphs.len() as u64));
     let mut graph_bytes = 0u64;
@@ -3360,6 +3368,7 @@ pub(crate) fn capture_rank(
     downloader.drain()?;
     cuda.synchronize()?;
     storage_phase.finish(format!("{scanned} bytes scanned, {} bytes downloaded, {stored_bytes} bytes stored; {} allocations omitted", downloader.downloaded - storage_download_start + committed_downloads, allocations.len() - output.allocations.len()));
+    helios_core::runtime_core::tensor_contract::validate_bundle(&output.index.ranks[0])?;
     let weight_phase = progress.phase(if request.options.reuse_weights.is_some() {
         "Reuse cached weight payloads"
     } else { "Materialize weight payloads" }, None);

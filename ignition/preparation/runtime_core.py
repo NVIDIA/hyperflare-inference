@@ -106,7 +106,9 @@ class RuntimeCore:
             cubin_bytes=sum(len(image) for image in self.modules.values() if isinstance(image, bytes)))
 
     def write(self, path, graphs, *, execution=None, server=None, progress=None, core_data=None,
-              publisher=None, sources=False, rebuild_weights=None, zero_ranges=()):
+              publisher=None, sources=False, rebuild_weights=None, zero_ranges=(),
+              discover_allocations=False, numeric=(), parameter_layouts=None, inactive=(),
+              granularity=256, roots=None, tensor_contract=None):
         import flare_heliopause
         from .core_snapshot import _OPTIONS
         from .rebuild_manifest import rebuild_weights_metadata, weight_payload_request
@@ -122,14 +124,18 @@ class RuntimeCore:
         request = dict(path=str(path), context=context, graphs=_graphs(graphs, recorder=self.recorder),
             allocations=[asdict(a) for a in self.allocations], kernels=[asdict(k) for k in self.kernels],
             modules={name: str(path) for name,path in self.modules.items()},
-            roots=[a.name for a in self.allocations],
+            roots=[a.name for a in self.allocations] if roots is None else list(roots),
+            granularity=granularity,
             cupti_path=_cupti_path(), publisher=_publisher_metadata(publisher),
             reservations=[(r["address"], r["nbytes"]) for r in self.reservations], events=self.events,
             transports=self.transports, device_address_floor=self.device_address_floor, execution=execution,
+            tensor_contract=tensor_contract,
             server=server, core_data=None if core_data is None else core_data.export_metadata(),
             rebuild_weights=None if rebuild_weights is None else rebuild_weights_metadata(rebuild_weights),
             weight_payload=weight_payload_request(rebuild_weights),
             zero_ranges=list(zero_ranges), sources=sources,
+            discover_allocations=discover_allocations, numeric=list(numeric),
+            parameter_layouts=dict(parameter_layouts or {}), inactive=list(inactive),
             options=_cache_options(cache))
         self.source_path = Path(path)
         self._capture(request, (self, self.owners, graphs), self.recorder)

@@ -1073,6 +1073,7 @@ mod tests {
             events: vec![],
             roce: None,
             rebuild_weights: None,
+            tensor_contract: None,
         };
         let value = rank_json(
             2,

@@ -477,13 +477,36 @@ def _execute(forward):
     return forward()
 
 
+def _describe_guard_failure(error):
+    """Attach the rejected guard's source without retaining guarded values."""
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if (frame.f_code.co_name == "serialize_guards"
+                and frame.f_globals.get("__name__") == "torch._dynamo.guards"):
+            guard = frame.f_locals.get("guard")
+            if guard is not None:
+                name = str(guard.name)[:512]
+                source = str(guard.source)[:256]
+                create = str(guard.create_fn_name())[:128]
+                code = repr((guard.code_list or [])[:4])[:1024]
+                error.add_note(f"Rejected compiled guard: name={name!r}, source={source}, "
+                               f"create_fn={create}, code_list={code}")
+                return
+        trace = trace.tb_next
+
+
 def aot_forward(forward, *, options=None):
     runtime_patches.apply()
     options = dict(_OPTIONS if options is None else options)
     sources = r'.*\.(?:_?handle|stream_handle|launch_order|plans\[\d+\])$'
     with _guard_serialization(), torch.compiler.config.patch(unbacked_sources=sources):
-        return torch.compile(_execute, backend=partial(StorageBackend, options=options), fullgraph=True,
-                             dynamic=False).aot_compile(((forward,), {}))
+        try:
+            return torch.compile(_execute, backend=partial(StorageBackend, options=options), fullgraph=True,
+                                 dynamic=False).aot_compile(((forward,), {}))
+        except torch._dynamo.exc.PackageError as error:
+            _describe_guard_failure(error)
+            raise
 
 
 @dataclass

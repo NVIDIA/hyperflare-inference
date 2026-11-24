@@ -553,6 +553,7 @@ impl Verified {
             if protection::sha256(&signed.body).as_slice() != commitment.body_digest {
                 return Err(invalid("deployment body differs from its commitment"));
             }
+            schema::validate_deployment_contract(&core, &body)?;
             schema::validate_deployment(&body, &mut catalog)?;
             if wanted(signed.index as usize) {
                 scope.insert_all(&body.payloads)?;
@@ -613,6 +614,7 @@ impl Verified {
             if protection::sha256(&signed.body).as_slice() != commitment.body_digest {
                 return Err(invalid("rank body differs from its commitment"));
             }
+            schema::validate_rank_contract(deployment, &body)?;
             if !covered
                 .entry(signed.deployment)
                 .or_default()
@@ -2187,6 +2189,16 @@ fn inject_dependency_descriptors(
     for (position, signed) in envelope.deployments.iter().enumerate() {
         let mut body = wire::DeploymentBody::decode(signed.body.as_slice())
             .map_err(|e| invalid(format!("invalid deployment body: {e}")))?;
+        schema::validate_deployment_contract(&core, &body)?;
+        for rank in envelope
+            .ranks
+            .iter()
+            .filter(|rank| rank.deployment == position as u32)
+        {
+            let rank_body = wire::RankBody::decode(rank.body.as_slice())
+                .map_err(|e| invalid(format!("invalid rank body: {e}")))?;
+            schema::validate_rank_contract(&body, &rank_body)?;
+        }
         catalog.insert_all(&body.payloads)?;
         if let Some(engram) = &body.engram {
             for id in engram_payload_ids(engram) {

@@ -55,6 +55,8 @@ mod selection;
 mod serving;
 #[cfg(test)]
 mod shared_memory_tests;
+pub mod tensors;
+pub mod tensor_contract;
 pub use archive::{
     CoreFile, LegacyHeader, LegacyLayout, MAX_LEGACY_HEADER, MAX_LEGACY_INDEX, MAX_LEGACY_PAYLOAD,
     core_companions, is_snapshot_blob_name, read_legacy_header, validate_companion_filename,
@@ -108,6 +110,7 @@ pub struct NativeResources {
     names: Vec<String>,
     reservations: Vec<(u64, usize)>,
     execution: Option<protobuf::wire::Execution>,
+    tensor_contract: Option<tensor_contract::PreparedTensorContract>,
     // An integrated GPU (GB10) registers host memory without pinning it.
     integrated: bool,
     events: HashMap<String, Handle>,
@@ -405,6 +408,7 @@ impl NativeResources {
                 names: vec![],
                 reservations: vec![],
                 execution: core.execution.clone(),
+                tensor_contract: core.tensor_contract.clone(),
                 integrated: integrated != 0,
                 events: HashMap::new(),
                 cache: None,
@@ -1310,16 +1314,29 @@ impl NativeResources {
         })
     }
 
+    /// Fixed request geometry validated from the authenticated rank metadata.
+    pub fn tensor_contract(&self) -> Result<&tensor_contract::PreparedTensorContract> {
+        self.tensor_contract.as_ref().ok_or_else(|| invalid("core has no signed tensor contract; prepare and export a tensor core"))
+    }
+
     /// Copy an allocation after the caller has drained every replay that uses it.
     pub fn download(&self, name: &str) -> Result<Vec<u8>> {
+        let a = self.allocation(name)?;
+        self.download_range(name, 0, a.nbytes)
+    }
+
+    /// Copy a bounded allocation range after draining every replay that uses it.
+    pub fn download_range(&self, name: &str, offset: usize, nbytes: usize) -> Result<Vec<u8>> {
         if self.persistent_worker_state() == Some(WorkerState::Running) {
             return Err(invalid(
                 "cannot synchronize primary context while persistent worker is running",
             ));
         }
         let a = self.allocation(name)?;
-        let mut bytes = vec![0u8; a.nbytes];
-        // SAFETY: The allocation remains owned by self and the output is sized to it.
+        let address = tensors::range_address(&a, offset, nbytes)?;
+        let mut bytes = vec![0u8; nbytes];
+        // SAFETY: The bounded source range remains owned by self and the output
+        // has exactly the validated range length.
         unsafe {
             self.driver
                 .check("cuCtxSetCurrent", (self.driver.context_set)(self.context))?;
@@ -1327,7 +1344,7 @@ impl NativeResources {
                 .check("cuCtxSynchronize", (self.driver.context_sync)())?;
             self.driver.check(
                 "cuMemcpyDtoH_v2",
-                (self.driver.download)(bytes.as_mut_ptr().cast(), a.address as u64, bytes.len()),
+                (self.driver.download)(bytes.as_mut_ptr().cast(), address as u64, bytes.len()),
             )?;
         }
         Ok(bytes)
@@ -1335,16 +1352,23 @@ impl NativeResources {
 
     /// Replace allocation contents after draining replay on the owned context.
     pub fn upload(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let a = self.allocation(name)?;
+        if bytes.len() != a.nbytes {
+            return Err(invalid("upload size differs from allocation"));
+        }
+        self.upload_range(name, 0, bytes)
+    }
+
+    /// Replace a bounded allocation range after draining replay on the owned context.
+    pub fn upload_range(&self, name: &str, offset: usize, bytes: &[u8]) -> Result<()> {
         if self.persistent_worker_state() == Some(WorkerState::Running) {
             return Err(invalid(
                 "cannot synchronize primary context while persistent worker is running",
             ));
         }
         let a = self.allocation(name)?;
-        if bytes.len() != a.nbytes {
-            return Err(invalid("upload size differs from allocation"));
-        }
-        // SAFETY: The owned allocation and input span have equal validated sizes.
+        let address = tensors::range_address(&a, offset, bytes.len())?;
+        // SAFETY: The input length fits the validated range of the owned allocation.
         unsafe {
             self.driver
                 .check("cuCtxSetCurrent", (self.driver.context_set)(self.context))?;
@@ -1352,8 +1376,12 @@ impl NativeResources {
                 .check("cuCtxSynchronize", (self.driver.context_sync)())?;
             self.driver.check(
                 "cuMemcpyHtoD_v2",
-                (self.driver.upload)(a.address as u64, bytes.as_ptr().cast(), bytes.len()),
+                (self.driver.upload)(address as u64, bytes.as_ptr().cast(), bytes.len()),
             )?;
+            // Pageable H2D can return before DMA completes. Replay uses a
+            // nonblocking stream, so finish the upload before handing it inputs.
+            self.driver
+                .check("cuCtxSynchronize", (self.driver.context_sync)())?;
         }
         Ok(())
     }

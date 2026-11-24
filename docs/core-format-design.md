@@ -209,7 +209,7 @@ not substitutes for identifiers.
 | --- | --- |
 | `CoreBody` | Format version, core identity, publisher identity, shared frontend contract and payload descriptors, deployment IDs and commitments to their serialized bodies. |
 | `DeploymentBody` | Deployment ID, target architecture, TP topology, prepared contract and capacities, rank IDs and commitments to their serialized bodies. |
-| `RankBody` | Rank ID, context and address reservations, allocations, initializers, modules, functions, graph catalog, events, peer/transport bindings, referenced payload descriptors, and optional prepared-weight catalog. |
+| `RankBody` | Rank ID, context and address reservations, allocations, initializers, modules, functions, graph catalog, events, peer/transport bindings, referenced payload descriptors, optional prepared-weight catalog, and optional fixed tensor contract. |
 | `PayloadDescriptor` | Content ID equal to SHA-256 of exact stored bytes and byte length. Conflicting lengths for one ID are rejected. |
 | `PayloadSlice` | Payload ID, byte offset within the payload tensor, and byte length. |
 | `PayloadUse` | One `PayloadSlice` and its use role: weights, tuned weights, initial state, kernels, graphs, or frontend. |
@@ -217,8 +217,24 @@ not substitutes for identifiers.
 | `Initializer` | Allocation name, destination offset, source `PayloadUse`. |
 | `ExecutableResource` | Preassigned resource ID, kind, stored compressed `PayloadSlice`, signed decoded length, 4 MiB chunk metadata, and compressed chunk commitments. |
 | `Module` / `Function` | Cubin resource reference; module reference, symbol, parameter layout and launch attributes. |
-| `Graph` | Graph name, instantiation flags, compressed graph resource reference, node and edge counts, and function dependencies. Graph bytes encode nodes, edges, parameters, and dependencies. The rank's `flare.runtime.Execution` record carries each graph's operation kind, capacities, and input bindings. |
+| `Graph` | Graph name, instantiation flags, compressed graph resource reference, node and edge counts, and function dependencies. Graph bytes encode nodes, edges, parameters, and dependencies. For token serving, the rank's optional `flare.runtime.Execution` record carries operation kinds, capacities, and input bindings. |
+| `TensorContract` | Version, ordered graph names, and named input/output bindings with dtype, shape and allocation-relative references. Present for fixed tensor execution; mutually exclusive with token-serving execution. |
 | `PreparedWeightView` | Semantic tensor name, stable group, dtype, shape, strides, allocation/view binding, source tensor identities and logical ranges, concatenation order, padding/fills, typed packing parameters and locality tile, and quantization statistic domain. |
+
+A physical graph core contains authenticated storage and executable graphs for
+[fixed tensor requests](runtime-core-design.md#fixed-tensor-requests). Its core
+frontend and sampling defaults are both absent, it has no frontend assets, and
+every deployment omits the serving contract and Engram state. Each rank omits
+token-serving execution metadata and contains at least one graph. Token-serving
+cores retain paired frontend and sampling metadata and a serving contract in
+every deployment; rank execution remains optional in the container schema.
+Publication, authenticated reads, and conversion reject partial or mixed forms.
+Physical graph cores use the same signatures, resource checks, and wire format;
+the token-serving entry points reject them because they lack a serving contract.
+Fixed tensor execution additionally requires a signed `TensorContract` on one
+independent rank with fixed allocations and device-resident tensor bindings. Graph cores without this
+contract remain valid containers for inspection and conversion, but cannot run
+through `--tensor-request`.
 
 Payload descriptors are authenticated wherever consumed, with equality enforced
 across shared and rank bodies. Each body is signed over its exact serialized

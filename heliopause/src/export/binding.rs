@@ -212,6 +212,53 @@ pub(crate) fn execution(
     message("Execution", &value)
 }
 
+pub(crate) fn tensor_contract(
+    source: &super::TensorContractSource,
+    allocations: &[super::Allocation],
+) -> super::Result<super::wire::TensorContract> {
+    use helios_core::runtime_core::tensor_contract::PreparedTensorContract;
+    use super::wire;
+
+    let bind = |source: &super::TensorBindingSource| -> super::Result<wire::TensorBinding> {
+        let end = source.address.checked_add(source.nbytes)
+            .filter(|_| source.nbytes != 0)
+            .ok_or_else(|| super::invalid("tensor binding extent is empty or overflows"))?;
+        let mut candidates = allocations.iter().filter(|allocation| {
+            source.address >= allocation.address
+                && allocation.address.checked_add(allocation.nbytes).is_some_and(|limit| end <= limit)
+        });
+        let allocation = candidates.next()
+            .ok_or_else(|| super::invalid("tensor binding is outside registered storage"))?;
+        if candidates.next().is_some() {
+            return Err(super::invalid("tensor binding has ambiguous allocation ownership"));
+        }
+        let dtype = wire::TensorDtype::from_str_name(&format!("TENSOR_DTYPE_{}", source.dtype))
+            .ok_or_else(|| super::invalid("tensor binding has an unsupported dtype"))?;
+        Ok(wire::TensorBinding {
+            name: source.name.clone(),
+            reference: Some(wire::Reference {
+                allocation: allocation.name.clone(), offset: source.address - allocation.address,
+            }),
+            dtype: dtype as i32,
+            shape: source.shape.clone(),
+        })
+    };
+    let contract = wire::TensorContract {
+        version: source.version,
+        graphs: source.graphs.clone(),
+        inputs: source.inputs.iter().map(bind).collect::<super::Result<_>>()?,
+        outputs: source.outputs.iter().map(bind).collect::<super::Result<_>>()?,
+    };
+    let prepared = PreparedTensorContract::parse(&contract)?;
+    for (binding, source) in prepared.inputs().iter().chain(prepared.outputs())
+        .zip(source.inputs.iter().chain(&source.outputs)) {
+        if u64::try_from(binding.nbytes()?)? != source.nbytes {
+            return Err(super::invalid("tensor binding byte extent differs from its dtype and shape"));
+        }
+    }
+    Ok(contract)
+}
+
 pub(crate) fn finish_rank(
     request: &CaptureRequest,
     output: &mut super::RankOutput,
@@ -745,6 +792,18 @@ fn validate_sampling(value: &serde_json::Value) -> super::Result<()> {
 }
 
 pub(crate) fn validate_metadata(request: &CaptureRequest) -> super::Result<()> {
+    if let Some(contract) = &request.tensor_contract {
+        if request.world_size != 1 || request.rank != 0 || request.server.is_some()
+            || request.execution.is_some() || request.core_data.is_some()
+            || !request.transports.is_empty() || !request.peer_addresses.is_empty()
+            || !request.peer_mappings.is_empty()
+        {
+            return Err(super::invalid("tensor contracts require one rank without token-serving or peer metadata"));
+        }
+        if contract.graphs.iter().any(|name| !request.graphs.iter().any(|graph| &graph.name == name)) {
+            return Err(super::invalid("tensor contract names a graph absent from capture"));
+        }
+    }
     if let Some(server) = request.server.as_ref() {
         serving_metadata(&mut Default::default(), server)?;
     }
@@ -853,6 +912,96 @@ fn export_serving<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tensor_source() -> super::super::TensorContractSource {
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "graphs": ["text", "decode"],
+            "inputs": [{"name": "tokens", "address": 4128, "nbytes": 16, "dtype": "I64", "shape": [1, 2]}],
+            "outputs": [{"name": "image", "address": 4224, "nbytes": 32, "dtype": "F32", "shape": [1, 2, 4]}]
+        })).unwrap()
+    }
+
+    fn tensor_allocation() -> super::super::Allocation {
+        serde_json::from_value(serde_json::json!({
+            "name": "retained.1", "address": 4096, "nbytes": 256
+        })).unwrap()
+    }
+
+    #[test]
+    fn tensor_bindings_resolve_split_storage_and_preserve_order() {
+        let contract = tensor_contract(&tensor_source(), &[tensor_allocation()]).unwrap();
+        assert_eq!(contract.version, 1);
+        assert_eq!(contract.graphs, ["text", "decode"]);
+        assert_eq!(contract.inputs[0].reference, Some(super::super::wire::Reference {
+            allocation: "retained.1".into(), offset: 32,
+        }));
+        assert_eq!(contract.inputs[0].dtype, super::super::wire::TensorDtype::I64 as i32);
+        assert_eq!(contract.inputs[0].shape, [1, 2]);
+        assert_eq!(contract.outputs[0].reference.as_ref().unwrap().offset, 128);
+    }
+
+    #[test]
+    fn tensor_bindings_reject_unowned_ambiguous_or_inconsistent_extents() {
+        for (address, nbytes) in [(4088, 16), (4344, 16), (4129, 16), (u64::MAX - 7, 16), (4128, 0), (4128, 8)] {
+            let mut source = tensor_source();
+            source.inputs[0].address = address;
+            source.inputs[0].nbytes = nbytes;
+            assert!(tensor_contract(&source, &[tensor_allocation()]).is_err());
+        }
+        assert!(tensor_contract(&tensor_source(), &[tensor_allocation(), tensor_allocation()]).is_err());
+    }
+
+    #[test]
+    fn tensor_bindings_use_shared_geometry_and_name_validation() {
+        for change in ["dtype", "shape", "overlap", "name", "version"] {
+            let mut source = tensor_source();
+            match change {
+                "dtype" => source.inputs[0].dtype = "F64".into(),
+                "shape" => source.inputs[0].shape = vec![0, 2],
+                "overlap" => {
+                    let mut second = source.inputs[0].clone();
+                    second.name = "other".into();
+                    source.inputs.push(second);
+                },
+                "name" => source.outputs[0].name = "tokens".into(),
+                "version" => source.version = 2,
+                _ => unreachable!(),
+            }
+            assert!(tensor_contract(&source, &[tensor_allocation()]).is_err(), "{change}");
+        }
+    }
+
+    #[test]
+    fn preparation_tensor_descriptors_reject_physical_reference_overrides() {
+        let mut value = serde_json::to_value(tensor_source()).unwrap();
+        value["inputs"][0]["reference"] = serde_json::json!({"allocation": "other", "offset": 0});
+        assert!(serde_json::from_value::<super::super::TensorContractSource>(value).is_err());
+    }
+
+    #[test]
+    fn tensor_metadata_rejects_missing_graphs_and_mixed_serving_modes() {
+        let value = serde_json::json!({
+            "path": "unused", "context": 0, "graphs": [
+                {"name": "text", "graph": 0, "executable": 1},
+                {"name": "decode", "graph": 0, "executable": 2}],
+            "allocations": [], "execution": null, "server": null,
+            "tensor_contract": tensor_source()
+        });
+        let request: CaptureRequest = serde_json::from_value(value.clone()).unwrap();
+        validate_metadata(&request).unwrap();
+        for (key, override_value) in [
+            ("world_size", serde_json::json!(2)),
+            ("server", serde_json::json!({})),
+            ("execution", serde_json::json!({})),
+            ("graphs", serde_json::json!([])),
+        ] {
+            let mut malformed = value.clone();
+            malformed[key] = override_value;
+            let request: CaptureRequest = serde_json::from_value(malformed).unwrap();
+            assert!(validate_metadata(&request).is_err(), "{key}");
+        }
+    }
+
     #[test]
     fn startup_tuning_export_preserves_bindings_and_omits_process_handles() {
         let value = serde_json::json!({

@@ -1129,6 +1129,7 @@ extern "C" __global__ void cluster_2cta(int* out) {
         let files = TestFiles(blobs);
 
         let build_core = || Core {
+            tensor_contract: None,
             resources: HashMap::new(),
             architecture: [major, minor],
             allocations: vec![
@@ -1656,6 +1657,7 @@ extern "C" __global__ void step_emit_completion(
         };
 
         let core = Core {
+            tensor_contract: None,
             resources: HashMap::new(),
             architecture: [major, minor],
             allocations: vec![
@@ -1997,6 +1999,7 @@ extern "C" __global__ void worker_ignore_stop(
         let device_va = 0x800_0000_0000u64;
         let host_va = 0xc00_0000_0000u64;
         let core = Core {
+            tensor_contract: None,
             resources: HashMap::new(),
             architecture: [major, minor],
             allocations: vec![Allocation {

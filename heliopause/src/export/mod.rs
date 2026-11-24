@@ -152,6 +152,25 @@ pub(crate) enum DeviceIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TensorBindingSource {
+    pub name: String,
+    pub address: u64,
+    pub nbytes: u64,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TensorContractSource {
+    pub version: u32,
+    pub graphs: Vec<String>,
+    pub inputs: Vec<TensorBindingSource>,
+    pub outputs: Vec<TensorBindingSource>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct CaptureRequest {
     pub path: PathBuf,
     #[serde(default)]
@@ -199,6 +218,8 @@ pub(crate) struct CaptureRequest {
     #[serde(default)]
     pub device_identity: DeviceIdentity,
     pub execution: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tensor_contract: Option<TensorContractSource>,
     pub server: Option<serde_json::Value>,
     #[serde(default)]
     pub transports: Vec<serde_json::Value>,

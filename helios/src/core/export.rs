@@ -613,6 +613,7 @@ fn publish_inner(
             data_phase.finish(data_result(payload_bytes, reused_bytes));
             let ranks_count =
                 u32::try_from(deployment.ranks.len()).map_err(|_| invalid("too many ranks"))?;
+            schema::validate_rank_contract(&body, &rank_body)?;
             schema::validate_rank(&rank_body, ranks_count, &mut catalog, &mut resource_ids)?;
             if rank_body.compressed_prepared_weights.is_some()
                 && let Some(weights) = super::prepared_weights::catalog(&rank_body)?
@@ -657,6 +658,7 @@ fn publish_inner(
         }
         data_phase.finish(data_result(payload_bytes, reused_bytes));
         let encoded = wire::DeploymentBody::encode_to_vec(&body);
+        schema::validate_deployment_contract(&core, &body)?;
         schema::validate_deployment(&body, &mut catalog)?;
         core.deployments.push(wire::DeploymentCommitment {
             deployment_id: body.deployment_id.clone(),
@@ -881,6 +883,11 @@ fn preflight(request: &PublishRequest, destination: &Destination<'_>) -> Result<
     }
     for deployment in &request.deployments {
         safe_id(&deployment.body.deployment_id, "deployment id")?;
+        if deployment.ranks.len() != 1
+            && deployment.ranks.iter().any(|rank| rank.body.tensor_contract.is_some())
+        {
+            return Err(invalid("tensor contract requires one independent rank"));
+        }
         for payload in deployment
             .ranks
             .iter()
@@ -916,6 +923,13 @@ fn preflight(request: &PublishRequest, destination: &Destination<'_>) -> Result<
     if matches!(destination, Destination::Directory(root) if root.join("model.safetensors").exists())
     {
         return Err(invalid("primary already exists in the export directory"));
+    }
+    schema::validate_core_serving(&request.core)?;
+    for deployment in &request.deployments {
+        schema::validate_deployment_contract(&request.core, &deployment.body)?;
+        for rank in &deployment.ranks {
+            schema::validate_rank_contract(&deployment.body, &rank.body)?;
+        }
     }
     Ok(())
 }
@@ -2695,6 +2709,20 @@ mod tests {
 
     #[test]
     fn publish_writes_signed_directory_and_seals_executables() {
+        check_signed_publication(false, false);
+    }
+
+    #[test]
+    fn publish_physical_graph_core_authenticates_and_converts() {
+        check_signed_publication(true, false);
+    }
+
+    #[test]
+    fn publish_tensor_contract_authenticates_and_survives_conversion() {
+        check_signed_publication(true, true);
+    }
+
+    fn check_signed_publication(physical: bool, tensor: bool) {
         use crate::core::protection::{self, Selection};
         use crate::runtime_core::Publisher;
         use ring::signature::KeyPair;
@@ -2818,8 +2846,9 @@ mod tests {
             roce: None,
             prepared_weights: None,
             compressed_prepared_weights: None,
+            tensor_contract: None,
         };
-        let request = PublishRequest {
+        let mut request = PublishRequest {
             core,
             payloads: vec![PublishPayload {
                 role: wire::PayloadRole::Frontend,
@@ -2869,8 +2898,63 @@ mod tests {
             accepted: "example".into(),
             no_weights: false,
         };
+        if physical {
+            request.core.frontend = None;
+            request.core.sampling_defaults = None;
+            request.core.assets.clear();
+            request.payloads.clear();
+            request.deployments[0].body.contract = None;
+            request.core.frontend = Some(crate::runtime_core::wire::FrontendSettings::default());
+            let error = publish(&request, &key, Destination::Directory(&root))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("must be present together"));
+            request.core.frontend = None;
+            request.deployments[0].body.contract =
+                Some(crate::runtime_core::wire::ServingContract::default());
+            let error = publish(&request, &key, Destination::Directory(&root))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("serving contract disagrees"));
+            request.deployments[0].body.contract = None;
+            assert!(!root.join("model.safetensors").exists());
+            assert!(!root.join("weights").exists());
+            assert!(!root.join("deployments").exists());
+        }
+        if tensor {
+            use crate::runtime_core::wire as runtime;
+            let binding = |name: &str, offset| runtime::TensorBinding {
+                name: name.into(),
+                reference: Some(runtime::Reference { allocation: "device-0".into(), offset }),
+                dtype: runtime::TensorDtype::F32 as i32,
+                shape: vec![1],
+            };
+            request.deployments[0].ranks[0].body.tensor_contract = Some(runtime::TensorContract {
+                version: 1,
+                graphs: vec!["decode".into()],
+                inputs: vec![binding("input", 0)],
+                outputs: vec![binding("output", 4)],
+            });
+            let contract = request.deployments[0].ranks[0].body.tensor_contract.as_mut().unwrap();
+            contract.outputs[0].reference.as_mut().unwrap().offset = weight_bytes.len() as u64;
+            let error = publish(&request, &key, Destination::Directory(&root)).err().unwrap();
+            assert!(error.to_string().contains("outside allocation"), "{error}");
+            request.deployments[0].ranks[0].body.tensor_contract.as_mut().unwrap()
+                .outputs[0].reference.as_mut().unwrap().offset = 4;
+            let second = PublishRank {
+                body: request.deployments[0].ranks[0].body.clone(),
+                payloads: vec![],
+                resources: vec![],
+            };
+            request.deployments[0].ranks.push(second);
+            let error = publish(&request, &key, Destination::Directory(&root)).err().unwrap();
+            assert!(error.to_string().contains("one independent rank"), "{error}");
+            request.deployments[0].ranks.pop();
+            assert!(!root.join("model.safetensors").exists());
+            assert!(!root.join("deployments").exists());
+        }
         let published = publish(&request, &key, Destination::Directory(&root)).unwrap();
-        assert_eq!(published.payloads.len(), 4);
+        assert_eq!(published.payloads.len(), if physical { 3 } else { 4 });
         let publisher = Publisher {
             name: "Example".into(),
             namespace: "example".into(),
@@ -2881,13 +2965,35 @@ mod tests {
         assert_eq!(metadata.envelope, published.manifest);
         let verified = protection::verify(
             &metadata.envelope,
-            &[publisher],
+            std::slice::from_ref(&publisher),
             Selection::Deployment {
                 deployment: 0,
                 rank: Some(0),
             },
         )
         .unwrap();
+        assert_eq!(verified.deployment().unwrap().contract.is_none(), physical);
+        assert_eq!(verified.ranks()[0].tensor_contract, request.deployments[0].ranks[0].body.tensor_contract);
+        let authorized = crate::runtime_core::VerifiedCore::open(
+            &root, std::slice::from_ref(&publisher), Some(0),
+        ).unwrap().authorize("example", false).unwrap();
+        if tensor {
+            let prepared = authorized.tensor_contract().unwrap();
+            assert_eq!(prepared.graphs(), &["decode"]);
+            assert_eq!(prepared.inputs()[0].allocation, "device-0");
+            assert_eq!(prepared.outputs()[0].offset, 4);
+            assert_eq!(prepared.outputs()[0].nbytes().unwrap(), 4);
+        } else {
+            assert!(authorized.tensor_contract().unwrap_err().to_string().contains("no signed tensor contract"));
+        }
+        if tensor {
+            let mut tampered = protection::envelope(&metadata.envelope).unwrap();
+            let mut rank = wire::RankBody::decode(tampered.ranks[0].body.as_slice()).unwrap();
+            rank.tensor_contract.as_mut().unwrap().inputs[0].reference.as_mut().unwrap().offset = 4;
+            tampered.ranks[0].body = rank.encode_to_vec();
+            assert!(protection::verify(&tampered.encode_to_vec(), std::slice::from_ref(&publisher),
+                Selection::Deployment { deployment: 0, rank: Some(0) }).is_err());
+        }
         let catalog = verified.catalog().clone();
         let files = metadata
             .payloads(&catalog, [id.as_bytes().as_slice()])
@@ -2939,14 +3045,34 @@ mod tests {
             root.join("deployments/sm120-tp1/rank-0/graphs.safetensors")
                 .exists()
         );
-        let primary = container::Container::open(&root.join("model.safetensors")).unwrap();
-        let mut embedded = Vec::new();
-        primary
-            .tensor("frontend.tokenizer")
-            .unwrap()
-            .copy_to(&mut embedded)
+        if physical {
+            let packed = root.join("packed.safetensors");
+            crate::core::conversion::pack(&root, &packed).unwrap();
+            let unpacked = root.join("unpacked");
+            crate::core::conversion::unpack(&packed, &unpacked).unwrap();
+            let converted = crate::core::reader::Metadata::open(&unpacked).unwrap();
+            assert_eq!(converted.envelope, published.manifest);
+            let verified = protection::verify(
+                &converted.envelope,
+                &[publisher],
+                Selection::Deployment {
+                    deployment: 0,
+                    rank: None,
+                },
+            )
             .unwrap();
-        assert_eq!(embedded, tokenizer);
+            assert_eq!(verified.ranks()[0].tensor_contract, request.deployments[0].ranks[0].body.tensor_contract);
+            assert!(verified.authorize("example").is_ok());
+        } else {
+            let primary = container::Container::open(&root.join("model.safetensors")).unwrap();
+            let mut embedded = Vec::new();
+            primary
+                .tensor("frontend.tokenizer")
+                .unwrap()
+                .copy_to(&mut embedded)
+                .unwrap();
+            assert_eq!(embedded, tokenizer);
+        }
     }
 
     #[test]

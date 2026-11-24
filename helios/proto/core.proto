@@ -170,6 +170,7 @@ message RankBody {
   flare.runtime.RoceTransport roce = 15;
   PreparedWeightCatalog prepared_weights = 16;
   CompressedPreparedWeightCatalog compressed_prepared_weights = 17;
+  flare.runtime.TensorContract tensor_contract = 18;
 }
 
 message Allocation {

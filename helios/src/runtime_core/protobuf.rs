@@ -323,6 +323,7 @@ pub(super) fn validate_persistent_workers(core: &Core, execution: &wire::Executi
 }
 
 pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
+    let tensor_contract = super::tensor_contract::validate_bundle(&value)?;
     normalize_execution(&mut value.execution)?;
     let context = required(value.context, "CUDA context")?;
     let core = Core {
@@ -396,6 +397,7 @@ pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
             })
         })?,
         execution: value.execution,
+        tensor_contract,
     };
     Ok(core)
 }
@@ -1228,6 +1230,7 @@ pub(super) fn payload_rank(
             })
         })?,
         execution,
+        tensor_contract: super::tensor_contract::validate_rank(rank)?,
         context: Context {
             flags: context.flags,
             cache: context.cache,
@@ -1344,6 +1347,7 @@ mod payload_tests {
             roce: None,
             prepared_weights: None,
             compressed_prepared_weights: None,
+            tensor_contract: None,
         }
     }
 
@@ -1534,6 +1538,7 @@ mod payload_tests {
                 ..Default::default()
             };
             Core {
+                tensor_contract: None,
                 resources: HashMap::new(),
                 events: vec![],
                 architecture: [10, 3],

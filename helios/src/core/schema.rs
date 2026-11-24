@@ -235,12 +235,7 @@ pub fn validate_core(body: &wire::CoreBody) -> Result<Catalog> {
             .as_ref()
             .ok_or_else(|| invalid("core has no publisher metadata"))?,
     )?;
-    if body.frontend.is_none() {
-        return Err(invalid("core has no frontend settings"));
-    }
-    if body.sampling_defaults.is_none() {
-        return Err(invalid("core has no sampling defaults"));
-    }
+    validate_core_serving(body)?;
     let mut catalog = Catalog::new();
     catalog.insert_all(&body.payloads)?;
     let mut names = BTreeSet::new();
@@ -277,6 +272,68 @@ pub fn validate_core(body: &wire::CoreBody) -> Result<Catalog> {
     Ok(catalog)
 }
 
+/// A physical graph core omits all token-serving metadata and frontend assets.
+pub fn validate_core_serving(body: &wire::CoreBody) -> Result<()> {
+    if body.frontend.is_some() != body.sampling_defaults.is_some() {
+        return Err(invalid(
+            "core frontend and sampling defaults must be present together",
+        ));
+    }
+    if body.frontend.is_none() && !body.assets.is_empty() {
+        return Err(invalid(
+            "physical graph core cannot contain frontend assets",
+        ));
+    }
+    Ok(())
+}
+
+/// Every deployment must agree with the core's token-serving metadata.
+pub fn validate_deployment_contract(
+    core: &wire::CoreBody,
+    deployment: &wire::DeploymentBody,
+) -> Result<()> {
+    validate_core_serving(core)?;
+    if core.frontend.is_some() != deployment.contract.is_some() {
+        return Err(invalid(
+            "deployment serving contract disagrees with core frontend metadata",
+        ));
+    }
+    if deployment.contract.is_none() && deployment.engram.is_some() {
+        return Err(invalid(
+            "physical graph deployment cannot contain Engram serving state",
+        ));
+    }
+    Ok(())
+}
+
+/// Physical ranks contain graphs without a token-serving execution contract.
+pub fn validate_rank_contract(
+    deployment: &wire::DeploymentBody,
+    rank: &wire::RankBody,
+) -> Result<()> {
+    if rank.tensor_contract.is_some()
+        && (deployment.contract.is_some() || deployment.cluster.is_some()
+            || deployment.engram.is_some() || deployment.ranks.len() > 1
+            || deployment.tensor_parallel > 1)
+    {
+        return Err(invalid("tensor contract requires one independent rank without token-serving metadata"));
+    }
+    crate::runtime_core::tensor_contract::validate_rank(rank)?;
+    if deployment.contract.is_none() {
+        if rank.execution.is_some() {
+            return Err(invalid(
+                "physical graph rank cannot contain token-serving execution",
+            ));
+        }
+        if rank.graphs.is_empty() {
+            return Err(invalid(
+                "physical graph rank must contain at least one graph",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate one deployment body and extend the catalog with its payloads.
 pub fn validate_deployment(body: &wire::DeploymentBody, catalog: &mut Catalog) -> Result<u32> {
     bounded_name(&body.deployment_id, 128, "deployment id")?;
@@ -290,8 +347,10 @@ pub fn validate_deployment(body: &wire::DeploymentBody, catalog: &mut Catalog) -
             "deployment architecture must name a compute capability",
         ));
     }
-    if body.contract.is_none() {
-        return Err(invalid("deployment has no serving contract"));
+    if body.contract.is_none() && body.engram.is_some() {
+        return Err(invalid(
+            "physical graph deployment cannot contain Engram serving state",
+        ));
     }
     let ranks = u32::try_from(body.ranks.len()).map_err(|_| invalid("too many ranks"))?;
     if ranks == 0 {
@@ -476,6 +535,10 @@ pub fn validate_rank(
     catalog: &mut Catalog,
     resource_ids: &mut BTreeSet<u64>,
 ) -> Result<()> {
+    if body.tensor_contract.is_some() && ranks != 1 {
+        return Err(invalid("tensor contract requires one independent rank"));
+    }
+    crate::runtime_core::tensor_contract::validate_rank(body)?;
     bounded_name(&body.deployment_id, 128, "deployment id")?;
     catalog.insert_all(&body.payloads)?;
     if body.rank >= ranks {

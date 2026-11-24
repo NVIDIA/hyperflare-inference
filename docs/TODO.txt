@@ -323,3 +323,25 @@
     dense Qwen3.8, and read each one's pre-tokenizer for Metaspace (see the test
     header). Close when each passes and none uses Metaspace, or loading rejects
     one that does.
+
+[ ] Qualify generated-kernel and compiled-forward device rebinding in
+    tests/preparation/test_aot.py on two assigned GPUs with the runtime metadata
+    patches installed. Close when both rebinding tests pass their no-tracing,
+    no-compilation, changed-input replay and allocation checks.
+
+[ ] Obtain project-owner approval for the fixed offline tensor-request and
+    graph-only core operation contracts in diffusion-design.md. Numerical
+    qualification does not replace the required design decision.
+
+[ ] Define and obtain project-owner approval for concurrent tensor-serving
+    admission, state ownership and completion semantics before extending fixed
+    tensor execution to concurrent scheduling or HTTP delivery.
+
+[ ] Requalify SDXL and PixArt after the recipe repository split with the merged
+    core loader, compiler patches and pinned preparation dependencies. Require
+    exact canonical/captured/native outputs for the fixed diffusion profiles.
+
+[ ] Make single_host_run_reaches_core_loading in flare-cli/tests/cli.rs respect
+    assigned GPUs. Its --gpus 0,1 case rejects GPU 1 in a one-GPU allocation
+    before the missing-core assertion. Exercise loading with one and two
+    assigned GPUs without changing device visibility.

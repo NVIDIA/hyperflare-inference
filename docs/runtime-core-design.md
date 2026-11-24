@@ -887,6 +887,31 @@ Flare acquires prepared cores from the Hub and resolves offline cores
 through the shared model cache. Model recipes, preparation planning, and kernel
 preparation belong to Ignition.
 
+### Fixed tensor requests
+
+`runtime_core::tensors::TensorRunner` owns a `NativeResources` bundle, one
+native CUDA stream, and timing events allocated before replay. It uploads
+bounded input allocation ranges and launches an explicit sequence of exported
+graphs on that stream without intergraph host synchronization. It synchronizes
+after the complete sequence and reads persistent output ranges separately.
+No Python runtime, kernel compilation, graph capture, GPU allocation, or
+model-specific arithmetic occurs during a request. Explicit close confirms
+drain before releasing resources; a failed drain retains the stream, events,
+and resource owner until process exit.
+
+The [`flare run` tensor options](cli-design.md#fixed-tensor-execution) expose
+this single-request path for exported graph qualification and offline execution.
+The signed rank-local `TensorContract` fixes graph order and named input/output
+bindings, including dtype, shape and allocation-relative ranges. Preparation
+resolves captured addresses into these bindings before signing. Helios validates
+the contract against the authenticated graph and storage catalog; the resource
+owner retains it for `TensorRunner`. Requests supply only named input files and
+cannot replace execution metadata. Tensor execution requires one independent
+rank with fixed allocations, device-resident tensor bindings and no token-serving
+execution metadata.
+This interface does not add diffusion requests to the HTTP server or its
+continuous scheduler.
+
 ## 6. Tensor-parallel ranks as threads
 
 Tensor-parallel serving uses one Rust process with one CUDA execution thread

@@ -1647,6 +1647,7 @@ mod identity_tests {
     #[test]
     fn persistent_worker_topology_rejects_multi_rank_and_cluster_cores() {
         let worker_core = || Core {
+            tensor_contract: None,
             resources: std::collections::HashMap::new(),
             events: vec![],
             architecture: [10, 3],

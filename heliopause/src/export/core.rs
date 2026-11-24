@@ -162,6 +162,7 @@ pub(crate) fn validate_index(index: &wire::ModelIndex, length: u64) -> Result<()
     if !matches!(index.version, 4 | 5) || index.ranks.is_empty() {
         return Err(invalid("unsupported model index"));
     }
+    helios_core::runtime_core::tensor_contract::validate_model(index)?;
     let mut spans: Vec<&wire::Span> = index
         .ranks
         .iter()
@@ -1934,6 +1935,7 @@ fn rank_plan(
             events: bundle.events.clone(),
             peers,
             execution: bundle.execution.clone(),
+            tensor_contract: bundle.tensor_contract.clone(),
             roce: bundle.roce.clone(),
             prepared_weights: prepared,
             compressed_prepared_weights: None,
@@ -2741,6 +2743,46 @@ mod payload_export_tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn tensor_contract_survives_staged_sources_and_signed_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut rank = staged_rank(directory.path());
+        rank.index.contract = None;
+        rank.index.frontend = None;
+        rank.index.sampling_defaults = None;
+        let binding = |name: &str, offset| wire::TensorBinding {
+            name: name.into(),
+            reference: Some(wire::Reference { allocation: "device-0".into(), offset }),
+            dtype: wire::TensorDtype::F32 as i32,
+            shape: vec![2],
+        };
+        let contract = wire::TensorContract {
+            version: 1, graphs: vec!["decode".into()],
+            inputs: vec![binding("input", 0)], outputs: vec![binding("output", 32)],
+        };
+        rank.index.ranks[0].tensor_contract = Some(contract.clone());
+        let sources = directory.path().join("rank.sources.json");
+        write_sources(&sources, &rank).unwrap();
+        let restored = read_sources(&sources).unwrap();
+        validate_ranks(std::slice::from_ref(&restored), None).unwrap();
+        assert_eq!(restored.index.ranks[0].tensor_contract.as_ref(), Some(&contract));
+
+        let output = directory.path().join("core");
+        let signer = publisher();
+        publish_payload(&output, &[restored], vec![], None, &signer, None, false, "directory").unwrap();
+        let metadata = Metadata::open(&output).unwrap();
+        let profile = helios_core::runtime_core::Publisher {
+            name: "tensor fixture".into(), namespace: signer.namespace.clone(),
+            public_key: signer.public_key().try_into().unwrap(), development: false,
+        };
+        let verified = helios_core::core::protection::verify(
+            &metadata.envelope, &[profile],
+            helios_core::core::protection::Selection::Deployment { deployment: 0, rank: None },
+        ).unwrap();
+        assert_eq!(verified.rank(0).unwrap().tensor_contract.as_ref(), Some(&contract));
+        assert!(verified.deployment().unwrap().contract.is_none());
     }
 
     fn manifest_ids(root: &Path) -> (Vec<u8>, Vec<String>) {

@@ -821,6 +821,47 @@ GPU confidence allocation requires adaptive selection. Missing variants fail bef
 KV pages receive physical backing after graph upload, within fixed virtual
 extents. Reducing execution state can leave more memory for KV pages.
 
+### Fixed tensor execution
+
+`flare run CORE --tensor-request REQUEST.json --tensor-output DIRECTORY`
+executes one fixed tensor request on one GPU and exits. It authenticates and
+loads the exported core through Helios, then launches the signed tensor
+contract's ordered graphs. This path has no HTTP frontend, tokenizer, concurrent request
+scheduler, or model-specific native arithmetic. The core must contain one
+independent rank with fixed allocation sizes. Its graphs and persistent
+outputs must support the declared execution order.
+
+The request contains only named input files, resolved relative to the JSON file:
+
+```json
+{"inputs": [{"name": "noise", "file": "inputs/noise.bin"}]}
+```
+
+Every signed input must appear exactly once; unknown fields and input names are
+rejected. Files contain contiguous raw bytes of the signed dtype and shape.
+The core's versioned tensor contract supplies graph order and input/output
+names, dtypes, shapes and allocation-relative bindings. Supported dtypes are
+`F16`, `BF16`, `F32`, `I32`, `I64` and `U8`. Contract validation rejects invalid
+names, zero dimensions, overflow, misalignment, allocation bounds errors,
+overlapping input ranges, and missing or repeated graph names. Input names and
+file sizes are checked before GPU loading. Input values must still satisfy the
+captured kernels' numerical and index requirements.
+
+Tensor execution requires a signed tensor contract. Diffusion cores exported
+without one must be prepared again. Token-serving cores use their existing
+serving contract and are unaffected.
+
+The runner restores every input before each replay. It saves an initial
+correctness replay, performs `--tensor-warmup N` untimed repetitions (default
+one), and records `--tensor-repetitions N` timed repetitions (default three,
+minimum one). Output download occurs outside replay timing. The destination
+must not exist; it receives `NAME.bin`, `NAME.repeat.bin` from the final replay,
+and `report.json`. The report records raw CUDA event and host replay durations,
+per-graph CUDA durations, input upload and output download durations, the signed
+core envelope hash, and output descriptors. Replay measurements exclude
+loading, input transfer, output transfer, and file IO. Linux runs also verify
+that the process has loaded neither Python nor PyTorch libraries.
+
 ### Runtime memory limits
 
 `--kv-cache-limit memory` uses the remaining memory budget for KV.
