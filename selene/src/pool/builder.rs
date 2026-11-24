@@ -20,11 +20,26 @@ use std::sync::{Arc, Mutex};
 
 /// Registration precedes cache sizing; copying starts with the final cache geometry.
 struct Copier {
+    profile: Option<[u8; 32]>,
+    receive_profiles: Vec<[u8; 32]>,
+    codec_layout: Option<crate::shared::wire::CodecLayout>,
     layout: Layout,
     transfers: Option<Box<dyn crate::PageCopier>>,
 }
 
 impl PageCopier for Copier {
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.profile
+    }
+    fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+        if let Some(transfers) = &self.transfers {
+            return transfers.codec_receive_profiles();
+        }
+        self.receive_profiles.clone()
+    }
+    fn codec_layout(&self) -> Option<crate::shared::wire::CodecLayout> {
+        self.codec_layout.clone()
+    }
     fn layout(&self) -> &Layout {
         &self.layout
     }
@@ -104,7 +119,15 @@ impl PoolBuilder<'_> {
             mut peers,
             disk,
         } = self;
+        let profile = crate::codec_copy::profile(geometry);
+        let include_gpu = geometry
+            .first()
+            .is_some_and(|g| g.placement == crate::offload::KvCompression::Gpu);
+        let receive_profiles = crate::codec_copy::receive_profiles(geometry, include_gpu);
         let copier = Arc::new(Mutex::new(Copier {
+            profile,
+            receive_profiles,
+            codec_layout: profile.map(|_| (&geometry[0]).into()),
             layout: Layout::new(geometry)?,
             transfers: None,
         }));
@@ -272,6 +295,7 @@ impl PreparedPool {
             self.identity,
             &self.layout,
         );
+        store.decode = self.copier.lock().unwrap().transfers.as_ref().and_then(|copier| copier.decode_counters());
         store.drain_on_shutdown = drain_on_shutdown;
         Ok(Box::new(store))
     }

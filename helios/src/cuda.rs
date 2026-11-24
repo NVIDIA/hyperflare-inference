@@ -686,6 +686,10 @@ impl Stream {
         })
     }
 
+    pub(crate) fn raw(&self) -> usize {
+        self.handle
+    }
+
     /// Issue one batched copy of `destinations[i] <- sources[i]` for `sizes[i]`
     /// bytes each, in stream order on both sides. Every address is a device
     /// address, including the device alias of registered host memory. CPU

@@ -157,6 +157,7 @@ fn put_and_wait(
             child_paths,
             descendant_row: child_paths == 1,
             next_child: None,
+            packed: None,
             source: PutSource::Host(Box::new(RecordBytes {
                 data,
                 sums,
@@ -1664,6 +1665,7 @@ fn host_put(manager: &Manager, world: usize, reach: &[Reach]) {
             descendant_row: false,
             next_child: None,
             row: true,
+            packed: None,
             source: PutSource::Host(Box::new(ZeroBytes(RankFiles {
                 world,
                 rank: 0,

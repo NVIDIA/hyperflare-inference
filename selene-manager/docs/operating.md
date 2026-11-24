@@ -342,6 +342,10 @@ does not answer within 1 s the previous store text is served.
 | `selene_put_shapes_total{shape="row"\|"page_only"\|"empty"}` | Accepted puts that carry a row, accepted puts that carry pages only, including later failures or cancellation, and puts with no new pages and no row, which are answered `PRESENT` and also count under `present`. | A rising `page_only` share shows writers sending pages without rows. |
 | `selene_put_bytes_total{part="pages"\|"rows"}` | Padded page and row payload bytes accepted per put, excluding headers and checksum tables. Counts the accepted shape once, including puts that later fail or are cancelled. | Page bytes per accepted put rising without a similar increase in conversation length. |
 | `selene_gets_total{outcome}` | `ok`, `error` for the store's reads. | Any `error`. |
+| `selene_codec_encoded_original_bytes_total`, `selene_codec_encoded_stored_bytes_total` | Raw and stored file bytes for successful packed writes. | |
+| `selene_codec_encode_seconds` | Histogram of time spent on each encode attempt. | |
+| `selene_codec_writeback_raw_total{cause}`, `selene_codec_writeback_raw_bytes_total{cause}` | Records and bytes written raw, by reason. | Any `raw_checksum` or `verify_failed`. |
+| `selene_codec_layout_rejected_total` | Layout offers rejected by the manager. | Any increase. |
 | `selene_nvme_errors_total` | NVMe read and write failures. | Any increase. |
 | `selene_nvme_bytes_total`, `selene_nvme_read_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written, bytes read for restores, and disk time for both directions. | Disk time growing faster than the sum of written and read bytes. |
 | `selene_memory_allocated_bytes`, `selene_staging_allocated_bytes` | Arena and staging in use. | Near `--memory` / `--staging`. |
@@ -409,3 +413,21 @@ requesting an export, and the instance falls back to an equivalent local
 copy or recomputes after draining. An occasional warning during restarts is
 expected; repeated warnings on a quiet pool warrant checking source sessions
 and record retention.
+
+### Upgrading a checkpoint root for codec envelopes
+
+Upgrade managers that share a record root before enabling write-back compression. A manager reads raw v1–v3 and packed v4 files. A pre-v4 manager deletes packed files during recovery and can prune dependent entries. A Flare instance with `--lossless-kv-compression cpu` offers its layout and profile to the manager and uses shared memory or TCP for that pool session.
+
+For a cold restore, staging must fit the largest indivisible stored row. The file's physical length includes the header, directory and stored payload.
+
+### Compressing raw checkpoints on NVMe
+
+Set `--compress-at-rest cpu` to let a manager with a record root compress raw arena records at write-back. The default is `off`. The encoder uses one quarter of available CPUs, rounded down and limited to 1–16 threads. Startup logs the pool size.
+
+The manager checks the original page and row checksums before encoding. It decodes and compares each packet before retaining it, and writes a packed file only when the complete file is smaller. Records streamed directly to disk stay raw. Compression shares temporary storage equal to one eighth of the arena capacity. A raw-only reader can claim a resident raw copy. After its release, a packed file requires a compatible reader.
+
+Each encode job gets 250 ms plus the time to process its raw record at 500 MB/s (decimal). The worker checks this deadline before each unit. If it expires, the manager writes the original record raw. A put can wait for several ancestor writes or arena reclaims. In the final 500 ms of shutdown, new writes go raw and running encodes stop at their next unit.
+
+`selene_codec_encoded_original_bytes_total` and `selene_codec_encoded_stored_bytes_total` compare complete file lengths for successful encoded writes. The `selene_codec_encode_seconds` histogram measures elapsed time per encode attempt. With write-back compression enabled, an invalid offered layout increments `selene_codec_layout_rejected_total`. Incompatible pool lookups and claims increment `selene_pool_codec_incompatible_total`.
+
+`selene_codec_writeback_raw_total` and `selene_codec_writeback_raw_bytes_total` count raw fallback by cause. The resource and eligibility causes are `deadline`, `shutdown`, `temp_budget`, `v4_limits`, `no_plan` and `streamed`. A record with no smaller packet counts as `literal_only`. Directory overhead that eliminates the savings counts as `not_smaller`. A recoverable encoded-file write error that falls back to a raw write counts as `write_retry`. A logged `raw_checksum` indicates damaged input. A logged `verify_failed` indicates a codec failure. Both paths preserve the original raw checksums.

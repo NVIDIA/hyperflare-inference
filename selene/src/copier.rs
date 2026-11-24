@@ -32,6 +32,7 @@ pub enum Direction {
 pub struct Job {
     pub id: JobId,
     pub window: u32,
+    pub codec: Option<Arc<crate::codec_copy::Window>>,
     pub direction: Direction,
     /// Inbound pages and row contain one verified share, reused by every local rank.
     pub replication: crate::record::Replication,
@@ -59,6 +60,27 @@ pub trait PageCopier: Send {
     /// The cross-rank record layout the copier moves.
     fn layout(&self) -> &Layout;
 
+    fn decode_counters(&self) -> Option<crate::codec_copy::DecodeCounters> {
+        None
+    }
+
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        None
+    }
+    /// Every codec profile this copier can decode on restore (write profile plus any
+    /// read-through compatibility profile for mixed CPU/GPU caches).
+    fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+        self.codec_profile().into_iter().collect()
+    }
+    fn codec_layout(&self) -> Option<crate::shared::wire::CodecLayout> {
+        None
+    }
+    /// When `Some`, `MemoryStore` captures raw bytes directly into its pinned
+    /// DRAM slabs, releases the GPU capture pin as soon as DtoH completes, and
+    /// encodes the slabs asynchronously on a bounded host worker pool.
+    fn async_host_codec(&self) -> Option<crate::codec_copy::HostEncoder> {
+        None
+    }
     /// Queue the job on every rank without waiting.
     ///
     /// `Err` means the job was rejected and no reply follows. After `Ok`,

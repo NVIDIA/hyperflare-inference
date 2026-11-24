@@ -3143,80 +3143,82 @@ pub(crate) fn capture_rank(
         module_bytes += exported.len() as u64;
         module_phase.advance_bytes(exported.len() as u64);
         fs::write(stage.path.join(&file), exported)?;
-        let kernel = kernels
-            .iter()
-            .find(|k| k.module == name)
-            .ok_or_else(|| invalid("registered module has no function"))?;
-        let mut module = std::ptr::null_mut();
-        cu!(
-            &cuda,
-            "cuFuncGetModule",
-            (*mut Handle, Handle),
-            &mut module,
-            kernel.function as Handle
-        )?;
         let mut globals = Vec::new();
-        for symbol in cubin::global_symbols(&image)? {
-            let symbol_c = std::ffi::CString::new(symbol.clone())?;
-            let (mut address, mut size) = (0u64, 0usize);
+        if let Some(kernel) = kernels.iter().find(|k| k.module == name) {
+            let mut module = std::ptr::null_mut();
             cu!(
                 &cuda,
-                "cuModuleGetGlobal_v2",
-                (*mut u64, *mut usize, Handle, *const c_char),
-                &mut address,
-                &mut size,
-                module,
-                symbol_c.as_ptr()
+                "cuFuncGetModule",
+                (*mut Handle, Handle),
+                &mut module,
+                kernel.function as Handle
             )?;
-            output
-                .module_globals
-                .push((address, size as u64, format!("{name}.{symbol}")));
-            let data_file = format!("module-{index}-global-{}.bin", globals.len());
-            let path = stage.path.join(&data_file);
-            let mut writer = BufWriter::new(File::create(&path)?);
-            let global = Allocation {
-                name: format!("module-global:{name}.{symbol}"),
-                address,
-                nbytes: size as u64,
-                alignment: 1,
-                initialize: "snapshot".into(),
-                relocations: vec![],
-                preserve_address: true,
-                memory: "device".into(),
-                snapshot_spans: None,
-                sizing: None,
-            };
-            downloader.for_each(&global, &[(0, size as u64)], |offset, bytes| {
-                let mut redacted = Vec::new();
-                let data = if symbol.starts_with("assertFile_") {
-                    if offset + bytes.len() as u64 == size as u64 && bytes.last() != Some(&0) {
-                        return Err(invalid(
-                            "CUDA assertion filename must be a terminated string",
-                        ));
-                    }
-                    redacted.resize(bytes.len(), 0);
-                    if offset == 0 {
-                        let length = 6.min(size.saturating_sub(1));
-                        redacted[..length].copy_from_slice(&b"kernel"[..length]);
-                    }
-                    redacted.as_slice()
-                } else {
-                    bytes
+            for symbol in cubin::global_symbols(&image)? {
+                let symbol_c = std::ffi::CString::new(symbol.clone())?;
+                let (mut address, mut size) = (0u64, 0usize);
+                cu!(
+                    &cuda,
+                    "cuModuleGetGlobal_v2",
+                    (*mut u64, *mut usize, Handle, *const c_char),
+                    &mut address,
+                    &mut size,
+                    module,
+                    symbol_c.as_ptr()
+                )?;
+                output
+                    .module_globals
+                    .push((address, size as u64, format!("{name}.{symbol}")));
+                let data_file = format!("module-{index}-global-{}.bin", globals.len());
+                let path = stage.path.join(&data_file);
+                let mut writer = BufWriter::new(File::create(&path)?);
+                let global = Allocation {
+                    name: format!("module-global:{name}.{symbol}"),
+                    address,
+                    nbytes: size as u64,
+                    alignment: 1,
+                    initialize: "snapshot".into(),
+                    relocations: vec![],
+                    preserve_address: true,
+                    memory: "device".into(),
+                    snapshot_spans: None,
+                    sizing: None,
                 };
-                reach.opaque_contents(&global.name, offset, data)?;
-                writer.write_all(data)?;
-                module_bytes += data.len() as u64;
-                module_phase.advance_bytes(data.len() as u64);
-                Ok(())
-            })?;
-            writer.flush()?;
-            other_resources.push((data_file.clone(), file_source(path)?));
-            globals.push(wire::Global {
-                symbol,
-                file: data_file,
-                nbytes: size as u64,
-                relocations: vec![],
-            });
+                downloader.for_each(&global, &[(0, size as u64)], |offset, bytes| {
+                    let mut redacted = Vec::new();
+                    let data = if symbol.starts_with("assertFile_") {
+                        if offset + bytes.len() as u64 == size as u64 && bytes.last() != Some(&0) {
+                            return Err(invalid(
+                                "CUDA assertion filename must be a terminated string",
+                            ));
+                        }
+                        redacted.resize(bytes.len(), 0);
+                        if offset == 0 {
+                            let length = 6.min(size.saturating_sub(1));
+                            redacted[..length].copy_from_slice(&b"kernel"[..length]);
+                        }
+                        redacted.as_slice()
+                    } else {
+                        bytes
+                    };
+                    reach.opaque_contents(&global.name, offset, data)?;
+                    writer.write_all(data)?;
+                    module_bytes += data.len() as u64;
+                    module_phase.advance_bytes(data.len() as u64);
+                    Ok(())
+                })?;
+                writer.flush()?;
+                other_resources.push((data_file.clone(), file_source(path)?));
+                globals.push(wire::Global {
+                    symbol,
+                    file: data_file,
+                    nbytes: size as u64,
+                    relocations: vec![],
+                });
+            }
+        } else if !cubin::global_symbols(&image)?.is_empty() {
+            return Err(invalid(format!(
+                "standalone module {name} declares globals without a captured kernel"
+            )));
         }
         output.index.ranks[0].modules.push(wire::Module {
             name,

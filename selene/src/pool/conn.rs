@@ -472,7 +472,14 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     };
     let st = engine.st.clone();
     let (tx, rx) = mpsc::channel::<wire::ClientMessage>(OUTBOUND);
+    let caps = engine.codec_caps(dial.as_ref().is_some_and(|d| d.may_use_rdma()));
     let open = wire::OpenSession {
+        codec_layout: if caps.receive_profiles.is_empty() {
+            None
+        } else {
+            engine.codec_layout()
+        },
+        codec: (!caps.receive_profiles.is_empty()).then_some(caps),
         manager_incarnation: hello.manager_incarnation,
         instance_id: st.instance_id.to_vec(),
         scope: Some(super::codec::scope_to(&st.scope)),

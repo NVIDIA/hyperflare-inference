@@ -28,8 +28,8 @@ use flare_selene::{CacheGeometry, HostStore};
 use crate::Result;
 
 pub use flare_selene::offload::{
-    Binding, PrefixCacheOffload, Preparation, Prepared, Resolved, Shared, input_memory_bytes,
-    parse_drain_on_shutdown, parse_max_age, parse_size,
+    Binding, KvCompression, PrefixCacheOffload, Preparation, Prepared, Resolved, Shared,
+    input_memory_bytes, parse_drain_on_shutdown, parse_max_age, parse_size,
 };
 
 pub fn prepare(
@@ -65,8 +65,12 @@ pub fn prepare_with_inputs(
     )?)
 }
 
-pub fn open(prepared: Prepared) -> Result<Box<dyn HostStore>> {
-    Ok(flare_selene::offload::open(prepared, &transfer::Copiers)?)
+pub fn open(mut prepared: Prepared) -> Result<Box<dyn HostStore>> {
+    let cubins = std::mem::take(&mut prepared.gpu_cubins);
+    Ok(flare_selene::offload::open(
+        prepared,
+        &transfer::Copiers::new(cubins),
+    )?)
 }
 
 /// One bounded ordinary-memory window for serialized prepared inputs and disk-read leases.

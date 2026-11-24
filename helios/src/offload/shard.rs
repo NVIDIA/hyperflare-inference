@@ -43,7 +43,7 @@ pub fn join_peer(
     Ok(flare_selene::offload::sharded::join_peer(
         store,
         rank,
-        &super::transfer::Copiers,
+        &super::transfer::Copiers::empty(),
         |record| Ok(rendezvous::exchange_record(stream, record, world)?),
     )?)
 }

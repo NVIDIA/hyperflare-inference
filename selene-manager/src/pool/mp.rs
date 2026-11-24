@@ -218,6 +218,20 @@ impl Core {
         let Some(claim) = self.claims.get_mut(&key) else {
             return;
         };
+        if claim.windows[index].packed.is_some() {
+            let ranks = claim.mp.req.layout.world();
+            return self.deliver(
+                key,
+                index,
+                vec![
+                    SliceSums {
+                        pages: vec![],
+                        row: None
+                    };
+                    ranks
+                ],
+            );
+        }
         if claim.mp.req.layout.world() == 1 && claim.mp.src.layout.world() == 1 {
             return self.deliver(key, index, stated);
         }
@@ -283,13 +297,14 @@ impl Core {
                 if r.phase != super::store_bridge::PutPhase::Open {
                     return None;
                 }
+                let packed = r.packed;
                 let w = r.mp.windows.get_mut(&index)?;
                 Some((
                     &mut w.stated,
                     &mut w.writers,
                     &mut w.arrived,
-                    w.pages,
-                    w.row,
+                    if packed { 0 } else { w.pages },
+                    if packed { false } else { w.row },
                 ))
             }),
             _ => None,
@@ -418,6 +433,7 @@ impl Core {
                 hub.push_window(
                     leg.ch.transfer,
                     channel::WindowOut {
+                        packed: spec.packed.clone(),
                         shape: super::claims::shape_for(&spec, &layout, rank),
                         page_xxh3: sums[rank].pages.clone(),
                         row_xxh3: sums[rank].row.unwrap_or(0),

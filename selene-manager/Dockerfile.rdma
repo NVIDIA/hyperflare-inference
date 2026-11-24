@@ -18,6 +18,7 @@ COPY selene/Cargo.toml selene/build.rs ./selene/
 COPY selene/src ./selene/src
 COPY selene/examples ./selene/examples
 COPY selene/proto ./selene/proto
+COPY selene/native ./selene/native
 COPY selene-manager/Cargo.toml selene-manager/Cargo.lock ./selene-manager/
 COPY selene-manager/src ./selene-manager/src
 COPY selene-manager/tests ./selene-manager/tests

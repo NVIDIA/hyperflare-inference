@@ -149,6 +149,7 @@ pub struct PooledStore<S: crate::store::TierStore, P: PoolPort = PoolClient> {
     pool_fetched: [u64; 3],
     /// Restores that failed in the pool part.
     pool_fetch_failed: u64,
+    pub(super) decode: Option<crate::codec_copy::DecodeCounters>,
     /// Bytes the pool parts copied into the device.
     pool_bytes_in: u64,
 }
@@ -204,6 +205,7 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
             collect_cascade_puts: false,
             pool_fetched: [0; 3],
             pool_fetch_failed: 0,
+            decode: None,
             pool_bytes_in: 0,
         }
     }
@@ -557,6 +559,11 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
                     request.begin_tokens,
                     request.want_row,
                 ) {
+                    Ok(pin) if pin.packed_offer().is_some() => {
+                        drop(pin);
+                        self.pool
+                            .export_refused(request.export, ExportRefusal::NotFound);
+                    }
                     Ok(pin) => self.pool.host_pinned(request.export, pin),
                     Err(reason) => self.pool.export_refused(request.export, reason),
                 },
@@ -597,6 +604,15 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
 
     fn stats(&self) -> StoreStats {
         let mut stats = self.inner.stats();
+        if let Some(counters) = &self.decode {
+            let pool = *counters.lock().unwrap();
+            stats.decode.original_bytes += pool.original_bytes;
+            stats.decode.stored_bytes += pool.stored_bytes;
+            stats.decode.transform_ns += pool.transform_ns;
+            stats.decode.failed_windows += pool.failed_windows;
+            stats.decode.stored_failures += pool.stored_failures;
+            stats.decode.original_failures += pool.original_failures;
+        }
         stats.fetched += self.pool_fetched.iter().sum::<u64>();
         for (count, pool) in stats.restores_by_tier.iter_mut().zip(self.pool_fetched) {
             *count += pool;

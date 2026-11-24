@@ -9,10 +9,14 @@
 /// Detail on an INVALID refusal when a page-only put cannot link to a held ancestor.
 pub const PUT_UNLINKED: &str = "page-only put has no held ancestor it can link to";
 
+pub mod codec;
+pub mod codec_layout;
 pub mod frame;
+pub mod gpu_codec;
 pub mod identity;
 pub mod index;
 pub mod limits;
+pub mod packed;
 pub mod rdma;
 pub mod record;
 pub mod region;

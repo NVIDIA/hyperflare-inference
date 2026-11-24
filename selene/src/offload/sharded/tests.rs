@@ -48,6 +48,9 @@ impl CopierFactory for Copiers {
         geometry: Vec<CacheGeometry>,
         pool: &crate::slab::SlabPool,
     ) -> Result<crate::SharedCopier> {
+        assert!(geometry.iter().all(|rank| {
+            rank.placement == offload::KvCompression::Off && rank.codec_fields.is_empty()
+        }));
         assert_eq!(
             pool.intake_slots(),
             offload::intake_slots(&crate::Layout::new(&geometry)?, 8)
@@ -127,6 +130,17 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
     };
     let (zero, zero_directory) = prepare(0);
     let (peer, peer_directory) = prepare(1);
+    {
+        let mut guard = peer.lock();
+        let prepared = guard.as_mut().unwrap();
+        prepared.geometry[0].placement = offload::KvCompression::Cpu;
+        prepared.geometry[0].codec_fields.push(crate::geometry::CodecField {
+            buffer: "kv".into(),
+            offset: 0,
+            length: 4096,
+            encoding: 0,
+        });
+    }
     let (offer_tx, offer_rx) = mpsc::channel();
     let (reply_tx, reply_rx) = mpsc::channel();
     let peer_factory = factory.clone();
@@ -191,13 +205,15 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
         completed(store.as_mut()),
         StoreEvent::Fetched { result: Ok(_), .. }
     ));
-    for (rank, memory) in factory.0.lock().unwrap().iter() {
+    let memories = factory.0.lock().unwrap();
+    for rank in [0, 1] {
+        let memory = &memories[&rank];
         let pages = memory.pages.lock().unwrap();
-        assert_eq!(pages[&3], vec![*rank as u8 + 1; 4096]);
-        assert_eq!(pages[&4], vec![*rank as u8 + 2; 4096]);
+        assert_eq!(pages[&3], vec![rank as u8 + 1; 4096]);
+        assert_eq!(pages[&4], vec![rank as u8 + 2; 4096]);
         assert_eq!(
             memory.rows.lock().unwrap()[&2],
-            vec![*rank as u8 + 10; 3 * 4096]
+            vec![rank as u8 + 10; 3 * 4096]
         );
     }
     store.close().unwrap();

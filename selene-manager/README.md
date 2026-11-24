@@ -61,6 +61,7 @@ Size options accept bytes with binary K/M/G/T suffixes.
 | `--socket` | `/run/selene/<name>.sock` |
 | `--root` | none; records stay in DRAM until evicted |
 | `--memory` | 1 GiB |
+| `--compress-at-rest` | `off`. Use `cpu` to compress arena records at write-back with one quarter of available CPUs, rounded down and limited to 1–16 threads. |
 | `--nvme` | 0 without `--root`; required with `--root` |
 | `--staging` | 4 GiB (minimum 8 MiB) |
 | `--listen` | none; serve instances on other hosts at ADDR:PORT |

@@ -209,6 +209,17 @@
     single-process instance of the same TP width: restore a record written by
     one into the other.
 
+[ ] Qualify DeepSeek serving with compression at rest. Restore a manager-written
+    packed checkpoint and match the output of a raw restore on the same core.
+
+[ ] Qualify two Flare instances sharing a compressed pool namespace. Write
+    back a checkpoint from one instance and restore it through the other
+    after release of the raw arena copy. Compare with a raw restore.
+
+[ ] Qualify serving with compression on SM121 and on multi-host ranks.
+    For each configuration, restore a packed checkpoint from the manager
+    and compare the serving output with a raw restore.
+
 [ ] Resolve pool-only host retention for ranks on separate hosts.
     prefix-cache-offload.md section 1 allows it, while ModelRuntime::start in
     helios/src/server/runtime.rs requires shard links that

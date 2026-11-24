@@ -36,6 +36,7 @@ fn peer_registration_budget_fails_startup() {
             enabled: true,
             identity: [3; 32],
             layout: [4; 16],
+            codec_profile: None,
             rank,
             world: 2,
             gpu_uuid: [rank as u8 + 1; 16],

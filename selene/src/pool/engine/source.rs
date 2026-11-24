@@ -255,6 +255,7 @@ impl Engine {
         let records: Vec<wire::Record> = expected
             .iter()
             .map(|r| wire::Record {
+                packed: None,
                 key: Some(codec::key_to(r.key)),
                 first_page: r.first_page,
                 pages: r.pages,
@@ -390,6 +391,7 @@ impl Engine {
             return;
         };
         let spec = wire::WindowSpec {
+            packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -449,8 +451,8 @@ impl Engine {
                     address + count * page_bytes as usize,
                 );
                 run.out.jobs_outstanding += jobs.len() as u32;
-                run.windows.insert(spec.index, spec);
-                let sent = run.out.fan_out(self.ranks.as_mut(), spec);
+                run.windows.insert(spec.index, spec.clone());
+                let sent = run.out.fan_out(self.ranks.as_mut(), spec.clone());
                 run.failed |= sent.is_err();
                 for job in jobs {
                     self.queue_job(
@@ -464,7 +466,7 @@ impl Engine {
             }
             Pin::Host(pin) => {
                 let pin = pin.clone();
-                run.windows.insert(spec.index, spec);
+                run.windows.insert(spec.index, spec.clone());
                 let span = HostWindow {
                     record: spec.record,
                     first_page: spec.first_page,
@@ -473,13 +475,13 @@ impl Engine {
                 };
                 let job = run.out.fill_host(
                     FillOwner::Export(id),
-                    spec,
+                    spec.clone(),
                     address,
                     slot,
                     self.ranks.as_ref(),
                     Box::new(move |dst| pin.lock().unwrap().read(&span, dst)),
                 );
-                run.failed |= run.out.fan_out(self.ranks.as_mut(), spec).is_err();
+                run.failed |= run.out.fan_out(self.ranks.as_mut(), spec.clone()).is_err();
                 if !self.submit_fill(job) {
                     let run = self.source.exports.get_mut(&id).expect("present");
                     run.out.jobs_outstanding -= 1;
@@ -556,7 +558,7 @@ impl Engine {
         };
         if run.failed {
             self.fill_failed(export, index);
-        } else if let Some(spec) = run.windows.get(&index).copied() {
+        } else if let Some(spec) = run.windows.get(&index).cloned() {
             if !self.window_still_running(export, index) {
                 let sums = self
                     .source
@@ -593,11 +595,12 @@ impl Engine {
             .is_some_and(|run| run.reference.is_some());
         let sums = persisted
             .map(Ok)
-            .unwrap_or_else(|| self.window_sums(spec, on_channel));
+            .unwrap_or_else(|| self.window_sums(spec.clone(), on_channel));
         let result = sums.and_then(|sums| {
             let run = self.source.exports.get_mut(&export).expect("present");
             run.windows.remove(&spec.index);
-            run.out.filled(spec, sums, on_channel, self.ranks.is_some())
+            run.out
+                .filled(spec.clone(), sums, on_channel, self.ranks.is_some())
         });
         match result {
             Ok(Some((sums, rank_sums))) => self.emit(Out::WindowFilled(wire::WindowFilled {

@@ -319,7 +319,7 @@ impl NativeResources {
             owner.reserve(&core)?;
             owner.allocate(&core, &phase)?;
             owner.load_payload(files, &core, &phase, 1)?;
-            owner.prepare_kernels(files, &core, &phase)?;
+            owner.prepare_kernels(files, &core, &phase, None)?;
             owner.prepare_graphs(files, &core, &phase)?;
         }
         phase.finish("");
@@ -726,6 +726,7 @@ impl NativeResources {
         files: &F,
         core: &Core,
         phase: &Phase,
+        skip_module: Option<&str>,
     ) -> Result<()> {
         let driver = self.driver.clone();
         unsafe {
@@ -753,6 +754,10 @@ impl NativeResources {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
             let mut modules = HashMap::new();
             for module in &core.modules {
+                if skip_module == Some(module.name.as_str()) {
+                    phase.advance(1);
+                    continue;
+                }
                 let image = files.read(core, &module.file)?;
                 if !image.starts_with(b"\x7fELF") {
                     return Err(invalid("module image is not a compiled cubin"));
