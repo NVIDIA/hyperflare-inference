@@ -1069,8 +1069,9 @@ validate every header field and frame length before decoding.
 
 Matrix fields (`encoding = 1`) are grouped up to four 128 × 128 binary32
 matrices per frame. Each matrix runs a bit-exact 64-pivot low-rank predictor,
-splits residual widths (`0..=32`) from four little-endian u32 low-bit lanes,
-and compresses the concatenated group widths as a standard Zstandard frame.
+splits residual widths (`0..=32`) into four little-endian `u16` lane word
+counts, each followed by that many `u32` low-bit words, and compresses the
+concatenated group widths as a standard Zstandard frame.
 Non-matrix fields are chunked up to 64 KiB per frame, apply byte-lane shuffle
 or compound page value/scale split-shuffle, and compress each frame as a
 standard Zstandard frame. Any frame whose encoded payload is not smaller than

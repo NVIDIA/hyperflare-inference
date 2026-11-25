@@ -144,24 +144,68 @@ pub(crate) fn read_from_slabs(
     }
 }
 
+/// Write packed units sequentially from offset 0 into `slab_addrs`, returning
+/// `(directory, slabs_kept)`. Callers pass `parallel = false` while holding the
+/// pool handle on the store thread and `parallel = true` on the background host-codec
+/// worker thread.
+///
+/// # Safety
+/// The caller must hold exclusive ownership of `slab_addrs` (an unpublished, pinned
+/// record) and have finished any reads from those slabs.
+unsafe fn write_packed_into_slabs(
+    slab_addrs: &[usize],
+    slab_bytes: usize,
+    items: &[(&crate::shared::wire::PackedUnit, &[u8])],
+    parallel: bool,
+) -> (Vec<(crate::shared::wire::PackedUnit, usize)>, usize) {
+    let mut dir = Vec::with_capacity(items.len());
+    let mut writes = Vec::with_capacity(items.len());
+    let mut offset = 0usize;
+    for &(unit, bytes) in items {
+        dir.push((unit.clone(), offset));
+        writes.push((offset, bytes));
+        offset += bytes.len();
+    }
+    #[cfg(feature = "codec")]
+    if parallel {
+        use rayon::prelude::*;
+        writes.par_iter().for_each(|&(start, bytes)| {
+            // SAFETY: exclusive ownership guaranteed by caller; each unit writes
+            // a strictly disjoint byte range inside `slab_addrs[..keep]`.
+            unsafe {
+                crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
+            }
+        });
+    } else {
+        for &(start, bytes) in &writes {
+            // SAFETY: exclusive ownership guaranteed by caller.
+            unsafe {
+                crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
+            }
+        }
+    }
+    #[cfg(not(feature = "codec"))]
+    {
+        let _ = parallel;
+        for &(start, bytes) in &writes {
+            // SAFETY: exclusive ownership guaranteed by caller.
+            unsafe {
+                crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
+            }
+        }
+    }
+    let keep = offset.div_ceil(slab_bytes);
+    (dir, keep)
+}
+
 fn pack_slices_into_slabs(
     pool: &SlabPool,
     slots: &mut Vec<Slot>,
     items: &[(&crate::shared::wire::PackedUnit, &[u8])],
 ) -> Vec<(crate::shared::wire::PackedUnit, usize)> {
-    let slab_bytes = pool.page_bytes();
     let addrs: Vec<usize> = slots.iter().map(|&s| pool.slot_address(s)).collect();
-    let mut dir = Vec::with_capacity(items.len());
-    let mut offset = 0usize;
-    for &(unit, bytes) in items {
-        dir.push((unit.clone(), offset));
-        // SAFETY: this unpublished record exclusively owns these slots.
-        unsafe {
-            crate::codec_copy::write_to_slabs(&addrs, slab_bytes, offset, bytes);
-        }
-        offset += bytes.len();
-    }
-    let keep = offset.div_ceil(slab_bytes);
+    // SAFETY: this unpublished record exclusively owns these slots.
+    let (dir, keep) = unsafe { write_packed_into_slabs(&addrs, pool.page_bytes(), items, false) };
     if keep < slots.len() {
         pool.release(slots.drain(keep..));
     }
@@ -1866,39 +1910,6 @@ fn zero_raw_page_gaps(layout: &Layout, page_addrs: &[usize]) {
     }
 }
 
-/// Write packed packets directly into `slab_addrs` in place from offset 0 on a
-/// background worker thread, returning the packed directory and number of slabs kept.
-///
-/// # Safety
-/// The caller must hold exclusive ownership of `slab_addrs` (unpublished, pinned record)
-/// and have already finished reading all raw bytes from `slab_addrs`.
-#[cfg(feature = "codec")]
-unsafe fn write_packed_into_slab_addrs(
-    slab_addrs: &[usize],
-    slab_bytes: usize,
-    items: &[(crate::shared::wire::PackedUnit, &[u8])],
-) -> (Vec<(crate::shared::wire::PackedUnit, usize)>, usize) {
-    use rayon::prelude::*;
-
-    let mut dir = Vec::with_capacity(items.len());
-    let mut writes = Vec::with_capacity(items.len());
-    let mut offset = 0usize;
-    for &(ref unit, bytes) in items {
-        dir.push((unit.clone(), offset));
-        writes.push((offset, bytes));
-        offset += bytes.len();
-    }
-    writes.par_iter().for_each(|&(start, bytes)| {
-        // SAFETY: exclusive ownership guaranteed by caller; each unit writes
-        // a strictly disjoint byte range inside `slab_addrs[..keep]`.
-        unsafe {
-            crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
-        }
-    });
-    let keep = offset.div_ceil(slab_bytes);
-    (dir, keep)
-}
-
 #[cfg(feature = "codec")]
 #[derive(Default)]
 struct CompressScratch {
@@ -1907,7 +1918,7 @@ struct CompressScratch {
     row_out: Vec<Vec<u8>>,
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "codec"), allow(dead_code))]
 struct CompressTask {
     checkpoint: CheckpointId,
     key: PrefixKey,
@@ -2087,12 +2098,12 @@ fn encode_host_task(
                 order.push((idx, unit, used));
             }
             order.sort_by_key(|(_, u, _)| (u.kind, u.logical_index, u.stored_rank));
-            let slices: Vec<(PackedUnit, &[u8])> = order
-                .into_iter()
-                .map(|(idx, unit, used)| (unit, &scratch.page_out[idx][..used]))
+            let slices: Vec<(&PackedUnit, &[u8])> = order
+                .iter()
+                .map(|(idx, unit, used)| (unit, &scratch.page_out[*idx][..*used]))
                 .collect();
             // SAFETY: all raw page reads have finished; we now compact into `task.page_addrs`.
-            unsafe { write_packed_into_slab_addrs(&task.page_addrs, slab_bytes, &slices) }
+            unsafe { write_packed_into_slabs(&task.page_addrs, slab_bytes, &slices, true) }
         } else {
             (Vec::new(), 0)
         };
@@ -2159,12 +2170,12 @@ fn encode_host_task(
                 order.push((r, unit, used));
             }
             order.sort_by_key(|(_, u, _)| (u.kind, u.logical_index, u.stored_rank));
-            let slices: Vec<(PackedUnit, &[u8])> = order
-                .into_iter()
-                .map(|(r, unit, used)| (unit, &scratch.row_out[r][..used]))
+            let slices: Vec<(&PackedUnit, &[u8])> = order
+                .iter()
+                .map(|(r, unit, used)| (unit, &scratch.row_out[*r][..*used]))
                 .collect();
             // SAFETY: all raw row reads have finished; we now compact into `row_addrs`.
-            Some(unsafe { write_packed_into_slab_addrs(row_addrs, slab_bytes, &slices) })
+            Some(unsafe { write_packed_into_slabs(row_addrs, slab_bytes, &slices, true) })
         } else {
             None
         };
@@ -5847,131 +5858,20 @@ mod tests {
     #[cfg(feature = "codec")]
     #[test]
     fn packed_memory_capture_releases_trailing_slabs_and_restores_exact_bytes() {
-        use crate::shared::{codec::Plan, wire};
-        struct CodecCopier {
-            layout: Layout,
-            profile: [u8; 32],
-            plan: Plan,
-            gpu: crate::testing::GpuMemory,
-            replies: Vec<Reply>,
-        }
-        impl crate::PageCopier for CodecCopier {
-            fn layout(&self) -> &Layout {
-                &self.layout
-            }
-            fn codec_profile(&self) -> Option<[u8; 32]> {
-                Some(self.profile)
-            }
-            fn submit(&mut self, job: Job) -> Result<()> {
-                let codec = job.codec.as_ref().expect("packed memory job carries codec window");
-                let mut pages = self.gpu.pages.lock().unwrap();
-                let mut rows = self.gpu.rows.lock().unwrap();
-                let mut bytes = 0u64;
-                match job.direction {
-                    Direction::Out => {
-                        let capture = codec.capture.as_ref().expect("capture slot");
-                        for (idx, (id, _)) in job.pages.iter().enumerate() {
-                            let raw = pages.get(&id.0).unwrap();
-                            let mut out = vec![0u8; self.plan.max_packet()];
-                            let base = wire::PackedUnit {
-                                kind: wire::packed_unit::Kind::Page as i32,
-                                logical_index: codec.first + idx as u64,
-                                stored_rank: 0,
-                                original_length: raw.len() as u64,
-                                ..Default::default()
-                            };
-                            let (unit, len) = self
-                                .plan
-                                .encode_capture(base, &self.profile, raw, &mut out, None)
-                                .unwrap();
-                            out.truncate(len);
-                            bytes += len as u64;
-                            capture.push(unit, out);
-                        }
-                        if let Some((slot, _)) = &job.row {
-                            let raw = rows.get(&slot.0).unwrap();
-                            let mut out = vec![0u8; self.plan.max_packet()];
-                            let base = wire::PackedUnit {
-                                kind: wire::packed_unit::Kind::Row as i32,
-                                logical_index: 0,
-                                stored_rank: 0,
-                                original_length: raw.len() as u64,
-                                ..Default::default()
-                            };
-                            let (unit, len) = self
-                                .plan
-                                .encode_capture(base, &self.profile, raw, &mut out, None)
-                                .unwrap();
-                            out.truncate(len);
-                            bytes += len as u64;
-                            capture.push(unit, out);
-                        }
-                    }
-                    Direction::In => {
-                        for packet in &codec.packets {
-                            // SAFETY: test slabs stay pinned until poll completes.
-                            let chunks = unsafe { packet.chunks() };
-                            let mut raw = vec![0u8; packet.unit.original_length as usize];
-                            if packet.unit.representation
-                                == wire::packed_unit::Representation::Literal as i32
-                            {
-                                let mut off = 0;
-                                for c in &chunks {
-                                    raw[off..off + c.len()].copy_from_slice(c);
-                                    off += c.len();
-                                }
-                            } else {
-                                self.plan
-                                    .decode_checked(
-                                        &chunks,
-                                        &mut raw,
-                                        packet.unit.stored_crc,
-                                        packet.unit.original_crc,
-                                        None,
-                                    )
-                                    .unwrap();
-                            }
-                            bytes += packet.unit.stored_length;
-                            if packet.unit.kind == wire::packed_unit::Kind::Page as i32 {
-                                let local = (packet.unit.logical_index - codec.first) as usize;
-                                pages.insert(job.pages[local].0.0, raw);
-                            } else if let Some((slot, _)) = &job.row {
-                                rows.insert(slot.0, raw);
-                            }
-                        }
-                    }
-                }
-                self.replies.push(Reply {
-                    id: job.id,
-                    window: job.window,
-                    direction: job.direction,
-                    result: Ok(()),
-                    bytes,
-                    elapsed: Duration::from_micros(1),
-                });
-                Ok(())
-            }
-            fn poll(&mut self, out: &mut Vec<Reply>) {
-                out.append(&mut self.replies);
-            }
-            fn in_flight(&self) -> usize {
-                self.replies.len()
-            }
-            fn close(&mut self) -> Result<()> {
-                Ok(())
-            }
-        }
+        use crate::shared::codec::Plan;
 
         let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
         let layout = Layout::new(&geometry).unwrap();
         let gpu = crate::testing::GpuMemory::default();
-        let copier: crate::SharedCopier = Arc::new(std::sync::Mutex::new(CodecCopier {
-            layout: layout.clone(),
-            profile: [7; 32],
-            plan: Plan::new(PAGE as usize, &[]).unwrap(),
-            gpu: gpu.clone(),
-            replies: Vec::new(),
-        }));
+        let plan = Arc::new(Plan::new(PAGE as usize, &[]).unwrap());
+        let copier = crate::testing::CodecCopier::new(
+            layout.clone(),
+            [7; 32],
+            plan.clone(),
+            plan,
+            gpu.clone(),
+        )
+        .shared();
         let pool = SlabPool::new(layout.page_record_bytes, 16, 0).unwrap();
         let mut store = MemoryStore::new(IDENTITY, pool.clone(), copier).unwrap();
         let h = history(6 * PT + 3, 1);
@@ -6033,99 +5933,14 @@ mod tests {
     fn packed_memory_cascades_without_announcing_raw_host_export() {
         use crate::pool::HostWindow;
         use crate::shared::codec::Plan;
-        use crate::shared::wire;
         use crate::store::TierStore;
-        use crate::testing::GpuMemory;
-
-        struct PackedTestCopier {
-            layout: Layout,
-            profile: [u8; 32],
-            plan: Plan,
-            gpu: GpuMemory,
-            replies: Vec<Reply>,
-        }
-        impl crate::PageCopier for PackedTestCopier {
-            fn layout(&self) -> &Layout {
-                &self.layout
-            }
-            fn codec_profile(&self) -> Option<[u8; 32]> {
-                Some(self.profile)
-            }
-            fn submit(&mut self, job: Job) -> Result<()> {
-                let mut bytes = 0u64;
-                if job.direction == Direction::Out {
-                    let codec = job.codec.as_ref().expect("packed capture job");
-                    let capture = codec.capture.as_ref().unwrap();
-                    let pages = self.gpu.pages.lock().unwrap();
-                    let rows = self.gpu.rows.lock().unwrap();
-                    for (idx, (pid, _)) in job.pages.iter().enumerate() {
-                        let raw = pages.get(&pid.0).unwrap();
-                        let mut out = vec![0u8; self.plan.max_packet()];
-                        let base = wire::PackedUnit {
-                            kind: wire::packed_unit::Kind::Page as i32,
-                            logical_index: codec.first + idx as u64,
-                            stored_rank: 0,
-                            original_length: raw.len() as u64,
-                            ..Default::default()
-                        };
-                        let (unit, len) = self
-                            .plan
-                            .encode_capture(base, &self.profile, raw, &mut out, None)
-                            .unwrap();
-                        out.truncate(len);
-                        bytes += len as u64;
-                        capture.push(unit, out);
-                    }
-                    if let Some((slot, _)) = &job.row {
-                        let raw = rows.get(&slot.0).unwrap();
-                        let mut out = vec![0u8; self.plan.max_packet()];
-                        let base = wire::PackedUnit {
-                            kind: wire::packed_unit::Kind::Row as i32,
-                            logical_index: 0,
-                            stored_rank: 0,
-                            original_length: raw.len() as u64,
-                            ..Default::default()
-                        };
-                        let (unit, len) = self
-                            .plan
-                            .encode_capture(base, &self.profile, raw, &mut out, None)
-                            .unwrap();
-                        out.truncate(len);
-                        bytes += len as u64;
-                        capture.push(unit, out);
-                    }
-                }
-                self.replies.push(Reply {
-                    id: job.id,
-                    window: job.window,
-                    direction: job.direction,
-                    result: Ok(()),
-                    bytes,
-                    elapsed: Duration::from_micros(1),
-                });
-                Ok(())
-            }
-            fn poll(&mut self, out: &mut Vec<Reply>) {
-                out.append(&mut self.replies);
-            }
-            fn in_flight(&self) -> usize {
-                self.replies.len()
-            }
-            fn close(&mut self) -> Result<()> {
-                Ok(())
-            }
-        }
+        use crate::testing::{CodecCopier, GpuMemory};
 
         let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
         let layout = Layout::new(&geometry).unwrap();
         let gpu = GpuMemory::default();
-        let copier: crate::SharedCopier = Arc::new(std::sync::Mutex::new(PackedTestCopier {
-            layout: layout.clone(),
-            profile: [7; 32],
-            plan: Plan::new(PAGE as usize, &[]).unwrap(),
-            gpu: gpu.clone(),
-            replies: Vec::new(),
-        }));
+        let plan = Arc::new(Plan::new(PAGE as usize, &[]).unwrap());
+        let copier = CodecCopier::new(layout.clone(), [7; 32], plan.clone(), plan, gpu.clone()).shared();
         let pool = SlabPool::new(layout.page_record_bytes, 6, 0).unwrap();
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
 
@@ -6195,124 +6010,17 @@ mod tests {
     #[cfg(feature = "codec")]
     #[test]
     fn async_host_codec_encodes_off_transfer_thread_and_cascades_packed() {
-        use crate::codec_copy::HostEncoder;
-        use crate::shared::{codec::Plan, wire};
+        use crate::shared::codec::Plan;
         use crate::store::TierStore;
-        use crate::testing::GpuMemory;
-
-        struct AsyncTestCopier {
-            layout: Layout,
-            profile: [u8; 32],
-            plan: Arc<Plan>,
-            gpu: GpuMemory,
-            replies: Vec<Reply>,
-        }
-        impl crate::PageCopier for AsyncTestCopier {
-            fn layout(&self) -> &Layout {
-                &self.layout
-            }
-            fn codec_profile(&self) -> Option<[u8; 32]> {
-                Some(self.profile)
-            }
-            fn async_host_codec(&self) -> Option<HostEncoder> {
-                Some(HostEncoder {
-                    profile: self.profile,
-                    page: self.plan.clone(),
-                    row: self.plan.clone(),
-                    counters: None,
-                })
-            }
-            fn submit(&mut self, job: Job) -> Result<()> {
-                let mut bytes = 0u64;
-                match job.direction {
-                    Direction::Out => {
-                        // Async host codec captures raw bytes directly into DRAM slabs.
-                        assert!(job.codec.is_none());
-                        let pages = self.gpu.pages.lock().unwrap();
-                        let rows = self.gpu.rows.lock().unwrap();
-                        for (pid, addr) in &job.pages {
-                            let src = &pages[&pid.0];
-                            // SAFETY: pinned DRAM slab owned by the test MemoryStore.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    src.as_ptr(),
-                                    *addr as *mut u8,
-                                    src.len(),
-                                );
-                            }
-                            bytes += src.len() as u64;
-                        }
-                        if let Some((slot, addrs)) = &job.row {
-                            let src = &rows[&slot.0];
-                            // SAFETY: pinned DRAM row slab owned by the test MemoryStore.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    src.as_ptr(),
-                                    addrs[0] as *mut u8,
-                                    src.len(),
-                                );
-                            }
-                            bytes += src.len() as u64;
-                        }
-                    }
-                    Direction::In => {
-                        let codec = job.codec.as_ref().expect("restore reads packed units");
-                        let mut pages = self.gpu.pages.lock().unwrap();
-                        let mut rows = self.gpu.rows.lock().unwrap();
-                        for packet in &codec.packets {
-                            // SAFETY: slabs stay pinned until reply is absorbed.
-                            let chunks = unsafe { packet.chunks() };
-                            let mut raw = vec![0u8; packet.unit.original_length as usize];
-                            self.plan
-                                .decode_checked(
-                                    &chunks,
-                                    &mut raw,
-                                    packet.unit.stored_crc,
-                                    packet.unit.original_crc,
-                                    None,
-                                )
-                                .unwrap();
-                            bytes += packet.unit.stored_length;
-                            if packet.unit.kind == wire::packed_unit::Kind::Page as i32 {
-                                let local = (packet.unit.logical_index - codec.first) as usize;
-                                pages.insert(job.pages[local].0.0, raw);
-                            } else if let Some((slot, _)) = &job.row {
-                                rows.insert(slot.0, raw);
-                            }
-                        }
-                    }
-                }
-                self.replies.push(Reply {
-                    id: job.id,
-                    window: job.window,
-                    direction: job.direction,
-                    result: Ok(()),
-                    bytes,
-                    elapsed: Duration::from_micros(1),
-                });
-                Ok(())
-            }
-            fn poll(&mut self, out: &mut Vec<Reply>) {
-                out.append(&mut self.replies);
-            }
-            fn in_flight(&self) -> usize {
-                self.replies.len()
-            }
-            fn close(&mut self) -> Result<()> {
-                Ok(())
-            }
-        }
+        use crate::testing::{CodecCopier, GpuMemory};
 
         let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
         let layout = Layout::new(&geometry).unwrap();
         let gpu = GpuMemory::default();
-        let copier: crate::SharedCopier = Arc::new(std::sync::Mutex::new(AsyncTestCopier {
-            layout: layout.clone(),
-            profile: [9; 32],
-            plan: Arc::new(Plan::new(PAGE as usize, &[]).unwrap()),
-            gpu: gpu.clone(),
-            replies: Vec::new(),
-        }));
+        let plan = Arc::new(Plan::new(PAGE as usize, &[]).unwrap());
+        let copier = CodecCopier::new(layout.clone(), [9; 32], plan.clone(), plan, gpu.clone())
+            .with_async_host_codec(true)
+            .shared();
         let pool = SlabPool::new(layout.page_record_bytes, 16, 0).unwrap();
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
 
@@ -6385,61 +6093,23 @@ mod tests {
     #[cfg(feature = "codec")]
     #[test]
     fn async_host_codec_failure_reports_stored_error_without_publishing() {
-        use crate::codec_copy::HostEncoder;
         use crate::shared::codec::Plan;
-
-        struct FailingAsyncCopier {
-            layout: Layout,
-            profile: [u8; 32],
-            bad_plan: Arc<Plan>,
-            replies: Vec<Reply>,
-        }
-        impl crate::PageCopier for FailingAsyncCopier {
-            fn layout(&self) -> &Layout {
-                &self.layout
-            }
-            fn codec_profile(&self) -> Option<[u8; 32]> {
-                Some(self.profile)
-            }
-            fn async_host_codec(&self) -> Option<HostEncoder> {
-                Some(HostEncoder {
-                    profile: self.profile,
-                    page: self.bad_plan.clone(),
-                    row: self.bad_plan.clone(),
-                    counters: None,
-                })
-            }
-            fn submit(&mut self, job: Job) -> Result<()> {
-                self.replies.push(Reply {
-                    id: job.id,
-                    window: job.window,
-                    direction: job.direction,
-                    result: Ok(()),
-                    bytes: PAGE,
-                    elapsed: Duration::from_micros(1),
-                });
-                Ok(())
-            }
-            fn poll(&mut self, out: &mut Vec<Reply>) {
-                out.append(&mut self.replies);
-            }
-            fn in_flight(&self) -> usize {
-                self.replies.len()
-            }
-            fn close(&mut self) -> Result<()> {
-                Ok(())
-            }
-        }
+        use crate::testing::{CodecCopier, GpuMemory};
 
         let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE)];
         let layout = Layout::new(&geometry).unwrap();
-        let copier: crate::SharedCopier = Arc::new(std::sync::Mutex::new(FailingAsyncCopier {
-            layout: layout.clone(),
-            profile: [9; 32],
-            // Deliberately mismatched original_bytes so encode_capture returns Err.
-            bad_plan: Arc::new(Plan::new((PAGE / 2) as usize, &[]).unwrap()),
-            replies: Vec::new(),
-        }));
+        // Deliberately mismatched original_bytes so encode_capture returns Err.
+        let bad_plan = Arc::new(Plan::new((PAGE / 2) as usize, &[]).unwrap());
+        let copier = CodecCopier::new(
+            layout.clone(),
+            [9; 32],
+            bad_plan.clone(),
+            bad_plan,
+            GpuMemory::default(),
+        )
+        .with_async_host_codec(true)
+        .with_raw_out_noop(true)
+        .shared();
         let pool = SlabPool::new(layout.page_record_bytes, 8, 0).unwrap();
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
 

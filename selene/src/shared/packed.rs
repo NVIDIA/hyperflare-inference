@@ -12,6 +12,7 @@ use super::{
 use crate::{Result, geometry::invalid};
 use prost::Message;
 
+/// Header version byte for v4 packed records (raw records use `record::VERSION = 3`).
 pub const REVISION: u32 = 4;
 pub const MAX_DIRECTORY: usize = 2 * 1024 * 1024;
 pub const MAX_UNITS: usize = 16384;

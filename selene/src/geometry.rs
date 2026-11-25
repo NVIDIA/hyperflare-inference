@@ -21,6 +21,7 @@ use crate::{Error, Result};
 /// Alignment of every plane inside a record and of every direct-I/O transfer.
 pub const BLOCK_BYTES: u64 = 4096;
 
+/// Round `bytes` up to the next [`BLOCK_BYTES`] boundary, returning `None` on overflow.
 pub fn padded_bytes(bytes: u64) -> Option<u64> {
     bytes.checked_next_multiple_of(BLOCK_BYTES)
 }
@@ -36,7 +37,7 @@ pub struct Plane {
 impl Plane {
     /// Bytes one unit occupies inside a record.
     pub fn padded_bytes(&self) -> u64 {
-        self.unit_bytes.div_ceil(BLOCK_BYTES) * BLOCK_BYTES
+        padded_bytes(self.unit_bytes).expect("plane padded byte length overflow")
     }
 
     pub fn unit_address(&self, index: u64) -> u64 {

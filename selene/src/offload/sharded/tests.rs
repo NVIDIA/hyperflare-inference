@@ -296,114 +296,7 @@ fn sharded_join_rejects_mismatched_compression_modes() {
 #[cfg(feature = "codec")]
 #[test]
 fn sharded_compressed_v4_store_fetch_truncate_and_restart_agree() {
-    use crate::copier::{Direction, Job, PageCopier, Reply};
-    use crate::shared::{codec::Plan, wire};
-
-    struct ShardedCodecCopier {
-        layout: crate::Layout,
-        profile: [u8; 32],
-        page_plan: Plan,
-        row_plan: Plan,
-        gpu: GpuMemory,
-        replies: Vec<Reply>,
-    }
-    impl PageCopier for ShardedCodecCopier {
-        fn layout(&self) -> &crate::Layout {
-            &self.layout
-        }
-        fn codec_profile(&self) -> Option<[u8; 32]> {
-            Some(self.profile)
-        }
-        fn submit(&mut self, job: Job) -> Result<()> {
-            let codec = job.codec.as_ref().expect("compressed sharded job");
-            let mut bytes = 0u64;
-            match job.direction {
-                Direction::Out => {
-                    let cap = codec.capture.as_ref().expect("capture window");
-                    let pages = self.gpu.pages.lock().unwrap();
-                    let rows = self.gpu.rows.lock().unwrap();
-                    for (idx, (pid, _)) in job.pages.iter().enumerate() {
-                        let raw = &pages[&pid.0];
-                        let mut out = vec![0u8; self.page_plan.max_packet()];
-                        let unit = wire::PackedUnit {
-                            kind: wire::packed_unit::Kind::Page as i32,
-                            logical_index: codec.first + idx as u64,
-                            stored_rank: 0,
-                            ..Default::default()
-                        };
-                        let (unit, used) = self
-                            .page_plan
-                            .encode_capture(unit, &self.profile, raw, &mut out, None)
-                            .unwrap();
-                        out.truncate(used);
-                        bytes += used as u64;
-                        cap.push(unit, out);
-                    }
-                    if let Some((slot, _)) = &job.row {
-                        let raw = &rows[&slot.0];
-                        let mut out = vec![0u8; self.row_plan.max_packet()];
-                        let unit = wire::PackedUnit {
-                            kind: wire::packed_unit::Kind::Row as i32,
-                            logical_index: 0,
-                            stored_rank: 0,
-                            ..Default::default()
-                        };
-                        let (unit, used) = self
-                            .row_plan
-                            .encode_capture(unit, &self.profile, raw, &mut out, None)
-                            .unwrap();
-                        out.truncate(used);
-                        bytes += used as u64;
-                        cap.push(unit, out);
-                    }
-                }
-                Direction::In => {
-                    let mut pages = self.gpu.pages.lock().unwrap();
-                    let mut rows = self.gpu.rows.lock().unwrap();
-                    for packet in &codec.packets {
-                        // SAFETY: staging slabs stay pinned until reply is absorbed.
-                        let chunks = unsafe { packet.chunks() };
-                        let is_page = packet.unit.kind == wire::packed_unit::Kind::Page as i32;
-                        let plan = if is_page { &self.page_plan } else { &self.row_plan };
-                        let mut raw = vec![0u8; packet.unit.original_length as usize];
-                        plan.decode_checked(
-                            &chunks,
-                            &mut raw,
-                            packet.unit.stored_crc,
-                            packet.unit.original_crc,
-                            None,
-                        )
-                        .unwrap();
-                        bytes += packet.unit.stored_length;
-                        if is_page {
-                            let local = (packet.unit.logical_index - codec.first) as usize;
-                            pages.insert(job.pages[local].0.0, raw);
-                        } else if let Some((slot, _)) = &job.row {
-                            rows.insert(slot.0, raw);
-                        }
-                    }
-                }
-            }
-            self.replies.push(Reply {
-                id: job.id,
-                window: job.window,
-                direction: job.direction,
-                result: Ok(()),
-                bytes,
-                elapsed: Duration::from_micros(1),
-            });
-            Ok(())
-        }
-        fn poll(&mut self, out: &mut Vec<Reply>) {
-            out.append(&mut self.replies);
-        }
-        fn in_flight(&self) -> usize {
-            self.replies.len()
-        }
-        fn close(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
+    use crate::copier::PageCopier;
 
     #[derive(Default)]
     struct CodecCopiers(Mutex<std::collections::HashMap<usize, GpuMemory>>);
@@ -442,14 +335,14 @@ fn sharded_compressed_v4_store_fetch_truncate_and_restart_agree() {
             };
             gpu.rows.lock().unwrap().insert(1, row_data);
             self.0.lock().unwrap().insert(rank, gpu.clone());
-            Ok(Arc::new(Mutex::new(ShardedCodecCopier {
+            Ok(crate::testing::CodecCopier::new(
                 layout,
                 profile,
-                page_plan,
-                row_plan,
+                Arc::new(page_plan),
+                Arc::new(row_plan),
                 gpu,
-                replies: Vec::new(),
-            })))
+            )
+            .shared())
         }
         fn unmapped(
             &self,
@@ -627,4 +520,36 @@ fn sharded_compressed_v4_store_fetch_truncate_and_restart_agree() {
     drop(store2);
     service2.join().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sharded_pool_with_compression_rejected_at_startup() {
+    let local = geometry(64, &[("kv", 4096)], 3 * 4096);
+    for compression in [offload::KvCompression::Cpu, offload::KvCompression::Gpu] {
+        let options = PrefixCacheOffload {
+            compression,
+            pool: Some(crate::pool::PoolOptions {
+                address: "127.0.0.1:9200".to_owned(),
+                ca: None,
+            }),
+            ..Default::default()
+        };
+        let err = offload::prepare_with_inputs(
+            &options,
+            std::path::Path::new("."),
+            [1; 32],
+            vec![local.clone()],
+            vec![(0, 0)],
+            4,
+            0,
+            Some((0, 2)),
+            &IdentityRegistrar,
+        )
+        .err()
+        .expect("sharded --ranks + --prefix-cache-pool + compression must be rejected");
+        assert!(
+            err.to_string().contains("multi-host --ranks"),
+            "unexpected error: {err}"
+        );
+    }
 }

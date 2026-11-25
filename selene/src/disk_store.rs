@@ -7596,150 +7596,10 @@ mod tests {
     #[cfg(feature = "codec")]
     #[test]
     fn packed_disk_round_trip_restart_mixed_profiles_and_compaction() {
-        use crate::shared::{
-            codec::Plan,
-            wire::{
-                PackedUnit,
-                packed_unit::{Kind, Representation},
-            },
-        };
+        use crate::shared::codec::Plan;
         let Some(directory) = test_directory("disk", "packed-roundtrip") else {
             return;
         };
-        struct MockCodecCopier {
-            layout: Layout,
-            profile: [u8; 32],
-            receive: Vec<[u8; 32]>,
-            page_plan: Plan,
-            row_plan: Plan,
-            gpu: crate::testing::GpuMemory,
-            replies: Vec<copier::Reply>,
-        }
-        impl PageCopier for MockCodecCopier {
-            fn layout(&self) -> &Layout {
-                &self.layout
-            }
-            fn codec_profile(&self) -> Option<[u8; 32]> {
-                Some(self.profile)
-            }
-            fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
-                self.receive.clone()
-            }
-            fn submit(&mut self, job: copier::Job) -> Result<()> {
-                let win = job.codec.as_ref().expect("packed disk job uses codec window");
-                let mut bytes = 0u64;
-                match job.direction {
-                    Direction::Out => {
-                        let cap = win.capture.as_ref().unwrap();
-                        let mut buf = vec![
-                            0u8;
-                            self.page_plan.max_packet().max(self.row_plan.max_packet())
-                        ];
-                        for (i, (page, _)) in job.pages.iter().enumerate() {
-                            let raw = self.gpu.pages.lock().unwrap()[&page.0].clone();
-                            let base = PackedUnit {
-                                kind: Kind::Page as i32,
-                                logical_index: win.first + i as u64,
-                                stored_rank: 0,
-                                ..Default::default()
-                            };
-                            let (u, n) = self
-                                .page_plan
-                                .encode_capture(base, &self.profile, &raw, &mut buf, None)
-                                .unwrap();
-                            cap.push(u, buf[..n].to_vec());
-                            bytes += raw.len() as u64;
-                        }
-                        if let Some((slot, _)) = &job.row {
-                            let raw = self.gpu.rows.lock().unwrap()[&slot.0].clone();
-                            let base = PackedUnit {
-                                kind: Kind::Row as i32,
-                                logical_index: 0,
-                                stored_rank: 0,
-                                ..Default::default()
-                            };
-                            let (u, n) = self
-                                .row_plan
-                                .encode_capture(base, &self.profile, &raw, &mut buf, None)
-                                .unwrap();
-                            cap.push(u, buf[..n].to_vec());
-                            bytes += raw.len() as u64;
-                        }
-                    }
-                    Direction::In => {
-                        for (i, (page, _)) in job.pages.iter().enumerate() {
-                            let idx = win.first + i as u64;
-                            let pkt = win
-                                .packets
-                                .iter()
-                                .find(|p| {
-                                    p.unit.kind == Kind::Page as i32 && p.unit.logical_index == idx
-                                })
-                                .unwrap();
-                            assert!(
-                                pkt.unit.representation == Representation::Literal as i32
-                                    || self.receive.iter().any(|r| r.as_slice() == pkt.unit.profile.as_slice())
-                            );
-                            let chunks = unsafe { pkt.chunks() };
-                            let mut dst = vec![0u8; self.layout.page_record_bytes as usize];
-                            self.page_plan
-                                .decode_checked(
-                                    &chunks,
-                                    &mut dst,
-                                    pkt.unit.stored_crc,
-                                    pkt.unit.original_crc,
-                                    None,
-                                )
-                                .unwrap();
-                            self.gpu.pages.lock().unwrap().insert(page.0, dst);
-                            bytes += self.layout.page_record_bytes;
-                        }
-                        if let Some((slot, _)) = &job.row {
-                            let pkt = win
-                                .packets
-                                .iter()
-                                .find(|p| p.unit.kind == Kind::Row as i32)
-                                .unwrap();
-                            assert!(
-                                pkt.unit.representation == Representation::Literal as i32
-                                    || self.receive.iter().any(|r| r.as_slice() == pkt.unit.profile.as_slice())
-                            );
-                            let chunks = unsafe { pkt.chunks() };
-                            let mut dst = vec![0u8; self.layout.row_record_bytes as usize];
-                            self.row_plan
-                                .decode_checked(
-                                    &chunks,
-                                    &mut dst,
-                                    pkt.unit.stored_crc,
-                                    pkt.unit.original_crc,
-                                    None,
-                                )
-                                .unwrap();
-                            self.gpu.rows.lock().unwrap().insert(slot.0, dst);
-                            bytes += self.layout.row_record_bytes;
-                        }
-                    }
-                }
-                self.replies.push(copier::Reply {
-                    id: job.id,
-                    window: job.window,
-                    direction: job.direction,
-                    result: Ok(()),
-                    bytes,
-                    elapsed: Duration::from_micros(1),
-                });
-                Ok(())
-            }
-            fn poll(&mut self, out: &mut Vec<copier::Reply>) {
-                out.append(&mut self.replies);
-            }
-            fn in_flight(&self) -> usize {
-                self.replies.len()
-            }
-            fn close(&mut self) -> Result<()> {
-                Ok(())
-            }
-        }
 
         let geometry = geometry();
         let layout = Layout::new(&geometry).unwrap();
@@ -7757,15 +7617,15 @@ mod tests {
             )
             .unwrap();
             let pool = SlabPool::new(layout.page_record_bytes, 16, 0).unwrap();
-            let copier: SharedCopier = Arc::new(Mutex::new(MockCodecCopier {
-                layout: layout.clone(),
+            let copier = crate::testing::CodecCopier::new(
+                layout.clone(),
                 profile,
-                receive,
-                page_plan: Plan::new(layout.page_record_bytes as usize, &[]).unwrap(),
-                row_plan: Plan::new(layout.row_record_bytes as usize, &[]).unwrap(),
-                gpu: gpu.clone(),
-                replies: Vec::new(),
-            }));
+                Arc::new(Plan::new(layout.page_record_bytes as usize, &[]).unwrap()),
+                Arc::new(Plan::new(layout.row_record_bytes as usize, &[]).unwrap()),
+                gpu.clone(),
+            )
+            .with_receive(receive)
+            .shared();
             DiskStore::new(
                 guard,
                 IDENTITY,

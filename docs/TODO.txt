@@ -220,6 +220,11 @@
     + `--lossless-kv-compression cpu|gpu`) on a multi-host cluster; unit tests
     cover sharded v4 store/fetch/truncate/agreement and mismatch rejection.
 
+[ ] Support `--lossless-kv-compression cpu|gpu` with multi-host `--ranks` +
+    `--prefix-cache-pool` by building world-wide packed offers and teaching
+    `selene/src/pool/records.rs` v4 headers, directories, and packed slicing
+    (currently rejected at startup in `selene/src/offload.rs`).
+
 [ ] Resolve pool-only host retention for ranks on separate hosts.
     prefix-cache-offload.md section 1 allows it, while ModelRuntime::start in
     helios/src/server/runtime.rs requires shard links that

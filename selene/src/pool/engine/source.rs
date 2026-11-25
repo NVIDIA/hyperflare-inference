@@ -249,6 +249,9 @@ impl Engine {
                 None => u64::from(r.pages) * page_bytes + if r.row { row_bytes } else { 0 },
             })
             .sum();
+        // Multi-process rank agents (`self.ranks.is_some()`) hold single-rank packed records
+        // rather than world-wide offers; startup rejects `--ranks` + `--prefix-cache-pool` +
+        // compression, and this guard defensively refuses any packed multi-rank export.
         let valid = !expected.is_empty()
             && row == run.want_row
             && !(any_packed && self.ranks.is_some());

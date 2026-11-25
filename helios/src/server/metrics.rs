@@ -664,16 +664,41 @@ impl Metrics {
         use crate::offload::KvCompression;
         let placement = self.codec_state.get().copied().unwrap_or_default();
         if placement != KvCompression::Off {
+            let _ = writeln!(text, "# HELP flare_kv_codec_active Active lossless KV checkpoint codec placement.");
+            let _ = writeln!(text, "# TYPE flare_kv_codec_active gauge");
             let _ = writeln!(text, "flare_kv_codec_active{{placement=\"{placement}\"}} 1");
             let stats = *self.decode.lock().unwrap();
-            for (name, value) in [
-                ("original_bytes_total", stats.original_bytes),
-                ("stored_bytes_total", stats.stored_bytes),
-                ("failed_windows_total", stats.failed_windows),
-                ("transform_nanoseconds_total", stats.transform_ns),
+            for (name, help, value) in [
+                (
+                    "original_bytes_total",
+                    "Logical uncompressed KV checkpoint bytes processed by the codec.",
+                    stats.original_bytes,
+                ),
+                (
+                    "stored_bytes_total",
+                    "Compressed or literal stored KV checkpoint bytes processed by the codec.",
+                    stats.stored_bytes,
+                ),
+                (
+                    "failed_windows_total",
+                    "KV checkpoint codec windows that failed encode or decode.",
+                    stats.failed_windows,
+                ),
+                (
+                    "transform_nanoseconds_total",
+                    "Cumulative time spent in KV checkpoint codec transforms and coding.",
+                    stats.transform_ns,
+                ),
             ] {
+                let _ = writeln!(text, "# HELP flare_kv_codec_{name} {help}");
+                let _ = writeln!(text, "# TYPE flare_kv_codec_{name} counter");
                 let _ = writeln!(text, "flare_kv_codec_{name}{{placement=\"{placement}\"}} {value}");
             }
+            let _ = writeln!(
+                text,
+                "# HELP flare_kv_codec_verification_failures_total CRC-32/IEEE verification failures during KV checkpoint decode."
+            );
+            let _ = writeln!(text, "# TYPE flare_kv_codec_verification_failures_total counter");
             for (stage, value) in [("stored", stats.stored_failures), ("original", stats.original_failures)] {
                 let _ = writeln!(text, "flare_kv_codec_verification_failures_total{{stage=\"{stage}\"}} {value}");
             }

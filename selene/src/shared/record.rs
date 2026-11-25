@@ -80,6 +80,7 @@ use prost::Message;
 use std::sync::Arc;
 
 pub const MAGIC: [u8; 8] = *b"FLARECKP";
+/// Header version byte for raw records (packed codec records use `packed::REVISION = 4`).
 pub const VERSION: u32 = 3;
 const LEGACY_VERSION: u32 = 1;
 const LEGACY_REPLICATED_VERSION: u32 = 2;

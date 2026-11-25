@@ -478,6 +478,11 @@ pub fn prepare_with_inputs(
     if shard.is_some() && memory_bytes != 0 {
         return Err("a multi-host core keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
     }
+    if shard.is_some() && options.pool.is_some() && options.compression != KvCompression::Off {
+        return Err(
+            "multi-host --ranks serving does not support --lossless-kv-compression with --prefix-cache-pool; use --lossless-kv-compression off with a pool or local --prefix-cache-disk without a pool".into(),
+        );
+    }
     let mut notes = Vec::new();
     let directory = match options
         .disk

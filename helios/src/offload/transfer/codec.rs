@@ -276,10 +276,7 @@ impl RankCodec {
                                     },
                                 )
                             };
-                            if res.is_err() {
-                                let _ = stream.synchronize();
-                            }
-                            res
+                            sync_on_err(stream, res)
                         }
                         .map_err(decode_error)?;
                         stats.transform_ns += start.elapsed().as_nanos() as u64;
@@ -312,10 +309,7 @@ impl RankCodec {
                                     slen
                                 },
                             );
-                            if res.is_err() {
-                                let _ = stream.synchronize();
-                            }
-                            res
+                            sync_on_err(stream, res)
                         }
                         .map_err(decode_error)?;
                         stats.transform_ns += start.elapsed().as_nanos() as u64;
@@ -348,10 +342,7 @@ impl RankCodec {
                                 slen
                             },
                         );
-                        if res.is_err() {
-                            let _ = stream.synchronize();
-                        }
-                        res
+                        sync_on_err(stream, res)
                     }
                     .map_err(decode_error)?;
                     stats.transform_ns += start.elapsed().as_nanos() as u64;
@@ -483,6 +474,22 @@ impl RankCodec {
         Ok(transferred)
     }
 
+    fn decode_route(&self, u: &PackedUnit, representation: Representation) -> Result<DecodeRoute> {
+        if representation == Representation::Literal {
+            Ok(DecodeRoute::Literal)
+        } else if u.profile.as_slice() == self.cpu_profile.as_slice() {
+            Ok(DecodeRoute::Cpu)
+        } else if u.profile.as_slice() == self.gpu_profile.as_slice() {
+            if self.gpu.is_some() {
+                Ok(DecodeRoute::GpuOnDevice)
+            } else {
+                Ok(DecodeRoute::GpuOnCpu)
+            }
+        } else {
+            Err(invalid("incompatible codec share"))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn restore_window(
         &mut self,
@@ -509,10 +516,10 @@ impl RankCodec {
                     u.kind == Kind::Page as i32
                         && u.logical_index == idx
                         && (u.stored_rank == rank as u32 || u.replicas.contains(&(rank as u32)))
-                        && (u.representation == Representation::Literal as i32
-                            || u.profile.as_slice() == self.cpu_profile.as_slice()
-                            || (self.gpu.is_none()
-                                && u.profile.as_slice() == self.gpu_profile.as_slice()))
+                        && Representation::try_from(u.representation)
+                            .ok()
+                            .and_then(|rep| self.decode_route(u, rep).ok())
+                            .is_some_and(|route| !matches!(route, DecodeRoute::GpuOnDevice))
                 })
             });
 
@@ -527,8 +534,10 @@ impl RankCodec {
                     let spans = device_spans(geometry, layout, false, u64::from(page.0))?;
                     let (u, representation, chunks) =
                         select_packet(window, false, index, rank, page_bytes)?;
+                    let route = self.decode_route(u, representation)?;
+                    debug_assert!(!matches!(route, DecodeRoute::GpuOnDevice));
                     stored += u.stored_length;
-                    items.push((u, representation, chunks));
+                    items.push((u, route, chunks));
                     batch_spans.push((slot_idx * page_bytes, spans));
                 }
                 let start = Instant::now();
@@ -536,24 +545,12 @@ impl RankCodec {
                     &mut self.cpu.staging.bytes_mut()[..chunk.len() * page_bytes];
                 let page_plan = &self.cpu.page;
                 let gpu_page_plan = &self.cpu.gpu_page;
-                let cpu_profile = &self.cpu_profile;
-                let gpu_profile = &self.gpu_profile;
                 pool.install(|| -> Result<()> {
                     staging_slice
                         .par_chunks_mut(page_bytes)
                         .zip(items.par_iter())
-                        .try_for_each(|(raw, (u, representation, chunks))| -> Result<()> {
-                            decode_unit_cpu(
-                                u,
-                                *representation,
-                                chunks,
-                                raw,
-                                page_plan,
-                                gpu_page_plan,
-                                cpu_profile,
-                                gpu_profile,
-                                None,
-                            )
+                        .try_for_each(|(raw, (u, route, chunks))| -> Result<()> {
+                            decode_unit_cpu(u, *route, chunks, raw, page_plan, gpu_page_plan, None)
                         })
                 })?;
                 stats.transform_ns += start.elapsed().as_nanos() as u64;
@@ -573,9 +570,16 @@ impl RankCodec {
         if remaining_pages_offset < job.pages.len()
             && self.cpu.gpu_page.num_mats() == 0
             && self.cpu.gpu_page.num_chunks() > 0
-            && let Some(gpu) = self.gpu.as_mut()
+            && self.gpu.is_some()
         {
-            let gpu_batch_cap = gpu.codec.lock().unwrap().page_batch_cap();
+            let gpu_batch_cap = self
+                .gpu
+                .as_ref()
+                .unwrap()
+                .codec
+                .lock()
+                .unwrap()
+                .page_batch_cap();
             if gpu_batch_cap > 1 {
                 let mut i = remaining_pages_offset;
                 while i < job.pages.len() {
@@ -588,9 +592,7 @@ impl RankCodec {
                         let index = first + j as u64;
                         let (u, representation, chunks) =
                             select_packet(window, false, index, rank, page_bytes)?;
-                        if representation != Representation::Packet
-                            || u.profile.as_slice() != self.gpu_profile.as_slice()
-                        {
+                        if self.decode_route(u, representation)? != DecodeRoute::GpuOnDevice {
                             break;
                         }
                         let spans =
@@ -609,7 +611,7 @@ impl RankCodec {
                             .collect();
                         let start = Instant::now();
                         {
-                            let mut guard = gpu.codec.lock().unwrap();
+                            let mut guard = self.gpu.as_mut().unwrap().codec.lock().unwrap();
                             let res = guard.decode_pages_batch_to_device(
                                 &self.cpu.gpu_page,
                                 &packets,
@@ -617,10 +619,7 @@ impl RankCodec {
                                 stream,
                                 event,
                             );
-                            if res.is_err() {
-                                let _ = stream.synchronize();
-                            }
-                            res
+                            sync_on_err(stream, res)
                         }
                         .map_err(decode_error)?;
                         stats.transform_ns += start.elapsed().as_nanos() as u64;
@@ -634,13 +633,12 @@ impl RankCodec {
                         let spans = device_spans(geometry, layout, false, u64::from(page.0))?;
                         let (u, representation, chunks) =
                             select_packet(window, false, index, rank, page_bytes)?;
+                        let route = self.decode_route(u, representation)?;
                         stored += u.stored_length;
-                        if representation == Representation::Packet
-                            && u.profile.as_slice() == self.gpu_profile.as_slice()
-                        {
+                        if route == DecodeRoute::GpuOnDevice {
                             let start = Instant::now();
                             {
-                                let mut guard = gpu.codec.lock().unwrap();
+                                let mut guard = self.gpu.as_mut().unwrap().codec.lock().unwrap();
                                 let res = guard.decode_to_device(
                                     &self.cpu.gpu_page,
                                     &chunks,
@@ -650,31 +648,24 @@ impl RankCodec {
                                     stream,
                                     event,
                                 );
-                                if res.is_err() {
-                                    let _ = stream.synchronize();
-                                }
-                                res
+                                sync_on_err(stream, res)
                             }
                             .map_err(decode_error)?;
                             stats.transform_ns += start.elapsed().as_nanos() as u64;
                         } else {
                             let raw = &mut self.cpu.staging.bytes_mut()[..page_bytes];
-                            let pool = (representation == Representation::Packet)
-                                .then(cpu_pool)
-                                .transpose()?;
+                            let pool = (route != DecodeRoute::Literal).then(cpu_pool).transpose()?;
                             let start = Instant::now();
                             decode_unit_cpu(
                                 u,
-                                representation,
+                                route,
                                 &chunks,
                                 raw,
                                 &self.cpu.page,
                                 &self.cpu.gpu_page,
-                                &self.cpu_profile,
-                                &self.gpu_profile,
                                 pool,
                             )?;
-                            if representation == Representation::Packet {
+                            if route != DecodeRoute::Literal {
                                 stats.transform_ns += start.elapsed().as_nanos() as u64;
                             }
                             copy_spans_batch(
@@ -704,11 +695,9 @@ impl RankCodec {
             let n = self.original_bytes(row);
             let spans = device_spans(geometry, layout, row, id)?;
             let (u, representation, chunks) = select_packet(window, row, index, rank, n)?;
+            let route = self.decode_route(u, representation)?;
             stored += u.stored_length;
-            if representation == Representation::Packet
-                && u.profile.as_slice() == self.gpu_profile.as_slice()
-                && let Some(gpu) = self.gpu.as_mut()
-            {
+            if route == DecodeRoute::GpuOnDevice {
                 let plan = if row {
                     &self.cpu.gpu_row
                 } else {
@@ -716,7 +705,7 @@ impl RankCodec {
                 };
                 let start = Instant::now();
                 {
-                    let mut guard = gpu.codec.lock().unwrap();
+                    let mut guard = self.gpu.as_mut().unwrap().codec.lock().unwrap();
                     let res = guard.decode_to_device(
                         plan,
                         &chunks,
@@ -726,10 +715,7 @@ impl RankCodec {
                         stream,
                         event,
                     );
-                    if res.is_err() {
-                        let _ = stream.synchronize();
-                    }
-                    res
+                    sync_on_err(stream, res)
                 }
                 .map_err(decode_error)?;
                 stats.transform_ns += start.elapsed().as_nanos() as u64;
@@ -741,22 +727,10 @@ impl RankCodec {
                     &self.cpu.gpu_page
                 };
                 let raw = &mut self.cpu.staging.bytes_mut()[..n];
-                let pool = (representation == Representation::Packet)
-                    .then(cpu_pool)
-                    .transpose()?;
+                let pool = (route != DecodeRoute::Literal).then(cpu_pool).transpose()?;
                 let start = Instant::now();
-                decode_unit_cpu(
-                    u,
-                    representation,
-                    &chunks,
-                    raw,
-                    cpu_plan,
-                    gpu_plan,
-                    &self.cpu_profile,
-                    &self.gpu_profile,
-                    pool,
-                )?;
-                if representation == Representation::Packet {
+                decode_unit_cpu(u, route, &chunks, raw, cpu_plan, gpu_plan, pool)?;
+                if route != DecodeRoute::Literal {
                     stats.transform_ns += start.elapsed().as_nanos() as u64;
                 }
                 copy_spans_batch(
@@ -772,6 +746,21 @@ impl RankCodec {
         stats.stored_bytes = stored;
         Ok(transferred)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeRoute {
+    Literal,
+    Cpu,
+    GpuOnCpu,
+    GpuOnDevice,
+}
+
+fn sync_on_err<T, E>(stream: &Stream, res: std::result::Result<T, E>) -> std::result::Result<T, E> {
+    if res.is_err() {
+        let _ = stream.synchronize();
+    }
+    res
 }
 
 fn select_packet<'a>(
@@ -805,42 +794,38 @@ fn select_packet<'a>(
     Ok((u, representation, chunks))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode_unit_cpu(
     u: &PackedUnit,
-    representation: Representation,
+    route: DecodeRoute,
     chunks: &[&[u8]],
     raw: &mut [u8],
     cpu_plan: &Plan,
     gpu_plan: &GpuPlan,
-    cpu_profile: &[u8; 32],
-    gpu_profile: &[u8; 32],
     pool: Option<&rayon::ThreadPool>,
 ) -> Result<()> {
-    if representation == Representation::Literal {
-        let mut pos = 0;
-        for c in chunks {
-            let end = pos + c.len();
-            raw.get_mut(pos..end)
-                .ok_or_else(|| invalid("literal length mismatch"))?
-                .copy_from_slice(c);
-            pos = end;
+    match route {
+        DecodeRoute::Literal => {
+            let mut pos = 0;
+            for c in chunks {
+                let end = pos + c.len();
+                raw.get_mut(pos..end)
+                    .ok_or_else(|| invalid("literal length mismatch"))?
+                    .copy_from_slice(c);
+                pos = end;
+            }
+            if pos != raw.len() {
+                return Err(invalid("literal length mismatch"));
+            }
+            packed::verify_units(std::slice::from_ref(u), raw)?;
+            Ok(())
         }
-        if pos != raw.len() {
-            return Err(invalid("literal length mismatch"));
-        }
-        packed::verify_units(std::slice::from_ref(u), raw)?;
-        Ok(())
-    } else if u.profile.as_slice() == cpu_profile.as_slice() {
-        cpu_plan
+        DecodeRoute::Cpu => cpu_plan
             .decode_checked(chunks, raw, u.stored_crc, u.original_crc, pool)
-            .map_err(decode_error)
-    } else if u.profile.as_slice() == gpu_profile.as_slice() {
-        gpu_plan
+            .map_err(decode_error),
+        DecodeRoute::GpuOnCpu => gpu_plan
             .decode_checked_cpu(chunks, raw, u.stored_crc, u.original_crc, pool)
-            .map_err(decode_error)
-    } else {
-        Err(invalid("incompatible codec share"))
+            .map_err(decode_error),
+        DecodeRoute::GpuOnDevice => Err(invalid("GPU packet dispatched to CPU decoder")),
     }
 }
 

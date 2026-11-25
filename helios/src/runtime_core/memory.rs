@@ -635,7 +635,6 @@ impl NativeModel {
         let minimum_pages = ceiling.map_or(active as u64 * 8192u64.div_ceil(page_tokens), |limit| limit.minimum);
         let capture = options.prefix_cache.pool_only() && self.cluster().is_none();
         let cfg = &options.prefix_cache;
-        cfg.validate_compression().map_err(|error| invalid(error.to_string()))?;
         let compression_requested = cfg.compression != crate::offload::KvCompression::Off;
         let codec_layout = if compression_requested {
             let layout = contract.cache.codec_layout.as_ref().ok_or_else(|| {

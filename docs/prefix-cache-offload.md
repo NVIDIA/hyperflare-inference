@@ -41,7 +41,7 @@ recipes. Captured graphs continue to use the raw checkpoint layout. The
 defines checkpoint contents and ownership; the [CLI design](cli-design.md)
 defines configuration precedence.
 
-## Lossless KV compression
+## 0. Lossless KV compression
 
 Flare supports two lossless checkpoint compression modes selected at serving
 time with `--lossless-kv-compression`:
@@ -78,18 +78,20 @@ record verbatim to NVMe without re-encoding. Incompressible units fall back to
 emit a standard raw v3 file). Shared-memory, TCP, and RDMA readers advertising
 a matching profile can claim packed records from both manager DRAM and NVMe.
 
-Both modes are fully bidirectional across shared pools and local disk:
+Both `cpu` and `gpu` modes advertise `[ZKV1, GKV1]` receive profiles across
+single-process local tiers, single-process `selene-manager` pools, and
+standalone multi-host `--ranks` local disk (the profile handshake rejects
+mismatched rank modes at startup, and multi-host `--ranks` +
+`--prefix-cache-pool` rejects active compression at startup):
 
-- Both `cpu` and `gpu` modes advertise `[ZKV1, GKV1]` receive profiles so
-  heterogeneous clusters (such as discrete GPUs running `gpu` mode alongside
-  unified-memory or CPU-mode hosts) share every compressed checkpoint without
-  pool fragmentation or incompatible-codec misses.
 - In `gpu` mode, new captures encode on GPU as `GKV1`, `GKV1` restores decode
   on GPU, and `ZKV1` restores decode on the CPU worker pool. All active offload
   tiers (`memory`, `disk`, `pool`) share one 3-buffer aliased per-rank
-  `GpuRankCodec` workspace (~130 MiB per GPU on GLM-5.3-Flash TP4, ~10 MiB per
+  `GpuRankCodec` workspace (~130 MiB per GPU on GLM-5.3-Flash TP4, ~32 MiB per
   GPU on DeepSeek-V4.1-Flash TP4, ~440 MiB on Qwen3.8-Flash-Next TP1) with no
-  secondary CUDA primary context.
+  secondary CUDA primary context. Because `gpu` mode runs on a lowest-priority
+  CUDA transfer stream, prefer `cpu` mode on unified-memory GPUs (such as DGX
+  Spark GB10) or small-page workloads under sustained foreground GPU saturation.
 - In `cpu` mode, Flare reserves **0 GPU VRAM**, never loads GPU codec modules,
   encodes new captures as `ZKV1`, and natively decodes both `ZKV1` and `GKV1`
   checkpoints on CPU.
@@ -97,23 +99,22 @@ Both modes are fully bidirectional across shared pools and local disk:
 Readers running with compression `off` miss packed pool records and incur zero
 runtime overhead; starting with `off` against an exclusive local
 `--prefix-cache-disk` directory prunes v4 `.ckpt` files during its startup
-scan. Upgrade every manager sharing a record root before enabling v4
-compression; downgrading a manager to a build without v4 support deletes
-unrecognized v4 `.ckpt` files during its startup scan.
+scan. Any `selene-manager` serving a codec-enabled writer must support v4
+envelopes; a manager without v4 support deletes unrecognized v4 `.ckpt` files
+during its startup scan.
 
 In `gpu` mode, the pure-CUDA C++ kernels in `ignition/preparation/kv_codec_gpu.cu`
-are compiled during Ignition core export for the core's target GPU architecture
-(covering SM103, SM120, SM121, and future architectures) and embedded inside the
-signed core archive as an optional `Module` referenced by
-`CodecLayout.gpu_module`. Helios skips loading that module when compression is
-`off` or `cpu`, and loads it lazily via `cuModuleLoadData` (using only
-`libcuda.so.1`) when `--lossless-kv-compression gpu` is selected.
-Normal `cargo` builds require no CUDA compiler, and serving continues to honor
-`CUDA_DISABLE_JIT=1`. Cores exported without `CodecLayout.gpu_module` support
-`off` and `cpu`; requesting `gpu` fails at startup with a message suggesting
-`cpu` or re-export. Decoding verifies both stored and original checksums before
-completing a restore and retains source windows through the last rank's copy
-fence.
+are compiled during Ignition core export into one cubin for the export device's
+SM architecture and embedded inside the signed core archive as an optional
+`Module` referenced by `CodecLayout.gpu_module`. Helios skips loading that
+module when compression is `off` or `cpu`, and loads it lazily via
+`cuModuleLoadData` (using only `libcuda.so.1`) when
+`--lossless-kv-compression gpu` is selected. Normal `cargo` builds require no
+CUDA compiler, and serving continues to honor `CUDA_DISABLE_JIT=1`. Cores
+exported without `CodecLayout.gpu_module` support `off` and `cpu`; requesting
+`gpu` fails at startup with a message suggesting `cpu` or re-export. Decoding
+verifies both stored and original checksums before completing a restore and
+retains source windows through the last rank's copy fence.
 
 ## 1. Scope and configurations
 
