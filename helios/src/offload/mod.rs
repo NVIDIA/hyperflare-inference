@@ -54,10 +54,6 @@ impl Binding {
         self.inner.rank()
     }
 
-    pub fn summary(&self) -> &str {
-        self.inner.summary()
-    }
-
     pub fn shares(&self, other: &Self) -> bool {
         self.inner.shares(&other.inner)
     }

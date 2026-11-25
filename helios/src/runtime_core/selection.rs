@@ -69,15 +69,8 @@ impl LoadOptions {
     pub(super) fn select(&self, cores: &mut [Core], config: &mut Value) -> Result<usize> {
         self.prefix_cache
             .validate_compression()
+            .and_then(|()| self.prefix_cache.validate_topology(self.cluster_rank.is_some()))
             .map_err(|error| invalid(error.to_string()))?;
-        if self.cluster_rank.is_some()
-            && self.prefix_cache.pool.is_some()
-            && self.prefix_cache.compression != crate::offload::KvCompression::Off
-        {
-            return Err(invalid(
-                "multi-host --ranks serving does not support --lossless-kv-compression with --prefix-cache-pool; use --lossless-kv-compression off with a pool or local --prefix-cache-disk without a pool",
-            ));
-        }
         if self.mtp_verification_token_budget.is_some()
             && self.mtp_max_verification_token_budget.is_some()
         {

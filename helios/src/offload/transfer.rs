@@ -439,43 +439,6 @@ impl RankWorker {
 }
 
 impl Transfers {
-    /// Start one thread per rank. `contexts` pairs each rank's CUDA context with
-    /// its device ordinal, in rank order matching `geometry`. The pool supplies
-    /// device addresses for registered slabs or storage split by rank, and must
-    /// remain alive until the transfer threads have drained.
-    pub fn start(
-        contexts: &[(usize, i32)],
-        geometry: Vec<CacheGeometry>,
-        pool: &SlabPool,
-    ) -> Result<Self> {
-        if contexts.is_empty() || contexts.len() != geometry.len() {
-            return Err(invalid(format!(
-                "transfer threads need one context per rank: {} contexts for {} ranks",
-                contexts.len(),
-                geometry.len()
-            )));
-        }
-        let layout = Layout::new(&geometry)?;
-        let parts = pool.device_parts(&layout)?.into_iter().map(Some).collect();
-        Self::start_parts(contexts, geometry, layout, parts, &[], None)
-    }
-
-    /// Start threads that copy to and from host memory registered with identical
-    /// host and device addresses, which a job names directly. The shared pool
-    /// regions map and register during startup, so no slab pool describes them.
-    pub fn start_unmapped(contexts: &[(usize, i32)], geometry: Vec<CacheGeometry>) -> Result<Self> {
-        if contexts.is_empty() || contexts.len() != geometry.len() {
-            return Err(invalid(format!(
-                "transfer threads need one context per rank: {} contexts for {} ranks",
-                contexts.len(),
-                geometry.len()
-            )));
-        }
-        let layout = Layout::new(&geometry)?;
-        let parts = vec![None; contexts.len()];
-        Self::start_parts(contexts, geometry, layout, parts, &[], None)
-    }
-
     fn start_parts(
         contexts: &[(usize, i32)],
         geometry: Vec<CacheGeometry>,
@@ -484,10 +447,13 @@ impl Transfers {
         gpu_cubins: &[std::sync::Arc<Vec<u8>>],
         shared_gpu: Option<codec::SharedGpuCodecs>,
     ) -> Result<Self> {
-        if contexts.is_empty() {
-            return Err(invalid("transfer threads need at least one rank context"));
+        if contexts.is_empty() || contexts.len() != geometry.len() {
+            return Err(invalid(format!(
+                "transfer threads need one context per rank: {} contexts for {} ranks",
+                contexts.len(),
+                geometry.len()
+            )));
         }
-        debug_assert_eq!(contexts.len(), geometry.len());
         debug_assert_eq!(parts.len(), geometry.len());
         let (reply_sender, receiver) = mpsc::channel();
         let profile = flare_selene::codec_copy::profile(&geometry);
@@ -1504,8 +1470,9 @@ mod tests {
         let row_slab = pool.slot_address(row);
         let host = page_slabs[0];
 
-        let mut transfers =
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap();
+        let mut transfers = Copiers::new(Vec::new())
+            .start(&[(context, device)], geometry.clone(), Some(&pool))
+            .unwrap();
         let wait = |transfers: &mut Transfers| -> Reply {
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut replies = Vec::new();
@@ -1846,7 +1813,9 @@ mod tests {
             .collect();
         let row = pool.allocate_page().unwrap();
         let row_slab = pool.slot_address(row);
-        let mut transfers = Transfers::start(&contexts, geometry.clone(), &pool).unwrap();
+        let mut transfers = Copiers::new(Vec::new())
+            .start(&contexts, geometry.clone(), Some(&pool))
+            .unwrap();
         let wait = |transfers: &mut Transfers| -> Reply {
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut replies = Vec::new();
@@ -2077,7 +2046,7 @@ impl Copiers {
         }
     }
 
-    fn start(
+    pub(crate) fn start(
         &self,
         contexts: &[(usize, i32)],
         geometry: Vec<CacheGeometry>,

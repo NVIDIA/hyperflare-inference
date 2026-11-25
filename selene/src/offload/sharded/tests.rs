@@ -548,7 +548,7 @@ fn sharded_pool_with_compression_rejected_at_startup() {
         .err()
         .expect("sharded --ranks + --prefix-cache-pool + compression must be rejected");
         assert!(
-            err.to_string().contains("multi-host --ranks"),
+            err.to_string().contains("multi-host --rank"),
             "unexpected error: {err}"
         );
     }

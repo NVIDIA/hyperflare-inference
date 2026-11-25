@@ -627,60 +627,11 @@ impl RankCodec {
                         transferred += (page_bytes * run_chunks.len()) as u64;
                         i = j;
                     } else {
-                        // Decode single GPU or non-GPU page via the standard per-unit path.
-                        let (page, _) = job.pages[i];
-                        let index = first + i as u64;
-                        let spans = device_spans(geometry, layout, false, u64::from(page.0))?;
-                        let (u, representation, chunks) =
-                            select_packet(window, false, index, rank, page_bytes)?;
-                        let route = self.decode_route(u, representation)?;
-                        stored += u.stored_length;
-                        if route == DecodeRoute::GpuOnDevice {
-                            let start = Instant::now();
-                            {
-                                let mut guard = self.gpu.as_mut().unwrap().codec.lock().unwrap();
-                                let res = guard.decode_to_device(
-                                    &self.cpu.gpu_page,
-                                    &chunks,
-                                    &spans,
-                                    u.stored_crc,
-                                    u.original_crc,
-                                    stream,
-                                    event,
-                                );
-                                sync_on_err(stream, res)
-                            }
-                            .map_err(decode_error)?;
-                            stats.transform_ns += start.elapsed().as_nanos() as u64;
-                        } else {
-                            let raw = &mut self.cpu.staging.bytes_mut()[..page_bytes];
-                            let pool = (route != DecodeRoute::Literal).then(cpu_pool).transpose()?;
-                            let start = Instant::now();
-                            decode_unit_cpu(
-                                u,
-                                route,
-                                &chunks,
-                                raw,
-                                &self.cpu.page,
-                                &self.cpu.gpu_page,
-                                pool,
-                            )?;
-                            if route != DecodeRoute::Literal {
-                                stats.transform_ns += start.elapsed().as_nanos() as u64;
-                            }
-                            copy_spans_batch(
-                                stream,
-                                event,
-                                Direction::In,
-                                &[(0, spans)],
-                                self.cpu.staging_alias,
-                            )?;
-                        }
-                        transferred += page_bytes as u64;
-                        i += 1;
+                        // Single GPU or non-GPU page: fall through to the per-unit loop below.
+                        break;
                     }
                 }
-                remaining_pages_offset = job.pages.len();
+                remaining_pages_offset = i;
             }
         }
 
@@ -1061,7 +1012,9 @@ mod tests {
                 .start(&[(context, 0)], vec![geometry.clone()], None)
                 .unwrap()
         } else {
-            Transfers::start_unmapped(&[(context, 0)], vec![geometry.clone()]).unwrap()
+            Copiers::new(Vec::new())
+                .start(&[(context, 0)], vec![geometry.clone()], None)
+                .unwrap()
         };
 
         // 1. Capture VRAM -> packed host (Direction::Out) across multiple pages + row.
@@ -1175,7 +1128,9 @@ mod tests {
         assert_eq!(stats.failed_windows, 1);
 
         geometry.placement = KvCompression::Off;
-        let mut off = Transfers::start_unmapped(&[(context, 0)], vec![geometry]).unwrap();
+        let mut off = Copiers::new(Vec::new())
+            .start(&[(context, 0)], vec![geometry], None)
+            .unwrap();
         assert!(off.codec_profile().is_none());
         transfers.close().unwrap();
         off.close().unwrap();
@@ -1283,7 +1238,9 @@ mod tests {
                 .expect("set FLARE_TEST_KV_CODEC_CUBIN to a compiled kv_codec_gpu.cubin");
             vec![Arc::new(std::fs::read(path).unwrap())]
         };
-        let mut cpu_xfer = Transfers::start_unmapped(&[(context, 0)], vec![base_geo.clone()]).unwrap();
+        let mut cpu_xfer = Copiers::new(Vec::new())
+            .start(&[(context, 0)], vec![base_geo.clone()], None)
+            .unwrap();
         base_geo.placement = KvCompression::Gpu;
         let gpu_copiers = Copiers::new(test_cubin());
         let mut gpu_xfer = gpu_copiers.start(&[(context, 0)], vec![base_geo], None).unwrap();

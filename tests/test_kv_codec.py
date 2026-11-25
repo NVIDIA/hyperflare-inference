@@ -32,12 +32,35 @@ def test_codec_layout_proto_gpu_module_optional():
     assert roundtrip_populated.gpu_module == GPU_CODEC_MODULE_NAME
 
 
-def test_gpu_codec_source_packaged_and_has_no_constant_globals():
+def test_gpu_codec_source_packaged():
     from ignition.preparation import kv_codec
 
     assert kv_codec._SOURCE.is_file(), f"missing packaged CUDA source: {kv_codec._SOURCE}"
-    source = kv_codec._SOURCE.read_text(encoding="utf-8")
-    assert "__constant__" not in source
-    # Pin the CUDA 13.3+ NVVM CRC32 table-synthesis barrier so standalone cubins
-    # never emit `.nv.global.init` `_$_crctable` symbols.
-    assert 'asm("" : "+r"(mask))' in source
+
+
+def test_compiled_gpu_codec_cubin_declares_no_elf_globals(tmp_path):
+    import os
+    import shutil
+    import subprocess
+    import pytest
+
+    if not os.environ.get("FLARE_RUN_CUDA_TESTS"):
+        pytest.skip("set FLARE_RUN_CUDA_TESTS=1 to compile and inspect kv_codec_gpu.cubin")
+    if shutil.which("readelf") is None:
+        pytest.skip("readelf not available")
+
+    from ignition.preparation.kv_codec import compile_gpu_codec_cubin
+
+    cubin = compile_gpu_codec_cubin((12, 0), cache_dir=tmp_path)
+    out = subprocess.run(
+        ["readelf", "-sW", str(cubin)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    globals_defined = [
+        line
+        for line in out.splitlines()
+        if len(line.split()) >= 8 and line.split()[3] == "OBJECT" and line.split()[6] != "UND"
+    ]
+    assert globals_defined == [], f"standalone cubin must declare zero ELF globals: {globals_defined}"

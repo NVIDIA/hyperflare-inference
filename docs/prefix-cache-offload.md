@@ -532,8 +532,10 @@ page count, the rank count, the per-rank plane sizes and row bytes, the page
 segment offset, the row segment offset, the row checksum, and the creation
 time. Versions 1 and 2 encode each plane size as `u64`; version 3 uses `u32`
 plane sizes so wider rank/plane catalogs fit the same header block. Row sizes
-remain `u64`. Version 4 stores the variable-length shares described in [Lossless KV compression](#lossless-kv-compression). New raw records use version 3 when every plane fits `u32`, otherwise
-the `u64` format is retained. All encodings still require the header to fit 4 KiB.
+remain `u64`. Version 4 stores the variable-length shares described in
+[Lossless KV compression](#0-lossless-kv-compression). New raw records use
+version 3 when every plane fits `u32`, otherwise the `u64` format is retained.
+All encodings still require the header to fit 4 KiB.
 Versions 2 and 3 use flag bit 31 for a replicated page segment and bit 30 for a
 replicated row; version 3 also permits non-replicated records. Page offsets use
 one fixed stride for the whole record. Version-1 and version-2 records still

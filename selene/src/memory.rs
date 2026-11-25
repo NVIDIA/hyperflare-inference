@@ -176,22 +176,14 @@ unsafe fn write_packed_into_slabs(
                 crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
             }
         });
-    } else {
-        for &(start, bytes) in &writes {
-            // SAFETY: exclusive ownership guaranteed by caller.
-            unsafe {
-                crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
-            }
-        }
+        return (dir, offset.div_ceil(slab_bytes));
     }
     #[cfg(not(feature = "codec"))]
-    {
-        let _ = parallel;
-        for &(start, bytes) in &writes {
-            // SAFETY: exclusive ownership guaranteed by caller.
-            unsafe {
-                crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
-            }
+    let _ = parallel;
+    for &(start, bytes) in &writes {
+        // SAFETY: exclusive ownership guaranteed by caller.
+        unsafe {
+            crate::codec_copy::write_to_slabs(slab_addrs, slab_bytes, start, bytes);
         }
     }
     let keep = offset.div_ceil(slab_bytes);

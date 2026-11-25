@@ -90,6 +90,18 @@ impl PrefixCacheOffload {
         Ok(())
     }
 
+    /// Reject unsupported multi-host (`--rank`) + pool + compression combinations.
+    /// Called both during core selection (for fast startup failure) and during
+    /// offload store preparation (for direct callers).
+    pub fn validate_topology(&self, multi_host: bool) -> Result<()> {
+        if multi_host && self.pool.is_some() && self.compression != KvCompression::Off {
+            return Err(
+                "multi-host --rank serving does not support --lossless-kv-compression with --prefix-cache-pool; use --lossless-kv-compression off with a pool or local --prefix-cache-disk without a pool".into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn enabled(&self) -> bool {
         self.memory_bytes.unwrap_or(0) != 0
             || (self.disk.is_some() && self.disk_limit != Some(0))
@@ -478,11 +490,7 @@ pub fn prepare_with_inputs(
     if shard.is_some() && memory_bytes != 0 {
         return Err("a multi-host core keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
     }
-    if shard.is_some() && options.pool.is_some() && options.compression != KvCompression::Off {
-        return Err(
-            "multi-host --ranks serving does not support --lossless-kv-compression with --prefix-cache-pool; use --lossless-kv-compression off with a pool or local --prefix-cache-disk without a pool".into(),
-        );
-    }
+    options.validate_topology(shard.is_some())?;
     let mut notes = Vec::new();
     let directory = match options
         .disk

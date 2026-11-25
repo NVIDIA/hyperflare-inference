@@ -713,7 +713,9 @@ Helios rejects graph operation identifiers 10, 11, and 13 and the graph kinds
 implemented: loading and serving cores that recorded those operations.
 
 Unselected graph templates and executables are never reconstructed. Functions
-used only by omitted graphs are dropped, as are unused modules without globals.
+used only by omitted graphs are dropped, as are unused modules without globals,
+except the codec module named by `CodecLayout.gpu_module` while
+`--lossless-kv-compression gpu` is active.
 Modules with globals retain their persistent contents. Weights, MTP weights,
 and fixed scratch remain intact because opaque kernel parameters and persistent
 device storage can embed their addresses. `SchedulerLimits.max_active` controls
