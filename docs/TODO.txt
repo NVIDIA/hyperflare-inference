@@ -341,3 +341,8 @@
 [ ] Qualify --row-shard-prefill on SM103 GPUs and remove the SM103 planning
     refusal in ignition/planning.py once tensor-parallel export and native
     serving pass on SM103.
+
+[ ] Validate GB300 PCI ID 0x31c210de through live CLI revision selection and
+    WinUI hardware filtering on that device. Run Orbit's PCI revision tests
+    on Unix; the Windows build excludes Orbit. Close when both applications
+    select gb300 on the device and the Orbit tests pass.
