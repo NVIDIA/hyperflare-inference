@@ -645,14 +645,18 @@ impl Inputs {
                     PrefixStateRow => values.push(
                         frame
                             .scheduler
-                            .snapshot_slot(
+                            .checked_snapshot_slot(
                                 live.prefix_snapshot()
                                     .ok_or("restore has no prefix state")?,
-                            )
+                            )?
                             .0 as i64,
                     ),
-                    SnapshotStateRow => values
-                        .push(frame.scheduler.snapshot_slot(live.snapshot_destination()).0 as i64),
+                    SnapshotStateRow => values.push(
+                        frame
+                            .scheduler
+                            .checked_snapshot_slot(live.snapshot_destination())?
+                            .0 as i64,
+                    ),
                     ConsumedTokens => values.push(live.consumed_tokens as i64),
                     SnapshotConsumedTokens => values.push(live.snapshot_consumed() as i64),
                     SamplingSeed => values.push(admission.sampling.seed as i64),
