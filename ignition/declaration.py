@@ -206,6 +206,14 @@ class SpeculativeMethod:
 
 
 @dataclass(frozen=True)
+class KvCacheFormat:
+    """Physical preparation costs for an alternative KV cache storage format."""
+
+    ranks: Mapping[int, RankCosts]
+    plain_ranks: Mapping[int, RankCosts] = field(default_factory=lambda: MappingProxyType({}))
+
+
+@dataclass(frozen=True)
 class Recipe:
     """One model family's qualified checkpoints, serving range, costs, and bootstrap.
 
@@ -272,6 +280,8 @@ class Recipe:
     mla_compute_modes: tuple[str, ...] = ("auto",)
     mla_compute_mode: str = "auto"
     expert_scale_compression: str | None = None
+    kv_cache_format: str = "fp8"
+    kv_cache_formats: Mapping[str, KvCacheFormat] = field(default_factory=lambda: MappingProxyType({}))
     export_repository: str = ""
     # Preparation overrides for vocabulary and transition projections used only by proposals.
     draft_head_quantizations: tuple[str, ...] = ()
@@ -329,6 +339,15 @@ class Recipe:
                 raise ValueError("speculative methods require known names and every declared tensor-parallel size")
             if method.draft_bytes is not None and method.draft_bytes <= 0:
                 raise ValueError("speculative draft bytes must be positive")
+        for name, fmt in self.kv_cache_formats.items():
+            if not name or name == self.kv_cache_format:
+                raise ValueError("alternative KV cache formats must have non-empty names distinct from the default")
+            if set(fmt.ranks) != set(self.ranks):
+                raise ValueError(f"kv_cache_formats[{name!r}] must declare costs for every recipe tensor-parallel size")
+            if self.speculation is not None and set(fmt.plain_ranks) != set(self.ranks):
+                raise ValueError(
+                    f"kv_cache_formats[{name!r}] must declare plain_ranks for every recipe tensor-parallel size"
+                )
         for checkpoint in self.checkpoints:
             if any(costs is not None and (not costs or not set(costs) <= set(self.ranks))
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):
@@ -348,8 +367,14 @@ class Recipe:
     def served_name(self, checkpoint: Checkpoint) -> str:
         return checkpoint.served_model_name or self.served_model_name
 
-    def costs(self, world_size: int, speculation: Speculation | None, checkpoint: Checkpoint | None = None) -> RankCosts:
-        """Return one rank's costs under the given speculation settings, for `checkpoint` when it declares its own."""
+    def costs(self, world_size: int, speculation: Speculation | None, checkpoint: Checkpoint | None = None,
+              kv_cache_format: str | None = None) -> RankCosts:
+        """Return one rank's costs under the given speculation and KV cache settings."""
+        if kv_cache_format is not None and kv_cache_format in self.kv_cache_formats:
+            fmt = self.kv_cache_formats[kv_cache_format]
+            if speculation is None:
+                return (fmt.plain_ranks or fmt.ranks)[world_size]
+            return fmt.ranks[world_size]
         ranks = self.ranks if checkpoint is None or checkpoint.ranks is None else checkpoint.ranks
         plain = self.plain_ranks if checkpoint is None or checkpoint.plain_ranks is None else checkpoint.plain_ranks
         if speculation is None:

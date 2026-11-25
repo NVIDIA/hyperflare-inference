@@ -199,6 +199,7 @@ def _export_hosts(args):
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
+                         kv_cache_format=args.kv_cache_format,
                          online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode,
@@ -283,6 +284,7 @@ def _prepare(args):
                       roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
+                      kv_cache_format=args.kv_cache_format,
                       online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                       language_model_only=args.language_model_only,
                       mla_compute_mode=args.mla_compute_mode)
@@ -303,6 +305,7 @@ def _prepare(args):
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
                      f" · mixed prefill {'on' if plan.mixed_prefill else 'off'}"
                      f" · expert scales {plan.expert_scale_compression or 'native'}"
+                     f"{(' · kv cache ' + plan.kv_cache_format) if plan.kv_cache_format != plan.recipe.kv_cache_format else ''}"
                      f"{(' · online MXFP8 ' + plan.online_mxfp8_scope) if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
@@ -465,7 +468,8 @@ def debug_serve(args) -> int:
                          stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
-                         expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
+                         expert_scale_compression=args.expert_scale_compression, kv_cache_format=args.kv_cache_format,
+                         online_mxfp8=args.online_mxfp8,
                          online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode,
                          row_shard_prefill=args.row_shard_prefill)

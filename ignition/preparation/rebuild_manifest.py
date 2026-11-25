@@ -263,6 +263,8 @@ def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
     args.extend(['--prefill-chunk-size', str(plan.prefill_chunk)])
     if plan.expert_scale_compression is not None:
         args.extend(['--expert-scale-compression', plan.expert_scale_compression])
+    if getattr(plan, 'kv_cache_format', None) and plan.kv_cache_format != plan.recipe.kv_cache_format:
+        args.extend(['--kv-cache-format', plan.kv_cache_format])
     if getattr(plan, 'prompt_logprobs', False):
         args.append('--prompt-logprobs')
     if plan.mixed_prefill:
@@ -376,6 +378,7 @@ def from_plan(model, plan, *, compiled_forwards, multi_host=False):
     add('force_moe_decode_a16', SCOPE_DEPLOYMENT, bool(plan.force_moe_decode_a16))
     add('image_concurrency', SCOPE_DEPLOYMENT, int(plan.image_concurrency))
     add('joint_tuning', SCOPE_DEPLOYMENT, bool(plan.joint_tuning))
+    add('kv_cache_format', SCOPE_DEPLOYMENT, plan.kv_cache_format)
     add('lock_gpu_clocks', SCOPE_DEPLOYMENT, bool(getattr(plan, 'lock_gpu_clocks', False)))
     add('max_concurrency', SCOPE_DEPLOYMENT, int(plan.concurrency))
     add('mixed_prefill', SCOPE_DEPLOYMENT, bool(plan.mixed_prefill))

@@ -171,6 +171,7 @@ def run(args):
         row_shard_prefill=args.row_shard_prefill,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
+        kv_cache_format=args.kv_cache_format,
         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
         language_model_only=args.language_model_only or model.recipe.benchmark_language_model_only,
         mla_compute_mode=args.mla_compute_mode)
@@ -242,7 +243,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         "preparation": {key: preparation[key] for key in (
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
             "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "compile_workers",
-            "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
+            "speculative_token_capacity", "speculation", "expert_scale_compression", "kv_cache_format", "mla_compute_mode",
             "row_shard_prefill",
             "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}
 
