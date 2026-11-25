@@ -220,20 +220,11 @@ class Plan:
                     f"hybrid context parallelism is not supported for {self.checkpoint.alias} "
                     f"at TP{self.world_size} DCP{self.context_parallel_size}"
                 )
-        if self.kv_cache_format is None and self.recipe.kv_cache_format is not None:
-            object.__setattr__(self, "kv_cache_format", self.recipe.kv_cache_format)
-        if self.kv_cache_format is not None:
-            supported = self.recipe.supported_kv_cache_formats
-            if not supported:
-                raise UsageError(
-                    f"--kv-cache-format {self.kv_cache_format}: {self.checkpoint.alias}"
-                    " does not declare KV cache format selection"
-                )
-            if self.kv_cache_format not in supported:
-                raise UsageError(
-                    f"--kv-cache-format {self.kv_cache_format}: {self.checkpoint.alias} supports "
-                    + ", ".join(supported)
-                )
+        object.__setattr__(
+            self,
+            "kv_cache_format",
+            resolve_kv_cache_format(self.recipe, self.checkpoint.alias, self.kv_cache_format),
+        )
         if self.online_mxfp8_scope is None:
             object.__setattr__(self, "online_mxfp8_scope",
                                self.recipe.online_mxfp8_scope if self.online_mxfp8 else "all")
@@ -456,6 +447,21 @@ class Plan:
         }
 
 
+def resolve_kv_cache_format(recipe: Recipe, alias: str, value: str | None) -> str | None:
+    """Resolve and validate `--kv-cache-format` against `recipe`'s declared formats."""
+    resolved = recipe.kv_cache_format if value is None else value
+    if resolved is not None:
+        supported = recipe.supported_kv_cache_formats
+        if not supported:
+            raise UsageError(
+                f"--kv-cache-format {resolved}: {alias}"
+                " does not declare KV cache format selection"
+            )
+        if resolved not in supported:
+            raise UsageError(f"--kv-cache-format {resolved}: {alias} supports " + ", ".join(supported))
+    return resolved
+
+
 def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concurrency: int, reserve_bytes: int,
         speculation: Speculation | None, prefill_chunk: int | None = None,
         context_parallel: bool = True, context_parallel_size: int | None = None, stream_overlap: bool = True, cache_states: int | None = None,
@@ -476,19 +482,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression = recipe.expert_scale_compression
     if expert_scale_compression == "native":
         expert_scale_compression = None
-    if kv_cache_format is None:
-        kv_cache_format = recipe.kv_cache_format
-    if kv_cache_format is not None:
-        supported = recipe.supported_kv_cache_formats
-        if not supported:
-            raise UsageError(
-                f"--kv-cache-format {kv_cache_format}: {checkpoint.alias}"
-                " does not declare KV cache format selection"
-            )
-        if kv_cache_format not in supported:
-            raise UsageError(
-                f"--kv-cache-format {kv_cache_format}: {checkpoint.alias} supports " + ", ".join(supported)
-            )
+    kv_cache_format = resolve_kv_cache_format(recipe, checkpoint.alias, kv_cache_format)
     if mla_compute_mode not in recipe.mla_compute_modes:
         raise UsageError(f"--mla-compute-mode {mla_compute_mode}: supported values for this recipe are "
                          + ", ".join(recipe.mla_compute_modes))

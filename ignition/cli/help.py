@@ -43,11 +43,14 @@ def recipe_help(model=None, *, recipes=(), prog="ignition"):
     if checkpoint.scale_compressed_device_bytes:
         lines.append(f"  --expert-scale-compression: native, {', '.join(checkpoint.scale_compressed_device_bytes)};"
                      f" default {recipe.expert_scale_compression or 'native'}.")
-    if recipe.kv_cache_formats:
-        lines.append(
-            f"  --kv-cache-format: {', '.join(recipe.supported_kv_cache_formats)};"
-            f" default {recipe.kv_cache_format}."
-        )
+    if recipe.supported_kv_cache_formats:
+        if recipe.kv_cache_formats:
+            lines.append(
+                f"  --kv-cache-format: {', '.join(recipe.supported_kv_cache_formats)};"
+                f" default {recipe.kv_cache_format}."
+            )
+        else:
+            lines.append(f"  --kv-cache-format: {recipe.kv_cache_format} only.")
     speculation = recipe.speculation
     if speculation is not None:
         methods = tuple(dict.fromkeys(name for name in (speculation.method, *recipe.speculative_methods) if name))
@@ -86,13 +89,33 @@ def recipe_help(model=None, *, recipes=(), prog="ignition"):
     if recipe.kv_cache_formats:
         default_tp = recipe.checkpoint_tensor_parallel(checkpoint)[0]
         default_page = recipe.costs(default_tp, recipe.speculation, checkpoint).page_bytes
+        plain_default_page = (
+            recipe.costs(default_tp, None, checkpoint).page_bytes
+            if recipe.speculation is not None else None
+        )
         for name in recipe.kv_cache_formats:
             alt_page = recipe.costs(default_tp, recipe.speculation, checkpoint, kv_cache_format=name).page_bytes
-            if default_page > 0 and alt_page < default_page:
-                saving = 100 * (1 - alt_page / default_page)
+            spec_saving = round(100 * (1 - alt_page / default_page)) if default_page > 0 and alt_page < default_page else None
+            plain_saving = None
+            if plain_default_page is not None and plain_default_page > 0:
+                alt_plain = recipe.costs(default_tp, None, checkpoint, kv_cache_format=name).page_bytes
+                if alt_plain < plain_default_page:
+                    plain_saving = round(100 * (1 - alt_plain / plain_default_page))
+            if spec_saving is not None and plain_saving is not None and plain_saving != spec_saving:
                 optional.append(
                     f"--kv-cache-format {name}"
-                    f" (TP{default_tp}: estimated {saving:.0f}% smaller KV pages; actual savings vary)"
+                    f" (TP{default_tp}: estimated {spec_saving}% smaller KV pages,"
+                    f" {plain_saving}% with --no-mtp; actual savings vary)"
+                )
+            elif spec_saving is not None:
+                optional.append(
+                    f"--kv-cache-format {name}"
+                    f" (TP{default_tp}: estimated {spec_saving}% smaller KV pages; actual savings vary)"
+                )
+            elif plain_saving is not None:
+                optional.append(
+                    f"--kv-cache-format {name}"
+                    f" (TP{default_tp} --no-mtp: estimated {plain_saving}% smaller KV pages; actual savings vary)"
                 )
             else:
                 optional.append(f"--kv-cache-format {name}")

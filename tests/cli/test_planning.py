@@ -4,59 +4,14 @@
 """Recipe-free planning, world-size validation, and PreparationManifest serialization."""
 
 from dataclasses import replace
-from types import MappingProxyType, SimpleNamespace
 
 import pytest
-from google.protobuf import json_format
 
 from ignition import planning
-from ignition.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, Speculation
+from ignition.declaration import Speculation
 from ignition.errors import CapacityError, UsageError
-from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
-
-GIB = 1 << 30
-MIB = 1 << 20
-DRAFTING = Speculation(draft_tokens=3)
-
-
-def _recipe(name="fixture", *, device_gib=60, ranks=(1, 2, 4), speculation=DRAFTING,
-            row_shard_prefill_world_sizes=(), joint_tuning=False):
-    checkpoint = Checkpoint(
-        alias=f"{name}-alias",
-        repository=f"example/{name}",
-        revision="ab12cd34" + "0" * 32,
-        architecture="FixtureForCausalLM",
-        stored_bytes=device_gib * GIB,
-        device_bytes=device_gib * GIB,
-        draft_bytes=2 * GIB if speculation is not None else 0,
-    )
-    return Recipe(
-        name=name,
-        served_model_name=name,
-        checkpoints=(checkpoint,),
-        context=262144,
-        page_tokens=64,
-        concurrency=4,
-        max_concurrency=64,
-        max_draft_tokens=7 if speculation is not None else 0,
-        prefill_chunk=4096,
-        ranks=MappingProxyType({size: RankCosts(100 * MIB // size, 2 * MIB // size, 4 * GIB) for size in ranks}),
-        plain_ranks=MappingProxyType(
-            {size: RankCosts(80 * MIB // size, 3 * MIB // (2 * size), 3 * GIB) for size in ranks}
-            if speculation is not None else {}
-        ),
-        prepare=lambda *args, **kwargs: None,
-        usage=lambda prepared: (),
-        sampling_defaults=SamplingDefaults(temperature=1.0, top_p=1.0, top_k=-1),
-        speculation=speculation,
-        joint_tuning=joint_tuning,
-        row_shard_prefill_world_sizes=row_shard_prefill_world_sizes,
-    )
-
-
-def _gpu(index, free_gib=95, capability=(12, 0)):
-    return planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index:04d}",
-                        96 * GIB, int(free_gib * GIB), capability)
+from ignition.preparation import runtime_core_pb2 as proto
+from tests.cli.planning_fixture import DRAFTING, decode_manifest_params, make_gpu as _gpu, make_recipe as _recipe
 
 
 def test_recipe_validates_row_shard_prefill_world_sizes():
@@ -90,13 +45,8 @@ def test_row_shard_prefill_validation_automatic_sizing_and_rebuild_manifest(monk
     assert fitted.row_shard_prefill
 
     for candidate in (ordinary, sharded, fitted):
-        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), candidate, compiled_forwards=True)
+        manifest, by_key = decode_manifest_params(candidate)
         assert ("--row-shard-prefill" in manifest["reproduction_args"]) == candidate.row_shard_prefill
-        encoded = json_format.ParseDict(manifest, proto.PreparationManifest())
-        decoded = proto.PreparationManifest.FromString(encoded.SerializeToString())
-        keys = [parameter.key for parameter in decoded.parameters]
-        assert keys == sorted(keys) and len(keys) == len(set(keys))
-        by_key = {parameter.key: parameter for parameter in decoded.parameters}
         assert by_key["row_shard_prefill"].scope == proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT
         assert by_key["row_shard_prefill"].value.bool_value == candidate.row_shard_prefill
         assert by_key["online_mxfp8"].scope == proto.PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT
@@ -149,12 +99,8 @@ def test_preparation_manifest_resolves_scopes_and_dflash2_inheritance(monkeypatc
     gpu = (_gpu(0),)
 
     def decode_params(plan):
-        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
-        encoded = json_format.ParseDict(manifest, proto.PreparationManifest())
-        decoded = proto.PreparationManifest.FromString(encoded.SerializeToString(deterministic=True))
-        keys = [parameter.key for parameter in decoded.parameters]
-        assert keys == sorted(keys) and len(keys) == len(set(keys))
-        return {parameter.key: parameter for parameter in decoded.parameters}
+        _, params = decode_manifest_params(plan)
+        return params
 
     # Inherited DFlash2 MXFP8 body quantization resolves explicitly when online_mxfp8 + all scope.
     inherited = planning.plan(recipe, recipe.checkpoints[0], gpu, selected=(0,), concurrency=4,

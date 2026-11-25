@@ -57,6 +57,19 @@ def _keep_reserve(plan, usage) -> None:
                             f"[memory] reserve requires {plan.reserve_bytes / gib:.1f} GiB.")
 
 
+def _check_kv_page_bytes(plan, storage) -> None:
+    """Require that a recipe declaring KV cache formats prepared the planned KV page size."""
+    if plan.kv_cache_format is None:
+        return
+    actual = sum(region.unit_bytes for region in storage.dynamic_regions if region.group == "KV_PAGES")
+    expected = plan.costs.page_bytes
+    if actual != expected:
+        raise PreparationError(
+            f"--kv-cache-format {plan.kv_cache_format}: recipe declared {expected:,} bytes per KV page"
+            f" but prepared {actual:,} bytes per KV page."
+        )
+
+
 def _server_options(configuration, model, plan) -> dict:
     """Derive native server settings independently of preparation's physical KV backing."""
     recipe, checkpoint = plan.recipe, plan.checkpoint
@@ -305,7 +318,7 @@ def _prepare(args):
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
                      f" · mixed prefill {'on' if plan.mixed_prefill else 'off'}"
                      f" · expert scales {plan.expert_scale_compression or 'native'}"
-                     f"{(' · kv cache format ' + plan.kv_cache_format) if plan.has_custom_kv_cache_format else ''}"
+                     f"{(' · kv cache format ' + plan.kv_cache_format) if plan.kv_cache_format is not None else ''}"
                      f"{(' · online MXFP8 ' + plan.online_mxfp8_scope) if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
@@ -362,6 +375,7 @@ def _prepare(args):
         with prepared:
             usage = model.recipe.usage(prepared)
             _keep_reserve(plan, usage)
+            _check_kv_page_bytes(plan, storage)
             options = _server_options(configuration, model, plan)
             from ignition.preparation.model_core import export_core
 

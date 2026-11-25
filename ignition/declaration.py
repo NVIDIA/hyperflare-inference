@@ -210,11 +210,12 @@ class KvCacheFormat:
     """Per-rank KV page byte overrides for an alternative KV cache storage format.
 
     Keyed in `Recipe.kv_cache_formats` by the `--kv-cache-format` CLI value.
-    `page_bytes` maps each recipe tensor-parallel size to its per-page byte cost
-    when speculation is enabled (or always when the recipe does not speculate);
-    `plain_page_bytes` maps per-page byte costs when speculation is disabled
-    (`--no-mtp`) for speculative recipes. All other `RankCosts` fields,
-    checkpoint cost overrides, and `speculative_methods` costs are preserved.
+    `page_bytes` maps each recipe tensor-parallel size to its per-page byte cost.
+    When `plain_page_bytes` is non-empty, it overrides `page_bytes` whenever a plan
+    runs without speculation (`speculation is None`, including `--no-mtp` and
+    non-speculating recipes); when empty, `page_bytes` applies to both speculative
+    and non-speculative plans. All other `RankCosts` fields, checkpoint cost
+    overrides, and `speculative_methods` costs are preserved.
     """
 
     page_bytes: Mapping[int, int]
@@ -361,25 +362,18 @@ class Recipe:
         for name, fmt in self.kv_cache_formats.items():
             if not name or name == self.kv_cache_format:
                 raise ValueError("alternative KV cache formats must have non-empty names distinct from the default")
-            if set(fmt.page_bytes) != expected_sizes:
-                missing = sorted(expected_sizes - set(fmt.page_bytes))
-                extra = sorted(set(fmt.page_bytes) - expected_sizes)
-                raise ValueError(
-                    f"kv_cache_formats[{name!r}].page_bytes must cover every recipe tensor-parallel size"
-                    f" (missing={missing}, unexpected={extra})"
-                )
-            if any(type(nbytes) is not int or nbytes <= 0 for nbytes in fmt.page_bytes.values()):
-                raise ValueError(f"kv_cache_formats[{name!r}].page_bytes values must be positive integers")
-            if self.speculation is not None and fmt.plain_page_bytes:
-                if set(fmt.plain_page_bytes) != expected_sizes:
-                    missing = sorted(expected_sizes - set(fmt.plain_page_bytes))
-                    extra = sorted(set(fmt.plain_page_bytes) - expected_sizes)
+            for field_name, pages in (("page_bytes", fmt.page_bytes), ("plain_page_bytes", fmt.plain_page_bytes)):
+                if field_name == "plain_page_bytes" and not pages:
+                    continue
+                if set(pages) != expected_sizes:
+                    missing = sorted(expected_sizes - set(pages))
+                    extra = sorted(set(pages) - expected_sizes)
                     raise ValueError(
-                        f"kv_cache_formats[{name!r}].plain_page_bytes must cover every recipe tensor-parallel size"
+                        f"kv_cache_formats[{name!r}].{field_name} must cover every recipe tensor-parallel size"
                         f" (missing={missing}, unexpected={extra})"
                     )
-                if any(type(nbytes) is not int or nbytes <= 0 for nbytes in fmt.plain_page_bytes.values()):
-                    raise ValueError(f"kv_cache_formats[{name!r}].plain_page_bytes values must be positive integers")
+                if any(type(nbytes) is not int or nbytes <= 0 for nbytes in pages.values()):
+                    raise ValueError(f"kv_cache_formats[{name!r}].{field_name} values must be positive integers")
         for checkpoint in self.checkpoints:
             if any(costs is not None and (not costs or not set(costs) <= set(self.ranks))
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):

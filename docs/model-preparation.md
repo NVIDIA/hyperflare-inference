@@ -63,7 +63,11 @@ Recurrent state, compressor accumulators, and hidden activations retain their
 model-specific precision. Cache writers and attention readers use matching
 scales where required, and memory planning includes each cache's declared page
 precision and partial-page snapshots.
-A core's cache layouts are fixed when it is prepared.
+Recipes may also declare alternative paged KV cache storage formats selected at
+preparation time with `--kv-cache-format`; Ignition checks that the prepared
+`KV_PAGES` allocation matches the declared per-page byte size before export.
+A core's cache layouts are fixed when it is prepared, so changing
+`--kv-cache-format` requires re-export.
 
 ## Environment setup
 

@@ -365,7 +365,7 @@ rules:
 
 - `PREPARATION_PARAMETER_SCOPE_DEPLOYMENT`: deployment-local preparation
   options (capacities, compiler, transport, tuning, speculative shape
-  settings, and declared `kv_cache_format` when non-`None`). Retained for
+  settings, and the resolved `kv_cache_format` when the recipe declares formats). Retained for
   inspection and reproduction; ignored by core combination and cached-weight
   reuse (`kv_cache_format` affects only the deployment's KV cache pool layout
   and attention/KV-writer kernels, never resident checkpoint weight payloads).
