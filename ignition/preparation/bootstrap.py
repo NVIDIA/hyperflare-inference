@@ -27,6 +27,7 @@ class BasePreparationConfig:
 
     compile_workers: int | None = None
     autotune_effort: str = "default"
+    kv_cache_format: str | None = None
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     tuning_replica: TuningReplica | None = None
@@ -51,6 +52,7 @@ def common_preparation_kwargs(plan, *, compile_forwards: bool, kernel_cache: Pat
         "mtp_only": plan.speculation is not None and plan.speculation.mtp_only,
         "compile_workers": plan.compile_workers,
         "autotune_effort": plan.autotune_effort,
+        "kv_cache_format": plan.kv_cache_format,
         "tuning_replica": plan.tuning_replica,
         "native_dense_activations": plan.native_dense_activations,
         "lock_gpu_clocks": plan.lock_gpu_clocks and plan.autotune_effort != "off",

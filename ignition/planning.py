@@ -183,7 +183,7 @@ class Plan:
     mixed_prefill: bool = False
     prompt_logprobs: bool = False
     expert_scale_compression: str | None = None
-    kv_cache_format: str = "fp8"
+    kv_cache_format: str | None = None
     mla_compute_mode: str = "auto"
     roce_ring: bool = False
     roce_chain: bool = False
@@ -219,6 +219,20 @@ class Plan:
                 raise UsageError(
                     f"hybrid context parallelism is not supported for {self.checkpoint.alias} "
                     f"at TP{self.world_size} DCP{self.context_parallel_size}"
+                )
+        if self.kv_cache_format is None and self.recipe.kv_cache_format is not None:
+            object.__setattr__(self, "kv_cache_format", self.recipe.kv_cache_format)
+        if self.kv_cache_format is not None:
+            supported = self.recipe.supported_kv_cache_formats
+            if not supported:
+                raise UsageError(
+                    f"--kv-cache-format {self.kv_cache_format}: {self.checkpoint.alias}"
+                    " does not declare KV cache format selection"
+                )
+            if self.kv_cache_format not in supported:
+                raise UsageError(
+                    f"--kv-cache-format {self.kv_cache_format}: {self.checkpoint.alias} supports "
+                    + ", ".join(supported)
                 )
         if self.online_mxfp8_scope is None:
             object.__setattr__(self, "online_mxfp8_scope",
@@ -301,6 +315,11 @@ class Plan:
 
         return (0 if self.speculation is None else speculative_token_capacity(
             self.concurrency, self.speculation.draft_tokens + 1, self.speculation.token_capacity))
+
+    @property
+    def has_custom_kv_cache_format(self) -> bool:
+        """Whether this plan selects a non-default KV cache storage format."""
+        return self.kv_cache_format is not None and self.kv_cache_format != self.recipe.kv_cache_format
 
     @property
     def costs(self):
@@ -459,11 +478,17 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression = None
     if kv_cache_format is None:
         kv_cache_format = recipe.kv_cache_format
-    if kv_cache_format != recipe.kv_cache_format and kv_cache_format not in recipe.kv_cache_formats:
-        supported = (recipe.kv_cache_format, *recipe.kv_cache_formats)
-        raise UsageError(
-            f"--kv-cache-format {kv_cache_format}: {checkpoint.alias} supports " + ", ".join(supported)
-        )
+    if kv_cache_format is not None:
+        supported = recipe.supported_kv_cache_formats
+        if not supported:
+            raise UsageError(
+                f"--kv-cache-format {kv_cache_format}: {checkpoint.alias}"
+                " does not declare KV cache format selection"
+            )
+        if kv_cache_format not in supported:
+            raise UsageError(
+                f"--kv-cache-format {kv_cache_format}: {checkpoint.alias} supports " + ", ".join(supported)
+            )
     if mla_compute_mode not in recipe.mla_compute_modes:
         raise UsageError(f"--mla-compute-mode {mla_compute_mode}: supported values for this recipe are "
                          + ", ".join(recipe.mla_compute_modes))

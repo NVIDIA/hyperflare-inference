@@ -44,8 +44,10 @@ def recipe_help(model=None, *, recipes=(), prog="ignition"):
         lines.append(f"  --expert-scale-compression: native, {', '.join(checkpoint.scale_compressed_device_bytes)};"
                      f" default {recipe.expert_scale_compression or 'native'}.")
     if recipe.kv_cache_formats:
-        formats = (recipe.kv_cache_format, *recipe.kv_cache_formats)
-        lines.append(f"  --kv-cache-format: {', '.join(formats)}; default {recipe.kv_cache_format}.")
+        lines.append(
+            f"  --kv-cache-format: {', '.join(recipe.supported_kv_cache_formats)};"
+            f" default {recipe.kv_cache_format}."
+        )
     speculation = recipe.speculation
     if speculation is not None:
         methods = tuple(dict.fromkeys(name for name in (speculation.method, *recipe.speculative_methods) if name))
@@ -81,12 +83,19 @@ def recipe_help(model=None, *, recipes=(), prog="ignition"):
         saving = 100 * (1 - compressed / checkpoint.device_bytes)
         optional.append(f"--expert-scale-compression {encoding}"
                         f" (estimated {saving:.0f}% less resident weight storage; actual savings vary)")
-    default_rank = next(iter(recipe.ranks.values()))
-    for name, fmt in recipe.kv_cache_formats.items():
-        alt_rank = next(iter(fmt.ranks.values()))
-        saving = 100 * (1 - alt_rank.page_bytes / default_rank.page_bytes)
-        optional.append(f"--kv-cache-format {name}"
-                        f" ({saving:.0f}% smaller KV pages)")
+    if recipe.kv_cache_formats:
+        default_tp = recipe.checkpoint_tensor_parallel(checkpoint)[0]
+        default_page = recipe.costs(default_tp, recipe.speculation, checkpoint).page_bytes
+        for name in recipe.kv_cache_formats:
+            alt_page = recipe.costs(default_tp, recipe.speculation, checkpoint, kv_cache_format=name).page_bytes
+            if default_page > 0 and alt_page < default_page:
+                saving = 100 * (1 - alt_page / default_page)
+                optional.append(
+                    f"--kv-cache-format {name}"
+                    f" (TP{default_tp}: estimated {saving:.0f}% smaller KV pages; actual savings vary)"
+                )
+            else:
+                optional.append(f"--kv-cache-format {name}")
     if recipe.mixed_prefill:
         optional.append("--mixed-prefill (requires concurrency >= 2)")
     if any(cost.page_tokens for cost in recipe.ranks.values()):

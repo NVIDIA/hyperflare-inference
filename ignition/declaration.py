@@ -207,10 +207,18 @@ class SpeculativeMethod:
 
 @dataclass(frozen=True)
 class KvCacheFormat:
-    """Physical preparation costs for an alternative KV cache storage format."""
+    """Per-rank KV page byte overrides for an alternative KV cache storage format.
 
-    ranks: Mapping[int, RankCosts]
-    plain_ranks: Mapping[int, RankCosts] = field(default_factory=lambda: MappingProxyType({}))
+    Keyed in `Recipe.kv_cache_formats` by the `--kv-cache-format` CLI value.
+    `page_bytes` maps each recipe tensor-parallel size to its per-page byte cost
+    when speculation is enabled (or always when the recipe does not speculate);
+    `plain_page_bytes` maps per-page byte costs when speculation is disabled
+    (`--no-mtp`) for speculative recipes. All other `RankCosts` fields,
+    checkpoint cost overrides, and `speculative_methods` costs are preserved.
+    """
+
+    page_bytes: Mapping[int, int]
+    plain_page_bytes: Mapping[int, int] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True)
@@ -241,6 +249,12 @@ class Recipe:
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,
     independently of KV storage encoding and kernel tuning. `mla_compute_mode` and
     `expert_scale_compression` supply defaults when their preparation flags are omitted.
+    `kv_cache_format` names the recipe's default KV storage format when the recipe
+    declares alternatives in `kv_cache_formats` (or `None` when the recipe does not
+    expose `--kv-cache-format`). Recipes that declare `kv_cache_formats` read
+    `plan.kv_cache_format` (forwarded into `BasePreparationConfig.kv_cache_format`
+    by `common_preparation_kwargs`) during `prepare` to allocate the matching KV
+    cache storage layout and attention kernels.
     `export_repository` names the Hugging Face destination and the default local snapshot
     namespace. Export writes locally; it does not upload or select a signing identity.
     `b12x_environment` holds the b12x settings the recipe prepares with. b12x reads them
@@ -280,7 +294,7 @@ class Recipe:
     mla_compute_modes: tuple[str, ...] = ("auto",)
     mla_compute_mode: str = "auto"
     expert_scale_compression: str | None = None
-    kv_cache_format: str = "fp8"
+    kv_cache_format: str | None = None
     kv_cache_formats: Mapping[str, KvCacheFormat] = field(default_factory=lambda: MappingProxyType({}))
     export_repository: str = ""
     # Preparation overrides for vocabulary and transition projections used only by proposals.
@@ -339,15 +353,33 @@ class Recipe:
                 raise ValueError("speculative methods require known names and every declared tensor-parallel size")
             if method.draft_bytes is not None and method.draft_bytes <= 0:
                 raise ValueError("speculative draft bytes must be positive")
+        if self.kv_cache_format is not None and not self.kv_cache_format:
+            raise ValueError("kv_cache_format must be None or a non-empty format name")
+        if self.kv_cache_formats and self.kv_cache_format is None:
+            raise ValueError("recipes declaring kv_cache_formats must declare a non-empty default kv_cache_format")
+        expected_sizes = set(self.ranks)
         for name, fmt in self.kv_cache_formats.items():
             if not name or name == self.kv_cache_format:
                 raise ValueError("alternative KV cache formats must have non-empty names distinct from the default")
-            if set(fmt.ranks) != set(self.ranks):
-                raise ValueError(f"kv_cache_formats[{name!r}] must declare costs for every recipe tensor-parallel size")
-            if self.speculation is not None and set(fmt.plain_ranks) != set(self.ranks):
+            if set(fmt.page_bytes) != expected_sizes:
+                missing = sorted(expected_sizes - set(fmt.page_bytes))
+                extra = sorted(set(fmt.page_bytes) - expected_sizes)
                 raise ValueError(
-                    f"kv_cache_formats[{name!r}] must declare plain_ranks for every recipe tensor-parallel size"
+                    f"kv_cache_formats[{name!r}].page_bytes must cover every recipe tensor-parallel size"
+                    f" (missing={missing}, unexpected={extra})"
                 )
+            if any(type(nbytes) is not int or nbytes <= 0 for nbytes in fmt.page_bytes.values()):
+                raise ValueError(f"kv_cache_formats[{name!r}].page_bytes values must be positive integers")
+            if self.speculation is not None and fmt.plain_page_bytes:
+                if set(fmt.plain_page_bytes) != expected_sizes:
+                    missing = sorted(expected_sizes - set(fmt.plain_page_bytes))
+                    extra = sorted(set(fmt.plain_page_bytes) - expected_sizes)
+                    raise ValueError(
+                        f"kv_cache_formats[{name!r}].plain_page_bytes must cover every recipe tensor-parallel size"
+                        f" (missing={missing}, unexpected={extra})"
+                    )
+                if any(type(nbytes) is not int or nbytes <= 0 for nbytes in fmt.plain_page_bytes.values()):
+                    raise ValueError(f"kv_cache_formats[{name!r}].plain_page_bytes values must be positive integers")
         for checkpoint in self.checkpoints:
             if any(costs is not None and (not costs or not set(costs) <= set(self.ranks))
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):
@@ -367,20 +399,30 @@ class Recipe:
     def served_name(self, checkpoint: Checkpoint) -> str:
         return checkpoint.served_model_name or self.served_model_name
 
+    @property
+    def supported_kv_cache_formats(self) -> tuple[str, ...]:
+        """Declared KV cache formats (default first), or empty when selection is unsupported."""
+        if self.kv_cache_format is None:
+            return ()
+        return (self.kv_cache_format, *self.kv_cache_formats)
+
     def costs(self, world_size: int, speculation: Speculation | None, checkpoint: Checkpoint | None = None,
               kv_cache_format: str | None = None) -> RankCosts:
         """Return one rank's costs under the given speculation and KV cache settings."""
-        if kv_cache_format is not None and kv_cache_format in self.kv_cache_formats:
-            fmt = self.kv_cache_formats[kv_cache_format]
-            if speculation is None:
-                return (fmt.plain_ranks or fmt.ranks)[world_size]
-            return fmt.ranks[world_size]
         ranks = self.ranks if checkpoint is None or checkpoint.ranks is None else checkpoint.ranks
         plain = self.plain_ranks if checkpoint is None or checkpoint.plain_ranks is None else checkpoint.plain_ranks
         if speculation is None:
-            return (plain or ranks)[world_size]
-        method = self.speculative_methods.get(speculation.method)
-        return ranks[world_size] if method is None else method.ranks[world_size]
+            base = (plain or ranks)[world_size]
+        else:
+            method = self.speculative_methods.get(speculation.method)
+            base = ranks[world_size] if method is None else method.ranks[world_size]
+        if kv_cache_format is None or kv_cache_format == self.kv_cache_format:
+            return base
+        if kv_cache_format not in self.kv_cache_formats:
+            raise ValueError(f"unknown KV cache format {kv_cache_format!r} for recipe {self.name}")
+        fmt = self.kv_cache_formats[kv_cache_format]
+        pages = fmt.plain_page_bytes if speculation is None and fmt.plain_page_bytes else fmt.page_bytes
+        return replace(base, page_bytes=pages[world_size])
 
     def weights_bytes(self, checkpoint: Checkpoint, world_size: int, speculation: Speculation | None,
                       expert_scale_compression: str | None = None) -> int:

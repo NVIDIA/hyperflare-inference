@@ -446,6 +446,7 @@ explicit flags take precedence.
 | `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen3.8 Flash with concurrency of at least two, with MTP speculation or without speculation; `--speculative-method dflash2` rejects it. Command line only; a core's catalog is fixed at export, so changing this flag requires re-export. | Disabled |
 | `--prompt-logprobs` | Capture separate scored prefill graphs for raw prompt token logprobs. See [the logprob contract](logprobs-design.md#prompt-scoring). Command line only. | Disabled |
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, Step-5 NVFP4 scales including BF16 experts converted to W4A16, or MiniMax M3.1 Flash NVFP4 scales. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; the MiniMax M3.1 Flash declaration estimates none. Actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
+| `--kv-cache-format FORMAT` | Select an alternative paged KV cache storage format declared by the recipe (for example, `nvfp4_4o6k` on recipes that declare NVFP4 paged KV support), overriding per-page KV memory sizing during planning and forwarding the format to recipe preparation via `plan.kv_cache_format` / `BasePreparationConfig.kv_cache_format`. Recipes that declare no `kv_cache_formats`, or values outside the recipe's declared set, are rejected with a `UsageError`. Command line only; changing it requires re-export. | Recipe declaration (omitted / `None` when undeclared) |
 | `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2; Kimi K3.1 Pro defaults to its DSpark draft and also supports DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
 | `--mtp-only` | Omit MTP-disabled prefill, decode, maintenance, and mixed graphs during preparation. Retain width-one speculative rounds and vision graphs. Requires positive draft depth; rejects `--no-mtp`. The core cannot load with native `--mtp-draft-tokens 0`. | Capture both execution modes |
@@ -479,7 +480,8 @@ configuration-file defaults and model overrides. The remaining speculation
 settings are command-line only. `--no-mtp` excludes explicit speculation flags and model-specific packed
 graph budgets. The `Select GPUs.` startup line states the settings in effect: `up to
 N draft tokens` while verification adapts, `exactly N draft tokens` when it is
-fixed, and `branches serialized` under `--no-stream-overlap`. That flag is also
+fixed, `kv cache format FORMAT` when a non-default `--kv-cache-format` is active,
+and `branches serialized` under `--no-stream-overlap`. That flag is also
 recorded in the plan and the exported graph catalog; it changes graph scheduling,
 not kernel selection, so its cores share tuned kernels with overlapped ones.
 

@@ -263,7 +263,7 @@ def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
     args.extend(['--prefill-chunk-size', str(plan.prefill_chunk)])
     if plan.expert_scale_compression is not None:
         args.extend(['--expert-scale-compression', plan.expert_scale_compression])
-    if getattr(plan, 'kv_cache_format', None) and plan.kv_cache_format != plan.recipe.kv_cache_format:
+    if plan.has_custom_kv_cache_format:
         args.extend(['--kv-cache-format', plan.kv_cache_format])
     if getattr(plan, 'prompt_logprobs', False):
         args.append('--prompt-logprobs')

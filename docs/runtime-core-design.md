@@ -364,9 +364,11 @@ compatibility without embedding Ignition option names or default-inheritance
 rules:
 
 - `PREPARATION_PARAMETER_SCOPE_DEPLOYMENT`: deployment-local preparation
-  options (capacities, compiler, transport, tuning, and speculative shape
-  settings). Retained for inspection and reproduction; ignored by core
-  combination and cached-weight reuse.
+  options (capacities, compiler, transport, tuning, speculative shape
+  settings, and declared `kv_cache_format` when non-`None`). Retained for
+  inspection and reproduction; ignored by core combination and cached-weight
+  reuse (`kv_cache_format` affects only the deployment's KV cache pool layout
+  and attention/KV-writer kernels, never resident checkpoint weight payloads).
 - `PREPARATION_PARAMETER_SCOPE_COMBINE`: shared preparation semantics (such as
   `language_model_only`, `mla_compute_mode`, and
   `speculation.vocabulary_parallel_sampling`) that must agree across combined
