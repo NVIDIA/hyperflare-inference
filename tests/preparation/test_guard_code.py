@@ -127,9 +127,26 @@ def test_guard_pickler_preserves_guarded_tensor_user_attributes_only(use_fake):
     assert isinstance(omitted, _Missing)
 
 
+class _EmptySentinel:
+    def __init__(self, tag):
+        self.tag = tag
+
+
+class _CustomGuardTensor(torch.Tensor):
+    pass
+
+
+class _IgnitionInt(int):
+    __module__ = "ignition.test_builtin_subclass"
+
+    def __getattr__(self, name):
+        raise AttributeError(name)
+
+
 def test_guard_pickler_honors_empty_and_missing_values_before_custom_overrides():
     device = torch.device("cpu")
     tensor = torch.ones(4)
+    sentinel = _EmptySentinel("state")
     restored_missing = _roundtrip_guard(
         device,
         guard_tree_values={id(device): device},
@@ -142,14 +159,64 @@ def test_guard_pickler_honors_empty_and_missing_values_before_custom_overrides()
         missing_values={id(tensor): tensor},
     )
     assert isinstance(restored_missing_tensor, _Missing)
+    restored_empty = _roundtrip_guard(
+        sentinel,
+        guard_tree_values={id(sentinel): sentinel},
+        empty_values={id(sentinel): sentinel},
+    )
+    assert type(restored_empty) is _EmptySentinel
+    assert not hasattr(restored_empty, "tag")
+    restored_empty_tensor = _roundtrip_guard(
+        tensor,
+        guard_tree_values={id(tensor): tensor},
+        empty_values={id(tensor): tensor},
+    )
+    assert type(restored_empty_tensor) is torch.Tensor
+    assert restored_empty_tensor.numel() == 0
 
 
-def test_guard_pickler_preserves_ignition_enum_identity():
+def test_guard_pickler_delegates_sparse_and_custom_tensor_subclasses(monkeypatch):
+    sparse = torch.sparse_coo_tensor([[0, 1], [1, 0]], [1.0, 2.0], (2, 2))
+    custom = torch.ones(4).as_subclass(_CustomGuardTensor)
+    quantized = torch.quantize_per_tensor(torch.ones(4), 0.1, 0, torch.quint8)
+
+    delegated = []
+    original_super = guards.GuardsStatePickler.reducer_override
+
+    def spy_super(self, obj):
+        if any(obj is target for target in (sparse, custom, quantized)):
+            delegated.append(obj)
+            if obj is quantized:
+                return _Missing, ("delegated quantized",)
+        return original_super(self, obj)
+
+    monkeypatch.setattr(guards.GuardsStatePickler, "reducer_override", spy_super)
+    restored_sparse = _roundtrip_guard(sparse, guard_tree_values={id(sparse): sparse})
+    restored_custom = _roundtrip_guard(custom, guard_tree_values={id(custom): custom})
+    restored_quantized = _roundtrip_guard(quantized, guard_tree_values={id(quantized): quantized})
+
+    assert delegated == [sparse, custom, quantized]
+    assert tuple(restored_sparse.shape) == (2, 2)
+    assert restored_custom.pytype is _CustomGuardTensor
+    assert isinstance(restored_quantized, _Missing)
+
+
+def test_guard_pickler_preserves_ignition_enum_and_builtin_subclass_identity(monkeypatch):
+    import types
     from ignition.preparation.frontend import PromptEncoder
 
     member = PromptEncoder.PROMPT_JINJA
     restored = _roundtrip_guard(member, guard_tree_values={id(member): member})
     assert restored is member
+
+    module = types.ModuleType("ignition.test_builtin_subclass")
+    module._IgnitionInt = _IgnitionInt
+    monkeypatch.setitem(sys.modules, "ignition.test_builtin_subclass", module)
+    value = _IgnitionInt(42)
+    value.note = "keep"
+    restored_int = _roundtrip_guard(value, guard_tree_values={id(value): value})
+    assert type(restored_int) is _IgnitionInt
+    assert int(restored_int) == 42
 
 
 class _AnnotatedTensorForward:

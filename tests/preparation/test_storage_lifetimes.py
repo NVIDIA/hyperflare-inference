@@ -423,6 +423,41 @@ def test_compiled_mutated_clones_keep_selected_source_offsets(computed):
         compilation._INVOCATIONS.reset(token)
 
 
+def test_lower_storage_skips_snapshot_for_single_use_full_temp_and_deferred_copy_clones():
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    def single_use_temp_forward(source):
+        temp = source + 1
+        cloned = temp.clone()
+        _accumulate(cloned.view(1, 8), cloned.view(1, 8))
+        return (cloned,)
+
+    def deferred_copy_forward(source, other):
+        temp = source[:, 1].clone()
+        temp.copy_(other)
+        return (temp,)
+
+    source = torch.arange(24, dtype=torch.float32).reshape(1, 3, 8)
+    single_module = make_fx(single_use_temp_forward)(source[:, 0].contiguous())
+    compilation._lower_storage(single_module)
+    assert not any(node.target is torch.ops.flare.snapshot.default for node in single_module.graph.nodes)
+
+    deferred_module = make_fx(deferred_copy_forward)(source, torch.ones((1, 8), dtype=torch.float32))
+    compilation._lower_storage(deferred_module)
+    assert not any(node.target is torch.ops.flare.snapshot.default for node in deferred_module.graph.nodes)
+
+    def strided_offset_zero_forward(source, output):
+        selected = source[:, :, 0].clone()
+        _accumulate(selected.view(1, 3), selected.view(1, 3))
+        output[:, :, 0].copy_(selected)
+        return (output,)
+
+    output = torch.empty_like(source)
+    strided_module = make_fx(strided_offset_zero_forward)(source, output)
+    compilation._lower_storage(strided_module)
+    assert any(node.target is torch.ops.flare.snapshot.default for node in strided_module.graph.nodes)
+
+
 class _ScalarConstantForward:
     def __init__(self):
         self.source = torch.linspace(-2.0, 2.0, 16, dtype=torch.float32)

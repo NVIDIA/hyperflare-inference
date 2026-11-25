@@ -122,7 +122,8 @@ def test_pool_and_compiler_entry_pass_policy_without_mutating_defaults(monkeypat
     baseline = dict(aot._OPTIONS)
     supplied = dict(baseline, **{'triton.autotune_at_compile_time': True})
     monkeypatch.setattr(compile_pool, 'device_memory_info', lambda device: (40 << 30, 96 << 30))
-    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda device: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda device: SimpleNamespace(
+        name='example', major=12, minor=0, multi_processor_count=96, is_integrated=False))
     calls = []
     class Subproc:
         def __init__(self, workers, **kwargs):
@@ -259,11 +260,39 @@ def test_prepare_many_recompiles_a_materialized_forward_that_no_longer_binds(cac
     assert (tmp_path / 'example.bin').read_bytes() == b'recompiled'
 
 
-def test_capture_forwards_passes_explicit_compile_options_without_mutating_defaults(monkeypatch):
+def test_partial_compile_options_merge_over_defaults_across_entry_points(caches, monkeypatch, tmp_path):
     from ignition.preparation import capture
 
-    assert 'reorder_for_peak_memory' not in aot._OPTIONS
-    seen = []
+    baseline = dict(aot._OPTIONS)
+    assert 'reorder_for_peak_memory' not in baseline
+    partial_override = {'reorder_for_peak_memory': False}
+
+    cache = caches(options=partial_override)
+    assert dict(cache.options) == {**baseline, 'reorder_for_peak_memory': False}
+    assert cache.root != caches().root
+
+    monkeypatch.setattr(compile_pool, 'device_memory_info', lambda device: (40 << 30, 96 << 30))
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda device: SimpleNamespace(
+        name='example', major=12, minor=0, multi_processor_count=96, is_integrated=False))
+    pool = compile_pool.CompilePool('cuda:0', options=partial_override)
+    assert pool.options['reorder_for_peak_memory'] is False
+    assert pool.options['memory_planning'] is True
+    assert pool.options['memory_pool'] == 'combined'
+    assert pool.options['compile_threads'] == 1
+
+    observed = []
+    original_standalone = torch._inductor.standalone_compile
+
+    def spy_standalone(module, examples, **kwargs):
+        observed.append(dict(kwargs['options']['config_patches']))
+        return original_standalone(module, examples, **kwargs)
+
+    monkeypatch.setattr(torch._inductor, 'standalone_compile', spy_standalone)
+    backend = aot.StorageBackend(lambda x: x + 1, [torch.ones(4)],
+                                 options={'reorder_for_peak_memory': False, 'compile_threads': 1})
+    assert observed == [{**baseline, 'reorder_for_peak_memory': False, 'compile_threads': 1}]
+    torch.testing.assert_close(backend(torch.ones(4)), torch.full((4,), 2.0))
+
     stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
     for name, value in {
         'current_stream': lambda device: stream,
@@ -280,19 +309,19 @@ def test_capture_forwards_passes_explicit_compile_options_without_mutating_defau
     monkeypatch.setattr(capture, '_seed_warmup_workspaces', lambda s, device: None)
     monkeypatch.setattr(capture.torch.distributed, 'is_initialized', lambda: False)
 
-    class FakeCache:
-        def __init__(self, *, options=None, **kwargs):
-            seen.append(options)
+    seen_caches = []
 
-        def prepare_many(self, forwards, signatures, **kwargs):
-            return {}
+    def record_prepare_many(self, forwards, signatures, **kwargs):
+        seen_caches.append(dict(self.options))
+        return {}
 
-    monkeypatch.setattr(capture, 'ForwardCache', FakeCache)
+    monkeypatch.setattr(aot.ForwardCache, 'prepare_many', record_prepare_many)
+    monkeypatch.setattr(capture, 'ForwardCache', lambda **kwargs: caches(options=kwargs.get('options')))
     session = SimpleNamespace(namespace=SimpleNamespace(to_dict=lambda: {}), capture=nullcontext, autotune=False)
-    override = {**aot._OPTIONS, 'reorder_for_peak_memory': False}
-    capture.capture_forwards({}, {}, session=session, device='cpu', stream=stream, pool=None,
-                             compile_decoder=True, compile_options=override)
-    capture.capture_forwards({}, {}, session=session, device='cpu', stream=stream, pool=None,
+    capture.capture_forwards({}, {}, session=session, device='cuda:0', stream=stream, pool=None,
+                             compile_decoder=True, compile_options=partial_override)
+    capture.capture_forwards({}, {}, session=session, device='cuda:0', stream=stream, pool=None,
                              compile_decoder=True)
-    assert seen == [override, None]
+    assert seen_caches == [{**baseline, 'reorder_for_peak_memory': False}, baseline]
+    assert aot._OPTIONS == baseline
     assert 'reorder_for_peak_memory' not in aot._OPTIONS

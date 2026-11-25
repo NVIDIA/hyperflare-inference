@@ -4,7 +4,6 @@
 
 """Serializable compiled forwards with caller-owned storage and runtime handles."""
 
-import enum
 import hashlib
 import importlib
 import inspect
@@ -34,7 +33,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten, treespec_dumps, tr
 from ignition import runtime_patches
 
 from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocation, _artifact_kernel_table,
-                          _byte_storage, _storage_region, _lower_storage, _compiler_recursion)
+                          _byte_storage, _compile_options, _storage_region, _lower_storage, _compiler_recursion)
 from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
 from .host_memory import release_unused
 
@@ -125,11 +124,10 @@ class _GuardPickler(GuardsStatePickler):
         if isinstance(obj, torch.device):
             return restore_device, (obj.type, obj.index)
         if isinstance(obj, torch.Tensor) and obj.device.type != "meta":
-            from torch.utils._python_dispatch import is_traceable_wrapper_subclass
-
             if id(obj) not in self.guard_tree_values:
                 return _Missing, ('tensor guard tree',)
-            if is_traceable_wrapper_subclass(obj):
+            if (type(obj) not in (torch.Tensor, torch.nn.Parameter, torch._subclasses.FakeTensor)
+                    or obj.layout != torch.strided or obj.is_nested or obj.is_quantized):
                 return super().reducer_override(obj)
             with torch._C._DisableTorchDispatch():
                 meta = torch.empty_strided(obj.shape, obj.stride(), dtype=obj.dtype,
@@ -154,11 +152,9 @@ class _GuardPickler(GuardsStatePickler):
             return type(self)._unpickle_tensor, args
         if isinstance(obj, JITFunction):
             return _deserialize_triton_kernel, (_serialize_triton_kernel(obj),)
-        if (hasattr(obj, '__dict__')
-                and type(obj).__module__.startswith(('ignition.', 'b12x.'))
-                and not inspect.isclass(obj)
-                and not isinstance(obj, (torch.Tensor, torch.nn.Module, enum.Enum,
-                                         int, float, str, bytes, dict, list, tuple, set, frozenset))):
+        from .forward_metadata import _uses_custom_object_state
+
+        if _uses_custom_object_state(obj):
             state = {key: value if id(value) in self.guard_tree_values
                      else _Missing('unguarded attribute')
                      for key, value in vars(obj).items()}
@@ -425,7 +421,7 @@ class StorageBackend(SerializableCallable):
         module = torch.fx.GraphModule({}, graph)
         with _compiler_recursion(module):
             self.artifact = standalone_compile(module, examples, dynamic_shapes='from_example_inputs',
-                fake_mode=detect_fake_mode(examples), options={'config_patches': dict(_OPTIONS if options is None else options)},
+                fake_mode=detect_fake_mode(examples), options={'config_patches': _compile_options(options)},
                 aot=True, donate_graph_module=True)
         self._serialized_artifact = None
         self._tuning_frozen = False
@@ -502,7 +498,7 @@ def _execute(forward):
 
 def aot_forward(forward, *, options=None):
     runtime_patches.apply()
-    options = dict(_OPTIONS if options is None else options)
+    options = _compile_options(options)
     sources = r'.*\.(?:_?handle|stream_handle|launch_order|plans\[\d+\])$'
     with _guard_serialization(), torch.compiler.config.patch(unbacked_sources=sources):
         return torch.compile(_execute, backend=partial(StorageBackend, options=options), fullgraph=True,
@@ -713,7 +709,7 @@ class ForwardCache:
         self.headroom_bytes = headroom_bytes
         self.compile_workers = compile_workers
         self.lock_gpu_clocks = lock_gpu_clocks
-        self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
+        self.options = MappingProxyType(_compile_options(options))
         properties = torch.cuda.get_device_properties(device)
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
         key = hashlib.sha256(pickle.dumps((namespace, options, torch_key(), runtime_patches.identity(),
