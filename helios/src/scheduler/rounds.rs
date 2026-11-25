@@ -11,7 +11,11 @@ const POPULATION_WEIGHT: f32 = 1.0 / 64.0;
 const CALIBRATION_PRIOR_WEIGHT: f64 = 4.0;
 const CALIBRATION_MAX_WEIGHT: f64 = 32.0;
 const CALIBRATION_FACTOR_MAX: f64 = 2.0;
-const SURPLUS_HISTORY_CAPACITY: usize = 64;
+const REQUEST_CALIBRATION_PRIOR_WEIGHT: f64 = 2.0;
+const REQUEST_CALIBRATION_MAX_WEIGHT: f64 = 32.0;
+const REQUEST_CALIBRATION_HALF_LIFE: f64 = 128.0;
+const REQUEST_CALIBRATION_ANCHOR_FLOOR: f64 = 0.05;
+const SURPLUS_HISTORY_CAPACITY: usize = 256;
 const SURPLUS_MIN_SAMPLES: usize = 4;
 const SURPLUS_FACTOR_MAX: f64 = 2.0;
 
@@ -44,6 +48,61 @@ impl DepthCalibration {
     }
 }
 
+/// Request-local aged per-depth verification calibration shrunk toward the global prior.
+#[derive(Clone, Copy)]
+struct RequestCalibration {
+    realized: f64,
+    predicted: f64,
+    weight: f64,
+    observed_at: u32,
+}
+
+impl RequestCalibration {
+    fn new(generated: u32) -> Self {
+        Self { realized: 0.0, predicted: 0.0, weight: 0.0, observed_at: generated }
+    }
+
+    fn decay(generated: u32, observed_at: u32) -> f64 {
+        (-f64::from(generated.saturating_sub(observed_at)) / REQUEST_CALIBRATION_HALF_LIFE).exp2()
+    }
+
+    fn weight_at(self, generated: u32) -> f64 {
+        self.weight * Self::decay(generated, self.observed_at)
+    }
+
+    fn information_at(self, generated: u32) -> f64 {
+        let base = if self.weight > 0.0 { self.weight } else { REQUEST_CALIBRATION_PRIOR_WEIGHT };
+        base * Self::decay(generated, self.observed_at)
+    }
+
+    fn factor(self, global: DepthCalibration) -> f64 {
+        if self.weight == 0.0 {
+            global.factor()
+        } else if self.predicted > 1e-6 {
+            (self.realized / self.predicted).clamp(0.0, CALIBRATION_FACTOR_MAX)
+        } else {
+            1.0
+        }
+    }
+
+    fn observe(&mut self, realized: f64, predicted: f64, generated: u32, global: DepthCalibration) {
+        debug_assert!(realized.is_finite() && (0.0..=1.0).contains(&realized));
+        debug_assert!(predicted.is_finite() && (0.0..=1.0).contains(&predicted));
+        let aged = if self.weight == 0.0 {
+            let anchor = predicted.max(REQUEST_CALIBRATION_ANCHOR_FLOOR);
+            self.predicted = anchor;
+            self.realized = (anchor * global.factor()).clamp(0.0, 1.0);
+            REQUEST_CALIBRATION_PRIOR_WEIGHT * Self::decay(generated, self.observed_at)
+        } else {
+            self.weight_at(generated)
+        };
+        self.weight = (aged + 1.0).min(REQUEST_CALIBRATION_MAX_WEIGHT);
+        self.realized += (realized - self.realized) / self.weight;
+        self.predicted += (predicted - self.predicted) / self.weight;
+        self.observed_at = generated;
+    }
+}
+
 /// Rolling window of paired `(actual, pre-step forecast)` calibrated prefix curves
 /// for estimating the GPU causal prefix allocator's cross-lane order-statistic surplus.
 struct SurplusHistory {
@@ -67,20 +126,38 @@ impl SurplusHistory {
     }
 
     fn build_table(&self, depth: usize) -> Option<SurplusTable> {
-        if depth < 2 {
+        if depth == 0 || self.entries.len() < SURPLUS_MIN_SAMPLES {
             return None;
         }
-        let samples = self.entries.iter().filter(|(a, _)| a.len() >= depth).count();
-        if samples < SURPLUS_MIN_SAMPLES {
+        // Choose the deepest effective depth in 1..=depth with enough samples so
+        // narrower rounds (e.g. W=2 at depth=1) do not starve wider shapes while
+        // never extrapolating beyond observed depths.
+        let mut counts = vec![0usize; depth];
+        for (actual, _) in &self.entries {
+            let capped = actual.len().min(depth);
+            if capped > 0 {
+                counts[capped - 1] += 1;
+            }
+        }
+        let mut samples = 0usize;
+        let mut eff_depth = 0usize;
+        for d in (1..=depth).rev() {
+            samples += counts[d - 1];
+            if samples >= SURPLUS_MIN_SAMPLES {
+                eff_depth = d;
+                break;
+            }
+        }
+        if eff_depth == 0 {
             return None;
         }
-        let mut actual_vals = Vec::with_capacity(samples * depth);
-        let mut forecast_vals = Vec::with_capacity(samples * depth);
+        let mut actual_vals = Vec::with_capacity(samples * eff_depth);
+        let mut forecast_vals = Vec::with_capacity(samples * eff_depth);
         for (actual, forecast) in &self.entries {
-            if actual.len() < depth {
+            if actual.len() < eff_depth {
                 continue;
             }
-            for d in 0..depth {
+            for d in 0..eff_depth {
                 actual_vals.push(f64::from(actual[d]).clamp(0.0, 1.0));
                 forecast_vals.push(f64::from(forecast[d]).clamp(0.0, 1.0));
             }
@@ -98,7 +175,7 @@ impl SurplusHistory {
             actual_prefix.push(a_sum);
             forecast_prefix.push(f_sum);
         }
-        Some(SurplusTable { depth, samples, actual_prefix, forecast_prefix })
+        Some(SurplusTable { depth: eff_depth, samples, actual_prefix, forecast_prefix })
     }
 }
 
@@ -144,11 +221,32 @@ fn interp_prefix(prefix: &[f64], pos: f64) -> f64 {
 struct Forecast {
     request: RequestHandle,
     prefixes: Vec<speculation::PrefixEstimate>,
+    calibration: Vec<RequestCalibration>,
 }
 
 impl Forecast {
     fn new(request: RequestHandle, prior: &[f32], generated: u32) -> Self {
-        Self { request, prefixes: prior.iter().map(|&p| speculation::PrefixEstimate::new(f64::from(p), generated)).collect() }
+        Self {
+            request,
+            prefixes: prior.iter().map(|&p| speculation::PrefixEstimate::new(f64::from(p), generated)).collect(),
+            calibration: vec![RequestCalibration::new(generated); prior.len()],
+        }
+    }
+
+    fn calibration_factor(&self, depth: usize, global: &[DepthCalibration]) -> f64 {
+        let global_entry = global.get(depth).copied().unwrap_or(DepthCalibration::new(1.0));
+        self.calibration.get(depth).map_or_else(|| global_entry.factor(), |entry| entry.factor(global_entry))
+    }
+
+    fn calibration_information(&self, depth: usize, generated: u32) -> f64 {
+        self.calibration.get(depth).map_or(REQUEST_CALIBRATION_PRIOR_WEIGHT, |entry| entry.information_at(generated))
+    }
+
+    fn observe_calibration(&mut self, depth: usize, realized: f64, predicted: f64, generated: u32, global: &[DepthCalibration]) {
+        if let Some(entry) = self.calibration.get_mut(depth) {
+            let global_entry = global.get(depth).copied().unwrap_or(DepthCalibration::new(1.0));
+            entry.observe(realized, predicted, generated, global_entry);
+        }
     }
 }
 
@@ -185,8 +283,20 @@ impl Forecasts {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn calibration_factor(&self, depth: usize) -> f64 {
         self.calibration.get(depth).map_or(1.0, |entry| entry.factor())
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_calibration_factor(&self, request: RequestHandle, depth: usize) -> f64 {
+        self.requests[request.slot as usize]
+            .as_ref()
+            .filter(|forecast| forecast.request == request)
+            .map_or_else(
+                || self.calibration_factor(depth),
+                |forecast| forecast.calibration_factor(depth, &self.calibration),
+            )
     }
 
     pub(super) fn observe_surplus(&mut self, actual: Vec<f32>, forecast: Vec<f32>) {
@@ -195,6 +305,11 @@ impl Forecasts {
 
     pub(super) fn surplus_table(&self, depth: usize) -> Option<SurplusTable> {
         self.surplus.build_table(depth)
+    }
+
+    #[cfg(test)]
+    pub(super) fn surplus_entries(&self) -> usize {
+        self.surplus.entries.len()
     }
 }
 
@@ -244,10 +359,11 @@ impl RequestScheduler {
                 .cloned().unwrap_or_else(|| Forecast::new(request.handle, &self.forecasts.population, request.generated_tokens));
             let mut bound = 1.0f64;
             forecast.prefixes.iter().enumerate().map(|(depth, estimate)| {
-                let mean = estimate.mean();
-                let calibrated = mean * self.forecasts.calibration_factor(depth);
+                let calibrated = estimate.mean() * forecast.calibration_factor(depth, &self.forecasts.calibration);
                 let value = if optimistic {
-                    calibrated + (estimate.upper(request.generated_tokens) - mean)
+                    let info = estimate.weight_at(request.generated_tokens)
+                        .min(forecast.calibration_information(depth, request.generated_tokens));
+                    calibrated + (20.0f64.ln() / (2.0 * info.max(1e-9))).sqrt()
                 } else {
                     calibrated
                 };
@@ -352,7 +468,14 @@ impl RequestScheduler {
     pub(super) fn speculative_information(&self, request: &LiveRequest, depth: usize) -> f64 {
         self.forecasts.requests[request.handle.slot as usize].as_ref().filter(|forecast| forecast.request == request.handle)
             .map_or_else(|| request.acceptance.information(self.proposal_source, depth, request.generated_tokens),
-                |forecast| forecast.prefixes[depth].weight_at(request.generated_tokens))
+                |forecast| {
+                    let info = forecast.prefixes[depth].weight_at(request.generated_tokens);
+                    if self.proposal_source == speculation::ProposalSource::Mtp && self.gpu_confidence() {
+                        info.min(forecast.calibration_information(depth, request.generated_tokens))
+                    } else {
+                        info
+                    }
+                })
     }
 
     pub(super) fn expected_speculative_tokens(&self, request: &LiveRequest, width: usize) -> f64 {
@@ -403,10 +526,17 @@ impl RequestScheduler {
                 .filter(|forecast| forecast.request == lane.request)
                 .unwrap_or_else(|| Forecast::new(lane.request, &self.forecasts.population, generated));
             let depth_limit = lane.tokens.saturating_sub(1).min(step.draft_tokens);
-            let mut host_pred = if gpu_confidence && depth_limit >= 2 {
+            let cal_factors = if gpu_confidence && depth_limit >= 1 {
+                (0..depth_limit)
+                    .map(|depth| forecast.calibration_factor(depth, &self.forecasts.calibration))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let mut host_pred = if !cal_factors.is_empty() {
                 let mut bound = 1.0f64;
                 (0..depth_limit).map(|depth| {
-                    let calibrated = forecast.prefixes[depth].mean() * self.forecasts.calibration_factor(depth);
+                    let calibrated = forecast.prefixes[depth].mean() * cal_factors[depth];
                     bound = bound.min(calibrated.clamp(0.0, 1.0));
                     bound as f32
                 }).collect::<Vec<_>>()
@@ -425,7 +555,7 @@ impl RequestScheduler {
                 prefix *= confidence[row][depth];
                 predicted_prefixes.push(prefix);
                 if !host_pred.is_empty() {
-                    let calibrated = f64::from(prefix) * self.forecasts.calibration_factor(depth);
+                    let calibrated = f64::from(prefix) * cal_factors[depth];
                     actual_bound = actual_bound.min(calibrated.clamp(0.0, 1.0));
                     actual_cal.push(actual_bound as f32);
                 }
@@ -438,7 +568,9 @@ impl RequestScheduler {
             if gpu_confidence {
                 for &(_, depth, realized) in row_realized {
                     if let Some(&predicted) = predicted_prefixes.get(depth) {
-                        self.forecasts.observe_calibration(depth, realized, f64::from(predicted));
+                        let pred = f64::from(predicted);
+                        forecast.observe_calibration(depth, realized, pred, generated, &self.forecasts.calibration);
+                        self.forecasts.observe_calibration(depth, realized, pred);
                     }
                 }
             }
