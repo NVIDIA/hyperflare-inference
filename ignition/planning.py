@@ -196,6 +196,7 @@ class Plan:
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
     force_moe_decode_a16: bool = False
+    target_head_quantization: str | None = None
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
@@ -285,6 +286,11 @@ class Plan:
                 raise UsageError(f"--joint-tuning is not supported by {self.checkpoint.alias}")
             if self.autotune_effort == "off":
                 raise UsageError("--joint-tuning requires --autotune-effort default or audit")
+        if self.target_head_quantization is not None and self.target_head_quantization not in self.recipe.target_head_quantizations:
+            raise UsageError(
+                f"--target-head-quantization {self.target_head_quantization}: {self.checkpoint.alias}"
+                " does not prepare this target head format"
+            )
 
     @property
     def world_size(self) -> int:
@@ -402,6 +408,8 @@ class Plan:
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
             "force_moe_decode_a16": self.force_moe_decode_a16,
+            **({} if self.target_head_quantization is None else {
+                "target_head_quantization": self.target_head_quantization}),
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "online_mxfp8_scope": self.online_mxfp8_scope, "language_model_only": self.language_model_only,

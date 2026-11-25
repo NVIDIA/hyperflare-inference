@@ -20,7 +20,7 @@ DRAFTING = Speculation(draft_tokens=3)
 
 
 def _recipe(name="fixture", *, device_gib=60, ranks=(1, 2, 4), speculation=DRAFTING,
-            row_shard_prefill_world_sizes=(), joint_tuning=False):
+            row_shard_prefill_world_sizes=(), joint_tuning=False, target_head_quantizations=()):
     checkpoint = Checkpoint(
         alias=f"{name}-alias",
         repository=f"example/{name}",
@@ -51,6 +51,7 @@ def _recipe(name="fixture", *, device_gib=60, ranks=(1, 2, 4), speculation=DRAFT
         speculation=speculation,
         joint_tuning=joint_tuning,
         row_shard_prefill_world_sizes=row_shard_prefill_world_sizes,
+        target_head_quantizations=target_head_quantizations,
     )
 
 
@@ -206,3 +207,47 @@ def test_preparation_manifest_resolves_scopes_and_dflash2_inheritance(monkeypatc
     assert not decoded_index.HasField("rebuild")
     expected = json_format.ParseDict(manifest, proto.PreparationManifest())
     assert decoded_index.preparation.SerializeToString(deterministic=True) == expected.SerializeToString(deterministic=True)
+
+
+def test_target_head_quantization_validation_and_preparation_manifest(monkeypatch):
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    unsupported = _recipe("plain", ranks=(1, 2), target_head_quantizations=())
+    supported = _recipe("quanthead", ranks=(1, 2), target_head_quantizations=("mxfp8",))
+
+    with pytest.raises(ValueError, match="target_head_quantizations"):
+        _recipe("bad", ranks=(1,), target_head_quantizations=("nvfp4",))
+
+    gpu0 = (_gpu(0),)
+    base = planning.plan(supported, supported.checkpoints[0], gpu0, selected=(0,),
+                         concurrency=4, reserve_bytes=0, speculation=DRAFTING)
+    assert base.target_head_quantization is None
+    assert "target_head_quantization" not in base.to_dict()
+
+    quantized = replace(base, target_head_quantization="mxfp8")
+    assert quantized.target_head_quantization == "mxfp8"
+    assert quantized.to_dict()["target_head_quantization"] == "mxfp8"
+
+    for candidate in (base, quantized):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), candidate, compiled_forwards=True)
+        has_flag = "--target-head-quantization" in manifest["reproduction_args"]
+        assert has_flag == (candidate.target_head_quantization is not None)
+        if candidate.target_head_quantization is not None:
+            idx = manifest["reproduction_args"].index("--target-head-quantization")
+            assert manifest["reproduction_args"][idx + 1] == candidate.target_head_quantization
+        encoded = json_format.ParseDict(manifest, proto.PreparationManifest())
+        decoded = proto.PreparationManifest.FromString(encoded.SerializeToString(deterministic=True))
+        assert list(decoded.reproduction_args) == manifest["reproduction_args"]
+        keys = [parameter.key for parameter in decoded.parameters]
+        assert keys == sorted(keys) and len(keys) == len(set(keys))
+        by_key = {parameter.key: parameter for parameter in decoded.parameters}
+        if candidate.target_head_quantization is None:
+            assert "target_head_quantization" not in by_key
+        else:
+            param = by_key["target_head_quantization"]
+            assert param.scope == proto.PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT
+            assert param.value.string_value == "mxfp8"
+
+    plain_plan = planning.plan(unsupported, unsupported.checkpoints[0], gpu0, selected=(0,),
+                               concurrency=4, reserve_bytes=0, speculation=DRAFTING)
+    with pytest.raises(UsageError, match="--target-head-quantization mxfp8: plain-alias"):
+        replace(plain_plan, target_head_quantization="mxfp8")

@@ -273,8 +273,9 @@ class Recipe:
     mla_compute_mode: str = "auto"
     expert_scale_compression: str | None = None
     export_repository: str = ""
-    # Preparation overrides for vocabulary and transition projections used only by proposals.
+    # Preparation overrides for vocabulary and transition projections.
     draft_head_quantizations: tuple[str, ...] = ()
+    target_head_quantizations: tuple[str, ...] = ()
     draft_body_quantizations: tuple[str, ...] = ()
     markov_head_quantizations: tuple[str, ...] = ()
     # Supported (world_size, context_parallel_size) hybrid context-parallel topologies.
@@ -324,6 +325,8 @@ class Recipe:
         if any(type(size) is not int or size < 2 or size not in self.ranks
                for size in self.row_shard_prefill_world_sizes):
             raise ValueError("row_shard_prefill_world_sizes must name tensor-parallel sizes >= 2 declared in ranks")
+        if any(name not in ("mxfp8",) for name in self.target_head_quantizations):
+            raise ValueError("target_head_quantizations must name supported target vocabulary head formats")
         for name, method in self.speculative_methods.items():
             if name not in ("mtp", "dspark", "dflash2") or set(method.ranks) != set(self.ranks):
                 raise ValueError("speculative methods require known names and every declared tensor-parallel size")

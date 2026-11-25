@@ -299,6 +299,8 @@ def reproduction_arguments(model, plan, *, compiled_forwards, multi_host=False):
         args.extend(['--mla-compute-mode', plan.mla_compute_mode])
     if plan.force_moe_decode_a16:
         args.append('--force-moe-decode-a16')
+    if getattr(plan, 'target_head_quantization', None) is not None:
+        args.extend(['--target-head-quantization', plan.target_head_quantization])
     if getattr(plan, 'native_dense_activations', False):
         args.append('--native-dense-activations')
     if plan.shard_hyperconnections:
@@ -358,6 +360,8 @@ def from_plan(model, plan, *, compiled_forwards, multi_host=False):
     add('online_mxfp8_scope', SCOPE_TARGET_WEIGHT, online_mxfp8_scope)
     if plan.expert_scale_compression is not None:
         add('expert_scale_compression', SCOPE_TARGET_WEIGHT, plan.expert_scale_compression)
+    if plan.target_head_quantization is not None:
+        add('target_head_quantization', SCOPE_TARGET_WEIGHT, plan.target_head_quantization)
 
     # Shared core-combination semantics (must agree across combined deployments).
     add('language_model_only', SCOPE_COMBINE, bool(plan.language_model_only))

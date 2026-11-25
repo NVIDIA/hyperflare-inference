@@ -167,6 +167,7 @@ def run(args):
         autotune_effort=args.autotune_effort,
         lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
         force_moe_decode_a16=args.force_moe_decode_a16,
+        target_head_quantization=getattr(args, "target_head_quantization", None),
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
         row_shard_prefill=args.row_shard_prefill,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
@@ -239,12 +240,16 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         "compiled_forwards": compile_forwards, "torch_version": torch.__version__,
         "verification_prefixes": settings.verification_prefixes, "logical_verification_width": settings.width,
         "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
-        "preparation": {key: preparation[key] for key in (
-            "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
-            "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "compile_workers",
-            "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
-            "row_shard_prefill",
-            "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}
+        "preparation": {
+            **{key: preparation[key] for key in (
+                "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
+                "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "compile_workers",
+                "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
+                "row_shard_prefill",
+                "online_mxfp8", "online_mxfp8_scope", "language_model_only")},
+            **({} if "target_head_quantization" not in preparation else {
+                "target_head_quantization": preparation["target_head_quantization"]}),
+        }}
 
     if settings.speculation_study:
         details["configuration"]["speculation_study"] = dict(

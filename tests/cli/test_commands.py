@@ -19,7 +19,8 @@ GIB = 1 << 30
 MIB = 1 << 20
 
 
-def _fixture_recipe(*, ranks=(1, 2, 4), row_shard_world_sizes=(2, 4), joint_tuning=True):
+def _fixture_recipe(*, ranks=(1, 2, 4), row_shard_world_sizes=(2, 4), joint_tuning=True,
+                    target_head_quantizations=()):
     speculation = Speculation(draft_tokens=3)
     checkpoint = Checkpoint(
         alias="fixture-tp-model",
@@ -48,6 +49,7 @@ def _fixture_recipe(*, ranks=(1, 2, 4), row_shard_world_sizes=(2, 4), joint_tuni
         speculation=speculation,
         joint_tuning=joint_tuning,
         row_shard_prefill_world_sizes=row_shard_world_sizes,
+        target_head_quantizations=target_head_quantizations,
     )
 
 
@@ -94,4 +96,43 @@ def test_derive_forwards_row_shard_prefill_and_rejects_joint_tuning(tmp_path):
         preparation.derive(
             configuration, model, host, gpus="0,1", concurrency=concurrency,
             speculation=recipe.speculation, row_shard_prefill=True, joint_tuning=True,
+        )
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
+def test_target_head_quantization_flag_is_model_agnostic(command, capsys):
+    parser = _parser()
+    assert parser.parse_args([command, "fixture-tp-model"]).target_head_quantization is None
+    assert parser.parse_args([command, "fixture-tp-model", "--target-head-quantization", "mxfp8"]).target_head_quantization == "mxfp8"
+
+    with pytest.raises(SystemExit) as exc:
+        _parser().parse_args([command, "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    section = help_text.split("--target-head-quantization", 1)[1].split("--markov-head-quantization", 1)[0]
+    assert "Qwen" not in section
+
+
+def test_derive_forwards_and_validates_target_head_quantization(tmp_path):
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text("")
+    configuration = Configuration.load(cfg_path)
+    host = preparation.Host(tuple(_gpu(i) for i in range(4)), None)
+
+    supported = _fixture_recipe(target_head_quantizations=("mxfp8",))
+    supported_model = ResolvedModel(supported, supported.checkpoints[0], "alias")
+    concurrency = configuration.max_concurrency(supported_model.checkpoint.alias, supported.concurrency, None)
+    plan = preparation.derive(
+        configuration, supported_model, host, gpus="0", concurrency=concurrency,
+        speculation=supported.speculation, target_head_quantization="mxfp8",
+    )
+    assert plan.target_head_quantization == "mxfp8"
+    assert plan.to_dict()["target_head_quantization"] == "mxfp8"
+
+    unsupported = _fixture_recipe(target_head_quantizations=())
+    unsupported_model = ResolvedModel(unsupported, unsupported.checkpoints[0], "alias")
+    with pytest.raises(UsageError, match="--target-head-quantization mxfp8: fixture-tp-model"):
+        preparation.derive(
+            configuration, unsupported_model, host, gpus="0", concurrency=concurrency,
+            speculation=unsupported.speculation, target_head_quantization="mxfp8",
         )
