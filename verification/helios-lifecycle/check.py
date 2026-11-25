@@ -113,7 +113,7 @@ def check_model_mutation(directory, java, jar, module, needle, replacement, inva
         raise RuntimeError(f"update the {invariant} mutation for {module}")
     source.write_text(original.replace(needle, replacement, 1))
     try:
-        run(tlc(java, jar, directory, module), cwd=directory)
+        run(tlc(java, jar, directory, module), cwd=directory, timeout=MODEL_TIMEOUT)
     except subprocess.CalledProcessError as failure:
         if f"Invariant {invariant} is violated" not in failure.output:
             raise RuntimeError("model mutation failed for an unexpected reason") from failure

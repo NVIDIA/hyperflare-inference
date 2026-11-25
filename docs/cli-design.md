@@ -796,6 +796,42 @@ RAM table storage holds both planes in host memory. The metric
 `flare_engram_resident_scale_bytes` reports the scale allocation separately from
 the row cache.
 
+`--embedding-table-prefetch` asks each table's reader thread to read rows into the
+row cache before the graph that requests them runs. A graph publishes its row ids
+only once it starts, so without prefetch every row miss is read while the GPU
+waits, and a cold prompt alternates between disk and GPU work instead of
+overlapping them. A prefill lane's prompt is known at admission, so its rows are
+read ahead of the launching chunk, continuing from where the previous step left
+off, up to a quarter of the table's row cache or the advisory queue's bound of
+about a million rows. Prompts prefilled together share that bound. A decode,
+speculative, or mixed lane hands over its pending token only when no step is in
+flight: a pipelined step takes its input from the previous step's device output,
+which the host has not seen yet. While a submitted step's graph has not yet published its ids, its reader
+thread spends that wait reading ahead in batches of 4096 rows, so a step whose ids
+appear waits at most for the batch in progress. A row read ahead is admitted to
+the cache however rarely it was requested before, and it is protected from
+eviction until a gather uses it or one full turnover of cache operations passes.
+
+The prediction uses only the addressing the package declares (`EngramHash.method`,
+`orders`, `multipliers`, `primes`, `offsets`, and the `Engram` `token_map`,
+`pad_token_id` and `compressed_vocabulary`), so no recipe or model identity reaches
+the runtime. It is advisory: the captured graph remains the authority, it publishes
+the ids its own lookup consumes, and the real gather reads them whether or not the
+prediction was right. Prefetch never allocates GPU memory, never enters a graph,
+and never takes a staging frame; it fills the same bounded host row cache that a
+request gather warms. Batches that find the reader's advisory queue full are
+discarded and offered again with the next step. The option is refused for
+`--embedding-table-storage ram`, and no prefetching happens when the row cache is
+disabled. Read-ahead depth follows the cache size: a cache smaller than one prefill
+chunk's rows can only warm part of each chunk. Drafts beyond a decode lane's pending
+token are produced inside the graph, so those rows are requested the ordinary way.
+
+`flare_engram_table_disk_queue_depth` and `..._queue_depth_requested` report the
+io_uring depth that actually landed after the locked-memory clamp and halving
+ladder, `..._alignment_bytes` the smallest per-file direct-I/O fragment floor
+`statx` reported, `..._uring_flags` the accepted `IORING_SETUP_*` bits, and
+`..._fixed_files` whether registered descriptors are in use.
+
 Ignition exports each recipe's canonical model name as its default serving
 alias, such as `DeepSeek-V4.1-Flash`. Checkpoint selectors such as
 `deepseek-v4.1-flash` select preparation inputs and configuration sections;

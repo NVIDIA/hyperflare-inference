@@ -91,6 +91,26 @@ impl RankExecutor {
         }
     }
 
+    /// The Engram bindings whose stores this executor holds, the coordinator's
+    /// first and then each threaded peer's in manifest order.
+    ///
+    /// A `Parallel` peer runs in another process against its own store, so only the
+    /// coordinator's binding is reachable here. A threaded peer shares this address
+    /// space and a CUDA context, so its store can be warmed from this thread.
+    #[cfg(feature = "server")]
+    pub(crate) fn engram_bindings(&self) -> Vec<&crate::engram::Binding> {
+        match self {
+            Self::Local(executor) => executor.manifest().engram.iter().collect(),
+            Self::Parallel(executor) => executor.manifest().engram.iter().collect(),
+            Self::Threaded(executor) => executor
+                .manifest()
+                .engram
+                .iter()
+                .chain(executor.peer_engram())
+                .collect(),
+        }
+    }
+
     #[cfg(feature = "server")]
     pub(crate) fn can_submit(&self, grammar: bool) -> bool {
         match self {

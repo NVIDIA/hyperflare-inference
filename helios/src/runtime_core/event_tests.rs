@@ -66,15 +66,17 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
         .unwrap_or(0);
     let reference_rows: Vec<usize> =
         serde_json::from_slice(&std::fs::read(root.join("reference_rows.json")).unwrap()).unwrap();
-    for (storage, cache_bytes, fail_read, resident_scales) in [
-        (Storage::Disk, 0, false, false),
-        (Storage::Ram, 0, false, false),
-        (Storage::Disk, 1 << 20, false, false),
-        (Storage::Disk, 0, true, false),
-        (Storage::Disk, 1 << 20, true, false),
-        (Storage::Disk, 0, false, true),
-        (Storage::Disk, 1 << 20, false, true),
-        (Storage::Disk, 1 << 20, true, true),
+    for (storage, cache_bytes, fail_read, resident_scales, prefetch) in [
+        (Storage::Disk, 0, false, false, false),
+        (Storage::Ram, 0, false, false, false),
+        (Storage::Disk, 1 << 20, false, false, true),
+        (Storage::Disk, 1 << 20, false, false, false),
+        (Storage::Disk, 0, true, false, true),
+        (Storage::Disk, 1 << 20, true, false, true),
+        (Storage::Disk, 0, false, true, true),
+        (Storage::Disk, 1 << 20, false, true, true),
+        (Storage::Disk, 1 << 20, false, true, false),
+        (Storage::Disk, 1 << 20, true, true, true),
     ] {
         let authorized = test_support::authorize(root.join("core"));
         let AuthorizedKind::Payload(payload) = authorized.kind else {
@@ -153,8 +155,13 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             cache_bytes,
             1,
             resident_scales,
+            // Swept independently of the cache: a cached disk table with the
+            // prefetcher disabled must behave like the pre-port reader, and an
+            // enabled prefetcher without a cache must stay inert.
+            prefetch,
         )
         .unwrap();
+        let advisory = std::sync::Arc::clone(&shared);
         assert!(shared.cache_bytes() <= cache_bytes);
         let mut manifest = owner.execution_manifest().unwrap();
         let output = manifest.buffer("output").unwrap().clone();
@@ -234,6 +241,18 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             std::fs::remove_file(failed_source).unwrap();
             continue;
         }
+        // Advisory delivery has to stay inert when the loader disabled it or the
+        // table has no cache to warm.
+        let warned: Vec<i64> = [1, 2]
+            .into_iter()
+            .flat_map(|generation| (0..96).map(move |row| (row * 19 + generation) % rows as i64))
+            .collect();
+        let warming = prefetch && storage == Storage::Disk && cache_bytes != 0;
+        assert_eq!(
+            advisory.prefetch(0, &warned),
+            warming,
+            "{storage:?} cache {cache_bytes} prefetch {prefetch}: advisory admission"
+        );
         // Distinct requests exercise both pinned frames before either completion is retired.
         for generations in [[1, 2], [2, 3], [3, 1]] {
             let mut pending = Vec::new();

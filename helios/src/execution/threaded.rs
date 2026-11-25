@@ -134,6 +134,10 @@ impl protocol::PendingFrame for Pending {
 pub(crate) struct ThreadedExecutor {
     local: GraphExecutor,
     peers: Vec<Peer>,
+    // Taken before each peer manifest moves into its rank thread, so serving can
+    // warm every peer-local store without reaching into another thread's executor.
+    #[cfg(feature = "server")]
+    peer_engram: Vec<crate::engram::Binding>,
     pending: VecDeque<Pending>,
     poison: Option<Error>,
     shutdown: Option<Shutdown>,
@@ -160,9 +164,13 @@ impl ThreadedExecutor {
             }
         }
         let local = unsafe { GraphExecutor::new_unstarted(manifest)? };
+        #[cfg(feature = "server")]
+        let peer_engram = ranks.iter().filter_map(|rank| rank.engram.clone()).collect();
         let mut result = Self {
             local,
             peers: Vec::new(),
+            #[cfg(feature = "server")]
+            peer_engram,
             pending: VecDeque::with_capacity(2),
             poison: None,
             shutdown: None,
@@ -302,6 +310,11 @@ impl ThreadedExecutor {
     #[cfg(feature = "server")]
     pub fn manifest(&self) -> &ExecutionManifest {
         self.local.manifest()
+    }
+    /// The peer ranks' Engram bindings, in manifest order.
+    #[cfg(feature = "server")]
+    pub(crate) fn peer_engram(&self) -> &[crate::engram::Binding] {
+        &self.peer_engram
     }
     pub fn outstanding(&self) -> usize {
         self.pending.len()
@@ -737,7 +750,7 @@ mod tests {
 
     #[test]
     fn rank_layout_accepts_shared_and_partitioned_engram_delivery() {
-        use crate::engram::{Binding, Index, Plane, Shared, Table};
+        use crate::engram::{Binding, Index, Plane, RowGeometry, Shared, Table};
 
         for partitioned in [false, true] {
             let groups: Vec<_> = (0..if partitioned { 4 } else { 1 })
@@ -745,6 +758,7 @@ mod tests {
                     Shared::layout_fixture(
                         Index {
                             tables: vec![Table {
+                                layer: 1,
                                 planes: [256, 8].map(|row_bytes| Plane {
                                     file: rank,
                                     offset: rank as u64 * 4096,
@@ -752,12 +766,17 @@ mod tests {
                                     row_bytes,
                                 }),
                                 heads: 24,
+                                rows: 100 + rank as u64,
+                                first_row: 0,
+                                geometry: RowGeometry::default(),
                                 weights: "weights".into(),
                                 scales: "scales".into(),
                                 hashes: "hashes".into(),
                                 event: "ready".into(),
                                 request: Some("requests".into()),
                             }],
+                            token_map: Vec::new(),
+                            pad_token_id: 0,
                         },
                         if partitioned { 1 } else { 4 },
                     )
@@ -802,7 +821,7 @@ mod tests {
     #[test]
     fn tp4_catalog_accepts_shared_and_partitioned_embedding_delivery() {
         use super::super::{BufferDescriptor, Dtype, GraphKind, InputBinding};
-        use crate::engram::{Binding, Index, Plane, Shared, Table};
+        use crate::engram::{Binding, Index, Plane, RowGeometry, Shared, Table};
 
         for logprobs in [false, true] {
             let mut root = if logprobs {
@@ -852,14 +871,21 @@ mod tests {
 
             for partitioned in [false, true] {
                 let groups: Vec<_> = (0..if partitioned { 4 } else { 1 }).map(|rank| {
-                    Shared::layout_fixture(Index { tables: vec![Table {
-                        planes: [256, 8].map(|row_bytes| Plane {
-                            file: rank, offset: rank as u64 * 4096,
-                            nbytes: (100 + rank) * row_bytes, row_bytes,
-                        }),
-                        heads: 24, weights: "weights".into(), scales: "scales".into(),
-                        hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()),
-                    }] }, if partitioned { 1 } else { 4 })
+                    Shared::layout_fixture(Index {
+                        tables: vec![Table {
+                            layer: 1,
+                            planes: [256, 8].map(|row_bytes| Plane {
+                                file: rank, offset: rank as u64 * 4096,
+                                nbytes: (100 + rank) * row_bytes, row_bytes,
+                            }),
+                            heads: 24, rows: 100 + rank as u64, first_row: 0,
+                            geometry: RowGeometry::default(),
+                            weights: "weights".into(), scales: "scales".into(),
+                            hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()),
+                        }],
+                        token_map: Vec::new(),
+                        pad_token_id: 0,
+                    }, if partitioned { 1 } else { 4 })
                 }).collect();
                 let ranks: Vec<_> = (0..4).map(|rank| {
                     let mut manifest = root.clone();
