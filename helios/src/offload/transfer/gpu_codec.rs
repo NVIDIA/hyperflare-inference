@@ -960,6 +960,9 @@ mod imp {
                 return Err(invalid("GPU decode plan exceeds codec workspace capacity"));
             }
 
+            if crc32_chunks(chunks) != stored_crc {
+                return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
+            }
             {
                 let dst = &mut self.h_pinned.bytes_mut()[..total];
                 let mut off = 0usize;
@@ -968,7 +971,7 @@ mod imp {
                     off += c.len();
                 }
             }
-
+            let hdr = plan.parse_packet_header(&self.h_pinned.bytes()[..total])?;
             let dp_idx = self.device_plan_index(plan)?;
 
             unsafe {
@@ -976,35 +979,6 @@ mod imp {
                     .copy_htod_async(self.buf_a.ptr(), self.h_pinned.address() as _, total)
                     .map_err(io_err)?;
             }
-            // Launch GPU stored_crc on `buf_a` immediately so CPU header parsing overlaps it.
-            self.launch_gpu_crc32(
-                self.buf_a.ptr(),
-                0,
-                total as u64,
-                0,
-                self.d_scalars.ptr() + 12,
-                stream,
-            )?;
-            unsafe {
-                stream
-                    .copy_dtoh_async(
-                        (self.h_scalars.address() + 12) as _,
-                        self.d_scalars.ptr() + 12,
-                        4,
-                    )
-                    .map_err(io_err)?;
-            }
-
-            let parsed = plan.parse_packet_header(&self.h_pinned.bytes()[..total]);
-
-            // Verify stored CRC32 BEFORE launching any GPU decode kernels.
-            sync_stream(stream, event)?;
-            let got_stored_crc =
-                u32::from_le_bytes(self.h_scalars.bytes()[12..16].try_into().unwrap());
-            if got_stored_crc != stored_crc {
-                return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
-            }
-            let hdr = parsed?;
 
             let off_ch_words = nc * 4;
             let off_lane_offs = nc * 8;
@@ -1674,16 +1648,18 @@ mod imp {
             }
             let dp_idx = self.device_plan_index(plan)?;
 
-            // 1. Copy all `batch` packets contiguously into `h_pinned` and validate lengths.
+            // 1. Verify stored CRC32 on CPU before touching PCIe/VRAM, copy all `batch` packets
+            //    contiguously into `h_pinned`, and parse packet headers.
             let mut pkt_offs = Vec::with_capacity(batch);
             let mut pkt_lens = Vec::with_capacity(batch);
+            let mut parsed = Vec::with_capacity(batch);
             let mut total_bytes = 0usize;
             for &(chunks, stored_crc, _) in packets {
+                if crc32_chunks(chunks) != stored_crc {
+                    return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
+                }
                 let len: usize = chunks.iter().map(|c| c.len()).sum();
                 if len < plan.metadata_bytes() || len > plan.max_packet() {
-                    if crc32_chunks(chunks) != stored_crc {
-                        return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
-                    }
                     return Err(invalid("invalid GKV1 packet length"));
                 }
                 pkt_offs.push(total_bytes as u64);
@@ -1694,6 +1670,7 @@ mod imp {
                     dst[pos..pos + c.len()].copy_from_slice(c);
                     pos += c.len();
                 }
+                parsed.push(plan.parse_packet_header(&self.h_pinned.bytes()[total_bytes..total_bytes + len])?);
                 total_bytes += len;
             }
             {
@@ -1702,9 +1679,8 @@ mod imp {
                 write_u64s(&mut bm[BATCH_OFF_PKT_LENS..BATCH_OFF_PKT_LENS + batch * 8], &pkt_lens);
             }
 
-            // 2. Upload all packets (`buf_a`) + offsets/lens (`d_batch_meta`), then launch stored CRC32.
+            // 2. Upload all verified packets (`buf_a`) + offsets/lens (`d_batch_meta`).
             let d_pkt_offs = self.d_batch_meta.ptr() + BATCH_OFF_PKT_OFFS as u64;
-            let d_pkt_lens = self.d_batch_meta.ptr() + BATCH_OFF_PKT_LENS as u64;
             unsafe {
                 stream
                     .copy_htod_async(self.buf_a.ptr(), self.h_pinned.address() as _, total_bytes)
@@ -1717,74 +1693,12 @@ mod imp {
                     )
                     .map_err(io_err)?;
             }
-            {
-                let (mut base, mut offs, mut lens, mut fstride, mut flen, mut mlen, mut out, mut b) = (
-                    self.buf_a.ptr(),
-                    d_pkt_offs,
-                    d_pkt_lens,
-                    0u64,
-                    0u64,
-                    0u64,
-                    self.d_batch_meta.ptr() + BATCH_OFF_STORED_CRC as u64,
-                    batch as c_int,
-                );
-                launch_1d(
-                    bf.fn_crc32_batch,
-                    batch as u32,
-                    256,
-                    0,
-                    stream,
-                    &mut [
-                        &mut base as *mut _ as _,
-                        &mut offs as *mut _ as _,
-                        &mut lens as *mut _ as _,
-                        &mut fstride as *mut _ as _,
-                        &mut flen as *mut _ as _,
-                        &mut mlen as *mut _ as _,
-                        &mut out as *mut _ as _,
-                        &mut b as *mut _ as _,
-                    ],
-                    "launch(kv_crc32_batch_gpu:dec_stored)",
-                )?;
-            }
-            unsafe {
-                stream
-                    .copy_dtoh_async(
-                        (self.h_batch_meta.address() + BATCH_OFF_STORED_CRC) as _,
-                        self.d_batch_meta.ptr() + BATCH_OFF_STORED_CRC as u64,
-                        batch * 4,
-                    )
-                    .map_err(io_err)?;
-            }
-
-            // Overlap CPU header parsing with GPU stored_crc verification.
-            let mut parsed = Vec::with_capacity(batch);
-            for p in 0..batch {
-                let off = pkt_offs[p] as usize;
-                let len = pkt_lens[p] as usize;
-                parsed.push(plan.parse_packet_header(&self.h_pinned.bytes()[off..off + len]));
-            }
-
-            // Verify every stored CRC32 BEFORE launching any GPU decode kernels.
-            sync_stream(stream, event)?;
-            let bm = self.h_batch_meta.bytes();
-            for (p, &(_, expected_stored_crc, _)) in packets.iter().enumerate() {
-                let got = u32::from_le_bytes(
-                    bm[BATCH_OFF_STORED_CRC + p * 4..BATCH_OFF_STORED_CRC + (p + 1) * 4]
-                        .try_into()
-                        .unwrap(),
-                );
-                if got != expected_stored_crc {
-                    return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
-                }
-            }
 
             // Pack all `batch * nc` chunk directories into `h_meta`.
             let off_ch_words = total_chunks * 4;
             {
                 let meta = self.h_meta.bytes_mut();
-                for (p, hdr_res) in parsed.into_iter().enumerate() {
-                    let hdr = hdr_res?;
+                for (p, hdr) in parsed.into_iter().enumerate() {
                     let base = p * nc * 4;
                     write_u32s(&mut meta[base..base + nc * 4], &hdr.chunk_pkt_offs);
                     write_u32s(

@@ -216,11 +216,11 @@
     instance and restore it through the other after arena release, comparing
     with a raw restore.
 
-[ ] Qualify multi-host `--ranks` local-disk compression (`--prefix-cache-disk`
+[ ] Qualify multi-host `--rank` local-disk compression (`--prefix-cache-disk`
     + `--lossless-kv-compression cpu|gpu`) on a multi-host cluster; unit tests
     cover sharded v4 store/fetch/truncate/agreement and mismatch rejection.
 
-[ ] Support `--lossless-kv-compression cpu|gpu` with multi-host `--ranks` +
+[ ] Support `--lossless-kv-compression cpu|gpu` with multi-host `--rank` +
     `--prefix-cache-pool` by building world-wide packed offers and teaching
     `selene/src/pool/records.rs` v4 headers, directories, and packed slicing
     (currently rejected at startup in `selene/src/offload.rs`).

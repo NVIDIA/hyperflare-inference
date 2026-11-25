@@ -38,6 +38,7 @@ struct CpuCodec {
 
 struct GpuCodec {
     codec: Arc<Mutex<GpuRankCodec>>,
+    page_batch_cap: usize,
 }
 
 pub(super) struct RankCodec {
@@ -121,7 +122,11 @@ impl RankCodec {
                 } else {
                     make_codec()?
                 };
-                Some(GpuCodec { codec })
+                let page_batch_cap = codec.lock().unwrap().page_batch_cap();
+                Some(GpuCodec {
+                    codec,
+                    page_batch_cap,
+                })
             }
             KvCompression::Cpu | KvCompression::Off => None,
         };
@@ -221,13 +226,10 @@ impl RankCodec {
                     .gpu
                     .as_mut()
                     .ok_or_else(|| invalid("GPU codec unavailable"))?;
-                let batch_cap = {
-                    let guard = gpu.codec.lock().unwrap();
-                    if page_plan.num_mats() == 0 && page_plan.num_chunks() > 0 {
-                        guard.page_batch_cap()
-                    } else {
-                        1
-                    }
+                let batch_cap = if page_plan.num_mats() == 0 && page_plan.num_chunks() > 0 {
+                    gpu.page_batch_cap
+                } else {
+                    1
                 };
                 if batch_cap > 1 && job.pages.len() > 1 {
                     let mut page_offset = 0usize;
@@ -475,12 +477,25 @@ impl RankCodec {
     }
 
     fn decode_route(&self, u: &PackedUnit, representation: Representation) -> Result<DecodeRoute> {
+        /// Minimum non-matrix unit size decoded on GPU during critical-path restores.
+        /// Smaller non-matrix pages (< 256 KiB) amortize poorly across GPU stream syncs under
+        /// foreground saturation and decode in milliseconds on CPU over async HtoD DMA without
+        /// contending for SMs or the shared GPU codec mutex.
+        const GPU_DECODE_MIN_BYTES: usize = 256 << 10;
+
         if representation == Representation::Literal {
             Ok(DecodeRoute::Literal)
         } else if u.profile.as_slice() == self.cpu_profile.as_slice() {
             Ok(DecodeRoute::Cpu)
         } else if u.profile.as_slice() == self.gpu_profile.as_slice() {
-            if self.gpu.is_some() {
+            let plan = if u.kind == Kind::Row as i32 {
+                &self.cpu.gpu_row
+            } else {
+                &self.cpu.gpu_page
+            };
+            if self.gpu.is_some()
+                && (plan.num_mats() > 0 || plan.original_bytes() >= GPU_DECODE_MIN_BYTES)
+            {
                 Ok(DecodeRoute::GpuOnDevice)
             } else {
                 Ok(DecodeRoute::GpuOnCpu)
@@ -488,6 +503,52 @@ impl RankCodec {
         } else {
             Err(invalid("incompatible codec share"))
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_pages_cpu_batch(
+        &mut self,
+        items: &[(&PackedUnit, DecodeRoute, Vec<&[u8]>)],
+        batch_spans: &[(usize, Vec<DeviceSpan>)],
+        stream: &Stream,
+        event: &Event,
+        stats: &mut DecodeStats,
+    ) -> Result<()> {
+        let pool = cpu_pool()?;
+        let page_bytes = self.cpu.page.original_bytes();
+        let staging_slice = &mut self.cpu.staging.bytes_mut()[..items.len() * page_bytes];
+        let page_plan = &self.cpu.page;
+        let gpu_page_plan = &self.cpu.gpu_page;
+        let start = Instant::now();
+        if items.len() == 1 {
+            let (u, route, chunks) = &items[0];
+            decode_unit_cpu(
+                u,
+                *route,
+                chunks,
+                staging_slice,
+                page_plan,
+                gpu_page_plan,
+                Some(pool),
+            )?;
+        } else {
+            pool.install(|| -> Result<()> {
+                staging_slice
+                    .par_chunks_mut(page_bytes)
+                    .zip(items.par_iter())
+                    .try_for_each(|(raw, (u, route, chunks))| -> Result<()> {
+                        decode_unit_cpu(u, *route, chunks, raw, page_plan, gpu_page_plan, None)
+                    })
+            })?;
+        }
+        stats.transform_ns += start.elapsed().as_nanos() as u64;
+        copy_spans_batch(
+            stream,
+            event,
+            Direction::In,
+            batch_spans,
+            self.cpu.staging_alias,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -525,7 +586,6 @@ impl RankCodec {
 
         let mut remaining_pages_offset = 0usize;
         if all_pages_cpu_path {
-            let pool = cpu_pool()?;
             for chunk in job.pages.chunks(batch_cap) {
                 let mut items = Vec::with_capacity(chunk.len());
                 let mut batch_spans = Vec::with_capacity(chunk.len());
@@ -540,27 +600,7 @@ impl RankCodec {
                     items.push((u, route, chunks));
                     batch_spans.push((slot_idx * page_bytes, spans));
                 }
-                let start = Instant::now();
-                let staging_slice =
-                    &mut self.cpu.staging.bytes_mut()[..chunk.len() * page_bytes];
-                let page_plan = &self.cpu.page;
-                let gpu_page_plan = &self.cpu.gpu_page;
-                pool.install(|| -> Result<()> {
-                    staging_slice
-                        .par_chunks_mut(page_bytes)
-                        .zip(items.par_iter())
-                        .try_for_each(|(raw, (u, route, chunks))| -> Result<()> {
-                            decode_unit_cpu(u, *route, chunks, raw, page_plan, gpu_page_plan, None)
-                        })
-                })?;
-                stats.transform_ns += start.elapsed().as_nanos() as u64;
-                copy_spans_batch(
-                    stream,
-                    event,
-                    Direction::In,
-                    &batch_spans,
-                    self.cpu.staging_alias,
-                )?;
+                self.decode_pages_cpu_batch(&items, &batch_spans, stream, event, stats)?;
                 transferred += (chunk.len() * page_bytes) as u64;
                 remaining_pages_offset += chunk.len();
             }
@@ -572,19 +612,12 @@ impl RankCodec {
             && self.cpu.gpu_page.num_chunks() > 0
             && self.gpu.is_some()
         {
-            let gpu_batch_cap = self
-                .gpu
-                .as_ref()
-                .unwrap()
-                .codec
-                .lock()
-                .unwrap()
-                .page_batch_cap();
+            let gpu_batch_cap = self.gpu.as_ref().unwrap().page_batch_cap;
             if gpu_batch_cap > 1 {
                 let mut i = remaining_pages_offset;
                 while i < job.pages.len() {
+                    let mut run_units: Vec<&PackedUnit> = Vec::new();
                     let mut run_chunks: Vec<Vec<&[u8]>> = Vec::new();
-                    let mut run_crcs: Vec<(u32, u32)> = Vec::new();
                     let mut run_spans: Vec<Vec<DeviceSpan>> = Vec::new();
                     let mut run_stored = 0u64;
                     let mut j = i;
@@ -598,31 +631,63 @@ impl RankCodec {
                         let spans =
                             device_spans(geometry, layout, false, u64::from(job.pages[j].0.0))?;
                         run_stored += u.stored_length;
+                        run_units.push(u);
                         run_chunks.push(chunks);
-                        run_crcs.push((u.stored_crc, u.original_crc));
                         run_spans.push(spans);
                         j += 1;
                     }
                     if run_chunks.len() > 1 {
-                        let packets: Vec<(&[&[u8]], u32, u32)> = run_chunks
-                            .iter()
-                            .zip(&run_crcs)
-                            .map(|(ch, &(sc, oc))| (ch.as_slice(), sc, oc))
-                            .collect();
                         let start = Instant::now();
-                        {
-                            let mut guard = self.gpu.as_mut().unwrap().codec.lock().unwrap();
-                            let res = guard.decode_pages_batch_to_device(
-                                &self.cpu.gpu_page,
-                                &packets,
-                                &run_spans,
-                                stream,
-                                event,
-                            );
-                            sync_on_err(stream, res)
+                        let gpu_ran = {
+                            if let Ok(mut guard) = self.gpu.as_mut().unwrap().codec.try_lock() {
+                                let packets: Vec<(&[&[u8]], u32, u32)> = run_chunks
+                                    .iter()
+                                    .zip(&run_units)
+                                    .map(|(ch, u)| (ch.as_slice(), u.stored_crc, u.original_crc))
+                                    .collect();
+                                let res = guard.decode_pages_batch_to_device(
+                                    &self.cpu.gpu_page,
+                                    &packets,
+                                    &run_spans,
+                                    stream,
+                                    event,
+                                );
+                                sync_on_err(stream, res).map_err(decode_error)?;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if gpu_ran {
+                            stats.transform_ns += start.elapsed().as_nanos() as u64;
+                        } else {
+                            // Background GPU capture currently holds the codec mutex: decode this
+                            // critical-path restore run on the bounded CPU pool instead of blocking.
+                            let mut off = 0usize;
+                            while off < run_chunks.len() {
+                                let take = (run_chunks.len() - off).min(batch_cap);
+                                let items: Vec<(&PackedUnit, DecodeRoute, Vec<&[u8]>)> =
+                                    run_units[off..off + take]
+                                        .iter()
+                                        .zip(&run_chunks[off..off + take])
+                                        .map(|(&u, ch)| (u, DecodeRoute::GpuOnCpu, ch.clone()))
+                                        .collect();
+                                let batch_spans: Vec<(usize, Vec<DeviceSpan>)> = run_spans
+                                    [off..off + take]
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(s, sp)| (s * page_bytes, sp.clone()))
+                                    .collect();
+                                self.decode_pages_cpu_batch(
+                                    &items,
+                                    &batch_spans,
+                                    stream,
+                                    event,
+                                    stats,
+                                )?;
+                                off += take;
+                            }
                         }
-                        .map_err(decode_error)?;
-                        stats.transform_ns += start.elapsed().as_nanos() as u64;
                         stored += run_stored;
                         transferred += (page_bytes * run_chunks.len()) as u64;
                         i = j;
@@ -646,7 +711,7 @@ impl RankCodec {
             let n = self.original_bytes(row);
             let spans = device_spans(geometry, layout, row, id)?;
             let (u, representation, chunks) = select_packet(window, row, index, rank, n)?;
-            let route = self.decode_route(u, representation)?;
+            let mut route = self.decode_route(u, representation)?;
             stored += u.stored_length;
             if route == DecodeRoute::GpuOnDevice {
                 let plan = if row {
@@ -655,22 +720,30 @@ impl RankCodec {
                     &self.cpu.gpu_page
                 };
                 let start = Instant::now();
-                {
-                    let mut guard = self.gpu.as_mut().unwrap().codec.lock().unwrap();
-                    let res = guard.decode_to_device(
-                        plan,
-                        &chunks,
-                        &spans,
-                        u.stored_crc,
-                        u.original_crc,
-                        stream,
-                        event,
-                    );
-                    sync_on_err(stream, res)
+                let gpu_ran = {
+                    if let Ok(mut guard) = self.gpu.as_mut().unwrap().codec.try_lock() {
+                        let res = guard.decode_to_device(
+                            plan,
+                            &chunks,
+                            &spans,
+                            u.stored_crc,
+                            u.original_crc,
+                            stream,
+                            event,
+                        );
+                        sync_on_err(stream, res).map_err(decode_error)?;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if gpu_ran {
+                    stats.transform_ns += start.elapsed().as_nanos() as u64;
+                } else {
+                    route = DecodeRoute::GpuOnCpu;
                 }
-                .map_err(decode_error)?;
-                stats.transform_ns += start.elapsed().as_nanos() as u64;
-            } else {
+            }
+            if route != DecodeRoute::GpuOnDevice {
                 let cpu_plan = if row { &self.cpu.row } else { &self.cpu.page };
                 let gpu_plan = if row {
                     &self.cpu.gpu_row

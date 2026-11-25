@@ -44,7 +44,8 @@ defines configuration precedence.
 ## 0. Lossless KV compression
 
 Flare supports two lossless checkpoint compression modes selected at serving
-time with `--lossless-kv-compression`:
+time with `--lossless-kv-compression` (requiring at least one configured offload
+tier: `--prefix-cache-memory`, `--prefix-cache-disk`, or `--prefix-cache-pool`):
 
 - `cpu` (profile revision `ZKV1/v1/64-pivots`): copies raw pages and
   continuation rows from VRAM into pinned staging on capture, encodes each unit
@@ -56,8 +57,10 @@ time with `--lossless-kv-compression`:
   on-GPU packet assembly, and parallel GPU CRC32 directly on each rank's
   lowest-priority CUDA transfer stream using a compact 3-buffer aliased
   per-rank GPU workspace budgeted before KV cache sizing. Only compressed bytes
-  cross PCIe during capture and restore, with zero external runtime libraries
-  beyond `libcuda.so.1`.
+  cross PCIe during capture and GPU-decoded restores, while small non-matrix
+  restores (< 256 KiB) or mutex-contended restores decode on the bounded CPU
+  worker pool over async HtoD DMA, with zero external runtime libraries beyond
+  `libcuda.so.1`.
 
 Both modes compress at the VRAM-to-DRAM boundary and keep compressed bytes
 across local DRAM (`MemoryStore`), local disk (`DiskStore`, standalone or
@@ -80,18 +83,21 @@ a matching profile can claim packed records from both manager DRAM and NVMe.
 
 Both `cpu` and `gpu` modes advertise `[ZKV1, GKV1]` receive profiles across
 single-process local tiers, single-process `selene-manager` pools, and
-standalone multi-host `--ranks` local disk (the profile handshake rejects
-mismatched rank modes at startup, and multi-host `--ranks` +
+standalone multi-host `--rank` local disk (the profile handshake rejects
+mismatched rank modes at startup, and multi-host `--rank` +
 `--prefix-cache-pool` rejects active compression at startup):
 
-- In `gpu` mode, new captures encode on GPU as `GKV1`, `GKV1` restores decode
-  on GPU, and `ZKV1` restores decode on the CPU worker pool. All active offload
-  tiers (`memory`, `disk`, `pool`) share one 3-buffer aliased per-rank
-  `GpuRankCodec` workspace (~130 MiB per GPU on GLM-5.3-Flash TP4, ~32 MiB per
-  GPU on DeepSeek-V4.1-Flash TP4, ~440 MiB on Qwen3.8-Flash-Next TP1) with no
-  secondary CUDA primary context. Because `gpu` mode runs on a lowest-priority
-  CUDA transfer stream, prefer `cpu` mode on unified-memory GPUs (such as DGX
-  Spark GB10) or small-page workloads under sustained foreground GPU saturation.
+- In `gpu` mode, new captures encode on GPU as `GKV1`, matrix-predictor and
+  large-page (>= 256 KiB) `GKV1` restores decode on GPU (falling back to the
+  bounded CPU pool if a background capture holds the GPU codec), and smaller
+  non-matrix `GKV1` and `ZKV1` restores decode on the bounded CPU worker pool
+  over async HtoD DMA so critical-path restores do not stall behind foreground
+  GPU saturation. All active offload tiers (`memory`, `disk`, `pool`) share one
+  3-buffer aliased per-rank `GpuRankCodec` workspace (~130 MiB per GPU on
+  GLM-5.3-Flash TP4, ~32 MiB per GPU on DeepSeek-V4.1-Flash TP4, ~440 MiB on
+  Qwen3.8-Flash-Next TP1) with no secondary CUDA primary context. Because `gpu`
+  capture runs on a lowest-priority CUDA transfer stream, `cpu` mode remains a
+  zero-VRAM option on unified-memory GPUs such as DGX Spark GB10.
 - In `cpu` mode, Flare reserves **0 GPU VRAM**, never loads GPU codec modules,
   encodes new captures as `ZKV1`, and natively decodes both `ZKV1` and `GKV1`
   checkpoints on CPU.

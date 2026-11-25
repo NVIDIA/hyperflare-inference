@@ -250,9 +250,10 @@ impl Engine {
             })
             .sum();
         // Multi-process rank agents (`self.ranks.is_some()`) hold single-rank packed records
-        // rather than world-wide offers; startup rejects `--rank` + `--prefix-cache-pool` +
-        // compression in `PrefixCacheOffload::validate_topology`.
-        debug_assert!(!(any_packed && self.ranks.is_some()));
+        // rather than world-wide offers; CLI startup rejects `--rank` + `--prefix-cache-pool` +
+        // compression in `PrefixCacheOffload::validate_topology`, and direct `PoolClient` callers
+        // are still guarded below by `shared::packed::Layout::new`'s world-wide rank-coverage
+        // check (`ClaimReason::ChainGap`).
         let valid = !expected.is_empty() && row == run.want_row;
         // A GPU export always has its staging reserved; a host export with none
         // reserved streams.
