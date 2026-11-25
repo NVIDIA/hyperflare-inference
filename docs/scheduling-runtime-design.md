@@ -105,20 +105,26 @@ generated tokens.
 Unobserved suffixes retain their means.
 
 When pricing candidate shapes on a GPU-confidence model, the stored per-request
-confidence forecast is adjusted by two global online corrections derived solely
-from completed rounds:
+confidence forecast is adjusted by two online corrections derived solely from
+completed rounds:
 
-1. **Per-depth drafter calibration (`DepthCalibration`):** A global per-depth
-   ratio `clamp(realized / predicted, 0.0, 2.0)` (defaulting to `1.0` when
-   `predicted <= 1e-6`), initialized with `realized == predicted == 0.5^d` at
-   prior weight `4.0` and updated with an EWMA weight capped at `32.0`
-   (effective steady-state step `1/32`, ~22-observation half-life). Updates use
-   the exact offered, determined prefix outcomes computed once in
+1. **Per-depth drafter calibration (`DepthCalibration`):** Each request carries
+   its own per-depth calibration ratio `clamp(realized / predicted, 0.0, 2.0)`
+   (defaulting to `1.0` when `predicted <= 1e-6`), initialized with prior weight
+   `4.0` from a slow round-level population calibration prior and updated per
+   request with weight capped at `64.0` and aged with a 128-token half-life
+   matching `PrefixEstimate`. The population prior starts with
+   `realized == predicted == 0.5^d` at prior weight `4.0` and updates once per
+   completed round from the round's mean realized and predicted survival across
+   contributing lanes (capped at weight `64.0`), so a single correlated large-batch
+   round cannot overwrite the prior or push unrelated requests into `W=1`, while
+   systematic drafter miscalibration or failure still propagates to new requests.
+   Updates use the exact offered, determined prefix outcomes computed once in
    `complete_inner` (Rao-Blackwellized with `completion_speculative_survival`
    when reported, else binary acceptance/rejection). Pricing multiplies each
-   depth's stored mean by its calibration factor, adds the optimistic margin
-   `(upper - mean)` during funded acceptance learning, clamps to `[0, 1]`, and
-   enforces nonincreasing prefix survival across depths.
+   depth's stored mean by the request's calibration factor, adds the optimistic
+   margin `(upper - mean)` during funded acceptance learning, clamps to `[0, 1]`,
+   and enforces nonincreasing prefix survival across depths.
 2. **Cross-lane order-statistic allocation surplus (`SurplusHistory`):** Inside
    a packed GPU-allocated round (`B >= 2`, `P < B * W`), the device allocator
    observes fresh per-step confidences across all active lanes and allocates
@@ -126,15 +132,18 @@ from completed rounds:
    that step. By Jensen's inequality, `E[sum Top-(P-B)(S_step)] >= sum
    Top-(P-B)(E[S])`, so pricing packed rounds from time-averaged lane curves
    systematically undervalues crowded packed graphs relative to plain `W=1`
-   and uncrowded small batches. The scheduler maintains a 64-entry rolling ring
+   and uncrowded small batches. The scheduler maintains a 256-entry rolling ring
    buffer of paired `(actual_calibrated, pre_step_forecast)` lane curves (min
    `4` samples), computes the normalized Lorenz concentration ratio over linear
    calibrated survival at quota `r = (P - b) / b`, scales the excess surplus by
    `(1 - 1/b) * min(alpha, 1.0)` (so it applies in full at `alpha = 1.0` and
    dampens smoothly when `alpha < 1.0` already applies a concave boost), clamps
    to `[1.0, 2.0]`, and caps total draft value by the physical `draft_budget`
-   maximum (100% survival per allocated draft row). The normalized ratio equals
-   `1.0` identically for single-lane cohorts (`b = 1`), uncrowded graphs
+   maximum (100% survival per allocated draft row). When fewer than `4` stored
+   curves reach the candidate shape's full depth, table construction falls back
+   to the deepest observed prefix length (`>= 2`) that has at least `4` samples
+   without extrapolating past that depth. The normalized ratio equals `1.0`
+   identically for single-lane cohorts (`b = 1`), uncrowded graphs
    (`P - b >= total_ceiling_drafts`), pure mean shifts, and pure
    between-request heterogeneity (preventing double-counting of per-request
    forecasts).

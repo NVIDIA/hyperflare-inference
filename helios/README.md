@@ -442,11 +442,13 @@ estimated per request and, on a model without GPU confidence, started from the
 population mean of earlier requests. Complete programs learn from terminal
 verification and keep stored confidence forecasts separate from acceptance
 outcomes. When pricing GPU-confidence shapes, stored per-depth forecasts are
-scaled by a global online per-depth verification calibration ratio (prior weight
-`4`, EWMA cap `32`, clamped to `[0, 2]`), and crowded GPU-allocated packed
+scaled by a per-request online per-depth verification calibration ratio (prior
+weight `4` seeded from a once-per-round population prior, weight cap `64`,
+128-token half-life aging, clamped to `[0, 2]`), and crowded GPU-allocated packed
 shapes (`B >= 2`, `P < B * W`) additionally apply a bounded empirical
-cross-lane order-statistic surplus (from a 64-entry rolling window of paired
-actual vs pre-step forecast curves, excess scaled by `(1 - 1/b) * min(alpha, 1)`
+cross-lane order-statistic surplus (from a 256-entry rolling window of paired
+actual vs pre-step forecast curves falling back to the deepest observed prefix
+length `>= 2`, excess scaled by `(1 - 1/b) * min(alpha, 1)`
 and capped at 100% draft survival) to capture the GPU allocator's per-step
 cherry-picking gain.
 Ordinary selection uses calibrated historical means, while a separate 1%

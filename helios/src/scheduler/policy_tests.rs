@@ -5127,3 +5127,163 @@ fn gpu_allocation_surplus_rescues_packed_speculative_at_alpha_one_and_falls_back
     assert_eq!((fallback.batch_capacity, fallback.token_capacity), (16, 1),
         "broken drafter must fall back cleanly to B16xW1 even with positive surplus history");
 }
+
+#[test]
+fn per_request_calibration_isolates_concurrent_requests_and_ages_with_generation() {
+    let mut scheduler = engine(4, true);
+    throughput_only(&mut scheduler);
+    let mut graphs = super::tests::duration_graphs(4);
+    for g in &mut graphs {
+        g.estimated_duration_ns = match (g.kind, g.batch_capacity, g.token_capacity) {
+            (GraphKind::Init | GraphKind::Prefill, _, _) => MS,
+            (GraphKind::Speculative, 2, 5) => 10 * MS,
+            _ => 50 * MS,
+        };
+    }
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.capabilities.speculative_allocations =
+        vec![(2, 4, 5, 10, crate::execution::PrefixAllocation::Gpu)];
+    let easy = add(&mut scheduler, 1, 64, 1024);
+    let hard = add(&mut scheduler, 2, 64, 1024);
+    ready(&mut scheduler, &[easy, hard]);
+    let slots = scheduler.limits.request_capacity();
+
+    // Run 32 two-lane rounds: `easy` has well-calibrated 0.90 survival, while `hard`
+    // reports 0.90 confidence but only 0.05 realized survival.
+    for _ in 0..32 {
+        let plan = scheduler.plan().unwrap();
+        assert_eq!(plan.lanes.len(), 2);
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let confidence = vec![vec![0.90; 15]; plan.batch_capacity];
+        for lane in &plan.lanes {
+            let offered = lane.tokens.saturating_sub(1).min(4);
+            records[lane.request.slot as usize].vector.as_mut().unwrap().offered_drafts = offered as i64;
+            let base = if lane.request == easy { 0.90f32 } else { 0.05f32 };
+            let mut p = 1.0f32;
+            for d in 0..offered {
+                p *= base;
+                surv[lane.request.slot as usize][d] = p;
+            }
+        }
+        scheduler
+            .complete_packed_round_with_survival(fence, &records, gpu_time(MS), &confidence, Some(&surv))
+            .unwrap();
+    }
+
+    let easy_curve = scheduler.speculative_curve(scheduler.request(easy).unwrap(), false);
+    let hard_curve = scheduler.speculative_curve(scheduler.request(hard).unwrap(), false);
+    assert!(easy_curve[0] > 0.80, "calibrated lane must not be dragged down by sibling: {:?}", &easy_curve[..4]);
+    assert!(hard_curve[0] < 0.25, "overconfident lane must calibrate down independently: {:?}", &hard_curve[..4]);
+
+    // Advance `hard`'s generated tokens by 512 (4 half-lives) without calibration updates,
+    // then feed 4 well-calibrated rounds and confirm rapid recovery via aged weight.
+    scheduler.request_mut(hard).unwrap().generated_tokens += 512;
+    for _ in 0..4 {
+        let plan = scheduler.plan().unwrap();
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let confidence = vec![vec![0.90; 15]; plan.batch_capacity];
+        for lane in &plan.lanes {
+            let offered = lane.tokens.saturating_sub(1).min(4);
+            records[lane.request.slot as usize].vector.as_mut().unwrap().offered_drafts = offered as i64;
+            let mut p = 1.0f32;
+            for d in 0..offered {
+                p *= 0.90f32;
+                surv[lane.request.slot as usize][d] = p;
+            }
+        }
+        scheduler
+            .complete_packed_round_with_survival(fence, &records, gpu_time(MS), &confidence, Some(&surv))
+            .unwrap();
+    }
+    let recovered = scheduler.speculative_curve(scheduler.request(hard).unwrap(), false);
+    assert!(recovered[0] > 0.65, "aged per-request calibration should recover rapidly: {:?}", &recovered[..4]);
+}
+
+#[test]
+fn large_batch_single_low_acceptance_round_does_not_collapse_calibration() {
+    let mut scheduler = engine(32, true);
+    throughput_only(&mut scheduler);
+    let mut graphs = super::tests::duration_graphs(32);
+    for g in &mut graphs {
+        g.estimated_duration_ns = match (g.kind, g.batch_capacity, g.token_capacity) {
+            (GraphKind::Init | GraphKind::Prefill, _, _) => MS,
+            (GraphKind::Speculative, 32, 1) => 9 * MS,
+            (GraphKind::Speculative, 32, 2) => 12 * MS,
+            _ => 50 * MS,
+        };
+    }
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.capabilities.speculative_allocations =
+        vec![(32, 1, 2, 64, crate::execution::PrefixAllocation::Gpu)];
+    let handles: Vec<_> = (0..32).map(|i| add(&mut scheduler, i + 1, 64, 512)).collect();
+    ready(&mut scheduler, &handles);
+    let slots = scheduler.limits.request_capacity();
+
+    // Establish 16 well-calibrated B=32 W=2 rounds (predicted=0.70, realized=0.68).
+    for _ in 0..16 {
+        let plan = scheduler.plan().unwrap();
+        assert_eq!((plan.batch_capacity, plan.token_capacity), (32, 2));
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let confidence = vec![vec![0.70; 15]; plan.batch_capacity];
+        for lane in &plan.lanes {
+            records[lane.request.slot as usize].vector.as_mut().unwrap().offered_drafts = 1;
+            surv[lane.request.slot as usize][0] = 0.68;
+        }
+        scheduler
+            .complete_packed_round_with_survival(fence, &records, gpu_time(12 * MS), &confidence, Some(&surv))
+            .unwrap();
+    }
+
+    // One correlated low-acceptance B=32 round (all 32 lanes drop to realized=0.05).
+    let plan = scheduler.plan().unwrap();
+    let fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&plan, fence).unwrap();
+    let mut records = completion_records(&scheduler, &plan, fence, 1);
+    let mut surv = vec![vec![-1.0f32; 15]; slots];
+    let confidence = vec![vec![0.70; 15]; plan.batch_capacity];
+    for lane in &plan.lanes {
+        records[lane.request.slot as usize].vector.as_mut().unwrap().offered_drafts = 1;
+        surv[lane.request.slot as usize][0] = 0.05;
+    }
+    scheduler
+        .complete_packed_round_with_survival(fence, &records, gpu_time(12 * MS), &confidence, Some(&surv))
+        .unwrap();
+
+    // Both the round-averaged global prior and every lane's calibrated forecast must stay
+    // above the W=2 vs W=1 threshold (32*1.60/12ms > 32/9ms) instead of collapsing into W=1.
+    assert!(scheduler.forecasts.calibration_factor(0) > 0.85,
+        "single correlated B=32 round must not collapse population prior: {}",
+        scheduler.forecasts.calibration_factor(0));
+    let next = scheduler.plan().unwrap();
+    assert_eq!((next.batch_capacity, next.token_capacity), (32, 2),
+        "single correlated B=32 dip must not trap scheduler in W=1");
+}
+
+#[test]
+fn surplus_table_falls_back_to_deepest_observed_prefix_depth() {
+    let easy = vec![0.95f32, 0.90, 0.85, 0.78];
+    let hard = vec![0.25f32, 0.04, 0.0, 0.0];
+    let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
+    let mut forecasts = rounds::Forecasts::new(8);
+    for i in 0..32 {
+        let actual = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+        forecasts.observe_surplus(actual, mean.clone());
+    }
+    // Only depth-4 (W=5) curves were observed; querying depth=7 (W=8) should fall back
+    // to depth=4 rather than starving deeper packed candidates at factor=1.0.
+    let table = forecasts.surplus_table(7).expect("should fall back to observed depth 4");
+    let packed_f = table.factor(16, 31, 1.0);
+    assert!(packed_f > 1.20 && packed_f < 1.60, "expected positive surplus at B=16, budget=31, got {packed_f}");
+    // Uncrowded relative to observed depth (budget >= lanes * 4) stays at 1.0 without extrapolating.
+    assert_eq!(table.factor(16, 64, 1.0), 1.0);
+    assert_eq!(table.factor(1, 2, 1.0), 1.0);
+}
