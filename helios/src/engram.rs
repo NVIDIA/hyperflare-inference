@@ -27,6 +27,7 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 #[derive(Default)]
@@ -230,11 +231,23 @@ impl Requests {
                 rows,
             } => {
                 let ready = unsafe { &*(flag as *const AtomicU64) };
+                // The GPU publishes this step's n-gram ids part-way through the step,
+                // milliseconds away, and two frames are pipelined: spinning a full
+                // step here holds a core that the model threads need, and eight such
+                // threads hold eight. Spin only long enough to catch an id set that
+                // lands immediately, then park in progressively longer naps.
+                let mut spins = 0u32;
                 while ready.load(Ordering::Acquire) != sequence {
                     if cancelled.load(Ordering::Acquire) {
                         return Err("n-gram request cancelled".into());
                     }
-                    std::hint::spin_loop();
+                    if spins < IDLE_SPIN_ROUNDS {
+                        std::hint::spin_loop();
+                    } else {
+                        let nap = u64::from((spins - IDLE_SPIN_ROUNDS).min(IDLE_STEPS)) + 1;
+                        thread::sleep(Duration::from_micros(nap * IDLE_STEP_US));
+                    }
+                    spins = spins.saturating_add(1);
                 }
                 Ok(unsafe { std::slice::from_raw_parts(address as *const i64, rows) }.to_vec())
             }
@@ -242,6 +255,12 @@ impl Requests {
     }
 }
 const STAGING_FRAMES: usize = 2;
+/// Spins taken before a waiting gather parks instead of holding a core.
+const IDLE_SPIN_ROUNDS: u32 = 1 << 12;
+/// Naps of `IDLE_STEP_US` a parked gather takes before its wait saturates.
+const IDLE_STEPS: u32 = 9;
+/// Longest nap, reached after ten rounds; the ids land within one step.
+const IDLE_STEP_US: u64 = 25;
 
 struct Job {
     frame: usize,
