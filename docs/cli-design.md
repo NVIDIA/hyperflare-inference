@@ -1636,23 +1636,33 @@ On Linux PCIe hosts, `flare doctor` verifies:
   `/sys/bus/pci/devices/<bdf>/config` requires root (`CAP_SYS_ADMIN`); without
   it, ACS is reported as `unverified` with a hint to run `sudo flare doctor`.
 
-On a DGX Spark identified by its GB10 PCI device, the report includes a local
-ConnectX-7 check for multi-host serving. The check uses the same RoCEv2 GID
-index selection as serving and requires at least one active CX7 device with
-an IPv4 address assigned to its network interface. The report lists the usable
-devices, interface names, addresses, prefix lengths, and available MTUs.
-Unused ports may be down. Warnings flag active devices missing a usable
-address, overlaps between local CX7 subnets, addresses and prefixes that
-need review, and MTUs below 9000 bytes. Compare subnet and MTU settings
-with the intended peers and switch. Peer reachability requires a separate
-check.
-`--gpus` does not affect this host check. On DGX Spark, PCIe tuning checks
-apply only when multiple selected GPUs require PCIe P2P.
+On Linux GB10 and RTX Spark N1X hosts, `flare doctor` checks the local
+ConnectX-7 fabric for multi-host serving. PCI identifies the ConnectX-7
+physical function (`15b3:1021`) even if its RDMA driver has not bound. The
+check is not applicable when the adapter is absent. `--gpus` does not affect
+this host check. On these hosts, PCIe tuning checks are not applicable when
+exactly one GPU is selected and are unverified when no GPU is selected or
+detected.
 
-`--json` prints the structured report; `--plain` disables terminal styling and
-conflicts with `--json`. The command exits zero when no check fails and
-non-zero when one or more checks fail. On non-Linux hosts, the command reports
-the checks as not applicable and exits zero.
+The fabric check uses serving's RoCEv2 GID index and reports the selected CX7
+devices, interface names, IPv4 prefixes, and MTUs. One active device with an
+assigned IPv4 address and RoCEv2 GID is sufficient. Additional unused ports
+may be down. The check warns if the driver, an active link, or a usable
+address is missing. It also warns about suspect prefixes, overlapping local
+subnets on different interfaces, and MTUs below 9000 bytes or unavailable.
+Two link-local interfaces may share a subnet. Link-local IPv4 requires an
+LLDP-confirmed direct peer.
+
+Compare each device's Ethernet MTU with the intended peers and switch. A
+9000-byte MTU can reduce packet overhead when the entire path supports it.
+NVIDIA's [Spark setup guide](https://build.nvidia.com/spark/connect-multiple-sparks/advance)
+uses MTU 9000 for a direct two-node link and MTU 1500 for ring and switched
+connections. Peer reachability requires a separate check.
+
+`--json` prints the structured report. `--plain` disables terminal styling and
+conflicts with `--json`. Check statuses are `pass`, `fail`, `warn`, `unverified`,
+and `not_applicable` in JSON. Only `fail` produces a nonzero exit status. On
+non-Linux hosts, the command reports the checks as not applicable and exits zero.
 
 ## 6. Capacity errors
 

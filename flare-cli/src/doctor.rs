@@ -6,7 +6,7 @@
 
 //! Host preflight diagnostics for tensor-parallel serving on Linux.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod spark;
 
 use std::{
@@ -228,7 +228,7 @@ fn diagnose(requested_gpus: &[i32]) -> Result<Report> {
             sysfs,
             Path::new(NVIDIA_PARAMS_PATH),
             Path::new(CMDLINE_PATH),
-            spark::is_gb10(sysfs),
+            flare_helios::execution::roce_fabric::discover,
         ))
     }
     #[cfg(not(target_os = "linux"))]
@@ -266,12 +266,13 @@ struct GpuProbe {
     notes: Vec<String>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn evaluate_linux_host(
     probe: GpuProbe,
     sysfs_root: &Path,
     nvidia_params_path: &Path,
     cmdline_path: &Path,
-    is_spark: bool,
+    discover: impl FnOnce() -> flare_helios::Result<flare_helios::execution::roce_fabric::Fabric>,
 ) -> Report {
     let gpu_bdfs: Vec<String> = probe.gpus.iter().map(|g| g.pci_bus_id.clone()).collect();
     let ancestor_chains = collect_ancestor_chains(sysfs_root, &gpu_bdfs);
@@ -282,6 +283,7 @@ fn evaluate_linux_host(
         Interconnect::Pcie | Interconnect::Mixed
     );
 
+    let spark_check = spark::check_host(sysfs_root, discover);
     let mut notes = probe.notes;
     let mut checks = if probe.interconnect == Interconnect::NvLink {
         notes.push(
@@ -297,8 +299,27 @@ fn evaluate_linux_host(
             detail: "Selected GPUs are connected over NVLink.".into(),
             remediation: None,
         }]
-    } else if is_spark && !pcie_tp_checks_required {
-        Vec::new()
+    } else if spark_check.is_some() && !pcie_tp_checks_required {
+        let (status, detail) = if probe.interconnect == Interconnect::SingleGpu {
+            (
+                CheckStatus::NotApplicable,
+                "PCIe TP>1 checks require at least two selected GPUs.",
+            )
+        } else {
+            (
+                CheckStatus::Unverified,
+                "No GPUs were selected or detected for PCIe topology checks.",
+            )
+        };
+        vec![Check {
+            id: "pcie.interconnect".into(),
+            name: "PCIe TP>1 preflight".into(),
+            status,
+            expected: None,
+            actual: Some(probe.interconnect.description().into()),
+            detail: detail.into(),
+            remediation: None,
+        }]
     } else {
         if matches!(
             probe.interconnect,
@@ -321,13 +342,7 @@ fn evaluate_linux_host(
         checks
     };
 
-    #[cfg(target_os = "linux")]
-    if is_spark {
-        checks.push(spark::check_fabric(
-            sysfs_root,
-            flare_helios::execution::roce_fabric::discover,
-        ));
-    }
+    checks.extend(spark_check);
 
     Report {
         platform: "linux",
@@ -515,31 +530,12 @@ pub fn render(report: &Report, mut canvas: Canvas) -> String {
         }
     }
 
-    let passed = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Pass)
-        .count();
-    let failed = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Fail)
-        .count();
-    let warnings = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Warn)
-        .count();
-    let unverified = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Unverified)
-        .count();
-    let na = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::NotApplicable)
-        .count();
+    let count = |status| report.checks.iter().filter(|c| c.status == status).count();
+    let passed = count(CheckStatus::Pass);
+    let failed = count(CheckStatus::Fail);
+    let warnings = count(CheckStatus::Warn);
+    let unverified = count(CheckStatus::Unverified);
+    let na = count(CheckStatus::NotApplicable);
 
     let mut summary = Vec::new();
     if passed > 0 {
@@ -548,7 +544,9 @@ pub fn render(report: &Report, mut canvas: Canvas) -> String {
     if failed > 0 {
         summary.push(format!("{failed} failed"));
     }
-    if warnings > 0 {
+    if warnings == 1 {
+        summary.push("1 warning".into());
+    } else if warnings > 1 {
         summary.push(format!("{warnings} warnings"));
     }
     if unverified > 0 {
@@ -565,6 +563,8 @@ pub fn render(report: &Report, mut canvas: Canvas) -> String {
         canvas.row("status", &CheckStatus::Unverified.styled(color));
     } else if warnings > 0 {
         canvas.row("status", &CheckStatus::Warn.styled(color));
+    } else if passed == 0 && na > 0 {
+        canvas.row("status", &CheckStatus::NotApplicable.styled(color));
     } else {
         canvas.row("status", &CheckStatus::Pass.styled(color));
     }
@@ -1519,41 +1519,57 @@ RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoChec
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cx7_preflight_uses_the_host_pci_id_even_without_visible_gpus() {
+    fn gb10_and_n1x_without_cx7_skip_fabric_preflight() {
+        use flare_helios::core::naming::GB10_DEVICES;
+
         let dir = tempfile::tempdir().unwrap();
         let sysfs = dir.path();
         let gpu = sysfs.join("bus/pci/devices/000f:01:00.0");
         fs::create_dir_all(&gpu).unwrap();
         fs::write(gpu.join("vendor"), "0x10de\n").unwrap();
-        let report = || {
+        let report = |interconnect| {
             evaluate_linux_host(
                 GpuProbe {
                     gpus: Vec::new(),
-                    interconnect: Interconnect::NoGpus,
+                    interconnect,
                     notes: Vec::new(),
                 },
                 sysfs,
                 &sysfs.join("params"),
                 &sysfs.join("cmdline"),
-                spark::is_gb10(sysfs),
+                || panic!("RoCE discovery must be skipped when there is no CX7 adapter"),
             )
         };
 
-        // RTX Spark N1X shares the core platform label with GB10.
-        fs::write(gpu.join("device"), "0x2e02\n").unwrap();
-        assert!(report().checks.iter().all(|check| check.id != "spark.cx7"));
+        fs::write(gpu.join("device"), "0x2b85\n").unwrap();
+        assert!(
+            report(Interconnect::SingleGpu)
+                .checks
+                .iter()
+                .all(|check| check.id != "spark.cx7")
+        );
 
-        fs::write(gpu.join("device"), "0x2e12\n").unwrap();
-        let report = report();
-        let [check] = report.checks.as_slice() else {
-            panic!("Expected only the CX7 check, got {:?}", report.checks);
-        };
-        assert_eq!(check.id, "spark.cx7");
-        assert_eq!(check.status, CheckStatus::Fail);
-        assert!(check.detail.contains("No ConnectX-7 RDMA devices"));
-        assert!(!report.ok);
-        let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["checks"][0]["status"], "fail");
+        for device in GB10_DEVICES {
+            fs::write(gpu.join("device"), format!("0x{device:04x}\n")).unwrap();
+            let report = report(Interconnect::SingleGpu);
+            assert!(report.ok);
+            assert_eq!(report.checks.len(), 2);
+            assert_eq!(report.checks[0].id, "pcie.interconnect");
+            assert_eq!(report.checks[1].id, "spark.cx7");
+            assert!(
+                report.checks.iter().all(|check| check.status == CheckStatus::NotApplicable)
+            );
+            assert_eq!(
+                serde_json::to_value(&report).unwrap()["checks"][1]["status"],
+                "not_applicable"
+            );
+            assert!(!render(&report, Canvas::sized(100, false)).contains("PASS"));
+        }
+
+        let report = report(Interconnect::NoGpus);
+        assert!(report.ok);
+        assert!(!report.all_verified);
+        assert_eq!(report.checks[0].status, CheckStatus::Unverified);
     }
 
     #[test]
@@ -1927,7 +1943,7 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
             dir.path(),
             &dir.path().join("missing-params"),
             &dir.path().join("missing-cmdline"),
-            false,
+            || panic!("RoCE discovery must be skipped on this host"),
         );
         assert!(report.ok);
         assert!(!report.pcie_tp_checks_required);
@@ -1986,7 +2002,9 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
             interconnect: Interconnect::Pcie,
             notes: Vec::new(),
         };
-        let report = evaluate_linux_host(pcie_probe, dir.path(), &params, &cmdline, false);
+        let report = evaluate_linux_host(pcie_probe, dir.path(), &params, &cmdline, || {
+            panic!("RoCE discovery must be skipped on this host")
+        });
         assert!(!report.ok);
         let plain = render(&report, Canvas::sized(100, false));
         assert!(plain.contains("Flare doctor"), "{plain}");

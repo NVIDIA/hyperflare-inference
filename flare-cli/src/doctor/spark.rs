@@ -5,26 +5,21 @@
 
 use std::{fs, io, net::Ipv4Addr, path::Path};
 
-use flare_helios::execution::roce_fabric::Fabric;
+use flare_helios::{
+    core::naming::platform_from_pci,
+    execution::roce_fabric::{
+        Fabric, MAX_DEVICES, has_rocev2_ipv4_gid, ipv4_subnet_mask, link_local, port1_active,
+    },
+};
 
-use super::{Check, CheckStatus};
+use super::{Check, CheckStatus, parse_u64_param};
 
-// PCI IDs in NVML format (device in the upper half, vendor in the lower half).
-const DGX_SPARK_GB10: u32 = 0x2e12_10de;
 const CONNECTX_7: u32 = 0x1021_15b3;
 const JUMBO_MTU: u32 = 9000;
 
-pub(super) fn is_gb10(sysfs: &Path) -> bool {
-    fs::read_dir(sysfs.join("bus/pci/devices")).is_ok_and(|devices| {
-        devices
-            .filter_map(Result::ok)
-            .any(|device| pci_id(&device.path()) == Some(DGX_SPARK_GB10))
-    })
-}
-
 fn pci_id(device: &Path) -> Option<u32> {
-    let read_id =
-        |name| u16::from_str_radix(read(&device.join(name))?.strip_prefix("0x")?, 16).ok();
+    let read_id = |name| u16::try_from(parse_u64_param(&read(&device.join(name))?)?).ok();
+    // NVML packs the device ID in the upper half and the vendor ID in the lower half.
     Some((u32::from(read_id("device")?) << 16) | u32::from(read_id("vendor")?))
 }
 
@@ -32,24 +27,58 @@ fn read(file: &Path) -> Option<String> {
     fs::read_to_string(file).ok().map(|s| s.trim().to_owned())
 }
 
-pub(super) fn check_fabric(
+pub(super) fn check_host(
     sysfs: &Path,
     discover: impl FnOnce() -> flare_helios::Result<Fabric>,
-) -> Check {
-    let (status, detail, remediation) = match inspect(sysfs, discover) {
+) -> Option<Check> {
+    let mut gb10 = false;
+    let mut cx7 = false;
+    for id in fs::read_dir(sysfs.join("bus/pci/devices"))
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|device| pci_id(&device.path()))
+    {
+        gb10 |= platform_from_pci(id) == Some("gb10");
+        cx7 |= id == CONNECTX_7;
+    }
+    if !gb10 {
+        return None;
+    }
+    if !cx7 {
+        return Some(result(
+            CheckStatus::NotApplicable,
+            Some("No ConnectX-7 PCI device".into()),
+            "This host has no ConnectX-7 adapter.".into(),
+            None,
+        ));
+    }
+    Some(check_fabric(sysfs, discover))
+}
+
+fn check_fabric(sysfs: &Path, discover: impl FnOnce() -> flare_helios::Result<Fabric>) -> Check {
+    match inspect(sysfs, discover) {
         Ok(outcome) => outcome,
-        Err(error) => (
+        Err(error) => result(
             CheckStatus::Unverified,
+            None,
             error.to_string(),
-            Some("Make the host's RDMA and network sysfs attributes visible to flare doctor."),
+            Some("Make the host's RDMA sysfs attributes visible to flare doctor."),
         ),
-    };
+    }
+}
+
+fn result(
+    status: CheckStatus,
+    actual: Option<String>,
+    detail: String,
+    remediation: Option<&str>,
+) -> Check {
     Check {
         id: "spark.cx7".into(),
-        name: "DGX Spark ConnectX-7 fabric".into(),
+        name: "ConnectX-7 fabric".into(),
         status,
         expected: Some("An active CX7 link with an assigned IPv4 address and a RoCEv2 GID".into()),
-        actual: None,
+        actual,
         detail,
         remediation: remediation.map(str::to_owned),
     }
@@ -58,7 +87,7 @@ pub(super) fn check_fabric(
 fn inspect(
     sysfs: &Path,
     discover: impl FnOnce() -> flare_helios::Result<Fabric>,
-) -> io::Result<(CheckStatus, String, Option<&'static str>)> {
+) -> io::Result<Check> {
     let root = sysfs.join("class/infiniband");
     let mut devices = match fs::read_dir(&root) {
         Ok(entries) => entries.collect::<io::Result<Vec<_>>>()?,
@@ -68,9 +97,10 @@ fn inspect(
     devices.retain(|device| pci_id(&device.path().join("device")) == Some(CONNECTX_7));
     devices.sort_by_key(|device| device.file_name());
     if devices.is_empty() {
-        return Ok((
-            CheckStatus::Fail,
-            "No ConnectX-7 RDMA devices found.".into(),
+        return Ok(result(
+            CheckStatus::Warn,
+            Some("No ConnectX-7 RDMA devices".into()),
+            "ConnectX-7 is present on PCI, but the kernel exposes no CX7 RDMA devices.".into(),
             Some(
                 "Check that the ConnectX-7 adapter is visible and the mlx5 RDMA driver is loaded.",
             ),
@@ -81,22 +111,17 @@ fn inspect(
     let mut unreadable = Vec::new();
     for device in &devices {
         let name = device.file_name().to_string_lossy().into_owned();
-        match read(&device.path().join("ports/1/state")) {
-            Some(state)
-                if state
-                    .split_once(':')
-                    .is_some_and(|(_, s)| s.trim() == "ACTIVE") =>
-            {
-                active.push(name);
-            }
-            Some(_) => {}
-            None => unreadable.push(name),
+        match port1_active(&device.path()) {
+            Ok(true) => active.push(name),
+            Ok(false) => {}
+            Err(_) => unreadable.push(name),
         }
     }
     if active.is_empty() {
         if !unreadable.is_empty() {
-            return Ok((
+            return Ok(result(
                 CheckStatus::Unverified,
+                None,
                 format!(
                     "Could not read the link state for {}.",
                     unreadable.join(", ")
@@ -108,8 +133,9 @@ fn inspect(
             .iter()
             .map(|device| device.file_name().to_string_lossy().into_owned())
             .collect();
-        return Ok((
-            CheckStatus::Fail,
+        return Ok(result(
+            CheckStatus::Warn,
+            Some("No active ConnectX-7 links".into()),
             format!(
                 "No active ConnectX-7 RDMA links ({}) for multi-host serving.",
                 names.join(", ")
@@ -132,7 +158,9 @@ fn inspect(
             let netdev = root
                 .join(&endpoint.name)
                 .join(format!("ports/1/gid_attrs/ndevs/{}", fabric.gid_index));
-            let interface = read(&netdev).unwrap_or_else(|| "interface unavailable".into());
+            let Some(interface) = read(&netdev) else {
+                continue;
+            };
             let mtu = read(&sysfs.join("class/net").join(&interface).join("mtu"))
                 .and_then(|mtu| mtu.parse().ok());
             ready.push(Interface {
@@ -150,34 +178,61 @@ fn inspect(
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut detail = format!(
-                "{} of {} active CX7 devices have an assigned IPv4 address at RoCEv2 GID index {}: {listed}.",
+                "{} of {} active CX7 devices supply IPv4 endpoints for serving at RoCEv2 GID index {}: {listed}.",
                 ready.len(),
                 active.len(),
                 fabric.gid_index
             );
             let mut warnings = configuration_warnings(&ready);
-            if ready.len() < active.len() {
-                let missing: Vec<_> = active
-                    .iter()
-                    .filter(|name| !ready.iter().any(|port| port.device == name.as_str()))
-                    .map(String::as_str)
-                    .collect();
+            if ready.iter().any(Interface::is_link_local) {
+                detail.push_str(" Link-local IPv4 requires an LLDP-confirmed direct peer.");
+            }
+            let mut omitted = Vec::new();
+            let mut missing = Vec::new();
+            for name in &active {
+                if ready.iter().any(|port| port.device == name) {
+                    continue;
+                }
+                if fabric.endpoints.len() == MAX_DEVICES
+                    && !fabric
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.name == *name)
+                    && has_rocev2_ipv4_gid(&root.join(name), fabric.gid_index)
+                {
+                    omitted.push(name.as_str());
+                } else {
+                    missing.push(name.as_str());
+                }
+            }
+            if !omitted.is_empty() {
+                detail.push_str(&format!(
+                    " Serving selects at most {MAX_DEVICES} devices and omitted {}.",
+                    omitted.join(", ")
+                ));
+            }
+            if !missing.is_empty() {
                 warnings.push(format!(
                     "Check the IPv4 address and GID on {}.",
                     missing.join(", ")
                 ));
             }
+            if !unreadable.is_empty() {
+                warnings.push(format!(
+                    "Could not read the link state for {}.",
+                    unreadable.join(", ")
+                ));
+            }
             if warnings.is_empty() {
-                return Ok((CheckStatus::Pass, detail, None));
+                return Ok(result(CheckStatus::Pass, Some(listed), detail, None));
             }
             detail.push(' ');
             detail.push_str(&warnings.join(" "));
-            return Ok((
+            return Ok(result(
                 CheckStatus::Warn,
+                Some(listed),
                 detail,
-                Some(
-                    "Use IPv4 subnets shared with the intended peers. Confirm jumbo MTU support on the peers and switch.",
-                ),
+                Some("Check IPv4 subnet and MTU settings against the intended peers and switch."),
             ));
         }
     }
@@ -189,8 +244,9 @@ fn inspect(
             fabric.gid_index
         ),
     };
-    Ok((
-        CheckStatus::Fail,
+    Ok(result(
+        CheckStatus::Warn,
+        Some("No usable ConnectX-7 IPv4 endpoint".into()),
         format!("Active ConnectX-7 links ({}): {reason}.", active.join(", ")),
         Some("Assign IPv4 addresses on the CX7 interfaces and check their RoCEv2 GID entries."),
     ))
@@ -205,6 +261,10 @@ struct Interface<'a> {
 }
 
 impl Interface<'_> {
+    fn is_link_local(&self) -> bool {
+        link_local((u32::from(self.address), self.prefix))
+    }
+
     fn describe(&self) -> String {
         let mtu = self
             .mtu
@@ -216,38 +276,24 @@ impl Interface<'_> {
     }
 }
 
-fn subnet_mask(prefix: u8) -> u32 {
-    u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
-}
-
 fn configuration_warnings(ports: &[Interface<'_>]) -> Vec<String> {
     let mut warnings = Vec::new();
     for (i, port) in ports.iter().enumerate() {
         let name = &port.interface;
         let address = u32::from(port.address);
-        let host_bits = !subnet_mask(port.prefix);
+        let host_bits = !ipv4_subnet_mask(port.prefix);
         let host = address & host_bits;
-        if matches!(port.prefix, 0 | 32)
-            || port.address.is_unspecified()
-            || port.address.is_loopback()
-            || port.address.is_multicast()
-            || port.address.is_broadcast()
-            || (port.prefix < 31 && (host == 0 || host == host_bits))
-        {
+        if matches!(port.prefix, 0 | 32) || (port.prefix < 31 && (host == 0 || host == host_bits)) {
             warnings.push(format!(
                 "Review {name}'s IPv4 subnet ({}/{}).",
                 port.address, port.prefix
-            ));
-        } else if port.address.is_link_local() {
-            warnings.push(format!(
-                "{name} uses link-local IPv4, which requires an LLDP-confirmed direct peer."
             ));
         }
 
         match port.mtu {
             Some(mtu) if mtu < JUMBO_MTU => {
                 warnings.push(format!(
-                    "{name}'s MTU {mtu} is below the recommended {JUMBO_MTU}."
+                    "{name}'s MTU {mtu} is below {JUMBO_MTU}. MTU {JUMBO_MTU} can improve throughput when the full path supports it."
                 ));
             }
             None => warnings.push(format!("Could not read the MTU for {name}.")),
@@ -255,10 +301,11 @@ fn configuration_warnings(ports: &[Interface<'_>]) -> Vec<String> {
         }
 
         for other in &ports[..i] {
-            if port.interface == other.interface {
+            if port.interface == other.interface || (port.is_link_local() && other.is_link_local())
+            {
                 continue;
             }
-            let mask = subnet_mask(port.prefix.min(other.prefix));
+            let mask = ipv4_subnet_mask(port.prefix.min(other.prefix));
             if address & mask == u32::from(other.address) & mask {
                 warnings.push(format!(
                     "IPv4 subnets overlap on {} and {name}.",
@@ -270,9 +317,11 @@ fn configuration_warnings(ports: &[Interface<'_>]) -> Vec<String> {
     warnings
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::doctor::{GpuProbe, Interconnect, Report, evaluate_linux_host, render};
+    use crate::inspect::Canvas;
     use flare_helios::execution::roce_fabric;
 
     fn write(root: &Path, path: &str, content: &str) {
@@ -281,10 +330,45 @@ mod tests {
         fs::write(file, content).unwrap();
     }
 
+    fn add_spark(sysfs: &Path) {
+        write(sysfs, "bus/pci/devices/000f:01:00.0/vendor", "0x10de\n");
+        write(sysfs, "bus/pci/devices/000f:01:00.0/device", "0x2e12\n");
+        write(sysfs, "bus/pci/devices/0000:01:00.0/vendor", "0x15b3\n");
+        write(sysfs, "bus/pci/devices/0000:01:00.0/device", "0x1021\n");
+    }
+
+    fn report(sysfs: &Path, prefix: impl Fn(&str, Ipv4Addr) -> Option<u8>) -> Report {
+        evaluate_linux_host(
+            GpuProbe {
+                gpus: Vec::new(),
+                interconnect: Interconnect::SingleGpu,
+                notes: Vec::new(),
+            },
+            sysfs,
+            &sysfs.join("params"),
+            &sysfs.join("cmdline"),
+            || {
+                roce_fabric::discover_in(&sysfs.join("class/infiniband"), prefix, |_| {
+                    Default::default()
+                })
+            },
+        )
+    }
+
     #[test]
     fn cx7_readiness_requires_a_live_ipv4_address_at_the_serving_gid_index() {
         let dir = tempfile::tempdir().unwrap();
         let sysfs = dir.path();
+        add_spark(sysfs);
+        let no_driver = report(sysfs, |_, _| None);
+        assert!(no_driver.ok);
+        assert_eq!(no_driver.checks[1].status, CheckStatus::Warn);
+        assert!(
+            no_driver.checks[1]
+                .detail
+                .contains("kernel exposes no CX7 RDMA devices")
+        );
+
         let root = sysfs.join("class/infiniband");
         let port = root.join("roce0/ports/1");
         write(&root, "roce0/device/vendor", "0x15b3\n");
@@ -292,44 +376,80 @@ mod tests {
         write(&root, "roce1/device/vendor", "0x15b3\n");
         write(&root, "roce1/device/device", "0x1021\n");
         write(&root, "roce1/ports/1/state", "1: DOWN\n");
+        write(&port, "state", "1: DOWN\n");
+        let no_links = report(sysfs, |_, _| None);
+        assert!(no_links.ok);
+        assert_eq!(no_links.checks[1].status, CheckStatus::Warn);
+        assert!(
+            no_links.checks[1]
+                .detail
+                .contains("No active ConnectX-7 RDMA links")
+        );
         write(&port, "state", "4: ACTIVE\n");
         write(&port, "gid_attrs/ndevs/3", "enp1s0f0np0\n");
         write(&port, "gids/3", "0000:0000:0000:0000:0000:ffff:c0a8:0b02\n");
         write(sysfs, "class/net/enp1s0f0np0/mtu", "9000\n");
 
         let inspect = |has_ip| {
-            check_fabric(sysfs, || {
-                roce_fabric::discover_in(
-                    &root,
-                    |netdev, addr| {
-                        (has_ip && netdev == "enp1s0f0np0" && addr.octets() == [192, 168, 11, 2])
-                            .then_some(24)
-                    },
-                    |_| Default::default(),
-                )
+            report(sysfs, |netdev, addr| {
+                (has_ip && netdev == "enp1s0f0np0" && addr.octets() == [192, 168, 11, 2])
+                    .then_some(24)
             })
         };
         write(&port, "gid_attrs/types/3", "RoCE v1\n");
-        assert_eq!(inspect(true).status, CheckStatus::Fail);
+        assert_eq!(inspect(true).checks[1].status, CheckStatus::Warn);
         write(&port, "gid_attrs/types/3", "RoCE v2\n");
-        assert_eq!(inspect(false).status, CheckStatus::Fail);
-        let ready = inspect(true);
+        assert_eq!(inspect(false).checks[1].status, CheckStatus::Warn);
+        let report = inspect(true);
+        let ready = &report.checks[1];
+        assert!(report.ok);
         assert_eq!(ready.status, CheckStatus::Pass, "{}", ready.detail);
         assert!(
             ready
-                .detail
+                .actual
+                .as_deref()
+                .unwrap()
                 .contains("enp1s0f0np0, 192.168.11.2/24, MTU 9000")
         );
         write(sysfs, "class/net/enp1s0f0np0/mtu", "1500\n");
         let warning = inspect(true);
-        assert_eq!(warning.status, CheckStatus::Warn);
+        assert!(warning.ok);
+        assert_eq!(warning.checks[1].status, CheckStatus::Warn);
         assert!(
-            warning
+            warning.checks[1]
                 .detail
-                .contains("MTU 1500 is below the recommended 9000")
+                .contains("MTU 1500 is below 9000. MTU 9000 can improve throughput")
         );
+        assert!(render(&warning, Canvas::sized(100, false)).contains("1 warning,"));
         fs::remove_file(port.join("state")).unwrap();
-        assert_eq!(inspect(true).status, CheckStatus::Unverified);
+        assert!(!inspect(true).all_verified);
+        assert_eq!(inspect(true).checks[1].status, CheckStatus::Unverified);
+    }
+
+    #[test]
+    fn cx7_preflight_distinguishes_devices_beyond_the_serving_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysfs = dir.path();
+        add_spark(sysfs);
+        for i in 0..=MAX_DEVICES {
+            let device = sysfs.join(format!("class/infiniband/roce{i}"));
+            write(&device, "device/vendor", "0x15b3\n");
+            write(&device, "device/device", "0x1021\n");
+            write(&device, "ports/1/state", "4: ACTIVE\n");
+            write(&device, "ports/1/gid_attrs/types/3", "RoCE v2\n");
+            write(&device, "ports/1/gid_attrs/ndevs/3", &format!("eth{i}\n"));
+            write(
+                &device,
+                "ports/1/gids/3",
+                &format!("0000:0000:0000:0000:0000:ffff:c0a8:{i:02x}02\n"),
+            );
+            write(sysfs, &format!("class/net/eth{i}/mtu"), "9000\n");
+        }
+        let report = report(sysfs, |_, _| Some(24));
+        let check = &report.checks[1];
+        assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+        assert!(check.detail.contains("4 of 5 active CX7 devices"));
+        assert!(check.detail.contains("omitted roce4"));
     }
 
     #[test]
@@ -363,5 +483,9 @@ mod tests {
                 .join(" ")
                 .contains("192.168.0.15/32")
         );
+        interfaces[0].address = Ipv4Addr::new(169, 254, 1, 2);
+        interfaces[1].address = Ipv4Addr::new(169, 254, 2, 2);
+        interfaces.iter_mut().for_each(|port| port.prefix = 16);
+        assert!(configuration_warnings(&interfaces).is_empty());
     }
 }
