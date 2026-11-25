@@ -215,7 +215,11 @@ static __device__ __forceinline__ U crc32_byte_entry(U b) {
     U c = b;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        U mask = 0u - (c & 1u);
+        // Prevent NVVM/LLVM CRC table synthesis (CUDA 13+) from emitting
+        // .nv.global.init `_$_crctable` symbols into this standalone cubin.
+        asm("" : "+r"(mask));
+        c = (c >> 1) ^ (0xEDB88320u & mask);
     }
     return c;
 }
