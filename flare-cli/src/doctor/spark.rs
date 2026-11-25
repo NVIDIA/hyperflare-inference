@@ -7,15 +7,15 @@ use std::{fs, io, net::Ipv4Addr, path::Path};
 
 use flare_helios::{
     core::naming::platform_from_pci,
-    execution::roce_fabric::{
-        Fabric, MAX_DEVICES, has_rocev2_ipv4_gid, ipv4_subnet_mask, link_local, port1_active,
-    },
+    execution::roce_fabric::{Fabric, ipv4_subnet_mask, link_local, port1_active},
 };
 
 use super::{Check, CheckStatus, parse_u64_param};
 
 const CONNECTX_7: u32 = 0x1021_15b3;
-const JUMBO_MTU: u32 = 9000;
+// NVIDIA's Spark setup guide uses MTU 9000 for a direct pair and 1500 for rings
+// and switches. Set this to Some(9000) only after qualifying the intended fabric.
+const PREFERRED_MTU: Option<u32> = None;
 
 fn pci_id(device: &Path) -> Option<u32> {
     let read_id = |name| u16::try_from(parse_u64_param(&read(&device.join(name))?)?).ok();
@@ -60,9 +60,9 @@ fn check_fabric(sysfs: &Path, discover: impl FnOnce() -> flare_helios::Result<Fa
         Ok(outcome) => outcome,
         Err(error) => result(
             CheckStatus::Unverified,
-            None,
-            error.to_string(),
-            Some("Make the host's RDMA sysfs attributes visible to flare doctor."),
+            Some("RDMA device list unreadable".into()),
+            format!("Could not list RDMA devices in /sys/class/infiniband: {error}."),
+            Some("Check access to /sys/class/infiniband on this host."),
         ),
     }
 }
@@ -77,7 +77,9 @@ fn result(
         id: "spark.cx7".into(),
         name: "ConnectX-7 fabric".into(),
         status,
-        expected: Some("An active CX7 link with an assigned IPv4 address and a RoCEv2 GID".into()),
+        expected: Some(
+            "An active ConnectX-7 link with an assigned IPv4 address and a RoCEv2 GID".into(),
+        ),
         actual,
         detail,
         remediation: remediation.map(str::to_owned),
@@ -119,13 +121,11 @@ fn inspect(
     }
     if active.is_empty() {
         if !unreadable.is_empty() {
+            let names = unreadable.join(", ");
             return Ok(result(
                 CheckStatus::Unverified,
-                None,
-                format!(
-                    "Could not read the link state for {}.",
-                    unreadable.join(", ")
-                ),
+                Some(format!("Unreadable link state: {names}")),
+                format!("Could not read the link state for {names}."),
                 Some("Check the host's RDMA port state in /sys/class/infiniband."),
             ));
         }
@@ -148,17 +148,21 @@ fn inspect(
     let fabric = discover();
     let mut ready = Vec::new();
     if let Ok(fabric) = &fabric {
+        let mut unresolved = Vec::new();
         for endpoint in &fabric.endpoints {
+            // Serving discovers every RDMA adapter. This check covers ConnectX-7 devices.
             if !active.contains(&endpoint.name) {
                 continue;
             }
             let Some((address, prefix)) = endpoint.ipv4 else {
+                unresolved.push(endpoint.name.as_str());
                 continue;
             };
             let netdev = root
                 .join(&endpoint.name)
                 .join(format!("ports/1/gid_attrs/ndevs/{}", fabric.gid_index));
             let Some(interface) = read(&netdev) else {
+                unresolved.push(endpoint.name.as_str());
                 continue;
             };
             let mtu = read(&sysfs.join("class/net").join(&interface).join("mtu"))
@@ -187,34 +191,26 @@ fn inspect(
             if ready.iter().any(Interface::is_link_local) {
                 detail.push_str(" Link-local IPv4 requires an LLDP-confirmed direct peer.");
             }
-            let mut omitted = Vec::new();
-            let mut missing = Vec::new();
-            for name in &active {
-                if ready.iter().any(|port| port.device == name) {
-                    continue;
-                }
-                if fabric.endpoints.len() == MAX_DEVICES
-                    && !fabric
+            let unselected: Vec<_> = active
+                .iter()
+                .filter(|name| {
+                    !fabric
                         .endpoints
                         .iter()
-                        .any(|endpoint| endpoint.name == *name)
-                    && has_rocev2_ipv4_gid(&root.join(name), fabric.gid_index)
-                {
-                    omitted.push(name.as_str());
-                } else {
-                    missing.push(name.as_str());
-                }
-            }
-            if !omitted.is_empty() {
+                        .any(|endpoint| &endpoint.name == *name)
+                })
+                .map(String::as_str)
+                .collect();
+            if !unselected.is_empty() {
                 detail.push_str(&format!(
-                    " Serving selects at most {MAX_DEVICES} devices and omitted {}.",
-                    omitted.join(", ")
+                    " Serving discovery did not select {}.",
+                    unselected.join(", ")
                 ));
             }
-            if !missing.is_empty() {
+            if !unresolved.is_empty() {
                 warnings.push(format!(
-                    "Check the IPv4 address and GID on {}.",
-                    missing.join(", ")
+                    "Could not resolve a local IPv4 address and prefix for {}.",
+                    unresolved.join(", ")
                 ));
             }
             if !unreadable.is_empty() {
@@ -240,7 +236,7 @@ fn inspect(
     let reason = match fabric {
         Err(error) => error.to_string(),
         Ok(fabric) => format!(
-            "no CX7 device has an assigned IPv4 address at RoCEv2 GID index {}",
+            "discovery could not verify a local IPv4 address and prefix on a ConnectX-7 device at RoCEv2 GID index {}",
             fabric.gid_index
         ),
     };
@@ -248,7 +244,9 @@ fn inspect(
         CheckStatus::Warn,
         Some("No usable ConnectX-7 IPv4 endpoint".into()),
         format!("Active ConnectX-7 links ({}): {reason}.", active.join(", ")),
-        Some("Assign IPv4 addresses on the CX7 interfaces and check their RoCEv2 GID entries."),
+        Some(
+            "Check the IPv4 addresses, prefixes, and RoCEv2 GID entries on the ConnectX-7 interfaces.",
+        ),
     ))
 }
 
@@ -290,13 +288,13 @@ fn configuration_warnings(ports: &[Interface<'_>]) -> Vec<String> {
             ));
         }
 
-        match port.mtu {
-            Some(mtu) if mtu < JUMBO_MTU => {
+        match (port.mtu, PREFERRED_MTU) {
+            (Some(mtu), Some(preferred)) if mtu < preferred => {
                 warnings.push(format!(
-                    "{name}'s MTU {mtu} is below {JUMBO_MTU}. MTU {JUMBO_MTU} can improve throughput when the full path supports it."
+                    "{name}'s MTU {mtu} is below the preferred {preferred}. A larger MTU can reduce packet overhead when the full path supports it."
                 ));
             }
-            None => warnings.push(format!("Could not read the MTU for {name}.")),
+            (None, _) => warnings.push(format!("Could not read the MTU for {name}.")),
             _ => {}
         }
 
@@ -355,6 +353,14 @@ mod tests {
         )
     }
 
+    fn cx7(report: &Report) -> &Check {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == "spark.cx7")
+            .unwrap()
+    }
+
     #[test]
     fn cx7_readiness_requires_a_live_ipv4_address_at_the_serving_gid_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -362,12 +368,13 @@ mod tests {
         add_spark(sysfs);
         let no_driver = report(sysfs, |_, _| None);
         assert!(no_driver.ok);
-        assert_eq!(no_driver.checks[1].status, CheckStatus::Warn);
+        assert_eq!(cx7(&no_driver).status, CheckStatus::Warn);
         assert!(
-            no_driver.checks[1]
+            cx7(&no_driver)
                 .detail
                 .contains("kernel exposes no CX7 RDMA devices")
         );
+        assert!(render(&no_driver, Canvas::sized(100, false)).contains("1 warning,"));
 
         let root = sysfs.join("class/infiniband");
         let port = root.join("roce0/ports/1");
@@ -379,9 +386,9 @@ mod tests {
         write(&port, "state", "1: DOWN\n");
         let no_links = report(sysfs, |_, _| None);
         assert!(no_links.ok);
-        assert_eq!(no_links.checks[1].status, CheckStatus::Warn);
+        assert_eq!(cx7(&no_links).status, CheckStatus::Warn);
         assert!(
-            no_links.checks[1]
+            cx7(&no_links)
                 .detail
                 .contains("No active ConnectX-7 RDMA links")
         );
@@ -397,11 +404,11 @@ mod tests {
             })
         };
         write(&port, "gid_attrs/types/3", "RoCE v1\n");
-        assert_eq!(inspect(true).checks[1].status, CheckStatus::Warn);
+        assert_eq!(cx7(&inspect(true)).status, CheckStatus::Warn);
         write(&port, "gid_attrs/types/3", "RoCE v2\n");
-        assert_eq!(inspect(false).checks[1].status, CheckStatus::Warn);
+        assert_eq!(cx7(&inspect(false)).status, CheckStatus::Warn);
         let report = inspect(true);
-        let ready = &report.checks[1];
+        let ready = cx7(&report);
         assert!(report.ok);
         assert_eq!(ready.status, CheckStatus::Pass, "{}", ready.detail);
         assert!(
@@ -412,30 +419,37 @@ mod tests {
                 .contains("enp1s0f0np0, 192.168.11.2/24, MTU 9000")
         );
         write(sysfs, "class/net/enp1s0f0np0/mtu", "1500\n");
-        let warning = inspect(true);
-        assert!(warning.ok);
-        assert_eq!(warning.checks[1].status, CheckStatus::Warn);
+        let standard_mtu = inspect(true);
+        assert!(standard_mtu.ok);
+        assert_eq!(cx7(&standard_mtu).status, CheckStatus::Pass);
+        assert!(cx7(&standard_mtu).detail.contains("MTU 1500"));
+        fs::remove_file(sysfs.join("class/net/enp1s0f0np0/mtu")).unwrap();
+        let unreadable_mtu = inspect(true);
+        assert_eq!(cx7(&unreadable_mtu).status, CheckStatus::Warn);
         assert!(
-            warning.checks[1]
+            cx7(&unreadable_mtu)
                 .detail
-                .contains("MTU 1500 is below 9000. MTU 9000 can improve throughput")
+                .contains("Could not read the MTU")
         );
-        assert!(render(&warning, Canvas::sized(100, false)).contains("1 warning,"));
         fs::remove_file(port.join("state")).unwrap();
-        assert!(!inspect(true).all_verified);
-        assert_eq!(inspect(true).checks[1].status, CheckStatus::Unverified);
+        let unreadable_link = inspect(true);
+        assert!(!unreadable_link.all_verified);
+        assert_eq!(cx7(&unreadable_link).status, CheckStatus::Unverified);
     }
 
     #[test]
-    fn cx7_preflight_distinguishes_devices_beyond_the_serving_limit() {
+    fn cx7_preflight_reports_unselected_devices_and_unresolved_prefixes() {
         let dir = tempfile::tempdir().unwrap();
         let sysfs = dir.path();
         add_spark(sysfs);
-        for i in 0..=MAX_DEVICES {
+        for i in 0..3 {
             let device = sysfs.join(format!("class/infiniband/roce{i}"));
             write(&device, "device/vendor", "0x15b3\n");
             write(&device, "device/device", "0x1021\n");
             write(&device, "ports/1/state", "4: ACTIVE\n");
+            if i == 2 {
+                continue;
+            }
             write(&device, "ports/1/gid_attrs/types/3", "RoCE v2\n");
             write(&device, "ports/1/gid_attrs/ndevs/3", &format!("eth{i}\n"));
             write(
@@ -445,11 +459,30 @@ mod tests {
             );
             write(sysfs, &format!("class/net/eth{i}/mtu"), "9000\n");
         }
-        let report = report(sysfs, |_, _| Some(24));
-        let check = &report.checks[1];
+        let ready = report(sysfs, |_, _| Some(24));
+        let check = cx7(&ready);
         assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
-        assert!(check.detail.contains("4 of 5 active CX7 devices"));
-        assert!(check.detail.contains("omitted roce4"));
+        assert!(check.detail.contains("2 of 3 active CX7 devices"));
+        assert!(
+            check
+                .detail
+                .contains("Serving discovery did not select roce2.")
+        );
+
+        let unresolved = report(sysfs, |netdev, _| (netdev == "eth0").then_some(24));
+        assert!(unresolved.ok);
+        let check = cx7(&unresolved);
+        assert_eq!(check.status, CheckStatus::Warn, "{}", check.detail);
+        assert!(
+            check
+                .detail
+                .contains("Serving discovery did not select roce2.")
+        );
+        assert!(
+            check
+                .detail
+                .contains("Could not resolve a local IPv4 address and prefix for roce1.")
+        );
     }
 
     #[test]

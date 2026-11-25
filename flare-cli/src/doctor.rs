@@ -1554,13 +1554,19 @@ RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoChec
             let report = report(Interconnect::SingleGpu);
             assert!(report.ok);
             assert_eq!(report.checks.len(), 2);
-            assert_eq!(report.checks[0].id, "pcie.interconnect");
-            assert_eq!(report.checks[1].id, "spark.cx7");
+            assert!(
+                report.checks.iter().any(|check| check.id == "pcie.interconnect")
+            );
+            let cx7 = report
+                .checks
+                .iter()
+                .find(|check| check.id == "spark.cx7")
+                .unwrap();
             assert!(
                 report.checks.iter().all(|check| check.status == CheckStatus::NotApplicable)
             );
             assert_eq!(
-                serde_json::to_value(&report).unwrap()["checks"][1]["status"],
+                serde_json::to_value(cx7).unwrap()["status"],
                 "not_applicable"
             );
             assert!(!render(&report, Canvas::sized(100, false)).contains("PASS"));
@@ -1569,7 +1575,12 @@ RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoChec
         let report = report(Interconnect::NoGpus);
         assert!(report.ok);
         assert!(!report.all_verified);
-        assert_eq!(report.checks[0].status, CheckStatus::Unverified);
+        let pcie = report
+            .checks
+            .iter()
+            .find(|check| check.id == "pcie.interconnect")
+            .unwrap();
+        assert_eq!(pcie.status, CheckStatus::Unverified);
     }
 
     #[test]

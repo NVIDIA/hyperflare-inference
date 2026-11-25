@@ -197,7 +197,7 @@ impl Endpoint {
     }
 }
 
-/// IPv4 subnet mask for a prefix length in 0..=32.
+/// IPv4 subnet mask for a prefix length in 0..=32, shared by route planning and `flare doctor`.
 pub fn ipv4_subnet_mask(prefix: u8) -> u32 {
     u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
 }
@@ -344,13 +344,13 @@ fn mapped_ipv4(gid: &str) -> Option<Ipv4Addr> {
     u32::from_str_radix(&hex[24..], 16).ok().map(Ipv4Addr::from)
 }
 
-/// Whether serving considers port 1 active, from an RDMA device's sysfs directory.
+/// Whether serving and `flare doctor` consider port 1 active, from the RDMA device's sysfs directory.
 pub fn port1_active(device: &Path) -> std::io::Result<bool> {
     std::fs::read_to_string(device.join("ports/1/state")).map(|state| state.contains("ACTIVE"))
 }
 
 /// Whether port 1 advertises an IPv4-mapped RoCEv2 GID at the given index.
-pub fn has_rocev2_ipv4_gid(device: &Path, index: u32) -> bool {
+fn has_rocev2_ipv4_gid(device: &Path, index: u32) -> bool {
     let port = device.join("ports/1");
     read(&port.join(format!("gid_attrs/types/{index}")))
         .is_some_and(|kind| kind.eq_ignore_ascii_case("RoCE v2"))
@@ -621,7 +621,8 @@ fn any_lldp_adjacency(endpoints: &[Vec<Endpoint>]) -> bool {
 }
 
 /// Whether `network` lies in IPv4 link-local space (169.254.0.0/16). Hosts using link-local
-/// addressing share that subnet whether or not their ports are linked.
+/// addressing share that subnet whether or not their ports are linked. Route planning and
+/// `flare doctor` use the same link-local classification.
 pub fn link_local((address, prefix): (u32, u8)) -> bool {
     prefix >= 16 && address & 0xffff_0000 == 0xa9fe_0000
 }

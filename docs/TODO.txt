@@ -254,6 +254,12 @@
     verification, and coordinated shutdown complete on that configuration.
     See roce-ring.md.
 
+[ ] Verify ConnectX-7 peer reachability and measure throughput with MTU 1500
+    and MTU 9000 on direct and switched DGX Spark fabrics before preferring
+    an MTU in flare doctor. Run the local preflight on Linux RTX Spark N1X
+    hardware and verify that hosts without a ConnectX-7 adapter skip it.
+    See cli-design.md#54-flare-doctor.
+
 [ ] Qualify x86_64 RoCE serving on RDMA hardware; its coverage is functional,
     over Soft-RoCE. See multi-host.md.
 
