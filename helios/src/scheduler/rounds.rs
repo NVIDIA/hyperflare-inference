@@ -9,7 +9,7 @@ use super::{policy::{Candidate, bits}, utility::{LaneValue, ValueRate, best_coho
 
 const POPULATION_WEIGHT: f32 = 1.0 / 64.0;
 const CALIBRATION_PRIOR_WEIGHT: f64 = 4.0;
-const CALIBRATION_MAX_WEIGHT: f64 = 32.0;
+const POPULATION_CALIBRATION_MAX_WEIGHT: f64 = 64.0;
 const CALIBRATION_FACTOR_MAX: f64 = 2.0;
 const REQUEST_CALIBRATION_PRIOR_WEIGHT: f64 = 2.0;
 const REQUEST_CALIBRATION_MAX_WEIGHT: f64 = 32.0;
@@ -34,7 +34,7 @@ impl DepthCalibration {
     fn observe(&mut self, realized: f64, predicted: f64) {
         debug_assert!(realized.is_finite() && (0.0..=1.0).contains(&realized));
         debug_assert!(predicted.is_finite() && (0.0..=1.0).contains(&predicted));
-        self.weight = (self.weight + 1.0).min(CALIBRATION_MAX_WEIGHT);
+        self.weight = (self.weight + 1.0).min(POPULATION_CALIBRATION_MAX_WEIGHT);
         self.realized += (realized - self.realized) / self.weight;
         self.predicted += (predicted - self.predicted) / self.weight;
     }
@@ -103,65 +103,48 @@ impl RequestCalibration {
     }
 }
 
-/// Rolling window of paired `(actual, pre-step forecast)` calibrated prefix curves
+/// Rolling windows of paired `(actual, pre-step forecast)` calibrated prefix curves
 /// for estimating the GPU causal prefix allocator's cross-lane order-statistic surplus.
+/// Depth-1 (`width = 2`) pairs are stored in a dedicated 256-entry ring so sustained
+/// `W=2` rounds keep depth-1 surplus fresh without evicting deeper (`depth >= 2`) curves.
 struct SurplusHistory {
-    entries: Vec<(Vec<f32>, Vec<f32>)>,
-    next: usize,
+    deep: Vec<(Vec<f32>, Vec<f32>)>,
+    deep_next: usize,
+    depth_one: Vec<(f32, f32)>,
+    depth_one_next: usize,
 }
 
 impl SurplusHistory {
     fn new() -> Self {
-        Self { entries: Vec::with_capacity(SURPLUS_HISTORY_CAPACITY), next: 0 }
+        Self {
+            deep: Vec::with_capacity(SURPLUS_HISTORY_CAPACITY),
+            deep_next: 0,
+            depth_one: Vec::with_capacity(SURPLUS_HISTORY_CAPACITY),
+            depth_one_next: 0,
+        }
     }
 
     fn push(&mut self, actual: Vec<f32>, forecast: Vec<f32>) {
         debug_assert_eq!(actual.len(), forecast.len());
-        if self.entries.len() < SURPLUS_HISTORY_CAPACITY {
-            self.entries.push((actual, forecast));
-        } else {
-            self.entries[self.next] = (actual, forecast);
-            self.next = (self.next + 1) % SURPLUS_HISTORY_CAPACITY;
+        if let (Some(&a0), Some(&f0)) = (actual.first(), forecast.first()) {
+            if self.depth_one.len() < SURPLUS_HISTORY_CAPACITY {
+                self.depth_one.push((a0, f0));
+            } else {
+                self.depth_one[self.depth_one_next] = (a0, f0);
+                self.depth_one_next = (self.depth_one_next + 1) % SURPLUS_HISTORY_CAPACITY;
+            }
+        }
+        if actual.len() >= 2 {
+            if self.deep.len() < SURPLUS_HISTORY_CAPACITY {
+                self.deep.push((actual, forecast));
+            } else {
+                self.deep[self.deep_next] = (actual, forecast);
+                self.deep_next = (self.deep_next + 1) % SURPLUS_HISTORY_CAPACITY;
+            }
         }
     }
 
-    fn build_table(&self, depth: usize) -> Option<SurplusTable> {
-        if depth == 0 || self.entries.len() < SURPLUS_MIN_SAMPLES {
-            return None;
-        }
-        // Choose the deepest effective depth in 1..=depth with enough samples so
-        // narrower rounds (e.g. W=2 at depth=1) do not starve wider shapes while
-        // never extrapolating beyond observed depths.
-        let mut counts = vec![0usize; depth];
-        for (actual, _) in &self.entries {
-            let capped = actual.len().min(depth);
-            if capped > 0 {
-                counts[capped - 1] += 1;
-            }
-        }
-        let mut samples = 0usize;
-        let mut eff_depth = 0usize;
-        for d in (1..=depth).rev() {
-            samples += counts[d - 1];
-            if samples >= SURPLUS_MIN_SAMPLES {
-                eff_depth = d;
-                break;
-            }
-        }
-        if eff_depth == 0 {
-            return None;
-        }
-        let mut actual_vals = Vec::with_capacity(samples * eff_depth);
-        let mut forecast_vals = Vec::with_capacity(samples * eff_depth);
-        for (actual, forecast) in &self.entries {
-            if actual.len() < eff_depth {
-                continue;
-            }
-            for d in 0..eff_depth {
-                actual_vals.push(f64::from(actual[d]).clamp(0.0, 1.0));
-                forecast_vals.push(f64::from(forecast[d]).clamp(0.0, 1.0));
-            }
-        }
+    fn build_from_values(depth: usize, samples: usize, mut actual_vals: Vec<f64>, mut forecast_vals: Vec<f64>) -> SurplusTable {
         actual_vals.sort_unstable_by(|a, b| b.total_cmp(a));
         forecast_vals.sort_unstable_by(|a, b| b.total_cmp(a));
         let mut actual_prefix = Vec::with_capacity(actual_vals.len() + 1);
@@ -175,7 +158,66 @@ impl SurplusHistory {
             actual_prefix.push(a_sum);
             forecast_prefix.push(f_sum);
         }
-        Some(SurplusTable { depth: eff_depth, samples, actual_prefix, forecast_prefix })
+        SurplusTable { depth, samples, actual_prefix, forecast_prefix }
+    }
+
+    fn build_depth_one(&self) -> Option<SurplusTable> {
+        let samples = self.depth_one.len();
+        if samples < SURPLUS_MIN_SAMPLES {
+            return None;
+        }
+        let mut actual_vals = Vec::with_capacity(samples);
+        let mut forecast_vals = Vec::with_capacity(samples);
+        for &(a0, f0) in &self.depth_one {
+            actual_vals.push(f64::from(a0).clamp(0.0, 1.0));
+            forecast_vals.push(f64::from(f0).clamp(0.0, 1.0));
+        }
+        Some(Self::build_from_values(1, samples, actual_vals, forecast_vals))
+    }
+
+    fn build_table(&self, depth: usize) -> Option<SurplusTable> {
+        if depth == 0 {
+            return None;
+        }
+        if depth == 1 {
+            return self.build_depth_one();
+        }
+        // Choose the deepest effective depth in 2..=depth with at least SURPLUS_MIN_SAMPLES
+        // entries in `deep`, falling back conservatively to `depth_one` (eff_depth=1) only
+        // when no deeper history exists yet, without extrapolating past observed depths.
+        if self.deep.len() >= SURPLUS_MIN_SAMPLES {
+            let mut counts = vec![0usize; depth];
+            for (actual, _) in &self.deep {
+                let capped = actual.len().min(depth);
+                if capped >= 2 {
+                    counts[capped - 1] += 1;
+                }
+            }
+            let mut samples = 0usize;
+            let mut eff_depth = 0usize;
+            for d in (2..=depth).rev() {
+                samples += counts[d - 1];
+                if samples >= SURPLUS_MIN_SAMPLES {
+                    eff_depth = d;
+                    break;
+                }
+            }
+            if eff_depth >= 2 {
+                let mut actual_vals = Vec::with_capacity(samples * eff_depth);
+                let mut forecast_vals = Vec::with_capacity(samples * eff_depth);
+                for (actual, forecast) in &self.deep {
+                    if actual.len() < eff_depth {
+                        continue;
+                    }
+                    for d in 0..eff_depth {
+                        actual_vals.push(f64::from(actual[d]).clamp(0.0, 1.0));
+                        forecast_vals.push(f64::from(forecast[d]).clamp(0.0, 1.0));
+                    }
+                }
+                return Some(Self::build_from_values(eff_depth, samples, actual_vals, forecast_vals));
+            }
+        }
+        self.build_depth_one()
     }
 }
 
@@ -308,8 +350,13 @@ impl Forecasts {
     }
 
     #[cfg(test)]
-    pub(super) fn surplus_entries(&self) -> usize {
-        self.surplus.entries.len()
+    pub(super) fn surplus_deep_entries(&self) -> usize {
+        self.surplus.deep.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn surplus_depth_one_entries(&self) -> usize {
+        self.surplus.depth_one.len()
     }
 }
 
@@ -507,6 +554,11 @@ impl RequestScheduler {
         observed_realized: &[(usize, usize, f64)]) {
         // A model that does not report GPU confidence feeds the population from host estimates instead.
         let gpu_confidence = self.gpu_confidence();
+        let mut round_cal = if gpu_confidence {
+            vec![(0.0f64, 0.0f64, 0usize); self.forecasts.calibration.len()]
+        } else {
+            Vec::new()
+        };
         let mut cursor = 0usize;
         for (row, lane) in step.lanes.iter().enumerate() {
             while cursor < observed_realized.len() && observed_realized[cursor].0 < row {
@@ -570,11 +622,26 @@ impl RequestScheduler {
                     if let Some(&predicted) = predicted_prefixes.get(depth) {
                         let pred = f64::from(predicted);
                         forecast.observe_calibration(depth, realized, pred, generated, &self.forecasts.calibration);
-                        self.forecasts.observe_calibration(depth, realized, pred);
+                        if let Some(acc) = round_cal.get_mut(depth) {
+                            acc.0 += realized;
+                            acc.1 += pred;
+                            acc.2 += 1;
+                        }
                     }
                 }
             }
             self.forecasts.requests[lane.request.slot as usize] = Some(forecast);
+        }
+        // Update the global calibration prior once per completed round using the round's
+        // mean realized and predicted survival across contributing lanes, so a single
+        // correlated large-batch dip cannot overwrite the population prior in one step.
+        if gpu_confidence {
+            for (depth, (sum_real, sum_pred, count)) in round_cal.into_iter().enumerate() {
+                if count > 0 {
+                    let denom = count as f64;
+                    self.forecasts.observe_calibration(depth, sum_real / denom, sum_pred / denom);
+                }
+            }
         }
     }
 }
