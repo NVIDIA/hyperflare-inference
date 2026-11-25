@@ -160,6 +160,10 @@ def _preparation_arguments(running, *, model_default="defaults.model", recipes=(
                                " With no MODE, selects csf; native disables compression."
                                " Omitted flag uses the recipe default."
                                " See MODEL --help for recipe support and estimated savings")
+    capacity.add_argument("--kv-cache-format", metavar="FORMAT",
+                          help="KV cache storage format for recipes that declare format selection"
+                               " (default: recipe default; recipes declaring none reject it)."
+                               " See MODEL --help for supported formats")
     capacity.add_argument("--prefill-chunk-size", type=int, metavar="N",
                           help="most prompt tokens per prefill step; larger chunks reach a long prompt's first"
                                " token sooner and pause other requests longer; a multiple of 64"

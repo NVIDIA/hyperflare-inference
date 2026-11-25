@@ -183,6 +183,7 @@ class Plan:
     mixed_prefill: bool = False
     prompt_logprobs: bool = False
     expert_scale_compression: str | None = None
+    kv_cache_format: str | None = None
     mla_compute_mode: str = "auto"
     roce_ring: bool = False
     roce_chain: bool = False
@@ -219,6 +220,11 @@ class Plan:
                     f"hybrid context parallelism is not supported for {self.checkpoint.alias} "
                     f"at TP{self.world_size} DCP{self.context_parallel_size}"
                 )
+        object.__setattr__(
+            self,
+            "kv_cache_format",
+            resolve_kv_cache_format(self.recipe, self.checkpoint.alias, self.kv_cache_format),
+        )
         if self.online_mxfp8_scope is None:
             object.__setattr__(self, "online_mxfp8_scope",
                                self.recipe.online_mxfp8_scope if self.online_mxfp8 else "all")
@@ -302,9 +308,15 @@ class Plan:
             self.concurrency, self.speculation.draft_tokens + 1, self.speculation.token_capacity))
 
     @property
+    def has_custom_kv_cache_format(self) -> bool:
+        """Whether this plan selects a non-default KV cache storage format."""
+        return self.kv_cache_format is not None and self.kv_cache_format != self.recipe.kv_cache_format
+
+    @property
     def costs(self):
-        return self.recipe.costs(self.world_size, self.speculation, self.checkpoint).with_image_slots(
-            self.image_concurrency)
+        return self.recipe.costs(
+            self.world_size, self.speculation, self.checkpoint, kv_cache_format=self.kv_cache_format
+        ).with_image_slots(self.image_concurrency)
 
     @property
     def live_rows(self) -> int:
@@ -393,6 +405,7 @@ class Plan:
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
             "expert_scale_compression": self.expert_scale_compression,
+            "kv_cache_format": self.kv_cache_format,
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
@@ -434,11 +447,26 @@ class Plan:
         }
 
 
+def resolve_kv_cache_format(recipe: Recipe, alias: str, value: str | None) -> str | None:
+    """Resolve and validate `--kv-cache-format` against `recipe`'s declared formats."""
+    resolved = recipe.kv_cache_format if value is None else value
+    if resolved is not None:
+        supported = recipe.supported_kv_cache_formats
+        if not supported:
+            raise UsageError(
+                f"--kv-cache-format {resolved}: {alias}"
+                " does not declare KV cache format selection"
+            )
+        if resolved not in supported:
+            raise UsageError(f"--kv-cache-format {resolved}: {alias} supports " + ", ".join(supported))
+    return resolved
+
+
 def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concurrency: int, reserve_bytes: int,
         speculation: Speculation | None, prefill_chunk: int | None = None,
         context_parallel: bool = True, context_parallel_size: int | None = None, stream_overlap: bool = True, cache_states: int | None = None,
         mixed_prefill: bool = False, prompt_logprobs: bool = False,
-        expert_scale_compression: str | None = None, roce_ring: bool = False,
+        expert_scale_compression: str | None = None, kv_cache_format: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
         language_model_only: bool = False, mla_compute_mode: str | None = None,
@@ -454,6 +482,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression = recipe.expert_scale_compression
     if expert_scale_compression == "native":
         expert_scale_compression = None
+    kv_cache_format = resolve_kv_cache_format(recipe, checkpoint.alias, kv_cache_format)
     if mla_compute_mode not in recipe.mla_compute_modes:
         raise UsageError(f"--mla-compute-mode {mla_compute_mode}: supported values for this recipe are "
                          + ", ".join(recipe.mla_compute_modes))
@@ -505,7 +534,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     # Language-only plans prepare no vision encoder, so no image feature slots.
     images = (0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
               if image_concurrency is None else image_concurrency)
-    costs = recipe.costs(len(gpus), speculation, checkpoint)
+    costs = recipe.costs(len(gpus), speculation, checkpoint, kv_cache_format=kv_cache_format)
     graph_credit = recipe.hybrid_context_parallel_graph_credits.get((len(gpus), context_parallel_size))
     if graph_credit is not None:
         max_bytes, max_pages = graph_credit
@@ -519,7 +548,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 context_parallel_size=context_parallel_size,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
-                expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
+                expert_scale_compression=expert_scale_compression, kv_cache_format=kv_cache_format,
+                roce_ring=roce_ring, roce_chain=roce_chain,
                 row_shard_prefill=row_shard_prefill, mla_compute_mode=mla_compute_mode,
                 image_concurrency=images, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
                 language_model_only=language_model_only)
@@ -575,7 +605,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          prefill_chunk: int | None = None, context_parallel: bool = True, context_parallel_size: int | None = None,
          stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
-         expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
+         expert_scale_compression: str | None = None, kv_cache_format: str | None = None,
+         roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
          language_model_only: bool = False, mla_compute_mode: str | None = None,
          row_shard_prefill: bool = False) -> Plan:
@@ -656,7 +687,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    context_parallel_size=context_parallel_size,
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
-                   expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
+                   expert_scale_compression=expert_scale_compression, kv_cache_format=kv_cache_format,
+                   roce_ring=roce_ring, roce_chain=roce_chain,
                    row_shard_prefill=row_shard_prefill,
                    image_concurrency=(None if language_model_only
                                       else (None if image_concurrency is None else min(image_concurrency, concurrency))),
