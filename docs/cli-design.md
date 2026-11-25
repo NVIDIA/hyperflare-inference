@@ -115,7 +115,7 @@ flare-cli/target/release/flare run CORE --gpus 0
 flare run [CORE] [flags]               serve locally, join a rank, or launch peer agents
 flare download REPOSITORY [flags]         download a prepared core
 flare inspect CORE|MODEL[@VERSION] [--tensor-parallel N] [--rank N] [--unverified] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
-flare doctor [--gpus N[,N...]] [--json | --plain]  check Linux PCIe TP>1 driver, IOMMU, and ACS settings
+flare doctor [--gpus N[,N...]] [--json | --plain]  check Linux PCIe TP>1 settings and DGX Spark CX7 readiness
 flare agent [--listen IP:PORT]            run this host's rank agent
 flare agent install [--join-code CODE | --accept-first] [--listen IP:PORT]
 flare agent pair HOST... [--code CODE]    pair for --hosts or Orbit launches
@@ -1608,8 +1608,7 @@ envelope has format 4 or 6.
 
 ### 5.4 `flare doctor`
 
-Inspect Linux host configuration for multi-GPU tensor-parallel serving over
-PCIe:
+Inspect Linux host readiness for tensor-parallel serving:
 
 ```sh
 flare doctor [--gpus N[,N...]] [--json | --plain]
@@ -1636,6 +1635,19 @@ On Linux PCIe hosts, `flare doctor` verifies:
   Reading PCIe extended configuration space from
   `/sys/bus/pci/devices/<bdf>/config` requires root (`CAP_SYS_ADMIN`); without
   it, ACS is reported as `unverified` with a hint to run `sudo flare doctor`.
+
+On a DGX Spark identified by its GB10 PCI device, the report includes a local
+ConnectX-7 check for multi-host serving. The check uses the same RoCEv2 GID
+index selection as serving and requires at least one active CX7 device with
+an IPv4 address assigned to its network interface. The report lists the usable
+devices, interface names, addresses, prefix lengths, and available MTUs.
+Unused ports may be down. Warnings flag active devices missing a usable
+address, overlaps between local CX7 subnets, addresses and prefixes that
+need review, and MTUs below 9000 bytes. Compare subnet and MTU settings
+with the intended peers and switch. Peer reachability requires a separate
+check.
+`--gpus` does not affect this host check. On DGX Spark, PCIe tuning checks
+apply only when multiple selected GPUs require PCIe P2P.
 
 `--json` prints the structured report; `--plain` disables terminal styling and
 conflicts with `--json`. The command exits zero when no check fails and
