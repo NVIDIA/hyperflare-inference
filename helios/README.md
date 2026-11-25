@@ -439,11 +439,19 @@ This bounds aggregate refresh expense, not individual stalls; see
 
 Speculative width selection combines this cost with expected prefix survival,
 estimated per request and, on a model without GPU confidence, started from the
-population mean of earlier requests. Complete programs learn from terminal verification and keep
-completed confidence forecasts separate from acceptance outcomes. Ordinary selection uses
-historical means, while a separate 1% raw-time budget funds optimistic
-acceptance probes. Observational weight ages without changing unobserved means;
-width-one rounds still measure cost. See
+population mean of earlier requests. Complete programs learn from terminal
+verification and keep stored confidence forecasts separate from acceptance
+outcomes. When pricing GPU-confidence shapes, stored per-depth forecasts are
+scaled by a global online per-depth verification calibration ratio (prior weight
+`4`, EWMA cap `32`, clamped to `[0, 2]`), and crowded GPU-allocated packed
+shapes (`B >= 2`, `P < B * W`) additionally apply a bounded empirical
+cross-lane order-statistic surplus (from a 64-entry rolling window of paired
+actual vs pre-step forecast curves, excess scaled by `(1 - 1/b) * min(alpha, 1)`
+and capped at 100% draft survival) to capture the GPU allocator's per-step
+cherry-picking gain.
+Ordinary selection uses calibrated historical means, while a separate 1%
+raw-time budget funds optimistic acceptance probes. Observational weight ages
+without changing unobserved means; width-one rounds still measure cost. See
 [funded acceptance learning](../docs/scheduling-runtime-design.md#funded-acceptance-learning).
 
 Fairness enters selection through per-request service prices. Each resident

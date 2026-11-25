@@ -84,13 +84,13 @@ but need not agree bitwise. Exact request identities, consumption, emitted
 prefixes, and committed state agree across ranks.
 
 Confidence forecasts and verified acceptance are separate observations.
-A request's forecast averages its completed joint-prefix probabilities,
+A request's stored forecast averages its completed joint-prefix probabilities,
 starting from a population prior. That prior begins at `0.5^d` for the `d`-th
 draft position and moves toward each observed prefix value with weight one
 sixty-fourth. It is one mean per position across all requests, so it follows
 whichever traffic ran most recently. A model whose graphs allocate prefix
-lengths on the GPU takes the value from the completed prefix probability of
-each lane in the round's confidence sidecar; a model with any such graph is
+lengths on the GPU takes the stored value from the completed prefix probability
+of each lane in the round's confidence sidecar; a model with any such graph is
 treated this way for all its rounds. Every other model takes it from the
 verification outcome: for each position a completed MTP round determined, the
 value is the reported survival, or one for an accepted position and zero for a
@@ -102,9 +102,47 @@ estimates start at the population with weight two; with GPU confidence, and
 for copy proposals, they start at `0.5^d`. Forecast and acceptance prefix
 estimates start with weight two, cap at 128, and age with a half-life of 128
 generated tokens.
-Unobserved suffixes retain their means. Ordinary selection uses the historical
-means; funded acceptance learning uses the bounded optimistic estimate
-`min(1, mean + sqrt(ln(20) / (2 * aged_weight)))`.
+Unobserved suffixes retain their means.
+
+When pricing candidate shapes on a GPU-confidence model, the stored per-request
+confidence forecast is adjusted by two global online corrections derived solely
+from completed rounds:
+
+1. **Per-depth drafter calibration (`DepthCalibration`):** A global per-depth
+   ratio `clamp(realized / predicted, 0.0, 2.0)` (defaulting to `1.0` when
+   `predicted <= 1e-6`), initialized with `realized == predicted == 0.5^d` at
+   prior weight `4.0` and updated with an EWMA weight capped at `32.0`
+   (effective steady-state step `1/32`, ~22-observation half-life). Updates use
+   the exact offered, determined prefix outcomes computed once in
+   `complete_inner` (Rao-Blackwellized with `completion_speculative_survival`
+   when reported, else binary acceptance/rejection). Pricing multiplies each
+   depth's stored mean by its calibration factor, adds the optimistic margin
+   `(upper - mean)` during funded acceptance learning, clamps to `[0, 1]`, and
+   enforces nonincreasing prefix survival across depths.
+2. **Cross-lane order-statistic allocation surplus (`SurplusHistory`):** Inside
+   a packed GPU-allocated round (`B >= 2`, `P < B * W`), the device allocator
+   observes fresh per-step confidences across all active lanes and allocates
+   the `P - B` draft slots to the highest-confidence `(lane, depth)` pairs of
+   that step. By Jensen's inequality, `E[sum Top-(P-B)(S_step)] >= sum
+   Top-(P-B)(E[S])`, so pricing packed rounds from time-averaged lane curves
+   systematically undervalues crowded packed graphs relative to plain `W=1`
+   and uncrowded small batches. The scheduler maintains a 64-entry rolling ring
+   buffer of paired `(actual_calibrated, pre_step_forecast)` lane curves (min
+   `4` samples), computes the normalized Lorenz concentration ratio over linear
+   calibrated survival at quota `r = (P - b) / b`, scales the excess surplus by
+   `(1 - 1/b) * min(alpha, 1.0)` (so it applies in full at `alpha = 1.0` and
+   dampens smoothly when `alpha < 1.0` already applies a concave boost), clamps
+   to `[1.0, 2.0]`, and caps total draft value by the physical `draft_budget`
+   maximum (100% survival per allocated draft row). The normalized ratio equals
+   `1.0` identically for single-lane cohorts (`b = 1`), uncrowded graphs
+   (`P - b >= total_ceiling_drafts`), pure mean shifts, and pure
+   between-request heterogeneity (preventing double-counting of per-request
+   forecasts).
+
+Ordinary selection uses the calibrated historical means (plus cross-lane
+allocation surplus on crowded GPU-allocated shapes); funded acceptance learning
+uses the bounded optimistic estimate
+`min(1, calibrated_mean + sqrt(ln(20) / (2 * aged_weight)))`.
 
 A prepared program may also write `completion_speculative_survival`, cumulative
 products of `min(1, p(token)/q(token))` for evaluated prefixes. These replace

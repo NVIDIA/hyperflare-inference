@@ -4900,3 +4900,230 @@ fn short_prefill_tail_caps_service_price_on_decode_transition() {
         s.policy.token_fairness
     );
 }
+
+#[test]
+fn gpu_confidence_calibration_corrects_overconfident_forecasts_for_binary_and_survival_paths() {
+    for use_survival in [false, true] {
+        let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+        let handle = add(&mut scheduler, 1, 64, 512);
+        ready(&mut scheduler, &[handle]);
+        let slots = scheduler.limits.request_capacity();
+        // GPU confidence claims 0.95 per draft step, while realized survival drops sharply after depth 0.
+        for _ in 0..32 {
+            let plan = scheduler.plan().unwrap();
+            let fence = Fence(scheduler.submitted.0 + 1);
+            scheduler.commit(&plan, fence).unwrap();
+            let mut records = completion_records(&scheduler, &plan, fence, 1);
+            let offered = plan.lanes[0].tokens.saturating_sub(1).min(4);
+            records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = offered as i64;
+            let confidence = vec![vec![0.95; 15]; plan.batch_capacity];
+            if use_survival {
+                let mut surv = vec![vec![-1.0f32; 15]; slots];
+                for d in 0..offered {
+                    surv[handle.slot as usize][d] = if d == 0 { 0.92 } else { 0.08 };
+                }
+                scheduler
+                    .complete_packed_round_with_survival(fence, &records, gpu_time(MS), &confidence, Some(&surv))
+                    .unwrap();
+            } else {
+                scheduler
+                    .complete_packed_round(fence, &records, gpu_time(MS), &confidence)
+                    .unwrap();
+            }
+        }
+        let request = scheduler.request(handle).unwrap();
+        let curve = scheduler.speculative_curve(request, false);
+        assert!(curve[0] > 0.8, "use_survival={use_survival}: depth 0 should stay high, got {:?}", &curve[..4]);
+        assert!(curve[1] < 0.25, "use_survival={use_survival}: depth 1 should calibrate down, got {:?}", &curve[..4]);
+        assert!(curve[2] <= curve[1], "calibrated curve must stay nonincreasing, got {:?}", &curve[..4]);
+    }
+}
+
+#[test]
+fn gpu_confidence_calibration_keeps_calibrated_drafter_near_unity() {
+    let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    let handle = add(&mut scheduler, 1, 64, 512);
+    ready(&mut scheduler, &[handle]);
+    let slots = scheduler.limits.request_capacity();
+    let per_step = 0.8f32;
+    for _ in 0..32 {
+        let plan = scheduler.plan().unwrap();
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        let offered = plan.lanes[0].tokens.saturating_sub(1).min(4);
+        records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = offered as i64;
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let mut prefix = 1.0f32;
+        for d in 0..offered {
+            prefix *= per_step;
+            surv[handle.slot as usize][d] = prefix;
+        }
+        scheduler
+            .complete_packed_round_with_survival(
+                fence, &records, gpu_time(MS), &vec![vec![per_step; 15]; plan.batch_capacity], Some(&surv),
+            )
+            .unwrap();
+    }
+    for d in 0..4 {
+        let f = scheduler.forecasts.calibration_factor(d);
+        assert!((f - 1.0).abs() < 0.03, "calibrated drafter factor at depth {d} drifted: {f}");
+    }
+}
+
+#[test]
+fn gpu_confidence_calibration_isolates_two_lane_observations() {
+    let mut scheduler = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    let a = add(&mut scheduler, 1, 64, 512);
+    let b = add(&mut scheduler, 2, 64, 512);
+    ready(&mut scheduler, &[a, b]);
+    let slots = scheduler.limits.request_capacity();
+    for _ in 0..24 {
+        let plan = scheduler.plan().unwrap();
+        let fence = Fence(scheduler.submitted.0 + 1);
+        scheduler.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&scheduler, &plan, fence, 1);
+        let mut surv = vec![vec![-1.0f32; 15]; slots];
+        let mut confidence = vec![vec![0.8f32; 15]; plan.batch_capacity];
+        let mut remaining = plan.packed_token_capacity.saturating_sub(plan.lanes.len());
+        for (row, lane) in plan.lanes.iter().enumerate() {
+            let max_off = lane.tokens.saturating_sub(1).min(remaining);
+            let offered = if row == 0 { max_off.min(2) } else { max_off.min(1) };
+            remaining = remaining.saturating_sub(offered);
+            let emitted = (offered.min(1) + 1) as i64;
+            {
+                let vec = records[lane.request.slot as usize].vector.as_mut().unwrap();
+                vec.offered_drafts = offered as i64;
+                vec.accepted_drafts = offered.min(1) as i64;
+                vec.emitted_count = emitted;
+            }
+            records[lane.request.slot as usize].generated_tokens =
+                scheduler.request(lane.request).unwrap().generated_tokens as i64 + emitted;
+            records[lane.request.slot as usize].consumed_tokens =
+                scheduler.request(lane.request).unwrap().consumed_tokens as i64 + emitted;
+            confidence[row] = vec![if row == 0 { 0.9 } else { 0.5 }; 15];
+            for d in 0..offered {
+                surv[lane.request.slot as usize][d] = if d == 0 {
+                    if row == 0 { 0.9 } else { 0.5 }
+                } else {
+                    0.1
+                };
+            }
+        }
+        scheduler
+            .complete_packed_round_with_survival(fence, &records, gpu_time(MS), &confidence, Some(&surv))
+            .unwrap();
+    }
+    // Depth 0 matched predictions on both lanes (~1.0); depth 1 was only offered on lane 0 with 0.1 vs 0.81.
+    assert!((scheduler.forecasts.calibration_factor(0) - 1.0).abs() < 0.05);
+    assert!(scheduler.forecasts.calibration_factor(1) < 0.35);
+}
+
+#[test]
+fn gpu_allocation_surplus_invariants_and_within_request_variance() {
+    // 1. Pure between-request heterogeneity (zero step-to-step variance): actual == forecast => factor == 1.0.
+    let mut forecasts = rounds::Forecasts::new(8);
+    let easy = vec![0.95f32, 0.90, 0.85, 0.80, 0.72, 0.65, 0.58];
+    let hard = vec![0.35f32, 0.10, 0.02, 0.0, 0.0, 0.0, 0.0];
+    for i in 0..32 {
+        let curve = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+        forecasts.observe_surplus(curve.clone(), curve);
+    }
+    let table = forecasts.surplus_table(7).unwrap();
+    for lanes in [1, 2, 8, 16, 32] {
+        for budget in [0, lanes, 2 * lanes, 4 * lanes, 7 * lanes] {
+            let f = table.factor(lanes, budget, 1.0);
+            assert!((f - 1.0).abs() < 1e-9, "heterogeneity-only must stay 1.0 (lanes={lanes} budget={budget}): {f}");
+        }
+    }
+
+    // 2. Pure level shift (constant multiple, zero variance): factor == 1.0 everywhere.
+    let mut shifted = rounds::Forecasts::new(8);
+    for _ in 0..16 {
+        shifted.observe_surplus(
+            vec![0.80, 0.60, 0.40, 0.24, 0.12, 0.06, 0.02],
+            vec![0.40, 0.30, 0.20, 0.12, 0.06, 0.03, 0.01],
+        );
+    }
+    let shifted_table = shifted.surplus_table(7).unwrap();
+    assert!((shifted_table.factor(16, 32, 1.0) - 1.0).abs() < 1e-9);
+
+    // 3. Real within-request step-to-step burstiness: easy & hard steps share the same time-averaged forecast.
+    let mut bursty = rounds::Forecasts::new(8);
+    let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
+    for i in 0..64 {
+        let actual = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+        bursty.observe_surplus(actual, mean.clone());
+    }
+    let bursty_table = bursty.surplus_table(7).unwrap();
+    assert_eq!(bursty_table.factor(1, 2, 1.0), 1.0, "single lane has no cross-lane cherry-picking");
+    assert_eq!(bursty_table.factor(16, 16 * 7, 1.0), 1.0, "uncrowded shape has no cherry-picking surplus");
+    let packed_f = bursty_table.factor(16, 32, 1.0);
+    assert!(packed_f > 1.25 && packed_f < 1.60, "expected strong positive surplus at B=16, r=2, got {packed_f}");
+    let alpha06_f = bursty_table.factor(16, 32, 0.6);
+    assert!(alpha06_f > 1.0 && alpha06_f < packed_f, "smaller alpha should naturally reduce surplus: {alpha06_f} vs {packed_f}");
+}
+
+#[test]
+fn gpu_allocation_surplus_rescues_packed_speculative_at_alpha_one_and_falls_back_when_broken() {
+    let mut scheduler = engine(16, true);
+    throughput_only(&mut scheduler);
+    let mut graphs = super::tests::duration_graphs(16);
+    for g in &mut graphs {
+        g.estimated_duration_ns = match (g.kind, g.batch_capacity, g.token_capacity) {
+            (GraphKind::Init | GraphKind::Prefill, _, _) => MS,
+            (GraphKind::Speculative, 16, 1) => 10 * MS,
+            _ => 50 * MS,
+        };
+    }
+    // Add a packed B=16, D=7, W=8, P=48 GPU-allocated graph (22 ms) competing against B=16, W=1 (10 ms).
+    graphs.push(crate::execution::GraphDescriptor {
+        name: "packed-16x8-p48".into(),
+        kind: GraphKind::Speculative,
+        sampling_mode: SamplingMode::General,
+        handle: graphs.len() + 1,
+        batch_capacity: 16,
+        draft_tokens: 7,
+        token_capacity: 8,
+        packed_token_capacity: 48,
+        prefill_capacity: 0,
+        estimated_duration_ns: 22 * MS,
+        confidence_width: 7,
+        tuned_bindings: vec![],
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.capabilities.speculative_allocations =
+        vec![(16, 7, 8, 48, crate::execution::PrefixAllocation::Gpu)];
+    let handles: Vec<_> = (0..16).map(|i| add(&mut scheduler, i + 1, 64, 512)).collect();
+    ready(&mut scheduler, &handles);
+
+    // Mean curve [0.60, 0.47, 0.425, ...]:
+    //   without surplus: 16 + 16*(0.60+0.47) = 33.12 tok / 22ms = 1.505 tok/ms < B16xW1 (16 / 10ms = 1.60 tok/ms)
+    //   with bursty step-to-step variance (surplus ~1.49x): 16 + 17.12*1.49 = 41.5 tok / 22ms = 1.89 > 1.60
+    let easy = vec![0.95f32, 0.90, 0.85, 0.78, 0.70, 0.60, 0.50];
+    let hard = vec![0.25f32, 0.04, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
+    scheduler.forecasts.population = mean.clone();
+    let without_surplus = scheduler.plan().unwrap();
+    assert_eq!((without_surplus.batch_capacity, without_surplus.token_capacity), (16, 1),
+        "without variance surplus, mean-only pricing should underprice P=48 below B16xW1");
+    for i in 0..64 {
+        let actual = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+        scheduler.forecasts.observe_surplus(actual, mean.clone());
+    }
+    let plan = scheduler.plan().unwrap();
+    assert_eq!((plan.batch_capacity, plan.token_capacity, plan.packed_token_capacity), (16, 8, 48),
+        "order-statistic surplus should select packed B16xW8 P=48 at alpha=1.0");
+
+    // Now simulate a broken drafter (realized survival ~0 despite high predicted confidence):
+    // calibration pulls expected drafts near 0, so scheduler must cleanly fall back to W=1.
+    for _ in 0..64 {
+        for d in 0..7 {
+            scheduler.forecasts.observe_calibration(d, 0.0, f64::from(mean[d]));
+        }
+    }
+    let fallback = scheduler.plan().unwrap();
+    assert_eq!((fallback.batch_capacity, fallback.token_capacity), (16, 1),
+        "broken drafter must fall back cleanly to B16xW1 even with positive surplus history");
+}

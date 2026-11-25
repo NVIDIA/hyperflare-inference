@@ -2462,7 +2462,7 @@ impl RequestScheduler {
             && self.gpu_prefix_allocation(s.batch_capacity, s.draft_tokens, s.token_capacity, s.packed_token_capacity)) {
             return Err("speculative round completion requires its terminal confidence sidecar".into());
         }
-        self.complete_inner(fence, records, timing, survival)
+        self.complete_inner(fence, records, timing, survival, None)
     }
 
     pub fn complete_packed_round(
@@ -2491,9 +2491,7 @@ impl RequestScheduler {
                 .iter().any(|p| !p.is_finite() || !(0.0..=1.0).contains(p))) {
             return Err("invalid speculative round confidence sidecar".into());
         }
-        let generated = self.complete_inner(fence, records, timing, survival)?;
-        self.observe_packed_forecasts(&step, records, confidence);
-        Ok(generated)
+        self.complete_inner(fence, records, timing, survival, Some(confidence))
     }
 
     fn complete_inner(
@@ -2502,6 +2500,7 @@ impl RequestScheduler {
         records: &[CompletionRecord],
         timing: crate::execution::ExecutionTiming,
         survival: Option<&[Vec<f32>]>,
+        confidence: Option<&[Vec<f32>]>,
     ) -> Result<Vec<GeneratedToken>> {
         if records.len() < self.limits.request_capacity() || records.len() > REQUEST_LANES {
             return Err("completion does not cover the prepared request capacity".into());
@@ -2654,8 +2653,11 @@ impl RequestScheduler {
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
         // One population update per round: this path for host estimates, `observe_packed_forecasts` for GPU confidence.
-        let host_population = proposal_source == speculation::ProposalSource::Mtp && !self.gpu_confidence();
+        let gpu_confidence = self.gpu_confidence();
+        let host_population = proposal_source == speculation::ProposalSource::Mtp && !gpu_confidence;
+        let collect_calibration = confidence.is_some() && gpu_confidence;
         let mut population = Vec::new();
+        let mut calibration = Vec::new();
         let mut useful_tokens = [0u64; REQUEST_LANES];
         let mut generated = Vec::new();
         let mut boundaries = Vec::new();
@@ -2720,10 +2722,22 @@ impl RequestScheduler {
                     vector.emitted_count > vector.accepted_drafts,
                     survival,
                 );
-                // The population learns from the rounds the request's own profile learns from.
-                if host_population {
-                    population.extend(speculation::observed_prefixes(offered, vector.accepted_drafts as usize,
-                        vector.emitted_count > vector.accepted_drafts, survival));
+                // The population and GPU confidence calibration learn from the exact
+                // offered, determined prefix outcomes that update the request's profile.
+                if host_population || collect_calibration {
+                    for (depth, realized) in speculation::observed_prefixes(
+                        offered,
+                        vector.accepted_drafts as usize,
+                        vector.emitted_count > vector.accepted_drafts,
+                        survival,
+                    ) {
+                        if host_population {
+                            population.push((depth, realized));
+                        }
+                        if collect_calibration {
+                            calibration.push((row, depth, realized));
+                        }
+                    }
                 }
             }
             if record.status == 3 {
@@ -2815,6 +2829,9 @@ impl RequestScheduler {
         }
         for (depth, value) in population {
             self.forecasts.observe_population(depth, value as f32);
+        }
+        if let Some(confidence) = confidence {
+            self.observe_packed_forecasts(&step, records, confidence, &calibration);
         }
         for lane in &step.lanes {
             let pending = self.pending_token_ceiling(lane.request) as u64;
