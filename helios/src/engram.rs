@@ -263,8 +263,18 @@ const NAP_MAX: Duration = Duration::from_micros(250);
 
 /// Gives up the core for one round of a wait that has spent its spin, napping
 /// `NAP_GROWTH` longer each round up to `NAP_MAX`.
+///
+/// Windows keeps the spin: its timer granularity is longer than `NAP_MAX`, so a
+/// nap there could delay the ids by more than the decode step this wait stays
+/// under.
+#[cfg(not(windows))]
 fn yield_core(rounds: u32) {
     thread::sleep(NAP_GROWTH.saturating_mul(rounds.saturating_add(1)).min(NAP_MAX));
+}
+
+#[cfg(windows)]
+fn yield_core(_: u32) {
+    std::hint::spin_loop();
 }
 
 struct Job {
