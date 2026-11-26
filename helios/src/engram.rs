@@ -806,24 +806,61 @@ mod tests {
         assert!(state.prepare(1, 1, 24, 2).is_err());
     }
 
-    #[test]
-    fn device_request_wait_observes_publication_and_cancellation() {
-        let ids = [17i64, 31, 47];
-        let flag = AtomicU64::new(0);
-        let cancelled = AtomicBool::new(false);
-        let request = || Requests::Device {
+    /// A device row set whose publication flag and cancellation the test owns.
+    fn device_request(flag: &AtomicU64, ids: &[i64]) -> Requests {
+        Requests::Device {
             address: ids.as_ptr() as usize,
-            flag: &flag as *const AtomicU64 as usize,
+            flag: flag as *const AtomicU64 as usize,
             sequence: 7,
             rows: ids.len(),
-        };
+        }
+    }
+
+    /// Waits out the spin budget on any host, so a flag stored after it is stored
+    /// while the reader is napping.
+    const AFTER_SPIN: Duration = Duration::from_millis(5);
+
+    #[test]
+    fn device_request_wait_returns_ids_already_published() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(7);
+        assert_eq!(
+            device_request(&flag, &ids).read(&AtomicBool::new(false)).unwrap(),
+            ids
+        );
+    }
+
+    #[test]
+    fn device_request_wait_returns_ids_published_after_the_spin() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(0);
         thread::scope(|scope| {
-            let worker = scope.spawn(|| request().read(&cancelled));
+            let worker = scope.spawn(|| device_request(&flag, &ids).read(&AtomicBool::new(false)));
+            thread::sleep(AFTER_SPIN);
             flag.store(7, Ordering::Release);
             assert_eq!(worker.join().unwrap().unwrap(), ids);
         });
-        flag.store(0, Ordering::Release);
-        cancelled.store(true, Ordering::Release);
-        assert!(request().read(&cancelled).is_err());
+    }
+
+    #[test]
+    fn device_request_wait_observes_cancellation_before_publication() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(0);
+        assert!(device_request(&flag, &ids)
+            .read(&AtomicBool::new(true))
+            .is_err());
+    }
+
+    #[test]
+    fn device_request_wait_observes_cancellation_after_the_spin() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(0);
+        let cancelled = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| device_request(&flag, &ids).read(&cancelled));
+            thread::sleep(AFTER_SPIN);
+            cancelled.store(true, Ordering::Release);
+            assert!(worker.join().unwrap().is_err());
+        });
     }
 }
