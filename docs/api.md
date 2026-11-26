@@ -520,7 +520,9 @@ selects required mode. Named selection uses
 The selected tool must be declared and its type must match.
 
 Named selection presents only the selected tool definition to the model, retaining
-conversation history and adding no instructions or decoding constraints.
+conversation history and adding no separate call instruction. Selection by itself
+adds no decoding constraint; when the selected function sets `strict: true`, it
+attaches the strict request grammar described below.
 Buffered and streaming responses omit ordinary assistant answer text while
 preserving reasoning and tool arguments. Usage includes all generated tokens,
 including omitted answer text. Every returned call must target the selected tool,
@@ -538,12 +540,14 @@ DeepSeek retains the original text of a `string="false"` parameter that cannot
 be decoded inside the argument object. Invalid JSON in a whole argument document
 or a typed XTML value fails parsing. Required mode needs at least one declared
 tool, adds an instruction to call a tool to the prompt, and validates that
-generation produced at least one
-completed call to a declared tool. Sampling is unchanged; no calls are fabricated
-and no retries are attempted. Missing calls, including output truncated before a
-complete call, produce HTTP 500 for buffered requests or a terminal error event
-for streams. A required-mode stream may deliver partial text before that error, but does not
-emit a success terminator. Responses also supports text custom tools by presenting a
+generation produced at least one completed call to a declared tool. No calls are
+fabricated and no retries are attempted. Required mode by itself leaves sampling
+unconstrained; any active `strict: true` function still attaches the strict
+request grammar described below. Missing calls, including output truncated
+before a complete call, produce HTTP 500 for buffered requests or a terminal
+error event for streams. A required-mode stream may deliver partial text before
+that error, but does not emit a success terminator. Responses also supports text
+custom tools by presenting a
 JSON `{ "input": string }` function to the model and restoring the custom call on
 output. Anthropic's `type: "custom"` uses its ordinary `input_schema` contract.
 Responses namespaces become unique `namespace__name` names in the model template
@@ -593,13 +597,22 @@ to `#`, `#/$defs/<name>`, or `#/definitions/<name>`, numeric bounds,
 `multipleOf`, `minLength`, `maxLength`, and `pattern`). Function-tag and GLM
 argument-tag syntaxes reject top-level properties that mix `"string"` with
 any non-string type, including `"null"`. `enum` and `const` may specify a
-compatible `type` but cannot be combined with other assertions; numeric `enum`
-and `const` literals are parsed at IEEE 754 binary64 precision and must have
-magnitude strictly below `2^53` (`9,007,199,254,740,992`, so integer literals
-lie in `[-9,007,199,254,740,991, 9,007,199,254,740,991]`; pass larger exact
-identifiers or higher-precision decimals as strings). With an active strict
-tool, TMLv0 recognizes only declared tool names, including under
-`tool_choice: "auto"`.
+compatible `type` but cannot be combined with other assertions. Numeric `enum`
+and `const` literals are parsed at binary64 precision and must have magnitude
+strictly below `2^53`. Use strings for identifiers or decimal values that must
+be represented exactly.
+
+Range bounds (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`)
+are interpreted at binary64 precision. Above `2^53`, adjacent integers need not
+have distinct representations. For an `integer` property, `minimum: 9007199254740993`
+can admit `9007199254740992`. At the boundary, `exclusiveMinimum: 9007199254740992`
+can admit the endpoint itself because adding one rounds back to the same number.
+An inclusive `maximum: 9007199254740992` does distinguish the endpoint from
+the next integer. If exact enforcement of a large numeric bound matters, validate
+the tool arguments with exact arithmetic before executing the tool.
+
+With an active strict tool, TMLv0 recognizes only declared tool names,
+including under `tool_choice: "auto"`.
 
 Object property names cannot contain `<`, `>`, or whitespace. Top-level property
 names also exclude control characters, `"`, `'`, `&`, `\`, and `｜`.

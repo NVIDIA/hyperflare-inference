@@ -3886,6 +3886,18 @@ mod tests {
     }
 
     #[test]
+    fn strict_integer_maxima_preserve_large_inclusive_endpoints() {
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
+        for maximum in [1_000_000_000_000_000_000u64, i64::MAX as u64] {
+            let schema = json!({"type":"object","additionalProperties":false,"required":["n"],
+                "properties":{"n":{"type":"integer","maximum":maximum}}});
+            let grammar = validate_strict_tool_schema(&compiler, "measure", &schema).unwrap();
+            grammar.validate(&json!({"n": maximum}).to_string()).unwrap();
+            assert!(grammar.validate(&json!({"n": maximum + 1}).to_string()).is_err());
+        }
+    }
+
+    #[test]
     fn strict_const_and_enum_enforce_exact_integer_range() {
         let c = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let large: Value = serde_json::from_slice(b"1234567890123456789012345").unwrap();
