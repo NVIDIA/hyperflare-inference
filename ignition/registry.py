@@ -18,7 +18,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from ignition.declaration import Checkpoint, Recipe
+from ignition.declaration import Checkpoint, CheckpointOverlay, Recipe
 from ignition.errors import FetchError, UsageError
 
 _ACTIVE_RECIPES: contextvars.ContextVar[tuple[Recipe, ...]] = contextvars.ContextVar(
@@ -48,12 +48,12 @@ def snapshot_directory(hub_cache: Path, checkpoint: Checkpoint) -> Path:
     hub_cache = Path(hub_cache)
     name = f"models--{checkpoint.repository.replace('/', '--')}"
     exact = hub_cache / name / "snapshots" / checkpoint.revision
-    if _snapshot_cached(exact) or not hub_cache.is_dir():
+    if _snapshot_cached(exact, checkpoint.overlay) or not hub_cache.is_dir():
         return exact
     for repository in sorted(hub_cache.iterdir()):
         if repository.name != name and repository.name.casefold() == name.casefold():
             snapshot = repository / "snapshots" / checkpoint.revision
-            if _snapshot_cached(snapshot):
+            if _snapshot_cached(snapshot, checkpoint.overlay):
                 return snapshot
     return exact
 
@@ -73,9 +73,15 @@ def _csf_stored_bytes(container, snapshot):
     return stored
 
 
-def _snapshot_cached(snapshot: Path) -> bool:
+def _snapshot_cached(snapshot: Path, overlay: CheckpointOverlay | None = None) -> bool:
     """Report whether the index and every tensor file it names are present."""
     try:
+        if overlay is not None:
+            from ignition.preparation.checkpoint import checkpoint_assets_root, overlay_files_present
+
+            if not overlay_files_present(snapshot, overlay):
+                return False
+            snapshot = checkpoint_assets_root(snapshot, overlay)
         if _csf_container(snapshot) is not None:
             from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 
@@ -120,6 +126,28 @@ class ResolvedModel:
     def verify(self, hub_cache: Path) -> None:
         """Check index metadata; recipes validate tensor storage and geometry."""
         snapshot = self.snapshot(hub_cache)
+        overlay = self.checkpoint.overlay
+        if overlay is not None:
+            if not snapshot.exists():
+                return
+            from ignition.preparation.checkpoint import (
+                checkpoint_assets_root, overlay_files_present, overlay_stored_bytes, read_overlay_manifest,
+            )
+
+            try:
+                manifest_path = snapshot / overlay.manifest
+                if not manifest_path.is_file() and not manifest_path.is_symlink():
+                    raise UsageError(f"{snapshot} is missing overlay manifest {overlay.manifest}")
+                if read_overlay_manifest(snapshot, overlay) is None:
+                    raise UsageError(
+                        f"{snapshot} overlay manifest {overlay.manifest} does not declare schema {overlay.schema!r}"
+                    )
+                overlay_stored_bytes(snapshot, overlay)
+                if not overlay_files_present(snapshot, overlay):
+                    raise UsageError(f"{snapshot} lacks files declared by its overlay manifest")
+                snapshot = checkpoint_assets_root(snapshot, overlay)
+            except ValueError as error:
+                raise UsageError(f"{snapshot} has an invalid overlay release: {error}") from error
         try:
             container = _csf_container(snapshot)
             if container is not None:
@@ -138,10 +166,25 @@ class ResolvedModel:
         stored = index.get("metadata", {}).get("total_size") if isinstance(index, dict) else None
         if type(stored) is not int or stored <= 0:
             raise UsageError(f"{snapshot} has an invalid safetensors total_size: {stored!r}")
+        if overlay is not None:
+            weight_map = index.get("weight_map") if isinstance(index, dict) else None
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise UsageError(f"{snapshot} has an invalid safetensors weight_map")
+            missing = sorted(
+                str(shard)
+                for shard in set(weight_map.values())
+                if not isinstance(shard, str)
+                or not (snapshot / shard).is_file()
+                or (snapshot / shard).stat().st_size <= 0
+            )
+            if missing:
+                raise UsageError(
+                    f"{snapshot} lacks carrier tensor files named by its safetensors index: {', '.join(missing)}"
+                )
 
     def cached(self, hub_cache: Path) -> bool:
         """Report whether the index and every tensor file it names are present."""
-        return _snapshot_cached(self.snapshot(hub_cache))
+        return _snapshot_cached(self.snapshot(hub_cache), self.checkpoint.overlay)
 
 
 def aliases(recipes: Sequence[Recipe]) -> tuple[str, ...]:
@@ -155,16 +198,48 @@ def _unsupported(reason: str, recipes: Sequence[Recipe]) -> UsageError:
     return UsageError(f"{reason}; supported models: {', '.join(supported)}")
 
 
-def _supporting(config_path: Path, source: str, recipes: Sequence[Recipe]) -> tuple[Recipe, Checkpoint]:
+def _detect_overlays(directory: Path, recipes: Sequence[Recipe]) -> tuple[CheckpointOverlay, ...]:
+    """Return every declared CheckpointOverlay in `recipes` whose manifest and schema match `directory`."""
+    from ignition.preparation.checkpoint import read_overlay_manifest
+
+    declared = tuple(dict.fromkeys(
+        checkpoint.overlay for recipe in recipes for checkpoint in recipe.checkpoints
+        if checkpoint.overlay is not None
+    ))
+    if not declared:
+        return ()
+    matched = []
+    for overlay in declared:
+        try:
+            if read_overlay_manifest(directory, overlay) is not None:
+                matched.append(overlay)
+        except ValueError as error:
+            raise UsageError(f"{directory} has an unreadable overlay manifest: {error}") from error
+    return tuple(matched)
+
+
+def _supporting(config_path: Path, source: str, recipes: Sequence[Recipe],
+                overlays: tuple[CheckpointOverlay, ...] = ()) -> tuple[Recipe, Checkpoint]:
+    """Return the first declared checkpoint matching `config_path`'s architecture and overlay packaging."""
     try:
         architectures = json.loads(config_path.read_text())["architectures"]
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise _unsupported(f"{source} has no readable config.json architecture", recipes) from error
     for recipe in recipes:
         for checkpoint in recipe.checkpoints:
-            if isinstance(architectures, list) and checkpoint.architecture in architectures:
+            if not (isinstance(architectures, list) and checkpoint.architecture in architectures):
+                continue
+            if overlays:
+                if checkpoint.overlay in overlays:
+                    return recipe, checkpoint
+            elif checkpoint.overlay is None:
                 return recipe, checkpoint
-    raise _unsupported(f"no recipe supports architecture {architectures!r} in {source}", recipes)
+    if overlays:
+        schemas = ", ".join(dict.fromkeys(overlay.schema for overlay in overlays))
+        packaging = f" packaged as {schemas}"
+    else:
+        packaging = ""
+    raise _unsupported(f"no recipe supports architecture {architectures!r}{packaging} in {source}", recipes)
 
 
 def _stored_bytes(index_path: Path, source: str) -> int:
@@ -219,20 +294,44 @@ def resolve(model: str, hub_cache: Path | None = None, *, recipes: Sequence[Reci
             container = _csf_container(directory)
         except (OSError, ValueError) as error:
             raise UsageError(f"{directory} has an unreadable checkpoint manifest: {error}") from error
-        metadata = directory if container is None else directory / "metadata"
         for recipe in recipes:
             for checkpoint in recipe.checkpoints:
                 # A directory that a recipe declares keeps its declared placement.
                 if Path(checkpoint.repository).is_absolute() and Path(checkpoint.repository).resolve() == directory:
                     return ResolvedModel(recipe, checkpoint, directory)
-        recipe, qualified = _supporting(metadata / "config.json", str(directory), recipes)
+        overlays = () if container is not None else _detect_overlays(directory, recipes)
+        if len({overlay.assets_subdir for overlay in overlays}) > 1:
+            subdirs = ", ".join(sorted({repr(overlay.assets_subdir) for overlay in overlays}))
+            raise UsageError(
+                f"{directory} matches multiple overlay specifications with conflicting assets_subdir values: {subdirs}"
+            )
+        if container is not None:
+            metadata = directory / "metadata"
+        elif overlays and not (directory / "config.json").is_file():
+            from ignition.preparation.checkpoint import checkpoint_assets_root
+
+            try:
+                metadata = checkpoint_assets_root(directory, overlays[0])
+            except ValueError as error:
+                raise UsageError(f"{directory} has an invalid overlay release: {error}") from error
+        else:
+            metadata = directory
+        recipe, qualified = _supporting(metadata / "config.json", str(directory), recipes, overlays)
         # The directory's path identifies its measurements on this host.
         revision = hashlib.sha256(str(directory).encode()).hexdigest()[:40]
-        index = directory / "model.safetensors.index.json"
-        single = directory / "model.safetensors"
-        stored = (_csf_stored_bytes(container, directory) if container is not None else
-                  _stored_bytes(index, str(directory)) if index.exists() else
-                  single.stat().st_size if single.is_file() else qualified.stored_bytes)
+        if qualified.overlay is not None:
+            from ignition.preparation.checkpoint import overlay_stored_bytes
+
+            try:
+                stored = overlay_stored_bytes(directory, qualified.overlay)
+            except ValueError as error:
+                raise UsageError(f"{directory} has an invalid overlay manifest: {error}") from error
+        else:
+            index = directory / "model.safetensors.index.json"
+            single = directory / "model.safetensors"
+            stored = (_csf_stored_bytes(container, directory) if container is not None else
+                      _stored_bytes(index, str(directory)) if index.exists() else
+                      single.stat().st_size if single.is_file() else qualified.stored_bytes)
         return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored), directory)
     repository, _, revision = model.partition("@")
     if "/" not in repository:

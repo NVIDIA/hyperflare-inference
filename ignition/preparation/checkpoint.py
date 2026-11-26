@@ -18,6 +18,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ignition.declaration import CheckpointOverlay
 
 
 class CheckpointError(ValueError):
@@ -217,3 +221,138 @@ def _inspect_indexed_checkpoint(snapshot: Path, index: dict) -> IndexedCheckpoin
     if type(declared) is not int or declared < total:
         raise CheckpointError(f"index total_size is invalid for tensor payload bytes: {total}")
     return IndexedCheckpoint(snapshot, MappingProxyType(tensors), tuple(shards))
+
+
+def _validate_overlay_relative_path(path: object, label: str) -> str:
+    from ignition.declaration import validate_relative_path
+
+    try:
+        return validate_relative_path(path, label)
+    except ValueError as error:
+        raise CheckpointError(str(error)) from error
+
+
+def _has_safetensors_assets(directory: Path) -> bool:
+    return (directory / "model.safetensors.index.json").is_file() or (directory / "model.safetensors").is_file()
+
+
+def read_overlay_manifest(root: str | Path, overlay: CheckpointOverlay) -> dict | None:
+    """Return the parsed overlay manifest when ``root`` declares ``overlay.schema``, else None.
+
+    Raises ``CheckpointError`` when ``overlay.manifest`` exists under ``root`` but
+    cannot be read as a JSON object.
+    """
+    manifest_path = Path(root).expanduser() / overlay.manifest
+    if not manifest_path.is_file() and not manifest_path.is_symlink():
+        return None
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as error:
+        raise CheckpointError(f"{manifest_path} is unreadable: {error}") from error
+    manifest = _parse_json(raw, str(manifest_path))
+    return manifest if manifest.get("schema") == overlay.schema else None
+
+
+def checkpoint_assets_root(root: str | Path, overlay: CheckpointOverlay | None = None) -> Path:
+    """Return the directory holding ``root``'s safetensors index and frontend assets.
+
+    Non-overlay roots pass through unchanged: when ``overlay`` is ``None``,
+    ``overlay.assets_subdir`` is empty, ``overlay.manifest`` is absent, or the
+    manifest declares another schema, returns ``root``. When ``root`` carries a
+    manifest matching ``overlay.schema`` and ``overlay.assets_subdir`` is
+    non-empty, returns ``root / overlay.assets_subdir`` if it holds a
+    safetensors index or single-file checkpoint, and raises ``CheckpointError``
+    otherwise so a broken or misdeclared overlay never falls back to reading
+    root metadata or licenses. Raises ``CheckpointError`` when
+    ``overlay.manifest`` exists but cannot be read as a JSON object.
+    """
+    resolved = Path(root).expanduser()
+    if overlay is None or not overlay.assets_subdir:
+        return resolved
+    # Only roots declaring this overlay's schema redirect to assets_subdir; plain
+    # checkpoints and unrelated schemas pass through to `root`.
+    if read_overlay_manifest(resolved, overlay) is None:
+        return resolved
+    assets = resolved / overlay.assets_subdir
+    if not assets.is_dir() or not _has_safetensors_assets(assets):
+        raise CheckpointError(
+            f"{resolved} declares overlay {overlay.schema!r} but lacks safetensors assets under"
+            f" {overlay.assets_subdir!r}"
+        )
+    return assets
+
+
+def overlay_manifest_files(manifest: Mapping[str, object], overlay: CheckpointOverlay) -> tuple[tuple[str, int], ...]:
+    """Validate an overlay manifest and return its declared ``(relative_path, byte_size)`` pairs."""
+    if overlay.validate_manifest is not None:
+        overlay.validate_manifest(manifest)
+    if "files" not in manifest:
+        return ()
+    files = manifest["files"]
+    if not isinstance(files, list) or not files:
+        raise CheckpointError("overlay manifest 'files' must be a nonempty list")
+    entries = []
+    seen = set()
+    for entry in files:
+        path = entry.get("path") if isinstance(entry, dict) else None
+        size = entry.get("bytes") if isinstance(entry, dict) else None
+        if type(size) is not int or size <= 0:
+            raise CheckpointError(f"overlay manifest file entry {entry!r} has an invalid byte size")
+        validated = _validate_overlay_relative_path(path, "overlay manifest file path")
+        if validated in seen:
+            raise CheckpointError(f"overlay manifest repeats file path {validated!r}")
+        seen.add(validated)
+        entries.append((validated, size))
+    return tuple(entries)
+
+
+def overlay_files_present(root: str | Path, overlay: CheckpointOverlay | None) -> bool:
+    """Report whether every carrier, required, and manifest-declared overlay file is present at its expected size.
+
+    Returns ``True`` when ``overlay`` is ``None``. Returns ``False`` when the
+    manifest is absent, declares another schema, or any required or declared file
+    is missing or has a different size. Raises ``CheckpointError`` or
+    ``ValueError`` when a matching manifest fails validation.
+    """
+    if overlay is None:
+        return True
+    resolved = Path(root).expanduser()
+    manifest = read_overlay_manifest(resolved, overlay)
+    if manifest is None:
+        return False
+    entries = overlay_manifest_files(manifest, overlay)
+    assets = resolved / overlay.assets_subdir if overlay.assets_subdir else resolved
+    if not _has_safetensors_assets(assets):
+        return False
+    if not all((resolved / rel).is_file() for rel in overlay.required_files):
+        return False
+    return all((resolved / rel).is_file() and (resolved / rel).stat().st_size == size for rel, size in entries)
+
+
+def overlay_stored_bytes(root: str | Path, overlay: CheckpointOverlay) -> int:
+    """Return stored payload bytes of an overlay checkpoint: carrier payload plus manifest-declared files."""
+    resolved = Path(root).expanduser()
+    manifest = read_overlay_manifest(resolved, overlay)
+    if manifest is None:
+        raise CheckpointError(f"{resolved} does not declare overlay schema {overlay.schema!r}")
+    entries = overlay_manifest_files(manifest, overlay)
+    assets = resolved / overlay.assets_subdir if overlay.assets_subdir else resolved
+    index_path = assets / "model.safetensors.index.json"
+    single_path = assets / "model.safetensors"
+    if index_path.is_file():
+        try:
+            raw = index_path.read_bytes()
+        except OSError as error:
+            raise CheckpointError(f"{index_path} is unreadable: {error}") from error
+        index = _parse_json(raw, str(index_path))
+        metadata = index.get("metadata")
+        carrier = metadata.get("total_size") if isinstance(metadata, dict) else None
+        if type(carrier) is not int or carrier <= 0:
+            raise CheckpointError(f"{assets} has an invalid safetensors total_size: {carrier!r}")
+    elif single_path.is_file():
+        carrier = single_path.stat().st_size
+        if carrier <= 0:
+            raise CheckpointError(f"{assets} has an invalid safetensors file size: {carrier!r}")
+    else:
+        raise CheckpointError(f"{assets} has no safetensors index or weights file")
+    return carrier + sum(size for _, size in entries)

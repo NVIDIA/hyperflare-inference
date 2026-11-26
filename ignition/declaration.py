@@ -73,6 +73,53 @@ class SamplingDefaults:
         return result
 
 
+def validate_relative_path(value: object, label: str, *, allow_empty: bool = False) -> str:
+    """Validate that `value` is a canonical relative POSIX path and return it."""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if not value:
+        if allow_empty:
+            return value
+        raise ValueError(f"{label} must be a nonempty relative path")
+    if "\\" in value or value.startswith("/") or value.endswith("/"):
+        raise ValueError(f"{label} must be a canonical relative POSIX path: {value!r}")
+    if any(part in ("", ".", "..") for part in value.split("/")):
+        raise ValueError(f"{label} must be a canonical relative POSIX path: {value!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class CheckpointOverlay:
+    """Layout of a checkpoint packaged as an overlay on a carrier directory.
+
+    `manifest` names the JSON file at the checkpoint root whose `schema` field
+    identifies this overlay format. `assets_subdir` names the relative
+    subdirectory holding the carrier safetensors index and frontend assets, or
+    empty string when those files stay at the checkpoint root. `required_files`
+    lists relative paths that must exist alongside the carrier for a snapshot to
+    be complete. `validate_manifest`, when supplied, validates format-specific
+    invariants on the parsed manifest object and raises `ValueError` on failure.
+    """
+
+    manifest: str
+    schema: str
+    assets_subdir: str = ""
+    required_files: tuple[str, ...] = ()
+    validate_manifest: Callable[[Mapping[str, object]], None] | None = None
+
+    def __post_init__(self):
+        validate_relative_path(self.manifest, "overlay manifest")
+        if not isinstance(self.schema, str) or not self.schema:
+            raise ValueError("overlay schema must be a nonempty string")
+        validate_relative_path(self.assets_subdir, "overlay assets_subdir", allow_empty=True)
+        if not isinstance(self.required_files, tuple):
+            raise ValueError("overlay required_files must be a tuple of relative paths")
+        for path in self.required_files:
+            validate_relative_path(path, "overlay required file")
+        if self.validate_manifest is not None and not callable(self.validate_manifest):
+            raise ValueError("overlay validate_manifest must be callable or None")
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     """One qualified checkpoint revision and where its stored tensors reside."""
@@ -102,6 +149,16 @@ class Checkpoint:
     plain_ranks: Mapping[int, "RankCosts"] | None = None
     # API model name advertised for this checkpoint; empty uses the recipe's `served_model_name`.
     served_model_name: str = ""
+    # Tensor-parallel sizes this checkpoint can load when its stored shards fix them;
+    # empty uses the checkpoint's `ranks` when declared, else the recipe's `ranks`.
+    tensor_parallel: tuple[int, ...] = ()
+    # Overlay packaging specification when this checkpoint's root holds an overlay manifest
+    # and references carrier assets in a subdirectory.
+    overlay: CheckpointOverlay | None = None
+
+    def __post_init__(self):
+        if self.overlay is not None and not isinstance(self.overlay, CheckpointOverlay):
+            raise ValueError("checkpoint overlay must be a CheckpointOverlay or None")
 
 
 @dataclass(frozen=True)
@@ -351,13 +408,21 @@ class Recipe:
             if (checkpoint.ranks is None) != (checkpoint.plain_ranks is None) or (
                     checkpoint.ranks is not None and set(checkpoint.ranks) != set(checkpoint.plain_ranks)):
                 raise ValueError(f"{checkpoint.alias} declares costs with and without speculation for different sizes")
+            available = set(self.ranks) if checkpoint.ranks is None else set(checkpoint.ranks)
+            sizes = checkpoint.tensor_parallel
+            if (not isinstance(sizes, tuple) or any(type(size) is not int for size in sizes)
+                    or list(sizes) != sorted(set(sizes)) or not set(sizes) <= available):
+                raise ValueError(f"{checkpoint.alias} must declare its tensor-parallel sizes as an increasing tuple"
+                                 " that is a subset of the checkpoint's or recipe's declared sizes")
 
     @property
     def tensor_parallel(self) -> tuple[int, ...]:
         return tuple(sorted(self.ranks))
 
     def checkpoint_tensor_parallel(self, checkpoint: Checkpoint) -> tuple[int, ...]:
-        """Tensor-parallel sizes `checkpoint` prepares: its own declared sizes, else the recipe's."""
+        """Tensor-parallel sizes `checkpoint` prepares: its restricted sizes, its own rank costs, else the recipe's."""
+        if checkpoint.tensor_parallel:
+            return checkpoint.tensor_parallel
         return self.tensor_parallel if checkpoint.ranks is None else tuple(sorted(checkpoint.ranks))
 
     def served_name(self, checkpoint: Checkpoint) -> str:
