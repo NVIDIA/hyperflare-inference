@@ -209,6 +209,9 @@ def _preparation_arguments(running, *, model_default="defaults.model", recipes=(
                                " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
                                " MXFP8: DeepSeek V4.1; both: Qwen3.8 dense and Flash Next DFlash2 with a BF16 checkpoint head;"
                                " default: checkpoint precision)")
+    advanced.add_argument("--target-head-quantization", choices=("mxfp8",),
+                          help="prepare the target vocabulary head as MXFP8 for recipes that declare it"
+                               " (default: checkpoint precision)")
     advanced.add_argument("--markov-head-quantization", choices=("nvfp4", "fp8"),
                           help="prepare the draft Markov transition projection as NVFP4"
                                " or row-scaled E4M3 FP8 (FP8: DeepSeek V4.1; default: checkpoint precision)")
