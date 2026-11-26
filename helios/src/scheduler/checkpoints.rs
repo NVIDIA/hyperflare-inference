@@ -332,10 +332,10 @@ impl RequestScheduler {
                 } else {
                     entry.non_terminal_ns
                 };
+                // Dispatch discovers an unmeasured prefill graph only at the step's
+                // natural-fit capacity, so other unmeasured capacities never run here.
                 let Some(nanos) = nanos else {
-                    if !adds_work
-                        || (has_terminal_catalog && Some(entry.capacity) != target_capacity)
-                    {
+                    if !adds_work || Some(entry.capacity) != target_capacity {
                         continue;
                     }
                     return None;
@@ -906,6 +906,11 @@ mod tests {
                 .min()
                 .unwrap_or(end)
                 .min(end);
+            let target_capacity = catalog
+                .iter()
+                .copied()
+                .find(|&capacity| capacity >= limit - start)
+                .or_else(|| catalog.last().copied());
             let mut best: Option<(usize, u64)> = None;
             let mut max_work = 0usize;
             for &capacity in catalog {
@@ -928,7 +933,7 @@ mod tests {
                     .duration(request.prefill_kind(), 1, capacity)
                     .filter(|&nanos| nanos != 0)
                 else {
-                    if !adds_work {
+                    if !adds_work || Some(capacity) != target_capacity {
                         continue;
                     }
                     return None;
@@ -1675,5 +1680,49 @@ mod tests {
         );
         assert!(!partial_budget);
         assert_eq!(partial_selected.initial_prefill_ns, Some(150_000));
+    }
+
+    #[test]
+    fn uniform_prefill_catalog_skips_unmeasured_non_target_capacities() {
+        // Cold discovery measures only the natural-fit capacity of each chunk, so long
+        // prompts on a catalog without terminal prefill leave smaller capacities
+        // unmeasured. Dispatch never selects those capacities for a full chunk, so they
+        // must not make the chunk's price unknown.
+        let mut scheduler = super::super::tests::scheduler(1, 128, 16);
+        scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+        scheduler
+            .graph_durations(&super::super::tests::duration_graphs(1))
+            .unwrap();
+        measure(&mut scheduler, GraphKind::Prefill, 512, 400_000);
+        measure(&mut scheduler, GraphKind::Snapshot, 1, 1_000);
+        let mut spec = super::super::tests::spec(1024, 3);
+        spec.message_boundaries = vec![512];
+        let handle = scheduler.admit(spec).unwrap();
+        let (selected, unknown, budget) =
+            scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
+        assert!(
+            !unknown,
+            "uniform catalog must not fail on unmeasured non-target capacities"
+        );
+        assert!(!budget);
+        assert_eq!(selected.initial_prefill_ns, Some(800_000));
+        assert!(selected.cuts.iter().any(|cut| cut.endpoint == 512));
+
+        // An unmeasured natural-fit capacity still makes the price unknown: dispatch
+        // would discover it rather than run a measured smaller capacity.
+        let mut cold = super::super::tests::scheduler(1, 128, 16);
+        cold.prefill_graphs(&[128, 256, 512]).unwrap();
+        cold.graph_durations(&super::super::tests::duration_graphs(1))
+            .unwrap();
+        measure(&mut cold, GraphKind::Prefill, 128, 100_000);
+        measure(&mut cold, GraphKind::Prefill, 256, 200_000);
+        measure(&mut cold, GraphKind::Snapshot, 1, 1_000);
+        let mut cold_spec = super::super::tests::spec(1024, 3);
+        cold_spec.message_boundaries = vec![512];
+        let cold_handle = cold.admit(cold_spec).unwrap();
+        let (cold_selected, cold_unknown, _) =
+            cold.checkpoint_selection(cold.request(cold_handle).unwrap());
+        assert!(cold_unknown);
+        assert_eq!(cold_selected.initial_prefill_ns, None);
     }
 }
