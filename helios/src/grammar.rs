@@ -378,6 +378,17 @@ impl GrammarCompiler {
             self.marker("<|content_thinking|>"), self.marker("<|content_text|>")));
         grammar.grammars[0].name = Some("answer".into());
         let mut tools = vec![];
+        if !envelope.tools.is_empty() {
+            let mut payload = TopLevelGrammar::from_json_schema(serde_json::json!({
+                "type":"object", "properties":{"name":{"enum":&envelope.tools},"args":{"type":"object"}},
+                "required":["name","args"], "additionalProperties":false,
+            })).grammars.remove(0);
+            payload.name = Some("payload_any".into());
+            grammar.grammars.push(payload);
+            rules.push_str(&format!("tool_unnamed: {} @payload_any {end}\n",
+                self.marker("<|content_invoke_tool_json|>")));
+            tools.push("tool_unnamed".into());
+        }
         for (index, name) in envelope.tools.iter().enumerate() {
             let mut payload = TopLevelGrammar::from_json_schema(serde_json::json!({
                 "type":"object", "properties":{"name":{"const":name},"args":{"type":"object"}},
@@ -389,9 +400,9 @@ impl GrammarCompiler {
                 self.marker(name), self.marker("<|content_invoke_tool_json|>")));
             tools.push(format!("tool_{index}"));
         }
-        let ending = if tools.is_empty() { "answer" } else {
+        let ending = if tools.is_empty() { "answer".to_owned() } else {
             rules.push_str(&format!("tool: {}\ntools: tool ({restart} thinking* tool)* ({restart} thinking* answer)?\n", tools.join(" | ")));
-            "(answer | tools)"
+            format!("(answer ({restart} thinking* tool)* | tools)")
         };
         rules.push_str(&format!("tail: thinking* {ending}\n"));
         match envelope.start {
@@ -1914,6 +1925,74 @@ pub(crate) mod tests {
                     assert_eq!(accepted, expected, "lark={lark}: {text}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn content_headers_grammar_allows_preamble_before_tools() {
+        use crate::model::contract::ToolParserKind;
+        use crate::output::tagged::OutputStart;
+
+        let markers = [
+            "<|message_model|>",
+            "<|content_thinking|>",
+            "<|content_text|>",
+            "<|content_invoke_tool_json|>",
+            "<|end_message|>",
+        ];
+        let tokenizer = byte_tokenizer_with(&markers);
+        let controls: Vec<_> = markers
+            .iter()
+            .map(|marker| (tokenizer.token_to_id(marker).unwrap(), (*marker).to_owned()))
+            .collect();
+        let compiler = GrammarCompiler::new(&tokenizer, 320, &[256, 257], &controls).unwrap();
+        let envelope = OutputEnvelope {
+            recipient: Some(RecipientEnvelope {
+                syntax: ToolParserKind::TmlJson,
+                start: OutputStart::RecipientFrame,
+                tools: vec!["bash".into()],
+            }),
+            reasoning_end: None,
+            tool: None,
+            function: None,
+            tool_ends_reasoning: false,
+            tool_body_start: false,
+            response: None,
+            message_close: None,
+        };
+        let thinking = "<|message_model|><|content_thinking|>Plan.<|end_message|>";
+        let answer = "<|message_model|><|content_text|>Checking branch.<|end_message|>";
+        let named_call = "<|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"cmd\":\"git status\"}}<|end_message|>";
+        let unnamed_call = "<|message_model|><|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"cmd\":\"git status\"}}<|end_message|>";
+        let bad_unnamed_call = "<|message_model|><|content_invoke_tool_json|>{\"name\":\"other\",\"args\":{}}<|end_message|>";
+        let bad_named_call = "<|message_model|>other<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{}}<|end_message|>";
+        for (text, valid) in [
+            (answer.to_owned(), true),
+            (named_call.to_owned(), true),
+            (unnamed_call.to_owned(), true),
+            (format!("{named_call}{answer}"), true),
+            (format!("{unnamed_call}{answer}"), true),
+            (format!("{answer}{named_call}"), true),
+            (format!("{answer}{unnamed_call}"), true),
+            (format!("{thinking}{answer}{unnamed_call}"), true),
+            (format!("{answer}{thinking}{named_call}{unnamed_call}"), true),
+            (bad_unnamed_call.to_owned(), false),
+            (bad_named_call.to_owned(), false),
+            (thinking.to_owned(), false),
+            (format!("{answer}{unnamed_call}{answer}"), false),
+        ] {
+            let mut grammar = compiler
+                .compile_lark_in("start: /(?s:.+)/", Some(&envelope))
+                .unwrap();
+            let accepted = tokenizer
+                .encode(text.as_str(), false)
+                .unwrap()
+                .get_ids()
+                .iter()
+                .copied()
+                .chain([256])
+                .all(|id| grammar.advance(id).is_ok());
+            assert_eq!(accepted, valid, "{text}");
         }
     }
 }
