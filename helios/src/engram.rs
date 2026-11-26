@@ -231,21 +231,18 @@ impl Requests {
                 rows,
             } => {
                 let ready = unsafe { &*(flag as *const AtomicU64) };
-                // The GPU publishes this step's n-gram ids part-way through the step,
-                // milliseconds away, and two frames are pipelined: spinning a full
-                // step here holds a core that the model threads need, and eight such
-                // threads hold eight. Spin only long enough to catch an id set that
-                // lands immediately, then park in progressively longer naps.
+                // The graph publishes these ids part-way through the step that
+                // consumes them, so this wait spins only while they may still be in
+                // flight and gives the core up once they are not.
                 let mut spins = 0u32;
                 while ready.load(Ordering::Acquire) != sequence {
                     if cancelled.load(Ordering::Acquire) {
                         return Err("n-gram request cancelled".into());
                     }
-                    if spins < IDLE_SPIN_ROUNDS {
+                    if spins < SPIN_ROUNDS {
                         std::hint::spin_loop();
                     } else {
-                        let nap = u64::from((spins - IDLE_SPIN_ROUNDS).min(IDLE_STEPS)) + 1;
-                        thread::sleep(Duration::from_micros(nap * IDLE_STEP_US));
+                        yield_core(spins - SPIN_ROUNDS);
                     }
                     spins = spins.saturating_add(1);
                 }
@@ -255,12 +252,20 @@ impl Requests {
     }
 }
 const STAGING_FRAMES: usize = 2;
-/// Spins taken before a waiting gather parks instead of holding a core.
-const IDLE_SPIN_ROUNDS: u32 = 1 << 12;
-/// Naps of `IDLE_STEP_US` a parked gather takes before its wait saturates.
-const IDLE_STEPS: u32 = 9;
-/// Longest nap, reached after ten rounds; the ids land within one step.
-const IDLE_STEP_US: u64 = 25;
+/// Rounds a waiting gather spins before it starts napping, enough to catch ids
+/// the graph published before the wait began.
+const SPIN_ROUNDS: u32 = 1 << 12;
+/// Nap growth per round after the spin; the tenth round reaches `NAP_MAX`.
+const NAP_GROWTH: Duration = Duration::from_micros(25);
+/// Longest nap between rounds, under one decode step so that a nap delays the
+/// published ids by no more than its own length.
+const NAP_MAX: Duration = Duration::from_micros(250);
+
+/// Gives up the core for one round of a wait that has spent its spin, napping
+/// `NAP_GROWTH` longer each round up to `NAP_MAX`.
+fn yield_core(rounds: u32) {
+    thread::sleep(NAP_GROWTH.saturating_mul(rounds.saturating_add(1)).min(NAP_MAX));
+}
 
 struct Job {
     frame: usize,
@@ -436,6 +441,8 @@ impl Shared {
             let row_bytes = planes.iter().map(|p| p.row_bytes).sum::<usize>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stop = cancelled.clone();
+            // One worker serves every rank whose rows this table holds; a rank-partitioned
+            // table becomes a separate `Shared` with its own workers.
             let worker = thread::Builder::new()
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
