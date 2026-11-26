@@ -968,6 +968,72 @@ fn appended_conversation_outlives_snapshot_capacity_without_losing_prefix_pages(
 }
 
 #[test]
+fn request_kv_pages_count_shared_prefix_pages_once() {
+    let mut scheduler = scheduler(2, 8, 5);
+    let seed = scheduler.admit(spec(64, 1)).unwrap();
+    init(&mut scheduler, 1);
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(2)).unwrap();
+    scheduler
+        .complete(
+            Fence(2),
+            &records(seed, 2, 64, 1, 77, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, seed, 3);
+    scheduler.finish(seed).unwrap();
+    let first = scheduler.admit(spec(65, 4)).unwrap();
+    let second = scheduler.admit(spec(65, 4)).unwrap();
+    init(&mut scheduler, 4);
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(5)).unwrap();
+    scheduler
+        .complete(
+            Fence(5),
+            &records(first, 5, 65, 1, 88, 1),
+            Default::default(),
+        )
+        .unwrap();
+    retain_prompt(&mut scheduler, 6);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Prefill);
+    assert_eq!(step.lanes[0].request, second);
+    scheduler.commit(&step, Fence(7)).unwrap();
+    scheduler
+        .complete(
+            Fence(7),
+            &records(second, 7, 65, 1, 90, 1),
+            Default::default(),
+        )
+        .unwrap();
+    let (shared, first_private, second_private, first_reserved, second_reserved) = {
+        let first_request = scheduler.request(first).unwrap();
+        let second_request = scheduler.request(second).unwrap();
+        assert_eq!(first_request.shared_pages, second_request.shared_pages);
+        assert!(!first_request.shared_pages.is_empty());
+        (
+            first_request.shared_pages.len(),
+            first_request.private_pages.len(),
+            second_request.private_pages.len(),
+            first_request.reserved_pages.len(),
+            second_request.reserved_pages.len(),
+        )
+    };
+    let stats = scheduler.stats();
+    assert_eq!(stats.request_pages, shared + first_private + second_private);
+    assert_eq!(stats.reserved_pages, first_reserved + second_reserved);
+    // Retirement releases the request pin and drains the slot for both a completed
+    // and a cancelled request; cancellation keeps this check independent of the
+    // terminal-snapshot plan.
+    scheduler.cancel(first).unwrap();
+    scheduler.cancel(second).unwrap();
+    let stats = scheduler.stats();
+    assert_eq!((stats.request_pages, stats.reserved_pages), (0, 0));
+    assert!(stats.cached_pages > 0);
+}
+
+#[test]
 fn branching_requests_own_distinct_tail_pages_and_terminal_snapshots() {
     let mut scheduler = scheduler(2, 8, 5);
     let seed = scheduler.admit(spec(64, 1)).unwrap();

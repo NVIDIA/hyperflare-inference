@@ -127,6 +127,10 @@ pub struct SchedulerStats {
     pub snapshot_backing_pages: usize,
     pub cached_checkpoints: usize,
     pub cached_pages: usize,
+    /// Distinct KV pages active requests reference: private pages plus their pinned prefix-checkpoint pages.
+    pub request_pages: usize,
+    /// KV pages reserved for active requests' growth and not yet written.
+    pub reserved_pages: usize,
     pub host_lookups: u64,
     pub host_hits: u64,
     pub host_reused_tokens: u64,
@@ -1209,6 +1213,19 @@ impl RequestScheduler {
             snapshot_capacity: self.limits.snapshots as usize,
             cached_checkpoints: cache.published_checkpoints,
             cached_pages: cache.cached_pages,
+            request_pages: self
+                .slots
+                .iter()
+                .filter_map(|slot| slot.request.as_ref())
+                .map(|request| request.private_pages.len())
+                .sum::<usize>()
+                + cache.request_pinned_pages,
+            reserved_pages: self
+                .slots
+                .iter()
+                .filter_map(|slot| slot.request.as_ref())
+                .map(|request| request.reserved_pages.len())
+                .sum(),
             inbound_waiting: if self.tickets.is_empty() {
                 0
             } else {
@@ -1624,7 +1641,11 @@ impl RequestScheduler {
             None
         };
         if let Some(id) = pinned {
-            self.cache.pin(id)?;
+            if inbound.is_none() {
+                self.cache.pin_request(id)?;
+            } else {
+                self.cache.pin(id)?;
+            }
         }
         let execution_limit = self.execution_limit(spec.prompt.len(), spec.max_new_tokens);
         let reserved_count = self.admission_pages(
@@ -1635,7 +1656,11 @@ impl RequestScheduler {
         );
         if reserved_count + (consumed / page_tokens) as usize > self.limits.pages as usize {
             if let Some(id) = pinned {
-                self.cache.unpin(id)?;
+                if inbound.is_none() {
+                    self.cache.unpin_request(id)?;
+                } else {
+                    self.cache.unpin(id)?;
+                }
             }
             return Err(crate::Error::admission(
                 crate::AdmissionError::Context,
@@ -1657,7 +1682,11 @@ impl RequestScheduler {
             self.ensure_resources(reserved_count + ticket_pages, ticket_snapshots)
         } {
             if let Some(id) = pinned {
-                self.cache.unpin(id)?;
+                if inbound.is_none() {
+                    self.cache.unpin_request(id)?;
+                } else {
+                    self.cache.unpin(id)?;
+                }
             }
             return Err(error);
         }
@@ -1868,7 +1897,7 @@ impl RequestScheduler {
         let shared_pages = self.cache.page_chain(id)?;
         for handle in ticket.waiters {
             self.request(handle)?;
-            self.cache.pin(id)?;
+            self.cache.pin_request(id)?;
             let request = self.request_mut(handle)?;
             request.prefix = Some(id);
             request.prefix_tokens = key.consumed_tokens;
@@ -2939,9 +2968,9 @@ impl RequestScheduler {
                 return Err("completed boundary copy was not GPU-ready".into());
             }
             self.record_publication(id);
-            self.cache.pin(id)?;
+            self.cache.pin_request(id)?;
             if let Some(parent) = self.request(handle)?.prefix {
-                self.cache.unpin(parent)?;
+                self.cache.unpin_request(parent)?;
             }
             let request = self.request_mut(handle)?;
             request
@@ -2959,8 +2988,8 @@ impl RequestScheduler {
             if let PublishResult::Existing { id, ready: true } = result
                 && matches!(capture.resume, RequestPhase::Snapshot | RequestPhase::Finishing)
             {
-                self.cache.pin(id)?;
-                if let Some(parent) = self.request(handle)?.prefix { self.cache.unpin(parent)?; }
+                self.cache.pin_request(id)?;
+                if let Some(parent) = self.request(handle)?.prefix { self.cache.unpin_request(parent)?; }
                 let snapshot = self.cache.checkpoint(id)?.snapshot();
                 let shared_pages = self.cache.page_chain(id)?;
                 let request = self.request_mut(handle)?;
@@ -3127,7 +3156,7 @@ impl RequestScheduler {
             if !publish || request.error_code.is_some() {
                 self.record_publication(prefix);
             }
-            self.cache.unpin(prefix)?;
+            self.cache.unpin_request(prefix)?;
         }
         if request.preempted
             && let Some(

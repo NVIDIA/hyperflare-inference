@@ -295,6 +295,15 @@ launches by kind, embedding row-cache counters, HTTP admission gauges, and
 uptime. `flare_history_drafts_enabled` reports whether shared decoded history
 augments learned proposals in the serving process.
 
+`flare_request_kv_pages` counts the distinct KV pages that active requests
+reference: their private pages plus the tail pages of the prefix checkpoints they
+pin, each page counted once even when several requests reference it.
+`flare_reserved_kv_pages` counts pages reserved for active requests' future
+growth that are neither free, cached, nor written yet. Both are gauges read from
+scheduler state on each scrape. Dividing `flare_request_kv_pages` by
+`flare_total_kv_pages` gives the KV share held by live requests; idle cached
+prefixes and snapshot backing pages are outside that share.
+
 The route returns one JSON object instead when the query contains `format=json`,
 or when the `Accept` header gives `application/json` a higher quality than
 `text/plain`; at equal quality the earlier media range wins. `format=prometheus`

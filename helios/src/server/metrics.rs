@@ -262,6 +262,8 @@ pub(super) struct Metrics {
     snapshot_backing_pages: AtomicU64,
     cached_checkpoints: AtomicU64,
     cached_pages: AtomicU64,
+    request_pages: AtomicU64,
+    reserved_pages: AtomicU64,
     pub pending: AtomicU64,
     host_lookups: AtomicU64,
     host_hits: AtomicU64,
@@ -512,6 +514,8 @@ impl Metrics {
             ),
             (&self.cached_checkpoints, stats.cached_checkpoints as u64),
             (&self.cached_pages, stats.cached_pages as u64),
+            (&self.request_pages, stats.request_pages as u64),
+            (&self.reserved_pages, stats.reserved_pages as u64),
         ] {
             target.store(value, Ordering::Relaxed);
         }
@@ -1303,6 +1307,16 @@ impl Metrics {
                 &self.cached_pages,
             ),
             (
+                "request_kv_pages",
+                "Distinct KV pages referenced by active requests: private pages plus pinned prefix-checkpoint pages, each counted once.",
+                &self.request_pages,
+            ),
+            (
+                "reserved_kv_pages",
+                "KV pages reserved for active requests' growth and not yet written.",
+                &self.reserved_pages,
+            ),
+            (
                 "pending_requests",
                 "Requests waiting inside the model scheduler, excluding its ingress channel.",
                 &self.pending,
@@ -1773,6 +1787,8 @@ mod tests {
             reused_tokens: 192,
             free_pages: 10,
             cached_pages: 3,
+            request_pages: 4,
+            reserved_pages: 2,
             host_lookups: 4,
             host_hits: 1,
             host_reused_tokens: 640,
@@ -1816,6 +1832,8 @@ mod tests {
             ("free_kv_tokens", 1280),
             ("cached_kv_pages", 3),
             ("cached_kv_tokens", 384),
+            ("request_kv_pages", 4),
+            ("reserved_kv_pages", 2),
             ("host_cache_slots_in_use", 3),
             ("host_cache_slots_total", 8),
             ("host_cache_intake_slots", 2),

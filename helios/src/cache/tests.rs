@@ -318,6 +318,30 @@ fn duplicate_publication_retains_unused_resources_with_caller() {
 }
 
 #[test]
+fn request_pins_count_each_shared_page_once() {
+    let mut cache = cache();
+    let left = history(2, 0);
+    let mut right = history(1, 0);
+    right.append(&[999; 64], &[]).unwrap();
+    let parent = created(&mut cache, &left, &proposal(None, 64, &[0], 0, 0));
+    let left_id = created(&mut cache, &left, &proposal(Some(parent), 128, &[1], 1, 0));
+    let right_id = created(&mut cache, &right, &proposal(Some(parent), 128, &[2], 2, 0));
+    cache.pin_request(left_id).unwrap();
+    cache.pin_request(right_id).unwrap();
+    // Both requests pin the shared parent, whose page counts once for both.
+    assert_eq!(cache.stats().request_pinned_pages, 3);
+    cache.pin(right_id).unwrap();
+    assert_eq!(cache.stats().request_pinned_pages, 3);
+    assert!(cache.unpin_request(parent).is_err());
+    cache.unpin_request(left_id).unwrap();
+    assert_eq!(cache.stats().request_pinned_pages, 2);
+    cache.unpin(right_id).unwrap();
+    assert_eq!(cache.stats().request_pinned_pages, 2);
+    cache.unpin_request(right_id).unwrap();
+    assert_eq!(cache.stats().request_pinned_pages, 0);
+}
+
+#[test]
 fn branching_pins_ancestors_and_prevents_direct_ancestor_unpin() {
     let mut cache = cache();
     let left = history(2, 0);
