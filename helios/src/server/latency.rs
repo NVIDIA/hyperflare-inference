@@ -31,7 +31,10 @@ struct Samples {
     dropped_at: Option<Instant>,
 }
 #[derive(Default)]
-pub(super) struct FirstResponseSamples(Mutex<Samples>);
+pub(super) struct FirstResponseSamples {
+    window: Mutex<Samples>,
+    histogram: super::metrics::Histogram<21>,
+}
 impl Samples {
     fn expire(&mut self, now: Instant) {
         while self
@@ -67,7 +70,7 @@ impl FirstResponseSamples {
     }
     pub(super) fn snapshot(&self) -> FirstResponseSnapshot {
         let (mut seconds, truncated) = {
-            let mut samples = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut samples = self.window.lock().unwrap_or_else(|e| e.into_inner());
             samples.expire(Instant::now());
             (
                 samples
@@ -104,10 +107,26 @@ pub(super) struct FirstResponse {
 impl FirstResponse {
     pub(super) fn output(&mut self) {
         if !self.recorded {
-            let mut samples = self.samples.0.lock().unwrap_or_else(|e| e.into_inner());
-            samples.record(self.started, Instant::now());
+            let now = Instant::now();
+            let mut samples = self.samples.window.lock().unwrap_or_else(|e| e.into_inner());
+            samples.record(self.started, now);
+            self.samples.histogram.observe(
+                &super::metrics::REQUEST_SECONDS,
+                now.saturating_duration_since(self.started).as_nanos() as u64,
+            );
             self.recorded = true;
         }
+    }
+}
+
+impl FirstResponseSamples {
+    pub(super) fn render_histogram(&self, text: &mut String) {
+        self.histogram.render(
+            text,
+            "time_to_first_response_seconds",
+            "Server-side HTTP admission to the first offered answer or reasoning text.",
+            &super::metrics::REQUEST_SECONDS,
+        );
     }
 }
 
@@ -176,13 +195,13 @@ mod tests {
         assert_eq!(empty.samples, 0);
         let now = Instant::now();
         {
-            let mut values = samples.0.lock().unwrap();
+            let mut values = samples.window.lock().unwrap();
             for seconds in [4, 1, 2, 3] {
                 values.values.push_back((now, Duration::from_secs(seconds)));
             }
         }
         assert_eq!(samples.snapshot().median_seconds, Some(2.5));
-        samples.0.lock().unwrap().expire(now + WINDOW);
+        samples.window.lock().unwrap().expire(now + WINDOW);
         assert_eq!(samples.snapshot().median_seconds, None);
     }
 
@@ -191,7 +210,7 @@ mod tests {
         let samples = FirstResponseSamples::default();
         let now = Instant::now();
         {
-            let mut values = samples.0.lock().unwrap();
+            let mut values = samples.window.lock().unwrap();
             for _ in 0..=CAPACITY {
                 values.record(now, now);
             }
@@ -200,7 +219,7 @@ mod tests {
         assert_eq!(snapshot.samples, CAPACITY as u64);
         assert_eq!(snapshot.window_seconds, 60);
         assert!(snapshot.truncated);
-        samples.0.lock().unwrap().expire(now + WINDOW);
+        samples.window.lock().unwrap().expire(now + WINDOW);
         let expired = samples.snapshot();
         assert_eq!(expired.samples, 0);
         assert!(!expired.truncated);

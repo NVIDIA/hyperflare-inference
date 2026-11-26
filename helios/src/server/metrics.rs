@@ -9,6 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+pub(super) mod process;
 pub(super) mod scheduler;
 
 pub(super) fn input_metrics(
@@ -208,6 +209,102 @@ const HOST_TIME_BUCKETS: [u64; 8] = [
 ];
 const HOST_TOKEN_BUCKETS: [u64; 8] = [64, 256, 1024, 4096, 16384, 65536, 262144, u64::MAX];
 
+/// Upper bucket bounds of a Prometheus histogram in its exposed unit, ending at
+/// `f64::INFINITY`. Observations are integers of `1 / scale` exposed units.
+pub(super) struct Buckets<const N: usize> {
+    bounds: [f64; N],
+    scale: f64,
+}
+
+pub(super) const REQUEST_SECONDS: Buckets<21> = Buckets {
+    bounds: [
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0,
+        160.0, 320.0, 640.0, 1280.0, 2560.0, f64::INFINITY,
+    ],
+    scale: 1e9,
+};
+
+pub(super) const TOKEN_SECONDS: Buckets<19> = Buckets {
+    bounds: [
+        0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2,
+        0.3, 0.5, 1.0, 2.5, f64::INFINITY,
+    ],
+    scale: 1e9,
+};
+
+pub(super) const PROMPT_TOKENS: Buckets<21> = Buckets {
+    bounds: [
+        1.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0,
+        32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0, 2097152.0, f64::INFINITY,
+    ],
+    scale: 1.0,
+};
+
+/// Fixed-bucket Prometheus histogram: per-bucket observations and the sum of the
+/// observed values, both on the exposed unit's integer grid.
+pub(super) struct Histogram<const N: usize> {
+    counts: [AtomicU64; N],
+    sum: AtomicU64,
+}
+
+impl<const N: usize> Default for Histogram<N> {
+    fn default() -> Self {
+        Self {
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            sum: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<const N: usize> Histogram<N> {
+    pub(super) fn observe(&self, buckets: &Buckets<N>, value: u64) {
+        // Division is correctly rounded, so an integer grid point lands exactly on
+        // a bound written as the same decimal.
+        let exposed = value as f64 / buckets.scale;
+        let index = buckets
+            .bounds
+            .iter()
+            .position(|bound| exposed <= *bound)
+            .unwrap_or(N - 1);
+        self.counts[index].fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(value, Ordering::Relaxed);
+    }
+
+    pub(super) fn render(&self, text: &mut String, name: &str, help: &str, buckets: &Buckets<N>) {
+        let _ = writeln!(
+            text,
+            "# HELP flare_{name} {help}\n# TYPE flare_{name} histogram"
+        );
+        let mut cumulative = 0;
+        for (index, bound) in buckets.bounds.iter().enumerate() {
+            cumulative += self.counts[index].load(Ordering::Relaxed);
+            let bound = if bound.is_infinite() {
+                "+Inf".to_string()
+            } else {
+                format!("{bound}")
+            };
+            let _ = writeln!(
+                text,
+                "flare_{name}_bucket{{le=\"{bound}\"}} {cumulative}"
+            );
+        }
+        let _ = writeln!(
+            text,
+            "flare_{name}_sum {}",
+            self.sum.load(Ordering::Relaxed) as f64 / buckets.scale
+        );
+        let _ = writeln!(text, "flare_{name}_count {cumulative}");
+    }
+}
+
+/// Request lifecycle instants on the `observation::monotonic_ns` clock, kept across preemption.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RequestTimes {
+    pub first_scheduled_ns: Option<u64>,
+    pub first_token_ns: Option<u64>,
+    pub last_token_ns: u64,
+}
+
 #[derive(Default)]
 pub(super) struct Metrics {
     pub scheduler_trace: scheduler::SchedulerMetrics,
@@ -227,6 +324,12 @@ pub(super) struct Metrics {
     pub admitted: AtomicU64,
     pub http_requests: [AtomicU64; 5],
     pub completed: AtomicU64,
+    pub(super) request_e2e: Histogram<21>,
+    request_queue: Histogram<21>,
+    request_prefill: Histogram<21>,
+    request_decode: Histogram<21>,
+    time_per_output_token: Histogram<19>,
+    request_prompt_tokens: Histogram<21>,
     pub reasoning_budget_cuts: AtomicU64,
     pub cancelled: AtomicU64,
     pub failed: AtomicU64,
@@ -341,6 +444,38 @@ impl Metrics {
             if value != 0 {
                 counter.fetch_add(value, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Records one successfully completed generation in the completion counter and
+    /// the per-request histograms, so the two cannot diverge.
+    pub(super) fn request_completed(
+        &self,
+        arrival_ns: u64,
+        times: RequestTimes,
+        prompt_tokens: usize,
+        generated_tokens: u32,
+    ) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.request_prompt_tokens
+            .observe(&PROMPT_TOKENS, prompt_tokens as u64);
+        if let Some(scheduled) = times.first_scheduled_ns {
+            self.request_queue
+                .observe(&REQUEST_SECONDS, scheduled.saturating_sub(arrival_ns));
+            if let Some(first) = times.first_token_ns {
+                self.request_prefill
+                    .observe(&REQUEST_SECONDS, first.saturating_sub(scheduled));
+            }
+        }
+        if let Some(first) = times.first_token_ns
+            && generated_tokens > 1
+        {
+            let decode = times.last_token_ns.saturating_sub(first);
+            self.request_decode.observe(&REQUEST_SECONDS, decode);
+            self.time_per_output_token.observe(
+                &TOKEN_SECONDS,
+                decode / u64::from(generated_tokens - 1),
+            );
         }
     }
 
@@ -1251,6 +1386,42 @@ impl Metrics {
                 count.load(Ordering::Relaxed)
             );
         }
+        for (histogram, name, help) in [
+            (
+                &self.request_e2e,
+                "request_e2e_seconds",
+                "Server-side HTTP admission to the completed response of a successful generation request.",
+            ),
+            (
+                &self.request_queue,
+                "request_queue_seconds",
+                "Model-scheduler arrival to the first model step that includes the request, for completed requests.",
+            ),
+            (
+                &self.request_prefill,
+                "request_prefill_seconds",
+                "First model step that includes the request to its first committed generated token, for completed requests.",
+            ),
+            (
+                &self.request_decode,
+                "request_decode_seconds",
+                "First to last committed generated token, for completed requests with at least two generated tokens.",
+            ),
+        ] {
+            histogram.render(&mut text, name, help, &REQUEST_SECONDS);
+        }
+        self.time_per_output_token.render(
+            &mut text,
+            "time_per_output_token_seconds",
+            "Decode time divided by generated tokens after the first, for completed requests with at least two generated tokens.",
+            &TOKEN_SECONDS,
+        );
+        self.request_prompt_tokens.render(
+            &mut text,
+            "request_prompt_tokens",
+            "Prompt tokens per completed request, including tokens reused from the prefix cache.",
+            &PROMPT_TOKENS,
+        );
         for (name, help, value) in [
             (
                 "constrained_max_inflight",
@@ -1476,6 +1647,63 @@ fn render_persistent_worker_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_histograms_bucket_completed_request_timings() {
+        let metrics = Metrics::new(0, 0, 0, 16);
+        metrics.request_completed(
+            1_000_000_000,
+            RequestTimes {
+                first_scheduled_ns: Some(1_250_000_000),
+                first_token_ns: Some(1_750_000_000),
+                last_token_ns: 2_750_000_000,
+            },
+            3000,
+            101,
+        );
+        let text = metrics.render();
+        for expected in [
+            "flare_request_queue_seconds_bucket{le=\"0.25\"} 1",
+            "flare_request_queue_seconds_bucket{le=\"0.1\"} 0",
+            "flare_request_prefill_seconds_bucket{le=\"0.5\"} 1",
+            "flare_request_decode_seconds_sum 1",
+            "flare_time_per_output_token_seconds_bucket{le=\"0.01\"} 1",
+            "flare_time_per_output_token_seconds_bucket{le=\"0.0075\"} 0",
+            "flare_request_prompt_tokens_bucket{le=\"4096\"} 1",
+            "flare_request_prompt_tokens_bucket{le=\"2048\"} 0",
+            "flare_requests_completed_total 1",
+        ] {
+            assert!(
+                text.contains(&format!("\n{expected}\n")),
+                "missing {expected}"
+            );
+        }
+        // A single generated token has no decode interval, and a request that never
+        // reached a model step has no queue or prefill observation.
+        metrics.request_completed(
+            1_000_000_000,
+            RequestTimes {
+                first_scheduled_ns: None,
+                first_token_ns: Some(2_000_000_000),
+                last_token_ns: 2_500_000_000,
+            },
+            3000,
+            1,
+        );
+        let text = metrics.render();
+        for expected in [
+            "flare_request_queue_seconds_count 1",
+            "flare_request_prefill_seconds_count 1",
+            "flare_request_decode_seconds_count 1",
+            "flare_request_prompt_tokens_count 2",
+            "flare_requests_completed_total 2",
+        ] {
+            assert!(
+                text.contains(&format!("\n{expected}\n")),
+                "missing {expected}"
+            );
+        }
+    }
 
     #[test]
     fn checkpoint_metrics_report_capture_roles_rejection_reasons_work_and_reservations() {

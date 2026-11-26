@@ -668,6 +668,7 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
         use std::fmt::Write;
         let _ = writeln!(text, "# HELP flare_first_response_median_seconds Server-side HTTP admission to first offered answer or reasoning text.\n# TYPE flare_first_response_median_seconds gauge\nflare_first_response_median_seconds {median}");
     }
+    state.first_response.render_histogram(&mut text);
     for (name, kind, help, value) in input_metrics {
         metrics::metric(&mut text, name, kind, help, value);
     }
@@ -705,6 +706,7 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
     ] {
         metrics::metric(&mut text, name, "gauge", help, value as u64);
     }
+    metrics::process::render(&mut text);
     (
         [
             (header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),

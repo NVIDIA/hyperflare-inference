@@ -248,6 +248,7 @@ impl Fixture {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation: Some(false),
+                times: Default::default(),
                 host_lookup: true,
                 readmitted: false,
                 prompt_score_end: 0,
@@ -572,6 +573,14 @@ fn reasoning_budget_cuts_or_plainly_continues_with_exact_history_and_usage() {
             assert_eq!(tokens.iter().filter(|&&token| token == 4).count(), 1);
             assert_eq!(finished, vec![(1, 3 + after, "length")]);
             assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 1);
+            let text = worker.metrics.render();
+            for expected in [
+                "\nflare_request_queue_seconds_count 1\n",
+                "\nflare_request_prefill_seconds_count 1\n",
+                "\nflare_request_prompt_tokens_sum 1\n",
+            ] {
+                assert!(text.contains(expected), "missing {expected}");
+            }
             assert_eq!(worker.metrics.admitted.load(Ordering::Relaxed), 1);
             assert_eq!(
                 worker.metrics.snapshot(false).generated_tokens,
@@ -4416,6 +4425,11 @@ async fn first_response_http_stream_excludes_pretext_failures_and_unpolled_bodie
         let snapshot = state.first_response.snapshot();
         assert_eq!(snapshot.samples, u64::from(emit_text && poll_body));
         assert_eq!(snapshot.median_seconds.is_some(), emit_text && poll_body);
+        assert!(state
+            .model
+            .metrics()
+            .render()
+            .contains("\nflare_request_e2e_seconds_count 0\n"));
     }
 }
 
@@ -4444,6 +4458,17 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
             drop(response);
         }
         assert_eq!(state.first_response.snapshot().samples, u64::from(poll_body));
+        assert!(state
+            .model
+            .metrics()
+            .render()
+            .contains("\nflare_request_e2e_seconds_count 1\n"));
+        let mut histogram = String::new();
+        state.first_response.render_histogram(&mut histogram);
+        assert!(histogram.contains(&format!(
+            "\nflare_time_to_first_response_seconds_count {}\n",
+            u64::from(poll_body)
+        )));
     }
 }
 
@@ -5352,6 +5377,16 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     assert!(value["first_response"]["median_seconds"].is_number());
     let (_, _, body) = get("/metrics", None).await.unwrap();
     assert!(body.contains("\nflare_first_response_median_seconds "));
+    assert!(
+        body.contains("\nflare_time_to_first_response_seconds_count 1\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("\nflare_request_e2e_seconds_bucket{le=\"+Inf\"} 0\n"),
+        "{body}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(body.contains("\nprocess_resident_memory_bytes "), "{body}");
     assert_eq!(get("/metrics?format=yaml", None).await.unwrap().0, 400);
     assert_eq!(get("/health", None).await.unwrap().0, 200);
     assert_eq!(get("/v1/models", None).await.unwrap().0, 401);

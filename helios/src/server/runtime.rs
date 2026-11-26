@@ -190,6 +190,8 @@ struct Incoming {
     failure: Arc<Mutex<Option<Error>>>,
     metrics: Arc<super::metrics::Metrics>,
     observation: Option<bool>,
+    /// Lifecycle instants for completion histograms; preserved when a preempted request is parked.
+    times: super::metrics::RequestTimes,
     /// Consult the host prefix store at admission; cleared after a failed restore.
     host_lookup: bool,
     /// Admitted once already, so the admission counter is not advanced again.
@@ -908,6 +910,7 @@ impl ModelRuntime {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation,
+                times: Default::default(),
                 host_lookup: true,
                 readmitted: false,
                 blocked: None,
@@ -1768,6 +1771,8 @@ impl<'a> Worker<'a> {
                 .as_mut()
                 .filter(|a| a.request == token.request)
             {
+                request.incoming.times.first_token_ns.get_or_insert(completed_at_ns);
+                request.incoming.times.last_token_ns = completed_at_ns;
                 request.incoming.observe_token(token.token);
                 request.last_token = Some(token.token);
                 if let Some(reasoning) = &mut request.reasoning {
@@ -1829,17 +1834,21 @@ impl<'a> Worker<'a> {
                         .published_output(token.request, completion.fence)?;
                 }
                 if stop {
-                    self.metrics.completed.fetch_add(1, Ordering::Relaxed);
                     let live = self.scheduler.request(token.request)?;
+                    let prompt_tokens =
+                        request.carried.prompt_tokens.unwrap_or(live.prompt_tokens);
+                    let generated_tokens = request.carried.generated_tokens + live.generated_tokens;
+                    self.metrics.request_completed(
+                        request.incoming.arrival_ns,
+                        request.incoming.times,
+                        prompt_tokens,
+                        generated_tokens,
+                    );
                     request
                         .incoming
                         .emit(GenerationEvent::Finished {
-                            prompt_tokens: request
-                                .carried
-                                .prompt_tokens
-                                .unwrap_or(live.prompt_tokens),
-                            generated_tokens: request.carried.generated_tokens
-                                + live.generated_tokens,
+                            prompt_tokens,
+                            generated_tokens,
                             reused_prompt_tokens: request
                                 .carried
                                 .reused_prompt_tokens
@@ -1981,7 +1990,12 @@ impl<'a> Worker<'a> {
                         } else {
                             false
                         } || budget_stop;
-                        self.metrics.completed.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.request_completed(
+                            request.incoming.arrival_ns,
+                            request.incoming.times,
+                            request.carried.prompt_tokens.unwrap_or(prompt_tokens),
+                            request.carried.generated_tokens + generated,
+                        );
                         for token in request.stops.finish() {
                             request
                                 .incoming
@@ -2172,6 +2186,21 @@ impl<'a> Worker<'a> {
 
     fn reserve_and_pack(&mut self, step: &ScheduledPlan, fence: crate::cache::Fence) -> Result<()> {
         self.scheduler.commit(step, fence)?;
+        // Stamp here rather than at submission so a request that reaches a model step
+        // has one, including requests driven through reserve_and_pack directly.
+        let scheduled_ns = super::observation::monotonic_ns();
+        for lane in &step.lanes {
+            if let Some(active) = self.active[lane.request.slot as usize]
+                .as_mut()
+                .filter(|a| a.request == lane.request)
+            {
+                active
+                    .incoming
+                    .times
+                    .first_scheduled_ns
+                    .get_or_insert(scheduled_ns);
+            }
+        }
         let inputs = self
             .inputs
             .as_mut()
@@ -3222,6 +3251,7 @@ mod tests {
             failure: failure.clone(),
             metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
             observation: None,
+            times: Default::default(),
             host_lookup: true,
             readmitted: false,
             prompt_score_end: 0,
