@@ -747,6 +747,7 @@ impl ModelRuntime {
                     worker_metrics.scheduler(worker.scheduler.stats());
                 }
                 worker_metrics.pending.store(0, Ordering::Relaxed);
+                worker_metrics.parked.store(0, Ordering::Relaxed);
                 if shutdown.error.is_none() {
                     shutdown.error = error;
                 }
@@ -864,6 +865,8 @@ impl ModelRuntime {
                 .clone()
                 .try_acquire_many_owned(count)
                 .map_err(|_| {
+                    self.metrics
+                        .admission_rejected(super::metrics::AdmissionLimit::GenerationCapacity);
                     Error::admission(
                         AdmissionError::Capacity,
                         "native generation capacity is full",
@@ -938,6 +941,8 @@ impl ModelRuntime {
             .try_send(incoming_group)
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => {
+                    self.metrics
+                        .admission_rejected(super::metrics::AdmissionLimit::RequestQueue);
                     Error::admission(AdmissionError::Capacity, "native request queue is full")
                 }
                 mpsc::TrySendError::Disconnected(_) => Error::admission(
@@ -1149,10 +1154,7 @@ impl<'a> Worker<'a> {
                 progress |= self.submit(executor, &step)?;
             }
             if progress {
-                self.metrics.scheduler(self.scheduler.stats());
-                self.metrics
-                    .pending
-                    .store(self.pending.len() as u64, Ordering::Relaxed);
+                self.publish_gauges();
             }
             self.metrics.scheduler_trace.details(|| {
                 use super::metrics::scheduler::{RequestDetail, SchedulerDetail};
@@ -1195,6 +1197,17 @@ impl<'a> Worker<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Publishes the scheduler statistics and the depth of each waiting queue.
+    fn publish_gauges(&self) {
+        self.metrics.scheduler(self.scheduler.stats());
+        self.metrics
+            .pending
+            .store(self.pending.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .parked
+            .store(self.parked.len() as u64, Ordering::Relaxed);
     }
 
     fn idle_wait(&self) -> std::time::Duration {
@@ -1705,6 +1718,18 @@ impl<'a> Worker<'a> {
         self.metrics
             .progress(prefill, generated.len(), accepted, draft_rounds,
                 verification_drafts, verification_rounds);
+        if matches!(
+            kind,
+            GraphKind::Prefill
+                | GraphKind::TerminalPrefill
+                | GraphKind::ScoredPrefill
+                | GraphKind::Resume
+                | GraphKind::Decode
+                | GraphKind::Speculative
+                | GraphKind::Mixed
+        ) {
+            self.metrics.model_step(prefill + generated.len() as u64);
+        }
         self.metrics.replay_completed(completed_at_ns, completion.timing, prefill);
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
@@ -1854,6 +1879,7 @@ impl<'a> Worker<'a> {
                             prompt_tokens,
                             reused_prompt_tokens,
                             generated_tokens,
+                            output_limit: false,
                         },
                     );
                     request
@@ -2004,6 +2030,11 @@ impl<'a> Worker<'a> {
                         let generated_tokens = request.carried.generated_tokens + generated;
                         let reused_prompt_tokens =
                             request.carried.reused_prompt_tokens.unwrap_or(reused);
+                        let eos = !request.incoming.prompt.ignore_eos
+                            && request
+                                .last_token
+                                .is_some_and(|token| self.config.eos_token_ids.contains(&token));
+                        let reason = if user_stop || eos { "stop" } else { "length" };
                         self.metrics.request_completed(
                             request.incoming.arrival_ns,
                             &request.incoming.record,
@@ -2011,6 +2042,7 @@ impl<'a> Worker<'a> {
                                 prompt_tokens,
                                 reused_prompt_tokens,
                                 generated_tokens,
+                                output_limit: reason == "length",
                             },
                         );
                         for token in request.stops.finish() {
@@ -2021,11 +2053,6 @@ impl<'a> Worker<'a> {
                                     None => GenerationEvent::Token(token),
                                 });
                         }
-                        let eos = !request.incoming.prompt.ignore_eos
-                            && request
-                                .last_token
-                                .is_some_and(|token| self.config.eos_token_ids.contains(&token));
-                        let reason = if user_stop || eos { "stop" } else { "length" };
                         request
                             .incoming
                             .emit(GenerationEvent::Finished {

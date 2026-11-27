@@ -813,6 +813,7 @@ async fn admit_http(
         Err(IngressRejection::Paused) => return http::error(protocol, StatusCode::SERVICE_UNAVAILABLE, "HTTP admission is paused"),
         Ok(permit) => Arc::new(permit),
         Err(IngressRejection::Full) => {
+            state.model.metrics().admission_rejected(metrics::AdmissionLimit::HttpSlots);
             let mut message = format!(
                 "native HTTP admission is full: {} requests are active or queued",
                 state.ingress_capacity

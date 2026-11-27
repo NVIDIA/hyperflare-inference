@@ -882,6 +882,8 @@ fn terminal_checkpoint_full_prompt_hit_restores_and_resumes_without_prefill() {
         (stats.cache_lookups, stats.cache_hits, stats.reused_tokens),
         (3, 2, 128)
     );
+    // Three admitted 64-token prompts were looked up, whether or not they hit.
+    assert_eq!(stats.cache_lookup_tokens, 192);
     assert_eq!(
         (
             stats.active_requests,
@@ -3425,11 +3427,16 @@ fn invalid_inbound_requests_reserve_nothing_and_planned_admission_matches_admit(
     assert_eq!(plan.resident_tokens(), 0);
     // Lookups count once per admitted request; the failed attempts above count none.
     assert_eq!(scheduler.stats().cache_lookups, 0);
+    assert_eq!(scheduler.stats().cache_lookup_tokens, 0);
     let admitted = scheduler
         .admit_planned(request.clone(), plan, None)
         .unwrap();
     assert!(admitted.ticket.is_none());
     assert_eq!(scheduler.stats().cache_lookups, 1);
+    assert_eq!(
+        scheduler.stats().cache_lookup_tokens,
+        request.prompt.len() as u64
+    );
     let live = scheduler.request(admitted.handle).unwrap();
     assert_eq!(live.phase, RequestPhase::Initialize);
     assert_eq!(live.consumed_tokens, 0);

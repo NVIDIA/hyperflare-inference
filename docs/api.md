@@ -342,6 +342,28 @@ readmitted; its buckets are vLLM's preemption bounds with an added zero bound.
 Cancelled and failed requests enter only `flare_requests_cancelled_total` and
 `flare_requests_failed_total`.
 
+`flare_requests_output_limited_total` counts completed requests that stopped at
+their output token limit; the rest of `flare_requests_completed_total` stopped at
+EOS, a stop sequence, or a stop string. `flare_cache_lookup_tokens_total` counts
+the prompt tokens of admitted requests offered to GPU prefix lookups, including
+readmissions, and `flare_cache_reused_tokens_total` counts the tokens found, so
+their ratio is the token hit rate; prompt-scoring requests skip the lookup and
+enter neither. `flare_pending_requests` counts requests waiting in the model
+scheduler for their first admission, and `flare_parked_requests` counts requests
+waiting there for readmission after a preemption, a reasoning budget cut, or a
+host-store restore that failed or was retried; neither includes admitted
+requests waiting for a host restore, which `flare_host_cache_inbound_waiting`
+counts among `flare_active_requests`. `flare_admission_rejections_total{reason}`
+counts generation requests refused because a queue limit was full: `http_slots`
+when the HTTP admission slots, one per generated choice, are all reserved (HTTP
+429), and `generation_capacity` or `request_queue` when the runtime's generation
+capacity or the channel into the model worker is full. Paused admission and an
+unavailable runtime return HTTP 503 and are not counted.
+`flare_model_step_tokens` observes, for every completed prefill, resume, decode,
+speculative, or mixed graph, the prompt tokens it computed plus the generated
+tokens it committed; rejected draft positions and padding are excluded, and
+initialization, restore, vision, and snapshot graphs are not observed.
+
 The route returns one JSON object instead when the query contains `format=json`,
 or when the `Accept` header gives `application/json` a higher quality than
 `text/plain`; at equal quality the earlier media range wins. `format=prometheus`
@@ -372,7 +394,7 @@ without the `flare_` prefix, such as `input_decoded_images_total`.
 | `accepted_drafts` | Accepted draft tokens, excluding the bonus token | `flare_accepted_draft_tokens_total` |
 | `draft_rounds` | Request rounds that offered at least one draft | `flare_draft_request_rounds_total` |
 | `active` | Model slots with a live request | `flare_active_requests` |
-| `pending` | Requests waiting in the model scheduler | `flare_pending_requests` |
+| `pending` | Requests waiting in the model scheduler for their first admission | `flare_pending_requests` |
 | `completed` | Requests whose generation completed successfully | `flare_requests_completed_total` |
 | `reasoning_budget_cuts` | Requests whose reasoning was closed by their hard token budget | `flare_reasoning_budget_cuts_total` |
 | `failed` | Requests failed by admission, execution, grammar, or output processing | `flare_requests_failed_total` |

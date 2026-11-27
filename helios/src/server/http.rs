@@ -234,6 +234,10 @@ pub(super) async fn generate(
                     .clone()
                     .try_acquire_many_owned((size - 1) as u32)
                     .map_err(|_| {
+                        prepare_state
+                            .model
+                            .metrics()
+                            .admission_rejected(super::metrics::AdmissionLimit::HttpSlots);
                         (
                             StatusCode::TOO_MANY_REQUESTS,
                             "native generation admission is full".into(),

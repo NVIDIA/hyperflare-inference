@@ -86,7 +86,7 @@ pub struct Snapshot {
     pub draft_rounds: u64,
     /// Physical model slots with a live request.
     pub active: u64,
-    /// Requests waiting inside the model scheduler, excluding its ingress channel.
+    /// Requests waiting inside the model scheduler for their first admission, excluding its ingress channel.
     pub pending: u64,
     /// Requests whose generation completed successfully.
     pub completed: u64,
@@ -362,12 +362,26 @@ impl RequestRecord {
     }
 }
 
-/// Token counts of one successfully completed request.
+/// Token counts and termination of one successfully completed request.
 pub(super) struct CompletedRequest {
     pub prompt_tokens: usize,
     /// Prompt tokens supplied by GPU or host prefix reuse at first admission.
     pub reused_prompt_tokens: u64,
     pub generated_tokens: u32,
+    /// The request ended at its output token limit, not at EOS or a stop.
+    pub output_limit: bool,
+}
+
+/// Queue limits that reject a generation request before the model scheduler
+/// holds it; each is one `reason` of `flare_admission_rejections_total`.
+#[derive(Clone, Copy)]
+pub(super) enum AdmissionLimit {
+    /// HTTP admission slots, one per generated choice, are all reserved.
+    HttpSlots,
+    /// Runtime generation capacity is fully reserved.
+    GenerationCapacity,
+    /// The channel into the model worker is full.
+    RequestQueue,
 }
 
 #[derive(Default)]
@@ -404,6 +418,9 @@ pub(super) struct Metrics {
     request_generated_tokens: Histogram<21>,
     request_max_tokens: Histogram<21>,
     request_preemptions: Histogram<9>,
+    model_step_tokens: Histogram<21>,
+    output_limited: AtomicU64,
+    admission_rejections: [AtomicU64; 3],
     pub reasoning_budget_cuts: AtomicU64,
     pub cancelled: AtomicU64,
     pub failed: AtomicU64,
@@ -418,6 +435,7 @@ pub(super) struct Metrics {
     constrained_max_inflight: AtomicU64,
     cache_lookups: AtomicU64,
     cache_hits: AtomicU64,
+    cache_lookup_tokens: AtomicU64,
     cache_misses: AtomicU64,
     reused_tokens: AtomicU64,
     snapshot_publications: AtomicU64,
@@ -440,6 +458,7 @@ pub(super) struct Metrics {
     cached_checkpoints: AtomicU64,
     cached_pages: AtomicU64,
     pub pending: AtomicU64,
+    pub parked: AtomicU64,
     host_lookups: AtomicU64,
     host_hits: AtomicU64,
     host_reused_tokens: AtomicU64,
@@ -533,9 +552,13 @@ impl Metrics {
             prompt_tokens,
             reused_prompt_tokens,
             generated_tokens,
+            output_limit,
         } = completed;
         let times = record.times;
         self.completed.fetch_add(1, Ordering::Relaxed);
+        if output_limit {
+            self.output_limited.fetch_add(1, Ordering::Relaxed);
+        }
         self.request_prompt_tokens
             .observe(&TOKEN_COUNTS, prompt_tokens as u64);
         self.request_prefill_computed_tokens.observe(
@@ -652,6 +675,16 @@ impl Metrics {
         }
     }
 
+    /// Records one completed text-model step that computed `tokens` prompt tokens
+    /// and committed generated tokens in total.
+    pub(super) fn model_step(&self, tokens: u64) {
+        self.model_step_tokens.observe(&TOKEN_COUNTS, tokens);
+    }
+
+    pub(super) fn admission_rejected(&self, limit: AdmissionLimit) {
+        self.admission_rejections[limit as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn launched(&self, kind: GraphKind) {
         let index = match kind {
             GraphKind::Init => 0,
@@ -735,6 +768,7 @@ impl Metrics {
         for (target, value) in [
             (&self.cache_lookups, stats.cache_lookups),
             (&self.cache_hits, stats.cache_hits),
+            (&self.cache_lookup_tokens, stats.cache_lookup_tokens),
             (&self.cache_misses, stats.cache_lookups - stats.cache_hits),
             (&self.reused_tokens, stats.reused_tokens),
             (&self.snapshot_publications, stats.snapshot_publications),
@@ -1350,6 +1384,11 @@ impl Metrics {
                 &self.failed,
             ),
             (
+                "requests_output_limited_total",
+                "Completed requests that stopped at their output token limit; the rest of flare_requests_completed_total stopped at EOS or a stop.",
+                &self.output_limited,
+            ),
+            (
                 "mixed_grammar_decode_steps_total",
                 "Successful decode submissions containing both grammar-constrained and unconstrained request lanes.",
                 &self.mixed_grammar_decode_steps,
@@ -1363,6 +1402,11 @@ impl Metrics {
                 "cache_hits_total",
                 "Prefix lookups returning a GPU-ready checkpoint.",
                 &self.cache_hits,
+            ),
+            (
+                "cache_lookup_tokens_total",
+                "Prompt tokens of admitted requests offered to GPU prefix lookups; flare_cache_reused_tokens_total counts the tokens found.",
+                &self.cache_lookup_tokens,
             ),
             (
                 "cache_reused_tokens_total",
@@ -1590,6 +1634,26 @@ impl Metrics {
             "Times each completed request was preempted and readmitted.",
             &PREEMPTION_COUNTS,
         );
+        self.model_step_tokens.render(
+            &mut text,
+            "model_step_tokens",
+            "Prompt tokens computed plus generated tokens committed by each completed text-model step.",
+            &TOKEN_COUNTS,
+        );
+        let _ = writeln!(
+            text,
+            "# HELP flare_admission_rejections_total Generation requests rejected because a queue limit was full.\n# TYPE flare_admission_rejections_total counter"
+        );
+        for (reason, count) in ["http_slots", "generation_capacity", "request_queue"]
+            .into_iter()
+            .zip(&self.admission_rejections)
+        {
+            let _ = writeln!(
+                text,
+                "flare_admission_rejections_total{{reason=\"{reason}\"}} {}",
+                count.load(Ordering::Relaxed)
+            );
+        }
         for (name, help, value) in [
             (
                 "constrained_max_inflight",
@@ -1643,8 +1707,13 @@ impl Metrics {
             ),
             (
                 "pending_requests",
-                "Requests waiting inside the model scheduler, excluding its ingress channel.",
+                "Requests waiting inside the model scheduler for first admission, excluding its ingress channel.",
                 &self.pending,
+            ),
+            (
+                "parked_requests",
+                "Requests waiting inside the model scheduler for readmission after a preemption, a reasoning budget cut, or a host-store restore that failed or was retried.",
+                &self.parked,
             ),
             (
                 "host_cache_outbound_in_flight",
@@ -1837,6 +1906,7 @@ mod tests {
                 prompt_tokens: 3000,
                 reused_prompt_tokens: 1000,
                 generated_tokens: 101,
+                output_limit: true,
             },
         );
         let text = metrics.render();
@@ -1882,6 +1952,7 @@ mod tests {
                 prompt_tokens: 3000,
                 reused_prompt_tokens: 0,
                 generated_tokens: 0,
+                output_limit: false,
             },
         );
         let text = metrics.render();
@@ -1898,6 +1969,7 @@ mod tests {
             "flare_request_generated_tokens_bucket{le=\"1\"} 1",
             "flare_request_preemptions_bucket{le=\"0\"} 1",
             "flare_requests_completed_total 2",
+            "flare_requests_output_limited_total 1",
         ] {
             assert!(
                 text.contains(&format!("\n{expected}\n")),
@@ -2224,6 +2296,7 @@ mod tests {
             reused_tokens: 192,
             free_pages: 10,
             cached_pages: 3,
+            cache_lookup_tokens: 320,
             host_lookups: 4,
             host_hits: 1,
             host_reused_tokens: 640,
@@ -2231,6 +2304,16 @@ mod tests {
             ..SchedulerStats::default()
         });
         metrics.launched(GraphKind::Restore);
+        metrics.parked.store(2, Ordering::Relaxed);
+        metrics.model_step(3);
+        metrics.model_step(20);
+        for limit in [
+            AdmissionLimit::HttpSlots,
+            AdmissionLimit::HttpSlots,
+            AdmissionLimit::RequestQueue,
+        ] {
+            metrics.admission_rejected(limit);
+        }
         metrics.launched(GraphKind::Decode);
         metrics.launched(GraphKind::Decode);
         metrics.store(StoreStats {
@@ -2267,6 +2350,7 @@ mod tests {
             ("free_kv_tokens", 1280),
             ("cached_kv_pages", 3),
             ("cached_kv_tokens", 384),
+            ("parked_requests", 2),
             ("host_cache_slots_in_use", 3),
             ("host_cache_slots_total", 8),
             ("host_cache_intake_slots", 2),
@@ -2349,6 +2433,17 @@ mod tests {
         }
         assert!(text.contains("flare_host_cache_outbound_bytes_per_second 2500000000\n"));
         assert!(text.contains("flare_cache_misses_total 3\n"));
+        assert!(text.contains("\nflare_cache_lookup_tokens_total 320\n"));
+        for line in [
+            "flare_model_step_tokens_bucket{le=\"8\"} 1",
+            "flare_model_step_tokens_bucket{le=\"32\"} 2",
+            "flare_model_step_tokens_sum 23",
+            "flare_admission_rejections_total{reason=\"http_slots\"} 2",
+            "flare_admission_rejections_total{reason=\"generation_capacity\"} 0",
+            "flare_admission_rejections_total{reason=\"request_queue\"} 1",
+        ] {
+            assert!(text.lines().any(|value| value == line), "{line}");
+        }
         assert!(text.contains("flare_cache_reused_tokens_total 192\n"));
         assert!(text.contains("flare_graph_launches_total{kind=\"restore\"} 1\n"));
         assert!(!text.contains("mode=\"greedy\""));

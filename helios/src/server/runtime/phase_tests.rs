@@ -940,6 +940,10 @@ fn reasoning_budget_does_not_readmit_eos_or_user_stops() {
         );
         assert!(worker.parked.is_empty());
         assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+        // EOS, a text stop, and a token stop each complete without an output limit.
+        let text = worker.metrics.render();
+        assert!(text.contains("\nflare_requests_completed_total 1\n"));
+        assert!(text.contains("\nflare_requests_output_limited_total 0\n"));
     }
 }
 
@@ -1492,6 +1496,16 @@ fn ignored_eos_at_the_output_limit_finishes_for_length() {
         finished,
         vec![(2, "length", crate::output::Termination::OutputLimit)]
     );
+    // The prefill step computes one prompt token and commits one generated token,
+    // the decode step commits one; initialization and snapshots are no text steps.
+    let text = fixture.metrics.render();
+    for expected in [
+        "\nflare_requests_output_limited_total 1\n",
+        "\nflare_model_step_tokens_count 2\n",
+        "\nflare_model_step_tokens_sum 3\n",
+    ] {
+        assert!(text.contains(expected), "missing {expected}");
+    }
 }
 
 #[test]
@@ -3797,6 +3811,40 @@ fn unread_response_keeps_its_budget_through_a_reasoning_continuation() {
 }
 
 #[test]
+fn full_runtime_queue_limits_count_admission_rejections() {
+    let fixture = Fixture::new();
+    let (runtime, _receiver) = group_runtime(&fixture, 3);
+    let prompt = || {
+        Fixture::prompt_for(
+            vec![1, 2],
+            4,
+            PromptData {
+                positions: vec![[0; 3], [1; 3]],
+                vision_token_indices: vec![-1; 2],
+                ..Default::default()
+            },
+        )
+    };
+    // The worker channel holds two groups; the third is refused at the channel and
+    // releases its capacity, after which two choices exceed the one free permit.
+    let held = (0..2)
+        .map(|_| runtime.generate(prompt()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(runtime.generate(prompt()).is_err());
+    assert_eq!(runtime.capacity.available_permits(), 1);
+    assert!(runtime.generate_many(vec![prompt(), prompt()]).is_err());
+    let text = fixture.metrics.render();
+    for line in [
+        "flare_admission_rejections_total{reason=\"http_slots\"} 0",
+        "flare_admission_rejections_total{reason=\"generation_capacity\"} 1",
+        "flare_admission_rejections_total{reason=\"request_queue\"} 1",
+    ] {
+        assert!(text.lines().any(|value| value == line), "{line}");
+    }
+    drop(held);
+}
+
+#[test]
 fn grouped_submission_validates_all_children_before_enqueue_and_releases_capacity() {
     let fixture = Fixture::new();
     let (runtime, receiver) = group_runtime(&fixture, 4);
@@ -3906,6 +3954,11 @@ fn exercise_text_preemption(
     let (incoming, parked) = worker.parked.front_mut().unwrap();
     assert!(parked.carried.generated_tokens > 0);
     assert_eq!(incoming.record.preemptions, 1);
+    worker.publish_gauges();
+    let text = worker.metrics.render();
+    assert!(text.contains("\nflare_parked_requests 1\n"));
+    assert!(text.contains("\nflare_pending_requests 0\n"));
+    let (incoming, parked) = worker.parked.front_mut().unwrap();
     assert_eq!(
         incoming
             .prompt
@@ -5365,6 +5418,47 @@ async fn ollama_discovery_uses_bearer_auth_without_generation_admission() {
     server.abort();
     drop(permits);
     result.unwrap();
+}
+
+#[tokio::test]
+async fn full_http_admission_counts_a_queue_limit_rejection() {
+    use std::io::{Read, Write};
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let held = state
+        .ingress_slots
+        .clone()
+        .acquire_many_owned(state.ingress_capacity as u32)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state.clone(), &[], 65536);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let status = tokio::task::spawn_blocking(move || {
+        let body = r#"{"prompt":"a","max_tokens":1}"#;
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        write!(
+            stream,
+            "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.split(' ').nth(1).unwrap().parse::<u16>().unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 429);
+    assert!(state
+        .model
+        .metrics()
+        .render()
+        .lines()
+        .any(|line| line == "flare_admission_rejections_total{reason=\"http_slots\"} 1"));
+    server.abort();
+    drop(held);
 }
 
 #[tokio::test]
