@@ -21,9 +21,14 @@ fn parse_stat(line: &str) -> Option<[u64; 5]> {
     // the fields begin after the last `)`.
     let tail = line.get(line.rfind(')')? + 1..)?;
     let mut fields = tail.split_whitespace();
+    // The state character follows the command name; rejecting a line without one
+    // keeps this parser from reading unrelated text that happens to contain `)`.
+    if !fields.next()?.chars().next().is_some_and(|state| "RSDZTtWXxKPI".contains(state)) {
+        return None;
+    }
     // Field 3 (state) is the first token of the tail; stat field N is token N - 3.
     let mut value = |skip: usize| -> Option<u64> { fields.nth(skip)?.parse().ok() };
-    let utime = value(11)?;
+    let utime = value(10)?;
     let stime = value(0)?;
     let starttime = value(6)?;
     let vsize = value(0)?;

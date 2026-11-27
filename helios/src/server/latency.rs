@@ -98,6 +98,14 @@ impl FirstResponseSamples {
             truncated,
         }
     }
+    pub(super) fn render_histogram(&self, text: &mut String) {
+        self.histogram.render(
+            text,
+            "time_to_first_response_seconds",
+            "Server-side HTTP admission to the first offered answer or reasoning text.",
+            &super::metrics::REQUEST_SECONDS,
+        );
+    }
 }
 pub(super) struct FirstResponse {
     samples: Arc<FirstResponseSamples>,
@@ -116,17 +124,6 @@ impl FirstResponse {
             );
             self.recorded = true;
         }
-    }
-}
-
-impl FirstResponseSamples {
-    pub(super) fn render_histogram(&self, text: &mut String) {
-        self.histogram.render(
-            text,
-            "time_to_first_response_seconds",
-            "Server-side HTTP admission to the first offered answer or reasoning text.",
-            &super::metrics::REQUEST_SECONDS,
-        );
     }
 }
 

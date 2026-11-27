@@ -1990,11 +1990,14 @@ impl<'a> Worker<'a> {
                         } else {
                             false
                         } || budget_stop;
+                        let prompt_tokens =
+                            request.carried.prompt_tokens.unwrap_or(prompt_tokens);
+                        let generated_tokens = request.carried.generated_tokens + generated;
                         self.metrics.request_completed(
                             request.incoming.arrival_ns,
                             request.incoming.times,
-                            request.carried.prompt_tokens.unwrap_or(prompt_tokens),
-                            request.carried.generated_tokens + generated,
+                            prompt_tokens,
+                            generated_tokens,
                         );
                         for token in request.stops.finish() {
                             request
@@ -2012,11 +2015,8 @@ impl<'a> Worker<'a> {
                         request
                             .incoming
                             .emit(GenerationEvent::Finished {
-                                prompt_tokens: request
-                                    .carried
-                                    .prompt_tokens
-                                    .unwrap_or(prompt_tokens),
-                                generated_tokens: request.carried.generated_tokens + generated,
+                                prompt_tokens,
+                                generated_tokens,
                                 reused_prompt_tokens: request
                                     .carried
                                     .reused_prompt_tokens

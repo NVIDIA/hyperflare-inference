@@ -1678,18 +1678,9 @@ mod tests {
                 "missing {expected}"
             );
         }
-        // A single generated token has no decode interval, and a request that never
-        // reached a model step has no queue or prefill observation.
-        metrics.request_completed(
-            1_000_000_000,
-            RequestTimes {
-                first_scheduled_ns: None,
-                first_token_ns: Some(2_000_000_000),
-                last_token_ns: 2_500_000_000,
-            },
-            3000,
-            1,
-        );
+        // A zero-token completion reaches no model step and commits no token, so it
+        // adds only a prompt-size observation.
+        metrics.request_completed(1_000_000_000, RequestTimes::default(), 3000, 0);
         let text = metrics.render();
         for expected in [
             "flare_request_queue_seconds_count 1",
