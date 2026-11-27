@@ -405,6 +405,8 @@ pub(super) async fn generate(
         let mut timestamps = Vec::new();
         let mut reused_total = 0;
         let mut generated = vec![0u32; size];
+        // `performance` is Chat-only, and Chat has one choice.
+        let mut first_scheduled_ns = None;
         if streaming && protocol == Protocol::Chat {
             // Chat has one choice and rejects streamed prompt logprobs, so no
             // output queue needs draining before the first raw token is ready.
@@ -524,10 +526,12 @@ pub(super) async fn generate(
                     reused_prompt_tokens,
                     termination,
                     stop_sequence,
+                    times,
                     ..
                 } => {
                     reused_total += reused_prompt_tokens;
                     generated[index] = generated_tokens;
+                    first_scheduled_ns = times.first_scheduled_ns;
                     let result = decoders[index]
                         .finish(if encoder.tool_limit_reached { crate::output::Termination::Cancelled } else { termination })
                         .and_then(|events| encoder.apply(index, events))
@@ -552,7 +556,7 @@ pub(super) async fn generate(
                                             &mut frame.data,
                                             &encoder.usage_value(),
                                             reused_prompt_tokens,
-                                            (ingress_ns, enqueue_ns),
+                                            (ingress_ns, enqueue_ns, times.first_scheduled_ns),
                                             true,
                                         );
                                     }
@@ -597,7 +601,7 @@ pub(super) async fn generate(
                 &mut response,
                 &encoder.usage_value(),
                 reused_total,
-                (ingress_ns, enqueue_ns),
+                (ingress_ns, enqueue_ns, first_scheduled_ns),
                 false,
             );
         }

@@ -99,6 +99,8 @@ pub enum GenerationEvent {
         reason: &'static str,
         termination: crate::output::Termination,
         stop_sequence: Option<String>,
+        /// The request's lifecycle instants, as its completion histograms record them.
+        times: super::metrics::RequestTimes,
     },
     AdmissionRejected(Error),
     Error(Error),
@@ -298,6 +300,7 @@ impl Incoming {
             reason: "stop",
             termination: crate::output::Termination::Cancelled,
             stop_sequence: None,
+            times: self.times,
         });
     }
 
@@ -1885,6 +1888,7 @@ impl<'a> Worker<'a> {
                                 .text_stops
                                 .as_ref()
                                 .and_then(|s| s.matched().map(str::to_owned)),
+                            times: request.incoming.times,
                         });
                     stopped.push(token.request);
                 }
@@ -2062,6 +2066,7 @@ impl<'a> Worker<'a> {
                                 } else {
                                     crate::output::Termination::OutputLimit
                                 },
+                                times: request.incoming.times,
                             });
                         if user_stop {
                             self.scheduler.cancel(request.request)?;

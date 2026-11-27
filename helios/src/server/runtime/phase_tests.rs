@@ -55,8 +55,12 @@ impl Fixture {
                 wrapping_newlines: 0,
                 terminal_markers: vec![],
             });
-        // Prepared text prompts have no image arrays or image graph inputs.
-        for graph in &mut fixture.config.contract.graphs {
+        fixture.text_inputs()
+    }
+
+    /// Prepared text prompts have no image arrays or image graph inputs.
+    fn text_inputs(mut self) -> Self {
+        for graph in &mut self.config.contract.graphs {
             graph.inputs.retain(|binding| {
                 !matches!(
                     binding.source,
@@ -65,7 +69,7 @@ impl Fixture {
                 )
             });
         }
-        fixture
+        self
     }
 
     fn with_template(template: &[u8], special_tokens: &[&str], text_tokens: &[&str]) -> Self {
@@ -4511,6 +4515,130 @@ async fn http_generation_request_observed(
     (response, incoming, state)
 }
 
+/// The bounds of one worker step on the observation clock.
+struct StepBounds {
+    start_ns: u64,
+    end_ns: u64,
+    generated: bool,
+}
+
+/// Drive a single request like `budget_pass`, pausing after each step so that
+/// instants recorded in different steps differ by at least the pause.
+fn timed_pass(worker: &mut Worker<'_>, samples: &[u32]) -> Vec<StepBounds> {
+    let mut bounds = Vec::new();
+    let mut samples = samples.iter().copied();
+    for sequence in 1..=samples.len() as u64 + 40 {
+        if worker.active.iter().all(Option::is_none) {
+            assert!(samples.next().is_none());
+            return bounds;
+        }
+        let start_ns = super::super::observation::monotonic_ns();
+        let step = worker.plan(0).unwrap().0.expect("timed pass must progress");
+        worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
+        let lane = &step.lanes[0];
+        let live = worker.scheduler.request(lane.request).unwrap();
+        let generates = matches!(step.kind, GraphKind::Decode | GraphKind::Resume)
+            || (step.kind == GraphKind::Prefill
+                && lane.start_position + lane.tokens as u64 == live.prompt_tokens as u64);
+        let token = generates.then(|| samples.next().expect("unexpected generation"));
+        let mut frame = completion(worker, &step, sequence, token);
+        if token.is_some_and(|token| worker.config.eos_token_ids.contains(&token)) {
+            frame.records[lane.request.slot as usize].status = 2;
+        }
+        worker.complete(step.kind, frame).unwrap();
+        worker.publish().unwrap();
+        bounds.push(StepBounds {
+            start_ns,
+            end_ns: super::super::observation::monotonic_ns(),
+            generated: generates,
+        });
+        thread::sleep(std::time::Duration::from_millis(3));
+    }
+    panic!("timed pass did not finish");
+}
+
+/// Serve one HTTP request through a worker that `timed_pass` drives, returning the
+/// step bounds and the JSON body, or the SSE `data` payloads of a stream.
+async fn served_through_worker(
+    fixture: fn() -> Fixture,
+    path: &str,
+    body: serde_json::Value,
+    samples: &[u32],
+) -> (Vec<StepBounds>, Vec<serde_json::Value>) {
+    use axum::{Extension, extract::State};
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let state = http_state_for(fixture(), sender, None, &[]);
+    let stream = body["stream"] == true;
+    let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let response = tokio::spawn(super::super::http::generate(State(state), Extension(ingress), request));
+    let group = tokio::task::spawn_blocking(move || {
+        receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+    })
+    .await
+    .unwrap();
+    let steps = {
+        let worker_fixture = fixture();
+        let (queue, inbound) = mpsc::channel();
+        queue.send(group).unwrap();
+        let mut worker = worker_fixture.worker(inbound);
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        timed_pass(&mut worker, samples)
+    };
+    let bytes = axum::body::to_bytes(response.await.unwrap().into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let values = if stream {
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    } else {
+        vec![serde_json::from_slice(&bytes).unwrap()]
+    };
+    (steps, values)
+}
+
+#[tokio::test]
+async fn performance_reports_the_first_scheduled_model_step() {
+    use serde_json::json;
+    for stream in [false, true] {
+        let (steps, values) = served_through_worker(
+            || Fixture::new().text_inputs(),
+            "/v1/chat/completions",
+            json!({"model":"qwen-worker-phases","messages":[{"role":"user","content":"a"}],
+                "max_tokens":2,"stream":stream,"return_token_ids":true,"return_token_timestamps":true}),
+            &[1, 2],
+        )
+        .await;
+        let performance = &values
+            .iter()
+            .find(|value| value.get("performance").is_some())
+            .expect("timed responses carry performance")["performance"];
+        let timestamps: Vec<u64> = values
+            .iter()
+            .flat_map(|value| value["choices"][0]["token_timestamps_ns"].as_array().cloned().unwrap_or_default())
+            .map(|value| value.as_u64().unwrap())
+            .collect();
+        let scheduled = performance["first_scheduled_ns"].as_u64().unwrap();
+        // The request's first model step stamps the instant; HTTP rendering, which
+        // runs after every step, does not.
+        assert!((steps[0].start_ns..=steps[0].end_ns).contains(&scheduled), "{stream}");
+        assert!(performance["enqueue_ns"].as_u64().unwrap() <= scheduled);
+        let first = steps.iter().find(|step| step.generated).unwrap();
+        assert_eq!(timestamps.len(), 2);
+        assert!(scheduled <= timestamps[0]);
+        assert!((first.start_ns..=first.end_ns).contains(&timestamps[0]));
+    }
+}
+
 #[tokio::test]
 async fn first_response_http_stream_excludes_pretext_failures_and_unpolled_bodies() {
     for (emit_text, poll_body) in [(false, true), (true, false), (true, true)] {
@@ -4555,7 +4683,7 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
         incoming[0].emit(GenerationEvent::Finished {
             prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
             reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
-            termination: crate::output::Termination::OutputLimit,
+            termination: crate::output::Termination::OutputLimit, times: Default::default(),
         });
         let response = response.await.unwrap();
         assert_eq!(state.first_response.snapshot().samples, 0);
@@ -4599,7 +4727,7 @@ async fn unread_http_stream_preserves_all_tokens_and_its_terminal_event() {
             incoming[0].emit(GenerationEvent::Finished {
                 prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 100,
                 reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
-                termination: crate::output::Termination::OutputLimit,
+                termination: crate::output::Termination::OutputLimit, times: Default::default(),
             });
         }
         assert!(!incoming[0].cancelled.load(Ordering::Acquire));
@@ -4829,6 +4957,7 @@ async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() 
             reason: "length",
             termination: crate::output::Termination::OutputLimit,
             stop_sequence: None,
+            times: Default::default(),
         });
         assert!(!incoming.cancelled.load(Ordering::Acquire));
         assert_eq!(incoming.publications.get(), 3000);
@@ -5049,7 +5178,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
     incoming[0].emit(GenerationEvent::Finished {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "stop", stop_sequence: None,
-        termination: crate::output::Termination::OutputLimit,
+        termination: crate::output::Termination::OutputLimit, times: Default::default(),
     });
     let bytes = axum::body::to_bytes(response.into_body(), 131072).await.unwrap();
     let body = std::str::from_utf8(&bytes).unwrap();
@@ -5079,7 +5208,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
     incoming[0].emit(GenerationEvent::Finished {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
-        termination: crate::output::Termination::OutputLimit,
+        termination: crate::output::Termination::OutputLimit, times: Default::default(),
     });
     let response = response.await.unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
@@ -5097,7 +5226,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
     incoming[0].emit(GenerationEvent::Finished {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
-        termination: crate::output::Termination::OutputLimit,
+        termination: crate::output::Termination::OutputLimit, times: Default::default(),
     });
     let response = response.await.unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
