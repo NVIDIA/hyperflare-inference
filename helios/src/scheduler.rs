@@ -926,6 +926,26 @@ impl RequestScheduler {
         StateSlotId((1 + self.limits.max_active * self.execution_rows()) as u32 + snapshot.0)
     }
 
+    /// `snapshot_slot` for values that reach a device transfer command.
+    /// Rejects snapshot ids outside the scheduler's planned range before the
+    /// state row is packed. The #517 fault address decodes to rows ~3,216-3,224,
+    /// past the last legal snapshot row 2,171. This closes the host snapshot-id
+    /// path only; it did not fire in the reproduction, so it is not a fix.
+    pub fn checked_snapshot_slot(&self, snapshot: SnapshotId) -> Result<StateSlotId> {
+        if snapshot.0 >= self.limits.snapshots {
+            return Err(crate::Error::execution(
+                crate::ExecutionError::State,
+                format!(
+                    "snapshot id {} exceeds planned snapshot slots {} (last legal row {})",
+                    snapshot.0,
+                    self.limits.snapshots,
+                    self.limits.max_active * self.execution_rows() + self.limits.snapshots as usize
+                ),
+            ));
+        }
+        Ok(self.snapshot_slot(snapshot))
+    }
+
     /// Each shape supplies (physical rows, decode width, prompt capacity).
     pub fn mixed_graphs(&mut self, shapes: &[(usize, usize, usize)]) -> Result<()> {
         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
