@@ -122,7 +122,7 @@ flare-cli/target/release/flare run CORE --gpus 0
 flare run [CORE] [flags]               serve locally, join a rank, or launch peer agents
 flare download REPOSITORY [flags]         download a prepared core
 flare inspect CORE|MODEL[@VERSION] [--tensor-parallel N] [--rank N] [--unverified] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
-flare doctor [--gpus N[,N...]] [--json | --plain]  check Linux PCIe TP>1 driver, IOMMU, and ACS settings
+flare doctor [--gpus N[,N...]] [--json | --plain]  check Linux PCIe TP>1 settings and DGX Spark CX7 readiness
 flare agent [--listen IP:PORT]            run this host's rank agent
 flare agent install [--join-code CODE | --accept-first] [--listen IP:PORT]
 flare agent pair HOST... [--code CODE]    pair for --hosts or Orbit launches
@@ -1621,8 +1621,7 @@ envelope has format 4 or 6.
 
 ### 5.4 `flare doctor`
 
-Inspect Linux host configuration for multi-GPU tensor-parallel serving over
-PCIe:
+Inspect Linux host readiness for tensor-parallel serving:
 
 ```sh
 flare doctor [--gpus N[,N...]] [--json | --plain]
@@ -1648,12 +1647,42 @@ On Linux PCIe hosts, `flare doctor` verifies:
   connecting the selected GPUs (from their lowest common ancestor downward).
   Reading PCIe extended configuration space from
   `/sys/bus/pci/devices/<bdf>/config` requires root (`CAP_SYS_ADMIN`); without
-  it, ACS is reported as `unverified` with a hint to run `sudo flare doctor`.
+  it, ACS is reported as `unverified` and its remediation suggests running
+  `sudo flare doctor`.
 
-`--json` prints the structured report; `--plain` disables terminal styling and
-conflicts with `--json`. The command exits zero when no check fails and
-non-zero when one or more checks fail. On non-Linux hosts, the command reports
-the checks as not applicable and exits zero.
+On Linux GB10 and RTX Spark N1X hosts, `flare doctor` checks the local
+ConnectX-7 fabric for multi-host serving. `--gpus` does not affect this host
+check. PCIe tuning checks are not applicable when exactly one GPU is selected
+on these hosts and are unverified when no GPU is selected or detected.
+
+- PCI identifies the ConnectX-7 physical function (`15b3:1021`) even if its
+  RDMA driver has not bound. The fabric check is not applicable when the
+  adapter is absent.
+- The report uses serving's RoCEv2 GID index and lists the selected
+  ConnectX-7 devices, interface names, IPv4 prefixes, and observed MTUs.
+  One active device with an assigned IPv4 address and RoCEv2 GID is
+  sufficient. The report identifies active devices skipped by discovery.
+- The check warns if there is no driver, active link, or usable IPv4 RoCEv2
+  endpoint. It warns if the address and prefix for a selected device or its
+  MTU cannot be read. It also flags /0 and /32 prefixes, network and broadcast
+  addresses, and overlapping subnets on different interfaces. Two link-local
+  interfaces may share a subnet. Link-local IPv4 requires an LLDP-confirmed
+  direct peer.
+
+Compare the reported Ethernet MTUs with the settings on the intended peers
+and switch.
+NVIDIA's [Spark setup guide](https://build.nvidia.com/spark/connect-multiple-sparks/advance)
+uses MTU 9000 for a direct two-node link and MTU 1500 for ring and switched
+connections. Peer reachability requires a separate check.
+
+The local check passed on four Linux DGX Sparks configured as a switched
+cluster. Each host had two active interfaces on separate IPv4 /24 subnets,
+RoCEv2 GID index 3, and Ethernet MTU 9000.
+
+`--json` prints the structured report. `--plain` disables terminal styling and
+conflicts with `--json`. Check statuses are `pass`, `fail`, `warn`, `unverified`,
+and `not_applicable` in JSON. Only `fail` produces a nonzero exit status. On
+non-Linux hosts, the command reports the checks as not applicable and exits zero.
 
 ## 6. Capacity errors
 

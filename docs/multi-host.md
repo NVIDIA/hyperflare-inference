@@ -53,6 +53,9 @@ Staging (`--stage-only`) does not need RoCE. Not qualified: x86_64 RoCE serving
 on RDMA hardware; its coverage is functional, over Soft-RoCE.
 The separate `rdma` feature enables the prefix pool's data channel.
 
+Run [`flare doctor`](cli-design.md#54-flare-doctor) on each DGX Spark to
+verify its local ConnectX-7 link and IPv4 RoCEv2 configuration before launch.
+
 ### Prefix cache pool
 
 A multi-host instance can use a Selene prefix cache pool (see

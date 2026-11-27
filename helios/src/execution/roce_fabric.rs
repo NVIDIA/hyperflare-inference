@@ -192,15 +192,14 @@ fn lldp_neighbors(netdevs: &[String]) -> std::collections::BTreeMap<String, Vec<
 
 impl Endpoint {
     fn network(&self) -> Option<(u32, u8)> {
-        self.ipv4.map(|(address, prefix)| {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - prefix as u32)
-            };
-            (u32::from(address) & mask, prefix)
-        })
+        self.ipv4
+            .map(|(address, prefix)| (u32::from(address) & ipv4_subnet_mask(prefix), prefix))
     }
+}
+
+/// IPv4 subnet mask for a prefix length in 0..=32, shared by route planning and `flare doctor`.
+pub fn ipv4_subnet_mask(prefix: u8) -> u32 {
+    u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
 }
 
 /// This host's RoCE devices in name order, and the GID index and traffic class they use.
@@ -345,6 +344,22 @@ fn mapped_ipv4(gid: &str) -> Option<Ipv4Addr> {
     u32::from_str_radix(&hex[24..], 16).ok().map(Ipv4Addr::from)
 }
 
+/// Whether serving and `flare doctor` consider port 1 active, from the RDMA device's sysfs directory.
+pub fn port1_active(device: &Path) -> std::io::Result<bool> {
+    std::fs::read_to_string(device.join("ports/1/state")).map(|state| state.contains("ACTIVE"))
+}
+
+/// Whether port 1 advertises an IPv4-mapped RoCEv2 GID at the given index.
+fn has_rocev2_ipv4_gid(device: &Path, index: u32) -> bool {
+    let port = device.join("ports/1");
+    read(&port.join(format!("gid_attrs/types/{index}")))
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("RoCE v2"))
+        && read(&port.join(format!("gids/{index}")))
+            .as_deref()
+            .and_then(mapped_ipv4)
+            .is_some()
+}
+
 /// Discover the RoCE devices under `root` (normally /sys/class/infiniband): every device whose
 /// port 1 is active and holds a RoCEv2 GID at the chosen index. The index is 3 when every active
 /// device has a RoCEv2 IPv4 GID there, otherwise the lowest index at which one does. `prefix`
@@ -367,21 +382,10 @@ pub fn discover_in(
                 .ok()
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
         })
-        .filter(|name| {
-            read(&root.join(name).join("ports/1/state"))
-                .is_some_and(|state| state.contains("ACTIVE"))
-        })
+        .filter(|name| port1_active(&root.join(name)).unwrap_or(false))
         .collect();
     names.sort();
-    let roce_v2_ipv4 = |name: &str, index: u32| {
-        let port = root.join(name).join("ports/1");
-        read(&port.join(format!("gid_attrs/types/{index}")))
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("RoCE v2"))
-            && read(&port.join(format!("gids/{index}")))
-                .as_deref()
-                .and_then(mapped_ipv4)
-                .is_some()
-    };
+    let roce_v2_ipv4 = |name: &str, index: u32| has_rocev2_ipv4_gid(&root.join(name), index);
     let gid_index = if !names.is_empty()
         && names
             .iter()
@@ -617,8 +621,9 @@ fn any_lldp_adjacency(endpoints: &[Vec<Endpoint>]) -> bool {
 }
 
 /// Whether `network` lies in IPv4 link-local space (169.254.0.0/16). Hosts using link-local
-/// addressing share that subnet whether or not their ports are linked.
-fn link_local((address, prefix): (u32, u8)) -> bool {
+/// addressing share that subnet whether or not their ports are linked. Route planning and
+/// `flare doctor` use the same link-local classification.
+pub fn link_local((address, prefix): (u32, u8)) -> bool {
     prefix >= 16 && address & 0xffff_0000 == 0xa9fe_0000
 }
 

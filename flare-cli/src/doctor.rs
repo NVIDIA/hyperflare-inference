@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Host preflight diagnostics for multi-GPU tensor-parallel serving over PCIe on Linux.
+//! Host preflight diagnostics for tensor-parallel serving on Linux.
+
+#[cfg(any(target_os = "linux", test))]
+mod spark;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -63,6 +66,7 @@ const IOMMU_REMEDIATION: &str =
 pub enum CheckStatus {
     Pass,
     Fail,
+    Warn,
     Unverified,
     NotApplicable,
 }
@@ -72,6 +76,7 @@ impl CheckStatus {
         match self {
             Self::Pass => "PASS",
             Self::Fail => "FAIL",
+            Self::Warn => "WARN",
             Self::Unverified => "UNVERIFIED",
             Self::NotApplicable => "N/A",
         }
@@ -85,7 +90,7 @@ impl CheckStatus {
         let code = match self {
             Self::Pass => "1;32",
             Self::Fail => "1;31",
-            Self::Unverified => "1;33",
+            Self::Warn | Self::Unverified => "1;33",
             Self::NotApplicable => "2",
         };
         format!("\x1b[{code}m{label}\x1b[0m")
@@ -217,11 +222,13 @@ fn diagnose(requested_gpus: &[i32]) -> Result<Report> {
     {
         let inherited = std::env::var("CUDA_VISIBLE_DEVICES").ok();
         let probe = probe_linux_gpus(requested_gpus, inherited.as_deref())?;
+        let sysfs = Path::new(SYSFS_ROOT);
         Ok(evaluate_linux_host(
             probe,
-            Path::new(SYSFS_ROOT),
+            sysfs,
             Path::new(NVIDIA_PARAMS_PATH),
             Path::new(CMDLINE_PATH),
+            flare_helios::execution::roce_fabric::discover,
         ))
     }
     #[cfg(not(target_os = "linux"))]
@@ -259,11 +266,13 @@ struct GpuProbe {
     notes: Vec<String>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn evaluate_linux_host(
     probe: GpuProbe,
     sysfs_root: &Path,
     nvidia_params_path: &Path,
     cmdline_path: &Path,
+    discover: impl FnOnce() -> flare_helios::Result<flare_helios::execution::roce_fabric::Fabric>,
 ) -> Report {
     let gpu_bdfs: Vec<String> = probe.gpus.iter().map(|g| g.pci_bus_id.clone()).collect();
     let ancestor_chains = collect_ancestor_chains(sysfs_root, &gpu_bdfs);
@@ -274,51 +283,66 @@ fn evaluate_linux_host(
         Interconnect::Pcie | Interconnect::Mixed
     );
 
+    let spark_check = spark::check_host(sysfs_root, discover);
     let mut notes = probe.notes;
-    if probe.interconnect == Interconnect::NvLink {
+    let mut checks = if probe.interconnect == Interconnect::NvLink {
         notes.push(
             "All selected GPU pairs have NVLink P2P; PCIe TP>1 tuning checks are not required."
                 .into(),
         );
-        return Report {
-            platform: "linux",
-            interconnect: probe.interconnect,
-            pcie_tp_checks_required: false,
-            gpus: probe.gpus,
-            bridges,
-            notes,
-            checks: vec![Check {
-                id: "pcie.interconnect".into(),
-                name: "PCIe TP>1 preflight".into(),
-                status: CheckStatus::NotApplicable,
-                expected: None,
-                actual: Some("NVLink".into()),
-                detail: "Selected GPUs are connected over NVLink.".into(),
-                remediation: None,
-            }],
-            ok: true,
-            all_verified: true,
+        vec![Check {
+            id: "pcie.interconnect".into(),
+            name: "PCIe TP>1 preflight".into(),
+            status: CheckStatus::NotApplicable,
+            expected: None,
+            actual: Some("NVLink".into()),
+            detail: "Selected GPUs are connected over NVLink.".into(),
+            remediation: None,
+        }]
+    } else if spark_check.is_some() && !pcie_tp_checks_required {
+        let (status, detail) = if probe.interconnect == Interconnect::SingleGpu {
+            (
+                CheckStatus::NotApplicable,
+                "PCIe TP>1 checks require at least two selected GPUs.",
+            )
+        } else {
+            (
+                CheckStatus::Unverified,
+                "No GPUs were selected or detected for PCIe topology checks.",
+            )
         };
-    }
+        vec![Check {
+            id: "pcie.interconnect".into(),
+            name: "PCIe TP>1 preflight".into(),
+            status,
+            expected: None,
+            actual: Some(probe.interconnect.description().into()),
+            detail: detail.into(),
+            remediation: None,
+        }]
+    } else {
+        if matches!(
+            probe.interconnect,
+            Interconnect::SingleGpu | Interconnect::NoGpus
+        ) {
+            notes.push(
+                "Fewer than two GPUs selected; reporting host readiness for PCIe TP>1 serving."
+                    .into(),
+            );
+        }
 
-    if matches!(
-        probe.interconnect,
-        Interconnect::SingleGpu | Interconnect::NoGpus
-    ) {
-        notes.push(
-            "Fewer than two GPUs selected; reporting host readiness for PCIe TP>1 serving.".into(),
-        );
-    }
+        let params_text = std::fs::read_to_string(nvidia_params_path);
+        let params_result = params_text
+            .as_deref()
+            .map_err(|error| format!("cannot read {}: {error}", nvidia_params_path.display()));
+        let mut checks = check_nvidia_params(params_result);
+        let cmdline = std::fs::read_to_string(cmdline_path).ok();
+        checks.push(check_iommu(sysfs_root, &gpu_bdfs, cmdline.as_deref()));
+        checks.push(check_acs(sysfs_root, &bridges));
+        checks
+    };
 
-    let params_text = std::fs::read_to_string(nvidia_params_path);
-    let params_result = params_text
-        .as_deref()
-        .map_err(|error| format!("cannot read {}: {error}", nvidia_params_path.display()));
-    let mut checks = check_nvidia_params(params_result);
-
-    let cmdline = std::fs::read_to_string(cmdline_path).ok();
-    checks.push(check_iommu(sysfs_root, &gpu_bdfs, cmdline.as_deref()));
-    checks.push(check_acs(sysfs_root, &bridges));
+    checks.extend(spark_check);
 
     Report {
         platform: "linux",
@@ -445,7 +469,7 @@ fn all_pairs_nvlink_by_pci_bdfs(gpu_bdfs: &[String]) -> Option<bool> {
 /// Render a human-readable `flare doctor` report into `canvas`.
 pub fn render(report: &Report, mut canvas: Canvas) -> String {
     let color = canvas.is_color();
-    canvas.open("Flare doctor · PCIe TP>1 preflight");
+    canvas.open("Flare doctor · Host preflight");
     canvas.row("platform", report.platform);
     canvas.row("interconnect", report.interconnect.description());
     canvas.row(
@@ -492,7 +516,7 @@ pub fn render(report: &Report, mut canvas: Canvas) -> String {
 
     let mut remediations = Vec::new();
     for check in &report.checks {
-        if matches!(check.status, CheckStatus::Fail | CheckStatus::Unverified)
+        if matches!(check.status, CheckStatus::Fail | CheckStatus::Warn | CheckStatus::Unverified)
             && let Some(hint) = &check.remediation
             && !remediations.contains(hint)
         {
@@ -506,26 +530,12 @@ pub fn render(report: &Report, mut canvas: Canvas) -> String {
         }
     }
 
-    let passed = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Pass)
-        .count();
-    let failed = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Fail)
-        .count();
-    let unverified = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Unverified)
-        .count();
-    let na = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::NotApplicable)
-        .count();
+    let count = |status| report.checks.iter().filter(|c| c.status == status).count();
+    let passed = count(CheckStatus::Pass);
+    let failed = count(CheckStatus::Fail);
+    let warnings = count(CheckStatus::Warn);
+    let unverified = count(CheckStatus::Unverified);
+    let na = count(CheckStatus::NotApplicable);
 
     let mut summary = Vec::new();
     if passed > 0 {
@@ -533,6 +543,11 @@ pub fn render(report: &Report, mut canvas: Canvas) -> String {
     }
     if failed > 0 {
         summary.push(format!("{failed} failed"));
+    }
+    if warnings == 1 {
+        summary.push("1 warning".into());
+    } else if warnings > 1 {
+        summary.push(format!("{warnings} warnings"));
     }
     if unverified > 0 {
         summary.push(format!("{unverified} unverified"));
@@ -545,13 +560,11 @@ pub fn render(report: &Report, mut canvas: Canvas) -> String {
     if failed > 0 {
         canvas.row("status", &CheckStatus::Fail.styled(color));
     } else if unverified > 0 {
-        canvas.row(
-            "status",
-            &format!(
-                "{} (run with sudo to complete privileged checks)",
-                CheckStatus::Unverified.styled(color)
-            ),
-        );
+        canvas.row("status", &CheckStatus::Unverified.styled(color));
+    } else if warnings > 0 {
+        canvas.row("status", &CheckStatus::Warn.styled(color));
+    } else if passed == 0 && na > 0 {
+        canvas.row("status", &CheckStatus::NotApplicable.styled(color));
     } else {
         canvas.row("status", &CheckStatus::Pass.styled(color));
     }
@@ -1504,6 +1517,72 @@ EnableResizableBar: 1
 RegistryDwords: "ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2;GrdmaPciTopoCheckOverride=1"
 "#;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gb10_and_n1x_without_cx7_skip_fabric_preflight() {
+        use flare_helios::core::naming::GB10_DEVICES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sysfs = dir.path();
+        let gpu = sysfs.join("bus/pci/devices/000f:01:00.0");
+        fs::create_dir_all(&gpu).unwrap();
+        fs::write(gpu.join("vendor"), "0x10de\n").unwrap();
+        let report = |interconnect| {
+            evaluate_linux_host(
+                GpuProbe {
+                    gpus: Vec::new(),
+                    interconnect,
+                    notes: Vec::new(),
+                },
+                sysfs,
+                &sysfs.join("params"),
+                &sysfs.join("cmdline"),
+                || panic!("RoCE discovery must be skipped when there is no CX7 adapter"),
+            )
+        };
+
+        fs::write(gpu.join("device"), "0x2b85\n").unwrap();
+        assert!(
+            report(Interconnect::SingleGpu)
+                .checks
+                .iter()
+                .all(|check| check.id != "spark.cx7")
+        );
+
+        for device in GB10_DEVICES {
+            fs::write(gpu.join("device"), format!("0x{device:04x}\n")).unwrap();
+            let report = report(Interconnect::SingleGpu);
+            assert!(report.ok);
+            assert_eq!(report.checks.len(), 2);
+            assert!(
+                report.checks.iter().any(|check| check.id == "pcie.interconnect")
+            );
+            let cx7 = report
+                .checks
+                .iter()
+                .find(|check| check.id == "spark.cx7")
+                .unwrap();
+            assert!(
+                report.checks.iter().all(|check| check.status == CheckStatus::NotApplicable)
+            );
+            assert_eq!(
+                serde_json::to_value(cx7).unwrap()["status"],
+                "not_applicable"
+            );
+            assert!(!render(&report, Canvas::sized(100, false)).contains("PASS"));
+        }
+
+        let report = report(Interconnect::NoGpus);
+        assert!(report.ok);
+        assert!(!report.all_verified);
+        let pcie = report
+            .checks
+            .iter()
+            .find(|check| check.id == "pcie.interconnect")
+            .unwrap();
+        assert_eq!(pcie.status, CheckStatus::Unverified);
+    }
+
     #[test]
     fn nvidia_params_parser_and_checks_validate_all_required_fields() {
         let checks = check_nvidia_params(Ok(HEALTHY_NVIDIA_PARAMS));
@@ -1875,6 +1954,7 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
             dir.path(),
             &dir.path().join("missing-params"),
             &dir.path().join("missing-cmdline"),
+            || panic!("RoCE discovery must be skipped on this host"),
         );
         assert!(report.ok);
         assert!(!report.pcie_tp_checks_required);
@@ -1933,7 +2013,9 @@ RegistryDwords: "ForceP2P=0x01;RMForceP2PType=1;RMPcieP2PType=0"
             interconnect: Interconnect::Pcie,
             notes: Vec::new(),
         };
-        let report = evaluate_linux_host(pcie_probe, dir.path(), &params, &cmdline);
+        let report = evaluate_linux_host(pcie_probe, dir.path(), &params, &cmdline, || {
+            panic!("RoCE discovery must be skipped on this host")
+        });
         assert!(!report.ok);
         let plain = render(&report, Canvas::sized(100, false));
         assert!(plain.contains("Flare doctor"), "{plain}");

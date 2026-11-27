@@ -47,7 +47,7 @@ pub enum Command {
     Download(Download),
     /// Summarize a core's metadata, with optional memory, graph, and frontend details.
     Inspect(Inspect),
-    /// Check Linux host PCIe, NVIDIA driver, IOMMU, and ACS settings for TP>1 serving.
+    /// Check Linux host readiness for PCIe and DGX Spark tensor-parallel serving.
     Doctor(Doctor),
     #[command(hide = true)]
     HardwareRevision {
