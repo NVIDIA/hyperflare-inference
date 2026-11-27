@@ -282,7 +282,7 @@ impl RequestScheduler {
             }
             let remaining = end.saturating_sub(start);
             let step_remaining = limit.saturating_sub(start);
-            let target_capacity = catalog
+            let pricing_capacity = catalog
                 .iter()
                 .map(|entry| entry.capacity)
                 .find(|&capacity| capacity >= step_remaining)
@@ -336,7 +336,7 @@ impl RequestScheduler {
                 // unknown: the pricing capacity covers at least as much work, so the
                 // skip loses no capacity that could cover more.
                 let Some(nanos) = nanos else {
-                    if !adds_work || Some(entry.capacity) != target_capacity {
+                    if !adds_work || Some(entry.capacity) != pricing_capacity {
                         continue;
                     }
                     return None;
@@ -908,7 +908,7 @@ mod tests {
                 .min()
                 .unwrap_or(end)
                 .min(end);
-            let target_capacity = catalog
+            let pricing_capacity = catalog
                 .iter()
                 .copied()
                 .find(|&capacity| capacity >= limit - start)
@@ -935,7 +935,7 @@ mod tests {
                     .duration(request.prefill_kind(), 1, capacity)
                     .filter(|&nanos| nanos != 0)
                 else {
-                    if !adds_work || Some(capacity) != target_capacity {
+                    if !adds_work || Some(capacity) != pricing_capacity {
                         continue;
                     }
                     return None;
