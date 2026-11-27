@@ -1306,6 +1306,17 @@ class RecipeParameters(ParameterGroup):
         bare_default_label="see MODEL --help",
         help="most prompt tokens per prefill step",
     )
+    context_target: int | None = param(
+        None,
+        flag="--request-context",
+        group="capacity and compression",
+        metavar="N",
+        value_type=int,
+        min_value=1,
+        manifest_key="context_target",
+        scope=ParameterScope.DEPLOYMENT,
+        help="cap the prepared per-request context at N tokens; must be a multiple of the page token count",
+    )
     autotune_effort: str = param(
         "default",
         flag="--autotune-effort",
@@ -1469,6 +1480,8 @@ class RecipeParameters(ParameterGroup):
 
         args.extend(["--max-concurrency", str(self.max_concurrency)])
         args.extend(["--prefill-chunk-size", str(self.prefill_chunk)])
+        if self.context_target is not None:
+            args.extend(["--request-context", str(self.context_target)])
 
         if self.speculation is None and ctx.defaults is not None and ctx.defaults.speculation is not None:
             args.append("--no-mtp")
@@ -1544,6 +1557,8 @@ class RecipeParameters(ParameterGroup):
             label = spec.status_label(getattr(self, dc_field.name))
             if label:
                 parts.append(label)
+        if self.context_target is not None:
+            parts.append(f"request context {min(self.context_target, context.recipe.context):,} tokens")
         parts.append(f"compile workers {self.compile_workers or 'auto'} per host")
         parts.append(f"autotune effort {self.autotune_effort}")
         return parts

@@ -14,11 +14,9 @@ Each recipe declares its preparation contract by binding a frozen
 `RecipeParameters` instance (`ignition/parameters.py`) on `Recipe.parameters`.
 `RecipeParameters` is both compositional and subclassable:
 
-- Core `ignition` defines the universal preparation fields (`max_concurrency`,
-  `prefill_chunk`, `autotune_effort`, `compile_workers`, `lock_gpu_clocks`,
-  `compiled_forwards`, `roce_ring`, `roce_chain`) and four optional Helios
-  `GraphOperation` ABI groups (`SpeculationParameters`, `VisionParameters`,
-  `PromptLogprobsParameters`, `MixedPrefillParameters`).
+- Core `ignition` defines the universal preparation fields (see
+  `RecipeParameters` in `ignition/parameters.py`) and four optional Helios
+  `GraphOperation` ABI groups.
 - External recipe packages define shared `ParameterGroup` components and
   recipe-specific `RecipeParameters` subclasses without adding model names or
   model flags to core `ignition`.
