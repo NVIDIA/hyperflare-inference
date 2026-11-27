@@ -163,14 +163,23 @@ fn bridge<A: Read + Write + Send, B: Read + Write + Send>(
         let (sender, receiver) = mpsc::channel();
         let second = sender.clone();
         let a = scope.spawn(move || {
-            let _ = sender.send(io::copy(&mut left, &mut right));
+            let _ = sender.send(("source to destination", io::copy(&mut left, &mut right)));
         });
         let b = scope.spawn(move || {
-            let _ = second.send(io::copy(&mut right_copy, &mut left_copy));
+            let _ = second.send((
+                "destination to source",
+                io::copy(&mut right_copy, &mut left_copy),
+            ));
         });
-        let result = receiver
+        let (direction, result) = receiver
             .recv()
             .map_err(|_| "preparation transfer worker stopped")?;
+        if let Err(error) = &result {
+            eprintln!(
+                "[fabric relay] the {direction} direction of a relayed transfer failed: {error}; \
+                 both directions close"
+            );
+        }
         stop();
         a.join()
             .map_err(|_| "preparation transfer worker panicked")?;
