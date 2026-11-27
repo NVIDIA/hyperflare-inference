@@ -1043,6 +1043,7 @@ dependencies = [
  "futures-util",
  "gif",
  "httpdate",
+ "ibverbs-sys",
  "image-webp",
  "io-uring",
  "libc",

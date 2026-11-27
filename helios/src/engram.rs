@@ -7,6 +7,7 @@
 //! Host- or graph-produced n-gram requests and asynchronous compact-row delivery.
 
 mod cache;
+pub mod fabric;
 #[cfg(unix)]
 mod prepared;
 mod reader;
@@ -17,6 +18,7 @@ use crate::{
 };
 #[cfg(unix)]
 pub use prepared::{PlaneSource, PreparedTables, SourceSegment, TableSource};
+pub(crate) use fabric::transient;
 pub(crate) use reader::Plane;
 #[cfg(feature = "server")]
 use std::fmt::Write;
@@ -46,6 +48,18 @@ pub(crate) struct Stats {
     disk_submit_ns: AtomicU64,
     disk_wait_ns: AtomicU64,
     disk_complete_ns: AtomicU64,
+    // Written by the fabric reader and read by the metrics renderer.
+    #[cfg_attr(not(any(feature = "server", feature = "engram-rdma")), allow(dead_code))]
+    fabric_reads: AtomicU64,
+    #[cfg_attr(not(any(feature = "server", feature = "engram-rdma")), allow(dead_code))]
+    fabric_bytes: AtomicU64,
+    #[cfg_attr(not(any(feature = "server", feature = "engram-rdma")), allow(dead_code))]
+    fabric_wait_ns: AtomicU64,
+    #[cfg_attr(not(any(feature = "server", feature = "engram-rdma")), allow(dead_code))]
+    fabric_failures: AtomicU64,
+    /// Present only for fabric storage; its counters are rendered only then.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    store: Option<Arc<fabric::Status>>,
 }
 
 impl Stats {
@@ -149,6 +163,52 @@ impl Stats {
                 counter.load(Ordering::Relaxed)
             );
         }
+        let Some(store) = &self.store else {
+            return;
+        };
+        for (name, kind, help, value) in [
+            (
+                "fabric_reads_total",
+                "counter",
+                "RDMA READ requests posted to the Engram store.",
+                self.fabric_reads.load(Ordering::Relaxed),
+            ),
+            (
+                "fabric_bytes_total",
+                "counter",
+                "Bytes requested by RDMA READs from the Engram store.",
+                self.fabric_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "fabric_wait_nanoseconds_total",
+                "counter",
+                "Cumulative worker wall time posting and completing Engram store READs.",
+                self.fabric_wait_ns.load(Ordering::Relaxed),
+            ),
+            (
+                "fabric_failures_total",
+                "counter",
+                "Miss gathers failed because the Engram store was unreachable; each fails its requests and leaves the table usable.",
+                self.fabric_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "fabric_reconnects_total",
+                "counter",
+                "Engram store sessions re-established after a loss.",
+                store.reconnects(),
+            ),
+            (
+                "fabric_ready",
+                "gauge",
+                "1 while every Engram store session of this process is ready.",
+                u64::from(store.ready()),
+            ),
+        ] {
+            let _ = writeln!(
+                text,
+                "# HELP flare_engram_{name} {help}\n# TYPE flare_engram_{name} {kind}\nflare_engram_{name} {value}",
+            );
+        }
     }
 }
 
@@ -157,6 +217,8 @@ pub enum Storage {
     #[default]
     Disk,
     Ram,
+    /// Rows the row cache misses are read over RDMA from an Engram store host's RAM.
+    Fabric,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,6 +367,21 @@ struct Layer {
     state: Mutex<[State; STAGING_FRAMES]>,
     cancelled: Arc<AtomicBool>,
 }
+impl Layer {
+    /// The first fatal reader error, which disables this layer until the process restarts.
+    /// Transient store errors fail only the sequence that observed them.
+    fn poisoned(&self) -> Result<()> {
+        for staging in self.staging.iter() {
+            if let Some(error) = staging.error.lock().unwrap().as_ref() {
+                if !transient(error) {
+                    return Err(error.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Layer {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
@@ -345,12 +422,29 @@ impl Shared {
         cache_bytes: u64,
         workers: usize,
         resident_scales: bool,
+        store: Option<fabric::Connect>,
     ) -> Result<Arc<Self>> {
         if storage == Storage::Ram && cache_bytes != 0 {
             return Err("embedding row cache requires disk table storage".into());
         }
+        let stats = Arc::new(Stats {
+            store: store.as_ref().map(|connect| connect.status.clone()),
+            ..Stats::default()
+        });
+        let session = match (storage, store) {
+            (Storage::Fabric, Some(connect)) => {
+                let planes = index.tables.iter().map(|table| table.planes).collect::<Vec<_>>();
+                Some(fabric::Session::connect(connect, &planes)?)
+            }
+            (Storage::Fabric, None) => {
+                return Err("fabric embedding-table storage requires a store endpoint".into());
+            }
+            (_, Some(_)) => {
+                return Err("an embedding table store endpoint requires fabric storage".into());
+            }
+            (_, None) => None,
+        };
         let index = Arc::new(index);
-        let stats = Arc::new(Stats::default());
         let table_bytes: u128 = index
             .tables
             .iter()
@@ -360,23 +454,36 @@ impl Shared {
         let readers = index
             .tables
             .iter()
-            .map(|table| {
+            .enumerate()
+            .map(|(ordinal, table)| {
                 let bytes: u128 = table.planes.iter().map(|plane| plane.nbytes as u128).sum();
                 let budget = usize::try_from(cache_bytes as u128 * bytes / table_bytes)
                     .map_err(|_| "embedding row cache exceeds host address range")?;
                 let rows = max_tokens
                     .checked_mul(table.heads)
                     .ok_or("embedding row capacity exceeds host range")?;
-                reader::Reader::from_files(
-                    files,
-                    &table.planes,
-                    storage == Storage::Ram,
-                    budget,
-                    rows,
-                    stats.clone(),
-                    workers,
-                    resident_scales,
-                )
+                match &session {
+                    Some(session) => reader::Reader::from_fabric(
+                        files,
+                        &table.planes,
+                        session.clone(),
+                        ordinal,
+                        budget,
+                        rows,
+                        stats.clone(),
+                        resident_scales,
+                    ),
+                    None => reader::Reader::from_files(
+                        files,
+                        &table.planes,
+                        storage == Storage::Ram,
+                        budget,
+                        rows,
+                        stats.clone(),
+                        workers,
+                        resident_scales,
+                    ),
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         Self::with_readers(index, readers, ranks, max_tokens, context, device, stats)
@@ -439,9 +546,15 @@ impl Shared {
                         }))
                         .unwrap_or_else(|_| Err("Engram reader panicked".into()));
                         if let Err(error) = result {
+                            // The zeroed rows only let the frame handshake drain. `finish`
+                            // returns the stored error for this sequence, so no completion of
+                            // the consuming graph is delivered as output.
                             output.fill(0);
+                            let fatal = !transient(&error);
                             *buffers.error.lock().unwrap() = Some(error);
-                            stop.store(true, Ordering::Release);
+                            if fatal {
+                                stop.store(true, Ordering::Release);
+                            }
                         }
                         // Release failed reads too, so graph shutdown can drain before reporting the error.
                         buffers.signal(job.generation);
@@ -473,17 +586,19 @@ impl Shared {
     pub(crate) fn cache_bytes(&self) -> u64 {
         self.stats.cache_bytes.load(Ordering::Relaxed)
     }
+
+    /// Reachability of the Engram store for fabric storage.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub(crate) fn store_status(&self) -> Option<Arc<fabric::Status>> {
+        self.stats.store.clone()
+    }
     fn validate_start(&self, table: usize, rank: usize, sequence: u64, rows: usize) -> Result<()> {
         if rows > self.max_tokens * self.index.tables[table].heads {
             return Err("Engram input exceeds staged capacity".into());
         }
         let layer = &self.layers[table];
         let states = layer.state.lock().unwrap();
-        for staging in layer.staging.iter() {
-            if let Some(error) = staging.error.lock().unwrap().as_ref() {
-                return Err(error.clone());
-            }
-        }
+        layer.poisoned()?;
         let mut state = states[sequence as usize % STAGING_FRAMES];
         state.prepare(rank, sequence, rows, self.ranks)?;
         Ok(())
@@ -502,15 +617,18 @@ impl Shared {
         }
         let layer = &self.layers[table];
         let mut states = layer.state.lock().unwrap();
-        for staging in layer.staging.iter() {
-            if let Some(error) = staging.error.lock().unwrap().as_ref() {
-                return Err(error.clone());
-            }
-        }
+        layer.poisoned()?;
         let frame = sequence as usize % STAGING_FRAMES;
         let mut state = states[frame];
         let fresh = state.prepare(rank, sequence, rows, self.ranks)?;
         if fresh {
+            // Every rank finished this frame's previous sequence before `prepare` accepted a
+            // new one, so a transient error stored for it has been returned and is cleared.
+            let mut stored = layer.staging[frame].error.lock().unwrap();
+            if stored.as_ref().is_some_and(transient) {
+                *stored = None;
+            }
+            drop(stored);
             layer
                 .sender
                 .as_ref()

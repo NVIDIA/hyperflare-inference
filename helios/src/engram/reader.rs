@@ -338,7 +338,7 @@ impl Resident {
         self.file.as_raw_fd()
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub(super) fn bytes(&self) -> &[u8] {
         #[cfg(unix)]
         let address = self.storage.address;
         #[cfg(windows)]
@@ -703,8 +703,27 @@ fn gather_thread_count(work_items: usize) -> usize {
         .min(work_items.div_ceil(PARALLEL_GATHER_MIN_ROWS / 2))
 }
 
+/// The read a row-cache miss takes. Fabric storage replaces only this read; coalescing, hits,
+/// and the `[weights][scales]` miss layout are shared.
+enum Miss {
+    Disk(DiskReader),
+    Fabric(super::fabric::Reader),
+}
+
+impl Miss {
+    fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
+        match self {
+            Self::Disk(reader) => reader.gather(planes, ids, output),
+            Self::Fabric(reader) => reader.gather(planes, ids, output),
+        }
+    }
+}
+
 struct CachedReader {
-    disk: DiskReader,
+    // Declared before `miss_output`: a fabric reader's registration of that workspace is
+    // released before the workspace is freed.
+    miss: Miss,
+    stats: Arc<Stats>,
     cache: RowCache,
     requests: Vec<(i64, usize)>,
     miss_ids: Vec<i64>,
@@ -777,7 +796,13 @@ fn copy_cached_hits(
 }
 
 impl CachedReader {
-    fn new(disk: DiskReader, planes: &[Plane; 2], budget: usize, max_rows: usize) -> Result<Self> {
+    fn new(
+        mut miss: Miss,
+        stats: Arc<Stats>,
+        planes: &[Plane; 2],
+        budget: usize,
+        max_rows: usize,
+    ) -> Result<Self> {
         if max_rows == 0 {
             return Err("embedding row cache requires a nonzero gather capacity".into());
         }
@@ -815,21 +840,26 @@ impl CachedReader {
         miss_ids.clear();
         miss_groups.clear();
         hit_groups.clear();
-        let miss_output = allocated(max_rows * row_bytes, 0u8)?;
+        let mut miss_output = allocated(max_rows * row_bytes, 0u8)?;
+        if let Miss::Fabric(reader) = &mut miss {
+            // RDMA READs land in this workspace, never in the CUDA-mapped staging frames.
+            reader.register(&mut miss_output)?;
+        }
         let cache = RowCache::new(
             payload_budget,
             planes[0].nbytes / planes[0].row_bytes,
             row_bytes,
         )?;
         let bytes = cache.bytes() + workspace;
-        disk.stats
+        stats
             .capacity_rows
             .fetch_add(cache.capacity() as u64, Ordering::Relaxed);
-        disk.stats
+        stats
             .cache_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(Self {
-            disk,
+            miss,
+            stats,
             cache,
             requests,
             miss_ids,
@@ -882,16 +912,15 @@ impl CachedReader {
             scales,
             ids.len(),
         );
-        self.disk.stats.hits.fetch_add(hits, Ordering::Relaxed);
-        self.disk
-            .stats
+        self.stats.hits.fetch_add(hits, Ordering::Relaxed);
+        self.stats
             .misses
             .fetch_add(self.miss_ids.len() as u64, Ordering::Relaxed);
         if self.miss_ids.is_empty() {
             return Ok(());
         }
         let count = self.miss_ids.len();
-        self.disk.gather(
+        self.miss.gather(
             planes,
             &self.miss_ids,
             &mut self.miss_output[..count * (weights + scales)],
@@ -906,14 +935,12 @@ impl CachedReader {
                 output[scale_base + row * scales..scale_base + (row + 1) * scales]
                     .copy_from_slice(s);
             }
-            // Only complete successful disk gathers enter the immutable cache.
+            // Only complete successful miss gathers enter the immutable cache.
             let inserted = self.cache.insert(id, w, s);
-            self.disk
-                .stats
+            self.stats
                 .resident_rows
                 .fetch_add(u64::from(inserted.added), Ordering::Relaxed);
-            self.disk
-                .stats
+            self.stats
                 .evictions
                 .fetch_add(u64::from(inserted.evicted), Ordering::Relaxed);
         }
@@ -946,7 +973,7 @@ fn gather_resident_slice(data: &[u8], row_bytes: usize, ids: &[i64], output: &mu
     }
 }
 
-fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
+pub(super) fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
     let data = data.bytes();
     let threads = gather_thread_count(ids.len());
     if threads <= 1 {
@@ -1019,7 +1046,8 @@ impl Reader {
             }
             if cache_bytes != 0 {
                 Data::Cached(Box::new(CachedReader::new(
-                    disk,
+                    Miss::Disk(disk),
+                    stats.clone(),
                     planes,
                     cache_bytes,
                     max_rows,
@@ -1030,6 +1058,42 @@ impl Reader {
         };
         Ok(Self { data, stats })
     }
+    /// Fabric storage: misses read from the store into the row cache's registered workspace.
+    /// The row cache is required; resident scales, when enabled, are loaded from the local
+    /// companions exactly as for disk storage and never read from the store.
+    pub fn from_fabric(
+        files: &[Arc<File>],
+        planes: &[Plane; 2],
+        session: Arc<super::fabric::Session>,
+        table: usize,
+        cache_bytes: usize,
+        max_rows: usize,
+        stats: Arc<Stats>,
+        resident_scales: bool,
+    ) -> Result<Self> {
+        if cache_bytes == 0 {
+            return Err("fabric embedding-table storage requires the row cache".into());
+        }
+        let scales = if resident_scales {
+            let file = files
+                .get(planes[1].file)
+                .ok_or("embedding plane references an unknown file")?;
+            let scales = Resident::load(file, planes[1])?;
+            stats
+                .resident_scale_bytes
+                .fetch_add(planes[1].resident_bytes()? as u64, Ordering::Relaxed);
+            Some(scales)
+        } else {
+            None
+        };
+        let miss = Miss::Fabric(super::fabric::Reader::new(session, table, scales, stats.clone()));
+        let cached = CachedReader::new(miss, stats.clone(), planes, cache_bytes, max_rows)?;
+        Ok(Self {
+            data: Data::Cached(Box::new(cached)),
+            stats,
+        })
+    }
+
     #[cfg(unix)]
     pub(super) fn resident(data: [Arc<Resident>; 2], stats: Arc<Stats>) -> Self {
         Self {

@@ -251,6 +251,9 @@ pub struct FrameCompletion {
     pub proposal_confidence: Option<Vec<Vec<f32>>>,
     /// Verification prefix survival by physical slot; -1 marks an unobserved prefix.
     pub speculative_survival: Option<Vec<Vec<f32>>>,
+    /// A transient Engram store failure observed by this frame. The graph consumed zeroed
+    /// rows only to drain, so every request in the frame fails and its records are discarded.
+    pub engram_failure: Option<Error>,
 }
 
 pub(crate) fn validate_speculative_survival(rows: &[Vec<f32>], records: &[CompletionRecord]) -> Result<()> {
@@ -983,11 +986,17 @@ impl GraphExecutor {
             }
         }
         let pending = frame.pending.take().unwrap();
+        let mut engram_failure = None;
         if crate::engram::consumes(self.manifest.graphs[pending.graph_index].kind) {
             if let Some(engram) = &resources.engram {
                 if let Err(error) = engram.finish(pending.fence.0) {
-                    self.poison = Some(error.clone());
-                    return Err(error);
+                    // A store outage fails this frame's requests; any other reader error
+                    // leaves the layer poisoned and ends the executor.
+                    if !crate::engram::transient(&error) {
+                        self.poison = Some(error.clone());
+                        return Err(error);
+                    }
+                    engram_failure = Some(error);
                 }
             }
         }
@@ -1004,7 +1013,7 @@ impl GraphExecutor {
                 return Err(error);
             }
         };
-        let logprobs = if pending.logprobs != 0 {
+        let logprobs = if pending.logprobs != 0 && engram_failure.is_none() {
             // SAFETY: This frame's transfer event covers its sidecar; the source
             // and pinned destination remain owned until decoding completes.
             let readback = frame.logprobs.as_ref().unwrap();
@@ -1031,7 +1040,10 @@ impl GraphExecutor {
         } else {
             None
         };
-        let prompt_logprobs = if pending.prompt_rows != 0 && !records.iter().any(|r| r.status == 3) {
+        let prompt_logprobs = if pending.prompt_rows != 0
+            && engram_failure.is_none()
+            && !records.iter().any(|r| r.status == 3)
+        {
             // SAFETY: The transfer event covers this frame; decoding precedes its release.
             let bytes = unsafe { frame.prompt_logprobs.as_ref().unwrap().bytes() };
             match decode_prompt_logprobs(bytes, pending.prompt_rows) {
@@ -1133,6 +1145,7 @@ impl GraphExecutor {
             } else {
                 None
             },
+            engram_failure,
         }))
     }
 

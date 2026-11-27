@@ -326,8 +326,11 @@ impl TensorParallelExecutor {
                         if reader.0.len() != self.local.manifest().completion_bytes() {
                             return Err(invalid("rank completion size differs from its ABI"));
                         }
+                        // A peer process escalates its own transient Engram failure to a rank
+                        // failure, which this completion format does not carry.
                         let completion = FrameCompletion {
                             logprobs: None, prompt_logprobs: None, proposal_confidence, speculative_survival,
+                            engram_failure: None,
                             fence, graph_index: graph, timing,
                             records: super::transport::decode_records(reader.0, fence,
                                 self.local.manifest().request_capacity(), self.local.manifest().completion_fields())?,
@@ -366,6 +369,9 @@ impl TensorParallelExecutor {
             } else { agree };
             agreement(&root, &completion).map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
             root.timing.merge_rank(index + 1, completion.timing)?;
+            if root.engram_failure.is_none() {
+                root.engram_failure = completion.engram_failure;
+            }
         }
         root.timing.queued = frame.queued;
         root.timing.wall_ns = frame.dispatched.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -633,6 +639,11 @@ pub unsafe fn serve_rank(
                 }
                 if let Some(completed) = executor.poll()? {
                     started.pop_front();
+                    // Rank zero would decode tokens from this rank's zeroed rows, so a store
+                    // outage in a rank process fails the rank as any reader error does.
+                    if let Some(error) = &completed.engram_failure {
+                        return Err(error.clone());
+                    }
                     channel.send(COMPLETE, &completion(&completed))?;
                 }
                 if prepared_at.is_some_and(|time| time.elapsed() > TIMEOUT) {

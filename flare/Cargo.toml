@@ -11,6 +11,8 @@ publish = false
 roce = ["flare-helios/roce"]
 # The prefix cache pool's data channel may use RDMA when its manager offers it (experimental).
 rdma = ["flare-helios/rdma"]
+# Fabric Engram table storage and the Engram store; links libibverbs.
+engram-rdma = ["flare-helios/engram-rdma"]
 
 [profile.release]
 strip = "symbols"

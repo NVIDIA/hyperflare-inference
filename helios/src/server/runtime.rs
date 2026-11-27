@@ -486,6 +486,8 @@ pub struct ModelRuntime {
     finished: Arc<(Mutex<bool>, Condvar)>,
     metrics: Arc<super::metrics::Metrics>,
     input_store: Option<flare_selene::input::InputStore>,
+    /// Reachability of the Engram store when embedding tables use fabric storage.
+    engram_store: Option<Arc<crate::engram::fabric::Status>>,
 }
 
 impl ModelRuntime {
@@ -555,6 +557,12 @@ impl ModelRuntime {
             .engram
             .as_ref()
             .map(|binding| binding.shared.stats());
+        // Every table group of this process shares one status; rank processes of a
+        // multi-host core report their own outages as rank failures.
+        let engram_store = manifest
+            .engram
+            .as_ref()
+            .and_then(|binding| binding.shared.store_status());
         metrics.persistent_worker = manifest
             .persistent_workers
             .first()
@@ -771,6 +779,7 @@ impl ModelRuntime {
                 shutdown: Mutex::new(None),
                 finished,
                 metrics,
+                engram_store,
             }),
             result => {
                 let shutdown = thread.join().unwrap_or_else(|_| Shutdown {
@@ -797,6 +806,10 @@ impl ModelRuntime {
 
     pub fn healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire)
+    }
+    /// The Engram store state for fabric storage, absent for every other storage mode.
+    pub fn engram_store(&self) -> Option<crate::engram::fabric::StatusSnapshot> {
+        self.engram_store.as_ref().map(|status| status.snapshot())
     }
     pub(super) fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
@@ -851,6 +864,22 @@ impl ModelRuntime {
             return Err(Error::admission(
                 AdmissionError::Unavailable,
                 "prepared model runtime is unavailable",
+            ));
+        }
+        // Fabric storage never falls back to local reads: requests wait for the store.
+        if let Some(store) = &self.engram_store
+            && !store.ready()
+        {
+            let state = store.snapshot();
+            return Err(Error::admission(
+                AdmissionError::EngramUnavailable,
+                match state.last_error {
+                    Some(reason) => format!(
+                        "embedding table store {} is {}: {reason}",
+                        state.endpoint, state.state
+                    ),
+                    None => format!("embedding table store {} is {}", state.endpoint, state.state),
+                },
             ));
         }
         let count = u32::try_from(prompts.len())
@@ -1087,6 +1116,9 @@ struct Worker<'a> {
     preparing_image: Option<RequestHandle>,
     image_preparation_cursor: usize,
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
+    /// Requests whose frame read zeroed embedding rows during an Engram store outage, with
+    /// the error each fails with. Their records in this and later frames carry no tokens.
+    engram_failures: Vec<(RequestHandle, Error)>,
 }
 
 impl<'a> Worker<'a> {
@@ -1123,6 +1155,7 @@ impl<'a> Worker<'a> {
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
+            engram_failures: Vec::new(),
         }
     }
 
@@ -1629,6 +1662,31 @@ impl<'a> Worker<'a> {
         if measured_step.kind != kind {
             return Err("completion graph kind differs from submitted step".into());
         }
+        if let Some(error) = completion.engram_failure.take() {
+            let scheduler = &self.scheduler;
+            self.engram_failures
+                .retain(|(handle, _)| scheduler.request(*handle).is_ok());
+            for lane in &measured_step.lanes {
+                if !self.engram_failures.iter().any(|(handle, _)| *handle == lane.request) {
+                    self.engram_failures.push((lane.request, error.clone()));
+                }
+            }
+        }
+        // The graph of a failed frame consumed zeroed rows, and frames submitted after it
+        // continue from that state, so none of their records may emit tokens. Each becomes
+        // a device-error record at the request's committed progress, which retires the
+        // request without a snapshot.
+        for lane in &measured_step.lanes {
+            if self.engram_failures.iter().any(|(handle, _)| *handle == lane.request)
+                && let Ok(live) = self.scheduler.request(lane.request)
+            {
+                withhold_record(
+                    &mut completion.records[lane.request.slot as usize],
+                    live.consumed_tokens,
+                    live.generated_tokens,
+                );
+            }
+        }
         for (row, lane) in measured_step.lanes.iter().enumerate() {
             let record = &completion.records[lane.request.slot as usize];
             if record.status != 0 {
@@ -1893,9 +1951,15 @@ impl<'a> Worker<'a> {
                         live.reused_prompt_tokens(),
                     );
                     if let Some(error) = live.error_code {
-                        request
-                            .incoming
-                            .fail(ExecutionError::Device { code: error }.into());
+                        let failure = match self
+                            .engram_failures
+                            .iter()
+                            .position(|(handle, _)| *handle == request.request)
+                        {
+                            Some(index) => self.engram_failures.swap_remove(index).1,
+                            None => ExecutionError::Device { code: error }.into(),
+                        };
+                        request.incoming.fail(failure);
                     } else {
                         let mut budget_stop = false;
                         if request.incoming.prompt.reasoning_cut.is_some()
@@ -2833,6 +2897,27 @@ fn admit_with_host_store(
         store.reused(key);
     }
     result
+}
+
+/// Replace a completion record with one that reports a device error at the request's
+/// committed progress and emits no token.
+fn withhold_record(
+    record: &mut crate::execution::CompletionRecord,
+    consumed_tokens: u64,
+    generated_tokens: u32,
+) {
+    record.consumed_tokens = consumed_tokens as i64;
+    record.generated_tokens = i64::from(generated_tokens);
+    record.token_id = -1;
+    record.status = 3;
+    record.error_code = 0;
+    if let Some(vector) = record.vector.as_mut() {
+        vector.emitted_count = 0;
+        vector.offered_drafts = 0;
+        vector.accepted_drafts = 0;
+        vector.copy_offered_mask = 0;
+        vector.tokens.fill(-1);
+    }
 }
 
 fn cancel_stopped(

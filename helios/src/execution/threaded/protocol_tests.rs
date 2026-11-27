@@ -24,6 +24,7 @@ fn completion(fence: u64, graph: usize) -> FrameCompletion {
         prompt_logprobs: None,
         proposal_confidence: None,
         speculative_survival: None,
+        engram_failure: None,
     }
 }
 

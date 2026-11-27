@@ -141,6 +141,7 @@ flare orbit ls | dashboard [--cluster NAME]  groups on the cluster's nodes; thei
 flare trust revoke FINGERPRINT [--trust-store PATH]
 flare models list | inspect | download | downloads | select | remove | gc   manage the prepared-model cache
 flare parallax [--url URL] [--interval-ms MS] [--json | --plain]  monitor live Parallax / persistent worker telemetry
+flare engram-store --package PATH --listen IP:PORT [--tensor-parallel N] [--rank all|N[,N...]]  serve a core's Engram tables over RDMA
 ```
 
 [Local model management](#local-model-management) specifies the `flare models`
@@ -744,7 +745,10 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--mtp-adaptive-verification-alpha ALPHA` | Positive finite exponent on completed prefix-survival scheduling scores; below 1 favors longer verification prefixes | `1.0` |
 | `--mtp-verification-token-budget N` | Select one exact captured packed verification capacity per batch | All captured capacities |
 | `--mtp-max-verification-token-budget N` | Retain all captured packed verification capacities at or below a total-row ceiling | All captured capacities |
-| `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
+| `--embedding-table-storage disk\|ram\|fabric` | PLE and Engram table storage; all modes deliver compact GPU rows. `fabric` reads row-cache misses from an [Engram store](engram-store.md) over RDMA and needs a build with the `engram-rdma` feature | `disk` |
+| `--embedding-table-store HOST:PORT` | Engram store control address; required with `fabric` and rejected otherwise | None |
+| `--embedding-table-store-lanes N` | Queue pairs between this process and the Engram store, 1 to 8 | `4` |
+| `--embedding-table-store-timeout MS` | Engram store connect, control-exchange and per-gather READ timeout in milliseconds | `5000` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
 | `--lossless-kv-compression off\|cpu\|gpu` | Lossless KV-cache checkpoint compression (`off` raw, `cpu` Zstd `ZKV1`, `gpu` core-embedded pure-CUDA rANS `GKV1`); see [prefix-cache-offload.md](prefix-cache-offload.md#0-lossless-kv-compression). | `[prefix_cache] compression`, otherwise `off` |
@@ -796,10 +800,34 @@ weight and scale row sizes; it does not select behavior by model identity.
 Weight rows remain on disk, and a row-cache miss reads
 only the weight plane. The resident scale allocation is additional to
 `--embedding-table-cache-size` and is included in the integrated GPU memory
-budget. This option needs no re-export and requires disk table storage;
-RAM table storage holds both planes in host memory. The metric
+budget. This option needs no re-export and requires disk or fabric table
+storage; RAM table storage holds both planes in host memory. The metric
 `flare_engram_resident_scale_bytes` reports the scale allocation separately from
 the row cache.
+
+`--embedding-table-storage fabric` keeps the row cache, the resident-scale
+default, and the host memory plan of disk storage, and replaces only the
+row-cache miss read: misses are read over RDMA READ from an
+[Engram store](engram-store.md) that holds the same signed core. Its settings
+are validated before CUDA initialization:
+
+| Combination | Result |
+|---|---|
+| `fabric` without `--embedding-table-store` | Rejected: the store endpoint is required |
+| `--embedding-table-store`, `--embedding-table-store-lanes` or `--embedding-table-store-timeout` with `disk` or `ram` | Rejected: the endpoint requires fabric storage |
+| `fabric` with `--embedding-table-cache-size 0` | Rejected: fabric storage requires the row cache |
+| `fabric` with `--embedding-table-workers` | Rejected: workers configure the disk reader |
+| `fabric` with resident scales | Allowed; enabled by default on discrete GPUs, as for `disk` |
+| `fabric` in a build without the `engram-rdma` feature | Rejected: the build has no RDMA support |
+
+Fabric storage never falls back to local reads. A Flare process whose store is
+unreachable starts, reports the store `down`, and rejects requests with HTTP
+503 until the store session is ready; a store that holds another core or
+disagrees with the core's plane layout fails startup. The desktop client's
+runtime settings carry the same choices as `embedding_table_storage`
+(`auto`, `disk`, `ram`, or `fabric`), `embedding_table_store`,
+`embedding_table_store_lanes`, and `embedding_table_store_timeout_ms`; the
+host configuration file has no embedding-table keys.
 
 Ignition exports each recipe's canonical model name as its default serving
 alias, such as `DeepSeek-V4.1-Flash`. Checkpoint selectors such as
@@ -1435,6 +1463,7 @@ Configuration assigns each decision to one owner:
 | Context limit | Checkpoint maximum; admission still requires sufficient shared cache capacity |
 | KV pages and GPU prefix-cache rows | Derived from available memory, graph cost, and concurrency |
 | KV history ceiling | Runtime `--kv-cache-limit` |
+| Embedding-table storage and Engram store | Runtime `--embedding-table-storage` and the `--embedding-table-store` flags |
 | Serving memory budget | Runtime `--memory-limit`, then configured `[memory] reserve`, then the core reserve |
 | Preparation headroom | 1 GiB for compiled warmup and capture, plus 128 KiB per effective prefill token above 4096, including mixed prompt/decode rows |
 | Serving driver margin | 64 MiB after graph upload |

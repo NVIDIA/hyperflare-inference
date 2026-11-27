@@ -1023,7 +1023,7 @@ fn packed_combined_peer_agreement_checks_the_complete_committed_vector() {
     vector.offered_drafts = 1;
     let record = CompletionRecord { generation: 1, submission_sequence: 1, consumed_tokens: 65,
         token_id: -1, status: 1, vector: Some(vector), ..Default::default() };
-    let completion = || FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
+    let completion = || FrameCompletion { engram_failure: None, speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
         records: vec![record.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     for mutation in 0..5 {
         let root = completion(); let mut peer = completion();
@@ -1045,7 +1045,7 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
     let active = CompletionRecord { generation: 1, submission_sequence: 1, consumed_tokens: 65,
         token_id: -1, status: 1, vector: Some(TokenVector { verification_width: 6, tokens: vec![-1; 16], ..Default::default() }),
         ..Default::default() };
-    let mut root = FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
+    let mut root = FrameCompletion { engram_failure: None, speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
         records: vec![active.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     root.records[3].status = 0;
     let mut peer_records = root.records.clone();
@@ -1059,7 +1059,7 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
         let bytes: Vec<_> = records.iter().flat_map(|r| r.fields()).flat_map(i64::to_le_bytes).collect();
         transport::decode_records(&bytes, crate::cache::Fence(1), 4, VECTOR_RECORD_FIELDS).unwrap();
     }
-    let mut peer = FrameCompletion { speculative_survival: None, prompt_logprobs: None, records: peer_records, fence: root.fence, graph_index: root.graph_index,
+    let mut peer = FrameCompletion { engram_failure: None, speculative_survival: None, prompt_logprobs: None, records: peer_records, fence: root.fence, graph_index: root.graph_index,
         timing: Default::default(), logprobs: None, proposal_confidence: None };
     parallel::agree_speculative(&root, &peer).unwrap();
     peer.records[3].generation += 1;

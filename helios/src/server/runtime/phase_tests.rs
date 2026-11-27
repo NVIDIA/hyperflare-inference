@@ -388,6 +388,7 @@ fn completion(
         prompt_logprobs: None,
         proposal_confidence: None,
         speculative_survival: None,
+        engram_failure: None,
         fence: Fence(sequence),
         graph_index: 0,
         timing: Default::default(),
@@ -1289,6 +1290,86 @@ fn output_clock_advances_only_after_stop_buffering_releases_tokens() {
             .last_output_ns,
         published
     );
+}
+
+#[test]
+fn an_engram_store_outage_fails_the_frame_requests_without_emitting_tokens() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, mut generation) = fixture.incoming(vec![0; 13], 4);
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let handle = worker.active[0].as_ref().unwrap().request;
+    advance(&mut worker, GraphKind::Init, 1, None);
+    let before = worker.scheduler.request(handle).unwrap().consumed_tokens;
+    let step = planned(&mut worker, GraphKind::Prefill, 2);
+    // The graph consumed the zeroed rows that let its frame drain and sampled a token.
+    let mut frame = completion(&worker, &step, 2, Some(1));
+    frame.engram_failure = Some(Error::admission(
+        AdmissionError::EngramUnavailable,
+        "embedding table store is unreachable",
+    ));
+    worker.complete(GraphKind::Prefill, frame).unwrap();
+    let live = worker.scheduler.request(handle).unwrap();
+    assert_eq!((live.consumed_tokens, live.generated_tokens), (before, 0));
+    assert!(live.error_code.is_some());
+    worker.publish().unwrap();
+    let mut failed = false;
+    while let Ok(event) = generation.events.try_recv() {
+        match event {
+            GenerationEvent::Error(error) => {
+                assert!(
+                    matches!(error, Error::Admission(AdmissionError::EngramUnavailable(_))),
+                    "{error}"
+                );
+                failed = true;
+            }
+            GenerationEvent::Token(_)
+            | GenerationEvent::LogprobToken(_)
+            | GenerationEvent::Protocol(_)
+            | GenerationEvent::ObservedToken { .. } => {
+                panic!("a failed frame delivered output");
+            }
+            _ => {}
+        }
+    }
+    assert!(failed, "the request did not fail with the store error");
+    assert!(worker.engram_failures.is_empty());
+}
+
+#[test]
+fn withheld_records_emit_no_tokens_and_keep_the_completion_contract() {
+    let mut record = CompletionRecord {
+        generation: 7,
+        submission_sequence: 9,
+        consumed_tokens: 130,
+        generated_tokens: 5,
+        token_id: 42,
+        status: 1,
+        error_code: 0,
+        reserved: 0,
+        vector: Some(crate::execution::TokenVector {
+            emitted_count: 2,
+            offered_drafts: 3,
+            accepted_drafts: 1,
+            copy_offered_mask: 5,
+            model_reserved: -1,
+            draft_cache_consumed: -1,
+            verification_width: 4,
+            tokens: vec![41, 42, -1, -1],
+        }),
+    };
+    withhold_record(&mut record, 128, 3);
+    assert_eq!(
+        (record.status, record.token_id, record.consumed_tokens, record.generated_tokens),
+        (3, -1, 128, 3)
+    );
+    assert_eq!((record.generation, record.submission_sequence), (7, 9));
+    let vector = record.vector.as_ref().unwrap();
+    assert_eq!((vector.emitted_count, vector.offered_drafts, vector.accepted_drafts), (0, 0, 0));
+    assert!(vector.tokens.iter().all(|token| *token == -1));
+    record.validate_vector().unwrap();
 }
 
 #[test]
@@ -4804,6 +4885,11 @@ async fn http_admission_rejections_use_json_or_terminal_stream_errors() {
                 "server_unavailable",
             ),
             (
+                Error::admission(AdmissionError::EngramUnavailable, "store unreachable"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "embedding_store_unavailable",
+            ),
+            (
                 Error::admission(AdmissionError::Context, "too long"),
                 StatusCode::BAD_REQUEST,
                 "context_length_exceeded",
@@ -4843,6 +4929,11 @@ async fn http_admission_rejections_use_json_or_terminal_stream_errors() {
                     .to_str()
                     .unwrap()
                     .starts_with("cmpl-")
+            );
+            // Only an unstarted response can carry a status and retry hint for a store outage.
+            assert_eq!(
+                response.headers().get("retry-after").map(|value| value.to_str().unwrap()),
+                (!stream && code == "embedding_store_unavailable").then_some("1"),
             );
             let bytes = axum::body::to_bytes(response.into_body(), 65536)
                 .await

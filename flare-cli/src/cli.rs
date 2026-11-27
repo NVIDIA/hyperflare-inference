@@ -74,6 +74,68 @@ pub enum Command {
     /// Monitor live Parallax expert-movement and persistent-worker telemetry.
     #[command(alias = "worker")]
     Parallax(ParallaxArgs),
+    /// Hold a core's Engram embedding tables in this host's RAM and serve them over RDMA to
+    /// Flare processes using fabric embedding-table storage.
+    EngramStore(Box<EngramStore>),
+}
+
+/// Ranks an Engram store serves: every rank of the deployment, or the listed ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreRanks(pub Option<Vec<usize>>);
+
+fn store_ranks(value: &str) -> Result<StoreRanks, String> {
+    if value == "all" {
+        return Ok(StoreRanks(None));
+    }
+    let ranks = value
+        .split(',')
+        .map(|rank| rank.trim().parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "ranks must be all or N[,N...]".to_owned())?;
+    if ranks.is_empty() || (1..ranks.len()).any(|index| ranks[..index].contains(&ranks[index])) {
+        return Err("ranks must be all or distinct N[,N...]".into());
+    }
+    Ok(StoreRanks(Some(ranks)))
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "Example:\n  flare engram-store --package /models/deepseek-v41 --listen 10.0.0.5:7700 --tensor-parallel 4\n\nThe store verifies the core's signature, then page-locks every table byte it serves; its\nlocked-memory limit (ulimit -l, or LimitMEMLOCK) must cover them, so it is normally unlimited.\nThe RDMA fabric between store and serving hosts is trusted: READs are neither encrypted nor\nauthenticated.")]
+pub struct EngramStore {
+    /// Local core holding the Engram tables to serve; the same signed core the serving hosts load.
+    #[arg(long, value_name = "PATH")]
+    pub package: PathBuf,
+
+    /// Control listener: an address of the RoCE interface the store serves from, and a port.
+    #[arg(long, value_name = "IP:PORT")]
+    pub listen: std::net::SocketAddr,
+
+    /// Ranks to serve [default: all].
+    #[arg(long, value_name = "all|N[,N...]", default_value = "all", value_parser = store_ranks)]
+    pub rank: StoreRanks,
+
+    /// Tensor-parallel size of the deployment to serve [default: the core's sole deployment].
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub tensor_parallel: Option<u32>,
+
+    /// Additional publisher verification profiles (JSON); does not grant execution trust.
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub publisher_keys: Vec<PathBuf>,
+
+    /// Verify stored table ranges against the signed digests before serving them.
+    #[arg(long)]
+    pub verify_weights: bool,
+
+    /// Permanently accept this exact signing key together with --dangerously-accept-publisher.
+    #[arg(long, requires = "dangerously_accept_publisher", value_name = "FINGERPRINT")]
+    pub dangerously_approve_key: Option<String>,
+
+    /// Exact Hugging Face publisher namespace acknowledged for unattended first use.
+    #[arg(long, requires = "dangerously_approve_key", value_name = "NAMESPACE")]
+    pub dangerously_accept_publisher: Option<String>,
+
+    /// Persistent trust file [default: ~/.config/flare/trust.toml].
+    #[arg(long, value_name = "PATH")]
+    pub trust_store: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -735,7 +797,7 @@ pub enum TrustCommand {
 #[derive(Debug, Args)]
 #[command(
     args_override_self = true,
-    after_help = "Examples:\n  flare run model.safetensors --gpus 0 --host 127.0.0.1 --port 8000\n  flare run model.safetensors --embedding-table-storage ram --mtp-draft-tokens 3\n\nConcurrency and draft limits must fit the core's prepared capacities.\nOmitted options use host configuration, then core defaults."
+    after_help = "Examples:\n  flare run model.safetensors --gpus 0 --host 127.0.0.1 --port 8000\n  flare run model.safetensors --embedding-table-storage ram --mtp-draft-tokens 3\n  flare run model.safetensors --embedding-table-storage fabric --embedding-table-store 10.0.0.5:7700\n\nConcurrency and draft limits must fit the core's prepared capacities.\nOmitted options use host configuration, then core defaults."
 )]
 pub struct Run {
     /// Local core, MODEL[@VERSION], or Hugging Face repository; local models resolve first.
@@ -921,11 +983,31 @@ pub struct ServingOptions {
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub max_concurrency: Option<NonZeroUsize>,
 
-    /// Storage for auxiliary embedding tables (PLE/Engram) [default: disk].
+    /// Storage for auxiliary embedding tables (PLE/Engram) [default: disk]. fabric reads row-cache
+    /// misses over RDMA from an Engram store host and requires --embedding-table-store.
     #[arg(long, value_name = "MODE", help_heading = "Serving options",
-        value_parser = PossibleValuesParser::new(["disk", "ram"])
-            .map(|value| if value == "disk" { Storage::Disk } else { Storage::Ram }))]
+        value_parser = PossibleValuesParser::new(["disk", "ram", "fabric"])
+            .map(|value| match value.as_str() {
+                "disk" => Storage::Disk,
+                "ram" => Storage::Ram,
+                _ => Storage::Fabric,
+            }))]
     pub embedding_table_storage: Option<Storage>,
+
+    /// Engram store control address for fabric embedding-table storage; requests are rejected
+    /// while it is unreachable.
+    #[arg(long, value_name = "HOST:PORT", help_heading = "Serving options")]
+    pub embedding_table_store: Option<String>,
+
+    /// Queue pairs between this process and the Engram store, 1 to 8 [default: 4].
+    #[arg(long, value_name = "N", help_heading = "Serving options",
+        value_parser = clap::value_parser!(u8).range(1..=8))]
+    pub embedding_table_store_lanes: Option<u8>,
+
+    /// Engram store connect and single-read timeout in milliseconds [default: 5000].
+    #[arg(long, value_name = "MS", help_heading = "Serving options",
+        value_parser = clap::value_parser!(u64).range(1..=600_000))]
+    pub embedding_table_store_timeout: Option<u64>,
 
     /// Per-host RAM budget for disk-backed embedding rows, including index, counters and miss
     /// workspace; 0 disables [default: 4GiB on discrete GPUs, 1GiB on unified-memory GPUs].
@@ -1178,13 +1260,22 @@ impl ServingOptions {
         if let Some(storage) = self.embedding_table_storage {
             options.extend([
                 "--embedding-table-storage".into(),
-                if storage == Storage::Disk {
-                    "disk"
-                } else {
-                    "ram"
+                match storage {
+                    Storage::Disk => "disk",
+                    Storage::Ram => "ram",
+                    Storage::Fabric => "fabric",
                 }
                 .into(),
             ]);
+        }
+        if let Some(address) = &self.embedding_table_store {
+            options.extend(["--embedding-table-store".into(), address.clone()]);
+        }
+        if let Some(lanes) = self.embedding_table_store_lanes {
+            options.extend(["--embedding-table-store-lanes".into(), lanes.to_string()]);
+        }
+        if let Some(timeout) = self.embedding_table_store_timeout {
+            options.extend(["--embedding-table-store-timeout".into(), timeout.to_string()]);
         }
         if let Some(workers) = self.embedding_table_workers {
             options.extend(["--embedding-table-workers".into(), workers.to_string()]);
@@ -1250,6 +1341,9 @@ impl ServingOptions {
                 None
             },
             embedding_table_workers: self.embedding_table_workers,
+            embedding_table_store: self.embedding_table_store.clone(),
+            embedding_table_store_lanes: self.embedding_table_store_lanes.map(usize::from),
+            embedding_table_store_timeout_ms: self.embedding_table_store_timeout,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
             history_drafts: if self.history_drafts {
@@ -1590,6 +1684,82 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn fabric_storage_flags_reach_the_loader_and_every_rank() {
+        let absent = run(&["flare", "run", "model.safetensors"]);
+        let options = absent.load_options();
+        assert_eq!(
+            (
+                options.embedding_table_store.as_deref(),
+                options.embedding_table_store_lanes,
+                options.embedding_table_store_timeout_ms
+            ),
+            (None, None, None)
+        );
+        assert!(!absent.rank_options().iter().any(|value| value.starts_with("--embedding-table-store")));
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--embedding-table-storage",
+            "fabric",
+            "--embedding-table-store",
+            "10.0.0.5:7700",
+            "--embedding-table-store-lanes",
+            "2",
+            "--embedding-table-store-timeout",
+            "750",
+        ]);
+        let options = args.load_options();
+        assert_eq!(options.embedding_table_storage, Some(Storage::Fabric));
+        let endpoint = options.embedding_store().unwrap();
+        assert_eq!(
+            (endpoint.address.as_str(), endpoint.lanes, endpoint.timeout.as_millis()),
+            ("10.0.0.5:7700", 2, 750)
+        );
+        let forwarded = args.rank_options();
+        for pair in [
+            ["--embedding-table-storage", "fabric"],
+            ["--embedding-table-store", "10.0.0.5:7700"],
+            ["--embedding-table-store-lanes", "2"],
+            ["--embedding-table-store-timeout", "750"],
+        ] {
+            assert!(forwarded.windows(2).any(|values| values == pair), "{pair:?}: {forwarded:?}");
+        }
+        for (flag, value) in [
+            ("--embedding-table-store-lanes", "0"),
+            ("--embedding-table-store-lanes", "9"),
+            ("--embedding-table-store-timeout", "0"),
+            ("--embedding-table-storage", "remote"),
+        ] {
+            assert!(Cli::try_parse_from(["flare", "run", "model.safetensors", flag, value]).is_err(), "{flag} {value}");
+        }
+    }
+
+    #[test]
+    fn engram_store_arguments_select_ranks_and_require_a_listener() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["flare", "engram-store", "--package", "/models/core", "--listen", "10.0.0.5:7700"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).map(|cli| cli.command) {
+                Ok(Command::EngramStore(store)) => Ok(*store),
+                Ok(_) => panic!("parsed another command"),
+                Err(error) => Err(error),
+            }
+        };
+        let store = parse(&[]).unwrap();
+        assert_eq!(store.rank, StoreRanks(None));
+        assert_eq!(store.listen, "10.0.0.5:7700".parse().unwrap());
+        assert_eq!(store.tensor_parallel, None);
+        assert_eq!(parse(&["--rank", "all"]).unwrap().rank, StoreRanks(None));
+        assert_eq!(parse(&["--rank", "0,2", "--tensor-parallel", "4"]).unwrap().rank, StoreRanks(Some(vec![0, 2])));
+        for ranks in ["", "1,1", "a", "-1"] {
+            assert!(parse(&["--rank", ranks]).is_err(), "{ranks}");
+        }
+        assert!(Cli::try_parse_from(["flare", "engram-store", "--package", "/models/core"]).is_err());
+        assert!(parse(&["--dangerously-approve-key", "abc"]).is_err());
     }
 
     #[test]

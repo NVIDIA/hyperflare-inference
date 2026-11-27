@@ -1492,6 +1492,11 @@ fn stream_errors_preserve_typed_codes_and_protocol_envelopes() {
             "server_unavailable",
         ),
         (
+            Error::admission(AdmissionError::EngramUnavailable, "store unreachable"),
+            "server_error",
+            "embedding_store_unavailable",
+        ),
+        (
             Error::admission(AdmissionError::Context, "too long"),
             "invalid_request_error",
             "context_length_exceeded",

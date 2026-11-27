@@ -28,6 +28,9 @@ roce = ["runtime-core", "dep:cc"]
 # Lets the prefix cache pool's data channel use RDMA when its manager offers it (experimental);
 # links libibverbs.
 rdma = ["flare-selene/rdma"]
+# Fabric Engram table storage: reads row-cache misses over RDMA READ from an Engram store host,
+# and serves the store; links libibverbs.
+engram-rdma = ["runtime-core", "dep:ibverbs-sys"]
 
 [dependencies]
 rayon = "1.12"
@@ -64,6 +67,7 @@ llguidance = { version = "=1.9.1", default-features = false, features = ["lark",
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 crossterm = { version = "0.28", default-features = false, optional = true }
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
+ibverbs-sys = { version = "0.3.2", optional = true }
 
 [dev-dependencies]
 flare-selene = { path = "../selene", features = ["test-support"] }

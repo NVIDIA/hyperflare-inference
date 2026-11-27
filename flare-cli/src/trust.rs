@@ -25,6 +25,37 @@ pub fn load_metadata(
 ) -> Result<(AuthorizedCore, Publisher)> {
     load_with(root, args, progress, origin, false)
 }
+/// What selects and authorizes a core: the serving command's or the Engram store's options.
+struct Verification<'a> {
+    review: ReviewOptions,
+    approve_key: Option<&'a String>,
+    accept_publisher: Option<&'a String>,
+    verify_weights: bool,
+}
+
+/// Authenticate the core an Engram store serves, with the same publisher review and consent as
+/// `flare run`. Every rank of the selected deployment is authorized.
+pub fn load_store(
+    root: &Path,
+    args: &crate::cli::EngramStore,
+    progress: &mut flare_helios::startup::StartupProgress,
+) -> Result<(AuthorizedCore, Publisher)> {
+    let verification = Verification {
+        review: ReviewOptions {
+            publisher_keys: args.publisher_keys.clone(),
+            profiles: Vec::new(),
+            hub: Default::default(),
+            trust_store: args.trust_store.clone(),
+            rank: None,
+            tensor_parallel: args.tensor_parallel,
+        },
+        approve_key: args.dangerously_approve_key.as_ref(),
+        accept_publisher: args.dangerously_accept_publisher.as_ref(),
+        verify_weights: args.verify_weights,
+    };
+    verify(root, &verification, progress, None, true)
+}
+
 fn load_with(
     root: &Path,
     args: &crate::cli::Run,
@@ -42,10 +73,8 @@ fn load_with(
         args.hub.tensor_parallel.first().copied().or_else(|| {
             (args.rank.is_none() && !args.gpus.is_empty()).then(|| args.gpus.len() as u32)
         });
-    let phase = progress.phase("Verify core", None);
-    let review = flare::trust::review(
-        root,
-        &ReviewOptions {
+    let verification = Verification {
+        review: ReviewOptions {
             publisher_keys: args.publisher_keys.clone(),
             profiles: Vec::new(),
             hub: (&args.hub).into(),
@@ -53,7 +82,22 @@ fn load_with(
             rank: args.rank.filter(|&rank| rank != 0),
             tensor_parallel,
         },
-    )?;
+        approve_key: args.dangerously_approve_key.as_ref(),
+        accept_publisher: args.dangerously_accept_publisher.as_ref(),
+        verify_weights: args.verify_weights,
+    };
+    verify(root, &verification, progress, origin, verify_payloads)
+}
+
+fn verify(
+    root: &Path,
+    args: &Verification<'_>,
+    progress: &mut flare_helios::startup::StartupProgress,
+    origin: Option<&str>,
+    verify_payloads: bool,
+) -> Result<(AuthorizedCore, Publisher)> {
+    let phase = progress.phase("Verify core", None);
+    let review = flare::trust::review(root, &args.review)?;
     let signatures = review.core().signature_count();
     phase.finish(format!(
         "{signatures} {}",
@@ -74,7 +118,7 @@ fn load_with(
             );
         }
     }
-    let explicit = match (&args.dangerously_approve_key, &args.dangerously_accept_publisher) {
+    let explicit = match (args.approve_key, args.accept_publisher) {
         (Some(key), Some(owner)) if key == &disclosure.fingerprint && owner == &disclosure.namespace => Some(owner.clone()),
         (None, None) => None,
         _ => return Err("--dangerously-approve-key and --dangerously-accept-publisher must exactly match the authenticated key and namespace".into()),

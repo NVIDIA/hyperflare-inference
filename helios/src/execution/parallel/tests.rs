@@ -349,6 +349,7 @@ fn completed(status: i64) -> FrameCompletion {
         prompt_logprobs: None,
         proposal_confidence: None,
         speculative_survival: None,
+        engram_failure: None,
         fence: Fence(3),
         graph_index: 2,
         timing: Default::default(),

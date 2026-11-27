@@ -19,6 +19,7 @@ mod core_cache;
 #[cfg(unix)]
 mod distribution;
 mod doctor;
+mod engram_store;
 mod environment;
 #[cfg(unix)]
 mod fabric;
@@ -56,6 +57,8 @@ extern "C" fn stop(_: libc::c_int) {
 
 #[cfg(all(feature = "roce", not(target_os = "linux")))]
 compile_error!("the roce feature requires Linux");
+#[cfg(all(feature = "engram-rdma", not(target_os = "linux")))]
+compile_error!("the engram-rdma feature requires Linux");
 
 fn main() -> std::process::ExitCode {
     match run() {
@@ -109,6 +112,10 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         }
         cli::Command::Parallax(args) => {
             parallax::run(args)?;
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        cli::Command::EngramStore(args) => {
+            engram_store::run(*args)?;
             return Ok(std::process::ExitCode::SUCCESS);
         }
         cli::Command::HardwareRevision { gpu_count } => {
