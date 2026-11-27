@@ -560,8 +560,8 @@ capacity: the smallest catalog capacity covering the chunk's remaining tokens,
 falling back to the largest catalog capacity when none does. Pure prefill
 dispatch discovers only the natural-fit capacity, and an atomic span can make
 the natural fit smaller than the pricing capacity. An unmeasured pricing
-capacity leaves the prefill cost unknown. Unknown prefill costs and
-unknown or stale snapshot-copy costs disable extras while preserving anchor
+capacity that adds work leaves the prefill cost unknown. Unknown prefill costs
+and unknown or stale snapshot-copy costs disable extras while preserving anchor
 eligibility. Productive completed decode earns the same fraction of measured
 time for a distinct terminal capture. There is no fixed capture count or
 concurrency-based snapshot share.

@@ -332,10 +332,9 @@ impl RequestScheduler {
                 } else {
                     entry.non_terminal_ns
                 };
-                // An unmeasured capacity other than this step's pricing capacity is
-                // skipped: the pricing capacity covers at least as much work, so the
-                // skip loses no capacity that could cover more. An unmeasured pricing
-                // capacity makes the price unknown.
+                // Only an unmeasured pricing capacity that adds work makes the price
+                // unknown: the pricing capacity covers at least as much work, so the
+                // skip loses no capacity that could cover more.
                 let Some(nanos) = nanos else {
                     if !adds_work || Some(entry.capacity) != target_capacity {
                         continue;
