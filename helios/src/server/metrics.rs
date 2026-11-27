@@ -231,11 +231,24 @@ pub(super) const TOKEN_SECONDS: Buckets<19> = Buckets {
     scale: 1e9,
 };
 
-pub(super) const PROMPT_TOKENS: Buckets<21> = Buckets {
+pub(super) const TOKEN_COUNTS: Buckets<21> = Buckets {
     bounds: [
         1.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0,
         32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0, 2097152.0, f64::INFINITY,
     ],
+    scale: 1.0,
+};
+
+/// vLLM's preemption-count bounds with a leading zero bound, so never-preempted
+/// requests stay separate from requests preempted once.
+pub(super) const PREEMPTION_COUNTS: Buckets<9> = Buckets {
+    bounds: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, f64::INFINITY],
+    scale: 1.0,
+};
+
+/// vLLM's bounds for the `n` request parameter.
+pub(super) const CHOICE_COUNTS: Buckets<6> = Buckets {
+    bounds: [1.0, 2.0, 5.0, 10.0, 20.0, f64::INFINITY],
     scale: 1.0,
 };
 
@@ -267,6 +280,18 @@ impl<const N: usize> Histogram<N> {
             .unwrap_or(N - 1);
         self.counts[index].fetch_add(1, Ordering::Relaxed);
         self.sum.fetch_add(value, Ordering::Relaxed);
+    }
+
+    /// Adds the observations of `other`, which shares this histogram's buckets.
+    fn absorb(&self, other: &Self) {
+        for (count, added) in self.counts.iter().zip(&other.counts) {
+            let added = added.load(Ordering::Relaxed);
+            if added != 0 {
+                count.fetch_add(added, Ordering::Relaxed);
+            }
+        }
+        self.sum
+            .fetch_add(other.sum.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub(super) fn render(&self, text: &mut String, name: &str, help: &str, buckets: &Buckets<N>) {
@@ -304,6 +329,47 @@ pub(super) struct RequestTimes {
     pub last_token_ns: u64,
 }
 
+/// Values a request accumulates for the completion histograms. The record moves
+/// with the request through preemption and readmission and is observed once, by
+/// [`Metrics::request_completed`], only if the request completes successfully.
+#[derive(Default)]
+pub(super) struct RequestRecord {
+    pub times: RequestTimes,
+    /// Output token limit at first admission, including tokens allowed after a
+    /// reasoning budget.
+    pub max_tokens: u32,
+    /// Times the request was preempted and parked for readmission.
+    pub preemptions: u32,
+    /// Intervals between successive model steps that committed generated tokens
+    /// for the request, merged into the server histogram on completion.
+    inter_token: Histogram<19>,
+}
+
+impl RequestRecord {
+    /// Records a model step that committed at least one generated token for the
+    /// request at `now_ns`: the first stamps the first token, each later one adds
+    /// one inter-token interval, however many tokens the step committed.
+    pub(super) fn tokens_committed(&mut self, now_ns: u64) {
+        if self.times.first_token_ns.is_some() {
+            self.inter_token.observe(
+                &TOKEN_SECONDS,
+                now_ns.saturating_sub(self.times.last_token_ns),
+            );
+        } else {
+            self.times.first_token_ns = Some(now_ns);
+        }
+        self.times.last_token_ns = now_ns;
+    }
+}
+
+/// Token counts of one successfully completed request.
+pub(super) struct CompletedRequest {
+    pub prompt_tokens: usize,
+    /// Prompt tokens supplied by GPU or host prefix reuse at first admission.
+    pub reused_prompt_tokens: u64,
+    pub generated_tokens: u32,
+}
+
 #[derive(Default)]
 pub(super) struct Metrics {
     pub scheduler_trace: scheduler::SchedulerMetrics,
@@ -323,12 +389,21 @@ pub(super) struct Metrics {
     pub admitted: AtomicU64,
     pub http_requests: [AtomicU64; 5],
     pub completed: AtomicU64,
-    pub(super) request_e2e: Histogram<21>,
+    request_e2e: Histogram<21>,
+    request_choices: Histogram<6>,
+    request_max_choice_generated_tokens: Histogram<21>,
     request_queue: Histogram<21>,
     request_prefill: Histogram<21>,
     request_decode: Histogram<21>,
+    request_inference: Histogram<21>,
+    time_to_first_token: Histogram<21>,
     time_per_output_token: Histogram<19>,
+    inter_token_latency: Histogram<19>,
     request_prompt_tokens: Histogram<21>,
+    request_prefill_computed_tokens: Histogram<21>,
+    request_generated_tokens: Histogram<21>,
+    request_max_tokens: Histogram<21>,
+    request_preemptions: Histogram<9>,
     pub reasoning_budget_cuts: AtomicU64,
     pub cancelled: AtomicU64,
     pub failed: AtomicU64,
@@ -451,19 +526,45 @@ impl Metrics {
     pub(super) fn request_completed(
         &self,
         arrival_ns: u64,
-        times: RequestTimes,
-        prompt_tokens: usize,
-        generated_tokens: u32,
+        record: &RequestRecord,
+        completed: CompletedRequest,
     ) {
+        let CompletedRequest {
+            prompt_tokens,
+            reused_prompt_tokens,
+            generated_tokens,
+        } = completed;
+        let times = record.times;
         self.completed.fetch_add(1, Ordering::Relaxed);
         self.request_prompt_tokens
-            .observe(&PROMPT_TOKENS, prompt_tokens as u64);
+            .observe(&TOKEN_COUNTS, prompt_tokens as u64);
+        self.request_prefill_computed_tokens.observe(
+            &TOKEN_COUNTS,
+            (prompt_tokens as u64).saturating_sub(reused_prompt_tokens),
+        );
+        self.request_generated_tokens
+            .observe(&TOKEN_COUNTS, u64::from(generated_tokens));
+        if record.max_tokens > 0 {
+            self.request_max_tokens
+                .observe(&TOKEN_COUNTS, u64::from(record.max_tokens));
+        }
+        self.request_preemptions
+            .observe(&PREEMPTION_COUNTS, u64::from(record.preemptions));
+        self.inter_token_latency.absorb(&record.inter_token);
+        if let Some(first) = times.first_token_ns {
+            self.time_to_first_token
+                .observe(&REQUEST_SECONDS, first.saturating_sub(arrival_ns));
+        }
         if let Some(scheduled) = times.first_scheduled_ns {
             self.request_queue
                 .observe(&REQUEST_SECONDS, scheduled.saturating_sub(arrival_ns));
             if let Some(first) = times.first_token_ns {
                 self.request_prefill
                     .observe(&REQUEST_SECONDS, first.saturating_sub(scheduled));
+                self.request_inference.observe(
+                    &REQUEST_SECONDS,
+                    times.last_token_ns.saturating_sub(scheduled),
+                );
             }
         }
         if let Some(first) = times.first_token_ns
@@ -474,6 +575,21 @@ impl Metrics {
             self.time_per_output_token.observe(
                 &TOKEN_SECONDS,
                 decode / u64::from(generated_tokens - 1),
+            );
+        }
+    }
+
+    /// Records one successful HTTP generation response delivered `elapsed_ns`
+    /// after admission. `generated` holds each choice's generated-token count in
+    /// response order, `choices` consecutive choices per prompt.
+    pub(super) fn response_completed(&self, elapsed_ns: u64, choices: usize, generated: &[u32]) {
+        self.request_e2e.observe(&REQUEST_SECONDS, elapsed_ns);
+        for prompt in generated.chunks(choices) {
+            self.request_choices
+                .observe(&CHOICE_COUNTS, choices as u64);
+            self.request_max_choice_generated_tokens.observe(
+                &TOKEN_COUNTS,
+                u64::from(prompt.iter().copied().max().unwrap_or(0)),
             );
         }
     }
@@ -1406,20 +1522,73 @@ impl Metrics {
                 "request_decode_seconds",
                 "First to last committed generated token, for completed requests with at least two generated tokens.",
             ),
+            (
+                &self.request_inference,
+                "request_inference_seconds",
+                "First model step that includes the request to its last committed generated token, for completed requests.",
+            ),
+            (
+                &self.time_to_first_token,
+                "time_to_first_token_seconds",
+                "Model-scheduler arrival to the first committed generated token, for completed requests.",
+            ),
         ] {
             histogram.render(&mut text, name, help, &REQUEST_SECONDS);
         }
-        self.time_per_output_token.render(
+        for (histogram, name, help) in [
+            (
+                &self.time_per_output_token,
+                "time_per_output_token_seconds",
+                "Decode time divided by generated tokens after the first, for completed requests with at least two generated tokens.",
+            ),
+            (
+                &self.inter_token_latency,
+                "inter_token_latency_seconds",
+                "Interval between successive model steps that committed generated tokens for a request, observed once per step after the first, for completed requests.",
+            ),
+        ] {
+            histogram.render(&mut text, name, help, &TOKEN_SECONDS);
+        }
+        for (histogram, name, help) in [
+            (
+                &self.request_prompt_tokens,
+                "request_prompt_tokens",
+                "Prompt tokens per completed request, including tokens reused from the prefix cache.",
+            ),
+            (
+                &self.request_prefill_computed_tokens,
+                "request_prefill_computed_tokens",
+                "Prompt tokens per completed request minus the tokens GPU or host prefix reuse supplied at its first admission.",
+            ),
+            (
+                &self.request_generated_tokens,
+                "request_generated_tokens",
+                "Committed generated tokens per completed request, including EOS and tokens withheld by text stops.",
+            ),
+            (
+                &self.request_max_tokens,
+                "request_max_tokens",
+                "Output token limit of each completed request: the client's limit, else the server default capped by the remaining context.",
+            ),
+            (
+                &self.request_max_choice_generated_tokens,
+                "request_max_choice_generated_tokens",
+                "Largest generated-token count among the choices of one prompt, for successful HTTP generation responses.",
+            ),
+        ] {
+            histogram.render(&mut text, name, help, &TOKEN_COUNTS);
+        }
+        self.request_choices.render(
             &mut text,
-            "time_per_output_token_seconds",
-            "Decode time divided by generated tokens after the first, for completed requests with at least two generated tokens.",
-            &TOKEN_SECONDS,
+            "request_choices",
+            "Requested choices (the n parameter) per prompt, for successful HTTP generation responses.",
+            &CHOICE_COUNTS,
         );
-        self.request_prompt_tokens.render(
+        self.request_preemptions.render(
             &mut text,
-            "request_prompt_tokens",
-            "Prompt tokens per completed request, including tokens reused from the prefix cache.",
-            &PROMPT_TOKENS,
+            "request_preemptions",
+            "Times each completed request was preempted and readmitted.",
+            &PREEMPTION_COUNTS,
         );
         for (name, help, value) in [
             (
@@ -1650,15 +1819,25 @@ mod tests {
     #[test]
     fn request_histograms_bucket_completed_request_timings() {
         let metrics = Metrics::new(0, 0, 0, 16);
+        let mut record = RequestRecord {
+            max_tokens: 256,
+            preemptions: 1,
+            ..Default::default()
+        };
+        record.times.first_scheduled_ns = Some(1_250_000_000);
+        // Three committing steps: the first token, then a step committing several
+        // tokens and a final step, which add two inter-token intervals.
+        for now_ns in [1_750_000_000, 2_000_000_000, 2_750_000_000] {
+            record.tokens_committed(now_ns);
+        }
         metrics.request_completed(
             1_000_000_000,
-            RequestTimes {
-                first_scheduled_ns: Some(1_250_000_000),
-                first_token_ns: Some(1_750_000_000),
-                last_token_ns: 2_750_000_000,
+            &record,
+            CompletedRequest {
+                prompt_tokens: 3000,
+                reused_prompt_tokens: 1000,
+                generated_tokens: 101,
             },
-            3000,
-            101,
         );
         let text = metrics.render();
         for expected in [
@@ -1666,10 +1845,27 @@ mod tests {
             "flare_request_queue_seconds_bucket{le=\"0.1\"} 0",
             "flare_request_prefill_seconds_bucket{le=\"0.5\"} 1",
             "flare_request_decode_seconds_sum 1",
+            "flare_request_inference_seconds_bucket{le=\"2.5\"} 1",
+            "flare_request_inference_seconds_bucket{le=\"1\"} 0",
+            "flare_request_inference_seconds_sum 1.5",
+            "flare_time_to_first_token_seconds_bucket{le=\"1\"} 1",
+            "flare_time_to_first_token_seconds_bucket{le=\"0.5\"} 0",
             "flare_time_per_output_token_seconds_bucket{le=\"0.01\"} 1",
             "flare_time_per_output_token_seconds_bucket{le=\"0.0075\"} 0",
+            "flare_inter_token_latency_seconds_bucket{le=\"0.3\"} 1",
+            "flare_inter_token_latency_seconds_bucket{le=\"1\"} 2",
+            "flare_inter_token_latency_seconds_sum 1",
+            "flare_inter_token_latency_seconds_count 2",
             "flare_request_prompt_tokens_bucket{le=\"4096\"} 1",
             "flare_request_prompt_tokens_bucket{le=\"2048\"} 0",
+            "flare_request_prefill_computed_tokens_bucket{le=\"2048\"} 1",
+            "flare_request_prefill_computed_tokens_bucket{le=\"1024\"} 0",
+            "flare_request_prefill_computed_tokens_sum 2000",
+            "flare_request_generated_tokens_bucket{le=\"128\"} 1",
+            "flare_request_generated_tokens_bucket{le=\"64\"} 0",
+            "flare_request_max_tokens_sum 256",
+            "flare_request_preemptions_bucket{le=\"0\"} 0",
+            "flare_request_preemptions_bucket{le=\"1\"} 1",
             "flare_requests_completed_total 1",
         ] {
             assert!(
@@ -1678,15 +1874,52 @@ mod tests {
             );
         }
         // A zero-token completion reaches no model step and commits no token, so it
-        // adds only a prompt-size observation.
-        metrics.request_completed(1_000_000_000, RequestTimes::default(), 3000, 0);
+        // adds only token-count and preemption observations.
+        metrics.request_completed(
+            1_000_000_000,
+            &RequestRecord::default(),
+            CompletedRequest {
+                prompt_tokens: 3000,
+                reused_prompt_tokens: 0,
+                generated_tokens: 0,
+            },
+        );
         let text = metrics.render();
         for expected in [
             "flare_request_queue_seconds_count 1",
             "flare_request_prefill_seconds_count 1",
+            "flare_request_inference_seconds_count 1",
+            "flare_time_to_first_token_seconds_count 1",
             "flare_request_decode_seconds_count 1",
+            "flare_inter_token_latency_seconds_count 2",
+            "flare_request_max_tokens_count 1",
             "flare_request_prompt_tokens_count 2",
+            "flare_request_prefill_computed_tokens_sum 5000",
+            "flare_request_generated_tokens_bucket{le=\"1\"} 1",
+            "flare_request_preemptions_bucket{le=\"0\"} 1",
             "flare_requests_completed_total 2",
+        ] {
+            assert!(
+                text.contains(&format!("\n{expected}\n")),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_histograms_count_choices_and_largest_choice_per_prompt() {
+        let metrics = Metrics::new(0, 0, 0, 16);
+        // Two prompts with two choices each, as a completions batch orders them.
+        metrics.response_completed(300_000_000, 2, &[3, 9, 0, 4]);
+        metrics.response_completed(300_000_000, 1, &[7]);
+        let text = metrics.render();
+        for expected in [
+            "flare_request_e2e_seconds_count 2",
+            "flare_request_choices_bucket{le=\"1\"} 1",
+            "flare_request_choices_bucket{le=\"2\"} 3",
+            "flare_request_choices_sum 5",
+            "flare_request_max_choice_generated_tokens_count 3",
+            "flare_request_max_choice_generated_tokens_sum 20",
         ] {
             assert!(
                 text.contains(&format!("\n{expected}\n")),

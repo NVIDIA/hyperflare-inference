@@ -400,6 +400,7 @@ pub(super) async fn generate(
         let mut raw_tokens = Vec::new();
         let mut timestamps = Vec::new();
         let mut reused_total = 0;
+        let mut generated = vec![0u32; size];
         if streaming && protocol == Protocol::Chat {
             // Chat has one choice and rejects streamed prompt logprobs, so no
             // output queue needs draining before the first raw token is ready.
@@ -522,6 +523,7 @@ pub(super) async fn generate(
                     ..
                 } => {
                     reused_total += reused_prompt_tokens;
+                    generated[index] = generated_tokens;
                     let result = decoders[index]
                         .finish(if encoder.tool_limit_reached { crate::output::Termination::Cancelled } else { termination })
                         .and_then(|events| encoder.apply(index, events))
@@ -598,9 +600,10 @@ pub(super) async fn generate(
         // One observation per successful response: a tool-limit cancellation reaches
         // this point but the runtime counts it as cancelled, so it is excluded.
         if !count && !encoder.tool_limit_reached {
-            state.model.metrics().request_e2e.observe(
-                &super::metrics::REQUEST_SECONDS,
+            state.model.metrics().response_completed(
                 admitted_at.elapsed().as_nanos() as u64,
+                decoded.request.choices,
+                &generated,
             );
         }
         yield Delivery::Complete(response);

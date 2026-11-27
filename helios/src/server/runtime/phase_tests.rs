@@ -248,7 +248,7 @@ impl Fixture {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation: Some(false),
-                times: Default::default(),
+                record: Default::default(),
                 host_lookup: true,
                 readmitted: false,
                 prompt_score_end: 0,
@@ -682,6 +682,21 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
         budget_events(&mut generation),
         (vec![2], vec![(13, 6, "length")], vec![])
     );
+    // Committing steps: the prefill token, the three-token speculative round, and
+    // the token after readmission; the forced close is no model step. The reasoning
+    // park is not a preemption, and the output limit spans budget and remainder.
+    let text = worker.metrics.render();
+    for expected in [
+        "\nflare_inter_token_latency_seconds_count 2\n",
+        "\nflare_time_to_first_token_seconds_count 1\n",
+        "\nflare_request_inference_seconds_count 1\n",
+        "\nflare_request_generated_tokens_sum 6\n",
+        "\nflare_request_max_tokens_sum 6\n",
+        "\nflare_request_prefill_computed_tokens_sum 13\n",
+        "\nflare_request_preemptions_bucket{le=\"0\"} 1\n",
+    ] {
+        assert!(text.contains(expected), "missing {expected}");
+    }
 }
 
 fn prepared_budget_request(
@@ -1477,6 +1492,35 @@ fn ignored_eos_at_the_output_limit_finishes_for_length() {
         finished,
         vec![(2, "length", crate::output::Termination::OutputLimit)]
     );
+}
+
+#[test]
+fn prefill_computed_tokens_exclude_the_prefix_reused_at_admission() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut sequence = 0;
+    let mut reused = vec![];
+    for token in [1, 2] {
+        let (incoming, mut generation) = fixture.incoming(vec![0; 13], 1);
+        sender.send(vec![incoming]).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let handle = worker.active.iter().flatten().next().unwrap().request;
+        reused.push(worker.scheduler.request(handle).unwrap().reused_prompt_tokens());
+        budget_pass(&mut worker, &mut sequence, &[token]);
+        assert_eq!(budget_events(&mut generation).1, vec![(13, 1, "length")]);
+    }
+    // The second request restores the first one's terminal checkpoint.
+    assert_eq!(reused, [0, 13]);
+    let text = fixture.metrics.render();
+    for expected in [
+        "\nflare_request_prompt_tokens_sum 26\n",
+        "\nflare_request_prefill_computed_tokens_bucket{le=\"1\"} 1\n",
+        "\nflare_request_prefill_computed_tokens_sum 13\n",
+        "\nflare_request_prefill_computed_tokens_count 2\n",
+    ] {
+        assert!(text.contains(expected), "missing {expected}");
+    }
 }
 
 #[test]
@@ -3861,6 +3905,7 @@ fn exercise_text_preemption(
     assert!(worker.scheduler.stats().preemptions > 0);
     let (incoming, parked) = worker.parked.front_mut().unwrap();
     assert!(parked.carried.generated_tokens > 0);
+    assert_eq!(incoming.record.preemptions, 1);
     assert_eq!(
         incoming
             .prompt
@@ -3998,6 +4043,16 @@ fn exercise_text_preemption(
             assert_eq!(emitted[index], expected);
             assert_eq!(finished, vec![(60, budget + cut.after, "length")]);
             assert!(worker.parked.is_empty());
+            // The count taken at the park reaches the completed request's histogram.
+            let text = worker.metrics.render();
+            for expected in [
+                "\nflare_request_preemptions_bucket{le=\"0\"} 0\n",
+                "\nflare_request_preemptions_bucket{le=\"1\"} 1\n",
+                "\nflare_request_preemptions_count 1\n",
+                format!("\nflare_request_max_tokens_sum {}\n", budget + cut.after).as_str(),
+            ] {
+                assert!(text.contains(expected), "missing {expected}");
+            }
             return;
         }
     }

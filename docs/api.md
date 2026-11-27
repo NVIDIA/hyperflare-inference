@@ -304,15 +304,43 @@ successful generation from admission to the completed response; for a stream it
 is observed when delivery completes, which requires the client to drain the
 body. `flare_time_to_first_response_seconds` counts each response that offers
 answer or reasoning text, from admission to that text, once the client reads it.
+With `flare_request_e2e_seconds`, each response also adds one observation per
+prompt to `flare_request_choices`, the requested choice count `n`, and to
+`flare_request_max_choice_generated_tokens`, the largest generated-token count
+among that prompt's choices. Only `/v1/completions` accepts `n` above one or a
+list of prompts; Flare runs each choice as its own model request.
 
 The runtime histograms observe completed generations. `flare_request_queue_seconds`
 spans model-scheduler arrival to the first model step that includes the request,
 which can be a vision step; `flare_request_prefill_seconds` spans that step to
-the request's first committed generated token; `flare_request_decode_seconds`
-and `flare_time_per_output_token_seconds` are recorded only for requests with at
-least two generated tokens; `flare_request_prompt_tokens` counts prompt tokens
-including tokens reused from the prefix cache. Cancelled and failed requests
-enter only `flare_requests_cancelled_total` and `flare_requests_failed_total`.
+the request's first committed generated token, and
+`flare_request_inference_seconds` spans it to the last committed generated token.
+`flare_time_to_first_token_seconds` spans model-scheduler arrival to the first
+committed generated token; unlike `flare_time_to_first_response_seconds`, it
+excludes HTTP preparation and counts tokens that produce no visible text.
+`flare_request_decode_seconds` and `flare_time_per_output_token_seconds` are
+recorded only for requests with at least two generated tokens.
+`flare_inter_token_latency_seconds` observes, for every model step after the
+first that commits generated tokens for a request, the time since the previous
+such step: a speculative round committing several tokens is one observation, and
+the interval that spans a preemption includes the wait for readmission. A
+request's intervals enter the histogram when it completes.
+
+The runtime token histograms count per completed request.
+`flare_request_prompt_tokens` counts prompt tokens including tokens reused from
+the prefix cache, and `flare_request_prefill_computed_tokens` subtracts the
+tokens that GPU or host prefix reuse supplied at the request's first admission;
+recomputation after a preemption is not included.
+`flare_request_generated_tokens` counts committed generated tokens, including
+EOS, tokens withheld by text stops, and a forced reasoning close.
+`flare_request_max_tokens` records the output limit at first admission: the
+client's `max_tokens` or `max_completion_tokens`, else the server default capped
+by the remaining context, including tokens a reasoning budget defers.
+Prompt-scoring requests with a zero limit are not observed.
+`flare_request_preemptions` counts how many times each request was preempted and
+readmitted; its buckets are vLLM's preemption bounds with an added zero bound.
+Cancelled and failed requests enter only `flare_requests_cancelled_total` and
+`flare_requests_failed_total`.
 
 The route returns one JSON object instead when the query contains `format=json`,
 or when the `Accept` header gives `application/json` a higher quality than

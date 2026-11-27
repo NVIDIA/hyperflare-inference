@@ -190,8 +190,8 @@ struct Incoming {
     failure: Arc<Mutex<Option<Error>>>,
     metrics: Arc<super::metrics::Metrics>,
     observation: Option<bool>,
-    /// Lifecycle instants for completion histograms; preserved when a preempted request is parked.
-    times: super::metrics::RequestTimes,
+    /// Values for the completion histograms; preserved when a preempted request is parked.
+    record: super::metrics::RequestRecord,
     /// Consult the host prefix store at admission; cleared after a failed restore.
     host_lookup: bool,
     /// Admitted once already, so the admission counter is not advanced again.
@@ -910,7 +910,7 @@ impl ModelRuntime {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation,
-                times: Default::default(),
+                record: Default::default(),
                 host_lookup: true,
                 readmitted: false,
                 blocked: None,
@@ -1552,6 +1552,8 @@ impl<'a> Worker<'a> {
             };
             if !incoming.readmitted {
                 self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                incoming.record.max_tokens = incoming.prompt.max_new_tokens
+                    + incoming.prompt.reasoning_cut.as_ref().map_or(0, |cut| cut.after);
             }
             self.scheduler.resume_decoded_sequence(handle, parked.carried.decoded_sequence)?;
             if !pending_pool_answer {
@@ -1771,8 +1773,11 @@ impl<'a> Worker<'a> {
                 .as_mut()
                 .filter(|a| a.request == token.request)
             {
-                request.incoming.times.first_token_ns.get_or_insert(completed_at_ns);
-                request.incoming.times.last_token_ns = completed_at_ns;
+                // A step that commits several tokens for one request, such as a
+                // speculative round, adds one inter-token interval.
+                if position == 0 {
+                    request.incoming.record.tokens_committed(completed_at_ns);
+                }
                 request.incoming.observe_token(token.token);
                 request.last_token = Some(token.token);
                 if let Some(reasoning) = &mut request.reasoning {
@@ -1838,21 +1843,25 @@ impl<'a> Worker<'a> {
                     let prompt_tokens =
                         request.carried.prompt_tokens.unwrap_or(live.prompt_tokens);
                     let generated_tokens = request.carried.generated_tokens + live.generated_tokens;
+                    let reused_prompt_tokens = request
+                        .carried
+                        .reused_prompt_tokens
+                        .unwrap_or(live.reused_prompt_tokens());
                     self.metrics.request_completed(
                         request.incoming.arrival_ns,
-                        request.incoming.times,
-                        prompt_tokens,
-                        generated_tokens,
+                        &request.incoming.record,
+                        super::metrics::CompletedRequest {
+                            prompt_tokens,
+                            reused_prompt_tokens,
+                            generated_tokens,
+                        },
                     );
                     request
                         .incoming
                         .emit(GenerationEvent::Finished {
                             prompt_tokens,
                             generated_tokens,
-                            reused_prompt_tokens: request
-                                .carried
-                                .reused_prompt_tokens
-                                .unwrap_or(live.reused_prompt_tokens()),
+                            reused_prompt_tokens,
                             reason: "stop",
                             termination: crate::output::Termination::UserStop,
                             stop_sequence: request
@@ -1993,11 +2002,16 @@ impl<'a> Worker<'a> {
                         let prompt_tokens =
                             request.carried.prompt_tokens.unwrap_or(prompt_tokens);
                         let generated_tokens = request.carried.generated_tokens + generated;
+                        let reused_prompt_tokens =
+                            request.carried.reused_prompt_tokens.unwrap_or(reused);
                         self.metrics.request_completed(
                             request.incoming.arrival_ns,
-                            request.incoming.times,
-                            prompt_tokens,
-                            generated_tokens,
+                            &request.incoming.record,
+                            super::metrics::CompletedRequest {
+                                prompt_tokens,
+                                reused_prompt_tokens,
+                                generated_tokens,
+                            },
                         );
                         for token in request.stops.finish() {
                             request
@@ -2017,10 +2031,7 @@ impl<'a> Worker<'a> {
                             .emit(GenerationEvent::Finished {
                                 prompt_tokens,
                                 generated_tokens,
-                                reused_prompt_tokens: request
-                                    .carried
-                                    .reused_prompt_tokens
-                                    .unwrap_or(reused),
+                                reused_prompt_tokens,
                                 reason,
                                 stop_sequence: request
                                     .text_stops
@@ -2067,13 +2078,9 @@ impl<'a> Worker<'a> {
         {
             return Ok(false);
         }
-        let remaining = self.active[slot]
-            .as_ref()
-            .unwrap()
-            .incoming
-            .prompt
-            .max_new_tokens
-            - live.generated_tokens;
+        let active = self.active[slot].as_mut().unwrap();
+        let remaining = active.incoming.prompt.max_new_tokens - live.generated_tokens;
+        active.incoming.record.preemptions += 1;
         self.park(slot, &[], remaining)?;
         Ok(true)
     }
@@ -2196,6 +2203,7 @@ impl<'a> Worker<'a> {
             {
                 active
                     .incoming
+                    .record
                     .times
                     .first_scheduled_ns
                     .get_or_insert(scheduled_ns);
@@ -3251,7 +3259,7 @@ mod tests {
             failure: failure.clone(),
             metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
             observation: None,
-            times: Default::default(),
+            record: Default::default(),
             host_lookup: true,
             readmitted: false,
             prompt_score_end: 0,
