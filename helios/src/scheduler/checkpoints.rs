@@ -884,8 +884,8 @@ mod tests {
         measure(scheduler, GraphKind::Snapshot, 1, 1);
     }
 
-    /// The interval walk with per-step cost lookups, as before catalog costs were resolved
-    /// once per selection, and with the interval walk's pricing-capacity rule.
+    /// Reference walk that looks each step's cost up directly instead of from the
+    /// once-per-selection catalog, used to check that both price a request identically.
     fn reference_interval_prefill_ns(
         scheduler: &RequestScheduler,
         request: &LiveRequest,
@@ -1685,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn uniform_prefill_catalog_skips_unmeasured_non_target_capacities() {
+    fn uniform_prefill_catalog_skips_unmeasured_non_pricing_capacities() {
         // Natural-fit discovery leaves capacities below a full chunk unmeasured.
         let mut scheduler = super::super::tests::scheduler(1, 128, 16);
         scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
@@ -1701,7 +1701,7 @@ mod tests {
             scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
         assert!(
             !unknown,
-            "uniform catalog must not fail on unmeasured non-target capacities"
+            "uniform catalog must not fail on unmeasured non-pricing capacities"
         );
         assert_eq!(selected.initial_prefill_ns, Some(800_000));
     }
