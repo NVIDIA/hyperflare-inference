@@ -275,8 +275,10 @@ and clips work to that candidate's capacity. Refresh and discovery plans
 retain their capacities and clip work to fit. Atomic image spans, feature windows,
 and prompt length also restrict logical work. A graph with 64 useful prompt tokens
 earns 64 prompt units and at most one output token, regardless of physical capacity.
-Candidate scoring has no smallest-fitting-shape filter, duration ceiling, forced
-oldest-request filter, or per-chunk prefill lateness cost.
+Apart from the natural-fit restriction on unmeasured pure prefill graphs
+described below, candidate scoring has no smallest-fitting-shape filter,
+duration ceiling, forced oldest-request filter, or per-chunk prefill lateness
+cost.
 
 When a prepared model registers `TERMINAL_PREFILL` graphs for a subset of
 aligned prefill capacities, Helios infers the tail-protection window as the
@@ -291,10 +293,7 @@ state is active, the scheduler excludes the request from `MIXED` graphs and
 suppresses checkpoint and early-retirement snapshot capture so incomplete
 continuation state is never published. Checkpoint cut budgeting prices
 non-terminal and terminal chunks using their separate measured durations with
-sibling fallback when only one operation is measured, skipping unmeasured
-larger capacities that consume no additional tokens and unmeasured capacities
-other than the step's target capacity, which pure prefill dispatch never
-discovers. An unmeasured target capacity leaves the price unknown.
+sibling fallback when only one operation is measured.
 
 With no active decoder, the age term vanishes. Fully occupied large prefill
 graphs win when their useful value rate is highest. With decoding streams, a
@@ -555,10 +554,15 @@ messages are considered in reverse order, followed by a distinct prompt end.
 Additional prefill splits and snapshot copies must fit a request-local allowance
 of `scheduler_checkpoint_extra_work_fraction` times estimated uncached prefill
 work, defaulting to 0.05. Prefill predictions use measured costs, including stale
-estimates retained for dispatch ranking. Unknown prefill costs and unknown or
-stale snapshot-copy costs disable extras while preserving anchor eligibility.
-Productive completed decode earns the same fraction of measured time for a
-distinct terminal capture. There is no fixed capture count or
+estimates retained for dispatch ranking. Pricing skips unmeasured capacities
+that add no tokens, and unmeasured capacities other than the chunk's pricing
+capacity: the smallest capacity covering its remaining tokens, or the largest.
+Pure prefill dispatch discovers only natural-fit capacities, and an atomic span
+can make the natural fit smaller than the pricing capacity. An unmeasured
+pricing capacity leaves the prefill cost unknown. Unknown prefill costs and
+unknown or stale snapshot-copy costs disable extras while preserving anchor
+eligibility. Productive completed decode earns the same fraction of measured
+time for a distinct terminal capture. There is no fixed capture count or
 concurrency-based snapshot share.
 
 An extra prefill cut is selected only with an obtainable snapshot destination.

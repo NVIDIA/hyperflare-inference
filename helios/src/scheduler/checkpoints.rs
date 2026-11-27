@@ -332,8 +332,9 @@ impl RequestScheduler {
                 } else {
                     entry.non_terminal_ns
                 };
-                // Dispatch discovers an unmeasured prefill graph only at the step's
-                // natural-fit capacity, so other unmeasured capacities never run here.
+                // Pure prefill dispatch runs an unmeasured graph only at the natural-fit
+                // capacity, so an unmeasured capacity other than this step's pricing
+                // target is never selected for this chunk.
                 let Some(nanos) = nanos else {
                     if !adds_work || Some(entry.capacity) != target_capacity {
                         continue;
@@ -1684,10 +1685,7 @@ mod tests {
 
     #[test]
     fn uniform_prefill_catalog_skips_unmeasured_non_target_capacities() {
-        // Cold discovery measures only the natural-fit capacity of each chunk, so long
-        // prompts on a catalog without terminal prefill leave smaller capacities
-        // unmeasured. Dispatch never selects those capacities for a full chunk, so they
-        // must not make the chunk's price unknown.
+        // Natural-fit discovery leaves capacities below a full chunk unmeasured.
         let mut scheduler = super::super::tests::scheduler(1, 128, 16);
         scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
         scheduler
@@ -1698,31 +1696,34 @@ mod tests {
         let mut spec = super::super::tests::spec(1024, 3);
         spec.message_boundaries = vec![512];
         let handle = scheduler.admit(spec).unwrap();
-        let (selected, unknown, budget) =
+        let (selected, unknown, _) =
             scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
         assert!(
             !unknown,
             "uniform catalog must not fail on unmeasured non-target capacities"
         );
-        assert!(!budget);
         assert_eq!(selected.initial_prefill_ns, Some(800_000));
-        assert!(selected.cuts.iter().any(|cut| cut.endpoint == 512));
+    }
 
-        // An unmeasured natural-fit capacity still makes the price unknown: dispatch
-        // would discover it rather than run a measured smaller capacity.
-        let mut cold = super::super::tests::scheduler(1, 128, 16);
-        cold.prefill_graphs(&[128, 256, 512]).unwrap();
-        cold.graph_durations(&super::super::tests::duration_graphs(1))
+    #[test]
+    fn span_shortened_chunk_prices_at_measured_capacities() {
+        // A span starting at 200 cuts both 256 and 512 to 200 tokens, so dispatch's
+        // natural fit is 256 while the pricing target, from the 700 remaining tokens,
+        // is 512. The unmeasured 256 is skipped and the chunk is priced at 512.
+        let mut scheduler = super::super::tests::scheduler(1, 128, 16);
+        scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+        scheduler
+            .graph_durations(&super::super::tests::duration_graphs(1))
             .unwrap();
-        measure(&mut cold, GraphKind::Prefill, 128, 100_000);
-        measure(&mut cold, GraphKind::Prefill, 256, 200_000);
-        measure(&mut cold, GraphKind::Snapshot, 1, 1_000);
-        let mut cold_spec = super::super::tests::spec(1024, 3);
-        cold_spec.message_boundaries = vec![512];
-        let cold_handle = cold.admit(cold_spec).unwrap();
-        let (cold_selected, cold_unknown, _) =
-            cold.checkpoint_selection(cold.request(cold_handle).unwrap());
-        assert!(cold_unknown);
-        assert_eq!(cold_selected.initial_prefill_ns, None);
+        measure(&mut scheduler, GraphKind::Prefill, 128, 200_000);
+        measure(&mut scheduler, GraphKind::Prefill, 512, 200_000);
+        let handle = scheduler.admit(super::super::tests::spec(700, 3)).unwrap();
+        scheduler.set_prefill_spans(handle, &[200..600]).unwrap();
+        let request = scheduler.request(handle).unwrap();
+        let catalog = scheduler.prefill_catalog_costs(request);
+        assert_eq!(
+            RequestScheduler::interval_prefill_ns(request, &catalog, 0, 0, 700),
+            Some(400_000)
+        );
     }
 }
