@@ -94,14 +94,21 @@ pub fn verify_record(bytes: &[u8], header: &Header, row: bool) -> Result<()> {
     {
         return Err(invalid("record header or length"));
     }
+    if let Some(layout) = &header.packed {
+        return flare_selene::shared::packed::verify_units(
+            layout.units(0, layout.page_count(), row).unwrap(),
+            &bytes[header.page_segment as usize..],
+        )
+        .map_err(|e| invalid(e.to_string()));
+    }
     for page in 0..header.tail_pages as usize {
-        let start = header.page_segment as usize + page * header.page_record_bytes() as usize;
+        let start = header.page_segment as usize + page * header.stored_page_bytes() as usize;
         let expected = u64::from_le_bytes(
             bytes[4096 + page * 8..4096 + page * 8 + 8]
                 .try_into()
                 .unwrap(),
         );
-        if checksum(&bytes[start..start + header.page_record_bytes() as usize]) != expected {
+        if checksum(&bytes[start..start + header.stored_page_bytes() as usize]) != expected {
             return Err(invalid("disk page checksum"));
         }
     }
@@ -136,12 +143,13 @@ mod tests {
     #[test]
     fn persisted_header_matches_the_descriptor_layout() {
         let fixture = include_bytes!("../tests/fixtures/flare-header-v1.bin");
-        let decoded = Header::decode(fixture).unwrap();
+        let current = include_bytes!("../tests/fixtures/flare-header-v3.bin");
         let mut planned = new_header(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
         planned.created = 1_700_000_000;
         planned.row_checksum = 0x0123456789abcdef;
-        assert_eq!(decoded, planned);
-        assert_eq!(&planned.encode().unwrap(), fixture);
+        assert_eq!(Header::decode(fixture).unwrap(), planned);
+        assert_eq!(Header::decode(current).unwrap(), planned);
+        assert_eq!(&planned.encode().unwrap(), current);
         for (offset, value) in [(129, 0u64), (173, 0), (181, u64::MAX)] {
             let mut invalid = *fixture;
             invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());

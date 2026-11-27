@@ -231,6 +231,16 @@ def _fake_fill(destination, value):
     pass
 
 
+@torch.library.custom_op('flare_test_lifetimes::accumulate', mutates_args=('destination',))
+def _accumulate(destination: torch.Tensor, source: torch.Tensor) -> None:
+    destination.add_(source)
+
+
+@_accumulate.register_fake
+def _fake_accumulate(destination, source):
+    pass
+
+
 @pytest.mark.parametrize('offset', [0, 16])
 def test_lowered_opaque_writes_keep_caller_storage_and_intermediate_values(offset):
     storage = torch.zeros(64)
@@ -270,3 +280,220 @@ def test_lowered_opaque_writes_keep_caller_storage_and_intermediate_values(offse
                 assert torch.all(storage[:offset] == initial)
     finally:
         compilation._INVOCATIONS.reset(token)
+
+
+@torch.library.custom_op('flare_test_lifetimes::copy_from', mutates_args=('destination',))
+def _copy_from(destination: torch.Tensor, source: torch.Tensor) -> None:
+    destination.copy_(source)
+
+
+@_copy_from.register_fake
+def _fake_copy_from(destination, source):
+    pass
+
+
+def test_lowered_dtype_views_of_mutated_temporaries_pass_through_their_owner(monkeypatch):
+    seed = torch.arange(32.)
+
+    def forward():
+        storage = seed + 1
+        other = seed * 2
+        plain = seed - 1
+        _fill(storage[8:16].view(torch.bfloat16).view(4, 4), 5.)
+        _copy_from(storage[:8].view(torch.bfloat16), other[8:16].view(torch.bfloat16))
+        _fill(plain[4:8], 7.)
+        return storage, plain
+
+    expected = forward()
+    module = torch.fx.experimental.proxy_tensor.make_fx(forward)()
+    calls = compilation._lower_storage(module)
+    assert len(calls) == 3
+    module.recompile()
+    owners = []
+    original = compilation._Invocation.run
+
+    def observe(invocation, reads, writes, integers=()):
+        owners.append((len(reads), len(writes), [array.numel() for array in (*reads, *writes)]))
+        return original(invocation, reads, writes, integers)
+
+    monkeypatch.setattr(compilation._Invocation, 'run', observe)
+    token = compilation._INVOCATIONS.set(calls)
+    try:
+        torch.testing.assert_close(module(), expected, rtol=0, atol=0)
+    finally:
+        compilation._INVOCATIONS.reset(token)
+    # A mutated allocation that is also viewed as bfloat16 is passed whole. The read of a bfloat16 slice
+    # and the mutation of a slice that has only one dtype are passed as the slices themselves.
+    assert owners == [(0, 1, [32]), (1, 1, [16, 32]), (0, 1, [4])]
+
+
+def test_lowering_rejects_temporary_owner_that_cannot_be_viewed_as_operand_dtype():
+    def forward():
+        scratch = torch.zeros(7, dtype=torch.bfloat16)
+        _fill(scratch[2:6].view(torch.float32), 1.)
+
+    module = torch.fx.experimental.proxy_tensor.make_fx(forward)()
+    with pytest.raises(ValueError, match='cannot view temporary storage-call owner'):
+        compilation._lower_storage(module)
+
+
+@torch.library.custom_op('flare_test_lifetimes::gather_ranks', mutates_args=('output',))
+def _gather_ranks(source: torch.Tensor, output: torch.Tensor, world: int) -> None:
+    # Rank r contributes the candidates plus r, in rank order across each row.
+    columns = source.shape[1]
+    for rank in range(world):
+        output[:, rank * columns:(rank + 1) * columns].copy_(source + rank)
+
+
+@_gather_ranks.register_fake
+def _fake_gather_ranks(source, output, world):
+    pass
+
+
+@pytest.mark.parametrize(('world', 'rows'), [(3, 1), (3, 512), (3, 1152), (3, 1536), (3, 4096), (2, 1536), (4, 3584)])
+def test_compiled_dtype_view_gathers_write_every_slice_in_place(world, rows):
+    # The context-parallel indexer gathers each 512-row slice of packed float32 candidates into a
+    # float32 buffer through bfloat16 views of both, and merges the whole buffer afterwards.
+    from torch._inductor import standalone_compile
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from ignition import runtime_patches
+
+    runtime_patches.apply()
+    seed = torch.randn(rows, 512, 2).to(torch.bfloat16).to(torch.float32)
+
+    def forward(seed):
+        candidates = seed.clone()
+        gathered = torch.zeros(rows, world * 512, 2)
+        for start in range(0, rows, 512):
+            end = min(start + 512, rows)
+            _gather_ranks(candidates[start:end].view(torch.bfloat16).view(end - start, -1),
+                          gathered[start:end].view(torch.bfloat16).view(end - start, -1), world)
+        return (gathered,)
+
+    packed = seed.view(torch.bfloat16).view(rows, -1)
+    expected = torch.cat([packed + rank for rank in range(world)], 1).view(torch.float32).view(rows, world * 512, 2)
+    module = make_fx(forward)(seed)
+    calls = compilation._lower_storage(module)
+    module.recompile()
+    compiled = standalone_compile(module, [seed], dynamic_shapes='from_example_inputs', aot=True,
+        options={'config_patches': {'memory_planning': True, 'memory_pool': 'combined', 'compile_threads': 1}})
+    token = compilation._INVOCATIONS.set(calls)
+    try:
+        observed, = compiled(seed)
+    finally:
+        compilation._INVOCATIONS.reset(token)
+    torch.testing.assert_close(observed.view(torch.int32), expected.view(torch.int32), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('computed', [False, True])
+def test_compiled_mutated_clones_keep_selected_source_offsets(computed):
+    from torch._inductor import standalone_compile
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from ignition import runtime_patches
+
+    runtime_patches.apply()
+    source = torch.arange(3 * 8, dtype=torch.float32).reshape(1, 3, 8)
+    output = torch.empty_like(source)
+
+    def forward(source, output):
+        values = source + 1 if computed else source
+        for index in range(3):
+            selected = values[:, index].clone()
+            _accumulate(selected.view(1, 8), selected.view(1, 8))
+            output[:, index].copy_(selected)
+        return (output,)
+
+    module = make_fx(forward)(source, output)
+    calls = compilation._lower_storage(module)
+    assert any(node.target is torch.ops.flare.snapshot.default for node in module.graph.nodes)
+    module.recompile()
+    compiled = standalone_compile(module, [source, output], dynamic_shapes='from_example_inputs', aot=True,
+        options={'config_patches': {'memory_planning': True, 'memory_pool': 'combined', 'compile_threads': 1}})
+    token = compilation._INVOCATIONS.set(calls)
+    try:
+        for step in range(3):
+            source.add_(step)
+            output.fill_(float('nan'))
+            expected = (source + 1 if computed else source) * 2
+            (result,) = compiled(source, output)
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    finally:
+        compilation._INVOCATIONS.reset(token)
+
+
+def test_lower_storage_skips_snapshot_for_single_use_full_temp_and_deferred_copy_clones():
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    def single_use_temp_forward(source):
+        temp = source + 1
+        cloned = temp.clone()
+        _accumulate(cloned.view(1, 8), cloned.view(1, 8))
+        return (cloned,)
+
+    def deferred_copy_forward(source, other):
+        temp = source[:, 1].clone()
+        temp.copy_(other)
+        return (temp,)
+
+    source = torch.arange(24, dtype=torch.float32).reshape(1, 3, 8)
+    single_module = make_fx(single_use_temp_forward)(source[:, 0].contiguous())
+    compilation._lower_storage(single_module)
+    assert not any(node.target is torch.ops.flare.snapshot.default for node in single_module.graph.nodes)
+
+    deferred_module = make_fx(deferred_copy_forward)(source, torch.ones((1, 8), dtype=torch.float32))
+    compilation._lower_storage(deferred_module)
+    assert not any(node.target is torch.ops.flare.snapshot.default for node in deferred_module.graph.nodes)
+
+    def strided_offset_zero_forward(source, output):
+        selected = source[:, :, 0].clone()
+        _accumulate(selected.view(1, 3), selected.view(1, 3))
+        output[:, :, 0].copy_(selected)
+        return (output,)
+
+    output = torch.empty_like(source)
+    strided_module = make_fx(strided_offset_zero_forward)(source, output)
+    compilation._lower_storage(strided_module)
+    assert any(node.target is torch.ops.flare.snapshot.default for node in strided_module.graph.nodes)
+
+
+class _ScalarConstantForward:
+    def __init__(self):
+        self.source = torch.linspace(-2.0, 2.0, 16, dtype=torch.float32)
+        self.output = torch.empty_like(self.source)
+
+    def __call__(self):
+        self.output.copy_(self.source * torch.tensor(2.5, dtype=torch.float32))
+
+
+def test_lower_storage_rewrites_cpu_scalar_lift_fresh_copy_to_scalar_tensor():
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    def forward():
+        return torch.tensor(3.5, dtype=torch.float32) + torch.ones(4, dtype=torch.float32)
+
+    module = make_fx(forward)()
+    lifted = [node.args[0].target for node in module.graph.nodes
+              if node.target is torch.ops.aten.lift_fresh_copy.default]
+    assert lifted
+    calls = compilation._lower_storage(module)
+    module.recompile()
+    assert not any(node.target is torch.ops.aten.lift_fresh_copy.default for node in module.graph.nodes)
+    assert any(node.target is torch.ops.aten.scalar_tensor.default for node in module.graph.nodes)
+    assert all(not hasattr(module, name) for name in lifted)
+    token = compilation._INVOCATIONS.set(calls)
+    try:
+        result = module()
+    finally:
+        compilation._INVOCATIONS.reset(token)
+    torch.testing.assert_close(result, torch.full((4,), 4.5), rtol=0, atol=0)
+
+
+def test_aot_forward_inlines_zero_dimensional_cpu_tensor_constants():
+    from ignition.preparation import aot
+
+    forward = _ScalarConstantForward()
+    compiled = aot.aot_forward(forward, options={'compile_threads': 1})
+    compiled(forward)
+    torch.testing.assert_close(forward.output, forward.source * 2.5, rtol=0, atol=0)

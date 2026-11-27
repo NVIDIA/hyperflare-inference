@@ -43,6 +43,7 @@ const SESSION: u64 = 7;
 
 #[derive(Default)]
 pub(super) struct FakeCopier {
+    codec_profile: Option<[u8; 32]>,
     layout: Option<Layout>,
     /// Device pages and rows by id.
     pub gpu_pages: HashMap<u32, Vec<u8>>,
@@ -119,6 +120,9 @@ impl FakeCopier {
 }
 
 impl PageCopier for FakeCopier {
+    fn codec_profile(&self) -> Option<[u8; 32]> {
+        self.codec_profile
+    }
     fn layout(&self) -> &Layout {
         self.layout.as_ref().unwrap()
     }
@@ -234,6 +238,7 @@ impl Rig {
 
     pub fn open_session(&mut self, regions: Option<Arc<Regions>>) -> Vec<wire::ClientMessage> {
         let opened = wire::SessionOpened {
+            codec: None,
             status: wire::OpenStatus::OpenOk as i32,
             session_incarnation: SESSION,
             scope_id: vec![3; 32],
@@ -398,6 +403,7 @@ pub(super) fn records(fetch: &PoolFetch) -> Vec<wire::Record> {
         .iter()
         .enumerate()
         .map(|(i, k)| wire::Record {
+            packed: None,
             key: Some(super::super::codec::key_to(*k)),
             first_page: 0,
             pages: nodes[i].tail_pages as u32,
@@ -415,6 +421,7 @@ pub(super) fn window(
     offset: u64,
 ) -> wire::WindowSpec {
     wire::WindowSpec {
+        packed: None,
         index,
         region: wire::Region::Staging as i32,
         offset,
@@ -499,6 +506,8 @@ fn the_session_opens_with_a_snapshot_and_becomes_ready_when_it_installs() {
         row: true,
         tier: Tier::Dram,
         bytes: PAGE,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     let out = rig.open_session(Some(rig.regions.clone()));
     let begin = pick!(out, ResyncBegin);
@@ -522,6 +531,8 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
             row: true,
             tier: Tier::Gpu,
             bytes: PAGE,
+            packed: false,
+            required_profiles: Vec::new(),
         });
     }
     rig.engine.pump(rig.now);
@@ -541,6 +552,8 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
         row: true,
         tier: Tier::Gpu,
         bytes: PAGE,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     rig.engine.pump(rig.now);
     assert_eq!(
@@ -562,6 +575,8 @@ fn a_resync_request_from_the_manager_takes_a_new_snapshot() {
         row: true,
         tier: Tier::Gpu,
         bytes: PAGE,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     rig.engine.pump(rig.now);
     rig.engine.take_out();
@@ -790,6 +805,68 @@ fn records_that_do_not_match_the_plan_are_abandoned_after_nothing_was_copied() {
     let events = rig.events();
     assert_eq!(fetched(&events).len(), 1);
     assert!(fetched(&events)[0].1.is_err());
+}
+
+#[test]
+fn a_changed_packed_manifest_is_rejected_before_the_first_decode_job() {
+    for corrupt in [false, true] {
+        let mut rig = Rig::new();
+        rig.open();
+        rig.engine.sess.as_mut().unwrap().codec =
+            Some(crate::codec_copy::reader_caps(Some([3; 32])));
+        let fetch = single_part();
+        let begun = rig.command(Command::Fetch(fetch.clone()));
+        let claim = pick!(begun, Claim)[0].claim_id;
+        let In::ClaimGranted(mut g) = granted(claim, &fetch) else {
+            unreachable!()
+        };
+        let bytes = vec![17; 15];
+        let units = (0..2)
+            .map(|logical_index| wire::PackedUnit {
+                logical_index,
+                original_length: PAGE,
+                stored_length: 15,
+                representation: 1,
+                profile: vec![3; 32],
+                stored_crc: crate::shared::packed::crc32(&bytes),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        g.records[0].packed = Some(wire::PackedOffer {
+            first_page: 0,
+            units: units.clone(),
+        });
+        let out = rig.send(In::ClaimGranted(g));
+        assert!(
+            pick!(out, CopyResult).is_empty(),
+            "the pinned selection must be accepted"
+        );
+        let wire_bytes = bytes.repeat(2);
+        let mut units = units;
+        if corrupt {
+            units[1].stored_crc ^= 1;
+        }
+        rig.staging(0, &wire_bytes);
+        let mut spec = window(0, 0, 0, 2, false, 0);
+        spec.packed = Some(wire::PackedWindow { units });
+        spec.length = wire_bytes.len() as u64;
+        let out = rig.send(In::WindowReady(wire::WindowReady {
+            claim_id: claim,
+            window: Some(spec),
+            ..Default::default()
+        }));
+        if corrupt {
+            assert_eq!(
+                pick!(out, CopyResult)[0].outcome,
+                wire::CopyOutcome::CopyErrorOutcome as i32
+            );
+            assert!(rig.copier.lock().unwrap().submitted.is_empty());
+            assert!(pick!(out, WindowReleased).is_empty());
+        } else {
+            assert!(pick!(out, CopyResult).is_empty());
+            assert!(rig.copier.lock().unwrap().submitted[0].codec.is_some());
+        }
+    }
 }
 
 #[test]
@@ -1179,6 +1256,33 @@ fn a_busy_source_retries_until_the_scaled_restore_deadline() {
     let results = fetched(&events);
     assert_eq!(results.len(), 1);
     assert!(results[0].1.is_err());
+    assert!(rig.engine.requester.is_empty());
+}
+
+#[test]
+fn a_refusal_for_missing_headroom_reaches_the_store_as_no_headroom() {
+    let mut rig = Rig::new();
+    rig.open();
+    let fetch = single_part();
+    let source = (fetch.part.candidate.source.clone(), fetch.part.candidate.tier);
+    let claim = pick!(rig.command(Command::Fetch(fetch)), Claim)[0].claim_id;
+    rig.send(terminal(
+        claim,
+        wire::ClaimState::Failed,
+        wire::ClaimReason::NoHeadroom,
+        false,
+    ));
+    let events = rig.events();
+    assert_eq!(events.len(), 1);
+    let PoolEvent::Fetched {
+        id,
+        result: Err(failure),
+    } = &events[0] else {
+        panic!("expected a failed restore");
+    };
+    assert_eq!(*id, 1);
+    assert_eq!(failure.source.as_ref(), Some(&source));
+    assert!(failure.no_headroom, "the source lacked headroom");
     assert!(rig.engine.requester.is_empty());
 }
 
@@ -1655,12 +1759,18 @@ pub(super) fn host_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
         .collect();
     let row = checksum(&data[3 * PAGE as usize..]);
     crate::pool::PutRequest {
+        ancestor_keys: Vec::new(),
         key: key(192, 2),
         parent,
         bucket: [4; 16],
         chain_pages: 3,
         tail_pages: 3,
+        capture_role: Default::default(),
+        child_paths: 0,
+        descendant_row: false,
+        next_child: None,
         row: true,
+        packed: None,
         source: crate::pool::PutSource::Host(Box::new(Bytes {
             data,
             sums,
@@ -1706,6 +1816,22 @@ pub(super) fn puts(events: &[PoolEvent]) -> Vec<(u64, String)> {
 }
 
 #[test]
+fn an_unlinked_put_keeps_its_refusal_reason() {
+    let mut rig = Rig::new();
+    rig.open();
+    rig.command(Command::Put {
+        id: 1,
+        request: host_put(None),
+    });
+    rig.send(In::PutRefused(wire::PutRefused {
+        put_id: 1,
+        reason: wire::Reason::Invalid as i32,
+        detail: crate::shared::PUT_UNLINKED.into(),
+    }));
+    assert_eq!(puts(&rig.events()), [(1, "Refused(Unlinked)".to_string())]);
+}
+
+#[test]
 fn a_refusal_ends_the_put_and_present_is_a_success() {
     let mut rig = Rig::new();
     rig.open();
@@ -1719,6 +1845,41 @@ fn a_refusal_ends_the_put_and_present_is_a_success() {
         detail: String::new(),
     }));
     assert_eq!(puts(&rig.events()), [(1, "Present".to_string())]);
+}
+
+#[test]
+fn a_linked_endpoint_put_uses_the_row_shape_accepted_by_the_manager() {
+    for omit in [false, true] {
+        let mut rig = Rig::new();
+        rig.open();
+        let mut request = host_put(Some(key(64, 1)));
+        request.tail_pages = 2;
+        request.capture_role = crate::CaptureRole::Endpoint;
+        rig.command(Command::Put { id: 4, request });
+        let In::PutAccept(mut accepted) = accept(4, 1, record_len(2)) else {
+            unreachable!()
+        };
+        accepted.capture_role = crate::CaptureRole::Endpoint as i32;
+        accepted.has_parent = true;
+        accepted.parent = Some(super::super::codec::key_to(key(64, 1)));
+        if omit {
+            accepted.record_bytes -= ROW;
+        }
+        rig.send(In::PutAccept(accepted));
+        rig.send(grant_put(4, window(0, 0, 0, 2, !omit, 0)));
+        let mut out = Vec::new();
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(5));
+            out.extend(rig.tick(Duration::ZERO));
+            if !pick!(out, PutCommit).is_empty() {
+                break;
+            }
+        }
+        let filled = pick!(out, PutFilled);
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].has_row, !omit);
+        assert_eq!(pick!(out, PutCommit).len(), 1);
+    }
 }
 
 #[test]
@@ -1853,6 +2014,8 @@ fn mutations_after_a_snapshot_cut_follow_its_last_chunk() {
         row: true,
         tier: Tier::Gpu,
         bytes: PAGE,
+        packed: false,
+        required_profiles: Vec::new(),
     };
     rig.announce.saved(entry.clone());
     let mut out = rig.send(In::ResyncRequired(wire::ResyncRequired {
@@ -1888,4 +2051,70 @@ fn pool_names_salt_scope_and_instance_ids_and_cannot_change_on_reconnect() {
     assert_eq!((a.scope_id, a.instance_id), bound);
     assert!(a.bind_pool("two").is_err());
     assert_eq!((a.scope_id, a.instance_id), bound);
+}
+
+#[test]
+fn put_accept_below_homogeneous_suffix_boundary_cancels_as_permanent_refusal() {
+    struct SuffixOnlyBytes {
+        inner: Box<dyn crate::pool::PutBytes>,
+        min_first: u64,
+    }
+    impl crate::pool::PutBytes for SuffixOnlyBytes {
+        fn min_first_page(&self) -> u64 {
+            self.min_first
+        }
+        fn fill(
+            &mut self,
+            first_page: u64,
+            page_count: u32,
+            row: bool,
+            dst: &mut [u8],
+        ) -> crate::Result<crate::pool::Checksums> {
+            self.inner.fill(first_page, page_count, row, dst)
+        }
+    }
+
+    let mut rig = Rig::new();
+    rig.open();
+    let mut req = host_put(None);
+    let crate::pool::PutSource::Host(inner) = req.source;
+    req.source = crate::pool::PutSource::Host(Box::new(SuffixOnlyBytes {
+        inner,
+        min_first: 2,
+    }));
+    rig.engine.start_put(rig.now, 1, req);
+    let _ = rig.engine.take_out();
+    // Manager forces a new root at page 0 (e.g., REROOT_DEPTH) across a mixed boundary.
+    let out = rig.send(accept(1, 0, record_len(3)));
+    let cancel_pos = out
+        .iter()
+        .position(|m| matches!(m.m, Some(Out::PutCancel(wire::PutCancel { put_id: 1 }))))
+        .expect("client must cancel the incompatible forced-root put");
+    let fence_pos = out
+        .iter()
+        .position(|m| {
+            matches!(
+                &m.m,
+                Some(Out::FenceAck(wire::FenceAck {
+                    subject: Some(wire::fence_ack::Subject::PutId(1)),
+                    outcome,
+                })) if *outcome == wire::FenceOutcome::Drained as i32
+            )
+        })
+        .expect("client must emit FenceAck(Drained) for the accepted put");
+    assert!(
+        cancel_pos < fence_pos,
+        "PutCancel must precede FenceAck(Drained)"
+    );
+    let events = rig.events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            PoolEvent::Put {
+                id: 1,
+                outcome: crate::pool::PutOutcome::Refused(crate::pool::PutRefusal::Invalid),
+            }
+        )),
+        "forced mixed root must surface as permanent Refused(Invalid), got {events:?}"
+    );
 }

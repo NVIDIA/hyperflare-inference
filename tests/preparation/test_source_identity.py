@@ -148,3 +148,47 @@ def test_preparation_identity_rejects_missing_flashinfer_native_data(tmp_path):
     package.mkdir()
     with pytest.raises(RuntimeError, match="FlashInfer native source directory is unavailable"):
         _source_identity(tmp_path / "flare", package)
+
+
+def test_preparation_identity_matches_installed_package_without_rust_checkout_and_tracks_extra_roots(tmp_path):
+    import flare_heliopause
+    from ignition.preparation.source_identity import _source_identity
+
+    flare, package, _ = source_trees(tmp_path / "checkout", editable=False)
+    native = {
+        "helios": flare_heliopause.export_source_identity([flare / "helios" / "src"]),
+        "heliopause": flare_heliopause.export_source_identity([flare / "heliopause" / "src"]),
+    }
+    checkout_id = _source_identity(flare, package)
+    installed_id = _source_identity(flare / "ignition", package, native_identities=native)
+    assert installed_id == checkout_id
+
+    recipes = tmp_path / "hyperflare_recipes"
+    recipes.mkdir()
+    (recipes / "recipe.py").write_text("RECIPE = 1\n")
+    with_recipes = _source_identity(
+        flare / "ignition",
+        package,
+        native_identities=native,
+        extra_roots=(("hyperflare_recipes", recipes),),
+    )
+    assert with_recipes != installed_id
+    (recipes / "recipe.py").write_text("RECIPE = 2\n")
+    assert (
+        _source_identity(
+            flare / "ignition",
+            package,
+            native_identities=native,
+            extra_roots=(("hyperflare_recipes", recipes),),
+        )
+        != with_recipes
+    )
+
+
+def test_heliopause_build_source_identity_matches_workspace_sources():
+    import flare_heliopause
+
+    root = Path(__file__).resolve().parents[2]
+    built = flare_heliopause.build_source_identity()
+    assert built["helios"] == flare_heliopause.export_source_identity([root / "helios" / "src"])
+    assert built["heliopause"] == flare_heliopause.export_source_identity([root / "heliopause" / "src"])

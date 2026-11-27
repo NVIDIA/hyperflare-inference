@@ -11,12 +11,10 @@ import torch
 
 @pytest.mark.parametrize("surface", ["PCIeTwoShotBF16.all_reduce", "OneshotAllReduce.all_reduce"])
 def test_preparation_uses_selected_surface_and_retains_storage(monkeypatch, surface):
-    from b12x.comm import pcie
     from b12x.comm.pcie import _twoshot_preparation
     from b12x.preparation import PreparedCall
     from ignition.components import collectives
 
-    monkeypatch.setattr(pcie, "joint_finalist_policy", lambda: object(), raising=False)
     source = torch.full((32, 5120), 3, dtype=torch.bfloat16)
     output = torch.empty_like(source)
     callbacks, calls, selected = [], [], []
@@ -55,113 +53,99 @@ def test_preparation_uses_selected_surface_and_retains_storage(monkeypatch, surf
     assert operation.runtime is runtime and operation.plan is plan
 
 
-@pytest.mark.parametrize("mode", ["static", "runtime"])
-@pytest.mark.parametrize("effort", ["off", "default", "audit"])
-def test_runtime_geometry_is_pinned_for_every_tuning_effort(monkeypatch, effort, mode):
+@pytest.mark.parametrize("world", [2, 4])
+def test_single_host_varlen_gather_plans_the_pcie_counted_byte_surface(monkeypatch, world):
     from b12x.comm import pcie
-    from b12x.preparation import AutotuneEffort
     from ignition.components import collectives
-    from ignition.preparation import startup_tuning
+    from ignition.preparation.collectives import VARLEN_BANK_BYTES
 
-    calls, requests, registered = [], [], []
+    queries, requests = [], []
     plan = SimpleNamespace(request=lambda **kwargs: requests.append(kwargs) or object())
-    runtime = SimpleNamespace(algorithm="oneshot", world_size=4, single_channel=True,
-        exchange_group=object(), for_stream=lambda: SimpleNamespace(_joint_workspace=object()),
-        plan=lambda *args, **kwargs: calls.append(kwargs) or plan)
-    from ignition.preparation.collective_ladder import load, select
-    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    runtime = SimpleNamespace(exchange_group=object(), world_size=world)
+    monkeypatch.setattr(pcie, "query_from_runtime",
+                        lambda runtime, *, surface, call: queries.append((surface, call)) or "query")
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: plan if query == "query" else None)
     monkeypatch.setattr(collectives, "_roce", lambda _: False)
-    monkeypatch.setattr(collectives, "declare", lambda *args, **kwargs: None)
+    monkeypatch.setattr(collectives, "declare", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: list(range(world)))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    output = torch.zeros((world, 528 * 16), dtype=torch.uint8)
+    counts = torch.zeros(world, dtype=torch.int64)
+    operation = collectives.PreparedVarlenGather(output, counts, runtime=runtime, session=None,
+                                                 coordinator=None, name="records")
+    assert operation.plan is plan
+    assert [(surface, call["bank_bytes"]) for surface, call in queries] == [
+        ("DcpAllToAll.all_gather_varlen", VARLEN_BANK_BYTES)]
+    assert queries[0][1]["out"] is output and queries[0][1]["counts"] is counts
+    assert [request["name"] for request in requests] == ["records"]
+
+
+@pytest.mark.parametrize("surface", ["OneshotAllReduce.all_reduce", "PCIeTwoShotBF16.all_reduce"])
+def test_static_prepared_all_reduce_enables_fused_addend(monkeypatch, surface):
+    from b12x.comm.pcie import _twoshot_preparation
+    from b12x.preparation import PreparedCall
+    from ignition.components import collectives
+
+    plan_calls, callbacks, run_calls = [], [], []
+    plan = SimpleNamespace(query=SimpleNamespace(surface=surface))
+    plan.request = lambda **kwargs: callbacks.append(kwargs) or object()
+    channel = SimpleNamespace(_eager_ptrs=((1,), (2,)))
+    runtime = SimpleNamespace(algorithm="oneshot", world_size=4, single_channel=True,
+                              exchange_group=object(), for_stream=lambda: channel,
+                              plan=lambda *_args, **kwargs: plan_calls.append(kwargs) or plan)
+    monkeypatch.setattr(collectives, "_roce", lambda _: False)
+    monkeypatch.setattr(collectives, "declare", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1, 2, 3])
-    monkeypatch.setattr(startup_tuning, "register_collective", lambda owner, session: registered.append(owner))
-    source = torch.ones(2048, dtype=torch.bfloat16)
+
+    def two_call(state, *, payload, out, addend=None):
+        run_calls.append(("two", addend is not None))
+        return PreparedCall(run=lambda: out.copy_(payload + addend), output=out, capture_safe=False,
+                            owners=(state, payload, out))
+
+    monkeypatch.setattr(_twoshot_preparation, "prepared_call", two_call)
+    source = torch.full((4, 64), 2.0, dtype=torch.bfloat16)
     output = torch.empty_like(source)
     operation = collectives.PreparedAllReduce(source, output, runtime=runtime,
-        session=SimpleNamespace(_autotune_effort=AutotuneEffort(effort), collective_tuning=mode, collective_ladder=ladder), coordinator=object(), name="reduce")
-    assert "finalist_policy" not in requests[0]
-    if mode == "static":
-        assert calls == [dict(out=output)]
-        assert registered == []
-    else:
-        row = select(ladder, 4096, world_size=4, capability=(12, 0), inplace=False)
-        assert calls == [dict(out=output, joint_only=True, override=pcie.CollectiveConfig(
-            implementation=row["implementation"], threads=row["threads"], blocks=row["blocks"],
-            submode=next(iter(row["profiles"])), active_blocks=1))]
-        assert operation.runtime_profiles == tuple((mode, count) for mode, counts in row["profiles"].items() for count in counts)
-        assert operation.runtime_cache_policy == "cold"
-        assert registered == [operation]
+        session=object(), coordinator=object(),
+        name="mlp.reduce", has_addend=True)
+    assert operation.fused_addend is True
+    assert plan_calls == [dict(out=output, has_addend=True)]
+
+    state = SimpleNamespace(query=plan.query,
+        bind_input=lambda tensor: run_calls.append(("bind", tensor is source)),
+        run_plain=lambda inp, out, addend=None: (run_calls.append(("plain", addend is not None)), out.copy_(inp + addend)))
+    prepared = callbacks[0]["prepare_call"](state)
+    prepared.run()
+    assert torch.equal(output, source)
+    assert run_calls == ([("two", True)] if surface == "PCIeTwoShotBF16.all_reduce"
+                         else [("bind", True), ("plain", True)])
 
 
-def test_direct_collective_requires_joint_api_before_capability_lookup(monkeypatch):
-    from importlib import import_module
+def test_static_prepared_all_gather_enables_gate(monkeypatch):
+    from b12x.comm import pcie
     from ignition.components import collectives
 
-    pcie = import_module("b12x.comm.pcie")
-    api = import_module("b12x.comm.pcie.api")
-    monkeypatch.delattr(pcie, "CollectiveConfig", raising=False)
-    monkeypatch.delattr(api, "CollectiveConfig", raising=False)
+    queries, callbacks, runs = [], [], []
+    plan = SimpleNamespace(request=lambda **kwargs: callbacks.append(kwargs) or object())
+    runtime = SimpleNamespace(exchange_group=object(), world_size=4, device=torch.device("cpu"),
+                              max_batch_size=8, heads_per_rank=1, total_heads=4, query_head_dim=64)
+    monkeypatch.setattr(pcie, "query_from_runtime",
+                        lambda rt, *, surface, call: queries.append((surface, dict(call))) or "query")
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: plan if query == "query" else None)
     monkeypatch.setattr(collectives, "_roce", lambda _: False)
-    def channel():
-        raise AssertionError("capability lookup must follow the required API import")
-    runtime = SimpleNamespace(algorithm="oneshot", world_size=2, single_channel=True, for_stream=channel)
-    source = torch.ones(2048, dtype=torch.bfloat16)
-    with pytest.raises(ImportError, match="CollectiveConfig"):
-        collectives.PreparedAllReduce(source, torch.empty_like(source), runtime=runtime,
-            session=object(), coordinator=object(), name="reduce")
-
-
-@pytest.mark.parametrize("first_profile", [("payload_rsag_phased", 8), ("payload_rsag", 64)])
-def test_clustered_ladder_prepares_a_valid_initial_profile(monkeypatch, first_profile):
-    from copy import deepcopy
-    from b12x.comm.pcie import CollectiveConfig
-    from ignition.components import collectives
-    from ignition.preparation import startup_tuning
-    from ignition.preparation.collective_ladder import load, validate
-
-    data = deepcopy(load("ignition/preparation/ladders/gb202_pcie_tp4.json"))
-    mode, active = first_profile
-    data["buckets"][0].update(threads=512, blocks=64, cluster_size=8, profiles={mode: [active]})
-    validate(data)
-    calls = []
-    plan = SimpleNamespace(request=lambda **kwargs: object())
-    runtime = SimpleNamespace(algorithm="oneshot", world_size=4, single_channel=True,
-        exchange_group=object(), for_stream=lambda: SimpleNamespace(_joint_workspace=object()),
-        plan=lambda *args, **kwargs: calls.append(kwargs) or plan)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
-    monkeypatch.setattr(collectives, "_roce", lambda _: False)
-    monkeypatch.setattr(collectives, "declare", lambda *args, **kwargs: None)
+    monkeypatch.setattr(collectives, "declare", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1, 2, 3])
-    monkeypatch.setattr(startup_tuning, "register_collective", lambda *args: None)
-    source = torch.ones(8, dtype=torch.bfloat16)
-    output = torch.empty_like(source)
-    collectives.PreparedAllReduce(source, output, runtime=runtime,
-        session=SimpleNamespace(collective_tuning="runtime", collective_ladder=data),
-        coordinator=object(), name="hidden.reduce")
-    assert calls == [dict(out=output, joint_only=True, joint_cluster_size=8,
-                         override=CollectiveConfig(implementation="joint_latency", threads=512,
-                             blocks=64, submode=mode, active_blocks=active))]
 
-
-def test_collective_choice_keys_distinguish_alternatives_and_finalist_policy():
-    from b12x.comm.pcie import joint_finalist_policy
-    from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery, TUNING
-    from b12x.preparation import FrozenMapping
-    from b12x.preparation.session import PreparationJob
-
-    def key(implementation, policy):
-        config = CollectiveConfig(implementation=implementation, threads=256, blocks=64)
-        query = CollectiveQuery(operation="all_reduce", world_size=2, rank=0,
-            alternatives=FrozenMapping({implementation: {"call": {"shape": (32, 2560)}}}), default=config)
-        plan = SimpleNamespace(contract=TUNING, invocation=FrozenMapping())
-        request = SimpleNamespace(plan=plan, dependencies=(), finalist_policy=policy)
-        obligation = SimpleNamespace(request=request, candidate_program_identity="same-program",
-            configuration=SimpleNamespace(encoded_query=FrozenMapping(TUNING.encode_query(query)), pinned=None))
-        return PreparationJob._choice_key(None, obligation, {})
-
-    static = key("oneshot", None)
-    runtime_without_finalists = key("joint_latency", None)
-    runtime = key("joint_latency", joint_finalist_policy())
-    assert len({static, runtime_without_finalists, runtime}) == 3
-    assert static == key("oneshot", None)
-    assert runtime == key("joint_latency", joint_finalist_policy())
+    source = torch.zeros((2, 64), dtype=torch.bfloat16)
+    output = torch.zeros((2, 256), dtype=torch.bfloat16)
+    operation = collectives.PreparedAllGather(source, output, runtime=runtime,
+        session=object(), coordinator=object(),
+        name="logprobs.exchange", has_gate=True)
+    assert operation.gated is True
+    assert queries[0][0] == "DcpAllToAll.all_gather_heads"
+    assert queries[0][1]["has_gate"] is True
+    state = SimpleNamespace(run=lambda **kwargs: runs.append(kwargs))
+    prepared = callbacks[0]["prepare_call"](state)
+    prepared.run()
+    assert "has_gate" not in runs[0]
+    assert runs[0]["gate"].dtype == torch.int32 and runs[0]["gate"].item() == 1

@@ -12,31 +12,43 @@ mod cache_memory;
 mod cooperative_tests;
 mod describe;
 pub use describe::InspectionOptions;
+pub mod address_space;
 mod device_memory;
 pub mod driver;
 mod engram;
 #[cfg(test)]
 mod event_tests;
-#[cfg(test)]
-mod programmatic_edge_tests;
 mod format;
 #[cfg(any(windows, test))]
 mod host;
 mod limits;
 mod metadata;
+#[cfg(test)]
+mod programmatic_edge_tests;
 pub use metadata::{unverified_metadata, unverified_metadata_selected};
 mod memory;
 mod model;
 mod payload;
+mod peer_access;
+mod persistent_worker;
+pub use persistent_worker::WorkerState;
+pub mod preparation;
 mod protection;
 mod protobuf;
 pub use protobuf::wire;
+pub use preparation::{
+    PREPARATION_MANIFEST_VERSION, compatible_for_combine, compatible_for_weight_reuse,
+    from_legacy_rebuild_manifest, resolve_preparation, validate_preparation_manifest,
+};
 pub fn validate_sampling_defaults(value: &wire::DefaultSamplingParameters) -> crate::Result<()> {
     protobuf::sampling_defaults(value.clone()).map(|_| ())
 }
 pub const WIRE_DESCRIPTOR: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/runtime_core_descriptor.bin"));
 mod publishers;
+pub fn embedded_publishers() -> Result<Vec<Publisher>> {
+    publishers::embedded()
+}
 #[cfg(any(test, feature = "test-tools"))]
 pub mod test_support;
 pub use protection::{
@@ -48,7 +60,10 @@ mod selection;
 mod serving;
 #[cfg(test)]
 mod shared_memory_tests;
-pub use archive::{CoreFile, core_companions};
+pub use archive::{
+    CoreFile, LegacyHeader, LegacyLayout, MAX_LEGACY_HEADER, MAX_LEGACY_INDEX, MAX_LEGACY_PAYLOAD,
+    core_companions, is_snapshot_blob_name, read_legacy_header, validate_companion_filename,
+};
 pub use limits::{KvCacheLimit, MemoryLimit};
 pub use model::{
     CacheAgreement, ClusterRank, NativeModel, RankNeeds, RoceSpec, core_cluster, rank_needs,
@@ -66,10 +81,10 @@ use crate::{
     startup::{Phase, StartupProgress},
 };
 use driver::{
-    Access, AllocationProperties, CopyEndpoint, CopyParams, Driver, Handle, KernelParams, Location,
+    AllocationProperties, CopyEndpoint, CopyParams, Driver, Handle, KernelParams, Location,
     MemsetParams, TensorMap,
 };
-use format::{Blob, Memory, Node, Core, Reference, Relocation, RelocationKind, invalid};
+use format::{Blob, Core, Memory, Node, Reference, Relocation, RelocationKind, invalid};
 
 struct Storage {
     base: u64,
@@ -85,7 +100,11 @@ struct Storage {
 pub struct NativeResources {
     driver: Arc<Driver>,
     context: Handle,
+    primary_context: bool,
     device: i32,
+    rank: usize,
+    // Allocation base -> (local rank, CUDA device) readers, including the owner.
+    peer_readers: HashMap<u64, Vec<(usize, i32)>>,
     allocations: HashMap<String, Storage>,
     modules: Vec<Handle>,
     functions: HashMap<usize, Handle>,
@@ -100,6 +119,8 @@ pub struct NativeResources {
     cache: Option<flare_selene::CacheGeometry>,
     #[cfg(windows)]
     host_mappings: Vec<(u64, usize)>,
+    green_partition: Option<persistent_worker::GreenContextPartition>,
+    persistent_worker: Option<Arc<persistent_worker::PersistentWorkerRuntime>>,
 }
 
 // SAFETY: CUDA contexts may move between threads. Resource operations bind the
@@ -261,8 +282,7 @@ impl NativeResources {
                         return Err(invalid("catalog verification cannot be loaded"));
                     }
                 };
-                let core =
-                    ModelCore::open(path, publishers, selected, accepted, verify_weights)?;
+                let core = ModelCore::open(path, publishers, selected, accepted, verify_weights)?;
                 unsafe { Self::load_any(core, ordinal) }
             }
             CoreFormat::Legacy => {
@@ -304,7 +324,7 @@ impl NativeResources {
             owner.reserve(&core)?;
             owner.allocate(&core, &phase)?;
             owner.load_payload(files, &core, &phase, 1)?;
-            owner.prepare_kernels(files, &core, &phase)?;
+            owner.prepare_kernels(files, &core, &phase, None)?;
             owner.prepare_graphs(files, &core, &phase)?;
         }
         phase.finish("");
@@ -334,15 +354,54 @@ impl NativeResources {
                 "cuDeviceGetAttribute",
                 (driver.device_attribute)(&mut integrated, 18, device),
             )?;
+            if let Some(execution) = core.execution.as_ref()
+                && execution.persistent_workers.len() > 1
+            {
+                return Err(invalid(
+                    "at most one persistent worker is supported per rank",
+                ));
+            }
+            let wants_worker = core
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.persistent_workers.first());
             let mut context = null_mut();
-            driver.check(
-                "cuCtxCreate_v2",
-                (driver.context_create)(&mut context, core.context.flags, device),
-            )?;
+            let primary_context = if wants_worker.is_some() {
+                if driver.green_ctx.is_none() {
+                    return Err(invalid(
+                        "persistent worker requires CUDA driver Green Context APIs",
+                    ));
+                }
+                // PyTorch records deprecated CU_CTX_MAP_HOST (0x08) from cuCtxGetFlags();
+                // CUDA 11+ contexts always map host memory and cuDevicePrimaryCtxSetFlags_v2
+                // rejects the bit with CUDA_ERROR_INVALID_VALUE.
+                const CU_CTX_MAP_HOST: u32 = 0x08;
+                let primary_flags = core.context.flags & !CU_CTX_MAP_HOST;
+                if primary_flags != 0 {
+                    let status = (driver.primary_ctx_set_flags)(device, primary_flags);
+                    if status != 0 && status != driver::CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE {
+                        driver.check("cuDevicePrimaryCtxSetFlags_v2", status)?;
+                    }
+                }
+                driver.check(
+                    "cuDevicePrimaryCtxRetain",
+                    (driver.primary_ctx_retain)(&mut context, device),
+                )?;
+                true
+            } else {
+                driver.check(
+                    "cuCtxCreate_v2",
+                    (driver.context_create)(&mut context, core.context.flags, device),
+                )?;
+                false
+            };
             let owner = Self {
                 driver,
                 context,
+                primary_context,
                 device,
+                rank: 0,
+                peer_readers: HashMap::new(),
                 allocations: HashMap::new(),
                 modules: vec![],
                 functions: HashMap::new(),
@@ -356,32 +415,56 @@ impl NativeResources {
                 cache: None,
                 #[cfg(windows)]
                 host_mappings: Vec::new(),
+                green_partition: None,
+                persistent_worker: None,
             };
-            let configured = (|| -> Result<()> {
-                for [limit, value] in &core.context.limits {
+            if !primary_context {
+                let configured = (|| -> Result<()> {
+                    for [limit, value] in &core.context.limits {
+                        owner.driver.check(
+                            "cuCtxSetLimit",
+                            (owner.driver.context_limit)(*limit as i32, *value),
+                        )?;
+                    }
                     owner.driver.check(
-                        "cuCtxSetLimit",
-                        (owner.driver.context_limit)(*limit as i32, *value),
-                    )?;
+                        "cuCtxSetCacheConfig",
+                        (owner.driver.context_cache)(core.context.cache),
+                    )
+                })();
+                // Creation pushes the context; later operations bind it without
+                // retaining creation-stack entries that could outlive the owner.
+                let mut popped = null_mut();
+                let restored = owner.driver.check(
+                    "cuCtxPopCurrent_v2",
+                    (owner.driver.context_pop)(&mut popped),
+                );
+                configured?;
+                restored?;
+                if popped != owner.context {
+                    return Err(invalid(
+                        "CUDA context creation stack differs from its owner",
+                    ));
                 }
-                owner.driver.check(
-                    "cuCtxSetCacheConfig",
-                    (owner.driver.context_cache)(core.context.cache),
-                )
-            })();
-            // Creation pushes the context; later operations bind it without
-            // retaining creation-stack entries that could outlive the owner.
-            let mut popped = null_mut();
-            let restored = owner.driver.check(
-                "cuCtxPopCurrent_v2",
-                (owner.driver.context_pop)(&mut popped),
-            );
-            configured?;
-            restored?;
-            if popped != owner.context {
-                return Err(invalid("CUDA context creation stack differs from its owner"));
             }
             Ok(owner)
+        }
+    }
+
+    pub(super) fn pci_bus_id(&self) -> Result<String> {
+        let mut buf = [0 as std::ffi::c_char; 32];
+        // SAFETY: `self.driver` initialized CUDA and `self.device` is a valid device handle.
+        unsafe {
+            self.driver.check(
+                "cuDeviceGetPCIBusId",
+                (self.driver.device_pci_bus_id)(
+                    buf.as_mut_ptr(),
+                    buf.len() as std::ffi::c_int,
+                    self.device,
+                ),
+            )?;
+            Ok(std::ffi::CStr::from_ptr(buf.as_ptr())
+                .to_string_lossy()
+                .into_owned())
         }
     }
 
@@ -420,7 +503,15 @@ impl NativeResources {
         let driver = &self.driver;
         unsafe {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
+            let bits = address_space::virtual_address_bits(self.device);
             for reservation in &core.reservations {
+                address_space::check_fits(
+                    "core reservation",
+                    reservation.address,
+                    reservation.nbytes as u64,
+                    bits,
+                )
+                .map_err(|error| invalid(format!("{error}; re-export the core for this GPU")))?;
                 let mut address = 0;
                 driver.check(
                     "cuMemAddressReserve",
@@ -583,17 +674,7 @@ impl NativeResources {
                 if allocation.address.is_some() {
                     match allocation.memory {
                         Memory::Device => {
-                            let access = Access {
-                                location: Location {
-                                    kind: 1,
-                                    device: self.device,
-                                },
-                                flags: 3,
-                            };
-                            driver.check(
-                                "cuMemSetAccess",
-                                (driver.access)(address, allocation.nbytes, &access, 1),
-                            )?;
+                            self.grant_storage_access(&allocation.name)?;
                         }
                         Memory::MappedHost => {
                             #[cfg(unix)]
@@ -668,12 +749,38 @@ impl NativeResources {
         files: &F,
         core: &Core,
         phase: &Phase,
+        skip_module: Option<&str>,
     ) -> Result<()> {
         let driver = self.driver.clone();
         unsafe {
+            // Configure recorded limits and Green Context partitions after VA
+            // reservations and mappings so cuCtxSetLimit cannot claim core VA.
+            if self.primary_context {
+                apply_context_settings(&driver, self.context, &core.context)?;
+                if let Some(worker) = core
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.persistent_workers.first())
+                {
+                    let partition = persistent_worker::GreenContextPartition::create(
+                        &driver,
+                        self.device,
+                        worker.worker_sm_count,
+                    )?;
+                    let (worker_context, compute_context) =
+                        (partition.worker_context, partition.compute_context);
+                    self.green_partition = Some(partition);
+                    apply_context_settings(&driver, worker_context, &core.context)?;
+                    apply_context_settings(&driver, compute_context, &core.context)?;
+                }
+            }
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
             let mut modules = HashMap::new();
             for module in &core.modules {
+                if skip_module == Some(module.name.as_str()) {
+                    phase.advance(1);
+                    continue;
+                }
                 let image = files.read(core, &module.file)?;
                 if !image.starts_with(b"\x7fELF") {
                     return Err(invalid("module image is not a compiled cubin"));
@@ -724,9 +831,7 @@ impl NativeResources {
                         (driver.parameter_info)(handle, index, &mut offset, &mut size),
                     )?;
                     if size != *expected {
-                        return Err(invalid(
-                            "loaded kernel parameter layout differs from core",
-                        ));
+                        return Err(invalid("loaded kernel parameter layout differs from core"));
                     }
                 }
                 let (mut offset, mut size) = (0, 0);
@@ -737,9 +842,7 @@ impl NativeResources {
                     &mut size,
                 );
                 if status != 1 {
-                    return Err(invalid(
-                        "loaded kernel parameter count differs from core",
-                    ));
+                    return Err(invalid("loaded kernel parameter count differs from core"));
                 }
                 for [attribute, value] in &function.attributes {
                     driver.check(
@@ -777,7 +880,31 @@ impl NativeResources {
                 )?;
                 dynamic_shared.insert(function as usize, bytes as u32);
             }
+            let worker_graph_name = core
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.persistent_workers.first())
+                .map(|worker| worker.graph.as_str());
             for graph in &core.graphs {
+                let (graph_context, upload_stream, partition_sms) =
+                    if let Some(partition) = self.green_partition.as_ref() {
+                        if worker_graph_name == Some(graph.name.as_str()) {
+                            (
+                                partition.worker_context,
+                                partition.worker_stream,
+                                Some(partition.worker_sm_count),
+                            )
+                        } else {
+                            (
+                                partition.compute_context,
+                                partition.compute_stream,
+                                Some(partition.compute_sm_count),
+                            )
+                        }
+                    } else {
+                        (self.context, null_mut(), None)
+                    };
+                driver.check("cuCtxSetCurrent", (driver.context_set)(graph_context))?;
                 let mut handle = null_mut();
                 driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
                 self.templates.push(handle);
@@ -867,8 +994,11 @@ impl NativeResources {
                                     attribute.id,
                                     value.as_ptr().cast(),
                                 );
-                                if attribute.id == 2 && value[0] as u32 != 0 && status == 720 {
-                                    self.clamp_cooperative_launch(&mut params)?;
+                                if attribute.id == 2
+                                    && value[0] as u32 != 0
+                                    && (status == 720 || (status == 0 && partition_sms.is_some()))
+                                {
+                                    self.clamp_cooperative_launch(&mut params, partition_sms)?;
                                     driver.check(
                                         "cuGraphKernelNodeSetParams_v2",
                                         (driver.graph_kernel_params)(result, &params),
@@ -906,7 +1036,7 @@ impl NativeResources {
                                     null(),
                                     0,
                                     &params,
-                                    self.context,
+                                    graph_context,
                                 ),
                             )?;
                         }
@@ -955,7 +1085,7 @@ impl NativeResources {
                                     null(),
                                     0,
                                     &params,
-                                    self.context,
+                                    graph_context,
                                 ),
                             )?;
                         }
@@ -1016,20 +1146,117 @@ impl NativeResources {
                 self.names.push(graph.name.clone());
                 driver.check(
                     "cuGraphUpload",
-                    (driver.graph_upload)(executable, null_mut()),
+                    (driver.graph_upload)(executable, upload_stream),
                 )?;
-                driver.check("cuCtxSynchronize", (driver.context_sync)())?;
+                if upload_stream.is_null() {
+                    driver.check("cuCtxSynchronize", (driver.context_sync)())?;
+                } else {
+                    driver.check("cuStreamSynchronize", (driver.stream_sync)(upload_stream))?;
+                }
                 driver.check("cuGraphDestroy", (driver.graph_destroy)(handle))?;
                 self.templates.pop();
                 phase.advance(1);
             }
             self.functions.clear();
+            driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
             driver.check("cuCtxSynchronize", (driver.context_sync)())?;
+            if let Some(worker) = core
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.persistent_workers.first())
+            {
+                let partition = self.green_partition.as_ref().ok_or_else(|| {
+                    invalid("persistent worker requires an initialized green context partition")
+                })?;
+                let index = self
+                    .names
+                    .iter()
+                    .position(|name| *name == worker.graph)
+                    .ok_or_else(|| invalid("persistent worker references an unknown graph"))?;
+                let stop_flag = worker
+                    .stop_flag
+                    .as_ref()
+                    .ok_or_else(|| invalid("persistent worker requires a stop_flag reference"))?;
+                let stop_alloc = self.allocation(&stop_flag.allocation)?;
+                let stop_offset = protobuf::size(stop_flag.offset)?;
+                if stop_offset % 4 != 0
+                    || stop_offset
+                        .checked_add(4)
+                        .is_none_or(|end| end > stop_alloc.nbytes)
+                {
+                    return Err(invalid(
+                        "persistent worker stop flag offset must be 4-byte aligned and in bounds",
+                    ));
+                }
+                let stop_flag_address = stop_alloc.address + stop_offset;
+                let (metrics_address, metrics_count) = match (
+                    worker.metrics.as_ref(),
+                    worker.metrics_count,
+                ) {
+                    (None, 0) => (0usize, 0usize),
+                    (Some(_), 0) => {
+                        return Err(invalid(
+                            "persistent worker metrics reference requires a positive metrics_count",
+                        ));
+                    }
+                    (None, _) => {
+                        return Err(invalid(
+                            "persistent worker metrics_count requires a metrics reference",
+                        ));
+                    }
+                    (Some(metrics), count) => {
+                        let metrics_alloc =
+                            self.allocations.get(&metrics.allocation).ok_or_else(|| {
+                                invalid(format!("unknown allocation {:?}", metrics.allocation))
+                            })?;
+                        if !matches!(metrics_alloc.memory, Memory::MappedHost) {
+                            return Err(invalid(
+                                "persistent worker metrics must reside in a mapped host allocation",
+                            ));
+                        }
+                        let metrics_offset = protobuf::size(metrics.offset)?;
+                        let count = count as usize;
+                        let metrics_bytes = count
+                            .checked_mul(std::mem::size_of::<u64>())
+                            .ok_or_else(|| invalid("persistent worker metrics size overflow"))?;
+                        if metrics_offset % std::mem::align_of::<u64>() != 0
+                            || metrics_offset
+                                .checked_add(metrics_bytes)
+                                .is_none_or(|end| end > metrics_alloc.nbytes)
+                        {
+                            return Err(invalid(
+                                "persistent worker metrics offset must be 8-byte aligned and in bounds",
+                            ));
+                        }
+                        let address = (metrics_alloc.address as usize)
+                            .checked_add(metrics_offset)
+                            .ok_or_else(|| {
+                                invalid("persistent worker metrics address overflow")
+                            })?;
+                        (address, count)
+                    }
+                };
+                self.persistent_worker = Some(persistent_worker::PersistentWorkerRuntime::new(
+                    worker.graph.clone(),
+                    partition.worker_sm_count,
+                    self.driver.clone(),
+                    partition.worker_context,
+                    partition.worker_stream,
+                    self.executables[index],
+                    stop_flag_address,
+                    metrics_address,
+                    metrics_count,
+                ));
+            }
         }
         Ok(())
     }
 
-    unsafe fn clamp_cooperative_launch(&self, params: &mut KernelParams) -> Result<()> {
+    unsafe fn clamp_cooperative_launch(
+        &self,
+        params: &mut KernelParams,
+        partition_sms: Option<u32>,
+    ) -> Result<()> {
         let threads = params
             .block
             .iter()
@@ -1046,10 +1273,17 @@ impl NativeResources {
                     params.shared as usize,
                 ),
             )?;
-            self.driver.check(
-                "cuDeviceGetAttribute",
-                (self.driver.device_attribute)(&mut sms, 16, self.device),
-            )?;
+            if let Some(partition_sms) = partition_sms {
+                sms = i32::try_from(partition_sms)
+                    .map_err(|_| invalid("partition SM count exceeds CUDA attribute range"))?;
+            } else if let Some(partition) = self.green_partition.as_ref() {
+                sms = partition.compute_sm_count as i32;
+            } else {
+                self.driver.check(
+                    "cuDeviceGetAttribute",
+                    (self.driver.device_attribute)(&mut sms, 16, self.device),
+                )?;
+            }
         }
         if blocks_per_sm <= 0 || sms <= 0 {
             return Err(invalid("cooperative kernel has no resident CTA capacity"));
@@ -1072,9 +1306,54 @@ impl NativeResources {
         (self.context as usize, self.device)
     }
 
+    pub(super) fn execution_context(&self) -> Handle {
+        self.green_partition
+            .as_ref()
+            .map_or(self.context, |partition| partition.compute_context)
+    }
+
+    /// Launch the prepared persistent worker graph once on its green-context worker stream.
+    /// No-op when the core declares no persistent worker or the worker is already running.
+    pub fn start_persistent_worker(&self) -> Result<()> {
+        match self.persistent_worker.as_ref() {
+            Some(worker) => worker.start(),
+            None => Ok(()),
+        }
+    }
+
+    /// Signal the mapped-host stop flag and drain the persistent worker stream.
+    /// Idempotent when already stopped or when no persistent worker was configured.
+    pub fn stop_persistent_worker(&self) -> Result<()> {
+        match self.persistent_worker.as_ref() {
+            Some(worker) => worker.stop(),
+            None => Ok(()),
+        }
+    }
+
+    /// Current lifecycle state of the rank's persistent worker, if declared.
+    pub fn persistent_worker_state(&self) -> Option<WorkerState> {
+        self.persistent_worker.as_ref().map(|worker| worker.state())
+    }
+
+    /// Lock-free telemetry snapshot from the rank's persistent worker, if declared.
+    pub fn persistent_worker_snapshot(
+        &self,
+    ) -> Option<crate::execution::PersistentWorkerSnapshot> {
+        self.persistent_worker
+            .as_ref()
+            .map(|worker| worker.snapshot())
+    }
+    pub(super) fn persistent_worker_control(
+        &self,
+    ) -> Option<crate::execution::PersistentWorkerControl> {
+        self.persistent_worker
+            .as_ref()
+            .map(persistent_worker::PersistentWorkerRuntime::control)
+    }
+
     pub fn graph_bundle(&self) -> GraphBundle {
         GraphBundle {
-            context: self.context as usize,
+            context: self.execution_context() as usize,
             device: self.device,
             graph_execs: self.executables.iter().map(|v| *v as usize).collect(),
             buffers: self
@@ -1102,6 +1381,14 @@ impl NativeResources {
 
     /// Copy an allocation after the caller has drained every replay that uses it.
     pub fn download(&self, name: &str) -> Result<Vec<u8>> {
+        if matches!(
+            self.persistent_worker_state(),
+            Some(WorkerState::Running | WorkerState::Draining | WorkerState::FailedDrain)
+        ) {
+            return Err(invalid(
+                "cannot synchronize primary context while persistent worker is running",
+            ));
+        }
         let a = self.allocation(name)?;
         let mut bytes = vec![0u8; a.nbytes];
         // SAFETY: The allocation remains owned by self and the output is sized to it.
@@ -1120,6 +1407,14 @@ impl NativeResources {
 
     /// Replace allocation contents after draining replay on the owned context.
     pub fn upload(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        if matches!(
+            self.persistent_worker_state(),
+            Some(WorkerState::Running | WorkerState::Draining | WorkerState::FailedDrain)
+        ) {
+            return Err(invalid(
+                "cannot synchronize primary context while persistent worker is running",
+            ));
+        }
         let a = self.allocation(name)?;
         if bytes.len() != a.nbytes {
             return Err(invalid("upload size differs from allocation"));
@@ -1139,30 +1434,50 @@ impl NativeResources {
     }
 }
 
-impl Drop for NativeResources {
-    fn drop(&mut self) {
-        // SAFETY: This owner is the sole resource destroyer. On a failed drain,
-        // retain the driver and all GPU resources until process termination.
+impl NativeResources {
+    /// Phase 1 of teardown: stop any persistent worker, synchronize this rank's context,
+    /// and destroy all graphs, modules, events, streams, device/host mappings, and green contexts
+    /// while peer contexts and shared VA reservations stay alive.
+    /// Returns `false` when the worker or context cannot be drained, retaining the driver until process exit.
+    pub(super) fn release_execution_resources(&mut self) -> bool {
+        if self.context.is_null() {
+            return true;
+        }
+        if self.stop_persistent_worker().is_err() {
+            std::mem::forget(self.driver.clone());
+            self.context = null_mut();
+            return false;
+        }
         unsafe {
             let mut previous = null_mut();
-            (self.driver.context_get)(&mut previous);
+            let had_previous = (self.driver.context_get)(&mut previous) == 0;
             if (self.driver.context_set)(self.context) != 0 || (self.driver.context_sync)() != 0 {
+                if had_previous && previous != self.context {
+                    let _ = (self.driver.context_set)(previous);
+                }
                 std::mem::forget(self.driver.clone());
-                return;
+                self.context = null_mut();
+                return false;
             }
-            for executable in self.executables.iter().rev() {
-                (self.driver.executable_destroy)(*executable);
+            if let Some(partition) = self.green_partition.as_mut() {
+                partition.destroy_streams(&self.driver);
             }
-            for graph in self.templates.iter().rev() {
-                (self.driver.graph_destroy)(*graph);
+            for executable in self.executables.drain(..).rev() {
+                (self.driver.executable_destroy)(executable);
             }
-            for event in self.events.values() {
-                (self.driver.event_destroy)(*event);
+            for graph in self.templates.drain(..).rev() {
+                (self.driver.graph_destroy)(graph);
             }
-            for module in self.modules.iter().rev() {
-                (self.driver.module_unload)(*module);
+            for (_, event) in std::mem::take(&mut self.events) {
+                (self.driver.event_destroy)(event);
             }
-            for allocation in self.allocations.values() {
+            for module in self.modules.drain(..).rev() {
+                (self.driver.module_unload)(module);
+            }
+            if let Some(worker) = &self.persistent_worker {
+                worker.invalidate_metrics();
+            }
+            for (_, allocation) in std::mem::take(&mut self.allocations) {
                 if allocation.nbytes == 0 {
                     continue;
                 }
@@ -1186,16 +1501,89 @@ impl Drop for NativeResources {
                 }
             }
             #[cfg(windows)]
-            for &(address, bytes) in self.host_mappings.iter().rev() {
+            for (address, bytes) in self.host_mappings.drain(..).rev() {
                 (self.driver.unmap)(address, bytes);
             }
-            for (address, size) in self.reservations.iter().rev() {
-                (self.driver.release_address)(*address, *size);
+            self.persistent_worker = None;
+            let mut previous_destroyed = false;
+            if let Some(mut partition) = self.green_partition.take() {
+                if previous == partition.worker_context || previous == partition.compute_context {
+                    previous_destroyed = true;
+                }
+                partition.destroy_green_contexts(&self.driver);
             }
-            (self.driver.context_destroy)(self.context);
-            if previous != self.context {
+            if had_previous && previous != self.context && !previous_destroyed {
+                (self.driver.context_set)(previous);
+            }
+            true
+        }
+    }
+
+    /// Phase 2 of teardown: release VA reservations and destroy or release this rank's CUDA context.
+    pub(super) fn release_reservations_and_context(&mut self) {
+        if self.context.is_null() {
+            return;
+        }
+        let context = std::mem::replace(&mut self.context, null_mut());
+        unsafe {
+            let mut previous = null_mut();
+            let had_previous = (self.driver.context_get)(&mut previous) == 0;
+            if (self.driver.context_set)(context) != 0 {
+                std::mem::forget(self.driver.clone());
+                return;
+            }
+            for (address, size) in self.reservations.drain(..).rev() {
+                (self.driver.release_address)(address, size);
+            }
+            if self.primary_context {
+                if !had_previous || previous == context {
+                    let _ = (self.driver.context_set)(null_mut());
+                }
+                (self.driver.primary_ctx_release)(self.device);
+            } else {
+                (self.driver.context_destroy)(context);
+            }
+            if had_previous && previous != context {
                 (self.driver.context_set)(previous);
             }
         }
+    }
+}
+
+impl Drop for NativeResources {
+    fn drop(&mut self) {
+        // SAFETY: This owner is the sole resource destroyer. On a failed drain,
+        // retain the driver and all GPU resources until process termination.
+        if self.release_execution_resources() {
+            self.release_reservations_and_context();
+        }
+    }
+}
+
+unsafe fn apply_context_settings(
+    driver: &Driver,
+    context: Handle,
+    settings: &format::Context,
+) -> Result<()> {
+    unsafe {
+        let mut previous = null_mut();
+        let had_previous = (driver.context_get)(&mut previous) == 0;
+        driver.check("cuCtxSetCurrent", (driver.context_set)(context))?;
+        let configured = (|| -> Result<()> {
+            for [limit, value] in &settings.limits {
+                driver.check(
+                    "cuCtxSetLimit",
+                    (driver.context_limit)(*limit as i32, *value),
+                )?;
+            }
+            driver.check(
+                "cuCtxSetCacheConfig",
+                (driver.context_cache)(settings.cache),
+            )
+        })();
+        if had_previous && previous != context {
+            let _ = (driver.context_set)(previous);
+        }
+        configured
     }
 }

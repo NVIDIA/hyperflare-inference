@@ -110,9 +110,9 @@ pub struct Snapshot {
     pub total_pages: u64,
     /// Logical history tokens per KV page.
     pub page_tokens: u64,
-    /// Host prefix store lookups whose chain admission fetched.
+    /// Requests attached to a successfully restored host prefix.
     pub host_hits: u64,
-    /// Tokens covered by host prefix store chains beyond the GPU checkpoint.
+    /// Successfully restored tokens beyond each request's admission GPU prefix.
     pub host_reused_tokens: u64,
     /// Checkpoint records resident in the host store's registered memory.
     pub host_memory_records: u64,
@@ -211,11 +211,13 @@ const HOST_TOKEN_BUCKETS: [u64; 8] = [64, 256, 1024, 4096, 16384, 65536, 262144,
 #[derive(Default)]
 pub(super) struct Metrics {
     pub scheduler_trace: scheduler::SchedulerMetrics,
+    pub prefill_plot: std::sync::OnceLock<Box<super::dashboard::PrefillPlot>>,
     pub history_drafts: bool,
     total_pages: u64,
     page_tokens: u64,
     decode_weight_bytes: u64,
     pub engram: Option<std::sync::Arc<crate::engram::Stats>>,
+    pub persistent_worker: Option<crate::execution::PersistentWorkerReader>,
     prefill_tokens: AtomicU64,
     generated_tokens: AtomicU64,
     accepted_drafts: AtomicU64,
@@ -266,6 +268,10 @@ pub(super) struct Metrics {
     host_reused_tokens: AtomicU64,
     host_stored: AtomicU64,
     host_row_refills: AtomicU64,
+    host_retirement: [AtomicU64; 4],
+    host_retirement_buckets: [AtomicU64; 8],
+    host_retirement_pinned: AtomicU64,
+    host_restores_by_tier: [AtomicU64; 3],
     host_lookup_outcomes: [AtomicU64; 5],
     host_store_reasons: [AtomicU64; 6],
     pub(super) host_retry_success: AtomicU64,
@@ -282,8 +288,17 @@ pub(super) struct Metrics {
     host_packed_records: [AtomicU64; 2],
     host_per_rank_records: [AtomicU64; 2],
     host_abandoned_stores: AtomicU64,
+    host_root_records: [[AtomicU64; flare_selene::RootReason::COUNT]; 2],
+    host_root_pages: [[AtomicU64; flare_selene::RootReason::COUNT]; 2],
+    host_deeper_link_records: [AtomicU64; 2],
+    host_deeper_link_pages: [AtomicU64; 2],
     host_slots: [AtomicU64; 3],
-    host_dropped: [AtomicU64; 6],
+    host_dropped: [AtomicU64; 8],
+    decode: std::sync::Mutex<flare_selene::codec_copy::DecodeStats>,
+    codec_state: std::sync::OnceLock<crate::offload::KvCompression>,
+    host_refusal_drops: [AtomicU64; 5],
+    pub(super) host_reoffer_calls: AtomicU64,
+    pub(super) host_reoffer_present: AtomicU64,
     host_parked: AtomicU64,
     host_fetched: AtomicU64,
     host_fetch_failed: AtomicU64,
@@ -329,6 +344,12 @@ impl Metrics {
         }
     }
 
+    pub fn persistent_worker_snapshot(&self) -> Option<crate::execution::PersistentWorkerSnapshot> {
+        self.persistent_worker
+            .as_ref()
+            .map(crate::execution::PersistentWorkerReader::snapshot)
+    }
+
     pub fn snapshot(&self, learned_drafter: bool) -> Snapshot {
         let mut snapshot = Snapshot {
             draft_steps: if learned_drafter { self.learned_draft_steps.load(Ordering::Relaxed) } else { 0 },
@@ -369,9 +390,12 @@ impl Metrics {
         snapshot
     }
 
-    pub fn replay_completed(&self, timing: crate::execution::ExecutionTiming) {
+    pub fn replay_completed(&self, completed_at_ns: u64, timing: crate::execution::ExecutionTiming, prefill: u64) {
         let raw = timing.gpu_ns.into_iter().flatten().max().unwrap_or(0);
         self.replay_gpu_ns.fetch_add(raw, Ordering::Relaxed);
+        if prefill > 0 && self.scheduler_trace.is_enabled() && let Some(plot) = self.prefill_plot.get() {
+            plot.record(completed_at_ns, raw, prefill);
+        }
         if let Some(intervals) = timing.readiness {
             self.replay_readiness_wait_ns.fetch_add(intervals.wait_ns(), Ordering::Relaxed);
             self.replay_readiness_samples.fetch_add(1, Ordering::Relaxed);
@@ -383,7 +407,7 @@ impl Metrics {
             GraphKind::Init => 0,
             GraphKind::Restore => 1,
             GraphKind::Resume => 2,
-            GraphKind::Prefill | GraphKind::ScoredPrefill => 3,
+            GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => 3,
             GraphKind::Decode => 4,
             GraphKind::Vision => 5,
             GraphKind::Snapshot => 6,
@@ -392,7 +416,7 @@ impl Metrics {
         };
         self.launches[index].fetch_add(1, Ordering::Relaxed);
         let sampling_index = match kind {
-            GraphKind::Prefill | GraphKind::ScoredPrefill => 0,
+            GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => 0,
             GraphKind::Decode => 1,
             GraphKind::Resume => 2,
             GraphKind::Speculative => 3,
@@ -532,13 +556,45 @@ impl Metrics {
         }
     }
 
+    pub(super) fn codec_placement(&self, placement: crate::offload::KvCompression) {
+        let _ = self.codec_state.set(placement);
+    }
+
     /// Host prefix store counters and gauges, written from the model thread.
     /// Lookups, hits, and reused tokens come from the scheduler, which applies
     /// the fetch policy.
     pub fn store(&self, stats: StoreStats) {
+        if self.codec_state.get().is_some_and(|placement| *placement != crate::offload::KvCompression::Off) {
+            *self.decode.lock().unwrap() = stats.decode;
+        }
+        for (gauge, value) in self
+            .host_retirement_buckets
+            .iter()
+            .zip(stats.retirement_latency_buckets)
+        {
+            gauge.store(value, Ordering::Relaxed);
+        }
+        self.host_retirement_pinned
+            .store(stats.retirement_pinned_bytes, Ordering::Relaxed);
+        for (gauge, count) in self
+            .host_restores_by_tier
+            .iter()
+            .zip(stats.restores_by_tier)
+        {
+            gauge.store(count, Ordering::Relaxed);
+        }
+        for (gauge, value) in self.host_retirement.iter().zip([
+            stats.retirement_paths,
+            stats.retirement_max_depth,
+            stats.retirement_ns,
+            stats.retirement_max_ns,
+        ]) {
+            gauge.store(value, Ordering::Relaxed);
+        }
         for (counter, value) in self
             .host_held
             .iter()
+            .chain(&self.host_refusal_drops)
             .chain(&self.host_dropped)
             .chain(&self.host_expired)
             .chain(&self.host_rows_thinned)
@@ -548,6 +604,7 @@ impl Metrics {
                 stats
                     .held
                     .into_iter()
+                    .chain(stats.refusal_drops)
                     .chain(stats.dropped)
                     .chain(stats.expired)
                     .chain(stats.rows_thinned)
@@ -556,6 +613,18 @@ impl Metrics {
             )
         {
             counter.store(value, Ordering::Relaxed);
+        }
+        for tier in 0..stats.root_records.len() {
+            self.host_deeper_link_records[tier]
+                .store(stats.deeper_link_records[tier], Ordering::Relaxed);
+            self.host_deeper_link_pages[tier]
+                .store(stats.deeper_link_pages[tier], Ordering::Relaxed);
+            for reason in 0..flare_selene::RootReason::COUNT {
+                self.host_root_records[tier][reason]
+                    .store(stats.root_records[tier][reason], Ordering::Relaxed);
+                self.host_root_pages[tier][reason]
+                    .store(stats.root_pages[tier][reason], Ordering::Relaxed);
+            }
         }
         for (target, value) in [
             (&self.host_stored, stats.stored),
@@ -592,7 +661,109 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
-        text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end or through oversize or I/O errors.\n# TYPE flare_host_cache_dropped_total counter\n");
+        use crate::offload::KvCompression;
+        let placement = self.codec_state.get().copied().unwrap_or_default();
+        if placement != KvCompression::Off {
+            let _ = writeln!(text, "# HELP flare_kv_codec_active Active lossless KV checkpoint codec placement.");
+            let _ = writeln!(text, "# TYPE flare_kv_codec_active gauge");
+            let _ = writeln!(text, "flare_kv_codec_active{{placement=\"{placement}\"}} 1");
+            let stats = *self.decode.lock().unwrap();
+            for (name, help, value) in [
+                (
+                    "original_bytes_total",
+                    "Logical uncompressed KV checkpoint bytes processed by the codec.",
+                    stats.original_bytes,
+                ),
+                (
+                    "stored_bytes_total",
+                    "Compressed or literal stored KV checkpoint bytes processed by the codec.",
+                    stats.stored_bytes,
+                ),
+                (
+                    "failed_windows_total",
+                    "KV checkpoint codec windows that failed encode or decode.",
+                    stats.failed_windows,
+                ),
+                (
+                    "transform_nanoseconds_total",
+                    "Cumulative time spent in KV checkpoint codec transforms and coding.",
+                    stats.transform_ns,
+                ),
+            ] {
+                let _ = writeln!(text, "# HELP flare_kv_codec_{name} {help}");
+                let _ = writeln!(text, "# TYPE flare_kv_codec_{name} counter");
+                let _ = writeln!(text, "flare_kv_codec_{name}{{placement=\"{placement}\"}} {value}");
+            }
+            let _ = writeln!(
+                text,
+                "# HELP flare_kv_codec_verification_failures_total CRC-32/IEEE verification failures during KV checkpoint decode."
+            );
+            let _ = writeln!(text, "# TYPE flare_kv_codec_verification_failures_total counter");
+            for (stage, value) in [("stored", stats.stored_failures), ("original", stats.original_failures)] {
+                let _ = writeln!(text, "flare_kv_codec_verification_failures_total{{stage=\"{stage}\"}} {value}");
+            }
+        }
+        for (tier, count) in ["gpu", "dram", "nvme"]
+            .iter()
+            .zip(&self.host_restores_by_tier)
+        {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_restores_total{{tier=\"{tier}\"}} {}",
+                count.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(text, "# TYPE flare_host_cache_retirement_seconds histogram");
+        for (ms, count) in flare_selene::RETIREMENT_LATENCY_MS
+            .iter()
+            .zip(&self.host_retirement_buckets)
+        {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_retirement_seconds_bucket{{le=\"{}\"}} {}",
+                *ms as f64 / 1000.0,
+                count.load(Ordering::Relaxed)
+            );
+        }
+        let [paths, max_depth, elapsed_ns, max_ns] = self
+            .host_retirement
+            .each_ref()
+            .map(|value| value.load(Ordering::Relaxed));
+        let _ = writeln!(
+            text,
+            "flare_host_cache_retirement_seconds_bucket{{le=\"+Inf\"}} {paths}"
+        );
+        let _ = writeln!(text, "flare_host_cache_retirement_seconds_count {paths}");
+        let _ = writeln!(
+            text,
+            "flare_host_cache_retirement_seconds_sum {}",
+            elapsed_ns as f64 / 1e9
+        );
+        let _ = writeln!(
+            text,
+            "flare_host_cache_retirement_pinned_bytes {}",
+            self.host_retirement_pinned.load(Ordering::Relaxed)
+        );
+        for (name, value) in [
+            ("paths_total", paths),
+            ("max_depth", max_depth),
+            ("nanoseconds_total", elapsed_ns),
+            ("max_nanoseconds", max_ns),
+        ] {
+            let _ = writeln!(text, "flare_host_cache_retirement_{name} {value}");
+        }
+        text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end, through oversize or I/O errors, or by a refused pool put.\n# TYPE flare_host_cache_dropped_total counter\n");
+        text.push_str("# TYPE flare_host_cache_pool_refusal_drops_total counter\n");
+        for (reason, count) in ["invalid", "unlinked", "oversize", "budget", "inflight"]
+            .iter()
+            .zip(&self.host_refusal_drops)
+        {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_pool_refusal_drops_total{{reason=\"{reason}\"}} {}",
+                count.load(Ordering::Relaxed)
+            );
+        }
         text.push_str("# TYPE flare_host_cache_expired_total counter\n");
         text.push_str("# HELP flare_host_cache_rows_thinned_total Rows eagerly dropped after a child commits.\n# TYPE flare_host_cache_rows_thinned_total counter\n");
         text.push_str("# HELP flare_host_cache_packed_records_total Records stored with identical rank bytes packed once.\n# TYPE flare_host_cache_packed_records_total counter\n# HELP flare_host_cache_per_rank_records_total Records stored with separate rank bytes.\n# TYPE flare_host_cache_per_rank_records_total counter\n# HELP flare_host_cache_abandoned_stores_total Stores abandoned after later rank bytes differed.\n# TYPE flare_host_cache_abandoned_stores_total counter\n");
@@ -601,6 +772,34 @@ impl Metrics {
             "flare_host_cache_abandoned_stores_total {}",
             self.host_abandoned_stores.load(Ordering::Relaxed)
         );
+        text.push_str("# HELP flare_host_cache_root_records_total Records copied as roots.\n# TYPE flare_host_cache_root_records_total counter\n");
+        text.push_str("# HELP flare_host_cache_root_pages_total Pages copied in root records.\n# TYPE flare_host_cache_root_pages_total counter\n");
+        text.push_str("# HELP flare_host_cache_deeper_link_records_total Records linked under a later offered ancestor.\n# TYPE flare_host_cache_deeper_link_records_total counter\n");
+        text.push_str("# HELP flare_host_cache_deeper_link_pages_total Pages copied in records linked under a later offered ancestor.\n# TYPE flare_host_cache_deeper_link_pages_total counter\n");
+        for (tier, name) in ["dram", "pool"].into_iter().enumerate() {
+            for (metric, counters) in [
+                ("deeper_link_records", &self.host_deeper_link_records),
+                ("deeper_link_pages", &self.host_deeper_link_pages),
+            ] {
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_{metric}_total{{tier=\"{name}\"}} {}",
+                    counters[tier].load(Ordering::Relaxed)
+                );
+            }
+            for (reason, label) in ["first", "no_held_ancestor"].into_iter().enumerate() {
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_root_records_total{{tier=\"{name}\",reason=\"{label}\"}} {}",
+                    self.host_root_records[tier][reason].load(Ordering::Relaxed)
+                );
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_root_pages_total{{tier=\"{name}\",reason=\"{label}\"}} {}",
+                    self.host_root_pages[tier][reason].load(Ordering::Relaxed)
+                );
+            }
+        }
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
             for (name, counters) in [
                 ("packed_records", &self.host_packed_records),
@@ -627,14 +826,17 @@ impl Metrics {
                 "flare_host_cache_held_total{{tier=\"{tier}\"}} {}",
                 self.host_held[i].load(Ordering::Relaxed)
             );
-            for (reason, counter) in ["end_of_chain", "oversize", "io_error"]
-                .into_iter()
-                .zip(&self.host_dropped[i * 3..i * 3 + 3])
+            for (reason, index) in [
+                ("end_of_chain", i * 3),
+                ("oversize", i * 3 + 1),
+                ("io_error", i * 3 + 2),
+                ("pool_refused", 6 + i),
+            ]
             {
                 let _ = writeln!(
                     text,
                     "flare_host_cache_dropped_total{{tier=\"{tier}\",reason=\"{reason}\"}} {}",
-                    counter.load(Ordering::Relaxed)
+                    self.host_dropped[index].load(Ordering::Relaxed)
                 );
             }
         }
@@ -767,6 +969,9 @@ impl Metrics {
 
         if let Some(stats) = &self.engram {
             stats.render(&mut text);
+        }
+        if let Some(worker) = self.persistent_worker_snapshot() {
+            render_persistent_worker_metrics(&mut text, &worker);
         }
         text.push_str("# HELP flare_sampling_graph_launches_total Successful native submissions by captured sampler mode; includes consumption-only prefill.\n# TYPE flare_sampling_graph_launches_total counter\n");
         for (kind, count) in ["prefill", "decode", "resume", "speculative", "mixed"]
@@ -946,18 +1151,28 @@ impl Metrics {
             ),
             (
                 "host_cache_hits_total",
-                "Host prefix store lookups whose chain the admission fetched.",
+                "Requests attached to a successfully restored host prefix.",
                 &self.host_hits,
             ),
             (
                 "host_cache_reused_tokens_total",
-                "Tokens covered by host prefix store chains beyond the GPU checkpoint.",
+                "Successfully restored tokens beyond each request's admission GPU prefix.",
                 &self.host_reused_tokens,
             ),
             (
                 "host_cache_row_refills_total",
                 "Compacted endpoints restored by complete record replacement.",
                 &self.host_row_refills,
+            ),
+            (
+                "host_cache_reoffer_calls_total",
+                "Store calls for reoffered publications.",
+                &self.host_reoffer_calls,
+            ),
+            (
+                "host_cache_reoffer_present_total",
+                "Reoffered publication calls answered PRESENT.",
+                &self.host_reoffer_present,
             ),
             (
                 "host_cache_retry_success_total",
@@ -1215,6 +1430,49 @@ pub(super) fn metric(text: &mut String, name: &str, kind: &str, help: &str, valu
     );
 }
 
+fn escape_prometheus_label(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn render_persistent_worker_metrics(
+    text: &mut String,
+    worker: &crate::execution::PersistentWorkerSnapshot,
+) {
+    let label = escape_prometheus_label(&worker.name);
+    let active = u8::from(worker.state.is_active());
+    let _ = writeln!(
+        text,
+        "# HELP flare_persistent_worker_active Whether the core's persistent GPU worker is actively running (1) or not (0).\n\
+         # TYPE flare_persistent_worker_active gauge\n\
+         flare_persistent_worker_active{{worker=\"{label}\"}} {active}\n\
+         # HELP flare_persistent_worker_sm_count Streaming multiprocessors partitioned for the persistent GPU worker.\n\
+         # TYPE flare_persistent_worker_sm_count gauge\n\
+         flare_persistent_worker_sm_count{{worker=\"{label}\"}} {}",
+        worker.worker_sm_count
+    );
+    if !worker.counters.is_empty() {
+        text.push_str(
+            "# HELP flare_persistent_worker_counter Raw 64-bit counter values reported by the persistent worker in mapped-host memory.\n\
+             # TYPE flare_persistent_worker_counter gauge\n",
+        );
+        for (index, value) in worker.counters.iter().enumerate() {
+            let _ = writeln!(
+                text,
+                "flare_persistent_worker_counter{{worker=\"{label}\",index=\"{index}\"}} {value}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,10 +1598,10 @@ mod tests {
         let mut timing = crate::execution::ExecutionTiming::default();
         timing.gpu_ns[0] = Some(10_000);
         timing.gpu_ns[1] = Some(9_000);
-        metrics.replay_completed(timing);
+        metrics.replay_completed(0, timing, 0);
         let bytes = [1000u64, 3000, 3100].into_iter().flat_map(u64::to_ne_bytes).collect::<Vec<_>>();
         timing.readiness = Some(crate::execution::ReadinessIntervals::decode(&bytes).unwrap());
-        metrics.replay_completed(timing);
+        metrics.replay_completed(0, timing, 0);
         let snapshot = metrics.snapshot(false);
         assert_eq!(snapshot.replay_gpu_ns, 20_000);
         assert_eq!(snapshot.replay_readiness_wait_ns, 2_000);
@@ -1537,7 +1795,15 @@ mod tests {
             per_rank_records: [9, 10],
             abandoned_stores: 11,
             held: [3, 4],
-            dropped: [1, 2, 3, 4, 5, 6],
+            dropped: [1, 2, 3, 4, 5, 6, 7, 8],
+            refusal_drops: [1, 2, 3, 4, 5],
+            root_records: [[1, 2], [3, 4]],
+            deeper_link_records: [5, 6],
+            deeper_link_pages: [50, 60],
+            root_pages: [[10, 20], [30, 40]],
+            retirement_paths: 2,
+            retirement_ns: 1_250_000_000,
+            retirement_latency_buckets: [0, 0, 0, 1, 2, 2, 2, 2],
             outbound_rate: 2.5e9,
             ..StoreStats::default()
         });
@@ -1570,6 +1836,26 @@ mod tests {
         assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"dram\"} 9\n"));
         assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"nvme\"} 10\n"));
         assert!(text.contains("flare_host_cache_abandoned_stores_total 11\n"));
+        for (tier, name) in ["dram", "pool"].into_iter().enumerate() {
+            for (metric, value) in [
+                ("deeper_link_records", 5 + tier),
+                ("deeper_link_pages", (5 + tier) * 10),
+            ] {
+                assert!(text.contains(&format!(
+                    "flare_host_cache_{metric}_total{{tier=\"{name}\"}} {value}\n"
+                )));
+            }
+            for (reason, label) in ["first", "no_held_ancestor"].into_iter().enumerate() {
+                let records = (tier * flare_selene::RootReason::COUNT + reason + 1) as u64;
+                assert!(text.contains(&format!(
+                    "flare_host_cache_root_records_total{{tier=\"{name}\",reason=\"{label}\"}} {records}\n"
+                )));
+                assert!(text.contains(&format!(
+                    "flare_host_cache_root_pages_total{{tier=\"{name}\",reason=\"{label}\"}} {}\n",
+                    records * 10
+                )));
+            }
+        }
         assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"dram\"} 5\n"));
         assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"nvme\"} 6\n"));
         for reason in [
@@ -1579,20 +1865,34 @@ mod tests {
                 "flare_host_cache_retry_abandoned_total{{reason=\"{reason}\"}} 0\n"
             )));
         }
+        assert!(text.contains("# TYPE flare_host_cache_retirement_seconds histogram\n"));
+        assert!(text.contains("flare_host_cache_retirement_seconds_bucket{le=\"0.5\"} 1\n"));
+        assert!(text.contains("flare_host_cache_retirement_seconds_bucket{le=\"+Inf\"} 2\n"));
+        assert!(text.contains("flare_host_cache_retirement_seconds_count 2\n"));
+        assert!(text.contains("flare_host_cache_retirement_seconds_sum 1.25\n"));
+        assert!(text.contains("flare_host_cache_retirement_paths_total 2\n"));
+        assert!(text.contains("flare_host_cache_retirement_nanoseconds_total 1250000000\n"));
+        assert!(!text.contains("flare_host_cache_replay_tokens_total"));
         assert!(text.contains("# TYPE flare_host_cache_parked_records gauge\n"));
         assert!(text.contains("flare_host_cache_parked_records 2\n"));
+        for (i, reason) in ["invalid", "unlinked", "oversize", "budget", "inflight"].iter().enumerate() {
+            assert!(text.contains(&format!("flare_host_cache_pool_refusal_drops_total{{reason=\"{reason}\"}} {}\n", i + 1)));
+        }
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
             assert!(text.contains(&format!(
                 "flare_host_cache_held_total{{tier=\"{tier}\"}} {}\n",
                 i + 3
             )));
-            for (j, reason) in ["end_of_chain", "oversize", "io_error"]
-                .into_iter()
-                .enumerate()
+            for (reason, value) in [
+                ("end_of_chain", i * 3 + 1),
+                ("oversize", i * 3 + 2),
+                ("io_error", i * 3 + 3),
+                ("pool_refused", 7 + i),
+            ]
             {
                 assert!(text.contains(&format!(
                     "flare_host_cache_dropped_total{{tier=\"{tier}\",reason=\"{reason}\"}} {}\n",
-                    i * 3 + j + 1
+                    value
                 )));
             }
         }
@@ -1612,6 +1912,52 @@ mod tests {
                 .count(),
             9
         );
+    }
+    #[test]
+    fn persistent_worker_prometheus_metrics_render_only_when_present() {
+        use crate::execution::{PersistentWorkerReader, PersistentWorkerSnapshot, WorkerState};
+        use std::sync::{Arc, Mutex};
+
+        let mut metrics = Metrics::new(0, 0, 0, 16);
+        let without_worker = metrics.render();
+        assert!(!without_worker.contains("flare_persistent_worker_"));
+
+        let state = Arc::new(Mutex::new(PersistentWorkerSnapshot {
+            name: "sm103_expert_mover".into(),
+            worker_sm_count: 8,
+            state: WorkerState::Running,
+            counters: vec![12, 4096, 1, 3, (2u64 << 32) | 19, 95, 5, 16],
+        }));
+        let state_ref = Arc::clone(&state);
+        metrics.persistent_worker = Some(PersistentWorkerReader::new(Arc::new(move || {
+            state_ref.lock().unwrap().clone()
+        })));
+
+        let text = metrics.render();
+        for expected in [
+            "# TYPE flare_persistent_worker_active gauge\n",
+            "flare_persistent_worker_active{worker=\"sm103_expert_mover\"} 1\n",
+            "# TYPE flare_persistent_worker_sm_count gauge\n",
+            "flare_persistent_worker_sm_count{worker=\"sm103_expert_mover\"} 8\n",
+            "# TYPE flare_persistent_worker_counter gauge\n",
+            "flare_persistent_worker_counter{worker=\"sm103_expert_mover\",index=\"0\"} 12\n",
+            "flare_persistent_worker_counter{worker=\"sm103_expert_mover\",index=\"1\"} 4096\n",
+            "flare_persistent_worker_counter{worker=\"sm103_expert_mover\",index=\"7\"} 16\n",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+
+        // Transitioning to Draining/Stopped flips active gauge to 0 and preserves label escaping.
+        {
+            let mut snap = state.lock().unwrap();
+            snap.state = WorkerState::Stopped;
+            snap.name = "custom\"worker".into();
+            snap.counters.clear();
+        }
+        let stopped = metrics.render();
+        assert!(stopped.contains("flare_persistent_worker_active{worker=\"custom\\\"worker\"} 0\n"));
+        assert!(stopped.contains("flare_persistent_worker_sm_count{worker=\"custom\\\"worker\"} 8\n"));
+        assert!(!stopped.contains("flare_persistent_worker_counter{"));
     }
 }
 

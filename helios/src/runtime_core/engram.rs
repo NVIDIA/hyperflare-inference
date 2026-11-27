@@ -210,7 +210,7 @@ pub(super) fn decode<F: super::payload::Files>(
                 .filter(|g| {
                     matches!(
                         g.kind.as_str(),
-                        "prefill" | "decode" | "speculative" | "mixed"
+                        "prefill" | "terminal_prefill" | "decode" | "speculative" | "mixed"
                     )
                 })
                 .map(|g| g.packed_tokens())
@@ -270,7 +270,7 @@ pub(super) fn decode<F: super::payload::Files>(
             for graph in execution.graphs.iter().filter(|g| {
                 matches!(
                     g.kind.as_str(),
-                    "prefill" | "decode" | "speculative" | "mixed"
+                    "prefill" | "terminal_prefill" | "decode" | "speculative" | "mixed"
                 )
             }) {
                 if !gpu

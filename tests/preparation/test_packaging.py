@@ -16,7 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 def test_pyproject_declares_preparation_entrypoint_and_cores():
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    includes = set(pyproject["tool"]["setuptools"]["cores"]["find"]["include"])
+    includes = set(pyproject["tool"]["setuptools"]["packages"]["find"]["include"])
 
     assert pyproject["project"]["name"] == "ignition"
     assert "ignition*" in includes

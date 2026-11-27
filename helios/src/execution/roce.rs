@@ -184,6 +184,9 @@ impl RoceTransport {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| failure("RoCE HCA name contains a NUL byte"))?;
         let pointers: Vec<*const c_char> = names.iter().map(|name| name.as_ptr()).collect();
+        if spec.region_address == 0 {
+            return Err(failure("RoCE transport region address is null"));
+        }
         let region = spec.region_address as *mut c_void;
         // Flags and the control record must start at zero: every rank begins again at sequence 1.
         unsafe { std::ptr::write_bytes(region.cast::<u8>(), 0, spec.region_bytes as usize) };
@@ -384,7 +387,9 @@ mod tests {
             traffic_class: 0,
             rails: 2,
             routes: vec![vec![], vec![(0, 0), (1, 1)], vec![], vec![(0, 0), (1, 1)]],
+            direct: vec![false; 4],
             shape: Shape::Ring,
+            links: super::super::roce_fabric::Links::All,
         };
         (region, spec, topology)
     }

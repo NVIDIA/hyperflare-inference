@@ -114,8 +114,8 @@ class RuntimeCore:
         if any(isinstance(module, bytes) for module in self.modules.values()):
             raise ValueError("module images must be native recorder handles or cubin file paths")
         context, _ = flare_heliopause.current_context()
-        from ignition.components.weights import record_final_fp4_expert_provenance_all
-        record_final_fp4_expert_provenance_all()
+        from . import provenance
+        provenance.flush_finalizers()
         # Absent cache configuration stays absent: the native exporter owns
         # default destination and cache selection.
         cache = _OPTIONS.get()
@@ -259,7 +259,11 @@ def _graphs(graphs, *, recorder=None):
 def _cache_options(cache, options=None):
     reuse = None if cache is None else cache.reuse_weights
     if reuse is not None:
-        reuse = dict(reuse, rebuild_manifest=None if options is None else options.get('rebuild_manifest'))
+        reuse = dict(
+            reuse,
+            preparation_manifest=None if options is None else options.get('preparation_manifest'),
+            rebuild_manifest=None if options is None else options.get('rebuild_manifest'),
+        )
     return dict(cache=None if cache is None else str(cache.cache), no_weights=False if cache is None else cache.no_weights,
                 reuse_weights=reuse)
 
@@ -319,11 +323,34 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
     numeric, parameter_layouts = live_metadata(
         numeric_bounds, storage.numeric_storage, prepared.buffers, zero_ranges=zero_ranges)
     # Warmup/binding has finalized expert storage by export time.
-    from ignition.components.weights import record_final_fp4_expert_provenance_all
-    record_final_fp4_expert_provenance_all()
+    from . import provenance
+    provenance.flush_finalizers()
     context, _ = flare_heliopause.current_context()
     # Absent cache configuration stays absent; the native exporter decides.
     cache = _OPTIONS.get()
+    extra_modules = {}
+    server = None if bundle_only else {**prepared.server_config, **options}
+    model_contract = prepared.server_config.get("model_contract")
+    has_codec_layout = (
+        isinstance(model_contract, dict)
+        and isinstance(model_contract.get("cache"), dict)
+        and bool(model_contract["cache"].get("codec_layout"))
+    )
+    if has_codec_layout:
+        from .kv_codec import GPU_CODEC_MODULE_NAME, compile_gpu_codec_cubin
+
+        cubin_path = compile_gpu_codec_cubin(
+            cache_dir=None if cache is None else cache.kernel_cache
+        )
+        extra_modules[GPU_CODEC_MODULE_NAME] = str(cubin_path)
+        if server is not None:
+            contract_copy = dict(server["model_contract"])
+            cache_copy = dict(contract_copy["cache"])
+            layout_copy = dict(cache_copy["codec_layout"])
+            layout_copy["gpu_module"] = GPU_CODEC_MODULE_NAME
+            cache_copy["codec_layout"] = layout_copy
+            contract_copy["cache"] = cache_copy
+            server = {**server, "model_contract": contract_copy}
     request = dict(path=str(path), context=context, rank=storage.rank, granularity=storage.granularity,
         world_size=storage.world, local_ranks=storage.local_ranks,
         publisher=_publisher_metadata(publisher),
@@ -331,10 +358,11 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         peer_mappings=[] if storage.peer_storage is None else
             [part for parts in storage.peer_storage.imported_mappings.values() for part in parts],
         graphs=_graphs(prepared.graphs, recorder=images.native), allocations=[asdict(a) for a in allocations], discover_allocations=True,
+        modules=extra_modules,
         events=prepared.export_events, numeric=numeric, inactive=inactive,
         parameter_layouts=parameter_layouts, zero_ranges=zero_ranges, transports=transports,
         device_address_floor=storage.EXTERNAL_FLOOR if storage.integrated else 0,
-        execution=prepared.export_manifest(), server=None if bundle_only else {**prepared.server_config, **options},
+        execution=prepared.export_manifest(), server=server,
         core_data=None if bundle_only or prepared.core_data is None else prepared.core_data.export_metadata(),
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else
             rebuild_weights_metadata(prepared.rebuild_weights),

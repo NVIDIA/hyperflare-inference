@@ -88,8 +88,15 @@ class ScratchArena:
             from cuda.bindings import driver as cuda
 
             # PyTorch's round-robin stream pool can alias a later capture stream.
+            # Highest stream priority lets small collective kernels preempt main-stream GEMMs.
             with torch.cuda.device(self.device):
-                status, handle = cuda.cuStreamCreate(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING)
+                pstatus, _least, greatest = cuda.cuCtxGetStreamPriorityRange()
+                if pstatus == cuda.CUresult.CUDA_SUCCESS and greatest < 0:
+                    status, handle = cuda.cuStreamCreateWithPriority(
+                        cuda.CUstream_flags.CU_STREAM_NON_BLOCKING, greatest
+                    )
+                else:
+                    status, handle = cuda.cuStreamCreate(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING)
                 if status != cuda.CUresult.CUDA_SUCCESS:
                     raise RuntimeError(f"cannot create overlap stream: {status}")
                 stream = torch.cuda.ExternalStream(int(handle), device=self.device)
@@ -106,13 +113,6 @@ class ScratchArena:
         if len(plans) < 2:
             raise ValueError("parallel scratch requires at least two plans")
         self._parallel_plans.append(plans)
-
-    def replace_parallel_plans(self, replacements):
-        """Rebind declared forks when prepared plan choices change before capture."""
-        if self.frozen:
-            raise RuntimeError("scratch declarations are frozen")
-        self._parallel_plans = [tuple(replacements.get(plan, plan) for plan in group)
-                                for group in self._parallel_plans]
 
     def parallel_nbytes(self, requirement):
         sizes = {}
@@ -220,8 +220,8 @@ class ScratchArena:
             raise TypeError("scratch binding finalizer must be callable")
         self._finalizers.append(callback)
 
-    def finalize(self, *, group=None, retain=False):
-        """Bind scratch views, retaining callbacks only for preparation trial graphs."""
+    def finalize(self, *, group=None):
+        """Bind scratch views and clear registered finalizers."""
         self._require_active()
         if group is None:
             for callback in self._finalizers:
@@ -250,8 +250,7 @@ class ScratchArena:
                         callback()
                 finally:
                     self._binding_views = None
-        if not retain:
-            self._finalizers.clear()
+        self._finalizers.clear()
 
 
 def _shared_views(layouts):

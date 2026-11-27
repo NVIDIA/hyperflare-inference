@@ -40,6 +40,20 @@ Flare's implementation changes score rounding, explicit proposal probabilities,
 and random-number domains for its probability-based rejection contract.
 The upstream copyright notice is retained in that source file.
 
+ignition/components/four_six_quantization.py adapts the four-or-six NVFP4
+quantizer; ignition/components/situ_experts.py adapts SiTU activation,
+MXFP8 scale rounding, and SM120 expert arithmetic; ignition/recipes/inkling2/loop.py
+adapts the low-rank message controller. Sources are from vLLM PR #69028
+(https://github.com/vllm-project/vllm/pull/69028), revision b3c0ff75424ea9393ce2dbfd2e912bb19f7323f0:
+https://github.com/vllm-project/vllm/blob/b3c0ff75424ea9393ce2dbfd2e912bb19f7323f0/vllm/models/inkling2/nvidia/ops/nvfp4.py
+https://github.com/vllm-project/vllm/blob/b3c0ff75424ea9393ce2dbfd2e912bb19f7323f0/vllm/models/inkling2/nvidia/ops/activation.py
+https://github.com/vllm-project/vllm/blob/b3c0ff75424ea9393ce2dbfd2e912bb19f7323f0/vllm/models/inkling2/nvidia/ops/mxfp8.py
+https://github.com/vllm-project/vllm/blob/b3c0ff75424ea9393ce2dbfd2e912bb19f7323f0/vllm/models/inkling2/nvidia/ops/moe_sm120.py
+https://github.com/vllm-project/vllm/blob/b3c0ff75424ea9393ce2dbfd2e912bb19f7323f0/vllm/models/inkling2/nvidia/loop.py
+Flare uses Blackwell hardware E2M1 conversion and binds persistent buffers and
+projections for prepared graph execution. The upstream copyright notices are
+retained in the adapted files.
+
 PyTorch
 -------
 helios/src/frontend/images/resize.rs adapts the resize coefficient generator

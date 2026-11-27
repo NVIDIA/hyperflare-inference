@@ -7,7 +7,10 @@
 use super::{NativeResources, format::invalid, protobuf::size};
 use crate::{
     Result,
-    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding, TunedBinding, TuningGraphDescriptor},
+    execution::{
+        BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding,
+        PersistentWorkerDescriptor, TunedBinding, TuningGraphDescriptor,
+    },
 };
 
 impl NativeResources {
@@ -95,15 +98,100 @@ impl NativeResources {
                 outputs: graph.outputs.clone(), status_buffer: graph.status_buffer.clone(),
             })
         }).collect::<Result<Vec<_>>>()?;
+        if execution.persistent_workers.len() > 1 {
+            return Err(invalid(
+                "at most one persistent worker is supported per rank",
+            ));
+        }
+        let persistent_workers = execution
+            .persistent_workers
+            .iter()
+            .map(|worker| -> Result<PersistentWorkerDescriptor> {
+                let index = self
+                    .names
+                    .iter()
+                    .position(|name| *name == worker.graph)
+                    .ok_or_else(|| invalid("persistent worker references an unknown graph"))?;
+                let stop_flag = worker
+                    .stop_flag
+                    .as_ref()
+                    .ok_or_else(|| invalid("persistent worker requires a stop_flag reference"))?;
+                let stop_alloc = self.allocation(&stop_flag.allocation)?;
+                let stop_flag_offset = size(stop_flag.offset)?;
+                if stop_flag_offset % 4 != 0
+                    || stop_flag_offset
+                        .checked_add(4)
+                        .is_none_or(|end| end > stop_alloc.nbytes)
+                {
+                    return Err(invalid(
+                        "persistent worker stop flag offset must be 4-byte aligned and in bounds",
+                    ));
+                }
+                let (metrics_allocation, metrics_offset, metrics_address, metrics_count) =
+                    match (worker.metrics.as_ref(), worker.metrics_count) {
+                        (None, 0) => (None, 0usize, 0usize, 0usize),
+                        (Some(_), 0) => {
+                            return Err(invalid(
+                                "persistent worker metrics reference requires a positive metrics_count",
+                            ));
+                        }
+                        (None, _) => {
+                            return Err(invalid(
+                                "persistent worker metrics_count requires a metrics reference",
+                            ));
+                        }
+                        (Some(metrics), count) => {
+                            let metrics_alloc = self.allocation(&metrics.allocation)?;
+                            let metrics_offset = size(metrics.offset)?;
+                            let count = count as usize;
+                            let metrics_bytes = count
+                                .checked_mul(std::mem::size_of::<u64>())
+                                .ok_or_else(|| {
+                                    invalid("persistent worker metrics size overflow")
+                                })?;
+                            if metrics_offset % std::mem::align_of::<u64>() != 0
+                                || metrics_offset
+                                    .checked_add(metrics_bytes)
+                                    .is_none_or(|end| end > metrics_alloc.nbytes)
+                            {
+                                return Err(invalid(
+                                    "persistent worker metrics offset must be 8-byte aligned and in bounds",
+                                ));
+                            }
+                            let address = metrics_alloc
+                                .address
+                                .checked_add(metrics_offset)
+                                .ok_or_else(|| {
+                                    invalid("persistent worker metrics address overflow")
+                                })?;
+                            (Some(metrics.allocation.clone()), metrics_offset, address, count)
+                        }
+                    };
+                Ok(PersistentWorkerDescriptor {
+                    worker_sm_count: worker.worker_sm_count,
+                    graph: worker.graph.clone(),
+                    handle: self.executables[index] as usize,
+                    stop_flag_allocation: stop_flag.allocation.clone(),
+                    stop_flag_offset,
+                    stop_flag_address: stop_alloc.address + stop_flag_offset,
+                    metrics_allocation,
+                    metrics_offset,
+                    metrics_address,
+                    metrics_count,
+                    control: self.persistent_worker_control(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let manifest = ExecutionManifest {
             tuning_graphs,
+            persistent_workers,
             collectives: None,
             engram: None,
             cache: self.cache.clone(),
             offload: None,
             abi_version: execution.abi_version,
             completion_token_capacity: crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity),
-            context: self.context as usize,
+            context: self.execution_context() as usize,
             device: self.device,
             max_active: size(execution.max_active)?,
             input_frame_bytes: size(execution.input_frame_bytes)?,

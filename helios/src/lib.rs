@@ -33,6 +33,7 @@ pub mod startup;
 pub mod frontend;
 
 pub use cuda::current_context;
+pub use flare_eos::raise_open_file_limit;
 pub use replay::{BufferSpan, Completion, GraphBundle, ReplayWorker, Shutdown};
 
 pub use error::{AdmissionError, CudaError, Error, ExecutionError, Failure, FrontendError};

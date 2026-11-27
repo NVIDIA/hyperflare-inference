@@ -9,7 +9,7 @@ use super::channel::{Pair, Rdma};
 use super::{Region, invalid};
 use crate::regions::LocalRegions;
 use flare_selene::shared::rdma::{self, Handshake, Qp, ffi};
-use std::{io, mem, ptr, sync::Arc};
+use std::{io, mem, net::IpAddr, ptr, sync::Arc};
 
 /// One transfer's queue pair and the registrations it keeps alive.
 pub struct LocalRdma {
@@ -35,18 +35,18 @@ unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
 impl Device {
-    /// Open the first device whose port is active and register both mapped regions.
+    /// Open the device matching the data listener address and register both regions.
     ///
     /// The device retains `regions` for its whole lifetime, so the mappings stay alive while the
     /// memory regions refer to them, and every bound is taken from the registered lengths rather
     /// than from a caller-supplied size.
-    pub fn open(regions: Arc<LocalRegions>) -> io::Result<Arc<Self>> {
+    pub fn open(regions: Arc<LocalRegions>, local_address: IpAddr) -> io::Result<Arc<Self>> {
         let arena = regions.mapping(Region::Arena);
         let staging = regions.mapping(Region::Staging);
         if arena.1 == 0 || staging.1 == 0 || arena.0.is_null() || staging.0.is_null() {
             return Err(invalid("both RDMA regions must be mapped"));
         }
-        let device = rdma::Device::open()?;
+        let device = rdma::Device::open(local_address)?;
         let pd = device.pd;
         let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0 as i32;
         // SAFETY: both ranges are mapped by `regions`, which this value retains.
@@ -111,12 +111,10 @@ impl Pair for LocalRdma {
             .peer
             .as_ref()
             .ok_or_else(|| invalid("RDMA pair is not connected"))?;
-        if len == 0
-            || !len.is_multiple_of(4096)
-            || !offset.is_multiple_of(4096)
-            || !remote_offset.is_multiple_of(4096)
-        {
-            return Err(invalid("RDMA range is not 4096-aligned"));
+        // Local packed windows and multi-rank gathered runs may carry arbitrary byte lengths
+        // and byte offsets within the 4096-aligned remote staging slot validated by the caller.
+        if len == 0 {
+            return Err(invalid("RDMA range length must be non-zero"));
         }
         let mr = match region {
             Region::Arena => self.device.arena,
@@ -213,7 +211,7 @@ fn release_mrs(arena: *mut ffi::ibv_mr, staging: *mut ffi::ibv_mr) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::arena::Arena;
     use std::time::{Duration, Instant};
@@ -231,18 +229,23 @@ mod tests {
     fn a_loopback_pair_writes_only_the_private_destination() {
         let regions_a = regions();
         let regions_b = regions();
-        let Ok(device_a) = Device::open(regions_a.clone()) else {
+        let Some(local_address) = crate::testing::rdma_address() else {
             assert!(
                 std::env::var_os("SELENE_RDMA_REQUIRED").is_none(),
-                "no active RDMA device"
+                "no local address has an active RoCE v2 GID"
             );
-            eprintln!("skipping: no active RDMA device");
+            eprintln!("skipping: no local address has an active RoCE v2 GID");
             return;
         };
+        let device_a = Device::open(regions_a.clone(), local_address).unwrap();
         let mut a = device_a.pair().unwrap();
         // SAFETY: this private destination stays mapped until the pair and device are dropped.
         let device_b = unsafe {
-            flare_selene::pool::rdma::Device::open(regions_b.mapping(Region::Staging).0, BYTES)
+            flare_selene::pool::rdma::Device::open(
+                regions_b.mapping(Region::Staging).0,
+                BYTES,
+                local_address,
+            )
         }
         .unwrap();
         let b = flare_selene::pool::rdma::Pair::new(&device_b).unwrap();
@@ -258,10 +261,8 @@ mod tests {
             }
         }
         for (offset, len, remote) in [
-            (1, 4096, 0),
-            (0, 1, 0),
-            (0, 4096, 1),
             (BYTES as u64, 4096, 0),
+            (BYTES as u64 - 10, 11, 0),
             (0, 0, 0),
         ] {
             assert!(a.write(Region::Arena, offset, len, remote).is_err());
@@ -271,6 +272,31 @@ mod tests {
         assert_eq!(
             unsafe { regions_b.bytes(Region::Staging, 0, 4096).unwrap() },
             unsafe { regions_a.bytes(Region::Arena, 0, 4096).unwrap() }
+        );
+        // Packed compressed windows carry arbitrary byte lengths and local arena offsets.
+        let unaligned_off = 17usize;
+        let unaligned_len = 4133usize;
+        unsafe {
+            for index in 0..unaligned_len {
+                *regions_a.mapping(Region::Arena).0.add(unaligned_off + index) =
+                    ((index * 7 + 3) % 251) as u8;
+            }
+        }
+        a.write(
+            Region::Arena,
+            unaligned_off as u64,
+            unaligned_len as u64,
+            4096,
+        )
+        .unwrap();
+        wait(&mut a);
+        assert_eq!(
+            unsafe { regions_b.bytes(Region::Staging, 4096, unaligned_len as u64).unwrap() },
+            unsafe {
+                regions_a
+                    .bytes(Region::Arena, unaligned_off as u64, unaligned_len as u64)
+                    .unwrap()
+            }
         );
         // Exercise a write larger than the old piece size.
         let len = 2 * (1 << 20) + 4096;

@@ -191,7 +191,7 @@ pub(super) fn manifest() -> ExecutionManifest {
             },
         ],
     };
-    ExecutionManifest { completion_token_capacity: 16, tuning_graphs: vec![],
+    ExecutionManifest { completion_token_capacity: 16, tuning_graphs: vec![], persistent_workers: vec![],
         engram: None,
         collectives: None,
         cache: None,
@@ -1328,4 +1328,76 @@ fn eight_token_completions_accept_shorter_proposal_confidence() {
     value.graphs[0].draft_tokens = 6;
     value.graphs[0].token_capacity = 7;
     assert!(value.validate().is_err());
+}
+
+#[test]
+fn persistent_worker_manifest_validation_enforces_handles_alignment_and_cardinality() {
+    let mut value = manifest();
+    let worker = PersistentWorkerDescriptor {
+        worker_sm_count: 8,
+        graph: "worker_loop".into(),
+        handle: 0x99000,
+        stop_flag_allocation: "worker_ctrl".into(),
+        stop_flag_offset: 0,
+        stop_flag_address: 0x2000_0000_0000,
+        metrics_allocation: None,
+        metrics_offset: 0,
+        metrics_address: 0,
+        metrics_count: 0,
+        control: None,
+    };
+    value.persistent_workers = vec![worker.clone()];
+    value.validate().unwrap();
+
+    // Optional mapped-host u64 counter range validates when aligned and nonzero.
+    let mut with_metrics = value.clone();
+    {
+        let w = &mut with_metrics.persistent_workers[0];
+        w.metrics_allocation = Some("worker_ctrl".into());
+        w.metrics_offset = 64;
+        w.metrics_address = 0x2000_0000_0040;
+        w.metrics_count = 8;
+    }
+    with_metrics.validate().unwrap();
+
+    // More than one persistent worker is rejected explicitly.
+    let mut two_workers = value.clone();
+    let mut second = worker.clone();
+    second.graph = "worker_loop_2".into();
+    second.handle = 0x9a000;
+    two_workers.persistent_workers.push(second);
+    assert!(two_workers.validate().is_err());
+
+    // Multi-rank execution rejects persistent workers explicitly.
+    assert!(unsafe { threaded::ThreadedExecutor::new(value.clone(), vec![value.clone()]) }.is_err());
+    assert!(unsafe { threaded::ThreadedExecutor::new(manifest(), vec![value.clone()]) }.is_err());
+
+    for mutation in 0..14 {
+        let mut bad = if mutation < 8 {
+            value.clone()
+        } else {
+            with_metrics.clone()
+        };
+        let w = &mut bad.persistent_workers[0];
+        match mutation {
+            0 => w.worker_sm_count = 0,
+            1 => w.graph = bad.graphs[0].name.clone(),
+            2 => w.handle = bad.graphs[0].handle,
+            3 => w.handle = 0,
+            4 => w.stop_flag_allocation.clear(),
+            5 => w.stop_flag_offset = 2,
+            6 => w.stop_flag_address = 0x2000_0000_0002,
+            7 => w.metrics_offset = 8,
+            8 => w.metrics_allocation = None,
+            9 => w.metrics_count = 0,
+            10 => w.metrics_allocation = Some(String::new()),
+            11 => w.metrics_offset = 68,
+            12 => w.metrics_address = 0,
+            _ => w.metrics_address = 0x2000_0000_0044,
+        }
+        assert!(
+            bad.validate().is_err(),
+            "expected persistent worker manifest mutation {mutation} to fail"
+        );
+    }
 }

@@ -56,7 +56,7 @@ mod memory {
 
     use crate::{
         cache::PrefixHistory,
-        offload::{registrar::CudaRegistrar, transfer::Transfers},
+        offload::{registrar::CudaRegistrar, transfer::Copiers},
     };
 
     const IDENTITY: [u8; 32] = [7; 32];
@@ -123,7 +123,7 @@ mod memory {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let mut store = MemoryStore::new(IDENTITY, pool, transfers.clone()).unwrap();
         let consumed = u64::from(pages) * pt;
@@ -133,9 +133,10 @@ mod memory {
             .collect();
         history.append(&tokens, &[]).unwrap();
         let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(1),
             key: history.key_at(consumed).unwrap(),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: history.bucket_at(consumed).unwrap(),
             chain_pages: sources.iter().map(|id| PageId(*id)).collect(),
             tail_pages: pages as usize,
@@ -282,7 +283,7 @@ mod memory {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let mut store = MemoryStore::new(IDENTITY, pool, transfers.clone()).unwrap();
 
@@ -293,9 +294,10 @@ mod memory {
             .collect();
         history.append(&tokens, &[]).unwrap();
         let checkpoint = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(1),
             key: history.key_at(consumed).unwrap(),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: history.bucket_at(consumed).unwrap(),
             chain_pages: sources.iter().map(|id| PageId(*id)).collect(),
             tail_pages: 3,
@@ -451,7 +453,7 @@ mod memory {
         .unwrap();
         small.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &small).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&small)).unwrap(),
         ));
         let mut store = MemoryStore::new(IDENTITY, small, transfers).unwrap();
         assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
@@ -472,9 +474,10 @@ mod memory {
         other.append(&[11, 12, 13, 14, 15], &[]).unwrap();
         let second_consumed = consumed + 5;
         let second = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(2),
             key: other.key_at(second_consumed).unwrap(),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: other.bucket_at(second_consumed).unwrap(),
             chain_pages: targets.iter().map(|id| PageId(*id)).collect(),
             tail_pages: 3,
@@ -506,9 +509,10 @@ mod memory {
         another.append(&[21, 22, 23], &[]).unwrap();
         let third_consumed = consumed + 3;
         let third = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(3),
             key: another.key_at(third_consumed).unwrap(),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: another.bucket_at(third_consumed).unwrap(),
             chain_pages: targets.iter().map(|id| PageId(*id)).collect(),
             tail_pages: 3,
@@ -553,7 +557,7 @@ mod composite {
 
     use crate::{
         cache::PrefixHistory,
-        offload::{registrar::CudaRegistrar, transfer::Transfers},
+        offload::{registrar::CudaRegistrar, transfer::Copiers},
     };
 
     const IDENTITY: [u8; 32] = [0x3c; 32];
@@ -581,7 +585,7 @@ mod composite {
         pool: SlabPool,
     ) -> Staged {
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.to_vec(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.to_vec(), Some(&pool)).unwrap(),
         ));
         Staged::new(
             Some(pool),
@@ -643,7 +647,7 @@ mod composite {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
@@ -689,18 +693,20 @@ mod composite {
             let root_pages: Vec<PageId> = (base..base + 3).map(PageId).collect();
             let child_page = PageId(base + 3);
             let root = PublishedCheckpoint {
+                capture_role: flare_selene::CaptureRole::Endpoint,
                 id: ids.next(),
                 key: history.key_at(root_consumed).unwrap(),
-                parent: None,
+                ancestors: Vec::new(),
                 bucket: history.bucket_at(root_consumed).unwrap(),
                 chain_pages: root_pages.clone(),
                 tail_pages: 3,
                 slot: StateSlotId(1 + pair * 2),
             };
             let child = PublishedCheckpoint {
+                capture_role: flare_selene::CaptureRole::Endpoint,
                 id: ids.next(),
                 key: history.key_at(child_consumed).unwrap(),
-                parent: Some(root.key),
+                ancestors: vec![root.key],
                 bucket: history.bucket_at(child_consumed).unwrap(),
                 chain_pages: root_pages.iter().copied().chain([child_page]).collect(),
                 tail_pages: 1,
@@ -784,27 +790,30 @@ mod composite {
             );
         }
         let root = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: ids.next(),
             key: history.key_at(root_consumed).unwrap(),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: history.bucket_at(root_consumed).unwrap(),
             chain_pages: root_pages.clone(),
             tail_pages: 3,
             slot: StateSlotId(5),
         };
         let child = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: ids.next(),
             key: history.key_at(child_consumed).unwrap(),
-            parent: Some(root.key),
+            ancestors: vec![root.key],
             bucket: history.bucket_at(child_consumed).unwrap(),
             chain_pages: root_pages.clone(),
             tail_pages: 0,
             slot: StateSlotId(6),
         };
         let grandchild = PublishedCheckpoint {
+            capture_role: flare_selene::CaptureRole::Endpoint,
             id: ids.next(),
             key: history.key_at(grandchild_consumed).unwrap(),
-            parent: Some(child.key),
+            ancestors: vec![child.key, root.key],
             bucket: history.bucket_at(grandchild_consumed).unwrap(),
             chain_pages: root_pages
                 .iter()
@@ -844,7 +853,7 @@ mod composite {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
@@ -992,7 +1001,7 @@ mod composite {
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+            Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
         ));
         let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
@@ -1024,9 +1033,10 @@ mod composite {
             .iter()
             .enumerate()
             .map(|(index, history)| PublishedCheckpoint {
+                capture_role: flare_selene::CaptureRole::Endpoint,
                 id: ids.next(),
                 key: history.key_at(consumed).unwrap(),
-                parent: None,
+                ancestors: Vec::new(),
                 bucket: history.bucket_at(consumed).unwrap(),
                 chain_pages: if index == 0 {
                     sources.clone()
@@ -1253,12 +1263,12 @@ mod composite {
             .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
             let transfers = Arc::new(Mutex::new(
-                Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+                Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
             ));
             let memory = MemoryStore::new_flat(IDENTITY, pool, transfers).unwrap();
             let staging_pool = memory.pool().clone();
             let transfers = Arc::new(Mutex::new(
-                Transfers::start(&[(context, device)], geometry.clone(), &staging_pool).unwrap(),
+                Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&staging_pool)).unwrap(),
             ));
             let lock = flare_selene::testing::directory_lock(&directory).unwrap();
             let scanned = record::scan(&lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
@@ -1406,7 +1416,7 @@ mod disk_store {
     };
 
     use flare_selene::{
-        HostStore, InboundTicket, Layout, PageId, PublishedCheckpoint, StateSlotId, StoreEvent,
+        HostStore, InboundTicket, Layout, PageId, StateSlotId, StoreEvent,
         StoreOutcome, Tier,
         disk::DiskThread,
         disk_store::{DiskStore, Staged},
@@ -1416,7 +1426,7 @@ mod disk_store {
 
     use crate::{
         cache::PrefixHistory,
-        offload::{registrar::CudaRegistrar, transfer::Transfers},
+        offload::{registrar::CudaRegistrar, transfer::Copiers},
     };
 
     const IDENTITY: [u8; 32] = [0x5a; 32];
@@ -1545,7 +1555,7 @@ mod disk_store {
             .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
             let transfers = Arc::new(Mutex::new(
-                Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
+                Copiers::new(Vec::new()).start(&[(context, device)], geometry.clone(), Some(&pool)).unwrap(),
             ));
             let disk = DiskThread::start("flare-offload-disk").unwrap();
             DiskStore::new(

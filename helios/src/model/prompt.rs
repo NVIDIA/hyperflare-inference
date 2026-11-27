@@ -11,6 +11,7 @@ use crate::{
     frontend::{
         Frontend, RenderedPrompt,
         images::{ImageProcessor, RgbImage},
+        within_ordinary,
     },
     model::{ModelConfig, PreparedInput, PromptData, contract::ImageLayoutKind},
 };
@@ -54,6 +55,11 @@ pub fn prepare_image_inputs(
         )?,
         Some(ImageLayoutKind::Glm) => crate::frontend::images::layouts::glm::prepare_input(
             frontend, processor, rendered, &images,
+        )?,
+        Some(ImageLayoutKind::ClassToken) => crate::frontend::images::layouts::class_token::prepare_input(
+            config.contract.frontend.image_tokens.as_ref()
+                .ok_or("class-token image layout requires a prepared feature token")?.feature_token,
+            processor, rendered, &images,
         )?,
         Some(ImageLayoutKind::Qwen) => crate::frontend::images::layouts::qwen::prepare_input(
             frontend, processor, rendered, &images,
@@ -200,6 +206,22 @@ pub fn reasoning_delimiter_tokens(
     Ok(tokens)
 }
 
+/// The added tokens of the markers that the prepared syntax names: its reasoning delimiters and
+/// terminal markers, the delimiters of the tool-call parser kind it selects, and its image feature
+/// and span tokens. Request text that spells one must stay ordinary text even when the tokenizer does not
+/// mark the token special and the chat template does not name it.
+pub fn declared_control_tokens(
+    frontend: &Frontend,
+    syntax: &super::contract::FrontendContract,
+) -> Result<Vec<u32>> {
+    let mut tokens = Vec::new();
+    for marker in crate::output::OutputPipeline::declared_markers(syntax) {
+        tokens.extend(frontend.encode(marker, false)?);
+    }
+    tokens.extend(syntax.image_tokens.iter().flat_map(super::contract::ImageTokenLayout::token_ids));
+    Ok(tokens)
+}
+
 /// `delimiters` comes from `reasoning_delimiter_tokens` for this frontend and contract.
 pub fn prepare_output(
     config: &ModelConfig,
@@ -220,30 +242,44 @@ pub fn prepare_output(
         .is_some_and(|v| v == &Value::Bool(true) || v.as_str().is_some_and(|s| !s.is_empty()));
     let open_assistant = effective("add_generation_prompt") == Some(&Value::Bool(true))
         || (continuation && messages.last().is_some_and(|m| m["role"] == "assistant"));
-    let turn = open_assistant
-        .then(|| rendered.text.rsplit_once(&syntax.assistant_marker))
+    // Markers are found in the rendered text, skipping a spelling that request text wrote
+    // completely. A marker the template builds from request fields (`'<|im_start|>' + role`)
+    // has template-written bytes and stays a marker.
+    let text = rendered.text.as_str();
+    let ordinary = rendered.ordinary.as_slice();
+    let find_last = |marker: &str, from: usize| {
+        text[from..]
+            .rmatch_indices(marker)
+            .map(|(at, _)| from + at..from + at + marker.len())
+            .find(|range| !within_ordinary(ordinary, range.start, range.end))
+    };
+    let starts = |at: usize, marker: &str| {
+        text[at..].starts_with(marker) && !within_ordinary(ordinary, at, at + marker.len())
+    };
+    let body_start = open_assistant
+        .then(|| find_last(&syntax.assistant_marker, 0))
         .flatten()
-        .map(|(_, suffix)| suffix);
-    let prefix = turn.filter(|suffix| {
+        .map(|marker| marker.end);
+    let prefix = body_start.filter(|&body_start| {
         !syntax
             .message_end_markers
             .iter()
-            .any(|end| suffix.contains(end))
+            .any(|end| find_last(end, body_start).is_some())
     });
     // A template may resume the assistant turn after an embedded tool response.
-    let resumed = turn.map(|suffix| {
-        let end = syntax
+    let resumed = body_start.map(|body_start| {
+        syntax
             .message_end_markers
             .iter()
-            .filter_map(|end| suffix.rfind(end.as_str()).map(|at| at + end.len()))
-            .max();
-        &suffix[end.unwrap_or(0)..]
+            .filter_map(|end| find_last(end, body_start).map(|marker| marker.end))
+            .max()
+            .unwrap_or(body_start)
     });
     let mut reasoning = syntax.reasoning.as_ref().is_some_and(|r| {
-        resumed.is_some_and(|prefix| {
-            prefix
-                .rfind(&r.open)
-                .is_some_and(|open| prefix.rfind(&r.close).is_none_or(|close| open > close))
+        resumed.is_some_and(|from| {
+            find_last(&r.open, from).is_some_and(|open| {
+                find_last(&r.close, from).is_none_or(|close| open.start > close.start)
+            })
         })
     });
     if let Some(r) = syntax
@@ -276,31 +312,23 @@ pub fn prepare_output(
     if !tools.is_empty() && syntax.tools.is_none() {
         return Err("tool parsing is not prepared".into());
     }
-    let mut control_tokens = if syntax
+    let markers = syntax
         .tools
         .as_ref()
-        .is_some_and(|tool| matches!(tool.kind, super::contract::ToolParserKind::Xtml | super::contract::ToolParserKind::Atem))
-    {
-        let markers = if syntax.tools.as_ref().unwrap().kind == super::contract::ToolParserKind::Atem {
-            vec!["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
-        } else { vec!["<|open|>", "<|close|>", "<|sep|>"] };
-        markers.into_iter()
-            .map(|marker| {
-                let ids = frontend.encode(marker, false)?;
-                if ids.len() != 1 {
-                    return Err("output envelope delimiters must each occupy one tokenizer token".into());
-                }
-                Ok((ids[0], marker.to_owned()))
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        vec![]
-    };
+        .map_or(&[] as &[&str], |tool| crate::output::OutputPipeline::envelope_markers(tool.kind));
+    let mut control_tokens = markers
+        .iter()
+        .map(|&marker| {
+            let ids = frontend.encode(marker, false)?;
+            if ids.len() != 1 {
+                return Err("output envelope delimiters must each occupy one tokenizer token".into());
+            }
+            Ok((ids[0], marker.to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     if syntax.tools.as_ref().is_some_and(|tool| tool.kind == super::contract::ToolParserKind::Dsml) {
         let tokenizer = frontend.tokenizer();
-        for token in [deepseek_recipe_core::special_tokens::SpecialToken::ThinkingEnd,
-                      deepseek_recipe_core::special_tokens::SpecialToken::Dsml] {
-            let name = token.default_str();
+        for name in crate::output::dsml::CONTROL_MARKERS {
             if let Some(&id) = tokenizer.get_added_vocabulary().get_vocab().get(name) {
                 if !delimiters.iter().any(|(existing, _)| *existing == id) {
                     control_tokens.push((id, name.to_owned()));
@@ -311,26 +339,33 @@ pub fn prepare_output(
     control_tokens.extend_from_slice(delimiters);
     let recipient = syntax.tools.as_ref().is_some_and(|t| t.kind == super::contract::ToolParserKind::Atem);
     if recipient {
-        reasoning = prefix.is_some_and(|p| p.starts_with(" to=self<|message|>"));
+        reasoning = prefix.is_some_and(|from| starts(from, " to=self<|message|>"));
     }
-    let start = if recipient && !open_assistant {
+    let content_headers = syntax.tools.as_ref().is_some_and(|t| t.kind == super::contract::ToolParserKind::TmlJson);
+    let start = if content_headers {
+        // The last framing token generated as a control token decides whether the
+        // prompt ends between frames, inside a header, or inside a frame body.
+        crate::output::tml::prompt_start(&rendered.token_ids, &control_tokens)
+    } else if recipient && !open_assistant {
         crate::output::tagged::OutputStart::RecipientFrame
-    } else if recipient && prefix.is_some_and(|p| !p.contains("<|message|>")) {
+    } else if recipient && prefix.is_some_and(|from| find_last("<|message|>", from).is_none()) {
         crate::output::tagged::OutputStart::RecipientHeader
-    } else if recipient && prefix.is_some_and(|p| {
-        p.starts_with(" to=") && ![" to=self<|message|>", " to=user<|message|>", " to=commentary<|message|>"].iter().any(|m|p.starts_with(m))
+    } else if recipient && prefix.is_some_and(|from| {
+        starts(from, " to=") && ![" to=self<|message|>", " to=user<|message|>", " to=commentary<|message|>"].iter().any(|m| starts(from, m))
     }) {
         crate::output::tagged::OutputStart::ToolBody
     } else if !tools.is_empty()
         && syntax.tools.as_ref().is_some_and(|tool| {
             tool.kind == super::contract::ToolParserKind::Dsml
-                && prefix.is_some_and(|suffix| {
+                && prefix.is_some_and(|from| {
                     let open = if tool.tag_separator == " " {
                         "<｜DSML｜ calls>"
                     } else {
                         "<｜DSML｜tool_calls>"
                     };
-                    suffix.trim_end().ends_with(open)
+                    let body_end = from + text[from..].trim_end().len();
+                    text[from..body_end].ends_with(open)
+                        && !within_ordinary(ordinary, body_end - open.len(), body_end)
                 })
         }) {
         crate::output::tagged::OutputStart::ToolBody
@@ -371,6 +406,7 @@ mod tests {
             "<｜deepseek_image｜>", "<|media_pad|>", "<|media_begin|>", "<|media_content|>",
             "<|media_end|>", "<im_patch>", "<patch_start>", "<patch_end>", "<patch_newline>",
             "<im_start>", "<im_end>", "<image>", "<img>", "</img>",
+            "<|start|>", "<|message|>", "<|eom|>", "<|eot|>",
         ].map(|text| tokenizers::AddedToken::from(text, true))).unwrap();
         let asset = |name: &str, bytes: &[u8]| {
             let path = root.join(name); std::fs::write(&path, bytes).unwrap();
@@ -406,6 +442,7 @@ mod tests {
             (ImageLayoutKind::Moonvit, ImageSettings::Moonvit {}, "<|media_pad|>", 4),
             (ImageLayoutKind::Step, ImageSettings::Step {}, "<im_patch>", 16),
             (ImageLayoutKind::Radio, ImageSettings::Radio {}, "<image>", 4),
+            (ImageLayoutKind::ClassToken, ImageSettings::PaddedGrid {}, "<image>", 4),
         ];
         for (layout, settings, placeholder, merge) in profiles {
             let initial = ImageProcessor::load(settings.clone(), Default::default()).unwrap();
@@ -443,7 +480,7 @@ mod tests {
             let processor = ImageProcessor::load(settings, limits).unwrap();
             let text = format!("a{placeholder}b{placeholder}c{placeholder}d");
             let rendered = RenderedPrompt { message_boundaries: Vec::new(), token_ids: frontend.encode(&text, false).unwrap(),
-                text, image_sources: vec![], image_checkpoint_hints: vec![] };
+                text, image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![] };
             let images = (0..3).map(|i| RgbImage::new(64, 64, vec![i; 64 * 64 * 3]).unwrap()).collect();
             let prepared = prepare_input(&config, &frontend, Some(&processor), &rendered, images).unwrap();
             assert_eq!(prepared.conditioned_inputs.len(), 3, "{layout:?}");
@@ -545,7 +582,7 @@ mod tests {
             let mut token_ids = frontend.encode(&prefix, false).unwrap();
             token_ids.extend(literal.bytes().map(u32::from));
             let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                image_sources: vec![], image_checkpoint_hints: vec![],
+                image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
                 text: prefix + literal,
                 token_ids,
             };
@@ -627,6 +664,52 @@ mod tests {
     }
 
     #[test]
+    fn declared_markers_are_controls_that_request_text_cannot_spell() {
+        use super::super::contract::{ImageSpan, ImageTokenLayout};
+        // The tokenizer marks none of these special and the template names none of them.
+        let declared = [
+            "<think>", "</think>", "<tool_call>", "</tool_call>", "<feature>", "<begin>", "<end>",
+            "<row>",
+        ];
+        let added = [&declared[..], &["/nothink"]].concat();
+        let frontend = ascii_frontend(&added);
+        let id = |text: &str| frontend.encode(text, false).unwrap()[0];
+        let mut syntax = serde_json::from_str::<crate::model::PreparedContract>(include_str!(
+            "../../tests/support/contracts/qwen38.json"
+        ))
+        .unwrap()
+        .frontend;
+        syntax.image_tokens = Some(ImageTokenLayout {
+            feature_token: id("<feature>"),
+            span: Some(ImageSpan {
+                start_token: id("<begin>"),
+                end_token: id("<end>"),
+                max_tokens: 4,
+                interior_tokens: vec![id("<row>")],
+                unscoped_tokens: vec![],
+            }),
+        });
+        let content = added.join(" ");
+        let render = |frontend: &Frontend| {
+            frontend
+                .render_chat(&[json!({"role": "user", "content": content})], &Map::new())
+                .unwrap()
+                .token_ids
+        };
+        let count = |ids: &[u32], text: &str| ids.iter().filter(|token| **token == id(text)).count();
+        let lexical = render(&frontend);
+        assert!(declared.iter().all(|text| count(&lexical, text) == 1), "{lexical:?}");
+        let tokens = declared_control_tokens(&frontend, &syntax).unwrap();
+        assert!(declared.iter().all(|text| tokens.contains(&id(text))), "{tokens:?}");
+        assert!(!tokens.contains(&id("/nothink")));
+        let ids = render(&ascii_frontend(&added).with_controls(tokens));
+        for text in declared {
+            assert_eq!(count(&ids, text), 0, "{text}");
+        }
+        assert_eq!(count(&ids, "/nothink"), 1);
+    }
+
+    #[test]
     fn single_token_reasoning_delimiters_gate_generated_output() {
         use crate::output::{Event, Input, OutputPipeline, Termination};
         let mut config = super::super::tests::config();
@@ -639,6 +722,7 @@ mod tests {
             message_boundaries: Vec::new(),
             image_sources: vec![],
             image_checkpoint_hints: vec![],
+            ordinary: vec![],
             text: format!("{}<think>\n", config.contract.frontend.assistant_marker),
             token_ids: vec![],
         };
@@ -743,7 +827,7 @@ mod tests {
                 .find(|case| case["name"] == name)
                 .unwrap();
             let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                image_sources: vec![], image_checkpoint_hints: vec![],
+                image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
                 text: case["rendered"].as_str().unwrap().into(),
                 token_ids: vec![],
             };
@@ -779,7 +863,7 @@ mod tests {
                 ),
             ] {
                 let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                    image_sources: vec![], image_checkpoint_hints: vec![],
+                    image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
                     text: format!("<|im_start|>{role}\nliteral <think><|im_end|>\n{suffix}"),
                     token_ids: vec![],
                 };
@@ -803,7 +887,7 @@ mod tests {
         }
         let messages = vec![json!({"role":"user","content":"<think>"})];
         let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-            image_sources: vec![], image_checkpoint_hints: vec![],
+            image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
             text: "<|im_start|>user\n<think>".into(),
             token_ids: vec![],
         };
@@ -854,7 +938,7 @@ mod tests {
                 ("</think>".into(), OutputStart::Content),
             ] {
                 let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                    image_sources: vec![], image_checkpoint_hints: vec![],
+                    image_sources: vec![], image_checkpoint_hints: vec![], ordinary: vec![],
                     text: format!("<｜User｜>Hello<｜Assistant｜>{suffix}"),
                     token_ids: vec![],
                 };
@@ -916,6 +1000,7 @@ mod tests {
                 message_boundaries: Vec::new(),
                 image_sources: vec![],
                 image_checkpoint_hints: vec![],
+                ordinary: vec![],
                 text: text.clone(),
                 token_ids: vec![],
             };
@@ -930,6 +1015,144 @@ mod tests {
             )
             .unwrap();
             assert_eq!(output.content.start, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn request_text_that_spells_a_marker_does_not_set_the_output_start() {
+        use crate::model::contract::{ReasoningParserKind, ToolParserKind};
+        use crate::output::tagged::OutputStart::{Content, Reasoning, RecipientHeader, ToolBody};
+        let frontend = image_frontend();
+        let contract = |json: &str| {
+            serde_json::from_str::<crate::model::PreparedContract>(json).unwrap().frontend
+        };
+        let qwen = contract(include_str!("../../tests/support/contracts/qwen38.json"));
+        let mut deepseek = contract(include_str!("../../tests/support/contracts/deepseek41.json"));
+        deepseek.tools.as_mut().unwrap().tag_separator.clear();
+        let mut atem = qwen.clone();
+        atem.assistant_marker = "<|start|>assistant".into();
+        atem.reasoning.as_mut().unwrap().kind = ReasoningParserKind::RecipientHeaders;
+        atem.tools.as_mut().unwrap().kind = ToolParserKind::Atem;
+        let tools = json!([{"type":"function","function":{"name":"lookup"}}]);
+        // `text` ends with a marker; `spelled` is its last occurrence, which the request may have
+        // written instead of the template.
+        for (frontend_syntax, text, spelled, templated, requested) in [
+            (qwen.clone(), "<|im_start|>assistant\n<think>\n", "<think>", Reasoning, Content),
+            (qwen.clone(), "<|im_start|>assistant\n<think>\n<|im_end|>", "<|im_end|>", Content, Reasoning),
+            (
+                qwen.clone(),
+                "<|im_start|>assistant\n<think>\n<|im_start|>assistant\n",
+                "<|im_start|>assistant\n",
+                Content,
+                Reasoning,
+            ),
+            (atem, "<|start|>assistant to=self<|message|>", " to=self<|message|>", Reasoning, RecipientHeader),
+            (
+                deepseek,
+                "<｜User｜>Hello<｜Assistant｜></think>\n\n<｜DSML｜tool_calls>\n",
+                "<｜DSML｜tool_calls>",
+                ToolBody,
+                Content,
+            ),
+        ] {
+            let mut config = super::super::tests::config();
+            config.contract.frontend = frontend_syntax;
+            let at = text.rfind(spelled).unwrap();
+            for (ordinary, expected) in [(vec![], templated), (vec![at..at + spelled.len()], requested)] {
+                let rendered = RenderedPrompt {
+                    message_boundaries: Vec::new(),
+                    image_sources: vec![],
+                    image_checkpoint_hints: vec![],
+                    ordinary,
+                    text: text.into(),
+                    token_ids: vec![],
+                };
+                let options = json!({"add_generation_prompt":true,"tools":tools});
+                let output = prepare_output(
+                    &config,
+                    &frontend,
+                    &rendered,
+                    &[json!({"role":"user","content":"Hi"})],
+                    options.as_object().unwrap(),
+                    false,
+                    &[],
+                )
+                .unwrap();
+                assert_eq!(output.content.start, expected, "{text:?} {:?}", rendered.ordinary);
+            }
+        }
+    }
+
+    /// A marker is skipped only when request text spelled all of it. Templates build markers from
+    /// request fields (`'<|im_start|>' + message.role`, ` to=` + `message.recipient`); the start
+    /// is then the one the same text has when no request ranges are recorded.
+    #[test]
+    fn markers_built_from_request_fields_give_the_start_of_a_prompt_without_ranges() {
+        use crate::model::contract::{ReasoningParserKind, ToolParserKind};
+        use crate::output::tagged::OutputStart::{self, Content, Reasoning, ToolBody};
+        let frontend = image_frontend();
+        let qwen = serde_json::from_str::<crate::model::PreparedContract>(include_str!(
+            "../../tests/support/contracts/qwen38.json"
+        ))
+        .unwrap()
+        .frontend;
+        let mut atem = qwen.clone();
+        atem.assistant_marker = "<|start|>assistant".into();
+        atem.reasoning.as_mut().unwrap().kind = ReasoningParserKind::RecipientHeaders;
+        atem.tools.as_mut().unwrap().kind = ToolParserKind::Atem;
+        let user = json!({"role":"user","content":"Hi"});
+        let reply = json!({"role":"assistant","content":"plan"});
+        let tools = json!([{"type":"function","function":{"name":"lookup"}}]);
+        let start = |syntax: &crate::model::contract::FrontendContract, text: &str, ordinary: Vec<std::ops::Range<usize>>, messages: &[Value], options: Value| {
+            let mut config = super::super::tests::config();
+            config.contract.frontend = syntax.clone();
+            let rendered = RenderedPrompt {
+                message_boundaries: Vec::new(),
+                image_sources: vec![],
+                image_checkpoint_hints: vec![],
+                ordinary,
+                text: text.into(),
+                token_ids: vec![],
+            };
+            prepare_output(&config, &frontend, &rendered, messages, options.as_object().unwrap(), false, &[])
+                .unwrap()
+                .content
+                .start
+        };
+        let span = |text: &str, part: &str| {
+            let at = text.rfind(part).unwrap();
+            at..at + part.len()
+        };
+        // ChatML: the role inside the header and the continued message are request text.
+        let text = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\nplan";
+        let ordinary = vec![span(text, "Hi"), span(text, "assistant"), span(text, "plan")];
+        let continued = json!({"continue_final_message": true});
+        for ranges in [vec![], ordinary] {
+            let actual = start(&qwen, text, ranges.clone(), &[user.clone(), reply.clone()], continued.clone());
+            assert_eq!(actual, Reasoning, "{ranges:?}");
+        }
+        // Atem: the recipient inside ` to=<recipient><|message|>` is request text.
+        for (recipient, expected) in
+            [("self", Reasoning), ("user", Content), ("commentary", Content), ("lookup", ToolBody)]
+        {
+            let text = format!("<|start|>assistant to={recipient}<|message|>");
+            let options = json!({"add_generation_prompt": true, "tools": tools});
+            for ranges in [vec![], vec![span(&text, recipient)]] {
+                let actual = start(&atem, &text, ranges.clone(), &[user.clone()], options.clone());
+                assert_eq!(actual, expected, "{text:?} {ranges:?}");
+            }
+        }
+        // A marker inside one longer request range is skipped; one that template bytes complete is not.
+        let text = "<|im_start|>assistant\n<think>\nsay: <|im_start|>assistant\n";
+        let options = json!({"add_generation_prompt": true});
+        let cases: [(Vec<std::ops::Range<usize>>, OutputStart); 3] = [
+            (vec![], Content),
+            (vec![span(text, "say: <|im_start|>assistant\n")], Reasoning),
+            (vec![span(text, "say: <|im_start|>assist")], Content),
+        ];
+        for (ranges, expected) in cases {
+            let actual = start(&qwen, text, ranges.clone(), &[user.clone()], options.clone());
+            assert_eq!(actual, expected, "{ranges:?}");
         }
     }
 }

@@ -9,7 +9,7 @@ from collections.abc import Mapping
 
 def quantized_layers(config):
     quant = config.get("quantization_config")
-    if (not isinstance(quant, Mapping) or quant.get("quant_method") != "modelopt"
+    if (not isinstance(quant, Mapping) or quant.get("quant_method") not in ("modelopt", "modelopt_mixed")
             or quant.get("quant_algo") != "MIXED_PRECISION"
             or quant.get("kv_cache_quant_algo") is not None):
         raise ValueError("expected modelopt MIXED_PRECISION with unquantized KV")
@@ -54,8 +54,6 @@ def projection_group_format(layers, prefixes):
     if not prefixes:
         raise ValueError("projection group must be nonempty")
     formats = [linear_format(layers, prefix) for prefix in prefixes]
-    if "tensor_fp8" in formats and len(prefixes) > 1:
-        raise ValueError("tensor-FP8 projections retain separate checkpoint activation and weight scales")
     if len(set(formats)) != 1:
         raise ValueError("fused projections must use the same quantization format")
     return formats[0]
@@ -72,6 +70,8 @@ def expert_format(layers, prefix):
     fmt = linear_format(layers, prefix)
     if fmt in ("iq2_xxs", "q8_0"):
         return fmt, "a16"
+    if fmt == "mxfp8":
+        return fmt, "a8"
     if fmt not in ("nvfp4", "mxfp4"):
         raise ValueError(f"{prefix}: expected FP4 or GGML block-quantized experts")
     mode = "a16" if entry["quant_algo"] == "W4A16_NVFP4" else "a8" if fmt == "mxfp4" else "a4"

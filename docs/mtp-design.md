@@ -70,9 +70,8 @@ The [checkpoint manifest](../ignition/preparation/qwen38.py) validates MTP
 tensor geometry. Target loading excludes those tensors; the separate
 [MTP loader](../ignition/recipes/qwen38/mtp_weights.py) prepares their weights.
 
-The Transformers revision pinned in `pyproject.toml`,
-`1d9654e78a23fb167ef539cbd699dfbd3e4830cf`, ignores `mtp.*` checkpoint keys
-and has no MTP module. The [MTP recipe](../ignition/recipes/qwen38/mtp.py) composes
+Transformers 5.23.0, the release pinned in `pyproject.toml`, ignores `mtp.*`
+checkpoint keys and has no MTP module. The [MTP recipe](../ignition/recipes/qwen38/mtp.py) composes
 b12x operators for feedback, attention, expert execution, and output mixing.
 Feedback arithmetic is checked against `b12x.sequence.mtp_feedback.reference`;
 state alignment and graph replay are exercised by the recipe tests.
@@ -190,11 +189,14 @@ packed targets may use fewer than `B*W` rows. Selecting a lower positive draft
 depth requires a captured producer at that depth; loading never relabels its `D`.
 A confidence-producing speculative operation captures proposal generation,
 fresh-confidence prefix allocation, target verification, and commit in one CUDA graph. The proposal
-backbone executes the full configured block. Before submission, cohort and target
-capacity selection use historical joint prefix survival and measured complete-round
-cost. Inside the graph, fresh confidence selects causal prefixes under the frozen
-host ceilings and physical capacity `P`. Verification outcomes update historical
-survival separately from these confidence forecasts.
+backbone executes the full configured block. Before submission, cohort and target capacity selection use historical joint
+prefix survival—calibrated per depth against observed verification outcomes and
+adjusted on crowded GPU-allocated packed rounds for the GPU allocator's
+empirical cross-lane order-statistic surplus—together with measured
+complete-round cost. Inside the graph, fresh confidence selects causal prefixes
+under the frozen host ceilings and physical capacity `P`. Verification outcomes
+update historical survival and per-depth calibration without mutating the
+stored per-request confidence forecasts.
 
 ## A speculative round is a state transaction
 
@@ -385,7 +387,8 @@ capture.
 | Acceptance/cost statistics and bounded exploration policy | Rust, using completed-round records |
 | Grammar advancement, stop sequences, output presentation | Rust with ordered token-vector completions |
 
-Rust adapts among prepared widths from request-local prefix survival and measured
+Rust adapts among prepared widths from per-request prefix survival, started from
+the population mean on a model without GPU confidence, and measured
 full-round costs. Every speculative graph is a complete proposal, verification,
 and commit program. The controller learns from its emitted/offered/accepted
 records, or optional verification probabilities supplied by prepared graphs;

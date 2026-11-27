@@ -110,6 +110,7 @@ struct Resync {
 }
 
 pub(crate) struct Session {
+    pub(crate) codec: Option<wire::CodecCaps>,
     header: wire::Header,
     pub(crate) limits: wire::Limits,
     pub(crate) regions: Option<Arc<Regions>>,
@@ -218,8 +219,8 @@ impl Engine {
         self.ranks = Some(ranks);
     }
 
-    pub(crate) fn registrar(&self) -> &dyn HostRegistrar {
-        &*self.registrar
+    pub(crate) fn registrar(&self) -> Arc<dyn HostRegistrar + Send + Sync> {
+        self.registrar.clone()
     }
 
     /// Registration is over: from here every attempt to register host memory fails.
@@ -263,6 +264,12 @@ impl Engine {
         std::mem::take(&mut self.out)
     }
 
+    pub(crate) fn codec_caps(&self) -> wire::CodecCaps {
+        crate::codec_copy::reader_caps_many(
+            &self.copier.lock().unwrap().codec_receive_profiles(),
+        )
+    }
+
     // ---- session ----------------------------------------------------------
 
     /// The manager opened a session. `regions` are the mapped and registered
@@ -283,6 +290,7 @@ impl Engine {
             .set_max_entries(limits.max_resync_entries as usize);
         self.shared.set_max_lookups(limits.max_concurrent_lookups);
         self.sess = Some(Session {
+            codec: opened.codec.clone(),
             header: wire::Header {
                 manager_incarnation,
                 session_incarnation: opened.session_incarnation,

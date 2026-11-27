@@ -18,11 +18,14 @@ class ObservationForward:
                 ("live_counts", (2,), torch.int32), ("starts", (rows,), torch.int64),
                 ("lengths", (rows,), torch.int32), ("query_start_loc", (rows + 1,), torch.int32))})
         if acceptance_width is not None:
-            from ignition.components.speculation import SpeculativeAcceptance
-
-            acceptance = SpeculativeAcceptance.storage_layout(rows, acceptance_width)
-            layout.update({f"acceptance.{name}": acceptance[name] for name in
-                           ("offered_drafts", "accepted_drafts", "survival", "valid")})
+            if type(acceptance_width) is not int or acceptance_width < 2:
+                raise ValueError("speculative acceptance width must be an integer >= 2")
+            layout.update({
+                "acceptance.offered_drafts": ((rows,), torch.int32),
+                "acceptance.accepted_drafts": ((rows,), torch.int32),
+                "acceptance.survival": ((rows, acceptance_width - 1), torch.float32),
+                "acceptance.valid": ((rows,), torch.bool),
+            })
             layout.update({f"commit.{name}": (shape, dtype) for name, shape, dtype in (
                 ("accepted_drafts", (rows,), torch.int32), ("emitted_count", (rows,), torch.int32),
                 ("emitted_ids", (rows, acceptance_width), torch.int64))})
@@ -75,7 +78,7 @@ def capture_observers(forwards, signatures, *, device, cache_root=None, **kwargs
     wrappers = {}
     for name, forward in forwards.items():
         signature = signatures[name]
-        if signature.kind not in ("prefill", "speculative"):
+        if signature.kind not in ("prefill", "terminal_prefill", "speculative"):
             raise ValueError("benchmark observations require prefill or speculative graphs")
         wrappers[names[name]] = ObservationForward(forward, rows=signature.batch_capacity, device=device,
             draft=signature.kind == "speculative" and forward.draft is not None)

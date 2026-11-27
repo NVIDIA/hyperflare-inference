@@ -42,7 +42,8 @@ fn ranges(
 #[cfg(windows)]
 impl super::NativeResources {
     pub(super) unsafe fn allocate_host(&mut self, core: &super::Core) -> Result<()> {
-        use super::{Access, AllocationProperties, Location, Memory};
+        use super::driver::Access;
+        use super::{AllocationProperties, Location, Memory};
 
         if !core
             .allocations
@@ -108,7 +109,10 @@ impl super::NativeResources {
                     flags: 3,
                 },
             ];
+            let bits = super::address_space::virtual_address_bits(self.device);
             for (address, bytes) in ranges {
+                super::address_space::check_fits("host reservation", address, bytes as u64, bits)
+                    .map_err(|error| invalid(format!("{error}; re-export the core for this GPU")))?;
                 let mut pointer = 0;
                 driver.check(
                     "cuMemAddressReserve(host)",

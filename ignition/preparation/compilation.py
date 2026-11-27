@@ -30,6 +30,10 @@ _OPTIONS = {'max_autotune': True, 'emulate_precision_casts': True,
             'compile_threads': min(16, os.cpu_count() or 1)}
 if os.name == 'nt':
     _OPTIONS['worker_start_method'] = 'spawn'
+
+
+def _compile_options(options=None):
+    return dict(_OPTIONS) if options is None else {**_OPTIONS, **options}
 # Compiled forwards and their guards persist beside b12x kernels and tuning selections.
 DEFAULT_CACHE_ROOT = Path.home() / '.cache' / 'flare' / 'kernels'
 
@@ -388,6 +392,31 @@ def _lower_storage(module):
             node.target = torch.ops.flare.native_layer_norm.default
         elif node.op == 'call_function' and node.target is torch.ops.aten._fused_rms_norm.default:
             node.target = torch.ops.flare.native_rms_norm.default
+        elif (node.op == 'call_function' and node.target is torch.ops.aten.lift_fresh_copy.default
+                and len(node.args) == 1 and isinstance(node.args[0], torch.fx.Node)
+                and node.args[0].op == 'get_attr'):
+            source = node.args[0]
+            constant = operator.attrgetter(source.target)(module)
+            if (isinstance(constant, torch.Tensor)
+                    and not isinstance(constant, torch._subclasses.FakeTensor)
+                    and constant.ndim == 0 and constant.device.type == 'cpu'):
+                with torch._C._DisableTorchDispatch():
+                    scalar = constant.item()
+                with graph.inserting_before(node):
+                    replacement = graph.call_function(
+                        torch.ops.aten.scalar_tensor.default,
+                        (scalar,),
+                        {'dtype': constant.dtype, 'layout': torch.strided, 'device': torch.device('cpu')},
+                    )
+                    replacement.meta = node.meta.copy()
+                node.replace_all_uses_with(replacement)
+                graph.erase_node(node)
+                if not source.users:
+                    graph.erase_node(source)
+                    parent_path, _, attr_name = source.target.rpartition('.')
+                    owner = operator.attrgetter(parent_path)(module) if parent_path else module
+                    if hasattr(owner, attr_name):
+                        delattr(owner, attr_name)
     for node in reversed(list(graph.nodes)):
         if (node.op == 'call_function' and isinstance(node.target, torch._ops.OpOverload)
                 and node.target._schema.name in (
@@ -518,6 +547,27 @@ def _lower_storage(module):
             deferred.add(node)
         else:
             opaque.update(key_for(arg) for arg in tensor_operands(node) if key_for(arg) in bases)
+    opaque_mutable_keys = {
+        keys[arg] for node, operands in mutations.items()
+        if operands and node not in deferred for arg in operands
+    }
+    for node in originals:
+        if node.target is not torch.ops.aten.clone.default or keys.get(node) not in opaque_mutable_keys:
+            continue
+        source = node.args[0] if node.args else None
+        source_val = source.meta.get('val') if isinstance(source, torch.fx.Node) else None
+        if (isinstance(source, torch.fx.Node) and isinstance(source_val, torch.Tensor)
+                and keys.get(source) not in bases and len(source.users) == 1
+                and int(source_val.storage_offset()) == 0 and source_val.is_contiguous()
+                and source_val.numel() * source_val.element_size() == source_val.untyped_storage().nbytes()):
+            continue
+        # Functionalization reconstructs mutable views relative to the clone's
+        # zero offset. Folding that clone into an offset, non-contiguous, sliced,
+        # or shared source corrupts mutable operands. Preserve its allocation boundary.
+        materialize.setdefault(node, [])
+    temporary_owners = {}
+    for node, key in keys.items():
+        temporary_owners.setdefault(key, node)
     calls, mutation_calls = [], {}
     for node in originals:
         if node.op != 'call_function':
@@ -545,12 +595,23 @@ def _lower_storage(module):
             mutable = key in mutable_keys
             array, indices = (writes, write_indices) if mutable else (reads, read_indices)
             base = bases.get(key)
+            if base is None and mutable and len(dtypes[key]) > 1:
+                # Inductor can materialize a dtype view of a mutated temporary slice as a smaller
+                # allocation, then apply the slice's offset in the parent to it. The call receives the
+                # allocation that owns the storage, and _Invocation.run rebuilds the operand's view.
+                base = temporary_owners[key]
+                try:
+                    base.meta['val'].view(value.dtype)
+                except RuntimeError as error:
+                    raise ValueError(f'cannot view temporary storage-call owner {base} as {value.dtype} '
+                                     f'for operand {arg}') from error
             identity = key if base is not None else arg
             if identity not in indices:
                 indices[identity] = len(array)
                 array.append(base if base is not None else arg)
+            begin = regions[key][0] if key in bases else 0
             descriptor = (value.dtype, tuple(map(int, value.shape)), tuple(map(int, value.stride())),
-                          int(value.storage_offset()) - regions[key][0] // value.element_size()) if base is not None else None
+                          int(value.storage_offset()) - begin // value.element_size()) if base is not None else None
             operands.append((position, mutable, indices[identity], descriptor))
             leaves[position] = None
         invocation = _Invocation(target, leaves, tree, operands, integer_positions)

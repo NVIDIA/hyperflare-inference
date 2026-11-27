@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Platforms a core may be named for. These are the NVIDIA device
 /// identifiers Flare already uses for revisions, not SM architecture names.
-pub const PLATFORMS: [&str; 3] = ["gb10", "gb202", "gb300"];
+pub const PLATFORMS: [&str; 4] = ["ga102", "gb10", "gb202", "gb300"];
 
 /// Platform for one NVIDIA PCI id in NVML's `device<<16 | vendor` layout.
 ///
@@ -25,8 +25,12 @@ pub const GB202_DEVICES: [u32; 9] = [
 /// GB10 and RTX Spark N1X device identifiers for the SM121 platform.
 pub const GB10_DEVICES: [u32; 5] = [0x2e02, 0x2e03, 0x2e06, 0x2e12, 0x2e2a];
 
+/// GA102 device identifiers for the SM86 platform: GeForce RTX 3090 Ti, 3090,
+/// 3080, 3080 Ti, 3080 12 GB and 3080 LHR.
+pub const GA102_DEVICES: [u32; 6] = [0x2203, 0x2204, 0x2206, 0x2208, 0x220a, 0x2216];
+
 /// GB300 device identifiers. `0x31c3` is the SM103 GPU of DGX Station GB300.
-pub const GB300_DEVICES: [u32; 1] = [0x31c3];
+pub const GB300_DEVICES: [u32; 2] = [0x31c2, 0x31c3];
 
 pub fn platform_from_pci(pci_id: u32) -> Option<&'static str> {
     if pci_id & 0xffff != 0x10de {
@@ -38,6 +42,9 @@ pub fn platform_from_pci(pci_id: u32) -> Option<&'static str> {
     }
     if GB300_DEVICES.contains(&device) {
         return Some("gb300");
+    }
+    if GA102_DEVICES.contains(&device) {
+        return Some("ga102");
     }
     GB202_DEVICES.contains(&device).then_some("gb202")
 }
@@ -178,6 +185,7 @@ mod tests {
                 "{device:#06x}"
             );
         }
+        assert_eq!(platform_from_pci(0x31c2_10de), Some("gb300"));
         assert_eq!(platform_from_pci(0x31c3_10de), Some("gb300"));
         for device in GB202_DEVICES {
             assert_eq!(
@@ -186,7 +194,17 @@ mod tests {
                 "{device:#06x}"
             );
         }
+        for device in GA102_DEVICES {
+            assert_eq!(
+                platform_from_pci(device << 16 | 0x10de),
+                Some("ga102"),
+                "{device:#06x}"
+            );
+        }
+        assert_eq!(platform_from_pci(0x2204_1af4), None);
+        assert_eq!(platform_from_pci(0x2484_10de), None);
         assert_eq!(platform_from_pci(0x2bbc_1af4), None);
+        assert_eq!(platform_from_pci(0x31c2_1af4), None);
         assert_eq!(platform_from_pci(0x31c3_1af4), None);
         assert_eq!(platform_from_pci(0x2e06_1af4), None);
         assert_eq!(platform_from_pci(0x2e07_10de), None);

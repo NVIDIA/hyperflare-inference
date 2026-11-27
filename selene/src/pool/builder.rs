@@ -20,11 +20,18 @@ use std::sync::{Arc, Mutex};
 
 /// Registration precedes cache sizing; copying starts with the final cache geometry.
 struct Copier {
+    receive_profiles: Vec<[u8; 32]>,
     layout: Layout,
     transfers: Option<Box<dyn crate::PageCopier>>,
 }
 
 impl PageCopier for Copier {
+    fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+        if let Some(transfers) = &self.transfers {
+            return transfers.codec_receive_profiles();
+        }
+        self.receive_profiles.clone()
+    }
     fn layout(&self) -> &Layout {
         &self.layout
     }
@@ -77,6 +84,23 @@ impl PoolBuilder<'_> {
         self,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
     ) -> Result<(PreparedPool, Vec<u64>)> {
+        self.start_wait(registrar, super::STARTUP_WAIT)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start_with_wait(
+        self,
+        registrar: Arc<dyn HostRegistrar + Send + Sync>,
+        wait: std::time::Duration,
+    ) -> Result<(PreparedPool, Vec<u64>)> {
+        self.start_wait(registrar, wait)
+    }
+
+    fn start_wait(
+        self,
+        registrar: Arc<dyn HostRegistrar + Send + Sync>,
+        wait: std::time::Duration,
+    ) -> Result<(PreparedPool, Vec<u64>)> {
         let Self {
             options,
             identity,
@@ -87,7 +111,9 @@ impl PoolBuilder<'_> {
             mut peers,
             disk,
         } = self;
+        let receive_profiles = crate::codec_copy::receive_profiles(geometry);
         let copier = Arc::new(Mutex::new(Copier {
+            receive_profiles,
             layout: Layout::new(geometry)?,
             transfers: None,
         }));
@@ -145,12 +171,12 @@ impl PoolBuilder<'_> {
                     copier.clone(),
                     registrar,
                     super::Roots::System,
-                    super::STARTUP_WAIT,
+                    wait,
                 )?;
                 (Some(client), None, None)
             }
         };
-        let mut prepared = PreparedPool {
+        let prepared = PreparedPool {
             client,
             agent,
             records,
@@ -159,10 +185,6 @@ impl PoolBuilder<'_> {
             copier: copier.clone(),
             identity,
         };
-        if prepared.registered_regions().is_empty() {
-            // Finish attachment before caches consume its startup allowance.
-            prepared.close()?;
-        }
         let (host, device) = prepared.registration_costs()?;
         let charges = Budget {
             host: Ok(0),
@@ -223,11 +245,7 @@ impl PreparedPool {
     }
     pub fn summary(&self) -> Result<String> {
         let (host, device) = self.registration_costs()?;
-        Ok(if self.approved() {
-            format!("{host} host bytes · {device} device bytes per GPU")
-        } else {
-            "local tiers only".into()
-        })
+        Ok(format!("{host} host bytes · {device} device bytes per GPU"))
     }
     fn registered_regions(&self) -> &[RegisteredRegion] {
         match (&self.client, &self.agent) {
@@ -254,14 +272,18 @@ impl PreparedPool {
     pub fn attach(
         self,
         local: Option<Box<dyn crate::store::TierStore>>,
+        drain_on_shutdown: std::time::Duration,
     ) -> Result<Box<dyn HostStore>> {
-        Ok(Box::new(PooledStore::new(
+        let mut store = PooledStore::new(
             super::local::Tiers::new(local),
             self.client
                 .ok_or("a pool rank agent cannot serve rank zero's store")?,
             self.identity,
             &self.layout,
-        )))
+        );
+        store.decode = self.copier.lock().unwrap().transfers.as_ref().and_then(|copier| copier.decode_counters());
+        store.drain_on_shutdown = drain_on_shutdown;
+        Ok(Box::new(store))
     }
 }
 

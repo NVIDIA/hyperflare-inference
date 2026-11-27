@@ -21,6 +21,8 @@
 !selene/examples/**
 !selene/proto/
 !selene/proto/**
+!selene/native/
+!selene/native/**
 !selene/src/
 !selene/src/**
 !selene-manager/
@@ -43,12 +45,6 @@
 !helios/proto/**
 !helios/native/
 !helios/native/**
-!ignition/recipes/qwen38/assets/
-!ignition/recipes/qwen38/assets/**
-!ignition/recipes/step5/assets/
-!ignition/recipes/step5/assets/**
-!ignition/recipes/kimi3/assets/
-!ignition/recipes/kimi3/assets/**
 !LICENSE
 !NOTICE
 !THIRD_PARTY_NOTICES.md

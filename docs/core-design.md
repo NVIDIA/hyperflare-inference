@@ -380,8 +380,8 @@ vision weights.
 
 [pyproject.toml](../pyproject.toml) and [uv.lock](../uv.lock) declare the
 preparation dependencies. Transformers supplies canonical architecture and
-processor semantics. `pyproject.toml` pins FlashInfer to a commit of
-`local-inference-lab/flashinfer`, and `uv.lock` records the same commit;
+processor semantics. `pyproject.toml` tracks the `main` branch of
+`local-inference-lab/flashinfer`, and `uv.lock` records the resolved commit;
 its b12x operators and FlashInfer sampling supply the prepared GPU computation.
 
 ### Runtime contract
@@ -948,9 +948,12 @@ Preparation proceeds in this order:
 6. After compiler workers exit, materialize final KV storage through
    `capture_forwards`' materialization callback. Bind live tensors and native
    handles, validate guards, and refresh cache-maintenance pointers.
-7. Warm every variant in rank order and capture each rank's graphs. Preserve
-   mutations, aliases, forks, and joins. Freeze storage and retain compiled
-   kernel owners through native drain.
+7. Warm compiled variants and capture each rank's graphs in descending order of
+   largest compiler-planned CUDA allocation (breaking ties by total planned bytes,
+   then catalog order, agreed across ranks by cross-rank maximum request size),
+   with uncompiled variants following in catalog order. Preserve mutations,
+   aliases, forks, and joins. Freeze storage and retain compiled kernel owners
+   through native drain.
 8. Validate the catalog and frontend assets, export the runtime core, and
    close the prepared model. `flare run CORE` loads the exported core.
 
@@ -991,9 +994,9 @@ enum values, invalid storage views, and incompatible input geometry reject loadi
 
 Each selected program's pending-token inputs determine its completion dependency.
 Host-fed pending tokens wait for the preceding completion. Device-fed generation
-declares a persistent read, and initialization, restoration, prefill, scored
-prefill, resume, decode, speculative, and mixed producers declare their state
-writes.
+declares a persistent read, and initialization, restoration, prefill, terminal
+prefill, scored prefill, resume, decode, speculative, and mixed producers declare
+their state writes.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft
@@ -1137,8 +1140,9 @@ templates across quantization publishers as specified in
 The [native image processor](../helios/src/frontend/images/mod.rs) is checked
 against the checkpoint's Transformers processor. Compare resized and normalized
 pixels, patch order, image grids, placeholder expansion, and positions before
-admitting image requests. PNG, JPEG, and static WebP decoding preserve the
-prepared profile's alpha and EXIF orientation semantics. JPEG and lossy WebP
+admitting image requests. PNG, JPEG, static WebP, and non-animated GIF decoding
+preserve the prepared profile's alpha semantics. PNG, JPEG, and static WebP also
+preserve EXIF orientation; GIF carries none. JPEG and lossy WebP
 RGB values use a per-channel tolerance of two against Pillow fixtures;
 resize, normalization, and patch formation must
 match exactly when given the same decoded pixels.
@@ -1224,8 +1228,8 @@ submitted lane limits. Confidence producers declare `confidence_width` and write
 FP32 `[2, request_slots, draft_capacity]` completion frames.
 
 Host pending-token, grammar, history, stop, cost-discovery, and phase-transition
-dependencies serialize the affected program. Prefill, scored prefill, mixed,
-resume, vision, and state operations drain the queue. A copy stream transfers
+dependencies serialize the affected program. Prefill, terminal prefill, scored
+prefill, mixed, resume, vision, and state operations drain the queue. A copy stream transfers
 records behind production events; input staging and completion frames remain
 owned until their fences complete. Tensor-parallel retirement waits for all
 ranks, protecting frame reuse and cancellation cleanup.
@@ -1528,10 +1532,25 @@ role, then consumed-token count, then checkpoint identity. Prompt and terminal
 endpoints have the lowest role, earlier message checkpoints follow, and the
 conversation anchor has the highest role. Demand recency takes precedence over
 role, so an idle conversation's anchor can be reclaimed before a recently used
-endpoint. One successfully admitted logical request receives one demand epoch;
-all its captures inherit that epoch. Cache reuse touches the matched checkpoint
-and its ancestors. Duplicate publication retains the maximum role and epoch.
-Preemption carries the epoch into readmission.
+endpoint. Each successfully admitted logical request receives a demand epoch;
+its captures inherit that epoch. Cache reuse and promotion touch only the selected
+checkpoint's snapshot. Successful completion refreshes a published terminal and
+its direct parent with one completion-time epoch. The parent commonly holds the
+prompt end or last captured message boundary, which remains useful when a follow-up
+rewrites generated history. The parent comes from the published checkpoint's cache
+record, including duplicate publication; it need not have been captured by the
+completing request and may have been restored from a host tier.
+
+Completion refreshes at most two checkpoints. Grandparents retain their own demand
+epochs: sharing their pages does not require restoring their rows. Older single-child
+ancestors can therefore be compacted under pressure without discarding descendant
+pages. When no terminal is published, completion refreshes only the retained prefix.
+Cancellation after completed inference also refreshes only that prefix, including
+client stop sequences. Cancellation before inference and execution failure do not
+refresh recency. Preemption carries the admission epoch into readmission without
+refreshing it. Duplicate publication retains the maximum role and epoch of the
+matching checkpoint; successful retirement then refreshes it and its direct parent.
+Branch points and direct pins still constrain which checkpoints are removable.
 
 The global allocator compares victims for both snapshot rows and physical page
 backing. A removable checkpoint is an unpinned leaf or an ancestor with exactly
@@ -1651,19 +1670,22 @@ the contracts established by the preceding stages.
    kernels and dependencies before changing fusion, precision, or overlap.
 
 Structured output composes the answer grammar with the output protocol's
-reasoning and tool delimiters. The grammar constrains the answer, while tool
-payloads retain their normal parsing and validation. The native sampling mask
-and speculative grammar advancement apply to the complete composed grammar.
-`tool_choice=required` adds a prompt
-instruction and validates that the model produced a completed call to a declared
-tool. Generation uses ordinary sampling; an unsatisfied requirement fails the
-response. Named tool selection filters the available definitions to the selected
-tool without adding instructions or decoding constraints. Output validation
-requires a completed call to that tool and rejects other tool names; presentation
-omits ordinary answer text while preserving reasoning and tool arguments.
-`tool_choice=none` removes tools from the template. Strict function schemas are
-unsupported. See [the API contracts](api.md) for
-protocol mappings and streamed errors.
+reasoning and tool delimiters. An answer grammar constrains the answer, not
+ordinary function arguments. An active strict function tool constrains its call
+using the declared schema and the core's tool syntax. The output encoder holds
+the call until it has validated the complete arguments; a truncated strict call
+does not publish partial arguments. The composed request grammar is active for
+the entire generation: reasoning, prose, and tool calls. Until that request
+finishes decoding, its MTP width is one and the [native replay loop](#native-replay-loop)
+keeps one step in flight for any decode batch containing it. These constraints
+do not begin or end at a tool delimiter.
+`tool_choice=required` adds a prompt instruction and requires a completed call
+to a declared tool. Without a grammar it uses ordinary sampling. Named tool
+selection filters the definitions to that tool; it does not by itself enable a
+grammar. The encoder requires a completed call to the selected tool and rejects
+other tool names. It omits ordinary answer text but preserves reasoning and arguments.
+`tool_choice=none` removes tools from the template. See the [API contracts](api.md)
+for the accepted strict schema subset, parser formats, protocol mappings and streamed errors.
 
 Bounded top-k sampling and compact recurrent commit require separate component
 and full-graph measurements. They cannot weaken threshold-tie handling,

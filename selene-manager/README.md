@@ -10,9 +10,11 @@ content in its index.
 Flare copies each published GPU checkpoint into its first configured host tier,
 in both local and pool modes. Pooled instances announce the GPU holding at
 publication and cascade retained records under host pressure: DRAM to local
-NVMe, then the manager. A handover drops the source only after the destination
-commits. Refusals, unavailable destinations and repeated failures keep records
-local and retry after progress; see [host retention](../docs/prefix-cache-offload.md#215-sharing-through-a-pool). GPU eviction does not initiate a late copy.
+NVMe, then the manager. A handover drops the source after the destination
+commits. DRAM paths transfer root-first and keep their ancestry after a failed
+put. The local NVMe tier drops invalid or oversized records and retries a
+budget or in-flight refusal once. See
+[host retention](../docs/prefix-cache-offload.md#215-sharing-through-a-pool). GPU eviction does not initiate a late copy.
 The [shutdown drain](../docs/prefix-cache-offload.md#25-transfers-slabs-and-record-files)
 is opt-in and off by default; shutdown without it drains accesses before releasing memory.
 A GPU cache hit refreshes a local host record's recency, but cannot
@@ -64,12 +66,15 @@ Size options accept bytes with binary K/M/G/T suffixes.
 | `--listen` | none; serve instances on other hosts at ADDR:PORT |
 | `--listen-data` | the host of `--listen`, next port; where those instances copy bytes |
 | `--tls-cert`, `--tls-key` | none; TLS for `--listen` |
-| `--rdma` | off; experimental, needs the `rdma` feature and `--listen`, not with TLS |
+| `--rdma` | off; experimental, needs the `rdma` feature and `--listen`, a data address on a RoCE interface, not with TLS |
 | `--max-age` | `off`; expires the manager's records a `DURATION` after last use (see [operating](docs/operating.md#deployment-model)) |
 | `--metrics` | disabled; when set, HTTP `GET /metrics` |
 
 See [address forms and startup warnings](docs/network-operations.md#addresses-and-startup-warnings)
-for network connection settings and diagnostics.
+for network connection settings and diagnostics. A configured pool must attach
+at instance startup; timeouts, registration failures and memory-budget rejection
+stop startup with corrective actions. Start the manager before its instances, or
+remove `--prefix-cache-pool` to run local-only.
 
 The arena and staging are preallocated files under `/dev/shm/selene/<name>-<hash>`, where the hash
 is 32 hex digits derived from the absolute socket path, so the shared-memory mount must hold at
@@ -79,8 +84,8 @@ least `--memory + --staging`. Budgets cover record and window extents, not total
 
 ```sh
 docker build -f selene-manager/Dockerfile -t selene .   # from the Flare repository root
-docker run --rm --name selene \
-  --user "$(id -u):$(id -g)" --pid=host --network=host --ipc=host \
+docker run --rm --name selene --stop-timeout 300 \
+  --user "$(id -u):$(id -g)" --network=host --ipc=host \
   --security-opt seccomp=selene-manager/deploy/seccomp-io-uring.json \
   -v /run/selene:/run/selene \
   -v /var/lib/selene:/var/lib/selene \
@@ -97,8 +102,11 @@ and instances after fixing the host configuration.
 Create `/run/selene` and the root directory with ownership matching the runtime uid/gid. The
 manager and every instance must share `/dev/shm/selene`: run them with `--ipc=host` as above, or
 bind-mount the same directory at `/dev/shm/selene` in each container. Share the socket directory
-and a PID namespace with the instances so the peer pid matches `SO_PEERCRED`. No GPU flags, CUDA
-libraries or privileges are required, and the image has no CUDA dependency.
+with the instances. On Linux 6.5+, `SO_PEERPIDFD` lets the manager watch client exit
+across PID namespaces, so `--pid=host` is optional. On older kernels, share a PID
+namespace for shared memory, or configure `--listen` and connect over TCP;
+without either, instance startup fails. No GPU flags, CUDA libraries or privileges
+are required, and the image has no CUDA dependency.
 
 The disk threads use io_uring, which Docker's default seccomp profile blocks. Run the container
 with `deploy/seccomp-io-uring.json`: Docker's default profile with `io_uring_setup`,

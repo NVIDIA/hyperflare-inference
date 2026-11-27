@@ -14,7 +14,7 @@
 //! to the tokens a request adds beyond its resident GPU checkpoint.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -27,6 +27,11 @@ use crate::geometry::invalid;
 pub struct Node<L> {
     pub key: PrefixKey,
     pub parent: Option<PrefixKey>,
+    /// Offered ancestors nearer than the record's parent, nearest first.
+    /// A root keeps all offered ancestors. These keys do not own pages.
+    pub published_ancestors: Vec<PrefixKey>,
+    /// Number of records from the root through this node.
+    pub chain_depth: usize,
     pub bucket: [u8; 16],
     /// Complete pages since the parent.
     pub tail_pages: usize,
@@ -35,7 +40,7 @@ pub struct Node<L> {
     /// True once every byte of the record is readable from this store.
     pub ready: bool,
     pub location: L,
-    children: u32,
+    children: Vec<PrefixKey>,
     ready_children: u32,
     pins: u32,
     accessed: u64,
@@ -44,8 +49,13 @@ pub struct Node<L> {
 
 impl<L> Node<L> {
     pub fn children(&self) -> u32 {
-        self.children
+        self.children.len() as u32
     }
+
+    pub(crate) fn ready_children(&self) -> u32 {
+        self.ready_children
+    }
+
     pub fn pins(&self) -> u32 {
         self.pins
     }
@@ -203,6 +213,31 @@ impl<L> Index<L> {
         }
     }
 
+    /// A non-fork Endpoint can replay from a row on its own branch within this page.
+    pub fn covered_endpoint(
+        &self,
+        key: PrefixKey,
+        mut parent: Option<PrefixKey>,
+        role: crate::CaptureRole,
+        children: u32,
+        readable: impl Fn(&Node<L>) -> bool,
+    ) -> bool {
+        if role != crate::CaptureRole::Endpoint || children > 1 {
+            return false;
+        }
+        while let Some(node) = parent.and_then(|p| self.node(&p)) {
+            if node.key.consumed_tokens / self.page_tokens != key.consumed_tokens / self.page_tokens
+            {
+                break;
+            }
+            if node.row && readable(node) {
+                return true;
+            }
+            parent = node.parent;
+        }
+        false
+    }
+
     pub fn page_tokens(&self) -> u64 {
         self.page_tokens
     }
@@ -227,6 +262,47 @@ impl<L> Index<L> {
         self.nodes.get_mut(key)
     }
 
+    /// Keep the offered ancestors between the record and its chosen parent.
+    pub(crate) fn set_published_ancestors(
+        &mut self,
+        key: &PrefixKey,
+        parent: Option<PrefixKey>,
+        ancestors: &[PrefixKey],
+    ) {
+        let Some(node) = self.node_mut(key) else {
+            return;
+        };
+        let kept = &mut node.published_ancestors;
+        kept.clear();
+        let mut below = key.consumed_tokens;
+        for &ancestor in ancestors {
+            if parent.is_some_and(|p| ancestor.consumed_tokens <= p.consumed_tokens) {
+                break;
+            }
+            if ancestor.consumed_tokens < below {
+                kept.push(ancestor);
+                below = ancestor.consumed_tokens;
+            }
+        }
+    }
+
+    /// Each local record offers its nearer ancestors before its parent.
+    pub(crate) fn ancestor_keys(&self, key: &PrefixKey) -> Vec<PrefixKey> {
+        let mut keys = Vec::new();
+        let mut node = self.node(key);
+        let limit = crate::shared::MAX_CHAIN_NODES as usize;
+        while let Some(current) = node {
+            let candidates = current.published_ancestors.iter().chain(&current.parent);
+            keys.extend(candidates.take(limit - keys.len()).copied());
+            if keys.len() == limit {
+                break;
+            }
+            node = current.parent.and_then(|parent| self.node(&parent));
+        }
+        debug_assert!(keys.windows(2).all(|pair| pair[0].consumed_tokens > pair[1].consumed_tokens));
+        keys
+    }
+
     /// Whether a row is redundant in this tier; disk counts only committed children.
     pub fn row_redundant(&self, key: &PrefixKey, ready_only: bool) -> bool {
         self.node(key).is_some_and(|node| {
@@ -234,9 +310,34 @@ impl<L> Index<L> {
                 && if ready_only {
                     node.ready_children == 1
                 } else {
-                    node.children == 1
+                    node.children() == 1
                 }
         })
+    }
+
+    /// A row on the unbranched suffix can take over as this path's restore point.
+    pub fn has_row_below(&self, key: &PrefixKey, has_row: impl Fn(&Node<L>) -> bool) -> bool {
+        let mut node = &self[key];
+        while let [child] = node.children.as_slice() {
+            node = &self[child];
+            if has_row(node) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drain queued row candidates in least-recently-used order, omitting removed records.
+    pub(crate) fn thinning_order(
+        &self,
+        queued: &mut HashSet<PrefixKey>,
+    ) -> impl Iterator<Item = PrefixKey> + use<L> {
+        let mut ordered: Vec<_> = std::mem::take(queued)
+            .into_iter()
+            .filter_map(|key| self.node(&key).map(|node| (node.accessed(), key)))
+            .collect();
+        ordered.sort_unstable();
+        ordered.into_iter().map(|(_, key)| key)
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &Node<L>> {
@@ -266,23 +367,23 @@ impl<L> Index<L> {
         if key.consumed_tokens == 0 || self.nodes.contains_key(&key) {
             return Err(invalid("host record key is empty or already indexed"));
         }
-        let parent_tokens = match parent {
+        let (parent_tokens, chain_depth) = match parent {
             Some(parent) => {
                 let node = self
                     .nodes
                     .get_mut(&parent)
                     .ok_or_else(|| invalid("host record parent is not indexed"))?;
-                node.children += 1;
-                parent.consumed_tokens
+                node.children.push(key);
+                (parent.consumed_tokens, node.chain_depth + 1)
             }
-            None => 0,
+            None => (0, 1),
         };
         if key.consumed_tokens <= parent_tokens
             || key.consumed_tokens / self.page_tokens - parent_tokens / self.page_tokens
                 != tail_pages as u64
         {
             if let Some(parent) = parent {
-                self.nodes.get_mut(&parent).unwrap().children -= 1;
+                self.nodes.get_mut(&parent).unwrap().children.pop();
             }
             return Err(invalid(
                 "host record must extend its parent by exactly its tail pages",
@@ -304,12 +405,14 @@ impl<L> Index<L> {
             Node {
                 key,
                 parent,
+                published_ancestors: Vec::new(),
+                chain_depth,
                 bucket,
                 tail_pages,
                 row,
                 ready,
                 location,
-                children: 0,
+                children: Vec::new(),
                 ready_children: 0,
                 pins: 0,
                 accessed,
@@ -338,7 +441,7 @@ impl<L> Index<L> {
             .nodes
             .get(key)
             .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
-        if node.children != 0 || node.pinned() {
+        if node.children() != 0 || node.pinned() {
             return Err(invalid(
                 "cannot remove a pinned host record or one with children",
             ));
@@ -353,7 +456,7 @@ impl<L> Index<L> {
         }
         if let Some(parent) = node.parent {
             let parent = self.nodes.get_mut(&parent).unwrap();
-            parent.children -= 1;
+            parent.children.retain(|child| child != key);
             parent.ready_children -= u32::from(node.ready);
         }
         self.notify(NodeEvent::Gone, &node);
@@ -399,10 +502,10 @@ impl<L> Index<L> {
         let now = SystemTime::now();
         self.ordered()
             .take_while(|node| {
-                node.children > 0
+                node.children() > 0
                     || now.duration_since(node.last_used).unwrap_or_default() >= self.max_age
             })
-            .filter(|node| node.children == 0 && eligible(node))
+            .filter(|node| node.children() == 0 && eligible(node))
             .take(64)
             .map(|node| node.key)
             .collect()
@@ -568,12 +671,20 @@ impl<L> Index<L> {
     }
 
     /// Remove a childless node and any page-only ancestors it leaves childless.
-    pub fn remove(&mut self, key: &PrefixKey) -> Result<Vec<Node<L>>> {
+    ///
+    /// The cascade stops below an ancestor for which `keep` is true, so a caller
+    /// with work in flight on a record can keep it indexed. The kept record is a
+    /// childless leaf afterwards and is retired like any other.
+    pub fn remove(
+        &mut self,
+        key: &PrefixKey,
+        keep: impl Fn(&Node<L>) -> bool,
+    ) -> Result<Vec<Node<L>>> {
         let node = self
             .nodes
             .get(key)
             .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
-        if node.children != 0 || node.pins != 0 {
+        if node.children() != 0 || node.pins != 0 {
             return Err(invalid(
                 "cannot remove a pinned host record or one with children",
             ));
@@ -592,9 +703,13 @@ impl<L> Index<L> {
             next = None;
             if let Some(parent) = node.parent {
                 let parent_node = self.nodes.get_mut(&parent).unwrap();
-                parent_node.children -= 1;
+                parent_node.children.retain(|child| *child != key);
                 parent_node.ready_children -= u32::from(node.ready);
-                if parent_node.children == 0 && !parent_node.row && parent_node.pins == 0 {
+                if parent_node.children() == 0
+                    && !parent_node.row
+                    && parent_node.pins == 0
+                    && !keep(parent_node)
+                {
                     next = Some(parent);
                 }
             }
@@ -615,20 +730,25 @@ impl<L> Index<L> {
                 node.ready
                     && node.pins == 0
                     && evictable(node)
-                    && (node.children == 0 || (need_row && node.row && node.children == 1))
+                    && (node.children() == 0
+                        || (need_row
+                            && node.row
+                            && self.has_row_below(&node.key, |n| n.ready && n.row)))
             })
             .map(|node| node.key)
     }
 
     /// Retire the oldest eligible leaf or, when `need_row`, compactable ancestor.
+    /// `keep` limits the leaf's ancestor cascade as in [`Index::remove`].
     pub fn evict(
         &mut self,
         need_row: bool,
         evictable: impl Fn(&Node<L>) -> bool,
+        keep: impl Fn(&Node<L>) -> bool,
     ) -> Option<Eviction<L>> {
         let candidate = self.candidate(need_row, evictable)?;
-        if self.nodes[&candidate].children == 0 {
-            return self.remove(&candidate).ok().map(Eviction::Leaves);
+        if self.nodes[&candidate].children() == 0 {
+            return self.remove(&candidate, keep).ok().map(Eviction::Leaves);
         }
         self.drop_row(&candidate);
         Some(Eviction::Compacted(candidate))
@@ -679,6 +799,61 @@ mod tests {
                 (),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_roots_candidate_ancestors_are_its_hint_list_strictly_descending() {
+        let mut index = Index::new(64);
+        let full = history(2000);
+        insert(&mut index, &full, 700, None);
+        insert(&mut index, &full, 1300, Some(700));
+        let [b, a, older] = [650, 640, 320].map(|c| full.key_at(c).unwrap());
+        let root = full.key_at(700).unwrap();
+        // A list with a repeat and a key at or above its predecessor keeps only strictly
+        // descending keys.
+        index.set_published_ancestors(&root, None, &[b, b, a, full.key_at(645).unwrap(), older]);
+        assert_eq!(
+            index.ancestor_keys(&full.key_at(1300).unwrap()),
+            [root, b, a, older]
+        );
+        assert_eq!(index.ancestor_keys(&root), [b, a, older]);
+        // A hint at or above the root's own key cannot be an ancestor.
+        index.set_published_ancestors(&root, None, &[full.key_at(1300).unwrap(), root, b]);
+        assert_eq!(index.ancestor_keys(&root), [b]);
+    }
+
+    #[test]
+    fn each_local_link_offers_its_nearer_ancestors_before_its_parent() {
+        let full = history(900);
+        let mut index = Index::new(64);
+        insert(&mut index, &full, 300, None);
+        insert(&mut index, &full, 600, Some(300));
+        insert(&mut index, &full, 900, Some(600));
+        let [hint, root, middle_hint, middle, far, near, leaf] =
+            [100, 300, 500, 600, 700, 800, 900].map(|n| full.key_at(n).unwrap());
+        index.set_published_ancestors(&root, None, &[hint]);
+        index.set_published_ancestors(&middle, Some(root), &[middle_hint, root, hint]);
+        index.set_published_ancestors(&leaf, Some(middle), &[near, far, middle, root]);
+        assert_eq!(index.ancestor_keys(&leaf), [near, far, middle, middle_hint, root, hint]);
+    }
+
+    #[test]
+    fn pool_candidate_limit_applies_to_local_parents_and_root_hints() {
+        let mut index = Index::new(64);
+        let full = history(4100);
+        insert(&mut index, &full, 3, None);
+        index.set_published_ancestors(&full.key_at(3).unwrap(), None, &[
+            full.key_at(2).unwrap(),
+            full.key_at(1).unwrap(),
+        ]);
+        for end in 4..=4100 {
+            insert(&mut index, &full, end, Some(end - 1));
+        }
+        for end in [4098, 4100] {
+            let keys = index.ancestor_keys(&full.key_at(end).unwrap());
+            let expected: Vec<_> = (end - 4096..end).rev().map(|n| full.key_at(n).unwrap()).collect();
+            assert_eq!(keys, expected);
+        }
     }
 
     #[test]
@@ -756,7 +931,7 @@ mod tests {
         index.nodes.get_mut(&leaf).unwrap().row = false;
         assert!(!index.complete(&leaf));
         index.nodes.get_mut(&leaf).unwrap().row = true;
-        index.remove(&leaf).unwrap();
+        index.remove(&leaf, |_| false).unwrap();
         assert!(!index.complete(&leaf));
     }
 
@@ -771,7 +946,7 @@ mod tests {
         index.touch(&full.key_at(600).unwrap());
         // Rows are needed and every leaf is pinned, so the oldest single-child ancestor compacts.
         index.pin(&full.key_at(600).unwrap()).unwrap();
-        match index.evict(true, |_| true) {
+        match index.evict(true, |_| true, |_| false) {
             Some(Eviction::Compacted(key)) => assert_eq!(key, full.key_at(400).unwrap()),
             other => panic!("unexpected eviction {other:?}"),
         }
@@ -785,9 +960,9 @@ mod tests {
             .unwrap();
         assert_eq!(found.nodes.len(), 3);
         assert_eq!(found.pages, 9);
-        assert!(index.evict(false, |_| true).is_none());
+        assert!(index.evict(false, |_| true, |_| false).is_none());
         index.unpin(&full.key_at(600).unwrap()).unwrap();
-        match index.evict(false, |_| true) {
+        match index.evict(false, |_| true, |_| false) {
             Some(Eviction::Leaves(nodes)) => {
                 assert_eq!(
                     nodes
@@ -827,13 +1002,13 @@ mod tests {
         insert(&mut index, &full, 600, Some(300));
         index.touch(&other);
         let durable = full.key_at(600).unwrap();
-        match index.evict(false, |node| node.key != durable) {
+        match index.evict(false, |node| node.key != durable, |_| false) {
             Some(Eviction::Leaves(nodes)) => assert_eq!(nodes[0].key, other),
             other => panic!("unexpected eviction {other:?}"),
         }
         index.pin(&durable).unwrap();
         assert!(
-            index.evict(true, |_| true).is_none() || {
+            index.evict(true, |_| true, |_| false).is_none() || {
                 // With the only leaf pinned, compaction may take the root ancestor at 100.
                 true
             }
@@ -843,7 +1018,7 @@ mod tests {
             .lookup_below(&full, 0, u64::MAX, |node| node.ready)
             .unwrap();
         assert_eq!(found.consumed_tokens, 600);
-        assert!(index.remove(&full.key_at(300).unwrap()).is_err());
+        assert!(index.remove(&full.key_at(300).unwrap(), |_| false).is_err());
     }
 
     #[test]
@@ -922,7 +1097,7 @@ mod tests {
         index.set_ready(&child, true).unwrap();
         assert!(index.row_redundant(&parent, true));
         index.drop_row(&parent);
-        assert_eq!(index.remove(&child).unwrap().len(), 2);
+        assert_eq!(index.remove(&child, |_| false).unwrap().len(), 2);
         assert_eq!(index[&root].ready_children, 0);
     }
 
@@ -939,7 +1114,7 @@ mod tests {
                 .lookup_below(&full, 0, u64::MAX, |node| node.ready)
                 .is_none()
         );
-        assert!(index.evict(true, |_| true).is_none());
+        assert!(index.evict(true, |_| true, |_| false).is_none());
         index.set_ready(&key, true).unwrap();
         assert_eq!(
             index
@@ -1021,21 +1196,22 @@ mod tests {
         index.drop_row(&child);
         index.drop_row(&child);
         assert_eq!(events(&sink), [(NodeEvent::RowDropped, 1300, false)]);
-        // The older parent compacts first, then the leaf goes and takes the
-        // page-only parent with it.
+        // The parent becomes compactable once the child's row returns.
+        assert!(index.candidate(true, |n| n.key != child).is_none());
+        index[&child].row = true;
         assert!(matches!(
-            index.evict(true, |_| true),
+            index.evict(true, |_| true, |_| false),
             Some(Eviction::Compacted(_))
         ));
         assert_eq!(events(&sink), [(NodeEvent::RowDropped, 700, false)]);
-        let Some(Eviction::Leaves(leaves)) = index.evict(true, |_| true) else {
+        let Some(Eviction::Leaves(leaves)) = index.evict(true, |_| true, |_| false) else {
             panic!("the leaf is evicted");
         };
         assert_eq!(leaves.len(), 2);
         assert_eq!(
             events(&sink),
             [
-                (NodeEvent::Gone, 1300, false),
+                (NodeEvent::Gone, 1300, true),
                 (NodeEvent::Gone, 700, false)
             ]
         );
@@ -1114,14 +1290,14 @@ mod tests {
         }
         tree.access_at(&test_key(200), 1000);
         tree.pin(&test_key(600)).unwrap();
-        assert!(tree.evict(false, |_| true).is_none());
+        assert!(tree.evict(false, |_| true, |_| false).is_none());
         assert!(
-            matches!(tree.evict(true, |_| true), Some(Eviction::Compacted(k)) if k == test_key(400))
+            matches!(tree.evict(true, |_| true, |_| false), Some(Eviction::Compacted(k)) if k == test_key(400))
         );
         assert!(!tree.node(&test_key(400)).unwrap().row);
         assert!(tree.node(&test_key(600)).unwrap().row);
         tree.unpin(&test_key(600)).unwrap();
-        let Some(Eviction::Leaves(removed)) = tree.evict(false, |_| true) else {
+        let Some(Eviction::Leaves(removed)) = tree.evict(false, |_| true, |_| false) else {
             panic!("leaves")
         };
         assert_eq!(

@@ -1,0 +1,40 @@
+{
+ "tools": {
+  "kind": 1,
+  "wrapping_newlines": 1,
+  "tag_separator": ""
+ },
+ "reasoning": {
+  "kind": 1,
+  "open": "<think>",
+  "close": "</think>",
+  "wrapping_newlines": 0,
+  "terminal_markers": [
+   "<tool_call>"
+  ]
+ },
+ "image_preparation": 5,
+ "image_layout": 5,
+ "position_dimensions": 0,
+ "rejected_tokens": [],
+ "assistant_marker": "<|im_start|>assistant\n",
+ "message_end_markers": [
+  "<|im_end|>"
+ ],
+ "prefix_boundary": {
+  "roles": [
+   "system",
+   "developer"
+  ],
+  "append_role": "user",
+  "continue_final_message": true,
+  "minimum_messages": 0,
+  "required_start": "<|im_start|>system\n",
+  "required_end": "",
+  "required_marker": "<|im_end|>"
+ },
+ "image_tokens": {
+  "feature_token": 128001,
+  "span": null
+ }
+}

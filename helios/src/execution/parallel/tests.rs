@@ -670,3 +670,38 @@ fn socket_completion_capacity_is_checked_before_rank_startup() {
     });
     assert!(validate_completion_packet(&manifest).is_err());
 }
+
+#[test]
+fn socket_parallel_execution_rejects_persistent_workers() {
+    let mut manifest = crate::execution::tests::manifest();
+    manifest.persistent_workers.push(crate::execution::PersistentWorkerDescriptor {
+        worker_sm_count: 8,
+        graph: "worker_loop".into(),
+        handle: 0x99000,
+        stop_flag_allocation: "worker_ctrl".into(),
+        stop_flag_offset: 0,
+        stop_flag_address: 0x2000_0000_0000,
+        metrics_allocation: None,
+        metrics_offset: 0,
+        metrics_address: 0,
+        metrics_count: 0,
+        control: None,
+    });
+    let (root_stream, peer_stream) = crate::execution::rank_stream::test_pair().unwrap();
+    let root_err = unsafe { TensorParallelExecutor::new(manifest.clone(), vec![root_stream]) }
+        .err()
+        .expect("TensorParallelExecutor::new must reject persistent workers");
+    assert!(
+        root_err.to_string().contains("single-rank"),
+        "unexpected error: {root_err}"
+    );
+    let shutdown = unsafe { serve_rank(manifest, peer_stream, 1, 2) };
+    assert!(shutdown.drained);
+    let peer_err = shutdown
+        .error
+        .expect("serve_rank must reject persistent workers");
+    assert!(
+        peer_err.to_string().contains("single-rank"),
+        "unexpected error: {peer_err}"
+    );
+}

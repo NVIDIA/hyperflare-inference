@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::runtime::{Prompt, ReasoningCut};
+use super::{inference::ToolChoice, runtime::{Prompt, ReasoningCut}};
 use crate::{
     AdmissionError, Error, Failure, FrontendError, Result,
     frontend::{Frontend, images::ImageProcessor},
@@ -85,6 +85,33 @@ pub(super) fn prepare_inference(
     )
 }
 
+pub(super) fn compile_strict_validators(
+    compiler: &crate::grammar::GrammarCompiler,
+    request: &super::inference::Request,
+) -> Result<std::collections::HashMap<String, crate::grammar::TextGrammar>> {
+    use std::collections::{HashMap, hash_map::Entry};
+    let mut validators = HashMap::new();
+    for tool in request.tools.iter().filter(|tool| tool.strict) {
+        match validators.entry(tool.native_name()) {
+            Entry::Occupied(e) => return Err(format!("ambiguous strict tool name {:?}", e.key()).into()),
+            Entry::Vacant(e) => {
+                let validator = crate::grammar::strict::validate_strict_tool_schema(compiler, e.key(), &tool.parameters)?;
+                e.insert(validator);
+            }
+        }
+    }
+    if !validators.is_empty() {
+        for tool in request.tools.iter().filter(|tool| !tool.strict) {
+            let conflict = match &tool.namespace {
+                None => validators.contains_key(&tool.name),
+                Some(_) => validators.contains_key(&tool.native_name()),
+            };
+            if conflict { return Err(format!("ambiguous strict tool name {:?}", tool.native_name()).into()); }
+        }
+    }
+    Ok(validators)
+}
+
 pub(super) fn prepare_inference_cached(
     frontend: &Frontend,
     processor: Option<&ImageProcessor>,
@@ -95,7 +122,21 @@ pub(super) fn prepare_inference_cached(
     count_only: bool,
     input_store: Option<&flare_selene::input::InputStore>,
 ) -> Result<PreparedInference> {
-    use super::inference::{Constraint, Input, RawPrompt, ToolChoice};
+    compile_strict_validators(compiler, request)?;
+    prepare_validated_inference(frontend, processor, compiler, config, request, index, count_only, input_store)
+}
+
+pub(super) fn prepare_validated_inference(
+    frontend: &Frontend,
+    processor: Option<&ImageProcessor>,
+    compiler: &crate::grammar::GrammarCompiler,
+    config: &ModelConfig,
+    request: &super::inference::Request,
+    index: usize,
+    count_only: bool,
+    input_store: Option<&flare_selene::input::InputStore>,
+) -> Result<PreparedInference> {
+    use super::inference::{Constraint, RawPrompt};
     let opts = &request.options;
     if let Some(top) = opts.prompt_logprobs {
         if !config.contract.graphs.iter().any(|g| g.kind == crate::model::contract::GraphOperation::ScoredPrefill) {
@@ -131,94 +172,10 @@ pub(super) fn prepare_inference_cached(
     }
     let object = &object;
     let structured = opts.constraint.is_some();
-    let legacy_prompt = matches!(
-        frontend.prompt_encoder(),
-        crate::frontend::PromptEncoder::Jinja
-    );
-    let (mut normalized, raw) = match &request.input {
-        Input::Conversation(messages) => (
-            super::inference::template_messages(
-                messages,
-                if legacy_prompt {
-                    request.tool_choice.clone()
-                } else {
-                    ToolChoice::Auto
-                },
-                &request.checkpoint_hints,
-            )?,
-            None,
-        ),
-        Input::Raw(prompts) => (vec![], Some(&prompts[index / request.choices])),
-    };
-    frontend.normalize_inline_system_messages(&mut normalized)?;
-    if raw.is_none() {
-        let schema = match &opts.constraint {
-            Some(Constraint::Json(schema)) => Some(schema.clone()),
-            Some(Constraint::JsonObject) if legacy_prompt => {
-                Some(serde_json::json!({"type":"object"}))
-            }
-            _ => None,
-        };
-        if let Some(schema) = schema {
-            super::inference::append_system_instruction(
-                &mut normalized,
-                &format!(
-                    "Return the final answer as a JSON value matching this schema. Do not wrap it in Markdown fences or add text outside the JSON value. Tool calls may precede the final answer.\nJSON schema:\n{schema}"
-                ),
-            )?;
-        }
-    }
-    let mut options = opts.template.clone();
-    if !legacy_prompt && matches!(opts.constraint, Some(Constraint::JsonObject)) {
-        options.insert("response_format".into(), "json_object".into());
-    }
-    let tool_choice = match request.tool_choice {
-        ToolChoice::Auto => None,
-        ToolChoice::None => Some("none"),
-        ToolChoice::Required => Some("required"),
-        ToolChoice::Named(_) => Some("auto"),
-    };
-    if let Some(choice) = tool_choice {
-        options.insert("tool_choice".into(), choice.into());
-    }
-    if !options.contains_key("reasoning_effort") {
-        if let Some(effort) = opts.effort {
-            use super::inference::Effort;
-            let candidates: &[&str] = match effort {
-                Effort::Low => &["low"],
-                Effort::High => &["high", "medium"],
-                Effort::Max => &["max", "xhigh", "high", "medium"],
-            };
-            options.insert(
-                "reasoning_effort".into(),
-                frontend.resolve_effort(candidates)?.into(),
-            );
-        }
-    }
-
-    if request.tool_choice == ToolChoice::None {
-        options.insert("tools".into(), Value::Array(vec![]));
-    } else if !request.tools.is_empty() {
-        options.insert("tools".into(), Value::Array(request.tools.iter().filter(|tool| {
-            match &request.tool_choice {
-                ToolChoice::Named(name) => tool.native_name() == *name,
-                _ => true,
-            }
-        }).map(|tool| {
-            let description = if let Some(grammar) = &tool.grammar {
-                format!("{}\nPut the complete tool input in the input string. It must match this {} grammar exactly:\n{}", tool.description, grammar.syntax, grammar.source)
-            } else { tool.description.clone() };
-            serde_json::json!({"type":"function", "function":{"name":tool.native_name(), "description":description, "parameters":tool.parameters}})
-        }).collect()));
-    }
-    if !options.contains_key("add_generation_prompt")
-        && requests_continuation(options.get("continue_final_message"))
-    {
-        options.insert("add_generation_prompt".into(), Value::Bool(false));
-    }
+    let (normalized, raw, options) = template_inputs(frontend, request, index)?;
     let (rendered, echo) = if let Some(raw) = raw {
-        let (mut token_ids, echo) = match raw {
-            RawPrompt::Text(text) => (frontend.encode(text, true)?, text.clone()),
+        let (mut token_ids, echo, decoded_text) = match raw {
+            RawPrompt::Text(text) => (frontend.encode(text, true)?, text.clone(), None),
             RawPrompt::Tokens(ids) => {
                 if ids.is_empty()
                     || ids
@@ -227,7 +184,8 @@ pub(super) fn prepare_inference_cached(
                 {
                     return Err("token prompt must contain valid vocabulary IDs".into());
                 }
-                (ids.clone(), frontend.decode(ids, false)?)
+                let decoded = frontend.decode(ids, false)?;
+                (ids.clone(), decoded.clone(), Some(decoded))
             }
         };
         if token_ids.is_empty() {
@@ -237,13 +195,18 @@ pub(super) fn prepare_inference_cached(
                     .ok_or("empty prompt requires a BOS token declared by the core")?,
             );
         }
+        let text = match decoded_text {
+            Some(text) => text,
+            None => frontend.decode(&token_ids, false)?,
+        };
         (
             crate::frontend::RenderedPrompt {
                 message_boundaries: Vec::new(),
-                text: frontend.decode(&token_ids, false)?,
+                text,
                 token_ids,
                 image_sources: Vec::new(),
                 image_checkpoint_hints: Vec::new(),
+                ordinary: Vec::new(),
             },
             echo,
         )
@@ -251,7 +214,7 @@ pub(super) fn prepare_inference_cached(
         (frontend.render_chat(&normalized, &options)?, String::new())
     };
     let images = describe_images(&rendered.image_sources, processor, input_store)?;
-    let output = if raw.is_some() {
+    let mut output = if raw.is_some() {
         None
     } else {
         Some(crate::model::prepare_output(
@@ -264,21 +227,75 @@ pub(super) fn prepare_inference_cached(
             compiler.delimiters(),
         )?)
     };
+    let active_tools: Vec<crate::grammar::strict::StrictToolSpec> =
+        if request.tool_choice != ToolChoice::None && request.tools.iter().any(|t| t.strict) {
+            request
+                .tools
+                .iter()
+                .filter(|tool| match &request.tool_choice {
+                    ToolChoice::Named(name) => tool.native_name() == *name,
+                    _ => true,
+                })
+                .map(|tool| crate::grammar::strict::StrictToolSpec {
+                    name: tool.native_name(),
+                    strict_schema: tool.strict.then_some(&tool.parameters),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let has_active_strict_tool = active_tools.iter().any(|t| t.strict_schema.is_some());
+    if has_active_strict_tool && raw.is_some() {
+        return Err("strict function tools are not supported on raw Completions".into());
+    }
     let envelope = output
         .as_ref()
         .and_then(crate::output::OutputPipeline::grammar_envelope);
-    let grammar = match &opts.constraint {
-        Some(Constraint::JsonObject) => Some(
-            compiler
-                .compile_json_schema_in(&serde_json::json!({"type":"object"}), envelope.as_ref())?,
-        ),
-        Some(Constraint::Json(schema)) => {
-            Some(compiler.compile_json_schema_in(schema, envelope.as_ref())?)
+    let grammar = if has_active_strict_tool {
+        use crate::grammar::strict::{AnswerConstraint, ToolGrammarPlan};
+        let answer_constraint = opts.constraint.as_ref().map(|c| match c {
+            Constraint::JsonObject => AnswerConstraint::JsonObject,
+            Constraint::Json(schema) => AnswerConstraint::Json(schema),
+            Constraint::Lark(source) => AnswerConstraint::Lark(source),
+        });
+        let dsml_token = output.as_ref().and_then(|o| {
+            let dsml_name = deepseek_recipe_core::special_tokens::SpecialToken::Dsml.default_str();
+            o.control_tokens
+                .iter()
+                .find(|(_, m)| m == dsml_name)
+                .cloned()
+        });
+        let plan = ToolGrammarPlan {
+            tools: active_tools,
+            syntax: config
+                .contract
+                .frontend
+                .tools
+                .as_ref()
+                .map(|t| (t.kind, t.wrapping_newlines as usize, t.tag_separator.clone())),
+            dsml_token,
+            allow_undeclared: request.tool_choice == ToolChoice::Auto,
+            require_call: matches!(
+                request.tool_choice,
+                ToolChoice::Required | ToolChoice::Named(_)
+            ),
+            single_call: !request.parallel_tool_calls,
+        };
+        Some(compiler.compile_presented_strict_tools(answer_constraint, envelope.as_ref(), &plan, output.as_mut().map(|o| &mut o.content))?)
+    } else {
+        match &opts.constraint {
+            Some(Constraint::JsonObject) => Some(compiler.compile_json_schema_in(
+                &serde_json::json!({"type":"object"}),
+                envelope.as_ref(),
+            )?),
+            Some(Constraint::Json(schema)) => {
+                Some(compiler.compile_json_schema_in(schema, envelope.as_ref())?)
+            }
+            Some(Constraint::Lark(source)) => {
+                Some(compiler.compile_lark_in(source, envelope.as_ref())?)
+            }
+            None => None,
         }
-        Some(Constraint::Lark(source)) => {
-            Some(compiler.compile_lark_in(source, envelope.as_ref())?)
-        }
-        None => None,
     };
     let mut message_boundaries = rendered.message_boundaries.clone();
     let crate::model::PreparedInput {
@@ -403,6 +420,109 @@ pub(super) fn prepare_inference_cached(
         rendered_prompt: rendered.text,
         echo,
     })
+}
+
+/// Lowers a request into the normalized messages and options its prompt encoder
+/// renders, or selects its raw prompt.
+pub(super) fn template_inputs<'a>(
+    frontend: &Frontend,
+    request: &'a super::inference::Request,
+    index: usize,
+) -> Result<(Vec<Value>, Option<&'a super::inference::RawPrompt>, serde_json::Map<String, Value>)> {
+    use super::inference::{Constraint, Input, ToolChoice};
+    let opts = &request.options;
+    // Encoders without their own tool-choice and response-format syntax receive
+    // shared instruction messages.
+    let shared_lowering = !frontend.prompt_encoder().renders_tool_choice();
+    let (mut normalized, raw) = match &request.input {
+        Input::Conversation(messages) => (
+            super::inference::template_messages(
+                messages,
+                if shared_lowering {
+                    request.tool_choice.clone()
+                } else {
+                    ToolChoice::Auto
+                },
+                &request.checkpoint_hints,
+                !frontend.prompt_encoder().renders_tool_errors(),
+            )?,
+            None,
+        ),
+        Input::Raw(prompts) => (vec![], Some(&prompts[index / request.choices])),
+    };
+    frontend.normalize_inline_system_messages(&mut normalized)?;
+    if raw.is_none() {
+        let schema = match &opts.constraint {
+            Some(Constraint::Json(schema)) => Some(schema.clone()),
+            Some(Constraint::JsonObject) if shared_lowering => {
+                Some(serde_json::json!({"type":"object"}))
+            }
+            _ => None,
+        };
+        if let Some(schema) = schema {
+            super::inference::append_system_instruction(
+                &mut normalized,
+                &format!(
+                    "Return the final answer as a JSON value matching this schema. Do not wrap it in Markdown fences or add text outside the JSON value. Tool calls may precede the final answer.\nJSON schema:\n{schema}"
+                ),
+            )?;
+        }
+    }
+    let mut options = opts.template.clone();
+    if !shared_lowering && matches!(opts.constraint, Some(Constraint::JsonObject)) {
+        options.insert("response_format".into(), "json_object".into());
+    }
+    let tool_choice = match request.tool_choice {
+        ToolChoice::Auto => None,
+        ToolChoice::None => Some("none"),
+        ToolChoice::Required => Some("required"),
+        ToolChoice::Named(_) => Some("auto"),
+    };
+    if let Some(choice) = tool_choice {
+        options.insert("tool_choice".into(), choice.into());
+    }
+    if !options.contains_key("reasoning_effort") {
+        if let Some(effort) = opts.effort {
+            use super::inference::Effort;
+            let candidates: &[&str] = match effort {
+                Effort::Minimal => &["minimal", "low"],
+                Effort::Low => &["low"],
+                Effort::High => &["high", "medium"],
+                Effort::Max => &["max", "xhigh", "high", "medium"],
+            };
+            options.insert(
+                "reasoning_effort".into(),
+                frontend.resolve_effort(candidates)?.into(),
+            );
+        }
+    }
+
+    if request.tool_choice == ToolChoice::None {
+        options.insert("tools".into(), Value::Array(vec![]));
+    } else if !request.tools.is_empty() {
+        options.insert("tools".into(), Value::Array(request.tools.iter().filter(|tool| {
+            match &request.tool_choice {
+                ToolChoice::Named(name) => tool.native_name() == *name,
+                _ => true,
+            }
+        }).map(|tool| {
+            let description = if let Some(grammar) = &tool.grammar {
+                format!("{}\nPut the complete tool input in the input string. It must match this {} grammar exactly:\n{}", tool.description, grammar.syntax, grammar.source)
+            } else { tool.description.clone() };
+            let mut function = serde_json::json!({"name":tool.native_name(), "description":description, "parameters":tool.parameters});
+            // TMLv0 distinguishes absent parameters from an empty object schema.
+            if !tool.declared_parameters && frontend.prompt_encoder() == crate::frontend::PromptEncoder::TmlV0 {
+                function.as_object_mut().unwrap().remove("parameters");
+            }
+            serde_json::json!({"type":"function", "function":function})
+        }).collect()));
+    }
+    if !options.contains_key("add_generation_prompt")
+        && requests_continuation(options.get("continue_final_message"))
+    {
+        options.insert("add_generation_prompt".into(), Value::Bool(false));
+    }
+    Ok((normalized, raw, options))
 }
 
 pub(super) fn thinking_budget_close(
@@ -587,6 +707,73 @@ mod tests {
     }
 
     #[test]
+    fn ignored_strict_tools_still_require_compiler_admissible_schemas() {
+        use crate::server::inference::{Input, Options, Request, Tool};
+
+        let compiler = crate::grammar::GrammarCompiler::new(
+            &crate::grammar::tests::byte_tokenizer(),
+            320,
+            &[256, 257],
+            &[],
+        )
+        .unwrap();
+        let tool = |name: &str, parameters: Value| Tool {
+            name: name.into(),
+            namespace: None,
+            description: String::new(),
+            parameters,
+            declared_parameters: true,
+            strict: true,
+            custom: false,
+            grammar: None,
+        };
+        let selected = tool(
+            "selected",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false
+            }),
+        );
+        let invalid = tool(
+            "ignored",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer", "minimum": 5, "maximum": 1}
+                },
+                "required": ["n"],
+                "additionalProperties": false
+            }),
+        );
+
+        for tool_choice in [
+            ToolChoice::None,
+            ToolChoice::Named("selected".into()),
+        ] {
+            let mut request = Request {
+                input: Input::Conversation(Vec::new()),
+                checkpoint_hints: Vec::new(),
+                options: Options::default(),
+                tools: vec![selected.clone()],
+                tool_choice,
+                parallel_tool_calls: true,
+                choices: 1,
+            };
+            assert!(compile_strict_validators(&compiler, &request).is_ok());
+            request.tools.push(invalid.clone());
+            assert!(compile_strict_validators(&compiler, &request).is_err());
+            request.tools = vec![selected.clone(), selected.clone()];
+            assert!(compile_strict_validators(&compiler, &request).err().unwrap().to_string().contains("ambiguous strict tool name"));
+            for reverse in [false, true] {
+                let loose = Tool { strict: false, ..selected.clone() };
+                request.tools = vec![loose, selected.clone()];
+                if reverse { request.tools.reverse(); }
+                assert!(compile_strict_validators(&compiler, &request).err().unwrap().to_string().contains("ambiguous strict tool name"));
+            }
+        }
+    }
+
+    #[test]
     fn image_history_can_exceed_feature_storage_but_remains_context_bounded() {
         use crate::frontend::images::{ImageLimits, ImageSettings};
         let initial = ImageProcessor::load(ImageSettings::Deepseek4 {}, ImageLimits::default()).unwrap();
@@ -702,6 +889,24 @@ mod tests {
             .to_string();
         assert!(pixels.contains("image is 40x40 px; max_image_pixels is 1000"), "{pixels}");
     }
+    #[test]
+    fn gif_data_url_is_decoded_and_described() {
+        use crate::frontend::images::{ImageLimits, ImageSettings};
+        let encoded = include_bytes!("../../../tests/frontend/gif-inputs/frame-offset.gif");
+        let url = format!(
+            "data:image/gif;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(encoded)
+        );
+        let processor = ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap();
+        let images = describe_images(&[url], Some(&processor), None).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!((images[0].description.width, images[0].description.height), (20, 12));
+        let error = describe_images(&["data:image/gif;base64,AA==".into()], Some(&processor), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid GIF"), "{error}");
+    }
+
     #[test]
     fn source_cache_coalesces_decoding_and_preserves_media_validation() {
         use crate::frontend::images::{ImageLimits, ImageSettings};
@@ -895,10 +1100,12 @@ fn describe_images(
                 (data, ImageEncoding::Jpeg)
             } else if let Some(data) = url.strip_prefix("data:image/webp;base64,") {
                 (data, ImageEncoding::Webp)
+            } else if let Some(data) = url.strip_prefix("data:image/gif;base64,") {
+                (data, ImageEncoding::Gif)
             } else {
                 return Err(Error::admission(
                     AdmissionError::Image,
-                    "image input requires a base64 PNG, JPEG, or WebP data URL",
+                    "image input requires a base64 PNG, JPEG, WebP, or GIF data URL",
                 ));
             };
         if data.len() > processor.max_encoded_bytes().div_ceil(3).saturating_mul(4) {
@@ -982,3 +1189,7 @@ fn describe_images(
 #[cfg(test)]
 #[path = "request/recipient_tests.rs"]
 mod recipient_tests;
+
+#[cfg(test)]
+#[path = "request/tml_tests.rs"]
+mod tml_tests;

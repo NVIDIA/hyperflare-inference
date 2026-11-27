@@ -211,6 +211,11 @@ pub fn free_space(path: &Path) -> io::Result<u64> {
     Ok(available)
 }
 
+/// Windows handle tables grow dynamically without a Unix `RLIMIT_NOFILE` soft cap.
+pub fn raise_open_file_limit(_desired: u64) -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

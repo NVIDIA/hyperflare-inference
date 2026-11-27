@@ -73,6 +73,7 @@ pub enum GraphKind {
     Restore,
     Snapshot,
     Prefill,
+    TerminalPrefill,
     ScoredPrefill,
     Decode,
     Speculative,
@@ -83,13 +84,14 @@ pub enum GraphKind {
 
 impl GraphKind {
     pub fn is_prefill(self) -> bool {
-        matches!(self, Self::Prefill | Self::ScoredPrefill)
+        matches!(self, Self::Prefill | Self::TerminalPrefill | Self::ScoredPrefill)
     }
 
     pub fn samples(self) -> bool {
         matches!(
             self,
             Self::Prefill
+                | Self::TerminalPrefill
                 | Self::ScoredPrefill
                 | Self::Decode
                 | Self::Speculative
@@ -126,6 +128,7 @@ impl TryFrom<&str> for GraphKind {
             "restore" => Ok(Self::Restore),
             "snapshot" => Ok(Self::Snapshot),
             "prefill" => Ok(Self::Prefill),
+            "terminal_prefill" => Ok(Self::TerminalPrefill),
             "scored_prefill" => Ok(Self::ScoredPrefill),
             "decode" => Ok(Self::Decode),
             "speculative" => Ok(Self::Speculative),
@@ -229,6 +232,191 @@ impl std::fmt::Debug for CollectiveHealth {
     }
 }
 
+/// Lifecycle state of a persistent worker graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core", feature = "server"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core", feature = "server"),
+    serde(rename_all = "snake_case")
+)]
+pub enum WorkerState {
+    /// Worker resources are bound and ready; the worker graph has not been launched.
+    Idle,
+    /// Worker graph was launched once on `worker_stream` and is active.
+    Running,
+    /// Stop flag was signaled and `worker_stream` is draining.
+    Draining,
+    /// Worker either never launched or observed `stop_flag == 1` and drained cleanly.
+    Stopped,
+    /// `worker_stream` failed to drain; GPU resources must remain retained until process exit.
+    FailedDrain,
+}
+
+impl WorkerState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::FailedDrain => "failed_drain",
+        }
+    }
+
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Running => 1,
+            Self::Draining => 2,
+            Self::Stopped => 3,
+            Self::FailedDrain => 4,
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Running,
+            2 => Self::Draining,
+            3 => Self::Stopped,
+            _ => Self::FailedDrain,
+        }
+    }
+}
+
+/// Lock-free telemetry snapshot from a prepared persistent worker graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-core", feature = "server"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+pub struct PersistentWorkerSnapshot {
+    pub name: String,
+    pub worker_sm_count: u32,
+    pub state: WorkerState,
+    pub counters: Vec<u64>,
+}
+
+/// Read-only handle for sampling persistent worker telemetry from metrics, HTTP, or TUI threads.
+#[derive(Clone)]
+pub struct PersistentWorkerReader {
+    snapshot: std::sync::Arc<dyn Fn() -> PersistentWorkerSnapshot + Send + Sync>,
+}
+
+impl PersistentWorkerReader {
+    pub fn new(
+        snapshot: std::sync::Arc<dyn Fn() -> PersistentWorkerSnapshot + Send + Sync>,
+    ) -> Self {
+        Self { snapshot }
+    }
+
+    pub fn snapshot(&self) -> PersistentWorkerSnapshot {
+        (self.snapshot)()
+    }
+}
+
+impl std::fmt::Debug for PersistentWorkerReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PersistentWorkerReader")
+    }
+}
+
+/// Lifecycle hooks shared between a manifest and its owning `NativeResources` for launching,
+/// draining, and reading mapped-host counters from a prepared persistent worker graph.
+#[derive(Clone)]
+pub struct PersistentWorkerControl {
+    start: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    stop: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    metrics: std::sync::Arc<dyn Fn() -> Option<Vec<u64>> + Send + Sync>,
+    snapshot: std::sync::Arc<dyn Fn() -> PersistentWorkerSnapshot + Send + Sync>,
+}
+
+impl PersistentWorkerControl {
+    pub fn new(
+        start: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        stop: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        metrics: std::sync::Arc<dyn Fn() -> Option<Vec<u64>> + Send + Sync>,
+        snapshot: std::sync::Arc<dyn Fn() -> PersistentWorkerSnapshot + Send + Sync>,
+    ) -> Self {
+        Self {
+            start,
+            stop,
+            metrics,
+            snapshot,
+        }
+    }
+
+    pub fn start(&self) -> Result<()> {
+        (self.start)()
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        (self.stop)()
+    }
+
+    pub fn metrics(&self) -> Option<Vec<u64>> {
+        (self.metrics)()
+    }
+
+    pub fn snapshot(&self) -> PersistentWorkerSnapshot {
+        (self.snapshot)()
+    }
+
+    pub fn reader(&self) -> PersistentWorkerReader {
+        PersistentWorkerReader::new(std::sync::Arc::clone(&self.snapshot))
+    }
+}
+
+impl std::fmt::Debug for PersistentWorkerControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PersistentWorkerControl")
+    }
+}
+
+/// Prepared persistent worker graph bound to a partitioned CUDA green context.
+#[derive(Clone, Debug)]
+pub struct PersistentWorkerDescriptor {
+    /// Positive SM count requested for the worker green context partition.
+    pub worker_sm_count: u32,
+    /// Dedicated worker graph name, disjoint from serving and startup tuning graphs.
+    pub graph: String,
+    /// Instantiated CUgraphExec handle for the worker graph.
+    pub handle: usize,
+    /// Mapped-host allocation name holding the 32-bit atomic stop flag.
+    pub stop_flag_allocation: String,
+    /// 4-byte aligned byte offset of the stop flag inside `stop_flag_allocation`.
+    pub stop_flag_offset: usize,
+    /// Resolved host-visible address of the 32-bit stop flag.
+    pub stop_flag_address: usize,
+    /// Optional mapped-host allocation name holding `metrics_count` 64-bit counters.
+    pub metrics_allocation: Option<String>,
+    /// 8-byte aligned byte offset of the counter array inside `metrics_allocation`.
+    pub metrics_offset: usize,
+    /// Resolved host-visible address of the 64-bit counter array, or 0 when absent.
+    pub metrics_address: usize,
+    /// Number of 64-bit counters at `metrics_address`, or 0 when absent.
+    pub metrics_count: usize,
+    /// Shared lifecycle controller bound by `NativeResources`.
+    pub control: Option<PersistentWorkerControl>,
+}
+
+impl PersistentWorkerDescriptor {
+    pub fn snapshot(&self) -> Option<PersistentWorkerSnapshot> {
+        self.control.as_ref().map(PersistentWorkerControl::snapshot)
+    }
+
+    pub fn reader(&self) -> Option<PersistentWorkerReader> {
+        self.control.as_ref().map(PersistentWorkerControl::reader)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecutionManifest {
     pub engram: Option<crate::engram::Binding>,
@@ -247,9 +435,91 @@ pub struct ExecutionManifest {
     pub buffers: Vec<BufferDescriptor>,
     pub graphs: Vec<GraphDescriptor>,
     pub tuning_graphs: Vec<TuningGraphDescriptor>,
+    /// Optional dedicated persistent worker graphs launched once after startup tuning.
+    pub persistent_workers: Vec<PersistentWorkerDescriptor>,
 }
 
 impl ExecutionManifest {
+    fn validate_persistent_workers(&self) -> Result<()> {
+        if self.persistent_workers.len() > 1 {
+            return Err(Error::execution(
+                ExecutionError::Manifest,
+                "at most one persistent worker is supported per rank",
+            ));
+        }
+        let Some(worker) = self.persistent_workers.first() else {
+            return Ok(());
+        };
+        if worker.worker_sm_count == 0 {
+            return Err(Error::execution(
+                ExecutionError::Manifest,
+                "persistent worker requires a positive worker_sm_count",
+            ));
+        }
+        if worker.graph.is_empty()
+            || self.graphs.iter().any(|g| g.name == worker.graph)
+            || self.tuning_graphs.iter().any(|g| g.name == worker.graph)
+        {
+            return Err(Error::execution(
+                ExecutionError::Manifest,
+                "persistent worker graph name must be nonempty and distinct from serving and tuning graphs",
+            ));
+        }
+        if worker.stop_flag_allocation.is_empty()
+            || worker.stop_flag_offset % 4 != 0
+            || worker.stop_flag_address == 0
+            || worker.stop_flag_address % 4 != 0
+            || worker.stop_flag_address.checked_add(4).is_none()
+        {
+            return Err(Error::execution(
+                ExecutionError::Manifest,
+                "persistent worker stop flag must have a nonzero 4-byte aligned address",
+            ));
+        }
+        match (worker.metrics_allocation.as_deref(), worker.metrics_count) {
+            (None, 0) => {
+                if worker.metrics_offset != 0 || worker.metrics_address != 0 {
+                    return Err(Error::execution(
+                        ExecutionError::Manifest,
+                        "persistent worker metrics offset and address must be zero when metrics are absent",
+                    ));
+                }
+            }
+            (Some(_), 0) => {
+                return Err(Error::execution(
+                    ExecutionError::Manifest,
+                    "persistent worker metrics reference requires a positive metrics_count",
+                ));
+            }
+            (None, _) => {
+                return Err(Error::execution(
+                    ExecutionError::Manifest,
+                    "persistent worker metrics_count requires a metrics reference",
+                ));
+            }
+            (Some(alloc), count) => {
+                let bytes = count.checked_mul(8).ok_or_else(|| {
+                    Error::execution(
+                        ExecutionError::Manifest,
+                        "persistent worker metrics size overflow",
+                    )
+                })?;
+                if alloc.is_empty()
+                    || worker.metrics_offset % 8 != 0
+                    || worker.metrics_address == 0
+                    || worker.metrics_address % 8 != 0
+                    || worker.metrics_address.checked_add(bytes).is_none()
+                {
+                    return Err(Error::execution(
+                        ExecutionError::Manifest,
+                        "persistent worker metrics must have a nonzero 8-byte aligned address",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_tuning(&self) -> Result<()> {
         let host_inputs: HashSet<_> = self.graphs.iter().flat_map(|graph|
             graph.input_bindings.iter().map(|binding| binding.buffer_name.as_str())).collect();
@@ -450,8 +720,13 @@ impl ExecutionManifest {
         GraphBundle {
             context: self.context,
             device: self.device,
-            graph_execs: self.graphs.iter().map(|graph| graph.handle)
-                .chain(self.tuning_graphs.iter().map(|graph| graph.handle)).collect(),
+            graph_execs: self
+                .graphs
+                .iter()
+                .map(|graph| graph.handle)
+                .chain(self.tuning_graphs.iter().map(|graph| graph.handle))
+                .chain(self.persistent_workers.iter().map(|worker| worker.handle))
+                .collect(),
             buffers: self
                 .buffers
                 .iter()
@@ -462,6 +737,7 @@ impl ExecutionManifest {
                 .collect(),
         }
         .validate()?;
+        self.validate_persistent_workers()?;
         let mut names = HashSet::new();
         for buffer in &self.buffers {
             if buffer.name.is_empty() || !names.insert(&buffer.name) {
@@ -606,7 +882,7 @@ impl ExecutionManifest {
                         && graph.batch_capacity <= self.request_capacity()
                         && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                 }
-                GraphKind::Prefill | GraphKind::ScoredPrefill => {
+                GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => {
                     graph.batch_capacity == 1
                         && ([1, 16].contains(&graph.token_capacity)
                             || (graph.token_capacity >= 64

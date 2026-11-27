@@ -21,7 +21,7 @@ use crate::{
     data::channel,
     proto::{self, v2, v2::server_message::M},
     record::{Descriptor, NamespaceId},
-    store::{GetAnswer, PutAnswer, Reply, StoreCommand},
+    store::{GetAnswer, PUT_UNLINKED, PutAnswer, Reply, StoreCommand},
 };
 use flare_selene::shared::Tier;
 use flare_selene::shared::record::{HEADER_BYTES, Header};
@@ -61,6 +61,8 @@ pub(super) struct PutRec {
     pub chain_pages: u64,
     /// The record carries the state row.
     pub row: bool,
+    /// True when the manager accepted a packed v4 record layout for this put.
+    pub packed: bool,
     /// What the store accepted: the parent it will link to and the first page it needs.
     pub accepted: Option<(Option<Key>, u32)>,
     /// Set when the writer's bytes arrive on the data channel.
@@ -103,9 +105,8 @@ impl Core {
 
     pub(super) fn store_send(&self, command: StoreCommand) {
         if let Some(store) = &self.store {
-            // A full queue means the store is busy; the pool retries nothing here because
-            // every use is a release the store also performs when the connection ends.
-            let _ = store.commands.try_send(command);
+            // Release commands must reach the store even when its queue is full.
+            tokio::task::block_in_place(|| store.commands.blocking_send(command)).ok();
         }
     }
 
@@ -166,6 +167,8 @@ impl Core {
                 _ => Tier::Nvme,
             };
             Entry {
+                packed: entry.packed,
+                required_profiles: entry.required_profiles.clone(),
                 key: entry.key,
                 parent: entry.parent,
                 bucket: entry.bucket,
@@ -199,16 +202,24 @@ impl Core {
     // ------------------------------------------------------------------ links
 
     /// The process's store connection, opened on first use.
-    pub(super) fn link_for(&mut self, process: ProcKey, scope: ScopeId, pid: u32) -> Option<Link> {
+    pub(super) fn link_for(
+        &mut self,
+        process: ProcKey,
+        scope: ScopeId,
+        pid: u32,
+        shm: bool,
+    ) -> Option<Link> {
         if let Some(link) = self.procs.get(&process).and_then(|p| p.link) {
             return Some(link);
         }
         let descriptor: Descriptor = self.scopes.get(&scope)?.valid.descriptor.clone();
         let connection = self.new_store_connection()?;
         let namespace = descriptor.namespace_id();
+        let process_nonce = shm.then_some(process.1);
         self.store_call(|reply| StoreCommand::Hello {
             connection,
             pid,
+            process_nonce,
             descriptor,
             reply,
         })
@@ -241,18 +252,25 @@ impl Core {
     // ------------------------------------------------------------------ put
 
     fn put_refusal_log(&mut self, put_id: u64, reason: v2::Reason, detail: &str) -> Option<String> {
-        if reason == v2::Reason::Present {
-            self.present_puts = self.present_puts.saturating_add(1);
-            return self.present_puts.is_power_of_two().then(|| {
-                format!(
-                    "selene: {} duplicate puts refused (Present) so far",
-                    self.present_puts
-                )
-            });
-        }
-        Some(format!(
-            "selene: put {put_id} refused ({reason:?}): {detail}"
-        ))
+        // Duplicates and unlinked page-only puts are routine, so each is logged as a
+        // cumulative count at 1, 2, 4, 8 and so on.
+        let (count, what) = match reason {
+            v2::Reason::Present => (&mut self.present_puts, "duplicate puts refused (Present)"),
+            v2::Reason::Invalid if detail == PUT_UNLINKED => (
+                &mut self.unlinked_puts,
+                "page-only puts refused (no held ancestor to link to)",
+            ),
+            _ => {
+                return Some(format!(
+                    "selene: put {put_id} refused ({reason:?}): {detail}"
+                ));
+            }
+        };
+        *count = count.saturating_add(1);
+        let count = *count;
+        count
+            .is_power_of_two()
+            .then(|| format!("selene: {count} {what} so far"))
     }
 
     fn put_refusal(&mut self, sid: u64, put_id: u64, reason: v2::Reason, detail: &str) {
@@ -350,6 +368,16 @@ impl Core {
         } else {
             None
         };
+        let Ok(ancestor_keys) = m
+            .ancestor_keys
+            .iter()
+            .take(flare_selene::shared::MAX_CHAIN_NODES as usize)
+            .map(|key| key_from(Some(key)))
+            .collect::<Checked<Vec<_>>>()
+        else {
+            self.put_refusal(sid, put_id, v2::Reason::Invalid, "bad ancestor key");
+            return Ok(());
+        };
         let Ok(bucket) = <[u8; 16]>::try_from(m.bucket.as_slice()) else {
             self.put_refusal(sid, put_id, v2::Reason::Invalid, "bucket must be 16 bytes");
             return Ok(());
@@ -362,16 +390,38 @@ impl Core {
             return Ok(());
         };
         let pid = self.sessions[&sid].pid;
-        let Some(link) = self.link_for(process, scope, pid) else {
-            let detail = if pid == 0 {
-                "the peer's process id is not visible; share a PID namespace with the manager"
-            } else {
-                "no connection to the manager's store"
-            };
-            self.put_refusal(sid, put_id, v2::Reason::Io, detail);
+        let Some(link) = self.link_for(process, scope, pid, shm) else {
+            self.put_refusal(
+                sid,
+                put_id,
+                v2::Reason::Io,
+                "no connection to the manager's store",
+            );
             return Ok(());
         };
         let descriptor = self.scopes[&scope].valid.descriptor.clone();
+        let next_child = match m
+            .next_child
+            .as_ref()
+            .map(|key| key_from(Some(key)))
+            .transpose()
+        {
+            Ok(child)
+                if child.is_none_or(|child| child.consumed_tokens > record_key.consumed_tokens) =>
+            {
+                child
+            }
+            _ => {
+                self.put_refusal(sid, put_id, v2::Reason::Invalid, "invalid successor key");
+                return Ok(());
+            }
+        };
+        let capture_role = m.capture_role();
+        let child_paths = m.child_paths;
+        let descendant_row = m.descendant_row;
+        let row = m.row;
+        let packed = m.packed;
+        let raw_chain_pages = m.chain_pages;
         let (events, mut answers) = mpsc::channel::<io::Result<PutAnswer>>(32);
         let begun = self.store_call(|reply| StoreCommand::PutBegin {
             connection: link.connection,
@@ -380,10 +430,16 @@ impl Core {
             descriptor,
             key: record_key,
             published_parent: parent,
+            ancestor_keys,
             bucket,
             chain_pages,
             published_tail_pages: tail_pages,
-            row: m.row,
+            capture_role,
+            child_paths,
+            descendant_row,
+            next_child,
+            row,
+            packed,
             events,
             reply,
         });
@@ -480,8 +536,9 @@ impl Core {
                 parties,
                 refused: false,
                 key: record_key,
-                chain_pages: m.chain_pages,
-                row: m.row,
+                chain_pages: raw_chain_pages,
+                row,
+                packed: false,
                 accepted: None,
                 legs,
                 deferred_commit: None,
@@ -527,6 +584,7 @@ impl Core {
         match answer {
             Ok(PutAnswer::Accept(accept)) => {
                 rec.accepted = Some((accept.parent, accept.first_page));
+                rec.packed = accept.packed;
                 rec.remaining = accept.windows;
                 let channel = rec
                     .channel()
@@ -550,8 +608,10 @@ impl Core {
                         has_parent: accept.parent.is_some(),
                         parent: accept.parent.map(key_to),
                         record_bytes: accept.record_bytes,
+                        capture_role: accept.capture_role as i32,
                         channel,
                         rank_channels,
+                        packed: accept.packed,
                     }),
                 );
             }
@@ -592,18 +652,26 @@ impl Core {
                 }
                 let legs = rec.legs.iter().map(|l| (l.ch.transfer, l.rank)).collect();
                 let spec = v2::WindowSpec {
+                    packed: grant.packed,
                     index: grant.index,
                     region: grant.region,
                     offset: grant.offset,
                     length: grant.length,
                     record: grant.record,
-                    first_page: grant.page_first as u32,
+                    // Grant pages count from the accepted record's first page, as the
+                    // writer's coverage and the rank agents read them. A row-only
+                    // grant has no first page, and the subtraction would underflow.
+                    first_page: if grant.page_count == 0 {
+                        0
+                    } else {
+                        grant.page_first as u32 - rec.accepted.expect("put accepted").1
+                    },
                     page_count: grant.page_count,
                     row: grant.row,
                 };
                 let message = M::PutGrant(v2::PutGrant {
                     put_id,
-                    window: Some(spec),
+                    window: Some(spec.clone()),
                 });
                 self.grant_windows(sid, message, legs, &layout, &[spec]);
             }
@@ -652,13 +720,10 @@ impl Core {
             return;
         };
         if self.holders(&rec.parties, None, rec.mp.passes) == Party::Drained {
-            if let Some(store) = &self.store {
-                let command = StoreCommand::Cancel {
-                    connection: rec.link.connection,
-                    transfer: key.2,
-                };
-                tokio::task::block_in_place(|| store.commands.blocking_send(command)).ok();
-            }
+            self.store_send(StoreCommand::Cancel {
+                connection: rec.link.connection,
+                transfer: key.2,
+            });
             self.puts.remove(&key);
         }
     }
@@ -1260,6 +1325,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn store_cancel_reaches_the_owner_when_the_queue_is_full() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        commands.try_send(StoreCommand::Tick).unwrap();
+        let (core, _handle, _events) = Core::new(
+            Default::default(),
+            Default::default(),
+            crate::arena::Arena::new(4096).unwrap(),
+            Some(commands),
+        );
+        let (waiting, entered) = std::sync::mpsc::channel();
+        let (sent, returned) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            waiting.send(()).unwrap();
+            core.store_send(StoreCommand::Cancel {
+                connection: 1,
+                transfer: 2,
+            });
+            sent.send(()).unwrap();
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let returned_while_full = returned.recv_timeout(std::time::Duration::from_millis(100));
+        assert!(matches!(receiver.try_recv(), Ok(StoreCommand::Tick)));
+        sender.join().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(StoreCommand::Cancel {
+                connection: 1,
+                transfer: 2
+            })
+        ));
+        assert!(returned_while_full.is_err());
+    }
+
+    #[test]
     fn duplicate_put_logs_are_aggregated_at_doubling_totals() {
         let (mut core, _handle, _events) = Core::new(
             Default::default(),
@@ -1286,6 +1388,34 @@ mod tests {
             );
         }
         assert_eq!(core.present_puts, 4096);
+    }
+
+    #[test]
+    fn unlinked_put_logs_are_aggregated_at_doubling_totals() {
+        let (mut core, _handle, _events) = Core::new(
+            Default::default(),
+            Default::default(),
+            crate::arena::Arena::new(4096).unwrap(),
+            None,
+        );
+        let mut logged = Vec::new();
+        for id in 1..=64 {
+            if let Some(message) = core.put_refusal_log(id, v2::Reason::Invalid, PUT_UNLINKED) {
+                assert!(message.contains(&format!("{id} page-only puts")));
+                logged.push(id);
+            }
+        }
+        assert_eq!(logged, [1, 2, 4, 8, 16, 32, 64]);
+        assert_eq!(core.unlinked_puts, 64);
+        // Any other INVALID refusal is a disagreement and is logged every time.
+        for id in 65..68 {
+            assert!(
+                core.put_refusal_log(id, v2::Reason::Invalid, "bad key")
+                    .is_some_and(|message| message.contains("bad key"))
+            );
+        }
+        assert_eq!(core.unlinked_puts, 64);
+        assert_eq!(core.present_puts, 0);
     }
 
     #[test]
@@ -1349,6 +1479,7 @@ mod tests {
                 key: Key::default(),
                 chain_pages: 0,
                 row: true,
+                packed: false,
                 accepted: None,
                 legs: Vec::new(),
                 deferred_commit: None,
@@ -1399,6 +1530,8 @@ mod tests {
                     unit_bytes: 4096,
                 })
                 .collect(),
+            placement: Default::default(),
+            codec_fields: Vec::new(),
             snapshot_pages: Vec::new(),
         };
         let geometry = vec![rank; 2];

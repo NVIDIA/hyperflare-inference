@@ -3,6 +3,7 @@
 
 """Placeholders for process-local resources survive the pickling of compiled-forward guards."""
 
+import os
 import pickle
 
 import pytest
@@ -28,3 +29,27 @@ def test_forward_metadata_replaces_cute_runtime_tensors_with_placeholders():
     assert isinstance(placeholder, _Unavailable)
     with pytest.raises(RuntimeError, match="cutlass.cute.runtime._Tensor.shape"):
         placeholder.shape
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
+                    reason="requires an explicitly assigned CUDA device")
+def test_collective_transport_metadata_leaves_cuda_resources_on_the_owning_rank():
+    from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
+    from b12x.comm.pcie._island_copy import PacketTransport
+
+    assert os.environ.get("CUDA_VISIBLE_DEVICES")
+    values = torch.zeros(128, device="cuda:0")
+    transport = PacketTransport(values.device, CudaRTLibrary())
+    try:
+        restored = forward_metadata.loads(forward_metadata.dumps(transport))
+        for resource in (restored.stream, restored.started, restored.finished):
+            with pytest.raises(RuntimeError, match="process-local resource"):
+                resource.query()
+        transport.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(transport.stream):
+            values.fill_(3)
+        transport.stream.synchronize()
+        torch.testing.assert_close(values, torch.full_like(values, 3))
+    finally:
+        torch.cuda.synchronize(values.device)
+        transport.close()

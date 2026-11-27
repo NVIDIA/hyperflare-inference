@@ -138,6 +138,7 @@ impl NetRig {
         Event::Window {
             claim,
             window: Window {
+                packed: None,
                 shape,
                 page_xxh3: sums,
                 row_xxh3: row,
@@ -416,6 +417,7 @@ fn a_lost_session_waits_for_the_task_before_it_owes_the_fence() {
 
 fn put_accept(put: u64, record_bytes: u64, channel: Option<wire::DataChannelRef>) -> In {
     In::PutAccept(wire::PutAccept {
+        capture_role: 0,
         put_id: put,
         first_page: 0,
         has_parent: false,

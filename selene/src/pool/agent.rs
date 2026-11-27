@@ -111,8 +111,8 @@ pub struct AgentConfig {
     pub records: Option<Box<dyn RankRecords>>,
     /// Called once at startup with everything this agent is about to register (the manager's
     /// shared files and/or its own data-channel staging), after the manager's first Hello and
-    /// before any registration. `Err(reason)` registers nothing: the agent is disabled with one
-    /// warning, and rank 0 turns the pool off for every rank. `None` approves.
+    /// before any registration. `Err(reason)` registers nothing and fails startup.
+    /// `None` approves.
     pub approve: Option<Approve>,
 }
 
@@ -126,7 +126,7 @@ pub struct RankAgent {
 }
 
 impl RankAgent {
-    /// Start the agent's thread and return at once.
+    /// Start the agent's thread and wait for registration and manager attachment.
     pub fn start(config: AgentConfig) -> Result<RankAgent> {
         Self::start_with(config, super::net::Roots::System)
     }
@@ -156,6 +156,7 @@ impl RankAgent {
             address: config.address,
             ca: config.ca,
             roots,
+            page_tokens: config.scope.geometry.page_tokens,
             fingerprint: config.scope.layout_fingerprint,
             layout,
             rank: config.rank,
@@ -192,35 +193,30 @@ impl RankAgent {
             .name("selene-rank-agent".into())
             .spawn(move || run(agent))
             .map_err(|e| Error::caused_by("cannot start the rank agent thread", e))?;
-        let registered = match startup.wait(super::client::STARTUP_WAIT) {
-            Ok(registered) => registered,
-            Err(timed_out) => {
-                if timed_out {
-                    let reason = format!(
-                        "the pool manager did not answer within {:?} of startup; this rank \
-                         will not attach to the pool later (start the manager before the instance)",
-                        super::client::STARTUP_WAIT
-                    );
-                    eprintln!("warning: rank {}: {reason}", config.rank);
-                    *status.lock().unwrap() = PoolStatus::Disabled(reason);
-                }
-                Vec::new()
-            }
-        };
-        Ok(RankAgent {
+        let mut agent = RankAgent {
             stop,
             wake,
             status,
             thread: Some(thread),
-            registered,
-        })
+            registered: Vec::new(),
+        };
+        agent.registered = match startup.wait_with_opening(super::client::STARTUP_WAIT, None) {
+            Ok(registered) => registered,
+            Err(error) => {
+                if let Err(close_error) = agent.close() {
+                    eprintln!("warning: cannot close the failed rank agent: {close_error}");
+                }
+                return Err(error);
+            }
+        };
+        Ok(agent)
     }
 
     pub fn status(&self) -> PoolStatus {
         self.status.lock().unwrap().clone()
     }
 
-    /// The ranges registered at startup. Empty when the agent did not attach.
+    /// The ranges registered before the manager accepted this agent.
     pub fn registered_regions(&self) -> &[RegisteredRegion] {
         &self.registered
     }
@@ -297,7 +293,39 @@ struct Xfer {
     row_bytes: u64,
 }
 
+impl Xfer {
+    fn packed_jobs(
+        &mut self,
+        spec: &wire::WindowSpec,
+        manifest: &wire::PackedWindow,
+        bytes: &[u8],
+        dest: usize,
+        rank: usize,
+        slot: Option<u32>,
+    ) -> Vec<Job> {
+        let jobs = restore_packets(
+            spec,
+            manifest,
+            bytes,
+            &self.pages[dest..],
+            self.slot,
+            Some(rank as u32),
+        );
+        self.windows.insert(
+            spec.index,
+            Win {
+                jobs_left: 0,
+                spec: spec.clone(),
+                slot,
+                persisted: None,
+            },
+        );
+        jobs
+    }
+}
+
 struct Agent {
+    page_tokens: u64,
     address: PoolAddress,
     ca: Option<PathBuf>,
     roots: net::Roots,
@@ -339,12 +367,14 @@ struct Agent {
 }
 
 fn run(mut agent: Agent) -> Result<()> {
+    let _startup = super::startup::StartupGuard(agent.startup.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| Error::caused_by("cannot start the rank agent runtime", e))?;
     runtime.block_on(async {
         let result = agent.serve().await;
+        agent.startup.close();
         agent.finish().await;
         let status = agent.status.clone();
         let mut status = status.lock().unwrap();
@@ -358,6 +388,7 @@ fn run(mut agent: Agent) -> Result<()> {
 impl Agent {
     fn set_status(&mut self, status: PoolStatus) {
         if let PoolStatus::Disabled(reason) = &status {
+            self.startup.fail(reason.clone());
             // All ranks use the pool or none do: rank 0 hears it.
             self.end.send_rank(Msg::Disabled {
                 reason: reason.clone(),
@@ -380,18 +411,26 @@ impl Agent {
         let mut backoff = FIRST_BACKOFF;
         let mut warned = false;
         loop {
-            if self.stopping() || self.end.failed() {
+            if self.stopping() {
+                return Ok(());
+            }
+            if self.end.failed() {
+                self.startup
+                    .fail("the rank links closed before pool attachment completed");
                 return Ok(());
             }
             let started = Instant::now();
             match self.attempt().await {
                 Attempt::Disabled(why) => {
-                    eprintln!("warning: rank {}: {why}", self.rank);
+                    if self.startup.is_open() {
+                        eprintln!("warning: rank {}: {why}", self.rank);
+                    }
                     self.set_status(PoolStatus::Disabled(why));
                     return Ok(());
                 }
                 Attempt::Retry(why) => {
-                    if !warned {
+                    self.startup.retry(why.clone());
+                    if self.startup.is_open() && !warned {
                         warned = true;
                         eprintln!(
                             "warning: rank {}: cannot attach to the pool manager ({why}); retrying the existing attachment",
@@ -416,7 +455,12 @@ impl Agent {
                     reason: "the manager attachment ended".into(),
                 });
             }
-            if self.stopping() || self.end.failed() {
+            if self.stopping() {
+                return Ok(());
+            }
+            if self.end.failed() {
+                self.startup
+                    .fail("the rank links closed before pool attachment completed");
                 return Ok(());
             }
             self.set_status(PoolStatus::Local);
@@ -508,8 +552,9 @@ impl Agent {
                         return true;
                     }
                     Incoming::Message(Msg::Close) => {
-                        *self.status.lock().unwrap() =
-                            PoolStatus::Disabled("rank 0 is not using the pool".into());
+                        self.set_status(PoolStatus::Disabled(
+                            "rank 0 is not using the pool".into(),
+                        ));
                         return false;
                     }
                     Incoming::Message(_) => {}
@@ -541,7 +586,12 @@ impl Agent {
         let link = self.link();
         let mut backoff = FIRST_BACKOFF;
         loop {
-            if self.stopping() || self.end.failed() {
+            if self.stopping() {
+                return false;
+            }
+            if self.end.failed() {
+                self.startup
+                    .fail("the rank links closed before pool attachment completed");
                 return false;
             }
             if self.startup.is_closed() {
@@ -557,19 +607,18 @@ impl Agent {
                     }
                     let staging = (!hello.data_transports.is_empty())
                         .then(|| (self.staging_slots(&hello), self.slot_bytes(&hello)));
-                    let prepared = conn::register_memory(
-                        hello.shared_memory.as_ref(),
+                    let prepared = conn::register_memory_blocking(
+                        hello.shared_memory.clone(),
                         staging,
-                        &*self.registrar,
+                        self.registrar.clone(),
                         self.context,
-                        self.approve.as_ref(),
-                    );
+                        self.approve.clone(),
+                    )
+                    .await;
                     let (regions, staging, registered) = match prepared {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             self.registrar = Arc::new(super::startup::ClosedRegistrar);
-                            self.startup.done(Vec::new());
-                            eprintln!("warning: rank {}: {error}", self.rank);
                             self.set_status(PoolStatus::Disabled(error.to_string()));
                             return false;
                         }
@@ -578,22 +627,22 @@ impl Agent {
                         .map(|regions| (hello.shared_memory.clone().expect("mapped"), regions));
                     self.staging = staging;
                     self.registrar = Arc::new(super::startup::ClosedRegistrar);
-                    self.startup.done(registered);
+                    self.startup.registered(registered);
                     return true;
                 }
                 Err(Attempt::Disabled(why)) => {
-                    self.startup.close();
-                    eprintln!("warning: rank {}: {why}", self.rank);
                     self.set_status(PoolStatus::Disabled(why));
                     return false;
                 }
-                Err(_) => {
+                Err(Attempt::Retry(why)) => {
+                    self.startup.retry(why);
                     let until = Instant::now() + backoff;
                     while Instant::now() < until && !self.stopping() {
                         let _ = tokio::time::timeout(IDLE_TICK, self.wake.notified()).await;
                     }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
+                Err(Attempt::Ended) => return false,
             }
         }
     }
@@ -617,7 +666,10 @@ impl Agent {
             return Attempt::Disabled("not bound to rank 0".into());
         };
         let (tx, rx) = mpsc::channel::<wire::RankClientMessage>(256);
+        let profiles = self.copier.lock().unwrap().codec_receive_profiles();
+        let caps = crate::codec_copy::reader_caps_many(&profiles);
         let attach = wire::RankAttach {
+            codec: (!caps.receive_profiles.is_empty()).then_some(caps),
             manager_incarnation: hello.manager_incarnation,
             instance_id: bound.instance_id.clone(),
             rank0_nonce: bound.rank0_nonce.clone(),
@@ -684,6 +736,7 @@ impl Agent {
             tx,
         });
         self.set_status(PoolStatus::Ready);
+        self.startup.opened();
         self.deliver_owed();
         self.end.send_rank(Msg::Attached {
             manager_incarnation: hello.manager_incarnation,
@@ -880,6 +933,29 @@ impl Agent {
         {
             return self.reject(xfer, "the transfer's record sizes are not this instance's");
         }
+        let mut coverage = Coverage::new(expected);
+        coverage.channel_rank = (!shared).then_some(self.rank as u32);
+        let caps = crate::codec_copy::reader_caps_many(
+            &self.copier.lock().unwrap().codec_receive_profiles(),
+        );
+        if let Err(why) = coverage.select_packed(
+            &open.records,
+            (!out).then_some(&caps),
+            self.page_tokens,
+            || {
+                (0..self.world)
+                    .map(|r| {
+                        let s = self.layout.rank(r);
+                        crate::record::RankSizes {
+                            planes: vec![s.page_len],
+                            row_bytes: s.row_len,
+                        }
+                    })
+                    .collect()
+            },
+        ) {
+            return self.reject(xfer, why);
+        }
         let mut run = Xfer {
             host: open.host,
             records: open.records.clone(),
@@ -887,7 +963,7 @@ impl Agent {
             out,
             kind: open.kind,
             fence_id: open.fence_id,
-            coverage: Coverage::new(expected),
+            coverage,
             pages: open.pages.iter().map(|id| PageId(*id)).collect(),
             slot: open.has_slot.then_some(StateSlotId(open.slot)),
             shared,
@@ -956,6 +1032,11 @@ impl Agent {
         };
         let (count, row) = (spec.page_count as usize, spec.row);
         let rank = self.rank;
+        if let Some(manifest) = &spec.packed {
+            let bytes = region.bytes(spec.offset, spec.length).expect("checked");
+            let jobs = run.packed_jobs(&spec, manifest, bytes, dest, rank, None);
+            return self.queue(xfer, spec.index, jobs);
+        }
         if !run.out {
             // Verify this rank's slices against the transfer checksums before copying.
             let Some(sums) = window.sums else {
@@ -992,7 +1073,7 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec,
+                spec: spec.clone(),
                 slot: None,
                 persisted: None,
             },
@@ -1073,7 +1154,7 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 1,
-                spec,
+                spec: spec.clone(),
                 slot,
                 persisted: None,
             },
@@ -1195,7 +1276,12 @@ impl Agent {
     }
 
     /// A window of an incoming claim arrived whole in a slot of this agent's staging.
-    fn on_net_window(&mut self, xfer: u64, window: super::frame::Window, slot: u32) {
+    fn on_net_window(
+        &mut self,
+        xfer: u64,
+        window: super::frame::Window,
+        slot: u32,
+    ) {
         let Some(staging) = self.staging.clone() else {
             return;
         };
@@ -1209,6 +1295,7 @@ impl Agent {
         }
         let shape = window.shape;
         let spec = wire::WindowSpec {
+            packed: window.packed,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -1230,6 +1317,10 @@ impl Agent {
             .region()
             .bytes(spec.offset, spec.length)
             .expect("a slot of the staging");
+        if let Some(manifest) = &spec.packed {
+            let jobs = run.packed_jobs(&spec, manifest, bytes, dest, rank, Some(slot));
+            return self.queue(xfer, spec.index, jobs);
+        }
         let page_len = mine.page_len as usize;
         let sums = self.layout.packed_sums(rank, bytes, count as u32, row);
         let bad = sums.map_or(true, |sums| {
@@ -1249,7 +1340,7 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec,
+                spec: spec.clone(),
                 slot: Some(slot),
                 persisted: None,
             },
@@ -1280,6 +1371,7 @@ impl Agent {
             return self.release_slot(slot);
         }
         let spec = wire::WindowSpec {
+            packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -1312,7 +1404,7 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec,
+                spec: spec.clone(),
                 slot: Some(slot),
                 persisted: None,
             },
@@ -1374,7 +1466,7 @@ impl Agent {
         let Some(win) = run.windows.get(&index) else {
             return;
         };
-        let (spec, slot) = (win.spec, win.slot);
+        let (spec, slot) = (win.spec.clone(), win.slot);
         let persisted = win.persisted.clone();
         let (count, row) = (spec.page_count as usize, spec.row);
         let over = run.failed.is_some() || run.cancelled;
@@ -1645,6 +1737,70 @@ impl Agent {
     }
 }
 
+pub(crate) fn restore_packets(
+    spec: &wire::WindowSpec,
+    manifest: &wire::PackedWindow,
+    bytes: &[u8],
+    pages: &[PageId],
+    slot: Option<StateSlotId>,
+    local_rank: Option<u32>,
+) -> Vec<Job> {
+    // Coverage::accept checked the manifest against the pinned selection and window length.
+    let expected = &manifest.units;
+    // The window remains leased until all these copier jobs have fenced.
+    let mut offset = 0;
+    let mut packets: Vec<_> = expected
+        .iter()
+        .map(|unit| {
+            let length = unit.stored_length as usize;
+            let address = bytes[offset..].as_ptr() as usize;
+            offset += length;
+            crate::codec_copy::PinnedPacket {
+                unit: unit.clone(),
+                spans: vec![(address, length)],
+            }
+        })
+        .collect();
+    if let Some(rank) = local_rank {
+        packets.retain(|p| p.unit.stored_rank == rank || p.unit.replicas.contains(&rank));
+        for p in &mut packets {
+            p.unit.stored_rank = 0;
+            p.unit.replicas.clear();
+        }
+    }
+    let mut first = expected
+        .iter()
+        .find(|u| u.kind == 0)
+        .map_or(0, |u| u.logical_index);
+    let mut jobs = jobs_of(
+        Direction::In,
+        spec.index,
+        spec.page_count as usize,
+        spec.row,
+        |i| pages[i],
+        slot,
+        |_| 0,
+        0,
+    );
+    for j in &mut jobs {
+        let end = first + j.pages.len() as u64;
+        let selected = packets
+            .iter()
+            .filter(|p| {
+                if p.unit.kind == 1 {
+                    j.row.is_some()
+                } else {
+                    (first..end).contains(&p.unit.logical_index)
+                }
+            })
+            .cloned()
+            .collect();
+        j.codec = Some(crate::codec_copy::Window::restore_pinned(first, selected));
+        first = end;
+    }
+    jobs
+}
+
 /// Copier jobs for one window: pages and then the row, at most [`WINDOW_PAGES`] pages each.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn jobs_of(
@@ -1672,6 +1828,7 @@ pub(crate) fn jobs_of(
             )
         });
         jobs.push(Job {
+            codec: None,
             replication: Default::default(),
             id: JobId(0),
             window,

@@ -216,6 +216,7 @@ pub fn metadata() -> PreparedContract {
         input_vocabulary: 248320,
         vision: VisionCapabilities::disabled(),
         cache: CacheContract {
+            codec_layout: None,
             page_tokens: 64,
             regions: vec![],
             page_tables: vec![PageTableView {
@@ -346,6 +347,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 GraphOperation::Restore => GraphKind::Restore,
                 GraphOperation::Snapshot => GraphKind::Snapshot,
                 GraphOperation::Prefill => GraphKind::Prefill,
+                GraphOperation::TerminalPrefill => GraphKind::TerminalPrefill,
                 GraphOperation::ScoredPrefill => GraphKind::ScoredPrefill,
                 GraphOperation::Decode => GraphKind::Decode,
                 GraphOperation::Resume => GraphKind::Resume,
@@ -380,6 +382,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
     ExecutionManifest {
         completion_token_capacity: config.completion_token_capacity,
         tuning_graphs: vec![],
+        persistent_workers: vec![],
         abi_version: 6,
         context: 1,
         device: 0,

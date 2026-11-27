@@ -31,6 +31,7 @@ pub enum OutputPipeline {
     SpacedDsml(super::dsml::DsmlOutput<true>),
     Xtml(super::xtml::XtmlOutput),
     Recipient(super::recipient::RecipientOutput),
+    Tml(super::tml::TmlOutput),
     MiniMaxXml(TaggedOutput<super::minimax_xml::MiniMaxXml>),
     GemmaCall(TaggedOutput<super::gemma_call::GemmaCall>),
     Text(TaggedOutput<PlainText>),
@@ -57,6 +58,7 @@ macro_rules! dispatch {
             OutputPipeline::SpacedDsml($parser) => $body,
             OutputPipeline::Xtml($parser) => $body,
             OutputPipeline::Recipient($parser) => $body,
+            OutputPipeline::Tml($parser) => $body,
             OutputPipeline::MiniMaxXml($parser) => $body,
             OutputPipeline::GemmaCall($parser) => $body,
             OutputPipeline::Text($parser) => $body,
@@ -73,6 +75,7 @@ impl OutputPipeline {
             .as_ref()
             .map(|t| (t.kind, t.wrapping_newlines, t.tag_separator.as_str()))
         {
+            Some((ToolParserKind::TmlJson, _, _)) => Self::Tml(super::tml::TmlOutput::new(config.content, config.control_tokens)),
             Some((ToolParserKind::Atem, _, _)) => Self::Recipient(super::recipient::RecipientOutput::new(config.content, config.control_tokens)),
             Some((ToolParserKind::QwenCoder, 0, _)) => Self::CompactFunctionTags(
                 TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
@@ -106,10 +109,10 @@ impl OutputPipeline {
     }
 
     /// Whether the parser `new` selects gates reasoning delimiters by token identity.
-    /// XTML and recipient-header framing carry their own control tokens.
+    /// XTML, recipient-header, and content-header framing carry their own control tokens.
     pub fn gates_reasoning_tokens(syntax: &FrontendContract) -> bool {
         match syntax.tools.as_ref().map(|t| t.kind) {
-            Some(ToolParserKind::Xtml | ToolParserKind::Atem) => false,
+            Some(ToolParserKind::Xtml | ToolParserKind::Atem | ToolParserKind::TmlJson) => false,
             Some(
                 ToolParserKind::Dsml
                 | ToolParserKind::QwenCoder
@@ -121,6 +124,55 @@ impl OutputPipeline {
         }
     }
 
+    /// The markers of the framing that `kind` writes, each of which must be one tokenizer token.
+    pub(crate) fn envelope_markers(kind: ToolParserKind) -> &'static [&'static str] {
+        match kind {
+            ToolParserKind::Xtml => &["<|open|>", "<|close|>", "<|sep|>"],
+            ToolParserKind::Atem => &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"],
+            ToolParserKind::TmlJson => &super::tml::CONTROL_MARKERS,
+            ToolParserKind::QwenCoder
+            | ToolParserKind::GlmArgumentTags
+            | ToolParserKind::Dsml
+            | ToolParserKind::MiniMaxXml
+            | ToolParserKind::GemmaCall => &[],
+        }
+    }
+
+    /// The delimiter strings that the prepared syntax names: its reasoning delimiters and terminal
+    /// markers, and the delimiters of the tool-call parser the contract selects. The contract
+    /// holds only the parser kind; every kind lists its own markers here, so a new kind must too.
+    pub fn declared_markers(syntax: &FrontendContract) -> Vec<&str> {
+        use super::tagged::ToolDialect;
+        fn dialect<D: ToolDialect>() -> Vec<&'static str> {
+            [D::OPEN, D::CLOSE]
+                .into_iter()
+                .chain(D::FUNCTION.into_iter().flat_map(|(open, close)| [open, close]))
+                .collect()
+        }
+        let mut markers = Vec::new();
+        if let Some(reasoning) = &syntax.reasoning {
+            markers.extend([reasoning.open.as_str(), reasoning.close.as_str()]);
+            markers.extend(reasoning.terminal_markers.iter().map(String::as_str));
+        }
+        if let Some(tools) = &syntax.tools {
+            markers.extend(match tools.kind {
+                ToolParserKind::QwenCoder => dialect::<super::chatml::FunctionTags<true>>(),
+                ToolParserKind::GlmArgumentTags => [
+                    dialect::<super::argument_tags::ArgumentTags>(),
+                    super::argument_tags::ARGUMENT_MARKERS.to_vec(),
+                ]
+                .concat(),
+                ToolParserKind::MiniMaxXml => dialect::<super::minimax_xml::MiniMaxXml>(),
+                ToolParserKind::GemmaCall => dialect::<super::gemma_call::GemmaCall>(),
+                ToolParserKind::Dsml => super::dsml::CONTROL_MARKERS.to_vec(),
+                ToolParserKind::Xtml => Self::envelope_markers(ToolParserKind::Xtml).to_vec(),
+                ToolParserKind::Atem => Self::envelope_markers(ToolParserKind::Atem).to_vec(),
+                ToolParserKind::TmlJson => Self::envelope_markers(ToolParserKind::TmlJson).to_vec(),
+            });
+        }
+        markers
+    }
+
     pub fn grammar_envelope(config: &OutputConfig) -> Option<crate::grammar::OutputEnvelope> {
         let mut envelope = match config
             .syntax
@@ -128,8 +180,9 @@ impl OutputPipeline {
             .as_ref()
             .map(|t| (t.kind, t.wrapping_newlines, t.tag_separator.as_str()))
         {
-            Some((ToolParserKind::Atem, _, _)) => Some(crate::grammar::OutputEnvelope {
+            Some((kind @ (ToolParserKind::Atem | ToolParserKind::TmlJson), _, _)) => Some(crate::grammar::OutputEnvelope {
                 recipient: Some(crate::grammar::RecipientEnvelope {
+                    syntax: kind,
                     start: config.content.start,
                     tools: config.content.tools.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_owned)).collect(),
                 }), reasoning_end: None, tool: None, function: None,

@@ -127,6 +127,9 @@ def test_capture_drains_after_prepare_and_sync_before_capture(monkeypatch):
                              synchronize=lambda: events.append('sync'))
     monkeypatch.setattr(capture, 'ForwardCache', Cache)
     monkeypatch.setattr(capture.torch.cuda, 'current_stream', lambda device: stream)
+    monkeypatch.setattr(capture, "_warmup_stream", lambda device: stream)
+    monkeypatch.setattr(capture, "_seed_warmup_workspaces", lambda stream, device: None)
+
     monkeypatch.setattr(capture.torch.cuda, 'stream', lambda stream: nullcontext())
     monkeypatch.setattr(capture.torch.cuda, 'synchronize', lambda device: None)
     monkeypatch.setattr(capture.torch.cuda, 'CUDAGraph', lambda: 'graph')

@@ -97,11 +97,11 @@ fn plain_parts(value: &Value, protocol: Protocol) -> Result<Vec<Part>> {
             "image" if protocol == Protocol::Messages => {
                 let source = &part["source"];
                 if field(source, "type")? != "base64" {
-                    return Err(unsupported("images require base64 PNG, JPEG, or WebP"));
+                    return Err(unsupported("images require base64 PNG, JPEG, WebP, or GIF"));
                 }
                 let media = field(source, "media_type")?;
-                if !["image/png", "image/jpeg", "image/webp"].contains(&media) {
-                    return Err(unsupported("images require PNG, JPEG, or WebP"));
+                if !["image/png", "image/jpeg", "image/webp", "image/gif"].contains(&media) {
+                    return Err(unsupported("images require PNG, JPEG, WebP, or GIF"));
                 }
                 Ok(Part::Image(format!(
                     "data:{media};base64,{}",
@@ -115,6 +115,29 @@ fn plain_parts(value: &Value, protocol: Protocol) -> Result<Vec<Part>> {
             })),
         })
         .collect()
+}
+/// Reads tool-message `tool_error` parts, tml-renderers' OpenAI form of a
+/// failed result, as the text of a failed result.
+fn tool_error_parts(content: &Value) -> Result<(Value, bool)> {
+    let Some(parts) = content.as_array() else {
+        return Ok((content.clone(), false));
+    };
+    if !parts.iter().any(|part| part["type"] == "tool_error") {
+        return Ok((content.clone(), false));
+    }
+    if parts.iter().any(|part| part["type"] == "text") {
+        return Err("tool message content cannot mix text and tool_error parts".into());
+    }
+    let parts = parts
+        .iter()
+        .map(|part| {
+            if part["type"] != "tool_error" {
+                return Ok(part.clone());
+            }
+            Ok(json!({"type":"text","text":field(part, "text")?}))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((Value::Array(parts), true))
 }
 fn thinking(text: &str, signature: Option<&str>) -> Result<Part> {
     if let Some(signature) = signature.filter(|s| s.starts_with("flare-thinking-v1:")) {
@@ -139,10 +162,12 @@ fn chat_messages(body: &Value) -> Result<Vec<Message>> {
                 ));
             }
             if role == Role::Tool {
+                let (content, failed) = tool_error_parts(&v["content"])?;
                 parts.push(Part::ToolResult {
                     id: optional_id(v, "tool_call_id")?,
-                    content: plain_parts(&v["content"], Protocol::Chat)?,
-                    is_error: flag(v, "is_error", false)?,
+                    name: optional_id(v, "name")?,
+                    content: plain_parts(&content, Protocol::Chat)?,
+                    is_error: flag(v, "is_error", false)? || failed,
                 });
             } else {
                 parts.extend(plain_parts(&v["content"], Protocol::Chat)?);
@@ -197,6 +222,7 @@ fn anthropic_messages(body: &Value, hints: &mut Vec<(usize, usize)>) -> Result<V
                     }],
                     "tool_result" => vec![Part::ToolResult {
                         id: Some(field(block, "tool_use_id")?.into()),
+                        name: None,
                         content: plain_parts(&block["content"], Protocol::Messages)?,
                         is_error: flag(block, "is_error", false)?,
                     }],
@@ -285,6 +311,7 @@ fn responses_messages(body: &Value) -> Result<Vec<Message>> {
                 Role::Tool,
                 vec![Part::ToolResult {
                     id: Some(field(&item, "call_id")?.into()),
+                    name: None,
                     content: plain_parts(&item["output"], Protocol::Responses)?,
                     is_error: false,
                 }],
@@ -342,9 +369,10 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
     } else {
         v
     };
-    if flag(definition, "strict", false)? {
+    let strict = flag(definition, "strict", false)?;
+    if strict && (custom || protocol == Protocol::Messages) {
         return Err(unsupported(
-            "strict tool schemas require constrained tool generation",
+            "strict tool schemas are supported only on Chat Completions and Responses function tools",
         ));
     }
     let grammar = if custom && present(v, "format") && v["format"]["type"] != "text" {
@@ -367,15 +395,17 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
             "only client function and text custom tools are supported",
         ));
     }
+    let declared = definition
+        .get(if protocol == Protocol::Messages {
+            "input_schema"
+        } else {
+            "parameters"
+        })
+        .filter(|v| !v.is_null());
     let parameters = if custom {
         json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"]})
     } else {
-        definition
-            .get(if protocol == Protocol::Messages {
-                "input_schema"
-            } else {
-                "parameters"
-            })
+        declared
             .cloned()
             .unwrap_or_else(|| json!({"type":"object","properties":{}}))
     };
@@ -388,6 +418,8 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
             .unwrap_or("")
             .into(),
         parameters,
+        declared_parameters: custom || declared.is_some(),
+        strict,
         custom,
         grammar,
     })
@@ -488,7 +520,8 @@ fn options(body: &Value, protocol: Protocol) -> Result<Options> {
                     .insert("enable_thinking".into(), false.into());
                 None
             }
-            Some("minimal" | "low") => Some(Effort::Low),
+            Some("minimal") => Some(Effort::Minimal),
+            Some("low") => Some(Effort::Low),
             Some("medium" | "high") => Some(Effort::High),
             Some("xhigh" | "max") => Some(Effort::Max),
             _ => return Err("unsupported reasoning effort".into()),
@@ -868,7 +901,7 @@ mod tests {
     }
     fn normalize_tool_arguments(message: &mut Value) -> Result<()> {
         let decoded = chat_messages(&json!({"messages":[message]}))?;
-        *message = template_messages(&decoded, ToolChoice::Auto, &[])?.remove(0);
+        *message = template_messages(&decoded, ToolChoice::Auto, &[], true)?.remove(0);
         Ok(())
     }
     #[test]
@@ -1051,7 +1084,7 @@ mod native_prompt_tests {
         let source = r#"{"z":1e2,"a":[1,  2],"z":-0,"s":"café\n"}"#;
         let (frontend, compiler, mut config) = renderer(
             PromptEncoder::Jinja,
-            Some(include_str!("../../../../ignition/recipes/kimi31/assets/chat_template.jinja")),
+            Some(include_str!("../../../tests/fixtures/templates/kimi31/chat_template.jinja")),
             TemplateEncoding::TokenSegments,
         );
         config.contract.frontend.rejected_tokens.clear();
@@ -1115,7 +1148,7 @@ mod native_prompt_tests {
                 "<|image_pad|>",
             ),
             (
-                include_str!("../../../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+                include_str!("../../../tests/fixtures/templates/kimi3/chat_template.jinja"),
                 TemplateEncoding::TokenSegments,
                 ImageLayoutKind::Moonvit,
                 "<|media_pad|>",
@@ -1323,7 +1356,7 @@ mod native_prompt_tests {
             let render = |hints: &[(usize, usize)]| {
                 frontend
                     .render_chat(
-                        &template_messages(messages, ToolChoice::Auto, hints).unwrap(),
+                        &template_messages(messages, ToolChoice::Auto, hints, true).unwrap(),
                         &serde_json::Map::new(),
                     )
                     .unwrap()
@@ -1771,6 +1804,77 @@ mod native_prompt_tests {
             );
             assert!(prepared.prompt.reasoning_cut.is_none());
             assert_eq!(prepared.prompt.max_new_tokens, 32);
+        }
+    }
+
+    #[test]
+    fn tools_without_parameters_keep_the_empty_object_schema_for_templates_and_deepseek() {
+        let template = "{% for m in messages %}{{ m.content }}{% mark %}{% endfor %}{{ tools | tojson }}";
+        for encoder in [PromptEncoder::Jinja, PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+            let (frontend, compiler, mut config) = renderer(encoder, Some(template), TemplateEncoding::Text);
+            config.contract.frontend.rejected_tokens.clear();
+            let render = |parameters: Option<Value>| {
+                let mut function = json!({"name":"now","description":"Current time."});
+                if let Some(parameters) = parameters {
+                    function["parameters"] = parameters;
+                }
+                let decoded = decode(Protocol::Chat, json!({"messages":[{"role":"user","content":"Time?"}],
+                    "tools":[{"type":"function","function":function}]}), false).unwrap();
+                crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, &decoded.request, 0, false,
+                )
+                .unwrap()
+                .rendered_prompt
+            };
+            let declared = render(Some(json!({"type":"object","properties":{}})));
+            assert_eq!(render(None), declared, "{encoder:?}");
+            assert_eq!(render(Some(Value::Null)), declared, "{encoder:?}");
+        }
+    }
+
+    #[test]
+    fn templates_receive_failed_tool_results_with_failure_text() {
+        let (frontend, compiler, config) = renderer(PromptEncoder::Jinja, None, TemplateEncoding::Text);
+        let render = |result: Value| {
+            let decoded = decode(Protocol::Chat, json!({"messages":[{"role":"user","content":"Go"},
+                {"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},
+                result]}), false).unwrap();
+            crate::server::request::prepare_inference(&frontend, None, &compiler, &config, &decoded.request, 0, false)
+                .unwrap()
+                .rendered_prompt
+        };
+        let flagged = render(json!({"role":"tool","tool_call_id":"c","is_error":true,"content":"timeout"}));
+        assert!(flagged.contains("<tool>Tool execution failed:\n\ntimeout</tool>"), "{flagged}");
+        assert_eq!(render(json!({"role":"tool","tool_call_id":"c",
+            "content":[{"type":"tool_error","text":"timeout"}]})), flagged);
+        assert!(decode(Protocol::Chat, json!({"messages":[{"role":"tool","tool_call_id":"c",
+            "content":[{"type":"text","text":"a"},{"type":"tool_error","text":"b"}]}]}), false).is_err());
+        assert!(decode(Protocol::Chat, json!({"messages":[{"role":"tool","tool_call_id":"c","is_error":7,
+            "content":[{"type":"tool_error","text":"timeout"}]}]}), false).is_err());
+    }
+
+    #[test]
+    fn minimal_effort_renders_low_where_the_prompt_format_has_no_minimal_level() {
+        let template = "{% for m in messages %}{{ m.content }}{% mark %}{% endfor %}effort={{ reasoning_effort }}";
+        for encoder in [PromptEncoder::Jinja, PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+            let (frontend, compiler, mut config) = renderer(encoder, Some(template), TemplateEncoding::Text);
+            config.contract.frontend.rejected_tokens.clear();
+            let render = |effort: &str| {
+                let decoded = decode(Protocol::Responses,
+                    json!({"input":"Hello","reasoning":{"effort":effort}}), false).unwrap();
+                assert_eq!(decoded.request.options.effort,
+                    Some(if effort == "minimal" { Effort::Minimal } else { Effort::Low }));
+                crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, &decoded.request, 0, false,
+                )
+                .unwrap()
+                .rendered_prompt
+            };
+            let low = render("low");
+            assert_eq!(render("minimal"), low, "{encoder:?}");
+            if encoder == PromptEncoder::Jinja {
+                assert!(low.ends_with("effort=low"));
+            }
         }
     }
 

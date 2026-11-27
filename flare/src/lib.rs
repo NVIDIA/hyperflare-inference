@@ -6,6 +6,7 @@ pub mod cache_support;
 pub mod download_cache;
 pub mod environment;
 pub mod hardware;
+pub(crate) mod http_client;
 pub mod hub;
 pub mod identity;
 pub mod options;

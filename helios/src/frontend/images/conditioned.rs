@@ -38,6 +38,7 @@ pub enum ImageEncoding {
     Png,
     Jpeg,
     Webp,
+    Gif,
 }
 
 #[derive(Debug)]
@@ -187,12 +188,13 @@ impl PreparedImageInput {
             Profile::Qwen(_) | Profile::MiMo(_) => 1536,
             Profile::Radio => 768,
             Profile::Glm => 1176,
+            Profile::PaddedGrid => super::padded_grid::FEATURES,
             _ => 588,
         };
         let patches = self.geometry.patches;
         let interpolation = matches!(
             self.processor.profile,
-            Profile::Qwen(_) | Profile::Moonvit | Profile::Step | Profile::Radio
+            Profile::Qwen(_) | Profile::Moonvit | Profile::Step | Profile::Radio | Profile::PaddedGrid
         );
         let sequences = if matches!(self.processor.profile, Profile::Step) {
             let local = self.geometry.grid_thw[1] * self.geometry.grid_thw[2];
@@ -208,6 +210,8 @@ impl PreparedImageInput {
                 0,
                 (self.geometry.grid_thw[1] * self.geometry.grid_thw[2]) as i32,
             ]
+        } else if matches!(self.processor.profile, Profile::PaddedGrid) {
+            vec![0, patches as i32 + 1]
         } else {
             vec![0, patches as i32]
         };
@@ -311,6 +315,7 @@ impl ImageProcessor {
             ImageEncoding::Png => self.decode_png(bytes),
             ImageEncoding::Jpeg => self.decode_jpeg(bytes),
             ImageEncoding::Webp => self.decode_webp(bytes),
+            ImageEncoding::Gif => self.decode_gif(bytes),
         }?;
         self.counts
             .decoded
@@ -351,6 +356,7 @@ mod tests {
             ImageSettings::Moonvit {},
             ImageSettings::Step {},
             ImageSettings::Radio {},
+            ImageSettings::PaddedGrid {},
         ]
     }
 

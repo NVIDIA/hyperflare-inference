@@ -855,6 +855,40 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
         } catch (hresult_error const& error) { show_error(std::wstring(error.message())); }
         trust_dialog_id_ = 0;
     }
+    fire_and_forget review_publisher_key(uint64_t id, std::string fingerprint, std::string publisher, std::wstring content) {
+        auto lifetime = get_strong();
+        ModalScope modal_scope{modal_open_}; if (!modal_scope) co_return;
+        try {
+            publisher_key_dialog_ = dialog(L"Review publisher key");
+            auto modal = publisher_key_dialog_;
+            StackPanel body; body.Spacing(16);
+            auto disclosure = label(content, 13, true); disclosure.IsTextSelectionEnabled(true);
+            ScrollViewer scroll; scroll.Content(disclosure); scroll.MaxHeight(360);
+            body.Children().Append(scroll);
+            body.Children().Append(label(L"Importing this key allows Flare to verify the download. You will be asked separately before running this model.", 13, true));
+            TextBox confirmation; confirmation.Header(box_value(L"Type " + std::wstring(to_hstring(publisher)) + L" to import this key"));
+            body.Children().Append(confirmation);
+            modal.Content(body);
+            modal.PrimaryButtonText(L"Import key and continue download");
+            modal.CloseButtonText(L"Cancel download");
+            modal.DefaultButton(ContentDialogButton::Close);
+            modal.IsPrimaryButtonEnabled(false);
+            auto weak_dialog = make_weak(modal);
+            confirmation.TextChanged([weak_dialog, expected = to_hstring(publisher)](IInspectable const& sender, TextChangedEventArgs const&) {
+                if (auto current = weak_dialog.get()) current.IsPrimaryButtonEnabled(sender.as<TextBox>().Text() == expected);
+            });
+            auto result = co_await modal.ShowAsync();
+            if (!closing_) {
+                accepted(result == ContentDialogResult::Primary
+                    ? flare_app_import_publisher_key(app_, id, fingerprint.data(), fingerprint.size(), publisher.data(), publisher.size())
+                    : flare_app_reject_publisher_key(app_, id));
+            }
+        } catch (hresult_error const& error) {
+            if (!closing_) { flare_app_reject_publisher_key(app_, id); show_error(std::wstring(error.message())); }
+        }
+        publisher_key_dialog_ = nullptr;
+        publisher_key_dialog_id_ = 0;
+    }
     void begin_close() {
         if (closing_) return;
         closing_ = true;
@@ -892,12 +926,23 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
             update_detail(snapshot.get(),status);
             update_chat(snapshot.get(),status);
             flare_trust_review review{};
+            flare_publisher_key_review key{};
+            bool has_key = flare_snapshot_publisher_key(snapshot.get(), &key) != 0;
+            if (publisher_key_dialog_ && (!has_key || key.review.decision_id != publisher_key_dialog_id_)) publisher_key_dialog_.Hide();
             if (!modal_open_ && !trust_dialog_id_ && flare_snapshot_trust(snapshot.get(), &review)) {
                 trust_dialog_id_ = review.decision_id;
                 auto content = L"Publisher: " + wide(review.publisher) + L"\n\nFingerprint: " + wide(review.fingerprint) +
                     L"\n\nIdentity: " + wide(review.identity_status) + L"\n\nOfficial source: " + wide(review.official_source) +
                     L"\n\nLicense: " + wide(review.license) + L"\n\nTrust only a publisher whose identity and source you have verified.";
                 review_trust(review.decision_id, utf8(review.publisher), content);
+            }
+            if (!modal_open_ && !publisher_key_dialog_id_ && has_key) {
+                publisher_key_dialog_id_ = key.review.decision_id;
+                auto content = L"Publisher profile: " + wide(key.publisher_name) + L"\n\nNamespace: " + wide(key.review.publisher) +
+                    L"\n\nSigning key fingerprint: " + wide(key.review.fingerprint) + L"\n\nKey supplied by: " + wide(key.profile_url) +
+                    L"\n\nIdentity: " + wide(key.review.identity_status) + L"\n\nSigned official source: " + wide(key.review.official_source) +
+                    L"\n\nModel license: " + wide(key.review.license);
+                review_publisher_key(key.review.decision_id, utf8(key.review.fingerprint), utf8(key.review.publisher), content);
             }
         } catch (hresult_error const& error) { show_error(std::wstring(error.message())); }
         catch (std::exception const& error) { show_error(std::wstring(to_hstring(error.what()))); }
@@ -947,6 +992,8 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
     flare_app* app_{};
     uint32_t session_state_{};
     uint64_t trust_dialog_id_{};
+    uint64_t publisher_key_dialog_id_{};
+    ContentDialog publisher_key_dialog_{nullptr};
     uint64_t current_operation_{};
     bool closing_{}, closed_{}, can_change_model_{true};
     std::vector<DownloadView> download_views_;

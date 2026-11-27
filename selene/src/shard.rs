@@ -436,6 +436,7 @@ const UNLINK: u8 = 7;
 const CLOSE: u8 = 8;
 const EVENT: u8 = 9;
 const CLOSED: u8 = 10;
+const STORE_EMPTY: u8 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Kind {
@@ -541,6 +542,8 @@ fn name(path: &Path) -> Result<&str> {
 struct Pending {
     kind: Kind,
     results: Vec<Option<Result<u64>>>,
+    /// Rank zero's committed header (carrying packed v4 metadata when compressed).
+    header: Option<Box<Header>>,
     /// A store's record file, removed from the ranks that wrote it when another rank failed.
     path: Option<PathBuf>,
     /// The store a cleanup unlink belongs to, with the failure it reports.
@@ -601,6 +604,7 @@ impl Sharded {
             Pending {
                 kind,
                 results,
+                header: None,
                 path,
                 cleanup: None,
                 started: Instant::now(),
@@ -608,13 +612,23 @@ impl Sharded {
         );
     }
 
-    fn record(&mut self, kind: Kind, id: JobId, rank: usize, result: Result<u64>) {
+    fn record_with_header(
+        &mut self,
+        kind: Kind,
+        id: JobId,
+        rank: usize,
+        result: Result<u64>,
+        header: Option<Box<Header>>,
+    ) {
         if self.poison.is_some() {
             return;
         }
         let Some(pending) = self.pending.get_mut(&(kind, id)) else {
             return;
         };
+        if rank == 0 && header.is_some() {
+            pending.header = header;
+        }
         if pending.results[rank].is_none() {
             pending.results[rank] = Some(result);
         }
@@ -624,18 +638,21 @@ impl Sharded {
         }
     }
 
+    fn record(&mut self, kind: Kind, id: JobId, rank: usize, result: Result<u64>) {
+        self.record_with_header(kind, id, rank, result, None);
+    }
+
     fn finish(&mut self, id: JobId, pending: Pending) {
         let failure = pending
             .results
             .iter()
             .enumerate()
-            .find_map(|(rank, result)| match result {
-                Some(Err(error)) => Some(Error::caused_by(
-                    format!("rank {rank}: {error}"),
-                    error.clone(),
-                )),
+            .filter_map(|(rank, result)| match result {
+                Some(Err(error)) => Some((rank, error)),
                 _ => None,
-            });
+            })
+            .min_by_key(|(_, error)| !error.is_record_read())
+            .map(|(rank, error)| Error::caused_by(format!("rank {rank}: {error}"), error.clone()));
         if let Some((store, error)) = pending.cleanup {
             // Preserve cleanup failures alongside the write failure.
             let leftover =
@@ -657,7 +674,15 @@ impl Sharded {
         }
         let Some(error) = failure else {
             let result = pending.results[0].as_ref().map_or(Ok(0), copy);
-            self.events.push(pending.kind.event(id, result));
+            let event = match pending.kind {
+                Kind::Stored => TransportEvent::Stored {
+                    id,
+                    result,
+                    header: pending.header,
+                },
+                kind => kind.event(id, result),
+            };
+            self.events.push(event);
             return;
         };
         let wrote: Vec<usize> = pending
@@ -701,6 +726,7 @@ impl Sharded {
         let pending = Pending {
             kind: Kind::Unlinked,
             results,
+            header: None,
             path: None,
             cleanup: Some((store, error)),
             started: Instant::now(),
@@ -717,7 +743,11 @@ impl Sharded {
         let _ = self.local.poll(&mut events);
         for event in events {
             let (kind, id, result) = Kind::of(&event);
-            self.record(kind, id, 0, result);
+            let header = match event {
+                TransportEvent::Stored { header, .. } => header,
+                _ => None,
+            };
+            self.record_with_header(kind, id, 0, result, header);
         }
     }
 
@@ -795,9 +825,16 @@ fn encode_event(kind: Kind, id: JobId, result: &Result<u64>) -> Vec<u8> {
     writer.u8(kind.code()).u64(id.0);
     match result {
         Ok(value) => writer.u8(1).u64(*value),
-        Err(error) => writer
-            .u8(if error.no_space() { 2 } else { 0 })
-            .text(&error.to_string()),
+        Err(error) => {
+            let code = if error.is_record_read() {
+                3
+            } else if error.no_space() {
+                2
+            } else {
+                0
+            };
+            writer.u8(code).text(&error.to_string())
+        }
     };
     writer.finish()
 }
@@ -813,6 +850,7 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
             reader.text()?.to_owned(),
             std::io::Error::from(ErrorKind::StorageFull),
         )),
+        3 => Err(invalid(reader.text()?.to_owned()).with_record_read()),
         _ => return Err(invalid("invalid prefix record event result")),
     };
     reader.end()?;
@@ -822,6 +860,34 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
 impl DiskTransport for Sharded {
     fn staged(&self) -> Option<&Staged> {
         Some(&self.local)
+    }
+
+    fn codec_receive_profiles(&self) -> Vec<[u8; 32]> {
+        self.local.codec_receive_profiles()
+    }
+
+    fn decode_counters(&self) -> Option<crate::codec_copy::DecodeCounters> {
+        self.local.decode_counters()
+    }
+
+    fn store_empty(
+        &mut self,
+        id: JobId,
+        header: Header,
+        temporary: PathBuf,
+        path: PathBuf,
+    ) -> Result<()> {
+        self.accept()?;
+        let mut writer = Writer::new(STORE_EMPTY);
+        writer
+            .u64(id.0)
+            .header(&header)?
+            .text(name(&temporary)?)
+            .text(name(&path)?);
+        self.local
+            .store_empty(id, header, temporary, path.clone())?;
+        self.begin(Kind::Stored, id, Some(path), &writer.finish());
+        Ok(())
     }
 
     fn store(
@@ -881,9 +947,10 @@ impl DiskTransport for Sharded {
         }
         writer.u32(plan.len() as u32);
         for segment in &plan {
+            let logical = logical_header(&segment.header)?;
             writer
                 .text(name(&segment.path)?)
-                .header(&segment.header)?
+                .header(&logical)?
                 .u32(segment.first_page)
                 .u32(segment.pages)
                 .u8(segment.row as u8);
@@ -1038,10 +1105,15 @@ impl Peer {
     fn dispatch(&mut self, tag: u8, payload: &[u8]) -> Result<Option<(Kind, JobId, Error)>> {
         let mut reader = Reader(payload);
         let id = JobId(reader.u64()?);
-        if tag == STORE {
+        if tag == STORE || tag == STORE_EMPTY {
             let header = self.own(reader.header()?)?;
             let temporary = file(&self.directory, reader.text()?)?;
             let path = file(&self.directory, reader.text()?)?;
+            if tag == STORE_EMPTY {
+                reader.end()?;
+                let result = self.staged.store_empty(id, header, temporary, path);
+                return Ok(result.err().map(|error| (Kind::Stored, id, error)));
+            }
             let slot = StateSlotId(reader.u32()?);
             let count = reader.count(4)?;
             let pages = (0..count)
@@ -1063,7 +1135,26 @@ impl Peer {
             let mut plan = Vec::with_capacity(segments);
             for _ in 0..segments {
                 let path = file(&self.directory, reader.text()?)?;
-                let header = self.own(reader.header()?)?;
+                let logical = self.own(reader.header()?)?;
+                let header = match std::fs::File::open(&path)
+                    .ok()
+                    .and_then(|mut file| Header::read_metadata(&mut file).ok())
+                    .and_then(|metadata| Header::decode(&metadata).ok())
+                {
+                    Some(local) if local.packed.is_some() => {
+                        if local.fingerprint != self.fingerprint
+                            || !local.matches(&self.geometry)
+                            || shape(&local)? != shape(&logical)?
+                        {
+                            return Err(invalid(format!(
+                                "packed record {} does not match rank zero's layout",
+                                record::file_name(&logical.key)
+                            )));
+                        }
+                        local
+                    }
+                    _ => logical,
+                };
                 plan.push(FetchSegment {
                     path,
                     header,
@@ -1087,8 +1178,14 @@ impl Peer {
         }
         if tag == TRUNCATE {
             let path = file(&self.directory, reader.text()?)?;
-            let length = reader.u64()?;
+            let mut length = reader.u64()?;
             reader.end()?;
+            if let Ok(mut file) = std::fs::File::open(&path)
+                && let Ok(metadata) = Header::read_metadata(&mut file)
+                && let Ok(local) = Header::decode(&metadata)
+            {
+                length = local.row_segment;
+            }
             let result = self.staged.truncate(id, path, length);
             return Ok(result.err().map(|error| (Kind::Truncated, id, error)));
         }
@@ -1195,9 +1292,28 @@ pub fn summary(scanned: &[Scanned]) -> Result<Vec<u8>> {
     Ok(writer.finish())
 }
 
+/// Canonical raw header describing a record's logical layout without rank-local packed offsets.
+fn logical_header(header: &Header) -> Result<Header> {
+    if header.packed.is_none() {
+        return Ok(header.clone());
+    }
+    Ok(Header::from_sizes(
+        header.page_tokens,
+        header.ranks.clone(),
+        header.identity,
+        header.fingerprint,
+        header.key,
+        header.parent,
+        header.bucket,
+        header.tail_pages,
+        header.created,
+    )?
+    .with_capture_role(header.capture_role()))
+}
+
 /// Digest of a header without the fields that differ between ranks' files of one record.
 fn shape(header: &Header) -> Result<[u8; 16]> {
-    let mut header = header.clone();
+    let mut header = logical_header(header)?;
     header.fingerprint = [0; 16];
     header.row_checksum = 0;
     let mut hash = Blake2b::<U16>::new();

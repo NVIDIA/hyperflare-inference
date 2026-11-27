@@ -145,7 +145,7 @@ def test_failed_parallel_read_closes_and_joins_all_workers(tmp_path):
     from contextlib import closing
     from ignition.preparation.remote_weights import RemoteWeightSession
 
-    with pytest.raises(ConnectionError):
+    with pytest.raises(RuntimeError, match="checkpoint source rejected access: interrupted source range"):
         with connected(tmp_path, 4) as (client, server, start):
             adapter = RemoteWeightSession.__new__(RemoteWeightSession)
             adapter.source = client
@@ -243,7 +243,7 @@ def test_source_mutation_aborts_the_same_reader(tmp_path):
         with path.open("r+b") as stream:
             stream.seek(start)
             stream.write(b"!")
-        with pytest.raises(ConnectionError):
+        with pytest.raises(RuntimeError, match="checkpoint source changed after admission: weights.safetensors"):
             client.read("weights.safetensors", start, 1)
         server.thread.join(5)
         assert isinstance(server.error, RuntimeError)
@@ -283,10 +283,50 @@ def test_channel_rejects_tamper_and_replay():
 def test_end_marker_byte_accounting_is_authenticated(tmp_path):
     with connected(tmp_path) as (client, server, _):
         client.stats["payload_bytes"] += 1
-        with pytest.raises(ConnectionError):
+        with pytest.raises(RuntimeError, match="checkpoint source completion byte accounting differs"):
             client.finish()
         server.thread.join(5)
         assert "accounting" in str(server.error)
+
+
+def test_finish_reports_checkpoint_identity_change(tmp_path, capsys):
+    with connected(tmp_path) as (client, server, _):
+        source = server.source.snapshot / "weights.safetensors"
+        link = server.source.snapshot / "temporary-link"
+        os.link(source, link)
+        os.unlink(link)
+        with pytest.raises(RuntimeError, match="checkpoint source changed after admission"):
+            client.finish()
+        server.thread.join(5)
+        assert isinstance(server.error, RuntimeError)
+        assert capsys.readouterr().out == ("flare: checkpoint source for rank 1 failed: "
+                                           "checkpoint source changed after admission: weights.safetensors\n")
+
+
+def test_channel_delivers_authenticated_error_when_expecting_data():
+    sender, receiver = socket.socketpair()
+    try:
+        root = transport.Channel(sender, b"k" * 32, server=True)
+        peer = transport.Channel(receiver, b"k" * 32, server=False)
+        root.send("error", error="source changed")
+        with pytest.raises(RuntimeError, match="source changed"):
+            peer.receive("data")
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_channel_rejects_unauthenticated_error():
+    sender, receiver = socket.socketpair()
+    try:
+        root = transport.Channel(sender, b"x" * 32, server=True)
+        peer = transport.Channel(receiver, b"k" * 32, server=False)
+        root.send("error", error="forged")
+        with pytest.raises(ValueError, match="authentication"):
+            peer.receive("data")
+    finally:
+        sender.close()
+        receiver.close()
 
 
 @pytest.mark.parametrize("streams", [1, 4, 8])
@@ -426,6 +466,7 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
     import torch.distributed as dist
     from ignition.preparation import host_ranks, runtime_core
     from ignition.preparation.core_file import read_sources
+    from ignition.preparation.core_snapshot import ExportOptions
 
     events = []
     control_root, control_peer = socket.socketpair()
@@ -488,7 +529,8 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
                   "store": ("127.0.0.1", 1234), "exporting": False}
     source = tmp_path / "weights.bin"
     source.write_bytes(b"synthetic weights")
-    commands = iter((("checkpoint-source", None), assignment, ("export", {}), "close"))
+    commands = iter((("checkpoint-source", None), assignment,
+                     ("export", {}, ExportOptions(tmp_path)), "close"))
     def export(*args, **kwargs):
         from ignition.preparation.core_file import write_sources
         from ignition.preparation.runtime_core_pb2 import ModelIndex, BundleIndex, Span

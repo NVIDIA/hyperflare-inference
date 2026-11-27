@@ -23,8 +23,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const MAX_HEADER: usize = 64 << 10;
-const MAX_INDEX: usize = 128 << 20;
+pub const MAX_LEGACY_HEADER: u64 = 64 << 10;
+pub const MAX_LEGACY_INDEX: u64 = 128 << 20;
+pub const MAX_LEGACY_PAYLOAD: u64 = (64u64 << 30) - 4096;
 const MAX_RECORD: usize = 1 << 20;
 
 #[derive(Deserialize)]
@@ -34,21 +35,160 @@ struct Header {
     format: Format,
     #[serde(rename = "flare.payload")]
     payload: ByteTensor,
-    #[serde(rename = "flare.metadata")]
-    index: ByteTensor,
+    #[serde(rename = "flare.metadata", default)]
+    index: Option<ByteTensor>,
     #[serde(rename = "flare.layout", default)]
     layout: Option<ByteTensor>,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Layout {
-    version: u32,
-    files: BTreeMap<String, Vec<(u64, String)>>,
+/// Validated safetensors header for legacy (`flare`, `flare-staging`, `flare-snapshot`, `flare-data`) containers.
+pub struct LegacyHeader {
+    pub format: String,
+    pub data_start: u64,
+    pub payload_length: u64,
+    pub index_length: Option<u64>,
+    pub layout_span: Option<(u64, u64)>,
+    pub raw_header: Vec<u8>,
 }
 
-impl Layout {
-    fn validate(&self) -> Result<()> {
+/// Read and validate a legacy safetensors container header against file size, alignment,
+/// zero-byte hygiene, and contiguous U8 tensor layout.
+pub fn read_legacy_header(file: &File) -> Result<LegacyHeader> {
+    let info = file.metadata().map_err(|e| e.to_string())?;
+    if !info.is_file() {
+        return Err(invalid("core file must be a regular file"));
+    }
+    let mut prefix = [0u8; 8];
+    file.read_exact_at(&mut prefix, 0)
+        .map_err(|e| e.to_string())?;
+    let header_size = u64::from_le_bytes(prefix);
+    let data_start = header_size
+        .checked_add(8)
+        .ok_or_else(|| invalid("invalid safetensors header size"))?;
+    if header_size == 0 || header_size > MAX_LEGACY_HEADER {
+        return Err(invalid("invalid safetensors header size"));
+    }
+    if data_start % 4096 != 0 {
+        return Err(invalid("invalid or unaligned safetensors header"));
+    }
+    let mut raw_header = vec![0u8; header_size as usize];
+    file.read_exact_at(&mut raw_header, 8)
+        .map_err(|e| e.to_string())?;
+    if raw_header[0] != b'{' || raw_header.contains(&0) {
+        return Err(invalid("invalid safetensors header"));
+    }
+    let header: Header = serde_json::from_slice(&raw_header)
+        .map_err(|e| invalid(format!("invalid safetensors header: {e}")))?;
+    let payload_length = header.payload.size()?;
+    if header.payload.data_offsets[0] != 0 {
+        return Err(invalid(
+            "core tensors must cover the data buffer without gaps or overlap",
+        ));
+    }
+    let mut end = payload_length;
+    let mut index_length = None;
+    let mut layout_span = None;
+    match header.format.format.as_str() {
+        "flare-data" => {
+            if header.index.is_some() || header.layout.is_some() {
+                return Err(invalid("unexpected companion metadata"));
+            }
+        }
+        "flare" | "flare-staging" | "flare-snapshot" => {
+            let index = header
+                .index
+                .ok_or_else(|| invalid("missing model metadata"))?;
+            let size = index.size()?;
+            if size == 0 || size > MAX_LEGACY_INDEX {
+                return Err(invalid("invalid model index size"));
+            }
+            if index.data_offsets[0] != payload_length {
+                return Err(invalid(
+                    "core tensors must cover the data buffer without gaps or overlap",
+                ));
+            }
+            index_length = Some(size);
+            end = index.data_offsets[1];
+            if header.format.format == "flare-snapshot" {
+                let tensor = header
+                    .layout
+                    .ok_or_else(|| invalid("snapshot lacks storage layout"))?;
+                let count = tensor.size()?;
+                if payload_length != 0
+                    || tensor.data_offsets[0] != end
+                    || count == 0
+                    || count > MAX_LEGACY_INDEX
+                {
+                    return Err(invalid("invalid snapshot layout tensor"));
+                }
+                layout_span = Some((tensor.data_offsets[0], count));
+                end = tensor.data_offsets[1];
+            } else if header.layout.is_some() {
+                return Err(invalid("unexpected snapshot layout"));
+            }
+        }
+        _ => return Err(invalid("not a Flare safetensors core")),
+    }
+    if info.len().checked_sub(data_start) != Some(end) {
+        return Err(invalid(
+            "safetensors data length differs from model core",
+        ));
+    }
+    Ok(LegacyHeader {
+        format: header.format.format,
+        data_start,
+        payload_length,
+        index_length,
+        layout_span,
+        raw_header,
+    })
+}
+
+pub fn is_snapshot_blob_name(name: &str) -> bool {
+    name.len() == 76
+        && name.ends_with(".safetensors")
+        && name.as_bytes()[..64]
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+}
+
+fn unique_files<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, Vec<(u64, String)>>, D::Error> {
+    struct Unique;
+    impl<'de> serde::de::Visitor<'de> for Unique {
+        type Value = BTreeMap<String, Vec<(u64, String)>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("unique logical core files")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut result = BTreeMap::new();
+            while let Some((name, parts)) = map.next_entry::<String, Vec<(u64, String)>>()? {
+                if result.insert(name, parts).is_some() {
+                    return Err(serde::de::Error::custom("duplicate logical core file"));
+                }
+            }
+            Ok(result)
+        }
+    }
+    deserializer.deserialize_map(Unique)
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyLayout {
+    pub version: u32,
+    #[serde(deserialize_with = "unique_files")]
+    pub files: BTreeMap<String, Vec<(u64, String)>>,
+}
+
+type Layout = LegacyLayout;
+
+impl LegacyLayout {
+    pub fn validate(&self) -> Result<()> {
         if self.version != 1 || !self.files.contains_key("") || self.files.len() > 100 {
             return Err(invalid("invalid snapshot layout"));
         }
@@ -62,14 +202,9 @@ impl Layout {
             for (size, blob) in parts {
                 count += 1;
                 if *size == 0
-                    || *size > (64u64 << 30) - 4096
+                    || *size > MAX_LEGACY_PAYLOAD
                     || count > 65536
-                    || (!blob.is_empty()
-                        && (blob.len() != 76
-                            || !blob.ends_with(".safetensors")
-                            || !blob.as_bytes()[..64]
-                                .iter()
-                                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))))
+                    || (!blob.is_empty() && !is_snapshot_blob_name(blob))
                 {
                     return Err(invalid("invalid snapshot blob"));
                 }
@@ -86,6 +221,18 @@ impl Layout {
             }
         }
         Ok(())
+    }
+
+    pub fn read_from_header(file: &File, header: &LegacyHeader) -> Result<Option<Self>> {
+        let Some((offset, count)) = header.layout_span else {
+            return Ok(None);
+        };
+        let mut bytes = vec![0u8; count as usize];
+        file.read_exact_at(&mut bytes, header.data_start + offset)
+            .map_err(|e| e.to_string())?;
+        let layout: Self = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+        layout.validate()?;
+        Ok(Some(layout))
     }
 
     fn segments(&self, span: &wire::Span) -> Result<Vec<(Option<String>, u64, u64)>> {
@@ -115,43 +262,6 @@ impl Layout {
             return Err(invalid("resource exceeds logical payload"));
         }
         Ok(result)
-    }
-
-    fn read(file: &File) -> Result<Option<Self>> {
-        let mut prefix = [0; 8];
-        file.read_exact_at(&mut prefix, 0)
-            .map_err(|e| e.to_string())?;
-        let size = u64::from_le_bytes(prefix);
-        if size == 0 || size > MAX_HEADER as u64 {
-            return Err(invalid("invalid core header"));
-        }
-        let mut bytes = vec![0; size as usize];
-        file.read_exact_at(&mut bytes, 8)
-            .map_err(|e| e.to_string())?;
-        let header: Header = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
-        if header.format.format != "flare-snapshot" {
-            if header.layout.is_some() {
-                return Err(invalid("unexpected snapshot layout"));
-            }
-            return Ok(None);
-        }
-        let tensor = header
-            .layout
-            .ok_or_else(|| invalid("snapshot lacks storage layout"))?;
-        let count = tensor.size()?;
-        if header.payload.size()? != 0
-            || tensor.data_offsets[0] != header.index.data_offsets[1]
-            || count == 0
-            || count > MAX_INDEX as u64
-        {
-            return Err(invalid("invalid snapshot layout tensor"));
-        }
-        let mut bytes = vec![0; count as usize];
-        file.read_exact_at(&mut bytes, size + 8 + tensor.data_offsets[0])
-            .map_err(|e| e.to_string())?;
-        let layout: Self = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
-        layout.validate()?;
-        Ok(Some(layout))
     }
 }
 
@@ -202,7 +312,7 @@ fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     merged
 }
 
-pub(super) fn validate_filename(name: &str) -> Result<()> {
+pub fn validate_companion_filename(name: &str) -> Result<()> {
     let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
     if name.len() > 255
         || !name.ends_with(".safetensors")
@@ -222,6 +332,10 @@ pub(super) fn validate_filename(name: &str) -> Result<()> {
         return Err(invalid("invalid core companion filename"));
     }
     Ok(())
+}
+
+pub(super) fn validate_filename(name: &str) -> Result<()> {
+    validate_companion_filename(name)
 }
 
 pub(super) struct PayloadFile {
@@ -259,41 +373,15 @@ impl PayloadFile {
         Ok(cached.as_ref().unwrap().clone())
     }
     fn companion(file: File) -> Result<Self> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct DataHeader {
-            #[serde(rename = "__metadata__")]
-            format: Format,
-            #[serde(rename = "flare.payload")]
-            payload: ByteTensor,
-        }
-        let info = file.metadata().map_err(|e| e.to_string())?;
-        if !info.is_file() {
-            return Err(invalid("core companion must be a regular file"));
-        }
-        let mut prefix = [0; 8];
-        file.read_exact_at(&mut prefix, 0)
-            .map_err(|e| e.to_string())?;
-        let size = u64::from_le_bytes(prefix);
-        if size == 0 || size > MAX_HEADER as u64 || (size + 8) % 4096 != 0 {
-            return Err(invalid("invalid companion header size"));
-        }
-        let mut bytes = vec![0; size as usize];
-        file.read_exact_at(&mut bytes, 8)
-            .map_err(|e| e.to_string())?;
-        if bytes[0] != b'{' {
-            return Err(invalid("invalid companion header"));
-        }
-        let header: DataHeader =
-            serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
-        let length = header.payload.size()?;
-        if header.format.format != "flare-data"
-            || header.payload.data_offsets[0] != 0
-            || info.len().checked_sub(size + 8) != Some(length)
-        {
+        let header = read_legacy_header(&file)?;
+        if header.format != "flare-data" {
             return Err(invalid("invalid companion payload length or format"));
         }
-        Ok(PayloadFile::new(Arc::new(file), size + 8, length))
+        Ok(PayloadFile::new(
+            Arc::new(file),
+            header.data_start,
+            header.payload_length,
+        ))
     }
 }
 
@@ -320,8 +408,8 @@ pub fn core_companions(path: &Path) -> Result<Vec<String>> {
             .collect();
         return Ok(names.into_iter().collect());
     }
-    let (file, _, _, bytes) = Archive::envelope(path)?;
-    if let Some(layout) = Layout::read(&file)? {
+    let (_, _, _, bytes, layout) = Archive::envelope(path)?;
+    if let Some(layout) = layout {
         return Ok(layout
             .files
             .values()
@@ -410,9 +498,9 @@ impl Archive {
         self.envelope_digest
     }
 
-    /// Open the file and read its signed envelope: the file, the payload start and size, and the
-    /// envelope bytes, none of them verified yet.
-    pub(super) fn envelope(path: &Path) -> Result<(File, u64, u64, Vec<u8>)> {
+    /// Open the file and read its signed envelope: the file, the payload start and size, the
+    /// envelope bytes, and any snapshot layout, none of them verified yet.
+    pub(super) fn envelope(path: &Path) -> Result<(File, u64, u64, Vec<u8>, Option<Layout>)> {
         let primary_path = path.is_dir().then(|| path.join("model.safetensors"));
         let path = primary_path.as_deref().unwrap_or(path);
         #[cfg(unix)]
@@ -426,51 +514,21 @@ impl Archive {
                 .open(path)
                 .map_err(|e| e.to_string())?
         };
-        let mut prefix = [0u8; 8];
-        file.read_exact_at(&mut prefix, 0)
-            .map_err(|e| e.to_string())?;
-        let header_size = u64::from_le_bytes(prefix);
-        if header_size == 0 || header_size > MAX_HEADER as u64 {
-            return Err(invalid("invalid safetensors header size"));
-        }
-        let start = 8 + header_size;
-        let mut header = vec![0; header_size as usize];
-        file.read_exact_at(&mut header, 8)
-            .map_err(|e| e.to_string())?;
-        if header[0] != b'{' || start % 4096 != 0 {
-            return Err(invalid("invalid or unaligned safetensors header"));
-        }
-        let header: Header = serde_json::from_slice(&header)
-            .map_err(|e| invalid(format!("invalid safetensors header: {e}")))?;
-        if !matches!(header.format.format.as_str(), "flare" | "flare-snapshot") {
+        let header = read_legacy_header(&file)?;
+        if !matches!(header.format.as_str(), "flare" | "flare-snapshot") {
             return Err(invalid("not a Flare safetensors core"));
         }
-        let payload = header.payload.size()?;
-        let size = header.index.size()?;
-        if size == 0 || size > MAX_INDEX as u64 {
-            return Err(invalid("invalid model index size"));
-        }
-        if header.payload.data_offsets[0] != 0 || header.index.data_offsets[0] != payload {
-            return Err(invalid(
-                "core tensors must cover the data buffer without gaps or overlap",
-            ));
-        }
-        let length = file.metadata().map_err(|e| e.to_string())?.len();
-        let end = header
-            .layout
-            .as_ref()
-            .map_or(header.index.data_offsets[1], |l| l.data_offsets[1]);
-        if length.checked_sub(start) != Some(end) {
-            return Err(invalid(
-                "safetensors data length differs from model core",
-            ));
-        }
+        let size = header
+            .index_length
+            .ok_or_else(|| invalid("missing model metadata"))?;
         let mut bytes = vec![0; size as usize];
-        file.read_exact_at(&mut bytes, start + payload)
+        file.read_exact_at(&mut bytes, header.data_start + header.payload_length)
             .map_err(|e| e.to_string())?;
-        let logical_payload =
-            Layout::read(&file)?.map_or(payload, |l| l.files[""].iter().map(|p| p.0).sum());
-        Ok((file, start, logical_payload, bytes))
+        let layout = Layout::read_from_header(&file, &header)?;
+        let logical_payload = layout
+            .as_ref()
+            .map_or(header.payload_length, |l| l.files[""].iter().map(|p| p.0).sum());
+        Ok((file, header.data_start, logical_payload, bytes, layout))
     }
     pub fn open(
         path: &Path,
@@ -512,12 +570,11 @@ impl Archive {
         };
         #[cfg(windows)]
         let primary = path.to_owned();
-        let (file, start, payload, bytes) = Self::envelope(&primary)?;
+        let (file, start, payload, bytes, layout) = Self::envelope(&primary)?;
         let envelope_digest: [u8; 32] = super::protection::sha256(&bytes)
             .try_into()
             .map_err(|_| invalid("signed envelope digest has the wrong length"))?;
         let (protection, index) = Protection::verify(&bytes, publishers, payload, rank)?;
-        let layout = Layout::read(&file)?;
         let file = Arc::new(file);
         let mut files = BTreeMap::new();
         files.insert(
@@ -930,7 +987,7 @@ mod tests {
     fn header_and_index_lengths_are_bounded_before_reading() {
         let path =
             std::env::temp_dir().join(format!("flare-header-{}.safetensors", std::process::id()));
-        for size in [0, MAX_HEADER as u64 + 1, u64::MAX] {
+        for size in [0u64, MAX_LEGACY_HEADER + 1, u64::MAX] {
             std::fs::write(&path, size.to_le_bytes()).unwrap();
             assert!(
                 Archive::open(&path, &[], None)
@@ -943,7 +1000,7 @@ mod tests {
         let header = serde_json::json!({
             "__metadata__": {"format": "flare"},
             "flare.payload": {"dtype": "U8", "shape": [0], "data_offsets": [0,0]},
-            "flare.metadata": {"dtype": "U8", "shape": [MAX_INDEX + 1], "data_offsets": [0,MAX_INDEX + 1]},
+            "flare.metadata": {"dtype": "U8", "shape": [MAX_LEGACY_INDEX + 1], "data_offsets": [0,MAX_LEGACY_INDEX + 1]},
         });
         let mut bytes = serde_json::to_vec(&header).unwrap();
         bytes.resize(4088, b' ');
@@ -959,6 +1016,33 @@ mod tests {
                 .contains("index size")
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_layout_rejects_duplicate_logical_files() {
+        let json = r#"{"version":1,"files":{"":[[4,""]],"":[[8,""]]}}"#;
+        assert!(serde_json::from_str::<LegacyLayout>(json).is_err());
+    }
+
+    #[test]
+    fn legacy_header_rejects_zero_bytes_in_header_padding() {
+        let path = std::env::temp_dir().join(format!(
+            "flare-header-nul-{}.safetensors",
+            std::process::id()
+        ));
+        let raw = r#"{"__metadata__":{"format":"flare-data"},"flare.payload":{"dtype":"U8","shape":[0],"data_offsets":[0,0]}}"#;
+        let header_size = 4096 - 8;
+        let mut buf = Vec::with_capacity(4096);
+        buf.extend_from_slice(&(header_size as u64).to_le_bytes());
+        buf.extend_from_slice(raw.as_bytes());
+        buf.resize(4096, 0);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&buf).unwrap();
+        drop(file);
+
+        let reopened = File::open(&path).unwrap();
+        assert!(read_legacy_header(&reopened).is_err());
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1029,6 +1113,13 @@ impl super::payload::Files for Archive {
     }
     fn direct_files(&self) -> Box<dyn Iterator<Item = Result<Arc<File>>> + '_> {
         Box::new(self.files.values().map(|file| file.direct()))
+    }
+    fn direct_file(&self, index: usize) -> Result<Arc<File>> {
+        self.files
+            .values()
+            .nth(index)
+            .ok_or_else(|| invalid("payload container index out of range"))?
+            .direct()
     }
     fn retained_files(&self) -> Result<Vec<Arc<File>>> {
         self.files

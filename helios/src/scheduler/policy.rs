@@ -104,6 +104,7 @@ impl Candidate {
 }
 
 impl RequestScheduler {
+    #[cfg(test)]
     pub(super) fn dominates_padding(&self, smaller: Candidate, larger: Candidate) -> bool {
         self.dominates_padding_with(&smaller, &larger,
             || self.candidate_round_lengths(&smaller), || self.candidate_round_lengths(&larger))
@@ -144,7 +145,7 @@ impl RequestScheduler {
                 && short.iter().sum::<usize>() > smaller.packed_token_capacity { return false; }
             return short == long;
         }
-        if smaller.kind == GraphKind::Prefill {
+        if smaller.kind.is_prefill() {
             return smaller.work == larger.work;
         }
         if smaller.capacity == larger.capacity && smaller.prefill_capacity == larger.prefill_capacity {
@@ -323,12 +324,20 @@ impl RequestScheduler {
     }
 
     fn prefill_catalog(&self, kind: GraphKind) -> &[usize] {
-        if kind == GraphKind::ScoredPrefill { &self.scored_prefill_catalog } else { &self.prefill_catalog }
+        match kind {
+            GraphKind::ScoredPrefill => &self.scored_prefill_catalog,
+            GraphKind::TerminalPrefill => &self.terminal_prefill_catalog,
+            _ => &self.prefill_catalog,
+        }
     }
 
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
+        self.prefill_work_through(request, capacity, self.estimated_checkpoint_cut(request))
+    }
+
+    pub(super) fn prefill_work_through(&self, request: &LiveRequest, capacity: usize, cut: Option<usize>) -> usize {
         let start = request.consumed_tokens as usize;
-        let mut end = self.checkpoint_cut(request)
+        let mut end = cut
             .unwrap_or(request.prompt_tokens)
             .min(start.saturating_add(capacity))
             .min(request.prefill_limit());
@@ -340,6 +349,37 @@ impl RequestScheduler {
             end = span.start;
         }
         end.saturating_sub(start)
+    }
+
+    /// Smallest registered catalog capacity that achieves the maximum single-step
+    /// prefill work through `cut`, respecting atomic spans and terminal completion.
+    /// Unmeasured pure prefill graphs only participate in cold discovery at this
+    /// capacity so smaller unmeasured shapes do not preempt larger fitting graphs.
+    fn natural_fit_prefill_capacity(
+        &self,
+        request: &LiveRequest,
+        catalog: &[usize],
+        cut: Option<usize>,
+    ) -> Option<usize> {
+        let terminal_only = self.prefill_requires_terminal_completion(request, cut);
+        let mut best: Option<(usize, usize)> = None;
+        for &capacity in catalog {
+            let work = self.prefill_work_through(request, capacity, cut);
+            if work == 0 {
+                continue;
+            }
+            let resolved = self.resolve_prefill_kind(request, capacity, work, cut);
+            if terminal_only && resolved == GraphKind::Prefill {
+                continue;
+            }
+            if self.costs.duration(resolved, 1, capacity).is_none() {
+                continue;
+            }
+            if best.is_none_or(|(_, best_work)| work > best_work) {
+                best = Some((capacity, work));
+            }
+        }
+        best.map(|(capacity, _)| capacity)
     }
 
     pub fn submission_window_available(&self, duration_ns: u64) -> bool {
@@ -413,10 +453,17 @@ impl RequestScheduler {
             }
             let service = self.projected_service(r);
             if let Some(rate) = tokens {
-                token_log[slot] = service
+                let mut price = service
                     .tokens
-                    .unwrap_or_else(|| ServicePrice::initial(rate / count as f64))
-                    .log_price(self.policy.token_fairness);
+                    .unwrap_or_else(|| ServicePrice::initial(rate / count as f64));
+                if let Some(previous) = service.prefill_rate {
+                    if r.consumed_tokens < r.prompt_tokens as u64 {
+                        price.rebase(previous, rate);
+                    } else {
+                        price.rebase_upward(previous, rate);
+                    }
+                }
+                token_log[slot] = price.log_price(self.policy.token_fairness);
             }
             if let Some(reference) = references[slot].filter(|_| deliveries.is_some()) {
                 delivery_log[slot] = service
@@ -458,13 +505,27 @@ impl RequestScheduler {
             }
         };
         if r.consumed_tokens < r.prompt_tokens as u64 {
-            let kind = r.prefill_kind();
-            for &capacity in self.prefill_catalog(kind) {
-                let work = self.prefill_work(r, capacity);
+            let catalog = self.prefill_catalog(r.prefill_kind());
+            let cut = self.estimated_checkpoint_cut(r);
+            let terminal_only = self.prefill_requires_terminal_completion(r, cut);
+            let mut natural_fit = None;
+            for &capacity in catalog {
+                let work = self.prefill_work_through(r, capacity, cut);
                 if work == 0 {
                     continue;
                 }
+                let kind = self.resolve_prefill_kind(r, capacity, work, cut);
+                if terminal_only && kind == GraphKind::Prefill {
+                    continue;
+                }
                 if let Some(ns) = self.costs.duration(kind, 1, capacity) {
+                    if ns == 0
+                        && *natural_fit
+                            .get_or_insert_with(|| self.natural_fit_prefill_capacity(r, catalog, cut))
+                            != Some(capacity)
+                    {
+                        continue;
+                    }
                     consider(
                         ns,
                         value.prefill(
@@ -508,7 +569,10 @@ impl RequestScheduler {
             else {
                 continue;
             };
-            if r.consumed_tokens < r.prompt_tokens as u64 {
+            if r.consumed_tokens < r.prompt_tokens as u64
+                && !r.prompt_logprobs
+                && !r.deferred_prefill
+            {
                 let work = self.prefill_work(r, prefill);
                 if work > 0 {
                     consider(
@@ -643,8 +707,11 @@ impl RequestScheduler {
         let mut best: Option<(u64, ValueRate)> = None;
         let mut consider = |following, batch, width, prefill| {
             let ns = if following == GraphKind::Speculative {
-                self.costs.duration(GraphKind::Speculative, batch, width).into_iter().chain(self.costs.packed_round_duration(batch, width)).min()
-            } else { self.costs.shape_duration(following, batch, width, prefill) };
+                // The full B x W graph is already included in the packed round aggregate.
+                self.costs.packed_round_duration(batch, width)
+            } else {
+                self.costs.shape_duration(following, batch, width, prefill)
+            };
             let Some(ns) = ns else {
                 return;
             };
@@ -685,7 +752,9 @@ impl RequestScheduler {
                     .flatten();
                 let accepts = |k: GraphKind| {
                     if mixed {
-                        k == GraphKind::Prefill || k == decode
+                        (k == GraphKind::Prefill && !request.deferred_prefill) || k == decode
+                    } else if following == GraphKind::TerminalPrefill {
+                        k == GraphKind::Prefill
                     } else {
                         k == following
                     }
@@ -702,8 +771,25 @@ impl RequestScheduler {
                 } else {
                     width
                 };
-                if role == GraphKind::Prefill && self.prefill_work(request, extent) == 0 {
-                    continue;
+                if role.is_prefill() {
+                    let cut = self.estimated_checkpoint_cut(request);
+                    let work = self.prefill_work_through(request, extent, cut);
+                    if work == 0
+                        || (!mixed
+                            && ((matches!(following, GraphKind::Prefill | GraphKind::TerminalPrefill)
+                                && (self.resolve_prefill_kind(request, extent, work, cut)
+                                    != following
+                                    || (following == GraphKind::Prefill
+                                        && self.prefill_requires_terminal_completion(request, cut))))
+                                || (ns == 0
+                                    && self.natural_fit_prefill_capacity(
+                                        request,
+                                        self.prefill_catalog(request.prefill_kind()),
+                                        cut,
+                                    ) != Some(extent))))
+                    {
+                        continue;
+                    }
                 }
                 let offer = (
                     slot,
@@ -754,6 +840,9 @@ impl RequestScheduler {
         for &width in &self.prefill_catalog {
             consider(GraphKind::Prefill, 1, width, 0);
         }
+        for &width in &self.terminal_prefill_catalog {
+            consider(GraphKind::TerminalPrefill, 1, width, 0);
+        }
         for &width in &self.scored_prefill_catalog {
             consider(GraphKind::ScoredPrefill, 1, width, 0);
         }
@@ -799,7 +888,7 @@ impl RequestScheduler {
 
     fn lane_tokens(&self, r: &LiveRequest, kind: GraphKind, capacity: usize) -> usize {
         match kind {
-            GraphKind::Prefill | GraphKind::ScoredPrefill => self.prefill_work(r, capacity),
+            GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => self.prefill_work(r, capacity),
             GraphKind::Decode => 1,
             GraphKind::Speculative => {
                 self.speculative_tokens(r, capacity)
@@ -816,9 +905,21 @@ impl RequestScheduler {
         duration_ns: u64,
         value: LaneValue,
     ) -> f64 {
-        let tokens = self.lane_tokens(r, kind, capacity);
+        self.lane_value_for_tokens(
+            r, kind, self.lane_tokens(r, kind, capacity), duration_ns, value,
+        )
+    }
+
+    fn lane_value_for_tokens(
+        &self,
+        r: &LiveRequest,
+        kind: GraphKind,
+        tokens: usize,
+        duration_ns: u64,
+        value: LaneValue,
+    ) -> f64 {
         match kind {
-            GraphKind::Prefill | GraphKind::ScoredPrefill => value.prefill(
+            GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => value.prefill(
                 tokens,
                 r.consumed_tokens + tokens as u64 == r.prompt_tokens as u64,
             ),
@@ -849,13 +950,23 @@ impl RequestScheduler {
         for slot in bits(mask) {
             let r = self.slots[slot].request.as_ref().unwrap();
             if kind.is_prefill() {
-                let catalog = self.prefill_catalog(kind);
-                let work = self.prefill_work(r, capacity);
-                // Explore larger graphs only when they can consume additional tokens.
+                let catalog = if kind == GraphKind::ScoredPrefill {
+                    &self.scored_prefill_catalog
+                } else {
+                    &self.prefill_catalog
+                };
+                let cut = self.estimated_checkpoint_cut(r);
+                let work = self.prefill_work_through(r, capacity, cut);
+                let resolved = self.resolve_prefill_kind(r, capacity, work, cut);
+                // Restrict unmeasured pure prefill discovery to the natural-fit capacity
+                // so smaller unmeasured shapes do not preempt larger fitting graphs and
+                // larger padded shapes that consume no additional tokens are skipped.
                 if work == 0
-                    || (duration_ns == 0 && catalog.iter()
-                        .take_while(|&&smaller| smaller < capacity)
-                        .any(|&smaller| self.prefill_work(r, smaller) == work))
+                    || resolved != kind
+                    || (kind == GraphKind::Prefill
+                        && self.prefill_requires_terminal_completion(r, cut))
+                    || (duration_ns == 0
+                        && self.natural_fit_prefill_capacity(r, catalog, cut) != Some(capacity))
                 {
                     continue;
                 }
@@ -940,6 +1051,7 @@ impl RequestScheduler {
         self.packed_round_candidates(output, values, age_price, false);
         for kind in [
             GraphKind::Prefill,
+            GraphKind::TerminalPrefill,
             GraphKind::ScoredPrefill,
             GraphKind::Vision,
             GraphKind::Init,
@@ -948,6 +1060,11 @@ impl RequestScheduler {
             GraphKind::Resume,
             GraphKind::Decode,
         ] {
+            let expected = if kind == GraphKind::TerminalPrefill {
+                GraphKind::Prefill
+            } else {
+                kind
+            };
             let mask = self
                 .slots
                 .iter()
@@ -956,7 +1073,7 @@ impl RequestScheduler {
                     entry
                         .request
                         .as_ref()
-                        .filter(|r| self.eligible(r) && self.request_kind(r) == Some(kind))
+                        .filter(|r| self.eligible(r) && self.request_kind(r) == Some(expected))
                         .map(|_| 1u64 << slot)
                 })
                 .fold(0, |a, b| a | b);
@@ -1018,7 +1135,9 @@ impl RequestScheduler {
                 };
                 let kind = self.request_kind(r);
                 match kind {
-                    Some(GraphKind::Prefill) if self.prefill_work(r, prefill) > 0 => {
+                    Some(GraphKind::Prefill)
+                        if !r.deferred_prefill && self.prefill_work(r, prefill) > 0 =>
+                    {
                         if duration_ns == 0 && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
                             b == batch && w == width && smaller < prefill
                                 && self.prefill_work(r, smaller) == self.prefill_work(r, prefill)
@@ -1118,7 +1237,7 @@ impl RequestScheduler {
         };
         let ordinary = *candidates[..ordinary_count].iter().max_by(|a, b| compare(a, b))?;
         if ordinary.rate.duration_ns == 0 {
-            return self.available_plan(ordinary, log_scale, PlanOrigin::Discovery);
+            return self.available_plan(ordinary, &values, age_price, log_scale, PlanOrigin::Discovery);
         }
         if self.refresh_ready() {
             let mut targets: Vec<_> = self.costs.stale_keys().filter(|key| *key != ordinary.cost_key())
@@ -1129,7 +1248,23 @@ impl RequestScheduler {
             for (order, target) in targets {
                 if best.is_some_and(|(best_order, _, _)| best_order < order) { break; }
                 choices.clear();
-                choices.extend(candidates.iter().copied().filter(|candidate| candidate.cost_key() == target));
+                choices.extend(candidates.iter().copied().filter(|candidate| {
+                    if candidate.cost_key() != target {
+                        return false;
+                    }
+                    if candidate.kind == GraphKind::Prefill {
+                        let slot = bits(candidate.mask).next().unwrap();
+                        let request = self.slots[slot].request.as_ref().unwrap();
+                        let cut = self.checkpoint_cut(request);
+                        let work = self.prefill_work_through(request, candidate.capacity, cut);
+                        if self.resolve_prefill_kind(request, candidate.capacity, work, cut)
+                            != GraphKind::Prefill
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                }));
                 if let Some(candidate) = choices.iter().copied().max_by(compare) {
                     if best.is_none_or(|(_, _, previous)| compare(&candidate, &previous).is_gt()) {
                         best = Some((order, target, candidate));
@@ -1137,20 +1272,52 @@ impl RequestScheduler {
                 }
             }
             if let Some((_, target, candidate)) = best {
-                return self.available_plan(candidate, log_scale, PlanOrigin::RefreshStart(target));
+                return self.available_plan(candidate, &values, age_price, log_scale, PlanOrigin::RefreshStart(target));
             }
         }
         if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() {
             if let Some(candidate) = self.acceptance_probe(ordinary, &values, age_price) {
-                return self.available_plan(candidate, log_scale, PlanOrigin::AcceptanceStart);
+                return self.available_plan(candidate, &values, age_price, log_scale, PlanOrigin::AcceptanceStart);
             }
         }
-        self.available_plan(ordinary, log_scale, PlanOrigin::Ordinary)
+        self.available_plan(ordinary, &values, age_price, log_scale, PlanOrigin::Ordinary)
     }
 
-    fn available_plan(
-        &self, candidate: Candidate, log_scale: f64, origin: PlanOrigin,
+    pub(super) fn available_plan(
+        &self,
+        mut candidate: Candidate,
+        values: &[LaneValue; REQUEST_LANES],
+        age_price: f64,
+        log_scale: f64,
+        mut origin: PlanOrigin,
     ) -> Option<ScheduledPlan> {
+        if (candidate.kind.is_prefill() || candidate.prefill_slot.is_some())
+            && matches!(origin, PlanOrigin::Ordinary | PlanOrigin::Discovery)
+        {
+            let slot = candidate.prefill_slot.unwrap_or_else(|| bits(candidate.mask).next().unwrap());
+            let request = self.slots[slot].request.as_ref().unwrap();
+            let (capacity, work) = if candidate.kind == GraphKind::Mixed {
+                (candidate.prefill_capacity, self.prefill_work(request, candidate.prefill_capacity))
+            } else {
+                (candidate.capacity, candidate.work)
+            };
+            let cut = self.checkpoint_cut(request);
+            let actual_work = self.prefill_work_through(request, capacity, cut);
+            let kind_changed = candidate.kind != GraphKind::Mixed
+                && self.resolve_prefill_kind(request, capacity, actual_work, cut) != candidate.kind;
+            if actual_work != work || kind_changed {
+                if let Some(resized) =
+                    self.resize_prefill(candidate, request, cut, values, age_price)
+                {
+                    candidate = resized;
+                    origin = if candidate.duration_ns == 0 {
+                        PlanOrigin::Discovery
+                    } else {
+                        PlanOrigin::Ordinary
+                    };
+                }
+            }
+        }
         let plan = self.materialize(candidate, log_scale, origin);
         // A winning feedback operation drains the queue instead of yielding to
         // lower-value work that would keep its execution window occupied.
@@ -1161,7 +1328,59 @@ impl RequestScheduler {
         Some(plan)
     }
 
-    fn materialize(&self, candidate: Candidate, log_scale: f64, origin: PlanOrigin) -> ScheduledPlan {
+    fn resize_prefill(
+        &self,
+        mut candidate: Candidate,
+        request: &LiveRequest,
+        cut: Option<usize>,
+        values: &[LaneValue; REQUEST_LANES],
+        age_price: f64,
+    ) -> Option<Candidate> {
+        let mixed = candidate.kind == GraphKind::Mixed;
+        let (kind, capacity, prefill, work) = if mixed {
+            let catalog = self.mixed_catalog.iter()
+                .filter(|&&(batch, width, _)| batch == candidate.batch && width == candidate.capacity)
+                .map(|&(_, _, prefill)| prefill);
+            let work = self.prefill_work_through(request, catalog.clone().max()?, cut);
+            let prefill = catalog.filter(|&capacity| capacity >= work).min()?;
+            (candidate.kind, candidate.capacity, prefill, work)
+        } else {
+            let catalog = self.prefill_catalog(request.prefill_kind());
+            let work = self.prefill_work_through(request, *catalog.last()?, cut);
+            let capacity = *catalog.iter().find(|&&capacity| capacity >= work)?;
+            let kind = self.resolve_prefill_kind(request, capacity, work, cut);
+            (kind, capacity, 0, work)
+        };
+        let duration_ns = self.costs.shape_duration(kind, candidate.batch, capacity, prefill)?;
+        candidate.kind = kind;
+        candidate.capacity = capacity;
+        candidate.prefill_capacity = prefill;
+        candidate.work = work;
+        candidate.duration_ns = duration_ns;
+        let slot = request.handle.slot as usize;
+        let kind = if mixed { GraphKind::Prefill } else { candidate.kind };
+        let mut expected = self.lane_value_for_tokens(request, kind, work, duration_ns, values[slot]);
+        if mixed {
+            let decode = if self.speculative_widths.is_empty() { GraphKind::Decode } else { GraphKind::Speculative };
+            expected += bits(candidate.mask & !(1 << slot)).map(|slot| {
+                self.lane_value(self.slots[slot].request.as_ref().unwrap(), decode,
+                    candidate.capacity, duration_ns, values[slot])
+            }).sum::<f64>();
+        }
+        candidate.rate = ValueRate::new(
+            duration_ns,
+            expected,
+            age_price,
+        );
+        Some(candidate)
+    }
+
+    fn materialize(
+        &self,
+        candidate: Candidate,
+        log_scale: f64,
+        origin: PlanOrigin,
+    ) -> ScheduledPlan {
         let lengths = (candidate.packed_token_capacity != 0).then(||
             candidate.host_lengths.unwrap_or_else(||
                 self.round_lengths_optimistic(candidate.mask, candidate.batch, candidate.draft_tokens,
@@ -1184,11 +1403,13 @@ impl RequestScheduler {
                 request: r.handle,
                 start_position: r.scheduled_consumed,
                 tokens: if kind.is_prefill() {
-                    if candidate.kind == GraphKind::Mixed {
-                        self.prefill_work(r, candidate.prefill_capacity)
+                    let capacity = if candidate.kind == GraphKind::Mixed {
+                        candidate.prefill_capacity
                     } else {
-                        candidate.work
-                    }
+                        candidate.capacity
+                    };
+                    let cut = self.checkpoint_cut(r);
+                    self.prefill_work_through(r, capacity, cut)
                 } else {
                     if candidate.packed_token_capacity != 0 {
                         lengths.as_ref().unwrap()[slot]
@@ -1233,6 +1454,11 @@ impl RequestScheduler {
     ) -> ScheduledPlan {
         let _checkpoint_selections = self.checkpoint_planning_scope();
         let (values, age_price, scale) = self.lane_values(0);
+        let expected = if kind == GraphKind::TerminalPrefill {
+            GraphKind::Prefill
+        } else {
+            kind
+        };
         let mask = self
             .slots
             .iter()
@@ -1243,7 +1469,7 @@ impl RequestScheduler {
                     .as_ref()
                     .filter(|r| {
                         self.eligible(r)
-                            && self.request_kind(r) == Some(kind)
+                            && self.request_kind(r) == Some(expected)
                             && request.is_none_or(|h| h == r.handle)
                     })
                     .map(|_| 1u64 << slot)

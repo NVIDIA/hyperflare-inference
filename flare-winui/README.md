@@ -110,6 +110,22 @@ first be prepared through Ignition. A discovery tag does not establish core
 compatibility or publisher trust; the Rust application validates the core
 before serving and supplies the exact publisher identity for consent.
 
+During acquisition of a payload-format core with an unknown signing key, the
+desktop client reads `publisher.json` from the resolved repository commit.
+It checks the profile's fingerprint and namespace against the core and verifies
+the signed catalog before showing **Review publisher key**. The dialog shows
+the key fingerprint, profile source, publisher identity status, and model license.
+Type the displayed namespace to import the public profile and continue downloading,
+or cancel the download. Imported profiles persist separately from execution
+approvals in the trust file, which the CLI also reads. Profiles imported by
+desktop builds that stored them in application state remain available to the
+desktop client.
+Importing a profile enables signature verification; it does not establish publisher
+identity or accept execution. First use still requires the publisher and license
+review before loading. Invalid signatures and mismatched profiles prevent import.
+For production identities, revocation at the signed official source also prevents
+import.
+
 Discovery cards recognize downloaded cores through retained acquisition records,
 including CLI downloads, and offer Run model for that local version. The
 association does not claim that the local version is the latest Hub revision.
@@ -188,7 +204,7 @@ Reload model finishes accepted requests before releasing and loading the core.
 | Setting | Runtime behavior |
 |---|---|
 | Serving memory limit | `30G` caps occupied memory, `-8G` reserves free memory, and `0.8` selects a total-memory fraction per GPU. Blank inherits the configured/core reserve. KV pages use the remainder after model and runtime allocations. |
-| KV capacity limit | Available memory, one prepared context, or prepared context times concurrency; this does not change prepared context length. |
+| KV history capacity | One model context by default. Available memory and Context × concurrency are also selectable. The limit applies to KV history shared across requests. |
 | Maximum concurrent requests | Blank inherits model/configuration/core defaults. An override must fit prepared capacity. |
 | Listener | Localhost by default; all IPv4 interfaces (`0.0.0.0`) or a custom IP and port are selectable. Client URLs use loopback for wildcard listeners, while Settings shows the actual bind. |
 | Verify weights on load | Off by default, matching the CLI. Enabling it scans stored weight ranges before GPU loading. Publisher/executable checks and download-integrity checks remain enabled. |

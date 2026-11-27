@@ -84,6 +84,12 @@
     <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.WinUI.1.8.260803003\build\native\Microsoft.WindowsAppSDK.WinUI.targets" />
     <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\Microsoft.WindowsAppSDK.DWrite.targets" />
   </ImportGroup>
+  <!-- Cargo's library under Local App Data is excluded from native file tracking. -->
+  <Target Name="RelinkFlareBridge" BeforeTargets="Link" Inputs="$(FlareBridgeLibrary)" Outputs="$(TargetPath)">
+    <CreateProperty Value="false">
+      <Output TaskParameter="ValueSetByTask" PropertyName="Link_MinimalRebuildFromTracking" />
+    </CreateProperty>
+  </Target>
   <Target Name="MergeFlareResources" AfterTargets="Build">
     <PropertyGroup>
       <_FlareToolArchitecture Condition="'$(PROCESSOR_ARCHITECTURE)'=='ARM64'">arm64</_FlareToolArchitecture>

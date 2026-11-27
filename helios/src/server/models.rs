@@ -30,6 +30,14 @@ struct ModelCatalog {
     ollama_info: Value,
 }
 
+pub(super) fn response_name<'a>(model: &'a ModelConfig, served_names: &'a [String]) -> &'a str {
+    served_names
+        .iter()
+        .find(|name| !name.is_empty())
+        .map(String::as_str)
+        .unwrap_or(&model.model_id)
+}
+
 impl ModelCatalog {
     fn new(
         model: &ModelConfig,
@@ -41,10 +49,7 @@ impl ModelCatalog {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let id = served_names
-            .iter()
-            .find(|name| !name.is_empty())
-            .unwrap_or(&model.model_id);
+        let id = response_name(model, served_names);
         let names = std::iter::once(&model.model_id)
             .chain(served_names)
             .filter(|name| !name.is_empty())

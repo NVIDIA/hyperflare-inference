@@ -117,6 +117,13 @@ pub(super) trait Files: Sync {
     fn direct_files(
         &self,
     ) -> Box<dyn Iterator<Item = crate::Result<std::sync::Arc<std::fs::File>>> + '_>;
+    /// Direct-I/O handle for one container by `source_index`, avoiding opening unrelated files.
+    fn direct_file(&self, index: usize) -> crate::Result<std::sync::Arc<std::fs::File>> {
+        self.direct_files()
+            .nth(index)
+            .transpose()?
+            .ok_or_else(|| invalid("payload container index out of range"))
+    }
     fn validate(&self, core: &Core) -> crate::Result<()>;
     /// Streaming plaintext of one resource: decompressed for executables, direct for stored bytes.
     /// Inspection digests through this so a resource is never materialized.
@@ -131,7 +138,7 @@ pub(super) trait Files: Sync {
 const CHUNK: usize = 4 << 20;
 const MAX_RECORD: usize = 1 << 20;
 const SLOTS: usize = 4;
-const READERS: usize = 4;
+pub(super) const READERS: usize = 4;
 const BLOCK: usize = 4096;
 
 struct Staging<'a> {
@@ -245,14 +252,13 @@ pub(super) unsafe fn load<F: Files>(
             for (source, [offset, nbytes]) in allocation.sources.iter().zip(allocation.spans()) {
                 let span = files.span(core, &source.resource)?;
                 let (file, base) = files.source(span)?;
-                let file = file.direct()?;
                 let mut file_offset = base
                     .checked_add(source.offset)
                     .ok_or_else(|| invalid("allocation source offset overflow"))?;
                 for start in (0..nbytes).step_by(chunk_bytes) {
                     let nbytes = chunk_bytes.min(nbytes - start);
                     chunks.push(Chunk {
-                        file: file.clone(),
+                        file: file.file.clone(),
                         file_offset,
                         destination: owner.allocations[&allocation.name].address
                             + (offset + start) as u64,
@@ -269,12 +275,11 @@ pub(super) unsafe fn load<F: Files>(
         };
         let span = files.span(core, file)?;
         let (source, mut file_offset) = files.source(span)?;
-        let file = source.direct()?;
         for [offset, nbytes] in allocation.spans() {
             for start in (0..nbytes).step_by(chunk_bytes) {
                 let nbytes = chunk_bytes.min(nbytes - start);
                 chunks.push(Chunk {
-                    file: file.clone(),
+                    file: source.file.clone(),
                     file_offset,
                     destination: owner.allocations[&allocation.name].address
                         + (offset + start) as u64,
@@ -316,12 +321,27 @@ pub(super) unsafe fn load<F: Files>(
             thread::Builder::new()
                 .name(format!("flare-reader-{index}"))
                 .spawn_scoped(scope, move || {
+                    // Each reader thread holds at most one O_DIRECT descriptor at a time,
+                    // reopened from the already-pinned handle without pathname lookup.
+                    let mut direct: Option<(usize, File)> = None;
                     loop {
                         let Ok((slot, index)) = available.lock().unwrap().recv() else {
                             break;
                         };
                         let chunk = &chunks[index];
                         let result = (|| -> Result<()> {
+                            let key = Arc::as_ptr(&chunk.file) as usize;
+                            if !matches!(direct, Some((cached, _)) if cached == key) {
+                                direct = None;
+                                let reopened =
+                                    crate::os::direct_reopen(&chunk.file).map_err(|error| {
+                                        invalid(format!(
+                                            "open core payload for direct I/O: {error}"
+                                        ))
+                                    })?;
+                                direct = Some((key, reopened));
+                            }
+                            let file = &direct.as_ref().unwrap().1;
                             let (_, _, nbytes) = chunk.read_range();
                             // SAFETY: A slot has one reader and is returned only after
                             // its upload event completes. Host chunks are disjoint
@@ -329,7 +349,7 @@ pub(super) unsafe fn load<F: Files>(
                             let destination = unsafe {
                                 std::slice::from_raw_parts_mut(buffers[slot] as *mut u8, nbytes)
                             };
-                            let bytes = chunk.read(&chunk.file, destination).map_err(|error| {
+                            let bytes = chunk.read(file, destination).map_err(|error| {
                                 invalid(format!(
                                     "read {} at {}: {error}",
                                     path.display(),

@@ -17,6 +17,7 @@ mod glm;
 mod moonvit;
 mod orientation;
 mod conditioned;
+mod padded_grid;
 mod record;
 pub use conditioned::{ImageDescription, ImageEncoding, ImageInput, ImageSource, PreparedImageInput};
 pub(crate) mod packing;
@@ -212,7 +213,6 @@ impl ProcessedImages {
 }
 
 pub struct ImagePrompt {
-    pub text: String,
     pub token_ids: Vec<u32>,
     pub mm_token_type_ids: Vec<i32>,
     /// Text, temporal, height, and width position rows, each of length token_ids.len().
@@ -255,9 +255,20 @@ pub enum ImageSettings {
     Step {},
     Radio {},
     Glm {},
+    PaddedGrid {},
 }
 
+/// The text that stands for an image in a RADIO prompt.
+pub(crate) const RADIO_PLACEHOLDER: &str = "<image>";
+
 impl ImageSettings {
+    /// The text that positions an image when a request spells it and the chat template wrote
+    /// none, for layouts whose template lets message text place the images. It comes from the
+    /// layout because cores prepared for RADIO declare no image placeholder token ID.
+    pub fn spelled_placeholder(&self) -> Option<&'static str> {
+        matches!(self, Self::Radio {}).then_some(RADIO_PLACEHOLDER)
+    }
+
     pub fn preparation_kind(&self) -> crate::model::contract::ImagePreparationKind {
         use crate::model::contract::ImagePreparationKind;
         match self {
@@ -270,6 +281,7 @@ impl ImageSettings {
             Self::Step {} => ImagePreparationKind::Step,
             Self::Radio {} => ImagePreparationKind::Radio,
             Self::Glm {} => ImagePreparationKind::Glm,
+            Self::PaddedGrid {} => ImagePreparationKind::PaddedGrid,
         }
     }
 }
@@ -325,6 +337,7 @@ enum Profile {
     Step,
     Radio,
     Glm,
+    PaddedGrid,
 }
 
 impl ImageProcessor {
@@ -357,6 +370,7 @@ impl ImageProcessor {
             ImageSettings::Step {} => Profile::Step,
             ImageSettings::Radio {} => Profile::Radio,
             ImageSettings::Glm {} => Profile::Glm,
+            ImageSettings::PaddedGrid {} => Profile::PaddedGrid,
             ImageSettings::Mimo(settings) => Profile::MiMo(mimo::load(&settings, limits)?),
             ImageSettings::PatchMerge(settings) => Profile::PatchMerge(patch_merge::Processor::load(settings, limits)?),
             ImageSettings::Qwen(settings) => {
@@ -375,7 +389,8 @@ impl ImageProcessor {
         hash.update((image.width as u64).to_le_bytes());
         hash.update((image.height as u64).to_le_bytes());
         hash.update(&image.pixels);
-        if matches!(self.profile, Profile::Moonvit) {
+        // MoonViT resizes retained alpha and CMYK planes; the padded grid composites alpha.
+        if matches!(self.profile, Profile::Moonvit | Profile::PaddedGrid) {
             hash.update([u8::from(image.nearest_resize)]);
             for channel in [&image.alpha, &image.cmyk] {
                 hash.update([u8::from(channel.is_some())]);
@@ -393,7 +408,7 @@ impl ImageProcessor {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"flare-encoded-image-v1\0");
-        hash.update([match encoding { ImageEncoding::Png => 0, ImageEncoding::Jpeg => 1, ImageEncoding::Webp => 2 }]);
+        hash.update([match encoding { ImageEncoding::Png => 0, ImageEncoding::Jpeg => 1, ImageEncoding::Webp => 2, ImageEncoding::Gif => 3 }]);
         hash.update(self.identity_domain);
         hash.update(bytes);
         hash.finalize().into()
@@ -439,7 +454,9 @@ impl ImageProcessor {
     }
 
     /// Decodes PNG with the prepared profile’s alpha and orientation semantics.
-    /// Animated PNG and 16-bit samples are rejected.
+    /// Animated PNG is rejected. 16-bit samples follow Pillow's RGB conversion:
+    /// RGB, RGBA, and grayscale-alpha keep the high byte, grayscale clamps, and
+    /// 16-bit tRNS keys are ignored.
     pub fn decode_png(&self, bytes: &[u8]) -> Result<RgbImage> {
         if bytes.len() > self.limits.max_encoded_bytes {
             return Err(Error::frontend(FrontendError::Input(Failure::new(
@@ -459,12 +476,28 @@ impl ImageProcessor {
         })?;
         let info = reader.info();
         self.check_input_extent(info.width as usize, info.height as usize)?;
-        if info.bit_depth == png::BitDepth::Sixteen || info.animation_control.is_some() {
+        if info.animation_control.is_some() {
             return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
-                "PNG requires non-animated, at most 8-bit samples",
+                "animated PNG is not supported",
             ))));
         }
-        let retain_alpha = info.color_type != png::ColorType::Rgb;
+        let source_gray = info.color_type == png::ColorType::Grayscale;
+        // Pillow ignores 16-bit tRNS keys: convert("RGBA") is opaque, so drop the alpha that
+        // EXPAND derives from them.
+        let drop_trns_alpha = info.bit_depth == png::BitDepth::Sixteen
+            && info.trns.is_some()
+            && matches!(
+                info.color_type,
+                png::ColorType::Rgb | png::ColorType::Grayscale
+            );
+        // The padded grid composites every 8-bit PNG transparency form that Pillow reports,
+        // including RGB and grayscale tRNS keys. Pillow ignores 16-bit tRNS keys, and MoonViT
+        // ignores RGB tRNS keys.
+        let retain_alpha = match self.profile {
+            Profile::Moonvit => info.color_type != png::ColorType::Rgb,
+            Profile::PaddedGrid => true,
+            _ => false,
+        };
         let nearest =
             info.color_type == png::ColorType::Indexed || info.bit_depth == png::BitDepth::One;
         let size = reader.output_buffer_size().ok_or_else(|| {
@@ -485,7 +518,7 @@ impl ImageProcessor {
                 e,
             )))
         })?;
-        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_)) {
+        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid) {
             1
         } else {
             reader
@@ -498,17 +531,45 @@ impl ImageProcessor {
         };
         let mut rgb = Vec::with_capacity(output.width as usize * output.height as usize * 3);
         let mut alpha = Vec::new();
-        for pixel in decoded[..output.buffer_size()].chunks_exact(output.color_type.samples()) {
-            if matches!(
-                output.color_type,
-                png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
-            ) {
-                alpha.push(pixel[pixel.len() - 1]);
+        let sixteen = output.bit_depth == png::BitDepth::Sixteen;
+        let sample_bytes = if sixteen { 2 } else { 1 };
+        let clamp_gray = sixteen && source_gray;
+        let sample = |pixel: &[u8], channel: usize| -> u8 {
+            if sixteen {
+                let value = u16::from_be_bytes([pixel[channel * 2], pixel[channel * 2 + 1]]);
+                if clamp_gray {
+                    value.min(255) as u8
+                } else {
+                    pixel[channel * 2]
+                }
+            } else {
+                pixel[channel]
+            }
+        };
+        for pixel in decoded[..output.buffer_size()]
+            .chunks_exact(output.color_type.samples() * sample_bytes)
+        {
+            if !drop_trns_alpha
+                && matches!(
+                    output.color_type,
+                    png::ColorType::Rgba | png::ColorType::GrayscaleAlpha
+                )
+            {
+                let channel = output.color_type.samples() - 1;
+                alpha.push(if sixteen {
+                    pixel[channel * 2]
+                } else {
+                    pixel[channel]
+                });
             }
             match output.color_type {
-                png::ColorType::Rgb | png::ColorType::Rgba => rgb.extend_from_slice(&pixel[..3]),
+                png::ColorType::Rgb | png::ColorType::Rgba => {
+                    for channel in 0..3 {
+                        rgb.push(sample(pixel, channel));
+                    }
+                }
                 png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => {
-                    rgb.extend_from_slice(&[pixel[0]; 3])
+                    rgb.extend_from_slice(&[sample(pixel, 0); 3]);
                 }
                 png::ColorType::Indexed => {
                     return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
@@ -518,8 +579,8 @@ impl ImageProcessor {
             }
         }
         let mut image = RgbImage::new(output.width as usize, output.height as usize, rgb)?;
+        image.alpha = (retain_alpha && !alpha.is_empty()).then_some(alpha);
         if matches!(self.profile, Profile::Moonvit) {
-            image.alpha = (retain_alpha && !alpha.is_empty()).then_some(alpha);
             image.nearest_resize = nearest;
         }
         Ok(orientation::orient(image, orientation))
@@ -533,7 +594,7 @@ impl ImageProcessor {
                 "encoded image exceeds the configured byte limit",
             ))));
         }
-        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_)) {
+        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid) {
             1
         } else {
             orientation::jpeg_orientation(bytes)?
@@ -625,7 +686,7 @@ impl ImageProcessor {
                 "animated WebP is unsupported; provide a still image",
             ))));
         }
-        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_)) {
+        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid) {
             1
         } else {
             decoder
@@ -645,7 +706,7 @@ impl ImageProcessor {
         decoder.read_image(&mut decoded).map_err(error)?;
         let (rgb, alpha) = if decoder.has_alpha() {
             let rgb = decoded.chunks_exact(4).flat_map(|pixel| pixel[..3].iter().copied()).collect();
-            let alpha = matches!(self.profile, Profile::Moonvit)
+            let alpha = matches!(self.profile, Profile::Moonvit | Profile::PaddedGrid)
                 .then(|| decoded.chunks_exact(4).map(|pixel| pixel[3]).collect());
             (rgb, alpha)
         } else {
@@ -654,6 +715,120 @@ impl ImageProcessor {
         let mut image = RgbImage::new(width as usize, height as usize, rgb)?;
         image.alpha = alpha;
         Ok(orientation::orient(image, orientation))
+    }
+
+    /// Decodes the first frame of a non-animated GIF as Pillow's RGB and RGBA conversions do.
+    /// The frame sits on a canvas that covers the logical screen and the frame; pixels outside
+    /// the frame take the transparent index, or index 0 without one. GIF has no EXIF orientation.
+    pub fn decode_gif(&self, bytes: &[u8]) -> Result<RgbImage> {
+        if bytes.len() > self.limits.max_encoded_bytes {
+            return Err(Error::frontend(FrontendError::Input(Failure::new(
+                "encoded image exceeds the configured byte limit",
+            ))));
+        }
+        let error = |e| {
+            Error::frontend(FrontendError::ImageDecode(Failure::caused_by(
+                format!("invalid GIF: {e}"),
+                e,
+            )))
+        };
+        // The decoder rejects a frame without a color table; Pillow reads such a frame as gray
+        // levels. When the screen descriptor's packed byte (offset 10) lacks the global-table
+        // flag 0x80, a copy gains a 256-entry (size bits 7) identity gray table after the
+        // 13-byte header and screen descriptor.
+        let patched;
+        let bytes = if bytes.len() >= 13 && bytes[10] & 0x80 == 0 {
+            let mut with_table = bytes[..10].to_vec();
+            with_table.push(bytes[10] | 0x87);
+            with_table.extend_from_slice(&bytes[11..13]);
+            (0..=255u8).for_each(|level| with_table.extend_from_slice(&[level; 3]));
+            with_table.extend_from_slice(&bytes[13..]);
+            patched = with_table;
+            &patched[..]
+        } else {
+            bytes
+        };
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::Indexed);
+        let mut decoder = options.read_info(Cursor::new(bytes)).map_err(error)?;
+        let (screen_width, screen_height) = (usize::from(decoder.width()), usize::from(decoder.height()));
+        let global_table = decoder.global_palette().unwrap_or_default().to_vec();
+        let Some(frame) = decoder.next_frame_info().map_err(error)? else {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "invalid GIF: no image data",
+            ))));
+        };
+        let (left, top) = (usize::from(frame.left), usize::from(frame.top));
+        let (frame_width, frame_height) = (usize::from(frame.width), usize::from(frame.height));
+        let (interlaced, transparent, local_table) = (frame.interlaced, frame.transparent, frame.palette.clone());
+        // Rejects an empty frame, which the canvas extent admits. A zero-size screen is valid:
+        // the canvas then has the frame's size.
+        self.check_input_extent(frame_width, frame_height)?;
+        let (width, height) = (screen_width.max(left + frame_width), screen_height.max(top + frame_height));
+        self.check_input_extent(width, height)?;
+        // The frame is read in one `fill_buffer` call, as the crate's non-interlaced read does,
+        // which yields rows in stored order. Reading a frame in several calls can end it early
+        // (a flat 31x19 frame read 31 pixels per call stops after 496 pixels), and the crate's
+        // interlaced read takes one row per call, so interlaced rows are placed below.
+        let mut frame_indices = vec![0; frame_width * frame_height];
+        if !decoder.fill_buffer(&mut frame_indices).map_err(error)? {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "invalid GIF: image truncated",
+            ))));
+        }
+        // A readable second image makes the file animated. Pillow reads only the first frame,
+        // so a missing trailer, a damaged second image or other bytes after it are accepted.
+        if matches!(decoder.next_frame_info(), Ok(Some(_))) {
+            return Err(Error::frontend(FrontendError::ImageDecode(Failure::new(
+                "animated GIF is not supported; provide a still image",
+            ))));
+        }
+        let mut indices = vec![transparent.unwrap_or(0); width * height];
+        // An interlaced frame stores rows 0, 8, ...; 4, 12, ...; 2, 6, ...; then the odd rows.
+        let rows: Vec<usize> = if interlaced {
+            [(0, 8), (4, 8), (2, 4), (1, 2)]
+                .into_iter()
+                .flat_map(|(first, step)| (first..frame_height).step_by(step))
+                .collect()
+        } else {
+            (0..frame_height).collect()
+        };
+        for (stored, row) in rows.into_iter().enumerate() {
+            let start = (top + row) * width + left;
+            indices[start..start + frame_width]
+                .copy_from_slice(&frame_indices[stored * frame_width..(stored + 1) * frame_width]);
+        }
+        // Pillow (GifImagePlugin `_is_palette_needed` and `_seek`) reads a frame as mode P only
+        // when its color table is not the identity gray ramp; otherwise the mode is L and a
+        // pixel's level is its index. A local identity table over a global table still takes
+        // the global colors. Pillow's resize samples only mode P images with nearest neighbors.
+        let needed = |table: &[u8]| table.chunks_exact(3).enumerate().any(|(i, c)| c.iter().any(|v| usize::from(*v) != i));
+        let global = needed(&global_table).then_some(global_table);
+        let local = local_table.as_ref().map(|table| needed(table).then_some(table));
+        let is_palette = match &local {
+            Some(local) => local.is_some(),
+            None => global.is_some(),
+        };
+        let table = local.flatten().or(global.as_ref()).map(|table| table.as_slice());
+        let mut rgb = Vec::with_capacity(indices.len() * 3);
+        for index in &indices {
+            match table {
+                Some(table) => {
+                    let start = usize::from(*index) * 3;
+                    rgb.extend_from_slice(table.get(start..start + 3).unwrap_or(&[0; 3]));
+                }
+                None => rgb.extend_from_slice(&[*index; 3]),
+            }
+        }
+        let alpha = transparent
+            .filter(|_| matches!(self.profile, Profile::Moonvit | Profile::PaddedGrid))
+            .map(|transparent| {
+                indices.iter().map(|index| if *index == transparent { 0 } else { 255 }).collect()
+            });
+        let mut image = RgbImage::new(width, height, rgb)?;
+        image.alpha = alpha;
+        image.nearest_resize = is_palette && matches!(self.profile, Profile::Moonvit);
+        Ok(image)
     }
 
     pub fn geometry(&self, width: usize, height: usize) -> Result<ImageGeometry> {
@@ -667,6 +842,7 @@ impl ImageProcessor {
             Profile::Step => step::geometry(self.limits, width, height),
             Profile::Radio => radio::geometry(self.limits, width, height),
             Profile::Glm => glm::geometry(self.limits, width, height),
+            Profile::PaddedGrid => padded_grid::geometry(self.limits, width, height),
         }
     }
     pub fn resized_rgb(&self, image: &RgbImage) -> Result<(ImageGeometry, Vec<u8>)> {
@@ -680,6 +856,7 @@ impl ImageProcessor {
             Profile::Step => step::resized_rgb(self.limits, image),
             Profile::Radio => Err("RADIO resizing produces float32 pixels; use process".into()),
             Profile::Glm => glm::resized_rgb(self.limits, image),
+            Profile::PaddedGrid => Err("padded-grid preparation pads with values outside RGB8; use process".into()),
         }
     }
     pub fn process(&self, images: &[RgbImage]) -> Result<ProcessedImages> {
@@ -698,23 +875,27 @@ impl ImageProcessor {
             Profile::Step => step::process(self.limits, images),
             Profile::Radio => radio::process(self.limits, images),
             Profile::Glm => glm::process(self.limits, images),
+            Profile::PaddedGrid => padded_grid::process(self.limits, images),
         }
     }
     pub fn expand_prompt(
         &self,
         frontend: &Frontend,
-        text: &str,
+        prompt_token_ids: &[u32],
         images: &ProcessedImages,
     ) -> Result<ImagePrompt> {
         match &self.profile {
-            Profile::Qwen(profile) => profile.expand_prompt(frontend, text, images),
-            Profile::PatchMerge(profile) => profile.expand_prompt(frontend, text, images),
+            Profile::Qwen(profile) => profile.expand_prompt(frontend, prompt_token_ids, images),
+            Profile::PatchMerge(profile) => {
+                profile.expand_prompt(frontend, prompt_token_ids, images)
+            }
             Profile::DeepSeek4 | Profile::DeepseekRowMajor(_) => Err("DeepSeek image spans require its model contract".into()),
             Profile::MiMo(_) => Err("MiMo image expansion requires its model contract".into()),
             Profile::Moonvit => Err("MoonViT image expansion requires its model contract".into()),
             Profile::Step => Err("Step image expansion requires its model contract".into()),
             Profile::Radio => Err("RADIO image expansion requires its model contract".into()),
             Profile::Glm => Err("GLM image expansion requires its prepared layout".into()),
+            Profile::PaddedGrid => Err("padded-grid image expansion requires its prepared layout".into()),
         }
     }
 }
@@ -910,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn png_drops_alpha_without_blending_and_rejects_sixteen_bit_or_truncated() {
+    fn png_drops_alpha_without_blending_and_rejects_truncated() {
         let processor = processor(ImageLimits::default());
         let bytes = png(
             2,
@@ -924,16 +1105,5 @@ mod tests {
             &[5, 6, 7, 8, 9, 10]
         );
         assert!(processor.decode_png(&bytes[..bytes.len() - 12]).is_err());
-        let sixteen = png(
-            1,
-            1,
-            png::BitDepth::Sixteen,
-            png::ColorType::Grayscale,
-            &[1, 2],
-        );
-        assert!(matches!(
-            processor.decode_png(&sixteen).err().unwrap(),
-            Error::Frontend(FrontendError::ImageDecode(_))
-        ));
     }
 }

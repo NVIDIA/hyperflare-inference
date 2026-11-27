@@ -556,6 +556,7 @@ mod tests {
         };
         let options = TrustOptions {
             publisher_keys: vec![profile],
+            profiles: Vec::new(),
             hub: HubOptions {
                 offline: true,
                 ..Default::default()

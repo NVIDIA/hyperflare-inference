@@ -12,10 +12,42 @@ model never retains its GPU tensors here.
 import weakref
 
 _ENTRIES = {}
+_FINALIZERS = {}
 
 
 def _drop(key):
     _ENTRIES.pop(key, None)
+
+
+def defer_finalizer(owner, callback):
+    """Register a weak-referenced callback to run before export inspects tensor provenance."""
+    try:
+        reference = weakref.ref(owner, lambda _ref, key=id(owner): _FINALIZERS.pop(key, None))
+    except TypeError:
+        return False
+    _FINALIZERS[id(owner)] = (reference, callback)
+    return True
+
+
+def flush_finalizer(owner):
+    """Run and clear a deferred provenance finalizer for `owner`, if one is pending."""
+    entry = _FINALIZERS.pop(id(owner), None)
+    if entry is None:
+        return
+    reference, callback = entry
+    if reference() is owner:
+        callback(owner)
+
+
+def flush_finalizers():
+    """Run and clear every pending deferred provenance finalizer whose owner is still alive."""
+    for key, (reference, callback) in list(_FINALIZERS.items()):
+        owner = reference()
+        if owner is None:
+            _FINALIZERS.pop(key, None)
+        else:
+            _FINALIZERS.pop(key, None)
+            callback(owner)
 
 
 def _valid(part, axis_size):

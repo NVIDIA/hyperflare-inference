@@ -38,9 +38,8 @@ Complete(before, after, fence, rank) ==
     \E i \in 1..Len(before.queue) :
         /\ before.queue[i].fence = fence
         /\ rank \notin before.queue[i].done
-        /\ IF rank = 0 THEN TRUE
-           ELSE /\ before.queue[i].committed
-                /\ \A j \in 1..(i - 1) : rank \in before.queue[j].done
+        /\ before.queue[i].committed
+        /\ (rank = 0 \/ \A j \in 1..(i - 1) : rank \in before.queue[j].done)
         /\ after = [before EXCEPT !.queue[i].done = @ \cup {rank}]
 
 Remove(before, after) ==

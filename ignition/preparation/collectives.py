@@ -4,8 +4,10 @@
 
 """Bootstrap coordination of b12x collectives over an established Gloo group."""
 
-from contextlib import contextmanager
 import json
+import pickle
+import struct
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
@@ -32,6 +34,7 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
     the runtime is registered for export, so a native rank can rebuild the transport over it.
     `varlen_bytes` sizes each rank's contribution to variable-length gathers; zero prepares none.
     """
+    import flare_heliopause
     from b12x.comm import roce
 
     if any(type(value) is not int or value <= 0 for value in (max_tokens, pipe_tokens, hidden_size, gather_bytes)):
@@ -47,8 +50,10 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
         lambda size: core_storage.host_allocate("roce", (size,), torch.uint8).host_view)
     if type(varlen_bytes) is not int or varlen_bytes < 0 or varlen_bytes % 16:
         raise ValueError("variable-length gather capacity must be a nonnegative multiple of 16 bytes")
+    # Each host uses the GID index native serving discovers for it.
     runtime = roce.AllReduce(exchange_group=group, device=device, max_size=nbytes, max_gather_bytes=gather_bytes,
                              pipe_bytes=pipe_bytes, region_allocator=region,
+                             gid_index=flare_heliopause.roce_gid_index(),
                              ring=ring, **({"ring_open": True} if ring_open else {}),
                              **({"max_varlen_bytes": varlen_bytes} if varlen_bytes else {}))
     if core_storage is not None:
@@ -84,8 +89,7 @@ def warmup_wait(runtime, coordinator):
         runtime.spin_limit = limit
 
 
-def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
-                              collective_tuning="static"):
+def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2):
     """Allocate one b12x IPC channel for the largest hidden activation.
 
     Every rank supplies identical capacities before preparing graph variants.
@@ -97,14 +101,11 @@ def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=Non
         raise ValueError("all-reduce capacities must be positive integers")
     if element_bytes not in (2, 4):
         raise ValueError("all-reduce storage must use two- or four-byte elements")
-    if collective_tuning not in ("static", "runtime"):
-        raise ValueError("collective_tuning must be static or runtime")
     nbytes = max_tokens * hidden_size * element_bytes
     if nbytes % 16:
         raise ValueError("all-reduce capacity must occupy complete 16-byte packs")
     return AllReduce.from_exchange_group(exchange_group=group, device=device, single_channel=True,
-                                         max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc,
-                                         joint=collective_tuning == "runtime")
+                                         max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc)
 
 
 def create_all_gather_runtime(group, device, *, max_rows, columns, ipc=None):
@@ -117,6 +118,15 @@ def create_all_gather_runtime(group, device, *, max_rows, columns, ipc=None):
         raise ValueError("column gathers require positive rows and 64-column-aligned rank partitions")
     return DcpAllToAll.from_exchange_group(exchange_group=group, device=device,
         max_batch_size=max_rows, total_heads=columns // 64, head_dim=64, stream_affine=False, ipc=ipc)
+
+
+# Staging bank of one single-host variable-length gather (PreparedVarlenGather), in bytes.
+VARLEN_BANK_BYTES = 4 << 20
+
+
+def create_varlen_gather_runtime(group, device, *, ipc=None):
+    """Allocate b12x staging for PreparedVarlenGather on one host: a single row of VARLEN_BANK_BYTES."""
+    return create_all_gather_runtime(group, device, max_rows=1, columns=VARLEN_BANK_BYTES // 2, ipc=ipc)
 
 
 def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
@@ -149,52 +159,81 @@ def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc
     return DmaAllReduce(exchange_group=group, device=device, max_bytes=max_tokens * hidden_size * element_bytes, ipc=ipc)
 
 
-def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head_dim=None, ipc=None):
-    """Allocate b12x staging for all-gathering head shards and LSE-combining partial attention.
+def _blocked_operation(state, default_ranks):
+    for index in (5, 3, 4, 1):
+        value = state[index]
+        if value:
+            ranks = (getattr(value, "ranks", default_ranks) if index in (5, 3) else
+                     getattr(value[0], "ranks", default_ranks) if index == 4 else value[0][1])
+            return index, tuple(ranks)
+    return None, None
 
-    Queries may be wider than the combined values: latent attention gathers absorbed queries of
-    `query_head_dim` and combines `head_dim` outputs.
-    """
-    from b12x.comm.pcie import DcpAllToAll
 
-    world_size = dist.get_world_size(group)
-    query_head_dim = head_dim if query_head_dim is None else query_head_dim
-    if world_size < 2 or max_rows <= 0 or heads % world_size or head_dim % 8 or query_head_dim % 8:
-        raise ValueError("head exchanges require multiple equal head shards and positive capacity")
-    return DcpAllToAll.from_exchange_group(exchange_group=group, device=device, max_batch_size=max_rows,
-        total_heads=heads, head_dim=head_dim, query_head_dim=query_head_dim, stream_affine=False, ipc=ipc)
+def _rank_can_advance(states, all_ranks, rank, state):
+    operation, local_ranks = _blocked_operation(state, all_ranks)
+    if operation is None:
+        return not state[0]
+    if not local_ranks or rank not in local_ranks or any(peer not in all_ranks for peer in local_ranks):
+        return True
+    members = [peer_state for peer_state, peer_rank in zip(states, all_ranks, strict=True) if peer_rank in local_ranks]
+    if any(peer[0] for peer in members):
+        return True
+    if not all(peer[operation] for peer in members):
+        return False
+    if operation == 5:
+        return not any(peer[5] is None or getattr(peer[5], "key", None) != getattr(state[5], "key", None)
+                       or tuple(peer[5].ranks) != local_ranks for peer in members)
+    if operation == 3:
+        return not any(peer[3] is None or tuple(getattr(peer[3], "ranks", all_ranks)) != local_ranks
+                       for peer in members)
+    if operation == 4:
+        return not any({tuple(getattr(contribution, "ranks", all_ranks)) for contribution in peer[4]} != {local_ranks}
+                       for peer in members)
+    if any(tuple(ranks) != local_ranks for _, ranks in state[1]):
+        return True
+    return not any(peer[1] != state[1] for peer in members)
+
+
+def _describe_rank_state(state):
+    if state[0]:
+        return "done"
+    if state[5] is not None:
+        return (f"collective_tuning(key={getattr(state[5], 'key', None)!r}, "
+                f"step={getattr(state[5], 'step', None)!r}, ranks={getattr(state[5], 'ranks', None)!r})")
+    if state[3] is not None:
+        return f"cache(ranks={getattr(state[3], 'ranks', None)!r})"
+    if state[4]:
+        keys = [getattr(item, "key", None) for item in state[4][:3]]
+        return f"tuning(keys={keys!r}, count={len(state[4])}, ranks={getattr(state[4][0], 'ranks', None)!r})"
+    if state[1]:
+        return f"collective(pending={state[1]!r})"
+    return "running"
+
+
+def _format_deadlock(all_ranks, states):
+    grouped = {}
+    for rank, state in zip(all_ranks, states, strict=True):
+        grouped.setdefault(_describe_rank_state(state), []).append(rank)
+    return "; ".join(f"ranks {tuple(ranks)}: {label}" for label, ranks in grouped.items())
 
 
 def _tuning_results(contributions):
-    """Forward finalist shards in rank order and select ordinary race winners."""
+    """Select the fastest completed candidate for each sharded tuning race."""
     races = {}
     for item in contributions:
         races.setdefault(item.key, []).append(item)
     results = []
     for key in sorted(races):
-        members = races[key]
-        policy = getattr(members[0], "finalist_policy", None)
-        if any(getattr(item, "finalist_policy", None) != policy for item in members):
-            raise ValueError("sharded finalist policies differ across ranks")
-        if policy is not None:
-            results.extend(members)
-        else:
-            completed = [item for item in members if item.assignment is not None]
-            if not completed:
-                raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
-            results.append(min(completed, key=lambda item: (item.latency_us, item.candidate_index)))
+        completed = [item for item in races[key] if item.assignment is not None]
+        if not completed:
+            raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
+        results.append(min(completed, key=lambda item: (item.latency_us, item.candidate_index)))
     return tuple(results)
 
 
 def _selected_plan_catalog(requests):
-    from b12x.preparation.session import _declaration_key
     from b12x.preparation.types import _CompositePlan
-
-    def declaration(plan):
-        if isinstance(plan, _CompositePlan):
-            return (plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
-                    tuple((count, declaration(child)) for count, child in plan.variants.items()))
-        return _declaration_key(plan)[:-1]
+    from .tuning_shards import portable_declaration
 
     by_name = {request.name: request for request in requests}
     identities = {}
@@ -202,7 +241,7 @@ def _selected_plan_catalog(requests):
     def identity(name):
         if name not in identities:
             request = by_name[name]
-            identities[name] = (declaration(request.plan),
+            identities[name] = (portable_declaration(request.plan),
                                 tuple(identity(dependency) for dependency in request.dependencies))
         return identities[name]
 
@@ -229,9 +268,8 @@ class CollectivePreparation:
     coordinator releases a collective only after all group members report the
     same declaration. When the session shards tuning, it also relays b12x's
     two exchanges: every rank's cached selections, which b12x reconciles in
-    rank order, and candidate results. Ordinary races use the fastest result;
-    finalist races retain every shard for b12x to consolidate. It is unused
-    after graph handoff.
+    rank order, and candidate results, selecting the fastest result for each
+    race. It is unused after graph handoff.
     """
 
     def __init__(self, group, *, timeout=timedelta(minutes=2)):
@@ -247,6 +285,25 @@ class CollectivePreparation:
         # Each rank's host, in group order; ranks on one host share its CPUs and CUDA IPC.
         self.hosts = tuple(hosts)
         self.local_ranks = self.hosts.count(host_identity())
+        self._progress_packet = torch.zeros(2048, dtype=torch.uint8, device="cpu")
+        self._progress_received = list(torch.empty((len(self.ranks), 2048), dtype=torch.uint8, device="cpu").unbind())
+
+    def _exchange_progress(self, value):
+        data = pickle.dumps(value, protocol=pickle.DEFAULT_PROTOCOL)
+        outgoing = memoryview(self._progress_packet.numpy())
+        incoming = [memoryview(packet.numpy()) for packet in self._progress_received]
+        capacity = len(outgoing) - 8
+        struct.pack_into("<Q", outgoing, 0, len(data))
+        if len(data) <= capacity:
+            outgoing[8:8 + len(data)] = data
+        dist.all_gather(self._progress_received, self._progress_packet, group=self.group)
+        sizes = [struct.unpack_from("<Q", packet, 0)[0] for packet in incoming]
+        if any(size > capacity for size in sizes):
+            states = [None] * len(self.ranks)
+            dist.all_gather_object(states, value, group=self.group)
+            return states
+        return [pickle.loads(packet[8:8 + size])
+                for packet, size in zip(incoming, sizes, strict=True)]
 
     def register_group(self, ranks, group):
         """Retain a control subgroup used by hybrid TP/DCP collective barriers."""
@@ -306,6 +363,22 @@ class CollectivePreparation:
         dist.all_reduce(matching, op=dist.ReduceOp.MIN, group=self.group)
         return bool(matching.item())
 
+    def gather_tuning_metadata(self, produce):
+        """Exchange local planning metadata or deliver a failing rank's error to every peer."""
+        error = None
+        try:
+            value = produce()
+        except Exception as exc:
+            value, error = None, exc
+        gathered = [None] * len(self.ranks)
+        dist.all_gather_object(gathered, (value, None if error is None else f"{type(error).__name__}: {error}"),
+                               group=self.group)
+        failures = [(rank, detail) for rank, (_, detail) in zip(self.ranks, gathered, strict=True)
+                    if detail is not None]
+        if failures:
+            raise RuntimeError(f"rank tuning metadata failed: {failures}") from error
+        return [item for item, _ in gathered]
+
     def share_selections(self, cache):
         """Adopt rank zero's cached kernel selections on every rank.
 
@@ -347,8 +420,9 @@ class CollectivePreparation:
     def reconcile_selections(self, requests):
         """Choose one actual configuration for matching declarations across ranks.
 
-        Unequal catalogs cannot shard candidate races. Their shared declarations
-        still need matching scratch layouts before compiled forwards are shared.
+        Unsharded remainder components in unequal catalogs (or catalogs on
+        heterogeneous hardware) still need matching scratch layouts before
+        compiled forwards are shared.
         """
         entries = _selected_plan_catalog(requests)
         local = {}
@@ -379,8 +453,7 @@ class CollectivePreparation:
             raise ValueError("collective preparation does not shard tuning candidates")
         pending = tuple((item.key, item.ranks) for item in progress.ready_collectives)
         local = (pending, progress.ready_collective_tuning)
-        states = [None] * len(self.ranks)
-        dist.all_gather_object(states, local, group=self.group)
+        states = self._exchange_progress(local)
         self._remember_operation_ranks(states)
         if not all(item[0] or item[1] is not None for item in states):
             return None
@@ -428,8 +501,7 @@ class CollectivePreparation:
                          None if error is None else f"{type(error).__name__}: {error}",
                          None if state is None else state.ready_cache, () if state is None else tuple(state.ready_tuning),
                          None if state is None else state.ready_collective_tuning)
-                states = [None] * len(self.ranks)
-                dist.all_gather_object(states, local, group=self.group)
+                states = self._exchange_progress(local)
                 self._remember_operation_ranks(states)
                 failures = [(rank, item[2]) for rank, item in zip(self.ranks, states, strict=True) if item[2] is not None]
                 if failures:
@@ -438,66 +510,60 @@ class CollectivePreparation:
                     return job.result()
                 authorization = {"collective_key": None}
                 local = states[self._local_index()]
-                operation, local_ranks = None, None
-                for index in (5, 3, 4, 1):
-                    value = local[index]
-                    if value:
-                        operation = index
-                        local_ranks = (getattr(value, "ranks", self.ranks) if index in (5, 3) else
-                                       getattr(value[0], "ranks", self.ranks) if index == 4 else value[0][1])
-                        break
+                operation, local_ranks = _blocked_operation(local, self.ranks)
                 if operation is None:
                     if local[0]:
                         for item in states:
-                            for index in (5, 3, 4, 1):
-                                value = item[index]
-                                if value:
-                                    ranks = (getattr(value, "ranks", self.ranks) if index in (5, 3) else
-                                             getattr(value[0], "ranks", self.ranks) if index == 4 else value[0][1])
-                                    if self._global_rank() in ranks:
-                                        raise RuntimeError("a rank finished before its peer's collective declaration")
+                            peer_operation, ranks = _blocked_operation(item, self.ranks)
+                            if peer_operation is not None and self._global_rank() in ranks:
+                                raise RuntimeError("a rank finished before its peer's collective declaration")
+                        if not any(_rank_can_advance(states, self.ranks, rank, item)
+                                   for rank, item in zip(self.ranks, states, strict=True)):
+                            raise RuntimeError(
+                                f"collective preparation deadlocked across ranks: {_format_deadlock(self.ranks, states)}")
                     continue
                 members = self._members(states, local_ranks)
                 def busy(item):
                     return item[1] or item[3] is not None or item[4] or item[5] is not None
                 if any(item[0] for item in members) and any(busy(item) for item in members):
                     raise RuntimeError("a rank finished before its peer's collective declaration")
-                if not all(item[operation] for item in members):
-                    continue
-                if operation == 5:
-                    if any(item[5] is None or getattr(item[5], "key", None) != getattr(local[5], "key", None)
-                           or item[5].ranks != local_ranks for item in members):
-                        continue
-                    authorization = {"collective_tuning": tuple(item[5] for item in members)}
-                elif operation == 3:
-                    if any(item[3] is None or getattr(item[3], "ranks", self.ranks) != local_ranks for item in members):
-                        continue
-                    # Each operation reconciles its own group's cached selections, first rank first.
-                    authorization = {"cache": tuple(item[3] for item in members)}
-                elif operation == 4:
+                ready = all(item[operation] for item in members)
+                if ready and operation == 5:
+                    if not any(item[5] is None or getattr(item[5], "key", None) != getattr(local[5], "key", None)
+                               or tuple(item[5].ranks) != local_ranks for item in members):
+                        authorization = {"collective_tuning": tuple(item[5] for item in members)}
+                elif ready and operation == 3:
+                    if not any(item[3] is None or tuple(getattr(item[3], "ranks", self.ranks)) != local_ranks
+                               for item in members):
+                        # Each operation reconciles its own group's cached selections, first rank first.
+                        authorization = {"cache": tuple(item[3] for item in members)}
+                elif ready and operation == 4:
                     contributions = [item[4] for item in members]
-                    if any({getattr(contribution, "ranks", self.ranks) for contribution in group} != {local_ranks}
-                           for group in contributions):
-                        continue
-                    races = [sorted(contribution.key for contribution in group) for group in contributions]
-                    if any(keys != races[0] for keys in races[1:]):
-                        reference = set(races[0])
-                        counts = dict(zip(local_ranks, map(len, races), strict=True))
-                        differences = {}
-                        for rank, keys in zip(local_ranks[1:], races[1:], strict=True):
-                            missing, extra = reference - set(keys), set(keys) - reference
-                            if missing or extra:
-                                differences[rank] = {"missing": len(missing), "extra": len(extra),
-                                                     "examples": sorted(missing | extra)[:2]}
-                        raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
-                    results = _tuning_results(contribution for group in contributions for contribution in group)
-                    authorization = {"tuning": results[0] if len(results) == 1 else results}
-                else:
+                    if not any({tuple(getattr(contribution, "ranks", self.ranks)) for contribution in group} != {local_ranks}
+                               for group in contributions):
+                        races = [sorted(contribution.key for contribution in group) for group in contributions]
+                        if any(keys != races[0] for keys in races[1:]):
+                            reference = set(races[0])
+                            counts = dict(zip(local_ranks, map(len, races), strict=True))
+                            differences = {}
+                            for rank, keys in zip(local_ranks[1:], races[1:], strict=True):
+                                missing, extra = reference - set(keys), set(keys) - reference
+                                if missing or extra:
+                                    differences[rank] = {"missing": len(missing), "extra": len(extra),
+                                                         "examples": sorted(missing | extra)[:2]}
+                            raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
+                        results = _tuning_results(contribution for group in contributions for contribution in group)
+                        authorization = {"tuning": results[0] if len(results) == 1 else results}
+                elif ready:
                     if any(tuple(ranks) != local_ranks for _, ranks in local[1]):
                         raise ValueError("collective declaration mixes incompatible control groups")
-                    if any(item[1] != local[1] for item in members):
-                        continue
-                    authorization = {"collective_key": local[1][0][0]}
+                    if not any(item[1] != local[1] for item in members):
+                        authorization = {"collective_key": local[1][0][0]}
+                if authorization == {"collective_key": None} and not any(
+                        _rank_can_advance(states, self.ranks, rank, item)
+                        for rank, item in zip(self.ranks, states, strict=True)):
+                    raise RuntimeError(
+                        f"collective preparation deadlocked across ranks: {_format_deadlock(self.ranks, states)}")
         except BaseException as failure:
             try:
                 if job is not None:

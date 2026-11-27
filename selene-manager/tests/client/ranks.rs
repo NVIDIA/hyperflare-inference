@@ -27,7 +27,7 @@ use flare_selene::{
         LookupState, PoolAddress, PoolClient, PoolConfig, PoolEvent, PoolFetch, PoolStatus,
         PutBytes, RankAgent, RankRecords, Tier, rank::memory_links,
     },
-    record::checksum,
+    record::{self, checksum},
     testing::{GpuMemory, SimulatedGpu, TestHistory, geometry},
 };
 
@@ -122,6 +122,65 @@ fn source(manager: &Manager, world: usize) -> Source {
     Source { client, _gpu: gpu }
 }
 
+/// Puts the record ending at `tokens` from `writer`, with or without its row, and waits
+/// for the manager's answer.
+fn put_and_wait(
+    writer: &mut Source,
+    history: &TestHistory,
+    world: usize,
+    tokens: u64,
+    parent: Option<PrefixKey>,
+    row: bool,
+    capture_role: flare_selene::CaptureRole,
+    child_paths: u32,
+) -> flare_selene::pool::PutOutcome {
+    let (page, row_bytes) = whole(world);
+    let pages = (tokens / PT) as usize;
+    let data = bytes_of(world, pages);
+    let sums = data[..pages * page]
+        .chunks_exact(page)
+        .map(checksum)
+        .collect();
+    let row_sum = checksum(&data[pages * page..]);
+    let key = history.key_at(tokens).unwrap();
+    writer
+        .client
+        .put(PutRequest {
+            ancestor_keys: Vec::new(),
+            key,
+            parent,
+            bucket: history.bucket_at(tokens).unwrap(),
+            chain_pages: pages as u64,
+            tail_pages: pages as u64 - parent.map_or(0, |p| p.consumed_tokens / PT),
+            row,
+            capture_role,
+            child_paths,
+            descendant_row: child_paths == 1,
+            next_child: None,
+            packed: None,
+            source: PutSource::Host(Box::new(RecordBytes {
+                data,
+                sums,
+                row: row_sum,
+                page_bytes: page,
+                row_bytes,
+            })),
+        })
+        .unwrap();
+    let mut outcome = None;
+    wait("the manager's answer to the put", || {
+        let mut events = Vec::new();
+        writer.client.poll(&mut events).unwrap();
+        for event in events {
+            if let PoolEvent::Put { outcome: done, .. } = event {
+                outcome = Some(done);
+            }
+        }
+        outcome.is_some()
+    });
+    outcome.unwrap()
+}
+
 /// A multi-process requester: rank 0's client and the agents of ranks `1..world`.
 struct Instance {
     rank0: PoolClient,
@@ -169,7 +228,7 @@ struct Faults {
     /// listed has a wrong persisted checksum in its files.
     host: Option<(usize, Option<usize>)>,
     /// What the peers' agents register through.
-    registrar: Option<Arc<super::CountingRegistrar>>,
+    registrar: Option<Arc<dyn flare_selene::HostRegistrar + Send + Sync>>,
     /// The peers' agents ask this before registering.
     approve: Option<flare_selene::pool::Approve>,
 }
@@ -251,7 +310,7 @@ fn instance_with(
     let gpus: Vec<[u8; 16]> = (0..world).map(|r| [seed + r as u8; 16]).collect();
     let rank0 = PoolClient::start(
         config_at(address_for(manager, reach[0]), world, gpus.clone()),
-        Some(links),
+        (world > 1).then_some(links),
         copier,
         Arc::new(OkRegistrar),
         flare_selene::pool::Roots::System,
@@ -431,6 +490,8 @@ fn offer(source: &Source, history: &TestHistory, world: usize, pages: usize) -> 
         row: true,
         tier: Tier::Dram,
         bytes: (pages * page + row) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     key
 }
@@ -444,6 +505,327 @@ fn a_two_rank_instance_restores_a_single_process_record_slice_by_slice() {
 fn every_rank_on_its_own_data_channel_restores_a_record() {
     let manager = network_manager(false);
     restore_through(&manager, 2, &[Reach::Network, Reach::Network]);
+}
+
+#[test]
+fn rank_agents_restore_manager_records_after_every_window_is_assembled() {
+    let manager = network_manager(false);
+    let world = 2;
+    // Four windows exceed the two credits; the last carries the row.
+    let pages = 193;
+    let history = history_of(4000);
+    let (page, row) = whole(world);
+    let mut writer = source(&manager, world);
+    wait("the writer", || writer.client.status() == PoolStatus::Ready);
+    let outcome = put_and_wait(
+        &mut writer,
+        &history,
+        world,
+        pages as u64 * PT,
+        None,
+        true,
+        Default::default(),
+        0,
+    );
+    assert!(
+        matches!(outcome, flare_selene::pool::PutOutcome::Stored { .. }),
+        "{outcome:?}"
+    );
+    writer.client.close().unwrap();
+    let scratch: Vec<_> = (100..100 + pages as u32).collect();
+    for reach in [
+        [Reach::Network, Reach::Network],
+        [Reach::Local, Reach::Network],
+        [Reach::Local, Reach::Local],
+    ] {
+        let mut requester = instance_reaching(&manager, world, &reach);
+        requester.ready();
+        wait_offered(&requester.rank0, &history);
+        for _ in 0..2 {
+            let fetch = fetch_for(&requester.rank0, world, &history, pages, &scratch);
+            requester.rank0.fetch(fetch).unwrap();
+            let result = requester.event("the manager restore", |e| match e {
+                PoolEvent::Fetched { result, .. } => Some(
+                    result
+                        .as_ref()
+                        .map(|bytes| *bytes)
+                        .map_err(|failure| failure.error.to_string()),
+                ),
+                _ => None,
+            });
+            assert_eq!(result, Ok((pages * page + row) as u64));
+            assert_slices(&requester, world, pages, &scratch);
+        }
+        requester.close();
+    }
+}
+
+#[test]
+fn rank_agents_restore_an_anchor_below_page_only_tails() {
+    // Without a disk tier every record is served from the arena. On disk the manager
+    // restarts first, so no record is resident and every one streams, whatever the
+    // arena size; a restore does not read records into the arena.
+    for (disk, memory, world) in [
+        (false, 0, 2),
+        (true, 4096, 2),
+        (true, 64 << 20, 2),
+        (true, 64 << 20, 1),
+    ] {
+        let mut manager = network_manager(false);
+        if disk {
+            manager.stop();
+            manager.config.root = Some(manager.base.join("records"));
+            manager.config.memory = memory;
+            manager.config.nvme = 64 << 20;
+            manager.run();
+        }
+        let history = history_of(4000);
+        let (page, row) = whole(world);
+        let mut writer = source(&manager, world);
+        wait("the writer", || writer.client.status() == PoolStatus::Ready);
+        let mut parent = None;
+        // A record is an anchor exactly when it is put with its row. The zero-page
+        // record carries nothing without its row, so it is answered Present and the
+        // chain continues from its parent.
+        for (tokens, anchor) in [
+            (2 * PT, true),
+            (2 * PT + 1, false),
+            (4 * PT, false),
+            (5 * PT, true),
+            (6 * PT, false),
+            (7 * PT, false),
+        ] {
+            let key = history.key_at(tokens).unwrap();
+            let tail_pages = tokens / PT - parent.map_or(0, |p: PrefixKey| p.consumed_tokens / PT);
+            let outcome = put_and_wait(
+                &mut writer,
+                &history,
+                world,
+                tokens,
+                parent,
+                anchor,
+                Default::default(),
+                0,
+            );
+            if tail_pages == 0 && !anchor {
+                assert!(
+                    matches!(outcome, flare_selene::pool::PutOutcome::Present),
+                    "{tokens}: {outcome:?}, expected Present"
+                );
+            } else {
+                let expected =
+                    8192 + tail_pages * page as u64 + if anchor { row as u64 } else { 0 };
+                assert!(
+                    matches!(outcome, flare_selene::pool::PutOutcome::Stored { bytes, .. } if bytes == expected),
+                    "{tokens}: {outcome:?}, expected {expected} bytes"
+                );
+            }
+            if tail_pages > 0 || anchor {
+                parent = Some(key);
+            }
+        }
+        writer.client.close().unwrap();
+        let metrics = manager.metrics();
+        assert!(metrics.contains("selene_put_shapes_total{shape=\"row\"} 2\n"));
+        assert!(metrics.contains("selene_put_shapes_total{shape=\"page_only\"} 3\n"));
+        assert!(metrics.contains("selene_put_shapes_total{shape=\"empty\"} 1\n"));
+        assert!(metrics.contains(&format!(
+            "selene_put_bytes_total{{part=\"rows\"}} {}\n",
+            2 * row
+        )));
+        assert!(metrics.contains(&format!(
+            "selene_put_bytes_total{{part=\"pages\"}} {}\n",
+            7 * page
+        )));
+        if disk {
+            manager.stop();
+            let directory = manager.base.join("records").join(record::directory_name(
+                &[7; 32],
+                &fingerprint(&ranks(world)),
+            ));
+            let checkpoints: std::collections::HashSet<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .filter_map(|entry| {
+                    record::parse_file_name(entry.unwrap().file_name().to_str().unwrap())
+                })
+                .collect();
+            // Streaming already wrote both trailing records. The arena flush stops at
+            // the last anchor, including the page-only predecessor it needs.
+            let pages: &[u64] = if memory == 4096 {
+                &[2, 4, 5, 6, 7]
+            } else {
+                &[2, 4, 5]
+            };
+            let expected = pages.iter()
+                .map(|p| history.key_at(p * PT).unwrap())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(checkpoints, expected);
+            manager.run();
+            // Recovery also drops any streamed page-only suffix.
+            wait("the three records through the last anchor", || {
+                manager
+                    .metrics()
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("selene_records{") && line.contains("tier=\"disk\"")
+                    })
+                    .filter_map(|line| line.rsplit(' ').next().unwrap().parse::<usize>().ok())
+                    .sum::<usize>()
+                    == 3
+            });
+        }
+        let scratch = [100, 101, 102, 103, 104];
+        let reaches: &[&[Reach]] = if world == 1 {
+            &[&[Reach::Local], &[Reach::Network]]
+        } else {
+            &[
+                &[Reach::Local, Reach::Local],
+                &[Reach::Local, Reach::Network],
+                &[Reach::Network, Reach::Network],
+            ]
+        };
+        for reach in reaches {
+            let mut requester = instance_reaching(&manager, world, reach);
+            requester.ready();
+            wait_offered(&requester.rank0, &history);
+            let fetch = fetch_for(&requester.rank0, world, &history, 5, &scratch);
+            assert_eq!(fetch.part.part.end, history.key_at(5 * PT).unwrap());
+            requester.rank0.fetch(fetch).unwrap();
+            let result = requester.event("the anchor restore", |event| match event {
+                PoolEvent::Fetched { result, .. } => Some(
+                    result
+                        .as_ref()
+                        .map(|bytes| *bytes)
+                        .map_err(|failure| failure.error.to_string()),
+                ),
+                _ => None,
+            });
+            assert_eq!(result, Ok((5 * page + row) as u64));
+            assert_slices(&requester, world, 5, &scratch);
+            requester.close();
+        }
+    }
+}
+
+#[test]
+fn rank_writers_send_only_the_pages_of_a_single_child_endpoint() {
+    use flare_selene::CaptureRole::{Anchor, Endpoint};
+    use flare_selene::pool::PutOutcome;
+    let manager = network_manager(false);
+    let world = 2;
+    let history = history_of(4000);
+    let (page, row) = whole(world);
+    let mut writer = source(&manager, world);
+    wait("the writer", || writer.client.status() == PoolStatus::Ready);
+    let root = put_and_wait(&mut writer, &history, world, 2 * PT, None, true, Anchor, 1);
+    assert!(
+        matches!(root, PutOutcome::Stored { bytes, .. } if bytes == (8192 + 2 * page + row) as u64)
+    );
+    let parent = history.key_at(2 * PT);
+    let child = put_and_wait(
+        &mut writer,
+        &history,
+        world,
+        4 * PT,
+        parent,
+        true,
+        Endpoint,
+        1,
+    );
+    assert!(matches!(child, PutOutcome::Stored { bytes, .. } if bytes == (8192 + 2 * page) as u64));
+    writer.client.close().unwrap();
+    let metrics = manager.metrics();
+    assert!(metrics.contains("selene_put_shapes_total{shape=\"row\"} 1\n"));
+    assert!(metrics.contains("selene_put_shapes_total{shape=\"page_only\"} 1\n"));
+    assert!(metrics.contains(&format!("selene_put_bytes_total{{part=\"rows\"}} {row}\n")));
+    assert!(metrics.contains(&format!(
+        "selene_put_bytes_total{{part=\"pages\"}} {}\n",
+        4 * page
+    )));
+}
+
+#[test]
+fn rank_agents_restore_through_a_zero_page_middle_record() {
+    let mut manager = network_manager(false);
+    manager.stop();
+    manager.config.root = Some(manager.base.join("records"));
+    manager.config.nvme = 64 << 20;
+    let world = 2;
+    let geometry = ranks(world);
+    let fingerprint = fingerprint(&geometry);
+    let directory = manager
+        .config
+        .root
+        .as_ref()
+        .unwrap()
+        .join(flare_selene::record::directory_name(&[7; 32], &fingerprint));
+    std::fs::create_dir_all(&directory).unwrap();
+    let history = history_of(4000);
+    let (page, row) = whole(world);
+    let mut parent = None;
+    // Recover a persisted chain so the claim checks zero-page traversal
+    // independently of Put window offsets.
+    for tokens in [2 * PT, 2 * PT + 1, 4 * PT] {
+        let pages = (tokens / PT) as usize;
+        let first = parent.map_or(0, |p: PrefixKey| p.consumed_tokens / PT) as usize;
+        let key = history.key_at(tokens).unwrap();
+        let data = bytes_of(world, pages);
+        let mut header = flare_selene::record::Header::new(
+            &geometry,
+            [7; 32],
+            fingerprint,
+            key,
+            parent,
+            history.bucket_at(tokens).unwrap(),
+            (pages - first) as u32,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        header.row_checksum = checksum(&data[pages * page..]);
+        let mut bytes = vec![0; header.length_with_row() as usize];
+        bytes[..4096].copy_from_slice(&header.encode().unwrap());
+        for (index, chunk) in data[first * page..pages * page]
+            .chunks_exact(page)
+            .enumerate()
+        {
+            bytes[4096 + index * 8..4104 + index * 8]
+                .copy_from_slice(&checksum(chunk).to_le_bytes());
+        }
+        bytes[header.page_segment as usize..header.row_segment as usize]
+            .copy_from_slice(&data[first * page..pages * page]);
+        bytes[header.row_segment as usize..].copy_from_slice(&data[pages * page..]);
+        std::fs::write(directory.join(flare_selene::record::file_name(&key)), bytes).unwrap();
+        parent = Some(key);
+    }
+    manager.run();
+    let scratch = [100, 101, 102, 103];
+    for reach in [
+        [Reach::Local, Reach::Local],
+        [Reach::Local, Reach::Network],
+        [Reach::Network, Reach::Network],
+    ] {
+        let mut requester = instance_reaching(&manager, world, &reach);
+        requester.ready();
+        wait_offered(&requester.rank0, &history);
+        let fetch = fetch_for(&requester.rank0, world, &history, 4, &scratch);
+        assert_eq!(fetch.part.candidate.plan.nodes.len(), 2);
+        requester.rank0.fetch(fetch).unwrap();
+        let result = requester.event(
+            "the restore past the row-only record",
+            |event| match event {
+                PoolEvent::Fetched { result, .. } => Some(
+                    result
+                        .as_ref()
+                        .map(|bytes| *bytes)
+                        .map_err(|failure| failure.error.to_string()),
+                ),
+                _ => None,
+            },
+        );
+        assert_eq!(result, Ok((4 * page + row) as u64));
+        assert_slices(&requester, world, 4, &scratch);
+        requester.close();
+    }
 }
 
 #[test]
@@ -533,6 +915,8 @@ fn publish(source: &Instance, history: &TestHistory, world: usize, pages: usize)
         row: true,
         tier: Tier::Gpu,
         bytes: (pages * page + row) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     key
 }
@@ -1169,6 +1553,8 @@ fn host_export(
         row: true,
         tier: Tier::Dram,
         bytes: (pages * page + row) as u64,
+        packed: false,
+        required_profiles: Vec::new(),
     });
     wait_offered(&requester.client, &history);
     let scratch = [300, 301, 302, 303];
@@ -1274,12 +1660,18 @@ fn host_put(manager: &Manager, world: usize, reach: &[Reach]) {
     writer
         .rank0
         .put(PutRequest {
+            ancestor_keys: Vec::new(),
             key,
             parent: None,
             bucket: history.bucket_at(key.consumed_tokens).unwrap(),
             chain_pages: pages as u64,
             tail_pages: pages as u64,
+            capture_role: Default::default(),
+            child_paths: 0,
+            descendant_row: false,
+            next_child: None,
             row: true,
+            packed: None,
             source: PutSource::Host(Box::new(ZeroBytes(RankFiles {
                 world,
                 rank: 0,
@@ -1332,6 +1724,25 @@ fn a_two_rank_instance_spills_a_record_from_its_ranks_files() {
 fn three_ranks_mixing_shared_memory_and_channels_spill_their_files_slices() {
     let manager = network_manager(false);
     host_put(&manager, 3, &[Reach::Local, Reach::Network, Reach::Local]);
+}
+
+#[test]
+fn slow_agent_registration_keeps_its_runtime_responsive_and_attaches() {
+    let manager = super::short_keepalive_manager();
+    let registrar = super::SlowRegistrar::new();
+    let faults = Faults {
+        registrar: Some(registrar.clone()),
+        ..Default::default()
+    };
+    let requester = instance_with(&manager, 2, &[Reach::Local, Reach::Local], 2, &faults);
+    requester.ready();
+    wait("the agent to attach", || {
+        requester.agents[0].status() == PoolStatus::Ready
+    });
+    assert_eq!(requester.agents[0].registered_regions().len(), 2);
+    assert_eq!(registrar.counting.calls.lock().unwrap().len(), 2);
+    assert!(registrar.runtime_progress.load(Ordering::SeqCst));
+    requester.close();
 }
 
 #[test]
@@ -1396,30 +1807,181 @@ fn an_agent_is_asked_about_its_whole_plan_before_it_registers_anything() {
 }
 
 #[test]
-fn an_agent_whose_plan_is_refused_registers_nothing_and_turns_the_pool_off_on_every_rank() {
+fn an_agent_waits_for_rank_zero_to_open_late() {
     let manager = Manager::start();
+    let (zero, peer) = memory_links();
     let counting = Arc::new(super::CountingRegistrar::default());
-    let faults = Faults {
-        registrar: Some(counting.clone()),
-        approve: Some(Arc::new(|_: &[flare_selene::pool::PlannedRegion]| {
-            Err("over the memory budget".to_string())
-        })),
-        ..Default::default()
-    };
-    let requester = instance_with(&manager, 2, &[Reach::Local, Reach::Local], 2, &faults);
-    wait("the agent to be disabled", || {
-        matches!(requester.agents[0].status(), PoolStatus::Disabled(_))
+    let registered = counting.clone();
+    let address = PoolAddress::Unix(manager.config.socket.clone());
+    let (copier, _gpu1) = SimulatedGpu::shared(&[local()]).unwrap();
+    let agent = thread::spawn(move || {
+        RankAgent::start(AgentConfig {
+            address,
+            ca: None,
+            scope: scope(2),
+            rank: 1,
+            world: 2,
+            link: peer,
+            copier,
+            registrar: counting,
+            registration_context: 0,
+            gpu_uuid: [3; 16],
+            records: None,
+            approve: None,
+        })
     });
-    assert!(counting.calls.lock().unwrap().is_empty());
-    assert!(requester.agents[0].registered_regions().is_empty());
-    wait("rank 0 to turn the pool off", || {
-        matches!(requester.rank0.status(), PoolStatus::Disabled(_))
+    wait("the agent's registration", || {
+        registered.calls.lock().unwrap().len() == 2
     });
-    requester.close();
+    thread::sleep(Duration::from_millis(100));
+    let waiting = !agent.is_finished();
+    let (copier, _gpu0) = SimulatedGpu::shared(&[local()]).unwrap();
+    let mut rank0 = PoolClient::start(
+        config(&manager, 2, vec![[2; 16], [3; 16]]),
+        Some(vec![zero]),
+        copier,
+        Arc::new(OkRegistrar),
+        flare_selene::pool::Roots::System,
+        flare_selene::pool::STARTUP_WAIT,
+    )
+    .unwrap();
+    let result = agent.join().unwrap();
+    assert!(waiting, "the agent stopped before rank zero opened");
+    let mut agent = result.unwrap();
+    assert_eq!(agent.status(), PoolStatus::Ready);
+    agent.close().unwrap();
+    rank0.close().unwrap();
 }
 
 #[test]
-fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
+fn an_agent_refused_by_the_manager_fails_startup_after_registration() {
+    use flare_selene::shard::{Reader, Writer};
+    let manager = Manager::start();
+    let (zero, mut peer) = memory_links();
+    let (copier, _gpu0) = SimulatedGpu::shared(&[local()]).unwrap();
+    let mut rank0 = PoolClient::start(
+        config(&manager, 2, vec![[2; 16], [3; 16]]),
+        Some(vec![zero]),
+        copier,
+        Arc::new(OkRegistrar),
+        flare_selene::pool::Roots::System,
+        flare_selene::pool::STARTUP_WAIT,
+    )
+    .unwrap();
+    let (mut forwarding, agent_link) = memory_links();
+    // Complete the rank-link greeting so rank zero sends its session binding.
+    let mut greeting = Writer::new(18);
+    greeting
+        .u32(1)
+        .u32(2)
+        .blob(&[9; 16])
+        .blob(&scope(2).layout_fingerprint)
+        .blob(&[3; 16]);
+    peer.enqueue(&greeting.finish()).unwrap();
+    for _ in 0..2 {
+        wait("rank zero's Hello and Bind", || {
+            let Some((tag, bytes)) = peer.receive().unwrap() else {
+                return false;
+            };
+            let mut frame = Writer::new(tag);
+            if tag == 13 {
+                // Keep the real session identity but make the manager reject the secret.
+                let mut reader = Reader(&bytes);
+                let mut secret = reader.blob().unwrap().to_vec();
+                secret[0] ^= 1;
+                frame.blob(&secret).blob(reader.blob().unwrap());
+            } else {
+                frame.bytes(&bytes);
+            }
+            forwarding.enqueue(&frame.finish()).unwrap();
+            true
+        });
+    }
+    let counting = Arc::new(super::CountingRegistrar::default());
+    let (copier, _gpu1) = SimulatedGpu::shared(&[local()]).unwrap();
+    let result = RankAgent::start(AgentConfig {
+        address: PoolAddress::Unix(manager.config.socket.clone()),
+        ca: None,
+        scope: scope(2),
+        rank: 1,
+        world: 2,
+        link: agent_link,
+        copier,
+        registrar: counting.clone(),
+        registration_context: 0,
+        gpu_uuid: [3; 16],
+        records: None,
+        approve: None,
+    });
+    let reason = result
+        .err()
+        .expect("manager rejection must fail agent startup")
+        .to_string();
+    assert!(reason.contains("RankBadSecret"), "{reason}");
+    assert_eq!(counting.calls.lock().unwrap().len(), 2);
+    assert_eq!(*counting.drops.lock().unwrap(), 2);
+    rank0.close().unwrap();
+}
+
+#[test]
+fn closed_rank_links_fail_agent_startup_with_the_cause() {
+    let manager = Manager::start();
+    let (zero, peer) = memory_links();
+    drop(zero);
+    let (copier, _gpu) = SimulatedGpu::shared(&[local()]).unwrap();
+    let reason = RankAgent::start(AgentConfig {
+        address: PoolAddress::Unix(manager.config.socket.clone()),
+        ca: None,
+        scope: scope(2),
+        rank: 1,
+        world: 2,
+        link: peer,
+        copier,
+        registrar: Arc::new(OkRegistrar),
+        registration_context: 0,
+        gpu_uuid: [3; 16],
+        records: None,
+        approve: None,
+    })
+    .err()
+    .expect("closed rank links must fail startup")
+    .to_string();
+    assert!(
+        reason.contains("rank links closed") || reason.contains("rank link failed"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn an_agent_whose_plan_is_refused_fails_startup() {
+    let manager = Manager::start();
+    let counting = Arc::new(super::CountingRegistrar::default());
+    let (_zero, peer) = memory_links();
+    let (copier, _gpu) = SimulatedGpu::shared(&[local()]).unwrap();
+    let reason = RankAgent::start(AgentConfig {
+        address: PoolAddress::Unix(manager.config.socket.clone()),
+        ca: None,
+        scope: scope(2),
+        rank: 1,
+        world: 2,
+        link: peer,
+        copier,
+        registrar: counting.clone(),
+        registration_context: 0,
+        gpu_uuid: [3; 16],
+        records: None,
+        approve: Some(Arc::new(|_| Err("over the memory budget".into()))),
+    })
+    .err()
+    .expect("a refused rank must fail startup")
+    .to_string();
+    assert!(reason.contains("over the memory budget"), "{reason}");
+    assert!(reason.contains("remove --prefix-cache-pool"), "{reason}");
+    assert!(counting.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn rank_zero_approval_rejection_fails_startup_and_stops_its_agents() {
     let manager = Manager::start();
     let (copier, _gpu) = SimulatedGpu::shared(&[local()]).unwrap();
     let (zero, peer) = memory_links();
@@ -1435,7 +1997,10 @@ fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
         flare_selene::pool::Roots::System,
         flare_selene::pool::STARTUP_WAIT,
     )
-    .unwrap();
+    .err()
+    .expect("rank zero must fail startup")
+    .to_string();
+    assert!(rank0.contains("over the memory budget"), "{rank0}");
     let (copier, _gpu1) = SimulatedGpu::shared(&[local()]).unwrap();
     let agent = RankAgent::start(AgentConfig {
         address: PoolAddress::Unix(manager.config.socket.clone()),
@@ -1451,11 +2016,11 @@ fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
         records: None,
         approve: None,
     })
-    .unwrap();
-    wait("rank 0 to be disabled", || {
-        matches!(rank0.status(), PoolStatus::Disabled(_))
-    });
-    wait("the agent to follow", || {
-        matches!(agent.status(), PoolStatus::Disabled(_))
-    });
+    .err()
+    .expect("rank zero's refusal must fail agent startup")
+    .to_string();
+    assert!(
+        agent.contains("rank 0 is not using the pool") || agent.contains("rank links closed"),
+        "{agent}"
+    );
 }

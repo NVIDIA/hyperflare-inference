@@ -49,10 +49,15 @@ enum Phase {
 }
 
 struct Put {
+    capture_role: crate::CaptureRole,
+    child_paths: u32,
     key: PrefixKey,
     bucket: [u8; 16],
     chain_pages: u64,
     row: bool,
+    packed_offer: Option<wire::PackedOffer>,
+    packed_accepted: bool,
+    min_first_page: u64,
     source: Arc<Mutex<Box<dyn PutBytes>>>,
     phase: Phase,
     first_page: u64,
@@ -95,13 +100,16 @@ impl State {
     }
 }
 
-fn refusal(reason: i32) -> PutOutcome {
+fn refusal(reason: i32, detail: &str) -> PutOutcome {
     use wire::Reason as R;
     match R::try_from(reason) {
         Ok(R::Present) => PutOutcome::Present,
         Ok(R::Inflight) => PutOutcome::Refused(PutRefusal::Inflight),
         Ok(R::Budget) => PutOutcome::Refused(PutRefusal::Budget),
         Ok(R::Oversize) => PutOutcome::Refused(PutRefusal::Oversize),
+        Ok(R::Invalid) if detail == crate::shared::PUT_UNLINKED => {
+            PutOutcome::Refused(PutRefusal::Unlinked)
+        }
         Ok(R::Invalid) => PutOutcome::Refused(PutRefusal::Invalid),
         Ok(R::Queue) => PutOutcome::Refused(PutRefusal::Queue),
         Ok(R::Io) => PutOutcome::Refused(PutRefusal::Io),
@@ -132,6 +140,7 @@ impl Engine {
             kind: wire::rank_fence::Kind::Put as i32,
             fence_id: id,
             records: vec![wire::Record {
+                packed: None,
                 key: Some(codec::key_to(put.key)),
                 first_page: 0,
                 pages,
@@ -177,9 +186,18 @@ impl Engine {
             put_id: id,
             key: Some(codec::key_to(request.key)),
             chain_pages: request.chain_pages,
+            capture_role: request.capture_role as i32,
+            child_paths: request.child_paths,
+            descendant_row: request.descendant_row,
+            next_child: request.next_child.map(codec::key_to),
             row: request.row,
             has_published_parent: request.parent.is_some(),
             published_parent: request.parent.map(codec::key_to),
+            ancestor_keys: request
+                .ancestor_keys
+                .into_iter()
+                .map(codec::key_to)
+                .collect(),
             bucket: request.bucket.to_vec(),
             published_tail_pages: request.tail_pages,
             mode: if self.dial.is_some() {
@@ -187,17 +205,24 @@ impl Engine {
             } else {
                 wire::CopyMode::SharedWindows
             } as i32,
+            packed: request.packed.clone(),
         }));
+        let (min_first_page, source) = match request.source {
+            PutSource::Host(bytes) => (bytes.min_first_page(), Arc::new(Mutex::new(bytes))),
+        };
         self.writer.puts.insert(
             id,
             Put {
+                capture_role: request.capture_role,
+                child_paths: request.child_paths,
                 key: request.key,
                 bucket: request.bucket,
                 chain_pages: request.chain_pages,
                 row: request.row,
-                source: match request.source {
-                    PutSource::Host(bytes) => Arc::new(Mutex::new(bytes)),
-                },
+                packed_offer: request.packed,
+                packed_accepted: false,
+                min_first_page,
+                source,
                 phase: Phase::Begun,
                 first_page: 0,
                 parent: None,
@@ -251,7 +276,7 @@ impl Engine {
     /// The record the manager accepted, as a header and a checksum segment.
     fn put_header(&self, put: &Put) -> crate::Result<Header> {
         let scope = &self.st.scope;
-        Header::new(
+        let header = Header::new(
             &scope.record_geometry(),
             scope.model_identity,
             scope.layout_fingerprint,
@@ -261,6 +286,30 @@ impl Engine {
             (put.chain_pages - put.first_page) as u32,
             SystemTime::now(),
         )
+        .map(|header| header.with_capture_role(put.capture_role))?;
+        if put.packed_accepted
+            && let Some(offer) = &put.packed_offer
+        {
+            let first = put.first_page;
+            let end = put.chain_pages;
+            let units: Vec<_> = offer
+                .units
+                .iter()
+                .filter(|u| match wire::packed_unit::Kind::try_from(u.kind) {
+                    Ok(wire::packed_unit::Kind::Page) => {
+                        u.logical_index >= first && u.logical_index < end
+                    }
+                    Ok(wire::packed_unit::Kind::Row) => put.row,
+                    Err(_) => false,
+                })
+                .cloned()
+                .collect();
+            return header.with_packed(wire::PackedOffer {
+                first_page: first,
+                units,
+            });
+        }
+        Ok(header)
     }
 
     pub(crate) fn on_put_accept(&mut self, accept: wire::PutAccept) {
@@ -284,26 +333,60 @@ impl Engine {
                 Error::new("the manager accepted a put this client cannot carry out"),
             );
         };
-        if pages == 0 && !put.row {
+        let offered_row = put.row;
+        let role = accept.capture_role();
+        let can_send_pages_only = parent.is_some()
+            && put.capture_role == crate::CaptureRole::Endpoint
+            && role == crate::CaptureRole::Endpoint
+            && put.child_paths < 2;
+        let put = self.writer.puts.get_mut(&id).expect("present");
+        if accept.first_page < put.min_first_page {
+            // The manager forced a root/suffix that crosses a mixed raw/packed boundary on
+            // this host chain. Because the manager has already accepted (and may have
+            // pipelined a shared-window grant), transition out of Begun so drive_put emits
+            // FenceAck(Drained) after PutCancel and the manager releases any leased window.
+            put.phase = Phase::Accepted;
+            put.refused = Some(PutOutcome::Refused(PutRefusal::Invalid));
+            self.send_cancel(id);
+            self.drive_put(id);
+            return;
+        }
+        if put.packed_offer.is_some() && !accept.packed {
             return self.fail_put(
                 id,
-                Error::new("the manager accepted a put with nothing to write"),
+                Error::new("the manager rejected packed storage for a compressed host record"),
             );
         }
-        let put = self.writer.puts.get_mut(&id).expect("present");
+        put.capture_role = role;
         put.first_page = accept.first_page;
         put.parent = parent;
-        let expected = match self.put_header(self.writer.puts.get(&id).expect("present")) {
-            Ok(header) => {
-                if self.writer.puts[&id].row {
-                    header.length_with_row()
-                } else {
-                    header.row_segment
-                }
-            }
+        put.packed_accepted = accept.packed;
+        let header = match self.put_header(&self.writer.puts[&id]) {
+            Ok(header) => header,
             Err(error) => return self.fail_put(id, error),
         };
-        if accept.record_bytes != expected {
+        let expected = header.length(offered_row);
+        let (row, final_header) = if accept.record_bytes == expected {
+            (offered_row, header)
+        } else if offered_row && can_send_pages_only {
+            let put = self.writer.puts.get_mut(&id).expect("present");
+            put.row = false;
+            let page_only_header = match self.put_header(&self.writer.puts[&id]) {
+                Ok(h) => h,
+                Err(error) => return self.fail_put(id, error),
+            };
+            if accept.record_bytes == page_only_header.row_segment {
+                (false, page_only_header)
+            } else {
+                return self.fail_put(
+                    id,
+                    Error::new(format!(
+                        "the manager expects a {}-byte record, this client writes {expected}",
+                        accept.record_bytes
+                    )),
+                );
+            }
+        } else {
             return self.fail_put(
                 id,
                 Error::new(format!(
@@ -311,14 +394,28 @@ impl Engine {
                     accept.record_bytes
                 )),
             );
+        };
+        if pages == 0 && !row {
+            return self.fail_put(
+                id,
+                Error::new("the manager accepted a put with nothing to write"),
+            );
         }
         let put = self.writer.puts.get_mut(&id).expect("present");
-        put.coverage = Some(Coverage::new(vec![ExpectedRecord {
+        put.row = row;
+        let mut coverage = Coverage::new(vec![ExpectedRecord {
             key: put.key,
             first_page: 0,
             pages: pages as u32,
             row: put.row,
-        }]));
+        }]);
+        if put.packed_accepted
+            && let Some(layout) = final_header.packed
+        {
+            coverage.set_packed_layout(0, (*layout).clone());
+        }
+        let put = self.writer.puts.get_mut(&id).expect("present");
+        put.coverage = Some(coverage);
         put.sums = vec![0; pages as usize];
         put.phase = Phase::Accepted;
         if self.ranks.is_some()
@@ -350,7 +447,8 @@ impl Engine {
         let Some(staging) = self.net.clone() else {
             return;
         };
-        let spec = wire::WindowSpec {
+        let mut spec = wire::WindowSpec {
+            packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
             offset: staging.offset(slot),
@@ -360,6 +458,15 @@ impl Engine {
             page_count: shape.page_count,
             row: shape.row,
         };
+        if let Some(units) = self
+            .writer
+            .puts
+            .get(&put)
+            .and_then(|run| run.coverage.as_ref())
+            .and_then(|cov| cov.pinned_units(&spec))
+        {
+            spec.packed = Some(wire::PackedWindow { units });
+        }
         if !self.put_window(put, spec, Some(slot)) {
             self.free_slot(slot);
         }
@@ -401,11 +508,11 @@ impl Engine {
             return true;
         };
         let first = put.first_page + dest;
-        put.windows.insert(spec.index, (spec, dest));
+        put.windows.insert(spec.index, (spec.clone(), dest));
         let bytes = put.source.clone();
         let job = put.out.fill_host(
             FillOwner::Put(id),
-            spec,
+            spec.clone(),
             address,
             slot,
             self.ranks.as_ref(),
@@ -416,7 +523,7 @@ impl Engine {
                     .fill(first, spec.page_count, spec.row, dst)
             }),
         );
-        let fan_out = put.out.fan_out(self.ranks.as_mut(), spec);
+        let fan_out = put.out.fan_out(self.ranks.as_mut(), spec.clone());
         if !self.submit_fill(job) {
             let put = self.writer.puts.get_mut(&id).expect("present");
             put.out.jobs_outstanding -= 1;
@@ -455,19 +562,27 @@ impl Engine {
         let Some((spec, dest)) = put.windows.remove(&window) else {
             return;
         };
-        let Some(sums) = supplied.filter(|s| s.pages.len() == spec.page_count as usize) else {
-            return self.fail_put(id, Error::new("a window's checksums are missing"));
+        let sums = if put.packed_accepted {
+            Checksums {
+                pages: Vec::new(),
+                row: None,
+            }
+        } else {
+            let Some(sums) = supplied.filter(|s| s.pages.len() == spec.page_count as usize) else {
+                return self.fail_put(id, Error::new("a window's checksums are missing"));
+            };
+            // A multi-process writer cannot state whole-page checksums; the manager computes the
+            // ones the record keeps.
+            if self.ranks.is_none() {
+                for (i, sum) in sums.pages.iter().enumerate() {
+                    put.sums[dest as usize + i] = *sum;
+                }
+                if spec.row {
+                    put.row_sum = sums.row;
+                }
+            }
+            sums
         };
-        // A multi-process writer cannot state whole-page checksums; the manager computes the
-        // ones the record keeps.
-        if self.ranks.is_none() {
-            for (i, sum) in sums.pages.iter().enumerate() {
-                put.sums[dest as usize + i] = *sum;
-            }
-            if spec.row {
-                put.row_sum = sums.row;
-            }
-        }
         let result = put
             .out
             .filled(spec, sums, put.via_channel, self.ranks.is_some());
@@ -524,7 +639,8 @@ impl Engine {
 
     pub(crate) fn on_put_refused(&mut self, refused: wire::PutRefused) {
         if let Some(put) = self.writer.puts.get_mut(&refused.put_id) {
-            put.refused.get_or_insert(refusal(refused.reason));
+            put.refused
+                .get_or_insert(refusal(refused.reason, &refused.detail));
             self.drive_put(refused.put_id);
         }
     }
@@ -574,7 +690,11 @@ impl Engine {
         }
         let put = self.writer.puts.remove(&id).expect("present");
         let outcome = if let Some(bytes) = put.stored {
-            PutOutcome::Stored { bytes }
+            PutOutcome::Stored {
+                bytes,
+                pages: put.chain_pages - put.first_page,
+                linked: put.parent,
+            }
         } else if let Some(outcome) = put.refused {
             outcome
         } else if put.cancelled {
@@ -588,6 +708,9 @@ impl Engine {
     fn commit_put(&mut self, id: u64) {
         let put = &self.writer.puts[&id];
         let metadata = self.put_header(put).and_then(|mut header| {
+            if header.packed.is_some() {
+                return header.packed_metadata();
+            }
             header.row_checksum = put.row_sum.unwrap_or(0);
             let mut bytes = header.encode()?.to_vec();
             let mut sums = vec![0u8; header.checksum_bytes() as usize];

@@ -29,20 +29,24 @@ cite them by number.
 3. **Encryption is declared, not negotiated.** The client selects its connection
    mode before connecting; see [address forms and trust](docs/network-operations.md#addresses-and-startup-warnings).
    For TCP clients, `Hello.encryption` must equal what the client connected with,
-   else the pool is disabled for the process (one warning, local tiers only).
+   else instance startup fails with an encryption-mode error.
    Unix-socket clients trust filesystem permissions and accept either network mode.
    RDMA is not listed in `data_transports` when the manager is TLS.
 4. **Same host is proven by the socket; levels.** `shared_memory` is
    returned only on a Unix-domain socket whose peer uid and gid match the
-   manager's. A session without it uses `DATA_CHANNEL` only. It may be an
-   export source when the manager serves a data channel: its windows are relayed
-   through the manager (section 7.5). Instance-sourced candidates
-   (neighbour GPU = level 2, neighbour DRAM = 3, neighbour NVMe = 4) are offered
-   to every session, whether the copy goes through shared windows or through the
-   manager's relay. Manager-store candidates are offered
-   to every session: a same-host manager's DRAM is level 3 and its NVMe level 4; a
-   remote manager's records (DRAM or NVMe) are level 5. The manager computes the
-   level from the requester's perspective.
+   manager's and whose exit can be watched: a nonzero peer pid, or a pidfd from
+   `SO_PEERPIDFD` (Linux 6.5+). A pid-zero peer without that descriptor receives
+   no shared memory; on older kernels, share a PID namespace or configure
+   `--listen` and connect over TCP for the data channel. A session without shared
+   memory uses `DATA_CHANNEL` only. It may be an export source when the manager
+   serves a data channel: its windows are relayed through the manager (section 7.5).
+   Instance-sourced candidates (neighbour GPU = level 2, neighbour DRAM = 3,
+   neighbour NVMe = 4) are offered to every session, whether the copy goes through
+   shared windows or through the manager's relay. Manager-store candidates are
+   offered to every session: a same-host manager chain is level 3 when every record the
+   claim reads is in DRAM, and level 4 when any requires NVMe. A remote manager's
+   records (DRAM or NVMe) are level 5. The candidate's `tier` is the endpoint's
+   tier; its level reflects the slowest tier read from the requester's perspective.
 5. **Content keys.** A source pins ready content by its scoped prefix key and
    validates the chain shape. Index entries are hints: late evictions can remove
    a fresh hint and cause a miss, but cannot grant ownership or change bytes.
@@ -98,9 +102,10 @@ cite them by number.
     export pinned, subtracts the resources the pin protects once, and uses the
     reservation arithmetic that admission uses, never a copy of it.
 17. **Put is part of the protocol.** The eviction cascade ends in a write into the
-    manager's store. Refusals keep the source local and release its selection.
-    Retrying requires manager progress, reconnect or a short backoff; the model
-    worker never waits for room.
+    manager's store. A DRAM retirement transfers its path root-first. Each
+    predecessor must be confirmed before its child starts. Failed puts release
+    the selection and retain the source path. Claims pin their source through
+    the last transfer window. The model worker continues serving.
 18. **Entries die with their session; its successor announces its own.** When a
     session ends, with or without a successor, the manager removes every entry it
     announced. When a new session opens for the same `instance_id`, the old
@@ -115,9 +120,8 @@ cite them by number.
     `DataChannelRef` and section 7 are fixed here.
 21. **Persisted checksums.** A DRAM or NVMe export serves the checksums
     committed with the record, never hashes of the bytes just read; the manager
-    validates every page and row. When the manager reads a whole record from NVMe
-    into DRAM it checks the record against those checksums and fails the claim
-    `COPY_ERROR` on a mismatch; a window read straight from NVMe into staging is
+    validates every page and row. A restore never reads
+    a whole record from NVMe into DRAM: a window read from NVMe into staging is
     served as it was read, with the persisted checksums, and the requester's check
     is the only one. The manager validates Put metadata against the accepted
     geometry, scope identity, parent, length and its own verification of the
@@ -215,10 +219,13 @@ Manager algorithm for each candidate source entry (endpoint `E` with a row):
 
 1. Skip the requester's own instance and sources the requester cannot reach
    (decision 4), including sources with no export slots. Busy sources are eligible.
-2. Compute the level from the tier and the relation to the requester.
+2. Compute the initial level from the endpoint's tier and the relation to the requester.
 3. `begin` = `resident_tokens` (exact, not page-aligned); the physical start
    is `floor(begin / page_tokens)`. Walk parents from `E` to the node containing
-   that page and require a contiguous chain. A hole gives no candidate.
+   that page and require a contiguous chain. A hole gives no candidate. Manager
+   chains may mix DRAM and NVMe; instance chains must stay in one tier. For a
+   same-host manager, use level 4 if any record the claim reads requires NVMe;
+   otherwise use level 3. The candidate's `tier` remains the endpoint's tier.
 4. Drop it if it supplies no page and no row beyond `begin` (zero pages with the
    row is kept: a row-only tail).
 5. Order by longest match, then fixed copy level and stable source identity; return at most
@@ -228,8 +235,9 @@ Answers: `LOOKUP_OK`, `LOOKUP_NOT_READY` (with `retry_after_ms`),
 `LOOKUP_OVERLOADED` (the session already has `max_concurrent_lookups` lookups
 waiting; answered at once, never queued), `LOOKUP_INVALID`.
 The requester treats every non-OK answer, a timeout, and a lost session as "no
-pool candidates for this request" and admits with its local match. Each request
-owns its lookup ticket.
+pool candidates for this attempt" and can admit with its local match. A queued
+request whose ticket has no answer retries the lookup when selected for
+admission. Each request owns its lookup ticket.
 
 A candidate is a hint. After the reply the client verifies each node against its
 history; any mismatch drops the candidate. Lookup reserves no export slot: another
@@ -336,8 +344,14 @@ requester     manager                     source
 
 Source rule: exactly one `PinAck` per `ExportRequest`; if it is `PINNED`, exactly
 one `ExportEnd` later. The manager frees the source's export slot on `PinAck
-REFUSED` or on `ExportEnd`, never on its own terminal transition (the source may
-still hold the pin). A `PINNED` ack for a terminal claim never produces a grant.
+REFUSED`, on `ExportEnd`, or on session loss while the export is still
+`Requested`, never on its own terminal transition (the source may still hold
+the pin). Session loss ends an unanswered export and releases its slot: no copy
+windows were issued, and `pin_ack` accepts an acknowledgment only while the
+export is `Requested`. The source may still hold a pin it acknowledged on the
+lost session for as long as it remains stalled; it releases the pin after it
+resumes and drains. That pin has no windows, so fencing is unaffected. A `PINNED`
+ack for a terminal claim never produces a grant.
 
 ### Race: late grant
 
@@ -363,7 +377,7 @@ that does not know it (restarted, or the claim was cancelled and forgotten).
 | `WindowReleased` | each (claim, index) returns its credit once |
 | `CopyResult` | first one counts; others ignored |
 | `FenceAck`, `ExportEnd` | first per (claim, party) counts |
-| `PinAck` | first per export counts; a late `PINNED` is released |
+| `PinAck` | counts only while the export is `Requested`; `PINNED` for a terminal claim triggers `ExportCancel`; ignored after session loss ends the unanswered export |
 | `ExportCancel` | idempotent; unknown export answered `ExportEnd{EXPORT_RELEASED, DRAINED}` |
 | `NoticeBatch` | applied in stream order |
 | `PutCancel` | idempotent |
@@ -486,7 +500,11 @@ is not reused until the owning process is confirmed exited, or for the lifetime
 of the manager process if exit cannot be observed (remote sessions). A
 disconnected local process that is still alive keeps its windows quarantined
 (`Core::holders` in `selene-manager/src/pool/claims.rs`; exit is observed through
-the pidfd helpers in `selene-manager/src/local.rs`).
+the pidfd helpers in `selene-manager/src/local.rs`). Visible peer pids from
+`SO_PEERCRED` are watched with `pidfd_open`. When the peer pid is zero because it
+is outside the manager's PID namespace, the accepted Unix socket supplies the
+pidfd through `SO_PEERPIDFD`. Socket closure alone is never exit proof; the pidfd
+becomes readable after the process has fully exited.
 
 - The manager counts quarantined bytes in `selene_pool_quarantined_bytes` and
   logs each quarantine event once (designed, not implemented: it logs only a
@@ -519,8 +537,14 @@ stream carrier by `length` payload bytes, then `END`; for a put `GRANT` from the
 carrier. On the RDMA carrier the payload never travels on the connection: the manager writes a
 claim's window into a private slot the instance lent (`CREDIT`) and then names it in `WINDOW`;
 the manager answers an RDMA `HELLO` with `ACCEPT`, its own queue-pair description. `ABORT` (with
-text) is the manager ending a transfer early.
-Puts and rank legs use the stream carrier. Windows arrive in index
+text) is the manager ending a transfer early. `PACKED_WINDOW` (tag 8) carries the window shape,
+the RDMA destination slot (`NO_SLOT` on stream), a u32 manifest length, the serialized
+`PackedWindow`, and on the stream carrier the stored bytes; on the RDMA carrier the manager writes
+the compressed bytes into the credited slot before naming it in `PACKED_WINDOW`. Writers with
+active compression may attach `PutBegin.packed` (`PackedOffer`) so the manager allocates the
+compressed v4 extent directly in its arena (`PutAccept.packed = true`), grants packed put windows,
+verifies unit checksums on ingest, and flushes the record verbatim to NVMe. Puts and rank legs use
+the stream carrier. Windows arrive in index
 order and are checked by the receiver's coverage exactly as shared windows are, so a transfer that
 ends short or over is a `COPY_ERROR`; `COPY_OK` waits for `END`.
 
@@ -596,13 +620,14 @@ process picks a new incarnation and becomes `READY` after scanning its NVMe
 records.
 
 - A `ClaimRelease`, `FenceAck` or `ExportEnd` that mentions a vanished claim or
-  export is answered (`UNKNOWN_CLAIM`) or ignored. The restarted manager grants
-  none of the previous run's windows: it reuses the same region files and holds
-  them until each process that had a session has reconnected or exited
-  (section 8.6).
+  export is answered (`UNKNOWN_CLAIM`) or ignored. When the manager reuses
+  region files, it holds them for recorded processes after a crash or a clean
+  stop with unfenced windows. Section 8.6 describes release of the hold,
+  including the 60-second bound for pid-zero holders.
 - Records the dead manager held only in DRAM are lost; NVMe records are
-  recovered. A writer drops its source copy at `Stored`, so a lost record cannot
-  be resent; it is recomputed on demand.
+  recovered if their entire parent chain is on disk. A writer may drop its copy
+  at `Stored`, before arena write-back. Losing an acknowledged row or a required
+  ancestor can make a returning request fetch from a peer or recompute the suffix.
 - Readiness does not wait for previous instances; source hints return as they resync.
 
 ### 8.3 Requester restart
@@ -633,7 +658,9 @@ On stream end or process exit the manager:
 
 1. removes the source's entries immediately (decision 18) so no new lookup offers
    them;
-2. fails every claim served by it `SOURCE_LOST`;
+2. fails each nonterminal claim served by it `SOURCE_LOST` and ends every
+   unanswered (`Requested`) export, including those of terminal claims,
+   releasing their export slots; these exports have no issued windows;
 3. quarantines the windows in `SOURCE_WRITE` until the source process is
    confirmed exited. Windows in `REQUESTER_READ` hold valid bytes the source
    does not touch and follow the requester's fence;
@@ -647,13 +674,20 @@ dying: a hold protects against eviction only (`ClaimGranted` in selene.proto).
 
 ### 8.5 Session loss summary
 
+Source session loss ends every unanswered (`Requested`) export and releases its
+slot, whether its claim is still active or already terminal. No windows were
+issued for these exports. A shared-memory source's pinned exports retain their
+drain and quarantine requirements; a channel source's export ends with its
+session, because it reaches its windows only through the manager's handler,
+whose exit fences them. An already terminal claim keeps its original reason.
+
 | Event | Claims as requester | Claims as source | Entries | Windows |
 |---|---|---|---|---|
 | stream ends, process gone | `REQUESTER_LOST` | `SOURCE_LOST` | removed | reclaimed (exit confirmed) |
 | stream ends, process alive | `REQUESTER_LOST` | `SOURCE_LOST` | removed | quarantined until fence acks arrive on a new session or the process exits |
 | superseded by a reconnect (same process) | `REQUESTER_LOST` | `SOURCE_LOST` | removed; the new session's snapshot announces its own | as above; the old stream's fence acks are accepted on the new session |
 | superseded by another process (same `instance_id`) | `REQUESTER_LOST` | `SOURCE_LOST` | removed; the new session's snapshot announces its own | quarantined until the old process's exit is confirmed; the new process attests nothing for it |
-| manager restart | all dead | all dead | gone | the same region files, held until the previous run's processes have reconnected (drained) or exited (8.6) |
+| manager restart | all dead | all dead | gone | the same region files, held for previous-run processes under 8.6, with a 60 s bound for pid-zero holders |
 
 ### 8.6 Persistent shared regions
 
@@ -678,8 +712,9 @@ running instances must restart to use the pool. Only these definite mismatches
 recreate the files; an unexpected I/O error during the check (an interrupted
 `fallocate` is retried) fails the start and deletes nothing. The lock decides
 ownership, so a live manager's files are never reclaimed and another instance's
-directory is never read. Startup refuses region files owned by another user or symbolic links, and
-removes only its unfinished `generation.tmp` and `holders.tmp` metadata writes.
+directory is never read. Startup refuses region files owned by another user or
+symbolic links, and removes its unfinished `generation.tmp`, `holders.tmp`
+and `last-shutdown.tmp` metadata writes.
 Other files are left alone. Shutdown retains the regions for reconnecting clients.
 
 **Client.** A client uses the pool only with the regions it registered:
@@ -690,34 +725,52 @@ Other files are left alone. Shutdown retains the regions for reconnecting client
   back the pool. It disables the pool for the process (local tiers only, one
   warning) and never registers late. Restarting the instance picks up the new
   regions;
-- manager unreachable at the first connect: it waits a bounded time, then runs
-  local-only for the life of the process and never attaches later.
+- manager unreachable at the first connect: it waits up to 30 seconds, then
+  fails startup. Registration failure, session-opening timeout and rejected memory
+  approval also fail startup; the operator must correct the cause or remove
+  `--prefix-cache-pool` to run local-only.
 
 **Why reuse is safe.** Reusing the files gives up what files created per
 incarnation would guarantee: that no access under the dead manager can alias a
 window of the new one. Physical fencing (7.1) is kept by the following rule. The
-manager records the pid and start time of every process with a local session, in
-a file that survives a crash. When it starts on reused regions, each recorded
-process that is still the same live process is a previous-run holder, and the
-manager takes the whole of both regions out of service (no window, put extent or
-record can be allocated in them) until every such holder has either
+manager records the pids and start times of visible-pid sessions and
+shared-memory ranks, and the process nonces of pid-zero shared-memory sessions
+and ranks, in a file that survives a crash. At a clean stop it keeps the
+registration of each process with a pending or quarantined shared window.
+This includes a requester whose claim ended before it fenced its window.
+When the manager reuses the regions, each recorded visible process that is still
+the same live process, and every recorded pid-zero process, is a previous-run
+holder. The manager takes the whole of both regions out of service (no window,
+put extent or record can be allocated in them) until every holder is released:
 
-1. exited, as its pidfd reports (the 7.4 quarantine rule: memory returns when
-   the owning process is confirmed gone), or
-2. opened a new session. A client opens one only after step 3 of 8.1: it has
-   failed its claims and every copy it submitted under the old incarnation has
-   completed on every rank. Old-epoch windows are not referred to by the new
-   incarnation (stale messages are rejected by `manager_incarnation`), so after
-   that nothing of the old epoch can write.
+1. A visible-pid holder is released when its pidfd reports exit, or when it opens
+   a new session. A visible process that cannot be watched keeps its hold until
+   it reconnects; there is no time limit for visible-pid holders.
+2. A pid-zero holder is released when its nonce opens a new session or rank
+   attachment, or 60 seconds after manager startup (`PID_ZERO_HOLD`), whichever
+   comes first. Its pidfd does not survive a restart, so the manager cannot
+   observe its exit. At expiry the manager logs the released nonce prefixes in
+   one line.
 
-While the hold lasts a claim is refused at once with `REGIONS_HELD`, not `NO_WINDOWS`. It ends as soon as the last recorded holder has reconnected or exited, not on a timer. A requester that gets it claims again after a short wait (250 ms), within the restore's own deadline, and recomputes only when that passes.
+A reconnect follows step 3 of 8.1: the client has failed its claims and every copy
+it submitted under the dead incarnation has completed on every rank. Stale
+messages are rejected by `manager_incarnation`, so no further copy is submitted
+under that incarnation. A live client drains its copies when its session ends,
+even if it never reconnects; this bounds its writes from the previous run. The
+60-second pid-zero hold allows that drain and prevents a dead client, whose
+replacement has a different nonce, from holding the regions indefinitely. This
+bound assumes the live client's session-loss detection and copy drain finish
+within 60 seconds of manager startup; it is not proof of process exit.
 
-A holder that is alive but never reconnects, or whose exit cannot be observed,
-keeps the regions held: the same outcome as a quarantined window in 7.4, at region
-size, and visible as `REGIONS_HELD`. A process that was not recorded cannot have a
-window of the old epoch, so it needs no wait. Recreated files need no hold: they
-are different files that no old mapping can reach. When the hold ends the
-allocators are fresh, so every window of the old epoch is free by construction.
+While the hold lasts a claim is refused at once with `REGIONS_HELD`, not
+`NO_WINDOWS`. It ends as soon as the last holder is released. A requester that
+gets it claims again after a short wait (250 ms), within the restore's own
+deadline, and recomputes only when that passes.
+
+A process that was not recorded cannot have a window of the dead incarnation,
+so it needs no wait. Recreated files need no hold: they are different files that
+no existing mapping can reach. When the hold ends the allocators are fresh, so
+every window of the previous run is free by construction.
 
 ## 9. Single-source restores
 
@@ -750,6 +803,8 @@ published. Waiting restores use the bounded claim-slot queue.
 | No progress | 3 s | manager | `FAILED{NO_PROGRESS}` |
 | Concurrent lookups per session | 8 | manager | `LOOKUP_OVERLOADED` |
 | Candidates, nodes, boundaries | 8, 4096, 8192 | both | trimmed (client) or `LOOKUP_INVALID` (manager) |
+| Ancestor keys per put | 4096 | manager | keys after the first 4096 are not considered |
+| Records in a chain before a put starts a new root | 2048 | manager | a put with a row is stored as a root with its complete chain; a page-only put is refused `INVALID` with the detail "page-only put has no held ancestor it can link to" |
 
 - Exports run on the lowest-priority copy stream.
 - A refusal is a normal outcome. The requester claims again 250 ms after a
@@ -773,23 +828,97 @@ writer                          manager
  PutFilled{i, xxh3} ----------->|  verified by the manager
  ...
  PutCommit{metadata} ---------->|
- <------ Stored{bytes}          |  committed, indexed: the writer may drop its copy
- or  <-- PutRefused{reason}     |  PRESENT is success; refusals keep the source local
+ <------ Stored{bytes}          |  indexed and available to serve. The writer may drop its copy
+ or  <-- PutRefused{reason}     |  PRESENT is success; other reasons follow pressure policy
 ```
 
 - `PutCancel` is legal only before `PutCommit`. Unfilled windows stay leased to
   the writer until `FenceAck{put_id}` or process exit.
-- "Already held means committed": `Stored` and `PRESENT` are the only answers
-  that let the writer remove its local copy after a handover. All refusals,
-  synchronous submission errors and repeated failures retain the source.
-- **Pressure policy.** `BUDGET` may mean temporary staging or arena pressure,
-  not a full manager. Every refusal releases selection and retries only after
-  a manager or put event, a reconnect or a short backoff. Queue bounds stop
-  selection before pinning. Unavailable or busy managers leave local LRU eviction
-  as the end of the chain; only the manager's own LRU drops its committed data.
-  Manager loss releases waiting selections through the failed-move path. Moves
-  already started keep their move and export pins until the drained terminal
-  event. The model worker never waits for these operations.
+- For a record not already indexed, `PutBegin.ancestor_keys` walks the local
+  chain, listing each record's nearer offered ancestors before its local parent
+  and ending with the root's offered ancestors. An offered ancestor is a GPU
+  checkpoint on the record's parent chain that the producer has already
+  published to its host tiers, whether or not any tier stored it.
+  The writer sends a strictly descending list of at most `MAX_CHAIN_NODES`
+  (4,096) keys; the manager considers at most the first 4096 keys and chooses
+  the first ready ancestor whose pages it holds, including a page-only ancestor. `PutAccept`
+  names that parent and its chain-relative end page as `first_page`.
+  The writer sends the remaining pages and the accepted endpoint row, if any.
+  If no ancestor is held, the manager selects no parent and `first_page = 0`, and the writer sends the
+  complete chain as a root. If the chosen ancestor's chain has at least 2048
+  records, the manager also selects a root, so no stored chain exceeds half of
+  the lookup and claim limit of 4096 records. Admission can also select a root
+  under arena pressure.
+  An absent or empty list uses `published_parent` alone and requires that parent
+  to be ready; it never links to an uncommitted parent. Managers that do not
+  implement field 10 ignore the list and use `published_parent` alone.
+- The writer supplies the scheduler's capture role in `PutBegin.capture_role` (field 11).
+  Message and Anchor captures keep their exact recurrent rows. Roots and forks
+  retain available rows regardless of capture role. A newly discovered fork can regain a missing row while a writer still holds it. The writer supplies its
+  local child count in `child_paths` (12) and the next child on the retiring
+  path in `next_child` (13). The manager
+  also counts committed children, counting a known next child only once.
+  The writer sets `descendant_row` (14) when a ready descendant on the
+  unbranched path can offer a row after the same-page rule. Absent means false.
+  These topology hints apply to this put. Only the capture role is persisted.
+- The manager can omit a single-child interior Endpoint row when the writer
+  sets `descendant_row`. Otherwise the same-page rule applies. A covered child
+  alone cannot justify dropping the ancestor that covers it. `PutAccept.record_bytes` is the exact length of the chosen record,
+  including its header. The writer checks that length against the page-only
+  and row-bearing layouts before opening rank transfers. When a child commits,
+  an arena-only Endpoint ancestor can release its former tip row once active claims drain and a committed descendant row covers the unbranched path.
+- An Endpoint tip keeps its row unless a row-bearing ancestor on its path
+  has the same completed-page count. Flare checks when offering the row and
+  the manager checks its chosen parent chain at put time. Two protected
+  boundaries in one page each retain their own row for exact rewinds.
+- An explicit `row=false` put requires a held parent. A missing parent is
+  `INVALID`. Arena pressure that requires a root instead is `BUDGET`. A parent
+  whose chain has at least 2048 records does not count, because the put would
+  then start a new root and a root needs a row: a page-only put there is
+  `INVALID` with the detail "page-only put has no held ancestor it can link to",
+  while a put with a row is stored as a root.
+  A put with zero new pages and no retained row returns `PRESENT` because
+  its parent already covers it.
+- A rowless re-put of a held record returns `PRESENT`. A writer with a newly
+  protected row can upgrade a held page-only record at that exact key. If
+  every holder has released the row, a later capture can supply it. Restore
+  starts at the deepest retained row and prefills the remaining suffix.
+- Under disk pressure, the manager can reclaim a durable interior Endpoint row
+  if its only child has a durable row. Roots, forks and protected roles keep available rows.
+- The manager echoes the accepted capture role in `PutAccept.capture_role` (field 8).
+  The writer puts that value in header flag bits 8 and 9. Zero identifies
+  records from peers without role support and preserves their available
+  rows until a role-aware writer rewrites the record. A legacy writer still
+  commits zero role bits. If the manager already knows the role, it preserves
+  it in the stored header after validating the commit. Record layout, rank
+  geometry and replication flags keep their wire meanings. Older readers can open the same files.
+- `PutGrant` window page numbers count from the accepted record's first page
+  (`PutAccept.first_page` is chain-relative), for every writer and rank agent.
+- `Stored` means the manager can serve the indexed record from its arena
+  or from disk. Arena puts can be acknowledged before write-back. `PRESENT`
+  can also mean an empty put is already covered by its parent.
+- A put that conflicts with another put of the same key, or needs to replace a
+  pinned or disk-busy record, waits for admission. Each continuous conflict
+  starts one wait in `selene_put_inflight_waits_total`. Once the conflict
+  clears, a later conflict starts a fresh five-second wait. Time queued for
+  write-back to free arena space is excluded.
+- `selene_put_inflight_wait_max_seconds` is the longest individual conflict
+  wait since manager startup among puts admitted (including upgrades) or
+  answered `PRESENT`. A put still blocked at its deadline receives `INFLIGHT`
+  and increments `selene_put_inflight_expired_total`. A writer whose own
+  store connection pins the key receives `INFLIGHT` immediately. Both
+  refusals count in `selene_puts_total{outcome="inflight"}`. With one writer
+  process per manager, the own-pin rule limits waiting to write-back,
+  compaction and same-key puts.
+- **Pressure policy.** A DRAM handoff sends predecessors root-first. An
+  ancestor refused with `INVALID` or `OVERSIZE` triggers a leaf-only put.
+  `BUDGET` and `INFLIGHT` retry once before the same fallback. If the
+  leaf exhausts its retry or the leaf-only put is refused for one of these
+  reasons, the writer drops the leaf. A shared fork stays available to
+  its other children. A manager with a disk root reclaims clean arena duplicates
+  first. Evicting a dirty record writes its undurable predecessors first.
+  A record larger than the arena streams through staging. Full or pinned
+  storage can refuse admission with `BUDGET`.
 - **Validation.** Before indexing, the manager checks the
   `PutCommit` metadata against the accepted geometry, the scope identity, the
   accepted parent and first page, the record length, and the checksums it
@@ -820,6 +949,8 @@ wire service; the store has none of its own.
   burst on one session beyond `max_concurrent_lookups` is refused `LOOKUP_OVERLOADED` at once.
 - **Manager-store entries.** The manager's own store appears in each scope's index as the
   manager's entries (tier DRAM or NVMe; records recovered after a restart start on NVMe).
+  Manager chains may mix both tiers; instance chains may not. A candidate's `tier`
+  names its endpoint's tier, while its level reflects the slowest tier the claim reads.
 - **Windows.** An instance-to-instance claim reserves one staging block for the whole export
   (its size rounds up to the allocator's size class), cut into windows by the pinned records.
   A host-tier source whose export does not fit streams with `window_credits`. Windows for the
@@ -893,7 +1024,7 @@ be granted nothing, but their open streams can attest and say goodbye. A new att
 requires a live rank-0 session. Stream loss retains shared-window obligations until the
 process exits. A restarted manager has no record of these obligations: it keeps them in
 memory only. Section 8.6 states how region files it reuses are held for the previous run's
-session processes.
+session processes and shared-memory ranks.
 
 **13.4 Windows and checksums.** A multi-process source states, per rank, slice transfer
 checksums (`RankSums`): rank 0's `WindowFilled.rank_sums`/`PutFilled.rank_sums` for itself and
@@ -913,3 +1044,87 @@ record the manager rewrites with the checksums it computed.
 Rank legs and puts use TCP. Each transfer owns its queue pair, whose destruction fences all
 outstanding work before its handler reports `Closed`. The manager never advertises its region
 keys or addresses; only the instance's private transfer staging is remotely writable.
+
+### Opaque checkpoint envelopes (revision 4)
+
+`OpenSession.codec` (9) and `SessionOpened.codec` (7) negotiate an envelope revision and a set
+of 32-byte receive-profile digests. An absent acknowledgement permits raw transfers only. A
+rank offers its capabilities in `RankAttach.codec` (7) and receives the acknowledgement in
+`RankAttached.codec` (4). Every process of an instance must offer identical capabilities. A
+mismatched attach is refused before it can supersede the live rank. Packed windows use shared
+memory, a TCP stream, or credited RDMA slots (`PACKED_WINDOW` with a non-`NO_SLOT` slot).
+
+Instance holdings may be raw or packed, and `PutBegin.packed` (15) may supply pre-encoded
+packed units (`PutAccept.packed` confirms acceptance). For manager-owned records, lookup
+requires the receiver to support every packed profile in the chain. A claim repeats this check
+on the pinned records. `Record.packed` (6) describes each selected suffix in the grant. Units
+are ordered by absolute page index and stored rank, followed by the endpoint row's ranks. Each
+unit names its replica destinations. A literal carries the original bytes and their XXH3. A
+packet carries its profile and CRC-32/IEEE checksums of the stored and original bytes.
+
+`WindowSpec.packed` (9) identifies the units in a shared window. TCP tag 8 carries the
+little-endian window shape, a little-endian u32 manifest length, a protobuf `PackedWindow` and
+the selected bytes. Each rank receives the units it owns or replicates. A window contains whole
+pages or an indivisible row and retains its source until release and fencing. The reader checks
+the manifest against the pinned selection, checks stored bytes before decode, and checks the
+original CRC before publishing the restore.
+
+The first 4,096-byte disk block uses the raw common fields through creation time at offset 165.
+Version is 4, and the raw row checksum field is zero. At offsets 173, 181, 185 and 189 are the
+directory offset (u64, 4096), directory length (u32), directory CRC-32/IEEE (u32), and
+untruncated physical record length (u64). The directory is a protobuf message with repeated
+RankPlanes at 1 and PackedOffer at 2. It is bounded to 2 MiB, 16,384 units and 64 ranks. The
+payload follows immediately. Physical offsets are checked prefix sums. Actual EOF at or beyond
+the end of the pages but short of the complete row means page-only. EOF within the pages or
+directory is invalid. Compaction truncates at the row offset. A refill publishes a replacement
+record. The directory is immutable, including after a truncate. Disk write-back and shutdown
+publish the physical file length from the chosen header.
+
+### Lossless packet format
+
+A packet encodes one rank's block-padded share of one page or continuation
+row. Layout revision 1 names the packet profile `ZKV1/v1/64-pivots`.
+All header and directory words are little-endian u32. The 16-byte header
+contains the four bytes `ZKV1`, version 1, the frame count and the original
+byte length. Each 4-byte directory entry stores the frame's payload length in
+bits 0–30 and sets bit 31 when the frame is stored literally without
+compression. Frame payloads follow the directory in order with no gaps or
+trailing bytes. Decoders derive frame boundaries from the declared layout and
+validate every header field and frame length before decoding.
+
+Matrix fields (`encoding = 1`) are grouped up to four 128 × 128 binary32
+matrices per frame. Each matrix runs a bit-exact 64-pivot low-rank predictor,
+splits residual widths (`0..=32`) into four little-endian `u16` lane word
+counts, each followed by that many `u32` low-bit words, and compresses the
+concatenated group widths as a standard Zstandard frame.
+Non-matrix fields are chunked up to 64 KiB per frame, apply byte-lane shuffle
+or compound page value/scale split-shuffle, and compress each frame as a
+standard Zstandard frame. Any frame whose encoded payload is not smaller than
+its raw bytes is stored literally with bit 31 set.
+
+The GPU codec profile `GKV1/v2/64-pivots-rans32` uses the same field
+transforms and bit-exact 64-pivot matrix predictor, coalesces transformed
+streams into 64 KiB chunks, and compresses each chunk with a 32-way
+warp-interleaved 12-bit static rANS coder (RLE, sparse table, dense table, or
+literal fallback). A `GKV1` packet begins with a 24-byte header of six
+little-endian `u32` words (`GKV1`, version 2, `original_bytes`, `num_chunks`,
+`num_mats`, and `low_bytes`), followed at byte 24 by the `num_chunks`-word
+`u32` chunk directory (bits 0–30 carry payload length; bit 31 marks a literal
+chunk), then `num_mats * 4` little-endian `u16` matrix low-bit lane word
+counts, then chunk payloads, and finally `low_bytes` of 4-lane low-bit
+payloads. Both `cpu` and `gpu` modes decode `GKV1` and `ZKV1` packets and
+verify stored and original CRC-32/IEEE checksums before publishing restored
+bytes.
+
+| Field encoding | Storage in one block |
+|---|---|
+| 0 | One uninterpreted byte |
+| 1 | One 128 × 128 binary32 matrix, 65,536 bytes, aligned to four bytes. The predictor uses 64 pivots. |
+| 2 | One bfloat16 element, two bytes |
+| 20, 32 | One convolution history entry of ten or sixteen bfloat16 elements (20 or 32 bytes), transposed by byte lane |
+| 40 | 256 rows of 512 FP8 values and four binary32 scales per row, 135,168 bytes |
+| 41 | 64 rows of 128 FP8 values followed by 64 binary32 scales, 8,448 bytes |
+| 42 | 64 rows of 512 FP8 values, 32,768 bytes |
+| 45 | 64 rows of 512 packed FP4 data bytes and 16 scale bytes, 33,792 bytes |
+| 47 | 64 rows of 256 packed FP4 data bytes and 32 scale bytes, 18,432 bytes |
+| 48 | 128 rows of 512 FP8 latent values and 64 FP8 key values per row, 73,728 bytes |

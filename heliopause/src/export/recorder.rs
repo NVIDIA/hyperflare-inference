@@ -509,15 +509,20 @@ unsafe fn elf_image(address: *const u8) -> ExportResult<Option<Vec<u8>>> {
     if address.is_null() {
         return Ok(None);
     }
-    let header = unsafe { std::slice::from_raw_parts(address, 64) };
-    if !header.starts_with(b"\x7fELF\x02\x01") {
-        return Ok(None);
+    // Check the 6-byte ELF64 little-endian magic one byte at a time so a short
+    // NUL-terminated PTX string (< 64 bytes) stops before reading past its end.
+    const ELF64_LE_MAGIC: [u8; 6] = *b"\x7fELF\x02\x01";
+    for (index, expected) in ELF64_LE_MAGIC.iter().enumerate() {
+        if unsafe { *address.add(index) } != *expected {
+            return Ok(None);
+        }
     }
+    let header = unsafe { std::slice::from_raw_parts(address, 64) };
     let u16at = |p| u16::from_le_bytes(header[p..p + 2].try_into().unwrap()) as usize;
     let u64at = |p| u64::from_le_bytes(header[p..p + 8].try_into().unwrap()) as usize;
     let offset = u64at(40);
     let count = u16at(60);
-    if u16at(58) != 64 || count == 0 {
+    if u16at(58) != 64 || count == 0 || offset < 64 {
         return Err(invalid("unsupported cubin ELF section table"));
     }
     let mut end = offset
@@ -1613,5 +1618,16 @@ mod tests {
         assert!(state.error.is_none(), "{:?}", state.error);
         assert!(state.modules.is_empty());
         assert!(state.libraries[&0x10].image.is_none());
+    }
+
+    #[test]
+    fn elf_image_stops_on_short_non_elf_buffers() {
+        assert!(unsafe { elf_image(std::ptr::null()) }.unwrap().is_none());
+        let empty_ptx = [0u8; 1];
+        assert!(unsafe { elf_image(empty_ptx.as_ptr()) }.unwrap().is_none());
+        let short_ptx = b".version 8.0\0";
+        assert!(unsafe { elf_image(short_ptx.as_ptr()) }.unwrap().is_none());
+        let partial_magic = b"\x7fELF\x01\0";
+        assert!(unsafe { elf_image(partial_magic.as_ptr()) }.unwrap().is_none());
     }
 }

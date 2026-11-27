@@ -8,12 +8,17 @@
 
 use crate::{
     Result,
-    output::tagged::{ToolDialect, parameter_value},
+    output::tagged::{RawArguments, ToolDialect, parameter_value, strict_nonstring_raw},
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 #[cfg(test)]
 use crate::output::tagged::{OutputConfig, TaggedOutput};
+
+/// The argument tags that `ArgumentTags::parse` reads. They are markers of the parser that
+/// `ToolDialect` does not carry; `OutputPipeline::declared_markers` lists them.
+pub(crate) const ARGUMENT_MARKERS: [&str; 4] =
+    ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"];
 
 pub struct ArgumentTags;
 impl ToolDialect for ArgumentTags {
@@ -23,6 +28,9 @@ impl ToolDialect for ArgumentTags {
     const CLOSE: &'static str = "</tool_call>";
 
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>> {
+        Self::parse_candidate(body, tools)?.ok_or_else(|| "incomplete JSON argument".into())
+    }
+    fn parse_candidate(body: &str, tools: &[Value]) -> Result<Option<Vec<(String, String)>>> {
         let body = body.trim();
         let split = body.find("<arg_key>").unwrap_or(body.len());
         let name = body[..split].trim();
@@ -34,11 +42,12 @@ impl ToolDialect for ArgumentTags {
             .iter()
             .filter_map(|tool| tool.get("function"))
             .find(|function| function.get("name").and_then(Value::as_str) == Some(name));
+        let strict = function.is_some_and(|f| f["strict"].as_bool() == Some(true));
         let properties = function
             .and_then(|function| function.get("parameters"))
             .and_then(|parameters| parameters.get("properties"))
             .and_then(Value::as_object);
-        let mut arguments = Map::new();
+        let mut arguments = RawArguments::new();
         while !rest.trim().is_empty() {
             let key = rest
                 .trim_start()
@@ -54,21 +63,30 @@ impl ToolDialect for ArgumentTags {
                 .trim_start()
                 .strip_prefix("<arg_value>")
                 .ok_or("GLM argument requires a value tag")?;
+            let schema = properties.and_then(|p| p.get(key));
+            let Ok(container) =
+                super::tagged::container_parameter(value, schema.filter(|_| strict))
+            else {
+                return Ok(None);
+            };
+            if let Some((parsed, remaining)) = container
+                && let Some(next) = remaining.strip_prefix("</arg_value>")
+            {
+                arguments.insert(key.to_owned(), parsed);
+                rest = next;
+                continue;
+            }
             let (value, tail) = value
                 .split_once("</arg_value>")
                 .ok_or("unterminated GLM argument value")?;
-            arguments.insert(
-                key.to_owned(),
-                parameter_value(value, properties.and_then(|p| p.get(key)))?,
-            );
+            if let Some(raw_json) = strict_nonstring_raw(value, schema.filter(|_| strict)) {
+                arguments.insert(key.to_owned(), raw_json);
+            } else {
+                arguments.insert_value(key.to_owned(), &parameter_value(value, schema)?)?;
+            }
             rest = tail;
         }
-        Ok(vec![(
-            name.to_owned(),
-            serde_json::to_string(&arguments).map_err(|error| {
-                crate::FrontendError::Input(crate::Failure::caused_by(error.to_string(), error))
-            })?,
-        )])
+        Ok(Some(vec![(name.to_owned(), arguments.to_json_string()?)]))
     }
     fn starts_call(text: &str) -> Option<bool> {
         // Calls continue with the function name and an argument key or closing tag;
@@ -120,6 +138,30 @@ mod tests {
                 "items":{"type":"array"}, "options":{"type":"object"}, "empty":{"type":"null"}
             }}}})],
         }
+    }
+
+    #[test]
+    fn declared_markers_are_the_tags_the_parser_reads() {
+        let [key, key_end, value, value_end] = ARGUMENT_MARKERS;
+        let parsed = ArgumentTags::parse(
+            &format!("run{key}text{key_end}{value}hello{value_end}"),
+            &config().tools,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            [("run".to_owned(), r#"{"text":"hello"}"#.to_owned())]
+        );
+        let syntax = serde_json::from_str::<crate::model::PreparedContract>(include_str!(
+            "../../tests/support/contracts/glm53.json"
+        ))
+        .unwrap()
+        .frontend;
+        let declared = crate::output::OutputPipeline::declared_markers(&syntax);
+        assert!(
+            ARGUMENT_MARKERS.iter().all(|tag| declared.contains(tag)),
+            "{declared:?}"
+        );
     }
 
     #[test]

@@ -161,6 +161,8 @@ impl SchedulerView {
                     matches!(
                         kind,
                         GraphKind::Prefill
+                            | GraphKind::TerminalPrefill
+                            | GraphKind::ScoredPrefill
                             | GraphKind::Decode
                             | GraphKind::Speculative
                             | GraphKind::Vision
@@ -456,6 +458,7 @@ fn ms(ns: u64) -> f64 {
 fn shape(graph: &GraphLabel) -> String {
     let name = match graph.kind {
         GraphKind::ScoredPrefill => "scored prefill",
+        GraphKind::TerminalPrefill => "terminal prefill",
         GraphKind::Prefill => "prefill",
         GraphKind::Decode => "decode",
         GraphKind::Speculative => "speculative",
@@ -486,7 +489,7 @@ fn shape(graph: &GraphLabel) -> String {
 
 fn kind_style(kind: GraphKind) -> (&'static str, Color) {
     match kind {
-        GraphKind::Prefill | GraphKind::ScoredPrefill => ("P", CYAN),
+        GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => ("P", CYAN),
         GraphKind::Decode => ("D", GREEN),
         GraphKind::Speculative => ("S", PURPLE),
         GraphKind::Mixed => ("M", CYAN),
@@ -657,11 +660,20 @@ mod tests {
     #[test]
     fn scheduler_pane_renders_at_terminal_sizes_with_legible_units_and_no_nan() {
         let (view, metrics, history) = fixture();
+        let worker = super::worker::WorkerView::default();
         for (width, height) in [(150, 38), (100, 30), (80, 24), (40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
-                    render_pane(frame, "Qwen", &history, &view, &metrics, Pane::Scheduler)
+                    render_pane(
+                        frame,
+                        "Qwen",
+                        &history,
+                        &view,
+                        &worker,
+                        &metrics,
+                        Pane::Scheduler,
+                    )
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();

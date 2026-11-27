@@ -15,6 +15,47 @@ pub struct PoolOptions {
     pub ca: Option<std::path::PathBuf>,
 }
 
+impl PoolOptions {
+    /// Check reachability and Hello before loading weights; registers no memory.
+    pub fn reach(&self, wait: std::time::Duration) -> crate::Result<()> {
+        use super::{Roots, conn, startup};
+        use std::sync::{Arc, atomic::AtomicBool};
+        let link = conn::Link {
+            address: pool_address(&self.address)?,
+            ca: self.ca.clone(),
+            roots: Roots::System,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            startup: Arc::new(startup::Startup::new()),
+            approve: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| crate::Error::caused_by("cannot start the pool runtime", error))?;
+        runtime.block_on(async {
+            let mut reason = startup::NO_CONNECTION_ATTEMPT.to_string();
+            let result = tokio::time::timeout(wait, async {
+                let mut backoff = conn::FIRST_BACKOFF;
+                loop {
+                    match conn::reach(&link, conn::HELLO_TIMEOUT).await {
+                        Ok(_) => return Ok(()),
+                        Err(conn::Attempt::Disabled(why)) => return Err(crate::Error::new(why)),
+                        Err(conn::Attempt::Retry(why)) => reason = why,
+                        Err(conn::Attempt::Ended) => {}
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(conn::MAX_BACKOFF);
+                }
+            })
+            .await;
+            result
+                .unwrap_or_else(|_| Err(startup::reach_timeout(wait, &reason)))
+                .map_err(startup::attachment_error)
+        })
+    }
+}
+
 /// Accept a Unix socket, plain TCP address, or explicit TLS address.
 pub fn parse_pool_address(text: &str) -> std::result::Result<String, String> {
     pool_address(text).map(|_| text.to_owned())
@@ -73,11 +114,16 @@ pub(super) fn pool_scope(
 ) -> crate::Result<crate::shared::Scope> {
     let mut scope = crate::shared::Scope::new(identity, geometry::fingerprint(geometry), geometry)?;
     for rank in &mut scope.geometry.ranks {
-        for bytes in rank.plane_bytes.iter_mut().chain([&mut rank.row_bytes]) {
-            *bytes = bytes.div_ceil(geometry::BLOCK_BYTES) * geometry::BLOCK_BYTES;
-        }
+        pad_pool_rank(&mut rank.plane_bytes, &mut rank.row_bytes);
     }
     Ok(scope)
+}
+
+/// A session advertises each plane and row at its stored, block-aligned size.
+pub fn pad_pool_rank(planes: &mut [u64], row: &mut u64) {
+    for bytes in planes.iter_mut().chain([row]) {
+        *bytes = bytes.next_multiple_of(geometry::BLOCK_BYTES);
+    }
 }
 
 #[cfg(test)]

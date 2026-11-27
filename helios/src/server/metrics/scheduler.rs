@@ -114,6 +114,10 @@ impl SchedulerMetrics {
         );
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
     pub fn start(&self) {
         self.buffer.get_or_init(|| {
             Mutex::new(TraceBuffer {
@@ -132,7 +136,7 @@ impl SchedulerMetrics {
     }
 
     fn write(&self, update: impl FnOnce(&mut TraceBuffer)) {
-        if !self.enabled.load(Ordering::Relaxed) {
+        if !self.is_enabled() {
             return;
         }
         let Some(buffer) = self.buffer.get() else {

@@ -35,11 +35,92 @@ starts the pool at load time (`pool.rs`).
 Host offload requires explicit configuration: `flare run` retains no host
 records unless a memory size, disk directory, or pool is configured. Derived
 default sizes and a default record directory are designed, not implemented
-(section 2.11). Host offload does not change the contracts of preparation,
-captured graphs, or the runtime core format. The
+(section 2.11). Preparation can include an optional codec layout for qualified
+recipes. Captured graphs continue to use the raw checkpoint layout. The
 [core design](core-design.md#4-prefix-checkpoints-and-complete-model-state)
 defines checkpoint contents and ownership; the [CLI design](cli-design.md)
 defines configuration precedence.
+
+## 0. Lossless KV compression
+
+Flare supports two lossless checkpoint compression modes selected at serving
+time with `--lossless-kv-compression` (requiring at least one configured offload
+tier: `--prefix-cache-memory`, `--prefix-cache-disk`, or `--prefix-cache-pool`):
+
+- `cpu` (profile revision `ZKV1/v1/64-pivots`): copies raw pages and
+  continuation rows from VRAM into pinned staging on capture, encodes each unit
+  with the 64-pivot matrix predictor and 64 KiB Zstd frames on a bounded CPU
+  worker pool (half the host CPUs, clamped to `[1, 24]`), and decodes both
+  `ZKV1` and `GKV1` restores on the same worker pool before host-to-device copy.
+- `gpu` (profile revision `GKV1/v2/64-pivots-rans32`): runs the 64-pivot
+  predictor, 4-lane bit packing, 32-way warp-interleaved 12-bit static rANS,
+  on-GPU packet assembly, and parallel GPU CRC32 directly on each rank's
+  lowest-priority CUDA transfer stream using a compact 3-buffer aliased
+  per-rank GPU workspace budgeted before KV cache sizing. Only compressed bytes
+  cross PCIe during capture and GPU-decoded restores, while small non-matrix
+  restores (< 256 KiB) or mutex-contended restores decode on the bounded CPU
+  worker pool over async HtoD DMA, with zero external runtime libraries beyond
+  `libcuda.so.1`.
+
+Both modes compress at the VRAM-to-DRAM boundary and keep compressed bytes
+across local DRAM (`MemoryStore`), local disk (`DiskStore`, standalone or
+composite `--prefix-cache-memory` + `--prefix-cache-disk`), manager DRAM
+(`selene-manager` arena), NVMe record files, shared-memory windows, TCP
+streams, and RDMA claims. After capturing a packed record into local DRAM
+slabs, `MemoryStore` compacts the compressed payloads and releases unused
+trailing slabs; `CompositeStore` spills those compressed units verbatim into v4
+`.ckpt` files on `--prefix-cache-disk` and promotes v4 `.ckpt` files back into
+packed DRAM slabs without re-encoding. Standalone `--prefix-cache-disk`
+captures compressed units from VRAM directly into v4 `.ckpt` files and restores
+v4 `GKV1`, v4 `ZKV1`, and raw v1–v3 `.ckpt` files across restarts. When
+retiring packed records from local memory or local disk to `selene-manager`,
+Flare sends `PutBegin.packed`; the manager sizes the arena allocation to the
+compressed v4 extent, verifies unit checksums on ingest, and flushes the v4
+record verbatim to NVMe without re-encoding. Incompressible units fall back to
+`Literal` storage with an xxh3 checksum (and all-literal local disk captures
+emit a standard raw v3 file). Shared-memory, TCP, and RDMA readers advertising
+a matching profile can claim packed records from both manager DRAM and NVMe.
+
+Both `cpu` and `gpu` modes advertise `[ZKV1, GKV1]` receive profiles across
+single-process local tiers, single-process `selene-manager` pools, and
+standalone multi-host `--rank` local disk (the profile handshake rejects
+mismatched rank modes at startup, and multi-host `--rank` +
+`--prefix-cache-pool` rejects active compression at startup):
+
+- In `gpu` mode, new captures encode on GPU as `GKV1`, matrix-predictor and
+  large-page (>= 256 KiB) `GKV1` restores decode on GPU (falling back to the
+  bounded CPU pool if a background capture holds the GPU codec), and smaller
+  non-matrix `GKV1` and `ZKV1` restores decode on the bounded CPU worker pool
+  over async HtoD DMA so critical-path restores do not stall behind foreground
+  GPU saturation. All active offload tiers (`memory`, `disk`, `pool`) share one
+  3-buffer aliased per-rank `GpuRankCodec` workspace (~130 MiB per GPU on
+  GLM-5.3-Flash TP4, ~32 MiB per GPU on DeepSeek-V4.1-Flash TP4, ~440 MiB on
+  Qwen3.8-Flash-Next TP1) with no secondary CUDA primary context. Because `gpu`
+  capture runs on a lowest-priority CUDA transfer stream, `cpu` mode remains a
+  zero-VRAM option on unified-memory GPUs such as DGX Spark GB10.
+- In `cpu` mode, Flare reserves **0 GPU VRAM**, never loads GPU codec modules,
+  encodes new captures as `ZKV1`, and natively decodes both `ZKV1` and `GKV1`
+  checkpoints on CPU.
+
+Readers running with compression `off` miss packed pool records and incur zero
+runtime overhead; starting with `off` against an exclusive local
+`--prefix-cache-disk` directory prunes v4 `.ckpt` files during its startup
+scan. Any `selene-manager` serving a codec-enabled writer must support v4
+envelopes; a manager without v4 support deletes unrecognized v4 `.ckpt` files
+during its startup scan.
+
+In `gpu` mode, the pure-CUDA C++ kernels in `ignition/preparation/kv_codec_gpu.cu`
+are compiled during Ignition core export into one cubin for the export device's
+SM architecture and embedded inside the signed core archive as an optional
+`Module` referenced by `CodecLayout.gpu_module`. Helios skips loading that
+module when compression is `off` or `cpu`, and loads it lazily via
+`cuModuleLoadData` (using only `libcuda.so.1`) when
+`--lossless-kv-compression gpu` is selected. Normal `cargo` builds require no
+CUDA compiler, and serving continues to honor `CUDA_DISABLE_JIT=1`. Cores
+exported without `CodecLayout.gpu_module` support `off` and `cpu`; requesting
+`gpu` fails at startup with a message suggesting `cpu` or re-export. Decoding
+verifies both stored and original checksums before completing a restore and
+retains source windows through the last rank's copy fence.
 
 ## 1. Scope and configurations
 
@@ -71,7 +152,7 @@ resolves to zero, and no other tier is configured, that phase reports
 | > 0 | none | none | `MemoryStore`; retain checkpoints in host memory. |
 | 0 | enabled | none | `DiskStore`; stream through automatic intake. |
 | > 0 | enabled | none | `CompositeStore`; retain warm records, spill under pressure. |
-| 0 | none | enabled | Pool only; the manager's arena supplies intake, with no local slot pool. |
+| 0 | none | enabled | Ranks in one process capture through a registered host buffer. Separate rank processes only restore. |
 | > 0 | none | enabled | Warm memory, then pool on retirement. |
 | 0 | enabled | enabled | Local disk, then pool on retirement; automatic local intake. |
 | > 0 | enabled | enabled | Warm memory, then local disk, then pool on retirement. |
@@ -202,16 +283,17 @@ a queued publication cannot obtain host capacity. A failed transfer releases its
 pin without retrying. GPU eviction uses demand/role retention ranking with leaf removal or
 ancestor compaction. `fetch` copies a looked-up chain into the ticket's page IDs and state slot.
 Submissions never wait; `poll` drains completions and failures.
-A `PublishedCheckpoint` names the GPU checkpoint, its key, its nearest offered
-ancestor's key, its bucket digest, every page of
-its chain from the root with the tail count since that offered ancestor,
-and the state slot of its row. `MemoryStore`, `DiskStore`, and `CompositeStore`
+A `PublishedCheckpoint` names the GPU checkpoint, its key and bucket digest,
+its complete page chain, and the state slot of its row. It lists up to 256
+offered ancestors, nearest first with strictly decreasing consumed tokens,
+and gives the tail page count since the nearest offered ancestor. `MemoryStore`, `DiskStore`, and `CompositeStore`
 implement the trait for serving, `PooledStore` wraps them when a pool is
 attached (section 2.15), and a test double implements it for worker tests. The
 worker holds `Option<Box<dyn HostStore>>`. The trait's remaining methods have
-default bodies: `reused` refreshes a retained record when a request reuses its
-GPU checkpoint, and the export, eviction-notice, and pool-lookup hooks of
-section 2.15 do nothing unless a pooled store overrides them.
+default bodies that do nothing. Local stores implement `reused` to refresh an
+indexed record when its GPU checkpoint is reused at admission or refreshed on
+request completion. Pooled stores implement the export, eviction-notice, and
+pool-lookup hooks of section 2.15.
 
 Three components are shared by the implementations:
 
@@ -250,28 +332,61 @@ probe count is about the new tokens divided by 64.
 Page content is determined by the token prefix ending at the page, so a
 suffix of a host chain's pages combines correctly with the GPU ancestor's
 pages, in the same way a GPU checkpoint's pages combine with a child computed
-later from a different request. A checkpoint published while its parent key
-is absent from the host index is stored as a root record holding its complete
+later from a different request. A checkpoint published while none of its offered
+ancestors is in the host index is stored as a root record holding its complete
 page chain, so a skipped or evicted ancestor never makes its descendants
-unrestorable.
+unrestorable. A host tier links a record under the first
+offered ancestor, nearest first, that it holds ready, and copies only the pages
+after it. The nearest offered ancestor can be a same-page Endpoint that no tier
+stores, so the whole list is offered. Each tier chooses its parent in one place
+(the DRAM store's ready ancestor, the disk store's first ancestor that accepts
+children), and that choice also decides whether an Endpoint keeps its row, so an
+Endpoint covered by a row on its page is always stored under the record that
+covers it. In a standalone DRAM store, a publication waits for the first known
+offered ancestor that is still copying out; inside a composite store the DRAM
+tier is flat and the disk index chooses the parent. A put to the manager offers up to 4096 ancestors, nearest first.
+Each record offers any ancestors nearer than its local parent before that parent,
+and the local root offers its remaining ancestors. The manager links the record under the
+nearest ready candidate. The writer sends only the pages after that ancestor.
+The manager stores a root with the complete chain only when it holds none of them, when the
+chosen ancestor's chain is already half the lookup limit long, or when the
+arena is under pressure.
 
 GPU eviction ranks eligible checkpoints by logical-request demand epoch,
 retention role, consumed-token count, and identity, as specified in
-[checkpoint lifetime](core-design.md#branching-and-lifetime). Host-store eviction
-independently removes the least recently used unpinned leaf; when every leaf is
-pinned, it compacts the least recently used unpinned single-child ancestor by
-dropping its row and keeping its pages. A compacted host node stays in the tree
-as page-only, no longer matches lookups, and continues to supply chain pages.
+[checkpoint lifetime](core-design.md#branching-and-lifetime). GPU demand recency
+belongs to the selected snapshot, not every ancestor supplying its pages.
+Successful terminal retirement also refreshes its direct parent, including a
+shared or host-restored checkpoint, without refreshing earlier ancestors.
+Pressure can compact an older single-child ancestor while preserving the reused
+descendant's complete page chain and reporting its compaction heir. Direct
+copy-out pins and outstanding GPU-use fences still protect transfer resources.
+Host-store pressure can remove the least recently used eligible leaf. To
+free a row, Flare considers unpinned, single-child interior Endpoints in LRU
+order. A descendant on the unbranched path must still have a row. The
+parent's pages remain available to its children. Message, Anchor, root
+and fork rows remain eligible for exact restores while held.
+An Endpoint can omit its row when an ancestor already covers the same page.
+A child covered this way cannot justify dropping the covering parent's row.
+Under disk pressure the manager can compact a durable interior Endpoint
+when its only child has a durable row.
 A node is evictable only when its store's policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
-Disk drops a non-root record's row once its only child commits, keeping the
-pages. DRAM retains these redundant rows while its free retention space exceeds
-two continuation rows. Reserved transfer intake does not count as retention
-headroom. When that threshold is reached, or an incoming record needs more
-space than is free, DRAM reclaims eligible redundant rows before evicting other
-records. Readers and spills delay row removal until their pins are released.
+DRAM and disk retain redundant non-root rows while the tier's free retention
+space exceeds two continuation rows. Disk counts only committed children when
+deciding whether a row is redundant. Reserved transfer intake does not count
+as retention headroom. When that threshold is reached, or an incoming record
+needs more space than is free, the tier reclaims eligible redundant rows before
+evicting other records. It reclaims them in least-recently-used order and stops
+once the headroom is restored: a single child does not show that its parent's
+row is unused, because a request that branches from the parent leaves that row
+as the only resume point of the conversation it branched from. With a pool
+configured, disk maintenance reclaims redundant rows before it hands leaves to
+the pool. A composite spill keeps the row, so the disk tier writes the row of
+every spilled parent and truncates it later under pressure. Readers and spills
+delay row removal until their pins are released.
 DRAM releases row slots, disk truncates at the row segment, and later spills
 omit removed rows. A rewind or later fork restores its retained endpoint when
 available; otherwise it restores the nearest row-bearing ancestor and
@@ -423,8 +538,10 @@ page count, the rank count, the per-rank plane sizes and row bytes, the page
 segment offset, the row segment offset, the row checksum, and the creation
 time. Versions 1 and 2 encode each plane size as `u64`; version 3 uses `u32`
 plane sizes so wider rank/plane catalogs fit the same header block. Row sizes
-remain `u64`. New records use version 3 when every plane fits `u32`, otherwise
-the `u64` format is retained. All encodings still require the header to fit 4 KiB.
+remain `u64`. Version 4 stores the variable-length shares described in
+[Lossless KV compression](#0-lossless-kv-compression). New raw records use
+version 3 when every plane fits `u32`, otherwise the `u64` format is retained.
+All encodings still require the header to fit 4 KiB.
 Versions 2 and 3 use flag bit 31 for a replicated page segment and bit 30 for a
 replicated row; version 3 also permits non-replicated records. Page offsets use
 one fixed stride for the whole record. Version-1 and version-2 records still
@@ -476,20 +593,23 @@ idle wait does not flush them. A default clean stop or crash loses these RAM-onl
 records whose file commits completed remain recoverable.
 
 `--prefix-cache-drain-on-shutdown[=DURATION]` saves DRAM-only records to
-local disk for a warm restart. It is off by default because larger DRAM tiers
-extend stop time. A bare flag drains until done; `=90s` limits new writes, and
+local disk for a warm restart, or to the pool when DRAM feeds the manager
+directly. It is off by default because larger DRAM tiers extend stop time.
+A bare flag drains until done. `=90s` limits the drain, and
 `=off` disables a configured drain. `[prefix_cache] drain_on_shutdown` accepts
 `"on"`, `"off"`, or a positive duration in ms, s, m, or h (bare numbers are seconds).
-Recent endpoints drain first, after their required ancestors; committed files
-are preserved. Limits and write failures do not fail shutdown; accepted transfers
-still drain before memory is released. Size a container's stop grace as Flare's
+When draining to disk, Flare writes recent endpoints first, after their
+required ancestors. Committed files survive a restart. On reaching a limit or
+a write failure, shutdown still drains accepted transfers before releasing memory. Size a container's stop grace as Flare's
 usual stop time plus DRAM bytes ÷ measured disk write rate.
 
 Host record expiry is off by default. Enable it with
 `--prefix-cache-max-age DURATION|off` or `[prefix_cache] max_age = "2h"`;
 positive durations accept ms, s, m, h, or bare seconds. `off` disables expiry.
-Publication, reuse, restore and child publication refresh the record and its
-required ancestors in memory only. Recovery uses file mtime, from the last write
+With expiry enabled, publication, GPU reuse at admission, request completion,
+restore, and child publication refresh last-use timestamps for the indexed
+record and its required ancestors in memory only. A reuse notice changes the
+LRU position of its named key only. Recovery uses file mtime, from the last write
 when a record was spilled cold or drained. After a restart, a record reused from
 disk but never rewritten may expire up to one max age early. The cost is a
 recompute, never wrong output. With expiry off, hits do not refresh last use;
@@ -620,8 +740,9 @@ both transports.
 - Cancelling a waiter removes it from the ticket. The ticket completes
   regardless, because the restored checkpoint is useful on its own.
 - `take_publications()` returns GPU-ready checkpoints offered since the previous
-  call, each once, with their id, key, nearest offered ancestor's key, bucket
-  digest, whole page chain, tail count since that ancestor, and row state slot.
+  call, each once, with their id, key, up to 256 offered ancestor keys
+  (nearest first), bucket digest, whole page chain, tail count since
+  the nearest offered ancestor, and row state slot.
   Deferred checkpoints enter the list on reuse or the fallback above.
 - `SchedulerStats` reports `host_lookups`, `host_hits`, `host_reused_tokens`,
   and `inbound_waiting`.
@@ -643,18 +764,32 @@ disk-only store whose ranks each keep their own records; see
 
 The worker loop admits requests, completes executor frames, and publishes
 finished requests. `service_store` polls host completions, applies inbound and
-outbound results, delivers eviction notices, reports publications through
-`store`, and retries capacity refusals after host progress. The worker then
+outbound results, delivers eviction notices, refreshes checkpoint recency through
+`reused`, reports publications through `store`, and retries capacity refusals
+after host progress. The worker then
 plans and submits model work. Copy-out pins are taken before the next admission, so a
-checkpoint cannot be evicted between submission and its pin. A pooled store
-receives logical eviction notices, including compaction; the scheduler queues
-no notices for a store without a pool. Every store
-call from the worker returns without waiting.
+checkpoint cannot be evicted between submission and its pin. Only pooled stores
+receive logical eviction notices, including compaction. Any attached store can
+receive completion refreshes. Every store call from the worker returns without waiting.
 
 Admission consults the store after `plan_admission`: `lookup` runs above the
 GPU hit, the policy in section 2.10 decides whether to fetch, and
-`admit_planned` receives the inbound request. A newly created ticket starts
-the inbound job through `fetch`. On inbound failure the worker cancels each
+`admit_planned` receives the inbound request. If capacity prevents reserving
+the restore's pages and snapshot row, admission waits while existing requests,
+inbound tickets, checkpoint pins, or fenced retirement may release resources.
+Waiting plus estimated transfer time must remain below half the estimated
+prefill time of the tokens gained. The worker retries after resource changes,
+pin release, transfer completion, or wait-budget expiry; expiry is checked even
+when resource counts stay unchanged. Other eligible requests can be admitted during this wait.
+If no resource holder remains or the budget expires, admission tries recomputation.
+If recomputation also lacks capacity, it waits for resource changes without
+repeated timeout retries. A successful admission clears the wait accounting so
+readmission after preemption starts a separate wait. Pooled lookups keep their
+validated history across retries and recheck GPU residency. Pending and ready
+tickets are retained; a ticket with no answer is replaced only when its request
+is selected for admission. First lookups start even while capacity is blocked,
+once prompt scoring is complete.
+A newly created ticket starts the inbound job through `fetch`. On inbound failure the worker cancels each
 waiter and pushes its `Incoming` to the front of the pending queue with host
 lookup disabled for that attempt.
 
@@ -686,8 +821,16 @@ Policy:
   eviction cascade only when the preceding tier needs room. Only queued copies
   pin GPU checkpoints. A capacity refusal waits for host progress before retry;
   admission uses ordinary cache eviction and the cache's pin and retirement fences.
-  A GPU-resident hit refreshes the matching host record's recency. This does not
-  recreate an evicted host copy or protect an endpoint from tree compaction.
+  A GPU hit at admission refreshes the matching host record. On successful
+  terminal publication, the worker reports the terminal's direct parent first,
+  then the terminal itself. Without a terminal publication, completion or a
+  client stop after inference progress reports only the retained prefix.
+  Preemption, execution errors, and cancellation before progress send no
+  completion notice. Each notice changes only the named record's LRU position.
+  Usually the prompt or message boundary is already on the host and the terminal
+  is deferred on the GPU until reuse. An indexed copy-out accepts the notice
+  before its transfer completes; an absent key is ignored. A notice neither
+  recreates a host copy nor protects an endpoint from tree compaction.
 - Inbound: fetch when the estimated transfer time is below half the estimated
   prefill time of the tokens gained. Transfer time is record bytes divided by
   the tier rate; prefill time is tokens gained divided by prefill throughput.
@@ -700,6 +843,11 @@ Policy:
 
 Offload limits interference through bounded work and explicit ownership:
 
+- The manager has four write-back workers. Independent chains can flush
+  concurrently, with each parent written before its children. The claim
+  drain and flush share 270 seconds from the stop signal. The claim drain
+  allows the configured claim deadline plus two seconds (32 seconds by
+  default), capped at four minutes. The flush gets the remaining time.
 - The model stream never waits on an offload event. Host-observed completion
   orders transfers and scheduler visibility. Shared bandwidth and copy engines
   still require the interference measurements in section 4.
@@ -796,7 +944,7 @@ Offload limits interference through bounded work and explicit ownership:
 - Ticket resources belong to the scheduler until `finish_inbound`.
 - A restored endpoint's row and pages describe the same token prefix. GPU
   ancestor pages are retained, and only the missing page suffix is uploaded.
-- Rows and pages are stored byte-exact; no compression or requantization.
+- Storage compression preserves every byte; state is never requantized.
 - Record files are keyed by model and execution-state identity plus layout
   fingerprint; incompatible state is never restored. Each record directory
   has one process owner through its complete I/O lifetime.
@@ -947,7 +1095,10 @@ registered staging together and exits with the error, rather than releasing
 memory its transfers may still use.
 
 Rank event framing and aggregation preserve filesystem-space pressure so a
-failed copy can defer until progress after every rank drains.
+failed copy can defer until progress after every rank drains. When ranks fail
+a restore for different reasons, a record-read failure on any rank wins, so the
+unreadable record stops being offered.
+Event result codes require every rank to run the same build.
 
 ### 2.15 Sharing through a pool
 
@@ -964,14 +1115,20 @@ sees no export requests. Local and pooled instances use the same copy-at-publish
 and GPU eviction policy from section 2.10. A pooled instance reads
 its own memory and disk tiers first; the pool supplies what they lack.
 
-The loader attaches once before sizing and allocating GPU caches. The
-`Wait for prefix cache pool` startup phase waits up to ten seconds for the
-manager's first Hello. HTTP admission opens after loading and worker readiness;
-if the manager is absent, the instance starts on local tiers and never attaches
-later. Connection retries during that startup window are silent. At the deadline,
-one warning says the manager did not answer, local tiers will be used, and the
-instance will not attach later. An instance that attached at startup retries
-its attachment after a lost connection.
+The loader checks the connection and `Hello` in `Reach prefix cache pool` before
+loading weights, then attaches once before sizing and allocating GPU caches. The
+`Wait for prefix cache pool` startup phase waits up to 30 seconds for the
+manager's first Hello, matching the manager operating guide's 30 one-second
+readiness probes. Registration time grows with the manager's `--memory` and
+`--staging` sizes and does not count against the startup wait; session opening
+has a separate 40-second allowance. Configuring a pool makes attachment required:
+a timeout, refused connection, registration failure or rejected memory budget fails startup with
+the cause and corrective action. Start the manager before the instance when
+recovery exceeds that window, or remove `--prefix-cache-pool` to run with local
+tiers only. HTTP admission opens after loading and worker readiness. CUDA
+registration consumes device memory, so the client cannot attach for the first
+time after cache sizing or request admission. An instance that attached at
+startup retries its existing attachment after a lost connection.
 
 Before any CUDA registration, the complete Hello plan must fit both budgets:
 the manager's arena plus staging on this host, or the client's data staging for
@@ -982,9 +1139,10 @@ rounded up separately for each region, as for local registered tiers. Integrated
 GPUs also share the host-byte charge once per host. The check preserves runtime
 headroom, explicit memory limits and minimum execution/KV capacity; accepted
 charges reduce the remaining cache budget. A plan exceeding either budget
-registers nothing and produces one warning naming its sizes and the reason,
-then serving uses local tiers. Failure to observe host supply also refuses the
-pool with that reason.
+registers nothing and fails startup, naming the region sizes and required versus
+available bytes. Free host/device memory or reduce the manager's `--memory` and
+`--staging` sizes. Failure to observe host supply also fails startup with that
+reason.
 
 The startup registrar requires identical CUDA and host addresses. Its owning
 registrations survive a manager restart when the region generation, paths and
@@ -1044,8 +1202,8 @@ same completion events the store produces.
   `HostStore::evictions_lost`, so the pool client announces holdings again.
 - **Lookups.** When a request reaches the worker, the worker builds its prefix
   history once and calls `begin_lookup`; the store returns a ticket whose state
-  never waits for a reply, and the ticket stays on the request while it queues.
-  Admission passes it to `lookup_for`, which answers from the local tiers and
+  never waits for a reply.
+  Admission passes the ticket to `lookup_for`, which answers from the local tiers and
   adds pool candidates only if the ticket is ready. A pending lookup holds
   admission for at most its grace period: 2 ms locally, or four measured control
   round trips for a network manager, bounded between 2 and 250 ms. After that,
@@ -1055,9 +1213,10 @@ same completion events the store produces.
   no prefill has been submitted. This rechecks history, cost and capacity through
   the same admission path, without extending the grace period. Requests with
   conditioned inputs keep their original decision because image preparation may
-  already own their slot. A request that waits on capacity keeps its ticket;
-  completion clears its capacity block, allowing another attempt without a
-  resource change. A cancelled request drops its ticket. Readmission without the
+  already own their slot. A request waiting on capacity retains a pending or
+  ready ticket; completion clears its capacity block, allowing another attempt
+  without a resource change. A ticket that will never be answered (state
+  none) is replaced only when its request is selected for admission. A cancelled request drops its ticket. Readmission without the
   store after a failed restore starts no new lookup.
 - **Restore deadlines.** Claims allow 10 seconds of setup plus transfer time at
   a conservative 8 MiB/s; the manager clamps setup to its configured limit
@@ -1076,23 +1235,37 @@ same completion events the store produces.
   progress trigger one coalesced maintenance pass per model-thread poll.
   Selection is bounded by the spill and move caps, without sorting all
   parked records. Full queues delay demotion and never discard a parked copy.
-  Refusals, submission errors and repeated handover failures keep records local,
-  release selection and retry only after manager progress or a short backoff.
+  Invalid or oversized puts discard the source. Budget or in-flight refusals
+  retain selection for one retry after a 50 ms backoff, then discard the source
+  on either refusal. Pool events do not shorten this backoff.
+  Other refusals, submission errors and repeated handover failures keep records
+  local, release selection and retry only after manager progress or a short backoff.
   Manager loss releases waiting selections; started moves keep their pins until
   their drained terminal event. While a manager is unavailable or busy, local
   disk LRU makes room; with DRAM alone, durable DRAM LRU is the local end.
   Local mode uses the same parked/spill path and LRU unlink at the end of its
   chain, with the same completed-maintenance budget accounting. Only end-of-chain eviction,
-  expiry, infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
+  expiry, invalid or oversized puts, repeated budget or in-flight refusals and
+  terminal disk I/O errors discard data.
   A host offer announces the GPU holding and starts its first host copy;
   GPU eviction sends its eviction notice and never starts a late copy.
 - **Retention metrics.** `flare_host_cache_held_total{tier}` counts record
   holding events. `flare_host_cache_dropped_total{tier,reason}` counts local
-  end-of-chain, oversize and terminal I/O drops (`end_of_chain`, `oversize`,
-  `io_error`). Tiers are `dram` and `nvme`. The `parked_records` count is
+  end-of-chain, oversized publication, terminal I/O and pool refusal drops
+  (`end_of_chain`, `oversize`, `io_error`, `pool_refused`). Pool refusal drops
+  include invalid or oversized puts and budget or in-flight refusals after one
+  retry. Tiers are `dram` and `nvme`. The `parked_records` count is
   exported as `flare_host_cache_parked_records`, a gauge.
   `flare_host_cache_store_skipped_total` counts publications that started no
   copy, including duplicates and retries.
+  `flare_host_cache_root_records_total{tier,reason}` and
+  `flare_host_cache_root_pages_total{tier,reason}` count root records and their pages.
+  `flare_host_cache_deeper_link_records_total{tier}` and
+  `flare_host_cache_deeper_link_pages_total{tier}` count records linked under a
+  later offered ancestor and the pages copied after it. These counters cover
+  GPU-to-DRAM copies started and puts the pool manager stored. Pool root
+  counters cover puts of local roots that the manager also stored as roots.
+  A `Present` response and local writes in a disk-only store contribute zero.
   `flare_host_cache_expired_total{tier}` counts direct age removals. Slot gauges
   `flare_host_cache_slots_in_use`, `flare_host_cache_slots_total` and
   `flare_host_cache_intake_slots` report the shared local pool, including
@@ -1112,9 +1285,8 @@ same completion events the store produces.
   a local copy of the same endpoint after the pool's writes drain; otherwise
   the destination is discarded and the request recomputes.
 
-Loading attaches the pool to the local tiers, if any, as a `PooledStore`; with
-no memory or disk tier every restore comes from the pool. The pool has its own
-copier, a third set of rank threads that names the manager's shared-memory
+Loading attaches the pool to the local tiers through a `PooledStore`. The pool
+has its own copier, a set of rank threads that names the manager's shared-memory
 windows by host address, so the registrar for those regions refuses any
 registration whose device address differs from its host address. The manager's
 pool name, model identity, layout fingerprint and per-rank plane sizes define
@@ -1152,7 +1324,9 @@ With the `rdma` cargo feature and a manager started with `--rdma`, which the
 manager refuses to combine with TLS, unsliced
 claims can use RDMA WRITEs into private slots lent by the instance. Puts and rank
 legs use TCP. An instance without a device, or after one failed RDMA transfer,
-uses the stream.
+uses the stream. Each end uses the device whose RoCE v2 GID is the local address of
+the data connection, so that connection must run on the RoCE interface (host
+networking for containers), and the manager's data listener must name that address.
 
 Copy priority is fixed: neighbour GPU, host DRAM, host NVMe, then remote NVMe.
 There are no synthetic startup transfers or borrowed GPU scratch ids.
@@ -1170,11 +1344,33 @@ under rank zero's holds, while the record links of section 2.14 mirror writes an
 restores. The pool link shares the record listener's launch token and address
 checks; deployments must secure the cluster fabric, since these links carry
 session secrets and transfer tokens in plaintext.
-Records reach the manager's store only when they cascade off the end of a
-local chain under pressure, and an instance's own records leave the manager's
-index when its session ends. Restarting with wiped local disks therefore
-restores nothing unless records had already cascaded to the manager. This holds
-on a single host too.
+Records reach the manager's store when they retire from the last local tier.
+The manager removes advertisements for instance-held records when the session
+ends. A compacted page-only record cascades without a row. The manager stores
+it when it can link it to a retained ancestor. Otherwise the manager refuses
+it as `INVALID` and the instance drops the copy. After a restart with wiped
+local disks, the manager can restore records it retained before shutdown.
+
+With only a pool configured and all ranks in one process, Flare registers a
+CPU-readable capture buffer. Its slot count is the larger of automatic intake
+and the largest GPU page capacity plus one row's slots, bounded by the host
+budget. All slots are available for capture. For GLM-5.3-Flash NVFP4 at TP4
+with 32 concurrent requests, automatic intake sets it to 11.0 GiB (1,664 slots);
+the full-chain floor is 7.1 GiB. Helios limits GPU page capacity so the buffer
+fits the host budget. If even the minimum page capacity plus one row does not
+fit, startup fails with `host budget cannot hold a full pool capture`. Configure `--prefix-cache-memory` to choose
+the host memory explicitly. While the manager can accept
+records, each poll selects completed leaves for retirement, with up to four
+selected at once. If a capture has no resident ancestor, it copies the full
+GPU chain and offers its ancestors for linking at the manager. While the manager
+is unavailable, the buffer retains records under the normal DRAM eviction policy.
+With separate rank processes, a pool without a local disk tier only restores.
+
+When DRAM feeds the pool directly, the shutdown drain continues copying,
+checksumming and retiring records until they finish or the configured time
+expires. It stops early when the manager cannot accept records, so a manager
+that is down does not hold shutdown for the whole drain time. Pool close cancels
+unfinished puts before the host copier closes.
 
 ## 3. Components and required test coverage
 
@@ -1410,4 +1606,4 @@ bandwidth from each NVMe root complex to each GPU root complex.
   without copying pages.
 - Page-granular matching in the GPU cache, which depends on rows being cheap
   to refetch.
-- Prefetch of likely continuations, and compression.
+- Prefetch of likely continuations.

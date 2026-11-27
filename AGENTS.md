@@ -3,12 +3,17 @@
 Flare is a local inference server for NVIDIA SM103/SM120/SM121 GPUs. The public
 README names the project Hyperflare; the code, the `flare` CLI, and the
 documentation name it Flare. Ignition, the
-Python package in `ignition/`, prepares models with PyTorch, Transformers, and
-FlashInfer, including b12x. Its `flare_heliopause` extension is built by the
-`heliopause/` crate. The Rust CLI in `flare-cli/` uses the application library in
-`flare/`, which links the Helios runtime in `helios/` to serve requests through
-prepared CUDA graphs. Flare and Heliopause depend on Helios; Helios has no Python
-or preparation-tool dependency.
+Python package in `ignition/`, is the recipe-free preparation library and CLI
+runner (`ignition.cli.main`) that prepares models with PyTorch, Transformers,
+and FlashInfer/b12x. Its `flare_heliopause` extension is built by the
+`heliopause/` crate. Official model recipes, reusable b12x model components,
+operator-tuning fixtures, numerical references, qualification drivers, and
+model test suites live in
+[local-inference-lab/hyperflare-recipes](https://github.com/local-inference-lab/hyperflare-recipes),
+which depends on `ignition` from this repository. The Rust CLI in `flare-cli/`
+uses the application library in `flare/`, which links the Helios runtime in
+`helios/` to serve requests through prepared CUDA graphs. Flare and Heliopause
+depend on Helios; Helios has no Python or preparation-tool dependency.
 
 Helios keeps prefix-cache checkpoints in host memory and record files through
 the Selene crate in `selene/`. The manager service in `selene-manager/`, whose
@@ -16,9 +21,9 @@ binary is `selene`, lets Flare instances share those records. The `eos/` crate
 holds the host operating-system operations that Helios and Selene use. Orbit,
 in `flare-cli/src/orbit/`, pairs a controller with host agents and starts
 serving ranks on their hosts. `flare-winui/` is the Windows desktop client built
-on the `flare/` library. Python tests are in `tests/`, qualification and
-benchmark drivers in `qualify/` and `scripts/`, and the TLA+ lifecycle models
-in `verification/helios-lifecycle/`. Each Rust crate has its own `Cargo.lock`;
+on the `flare/` library. Core Python tests are in `tests/`, scheduling simulator
+and utility scripts in `scripts/`, and the TLA+ lifecycle models in
+`verification/helios-lifecycle/`. Each Rust crate has its own `Cargo.lock`;
 the repository has no Cargo workspace.
 
 ## Required setup and commit review
@@ -134,6 +139,19 @@ detail. Scale length to the change: a small fix may need only a short paragraph
 and relevant validation. The content and order are mandatory; particular headings
 and a fixed-length template are not.
 
+## Contact on PRs and issues
+
+Every PR and issue description has a Discord line after the technical
+explanation, so project developers can contact the person who opens it directly.
+The line gives that person's Discord username, for example
+`Discord: example_user`. Write the username without a leading `@`; GitHub treats
+`@name` as a mention of the GitHub account with that name. When the person
+provides no Discord username, the line states that explicitly:
+`Discord: no username provided`. Never omit the line. An agent opening a PR or
+issue gives the username of the person it acts for, never its own identity.
+When the agent does not know that username, it asks the person instead of
+guessing.
+
 ## Contribution scope and rejection criteria
 
 Flare prepares and serves supported model recipes on NVIDIA GPUs through
@@ -203,8 +221,8 @@ and hardware sections of the preparation guide.
 | Task | Required guidance |
 |---|---|
 | Build, install dependencies, or launch Flare | [Build and run model checkpoints](#build-and-run-model-checkpoints), [environment setup](docs/model-preparation.md#environment-setup), and the relevant [CLI commands](docs/cli-design.md) |
-| Prepare, export, or serve an existing model | [Model preparation and serving](docs/model-preparation.md); [direct execution](docs/direct-execution.md) when reproducing faults with `--direct` |
-| Add or change a model recipe or execution component | [Model development](docs/model-development.md), [preparation development](docs/preparation-development.md), and the relevant [core design](docs/core-design.md#2-model-preparation) sections |
+| Prepare, export, or serve an existing model | [Model preparation and serving](docs/model-preparation.md) and official recipes in [`local-inference-lab/hyperflare-recipes`](https://github.com/local-inference-lab/hyperflare-recipes); [direct execution](docs/direct-execution.md) when reproducing faults with `--direct` |
+| Add or change a model recipe or reusable b12x component | Work in [`local-inference-lab/hyperflare-recipes`](https://github.com/local-inference-lab/hyperflare-recipes), following [model development](docs/model-development.md), [preparation development](docs/preparation-development.md), and [core design](docs/core-design.md#2-model-preparation) |
 | Change tuning, compilation, memory planning, capture, or TP preparation | [Preparation development](docs/preparation-development.md) and [preparation resources](docs/model-preparation.md#preparation-resources) |
 | Change Helios runtime, scheduling, caches, transport, or frontend | [Prepared model contract](helios/model-contract.md), [execution manifest](helios/manifest.md), and the relevant [Helios runtime](helios/README.md) and [core design](docs/core-design.md#3-helios-runtime-and-graph-interface) sections |
 | Change Protobuf metadata or core loading/export | [Runtime core design](docs/runtime-core-design.md), [prepared model contract](helios/model-contract.md), and [core compatibility](#model-core-compatibility) |
@@ -229,26 +247,27 @@ encoders must satisfy the [renderer contract and validation requirements](docs/m
 Run commands from the repository root:
 
 ```sh
-uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
-After changing `heliopause/` or Helios code used by the extension, rebuild the
-installed extension:
+For local Python core `ignition` and `heliopause` development, install
+`heliopause/` and editable `ignition` into `.venv` (official model exports run
+from [`local-inference-lab/hyperflare-recipes`](https://github.com/local-inference-lab/hyperflare-recipes),
+which pins `uv.lock` and bundles the official recipes):
 
 ```sh
 uv pip install --python .venv/bin/python --no-deps ./heliopause
+uv pip install --python .venv/bin/python --no-deps -e .
 ```
 
-The [preparation guide](docs/model-preparation.md) owns dependency updates,
-local FlashInfer installation, GPU selection, compiler and tuning resources,
-model-specific launch instructions, and hardware setup. The
-[CLI design](docs/cli-design.md) defines flags, configuration, signing, and
+The [preparation guide](docs/model-preparation.md) owns environment setup,
+GPU selection, compiler and tuning resources, and core serving setup. Model-specific
+launch instructions live in
+[`local-inference-lab/hyperflare-recipes`](https://github.com/local-inference-lab/hyperflare-recipes/blob/main/docs/model-preparation.md).
+The [CLI design](docs/cli-design.md) defines flags, configuration, signing, and
 core selection.
 
-Use the preparation guide's [DeepSeek V4.1](docs/model-preparation.md#deepseek-v41-flash)
-or [DeepSeek V4](docs/model-preparation.md#deepseek-v4-flash) commands for those
-models. For repeated exports with compatible weights, follow
+For repeated exports with compatible weights, follow
 [re-exporting with cached weights](docs/model-preparation.md#re-exporting-with-cached-weights).
 
 For serving-only Rust changes, rebuild Flare and load a compatible core.
@@ -357,13 +376,20 @@ architectural boundary before committing the change.
   stays unchanged. A new operation contract requires approval even if it reuses
   an existing graph kind or enum value. A design acknowledgment does not grant
   that approval.
-- Recipes in `ignition/recipes/` own model-specific composition, checkpoint mapping,
-  state layouts, and graph preparation. They may retain canonical forwards or
-  compose prepared components as the model requires.
-- Put reusable execution mechanisms in `ignition/components/`. Recipes should be
-  able to use components independently without adopting a rigid model framework.
-  Shared/routed expert overlap, projections, collectives, and state transfers
-  are examples of mechanisms that should not be copied between recipes.
+- Official model recipes live in
+  [`local-inference-lab/hyperflare-recipes`](https://github.com/local-inference-lab/hyperflare-recipes)
+  (`hyperflare_recipes/recipes/`), and external recipe repositories can pass
+  their own `Recipe` tuples directly to `ignition.cli.main(...)`. Recipes own
+  model-specific composition, checkpoint mapping, state layouts, and graph
+  preparation.
+- Keep `ignition/components/` in this repository limited to the 13 Helios-ABI
+  runtime interface modules (`capacity`, `collectives`, `completion`, `engram`,
+  `flashinfer_sampling`, `logprobs`, `ngram_delivery`, `readiness`, `sampling`,
+  `state`, `state_transfer`, `vision_delivery`, `vision_state`), enforced by
+  `tests/preparation/test_core_boundary.py`. Put reusable b12x/Triton model
+  execution mechanisms in `hyperflare_recipes/components/` in
+  `local-inference-lab/hyperflare-recipes`. Core `ignition` must never import
+  `hyperflare_recipes` or introduce a plugin discovery framework.
 - Keep native input packing, frontend processing, transport, scheduling, cache
   machinery, and request handling shared. Express model-dependent behavior through
   prepared metadata and frontend assets; keep native specialization focused on

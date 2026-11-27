@@ -101,6 +101,7 @@ class _Artifact:
         backend = StorageBackend.__new__(StorageBackend)
         backend.artifact = SimpleNamespace(inner_fn=SimpleNamespace(compiled_fn=execute))
         backend._serialized_artifact = b"portable backend"
+        backend._cuda_allocation_sizes = ()
         backend._tuning_frozen = False
         guards = SimpleNamespace(check=lambda arguments: isinstance(arguments["forward"], _Forward),
                                  check_verbose=lambda arguments: "forward type differs")
@@ -175,6 +176,7 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
 
     from ignition.preparation import aot, compile_pool
 
+    messages = []
     try:
         class Pool(_Pool):
             def __exit__(self, *args):
@@ -221,6 +223,7 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
                 int(capacity), 40 << 30, 16, 32 << 30, 8 << 30)
         aot.ForwardCache._load = lambda self, forward, path, required=False, before_run=None: aot.BoundForward(
             _Artifact(lambda owner: None), forward, True)
+        aot.ForwardCache._allocation_sizes = lambda self, path: ()
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
@@ -233,7 +236,8 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
         coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), hosts=hosts,
             spans_hosts=len(set(hosts)) > 1,
             local_ranks=world, barrier=lambda key, ranks: dist.monitored_barrier(group=dist.group.WORLD))
-        selected = cache._prepare_ranks(functions, {name: name for name in functions}, coordinator, progress=None,
+        selected = cache._prepare_ranks(functions, {name: name for name in functions}, coordinator,
+                                        progress=messages.append,
                                         materialize=lambda: None, warmup=nullcontext, before_run=None)
         if scenario == "two_hosts":
             outcome.put((rank, (sorted(selected), sorted(path.read_text() for path in root.glob("*.bin")))))
@@ -242,7 +246,7 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
     except Exception:  # noqa: BLE001 - The parent reports every rank's failure.
         import traceback
 
-        outcome.put((rank, traceback.format_exc()))
+        outcome.put((rank, (traceback.format_exc(), messages)))
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -309,7 +313,7 @@ def test_compiler_shutdown_failure_is_reported_to_every_rank(tmp_path):
             process.join(timeout=30)
             assert process.exitcode == 0
         assert set(results) == set(range(3))
-        assert all("compiler shutdown failed on rank 0" in result for result in results.values())
+        assert all("compiler shutdown failed on rank 0" in result[0] for result in results.values())
         assert len(list(root.glob("*.bin"))) == 8
         assert not list((root / "lent").iterdir())
     finally:
@@ -350,7 +354,13 @@ def test_host_admission_lends_to_local_workers_and_reports_failures_collectively
             assert all("rank 1" in path.read_text() for path in root.glob("*.bin"))
         else:
             reason = "no capacity for a forward compiler" if scenario == "no_capacity" else "forward worker failed on rank 1"
-            assert all(reason in result for result in results.values())
+            for rank, result in results.items():
+                assert isinstance(result, tuple), f"rank {rank} did not fail: {result}"
+                failure, messages = result
+                assert reason in failure
+                # The phase must end as failed, not complete, before the error is raised.
+                assert any(message.startswith("Compile model forwards failed in") for message in messages)
+                assert not any(message.startswith("Compile model forwards complete in") for message in messages)
         assert not list(root.rglob("*.forward"))
         assert not list(root.rglob("*.tmp"))
     finally:
@@ -392,6 +402,7 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
             assert restored and all(reference() is None for reference in restored)
 
         aot.ForwardCache._load = load
+        aot.ForwardCache._allocation_sizes = lambda self, path: ()
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})

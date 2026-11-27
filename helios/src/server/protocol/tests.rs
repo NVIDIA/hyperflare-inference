@@ -20,6 +20,8 @@ fn tools() -> Vec<inference::Tool> {
         namespace: None,
         description: "Find a value".into(),
         parameters: json!({"type":"object"}),
+        declared_parameters: true,
+        strict: false,
         custom: false,
         grammar: None,
     }]
@@ -152,8 +154,8 @@ fn named_tool_choices_decode_validate_and_preserve_messages() {
             assert_eq!(auto.options, named.options);
             let Input::Conversation(messages) = &named.input else { panic!() };
             assert_eq!(
-                template_messages(messages, named.tool_choice.clone(), &[]).unwrap(),
-                template_messages(messages, ToolChoice::Auto, &[]).unwrap(),
+                template_messages(messages, named.tool_choice.clone(), &[], true).unwrap(),
+                template_messages(messages, ToolChoice::Auto, &[], true).unwrap(),
             );
             requests.push(named);
         }
@@ -299,8 +301,8 @@ fn required_tool_instruction_preserves_history_and_sampling() {
         let Input::Conversation(messages) = &required.input else {
             panic!()
         };
-        let baseline = template_messages(messages, ToolChoice::Auto, &[]).unwrap();
-        let native = template_messages(messages, ToolChoice::Required, &[]).unwrap();
+        let baseline = template_messages(messages, ToolChoice::Auto, &[], true).unwrap();
+        let native = template_messages(messages, ToolChoice::Required, &[], true).unwrap();
         assert_eq!(native[0]["role"], "system");
         assert!(
             native[0]["content"]
@@ -719,43 +721,42 @@ fn parallel_tool_controls_decode_to_the_same_limit() {
 }
 
 #[test]
-fn disabled_parallel_calls_fail_before_the_second_call_is_emitted() {
+fn disabled_parallel_calls_stop_before_the_second_call_is_emitted() {
     for protocol in [Protocol::Chat, Protocol::Messages, Protocol::Responses] {
         for choice in [ToolChoice::Auto, ToolChoice::Required, ToolChoice::Named("lookup".into())] {
             for parallel in [false, true] {
-                let mut enc = encoder_with_parallel(protocol, choice.clone(), parallel);
-                enc.start();
-                enc.apply(0, events()).unwrap();
-                let first = enc.outputs[0].blocks.clone();
-                let second = enc.apply(
-                    0,
-                    vec![
-                        Event::ToolBegin {
-                            index: 1,
-                            name: "lookup".into(),
-                            id: None,
-                        },
-                        Event::ToolArguments {
-                            index: 1,
-                            text: "{}".into(),
-                        },
+                for together in [false, true] {
+                    let mut enc = encoder_with_parallel(protocol, choice.clone(), parallel);
+                    let mut first = events();
+                    if !together {
+                        enc.apply(0, std::mem::take(&mut first)).unwrap();
+                    }
+                    first.extend([
+                        Event::ToolBegin { index: 1, name: if parallel { "lookup" } else { "unknown" }.into(), id: Some("second".into()) },
+                        Event::ToolArguments { index: 1, text: "{}".into() },
                         Event::ToolEnd { index: 1 },
-                    ],
-                );
-                if parallel {
-                    second.unwrap();
-                    enc.finish(0, Termination::Eos, 12, 0, None).unwrap();
-                } else {
-                    let error = second.unwrap_err();
-                    assert!(error.to_string().contains("more than one tool call"));
-                    assert_eq!(enc.outputs[0].blocks, first);
-                    let failed = enc.failure(&error);
-                    assert!(!failed.done);
-                    if protocol == Protocol::Responses {
-                        assert_eq!(failed.data["type"], "response.failed");
-                        assert_eq!(failed.data["response"]["parallel_tool_calls"], false);
-                    } else {
-                        assert!(failed.data["error"]["message"].is_string());
+                        Event::Content("after second".into()),
+                    ]);
+                    let frames = enc.apply(0, first).unwrap();
+                    assert_eq!(enc.tool_limit_reached, !parallel);
+                    if !parallel {
+                        assert!(!format!("{frames:?}").contains("second"));
+                        assert!(enc.apply(0, vec![Event::Content("ignored".into())]).unwrap().is_empty());
+                    }
+                    let cause = if parallel { Termination::Eos } else if together {
+                        Termination::UserStop
+                    } else { Termination::OutputLimit };
+                    enc.finish(0, cause, 12, 0, Some("discarded stop".into())).unwrap();
+                    if !parallel && protocol == Protocol::Messages {
+                        assert!(enc.response()["stop_sequence"].is_null());
+                    }
+                    let calls = enc.outputs[0].blocks.iter().filter(|b| matches!(b, super::super::output::Block::Tool { .. })).count();
+                    assert_eq!(calls, if parallel { 2 } else { 1 });
+                    match protocol {
+                        Protocol::Chat => assert_eq!(enc.response()["choices"][0]["finish_reason"], "tool_calls"),
+                        Protocol::Messages => assert_eq!(enc.response()["stop_reason"], "tool_use"),
+                        Protocol::Responses => assert_eq!(enc.response()["status"], "completed"),
+                        _ => unreachable!(),
                     }
                 }
             }
@@ -801,7 +802,7 @@ fn developer_and_system_instructions_lower_to_one_template_preamble() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(native.len(), 2);
     assert_eq!(
         native[0],
@@ -822,7 +823,7 @@ fn response_history_retains_reasoning_calls_results_and_namespaces() {
     assert!(
         matches!(&messages[0].parts[..],[Part::Reasoning(_),Part::ToolCall{name,..}] if name=="shell__run")
     );
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(native[0]["reasoning_content"], "Think");
     assert_eq!(native[0]["tool_calls"][0]["id"], "c");
     assert_eq!(native[1]["tool_call_id"], "c");
@@ -837,10 +838,27 @@ fn messages_accept_webp_image_sources() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(
         native[0]["content"][0]["image_url"]["url"],
         "data:image/webp;base64,AA=="
+    );
+}
+
+#[test]
+fn messages_accept_gif_image_sources() {
+    let req = request(
+        Protocol::Messages,
+        json!({"max_tokens":4,"messages":[{"role":"user",
+        "content":[{"type":"image","source":{"type":"base64","media_type":"image/gif","data":"AA=="}}]}]}),
+    );
+    let Input::Conversation(messages) = req.input else {
+        panic!()
+    };
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
+    assert_eq!(
+        native[0]["content"][0]["image_url"]["url"],
+        "data:image/gif;base64,AA=="
     );
 }
 
@@ -853,7 +871,7 @@ fn messages_preserve_mixed_tool_results_and_images() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(native.len(), 3);
     assert_eq!(native[0]["content"], "before");
     assert_eq!(native[1]["is_error"], true);
@@ -883,7 +901,7 @@ fn messages_preserve_inline_system_text_and_discard_message_controls() {
             panic!()
         };
         assert_eq!(
-            template_messages(&messages, ToolChoice::Auto, &[]).unwrap(),
+            template_messages(&messages, ToolChoice::Auto, &[], true).unwrap(),
             vec![
                 json!({"role":"system","content":"Initial instructions"}),
                 json!({"role":"user","content":"Hello"}),
@@ -953,7 +971,7 @@ fn unsupported_controls_are_rejected_before_generation() {
         json!({"background":true}),
         json!({"tool_choice":{"type":"function","name":"lookup"}}),
         json!({"truncation":"auto"}),
-        json!({"tools":[{"type":"function","name":"f","strict":true}]}),
+        json!({"tools":[{"type":"custom","name":"f","strict":true}]}),
         json!({"tools":[{"type":"web_search"}]}),
         json!({"audio":{"voice":"alloy"}}),
     ] {
@@ -1566,7 +1584,7 @@ fn chat_history_without_call_ids_retains_template_semantics() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(native.len(), 3);
     assert!(native[1]["tool_calls"][0].get("id").is_none());
     assert!(native[2].get("tool_call_id").is_none());
@@ -1585,7 +1603,7 @@ fn empty_text_messages_preserve_conversation_roles() {
         panic!()
     };
     assert_eq!(
-        template_messages(&messages, ToolChoice::Auto, &[]).unwrap(),
+        template_messages(&messages, ToolChoice::Auto, &[], true).unwrap(),
         vec![
             json!({"role":"system","content":""}),
             json!({"role":"user","content":""}),
@@ -1725,5 +1743,574 @@ fn requested_logprob_ids_require_enablement_and_validate_before_deduplication() 
     for ids in [Value::Null, json!([]), json!([1])] {
         assert!(decode(Protocol::Messages,
             json!({"messages":[{"role":"user","content":"x"}],"max_tokens":1,"logprob_token_ids":ids}), false).is_err());
+    }
+}
+
+
+#[test]
+fn strict_function_tools_decode_and_gate_streaming_and_buffered_output_across_protocols() {
+    let compiler = crate::grammar::GrammarCompiler::new(
+        &crate::grammar::tests::byte_tokenizer(),
+        320,
+        &[256, 257],
+        &[],
+    )
+    .unwrap();
+
+    // Decode acceptance and explicit rejections on Chat & Responses
+    let chat_ok = decode(
+        Protocol::Chat,
+        json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}},
+                        "required": ["q"],
+                        "additionalProperties": false
+                    }
+                }
+            }]
+        }),
+        false,
+    )
+    .unwrap();
+    assert!(chat_ok.request.tools[0].strict);
+
+    let resp_ok = decode(
+        Protocol::Responses,
+        json!({
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                    "additionalProperties": false
+                }
+            }]
+        }),
+        false,
+    )
+    .unwrap();
+    assert!(resp_ok.request.tools[0].strict);
+
+    // Reject strict:true without parameters, non-bool strict, or strict on custom tools
+    for (protocol, bad_body) in [
+        (
+            Protocol::Chat,
+            json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","strict":true}}]}),
+        ),
+        (
+            Protocol::Chat,
+            json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","strict":"yes","parameters":{"type":"object"}}}]}),
+        ),
+        (
+            Protocol::Chat,
+            json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"custom","custom":{"name":"f","strict":true}}]}),
+        ),
+        (
+            Protocol::Responses,
+            json!({"input":"hi","tools":[{"type":"function","name":"f","strict":true}]}),
+        ),
+        (
+            Protocol::Responses,
+            json!({"input":"hi","tools":[{"type":"custom","name":"f","strict":true}]}),
+        ),
+    ] {
+        assert!(
+            decode(protocol, bad_body.clone(), false).is_err(),
+            "expected decode rejection for {protocol:?}: {bad_body}"
+        );
+    }
+
+    // Encoder strict gating: key-order-independent pass, zero-SSE-leak on invalid or truncated call
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "a": {"type": "string", "minLength": 2},
+            "b": {"type": "integer", "minimum": 10}
+        },
+        "required": ["a", "b"],
+        "additionalProperties": false
+    });
+    for protocol in [Protocol::Chat, Protocol::Responses] {
+        let make_enc = || {
+            let validator = crate::grammar::strict::validate_strict_tool_schema(
+                &compiler, "lookup", &schema,
+            )
+            .unwrap();
+            let strict_tools = vec![inference::Tool {
+                name: "lookup".into(),
+                namespace: None,
+                description: String::new(),
+                parameters: schema.clone(),
+                declared_parameters: true,
+                strict: true,
+                custom: false,
+                grammar: None,
+            }];
+            let mut enc = Encoder::new(
+                protocol,
+                "req_strict".into(),
+                "model".into(),
+                0,
+                1,
+                vec![PromptUsage::default()],
+                strict_tools,
+                ToolChoice::Auto,
+                true,
+                false,
+                Value::Null,
+            );
+            let mut map = std::collections::HashMap::new();
+            map.insert("lookup".to_owned(), validator);
+            enc.set_strict_validators(map);
+            enc
+        };
+
+        for invalid in [
+            Event::ToolBegin { index: 1, name: "lookup".into(), id: None },
+            Event::ToolArguments { index: 1, text: String::new() },
+            Event::ToolEnd { index: 1 },
+        ] {
+            let mut enc = make_enc();
+            let _ = enc.start();
+            assert!(enc.apply(0, vec![
+                Event::ToolBegin { index: 0, name: "lookup".into(), id: None },
+                Event::ToolArguments { index: 0, text: r#"{"a":"ok","b":12}"#.into() },
+            ]).unwrap().is_empty());
+            assert!(enc.apply(0, vec![invalid]).is_err());
+        }
+
+        // Argument fragments in generation order remain private until ToolEnd.
+        let mut enc = make_enc();
+        let _ = enc.start();
+        let pre_frames = enc
+            .apply(
+                0,
+                vec![
+                    Event::ToolBegin {
+                        index: 0,
+                        name: "lookup".into(),
+                        id: Some("call_1".into()),
+                    },
+                    Event::ToolArguments {
+                        index: 0,
+                        text: r#"{"a":"ok","#.into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(
+            pre_frames.is_empty(),
+            "strict tool must not stream partial unvalidated frames: {pre_frames:?}"
+        );
+        let end_frames = enc
+            .apply(
+                0,
+                vec![
+                    Event::ToolArguments {
+                        index: 0,
+                        text: r#""b":12}"#.into(),
+                    },
+                    Event::ToolEnd { index: 0 },
+                ],
+            )
+            .unwrap();
+        assert!(!end_frames.is_empty());
+        enc.finish(0, Termination::Eos, 8, 0, None).unwrap();
+
+        // Validation must not convert a generated integer through binary64.
+        let mut enc = make_enc();
+        let _ = enc.start();
+        let args = r#"{"a": "ok", "b": 123456789012345678901234567890}"#;
+        let held = enc.apply(0, vec![
+            Event::ToolBegin { index: 0, name: "lookup".into(), id: None },
+            Event::ToolArguments { index: 0, text: args.into() },
+        ]).unwrap();
+        assert!(held.is_empty());
+        let frames = enc.apply(0, vec![Event::ToolEnd { index: 0 }]).unwrap();
+        assert!(!frames.is_empty());
+        enc.finish(0, Termination::Eos, 8, 0, None).unwrap();
+
+        // 2. Invalid schema value fails at ToolEnd with zero previously leaked tool frames
+        let mut enc = make_enc();
+        let _ = enc.start();
+        let held = enc
+            .apply(
+                0,
+                vec![
+                    Event::ToolBegin {
+                        index: 0,
+                        name: "lookup".into(),
+                        id: Some("call_2".into()),
+                    },
+                    Event::ToolArguments {
+                        index: 0,
+                        text: r#"{"a":"ok","b":3}"#.into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(held.is_empty());
+        assert!(enc.apply(0, vec![Event::ToolEnd { index: 0 }]).is_err());
+
+        let mut enc = make_enc();
+        let _ = enc.start();
+        assert!(enc.apply(0, vec![Event::ToolBegin { index:0, name:"lookup".into(), id:None },
+            Event::ToolArguments { index:0, text:r#"{"a":"ok","b":12.0000000000000001}"#.into() }]).unwrap().is_empty());
+        assert!(enc.apply(0, vec![Event::ToolEnd { index:0 }]).is_err());
+
+        // 3a. Truncated strict call at Eos fails explicitly without leaking partial frames
+        let mut enc = make_enc();
+        let _ = enc.start();
+        let held = enc
+            .apply(
+                0,
+                vec![
+                    Event::ToolBegin {
+                        index: 0,
+                        name: "lookup".into(),
+                        id: Some("call_3".into()),
+                    },
+                    Event::ToolArguments {
+                        index: 0,
+                        text: r#"{"a":"ok""#.into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(held.is_empty());
+        assert!(enc.finish(0, Termination::Eos, 8, 0, None).is_err());
+
+        // 3b. Truncated strict call at OutputLimit under Auto drops the unvalidated call and reports length
+        let mut enc = make_enc();
+        let _ = enc.start();
+        let held = enc
+            .apply(
+                0,
+                vec![
+                    Event::ToolBegin {
+                        index: 0,
+                        name: "lookup".into(),
+                        id: Some("call_4".into()),
+                    },
+                    Event::ToolArguments {
+                        index: 0,
+                        text: r#"{"a":"ok""#.into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(held.is_empty());
+        enc.finish(0, Termination::OutputLimit, 8, 0, None).unwrap();
+        if protocol == Protocol::Chat {
+            assert_eq!(enc.response()["choices"][0]["finish_reason"], "length");
+            assert!(enc.response()["choices"][0]["message"]["tool_calls"].is_null());
+        } else {
+            assert_eq!(enc.response()["status"], "incomplete");
+            assert!(enc.response()["output"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn strict_tool_wires_reach_encoder_only_after_parser_completion() {
+    use crate::{
+        model::contract::{ToolParser, ToolParserKind},
+        output::{
+            Input as OutputInput, OutputConfig, OutputPipeline, Piece,
+            tagged::{self, OutputStart},
+            tml::CONTROL_MARKERS,
+        },
+    };
+
+    #[derive(Clone, Copy)]
+    struct Case {
+        name: &'static str,
+        kind: ToolParserKind,
+        separator: &'static str,
+        start: OutputStart,
+        controls: &'static [&'static str],
+        valid: &'static str,
+        invalid: &'static str,
+        truncated: &'static str,
+    }
+
+    fn pieces(wire: &str, controls: &[(u32, String)]) -> Vec<Piece> {
+        let mut pieces = Vec::new();
+        let mut rest = wire;
+        while let Some((at, id, marker)) = controls
+            .iter()
+            .filter_map(|(id, marker)| {
+                rest.find(marker)
+                    .map(|at| (at, *id, marker.as_str()))
+            })
+            .min_by_key(|(at, _, _)| *at)
+        {
+            pieces.push(Piece::Text(rest[..at].into()));
+            pieces.push(Piece::Token(id));
+            pieces.push(Piece::Text(marker.into()));
+            rest = &rest[at + marker.len()..];
+        }
+        pieces.push(Piece::Text(rest.into()));
+        pieces
+    }
+
+    fn push_input(
+        parser: &mut OutputPipeline,
+        encoder: &mut Encoder,
+        input: OutputInput<'_>,
+        case: &str,
+    ) -> crate::Result<usize> {
+        let events = parser
+            .push(input)
+            .unwrap_or_else(|error| panic!("{case} parser rejected valid wire syntax: {error}"));
+        let completed = events
+            .iter()
+            .any(|event| matches!(event, Event::ToolEnd { .. }));
+        let frames = encoder.apply(0, events)?;
+        assert!(
+            completed || frames.is_empty(),
+            "{case} strict call streamed before the parser completed it"
+        );
+        Ok(frames.len())
+    }
+
+    fn stream_wire(
+        parser: &mut OutputPipeline,
+        encoder: &mut Encoder,
+        wire: &str,
+        controls: &[(u32, String)],
+        case: &str,
+    ) -> crate::Result<usize> {
+        let mut frames = 0;
+        for piece in pieces(wire, controls) {
+            match piece {
+                Piece::Token(id) => {
+                    frames += push_input(parser, encoder, OutputInput::Token(id), case)?;
+                }
+                Piece::Text(text)
+                    if controls
+                        .iter()
+                        .any(|(_, marker)| marker.as_str() == text.as_str()) =>
+                {
+                    frames +=
+                        push_input(parser, encoder, OutputInput::Text(&text), case)?;
+                }
+                Piece::Text(text) => {
+                    for (at, character) in text.char_indices() {
+                        frames += push_input(
+                            parser,
+                            encoder,
+                            OutputInput::Text(&text[at..at + character.len_utf8()]),
+                            case,
+                        )?;
+                    }
+                }
+                Piece::Logprob(_) => unreachable!("strict wire fixtures contain no logprobs"),
+            }
+        }
+        Ok(frames)
+    }
+
+    let cases = [
+        Case {
+            name: "Qwen",
+            kind: ToolParserKind::QwenCoder,
+            separator: "",
+            start: OutputStart::Content,
+            controls: &[],
+            valid: "<function=lookup><parameter=q>ok</parameter></function>",
+            invalid: "<function=lookup><parameter=q>x</parameter></function>",
+            truncated: "<function=lookup><parameter=q>ok",
+        },
+        Case {
+            name: "GLM",
+            kind: ToolParserKind::GlmArgumentTags,
+            separator: "",
+            start: OutputStart::Content,
+            controls: &[],
+            valid: "<tool_call>lookup<arg_key>q</arg_key><arg_value>ok</arg_value></tool_call>",
+            invalid: "<tool_call>lookup<arg_key>q</arg_key><arg_value>x</arg_value></tool_call>",
+            truncated: "<tool_call>lookup<arg_key>q</arg_key><arg_value>ok",
+        },
+        Case {
+            name: "DSML",
+            kind: ToolParserKind::Dsml,
+            separator: "",
+            start: OutputStart::Content,
+            controls: &["｜DSML｜"],
+            valid: "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"><｜DSML｜parameter name=\"q\" string=\"true\">ok</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+            invalid: "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"><｜DSML｜parameter name=\"q\" string=\"true\">x</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+            truncated: "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"><｜DSML｜parameter name=\"q\" string=\"true\">ok",
+        },
+        Case {
+            name: "TML",
+            kind: ToolParserKind::TmlJson,
+            separator: "",
+            start: OutputStart::RecipientHeader,
+            controls: &CONTROL_MARKERS,
+            valid: "lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"q\":\"ok\"}}<|end_message|>",
+            invalid: "lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"q\":\"x\"}}<|end_message|>",
+            truncated: "lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"q\":\"ok\"}",
+        },
+    ];
+    let schema = json!({
+        "type": "object",
+        "properties": {"q": {"enum": ["ok"]}},
+        "required": ["q"],
+        "additionalProperties": false
+    });
+    let compiler = crate::grammar::GrammarCompiler::new(
+        &crate::grammar::tests::byte_tokenizer(),
+        320,
+        &[256, 257],
+        &[],
+    )
+    .unwrap();
+
+    for case in cases {
+        let controls: Vec<_> = case
+            .controls
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| (index as u32 + 1, (*marker).to_owned()))
+            .collect();
+        let make_parser = || {
+            let mut syntax = crate::model::testing::metadata().frontend;
+            syntax.reasoning = None;
+            syntax.tools = Some(ToolParser {
+                kind: case.kind,
+                wrapping_newlines: 0,
+                tag_separator: case.separator.into(),
+            });
+            OutputPipeline::new(OutputConfig {
+                syntax,
+                control_tokens: controls.clone(),
+                content: tagged::OutputConfig {
+                    structured: false,
+                    start: case.start,
+                    tools: vec![
+                        json!({"type":"function","function":{
+                            "name":"lookup","strict":true,"parameters":schema
+                        }}),
+                    ],
+                },
+            })
+        };
+        let make_encoder = || {
+            let validator = crate::grammar::strict::validate_strict_tool_schema(
+                &compiler, "lookup", &schema,
+            )
+            .unwrap();
+            let strict_tools = vec![inference::Tool {
+                name: "lookup".into(),
+                namespace: None,
+                description: String::new(),
+                parameters: schema.clone(),
+                declared_parameters: true,
+                strict: true,
+                custom: false,
+                grammar: None,
+            }];
+            let mut encoder = Encoder::new(
+                Protocol::Chat,
+                format!("strict_{}", case.name),
+                "model".into(),
+                0,
+                1,
+                vec![PromptUsage::default()],
+                strict_tools,
+                ToolChoice::Auto,
+                true,
+                false,
+                Value::Null,
+            );
+            let mut validators = std::collections::HashMap::new();
+            validators.insert("lookup".to_owned(), validator);
+            encoder.set_strict_validators(validators);
+            encoder
+        };
+
+        let mut parser = make_parser();
+        let mut encoder = make_encoder();
+        let _ = encoder.start();
+        let frames =
+            stream_wire(&mut parser, &mut encoder, case.valid, &controls, case.name).unwrap();
+        assert!(frames > 0, "{} completed call emitted no frames", case.name);
+        let tail = parser.finish(Termination::Eos).unwrap();
+        assert!(encoder.apply(0, tail).unwrap().is_empty());
+        let _ = encoder
+            .finish(0, Termination::Eos, 1, 0, None)
+            .unwrap();
+        let response = encoder.response();
+        let arguments = response["choices"][0]["message"]["tool_calls"][0]["function"]
+            ["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(arguments).unwrap(),
+            json!({"q":"ok"}),
+            "{}",
+            case.name
+        );
+
+        let mut parser = make_parser();
+        let mut encoder = make_encoder();
+        let _ = encoder.start();
+        assert!(
+            stream_wire(
+                &mut parser,
+                &mut encoder,
+                case.invalid,
+                &controls,
+                case.name
+            )
+            .is_err(),
+            "{} invalid completed call reached the client",
+            case.name
+        );
+        assert!(
+            encoder.response()["choices"][0]["message"]["tool_calls"].is_null(),
+            "{} invalid call mutated the response",
+            case.name
+        );
+
+        let mut parser = make_parser();
+        let mut encoder = make_encoder();
+        let _ = encoder.start();
+        assert_eq!(
+            stream_wire(
+                &mut parser,
+                &mut encoder,
+                case.truncated,
+                &controls,
+                case.name
+            )
+            .unwrap(),
+            0,
+            "{} truncated call streamed",
+            case.name
+        );
+        let tail = parser.finish(Termination::OutputLimit).unwrap();
+        assert!(tail.is_empty(), "{} parser emitted a truncated call", case.name);
+        assert!(encoder.apply(0, tail).unwrap().is_empty());
+        let _ = encoder
+            .finish(0, Termination::OutputLimit, 1, 0, None)
+            .unwrap();
+        assert!(
+            encoder.response()["choices"][0]["message"]["tool_calls"].is_null(),
+            "{} truncated call reached the response",
+            case.name
+        );
     }
 }

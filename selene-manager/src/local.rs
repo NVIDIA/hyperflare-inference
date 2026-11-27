@@ -11,7 +11,7 @@ use crate::{
     invalid,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::{
@@ -20,10 +20,12 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 pub const SHM_ROOT: &str = "/dev/shm/selene";
 pub const PAGE_BYTES: u64 = 4096;
+const PID_ZERO_HOLD: Duration = Duration::from_secs(60);
 use flare_selene::shared::region::{ARENA_FILE, Region, STAGING_FILE};
 
 /// One manager instance's shared-memory regions and the windows granted from them.
@@ -39,6 +41,7 @@ pub struct Local {
     staging_size: u64,
     region_files: [(u64, u64); 2],
     holders: HashMap<u64, u32>,
+    pid_zero_holders: HashMap<u64, u128>,
     /// Identifies this set of region files. It changes exactly when the files are recreated, so
     /// a process that registered the old files can tell the new ones are different.
     regions_generation: u64,
@@ -49,11 +52,13 @@ pub struct Local {
 }
 
 /// The reused regions' previous run: nothing in them is granted until every process that held
-/// a session then has reconnected (so it has drained) or exited. See PROTOCOL.md section 8.2.
+/// a session then has reconnected, exited, or reached the pid-zero bound in PROTOCOL.md 8.6.
 struct Prior {
     /// Pid to a descriptor that reports its exit; `None` when the process cannot be watched,
     /// which holds until it reconnects.
     holders: HashMap<u32, Option<OwnedFd>>,
+    pid_zero_holders: HashSet<u128>,
+    pid_zero_deadline: Instant,
     /// The whole of both regions, so no grant or store allocation can land in them.
     _extents: Vec<Extent>,
 }
@@ -115,6 +120,7 @@ impl Local {
     /// configured sizes (same files, inodes and offsets), else creates fresh, preallocated
     /// ones under a new generation.
     pub fn open(instance: &str, arena_bytes: usize, staging_bytes: usize) -> Result<Self> {
+        let started = Instant::now();
         validate_instance(instance)?;
         let root = Path::new(SHM_ROOT);
         create_private_directory(root).map_err(|error| step_error("create", root, error))?;
@@ -165,6 +171,7 @@ impl Local {
             STAGING_FILE,
             GENERATION_FILE,
             HOLDERS_FILE,
+            "last-shutdown",
         ] {
             check_owned_file(&directory.join(name))?;
         }
@@ -223,7 +230,7 @@ impl Local {
             );
         }
         let prior = if reused.is_some() {
-            Prior::read(&directory, &arena, &staging, instance)
+            Prior::read(&directory, &arena, &staging, instance, started)
         } else {
             None
         };
@@ -244,6 +251,7 @@ impl Local {
             staging_size: staging_size as u64,
             region_files: [arena_file?, staging_file?],
             holders: HashMap::new(),
+            pid_zero_holders: HashMap::new(),
             regions_generation,
             held: Arc::new(std::sync::atomic::AtomicBool::new(prior.is_some())),
             prior,
@@ -268,8 +276,8 @@ impl Local {
         self.prior.is_some()
     }
 
-    /// Writes the pids with a live local session, and the previous run's still-unresolved
-    /// holders, so a restart after a crash knows whose copies could still be in flight.
+    /// Persists visible pids and pid-zero process nonces, including unresolved prior holders,
+    /// so a restart knows whose copies could still be in flight.
     fn persist_holders(&self) {
         let mut pids: Vec<u32> = self.holders.values().copied().collect();
         if let Some(prior) = &self.prior {
@@ -283,15 +291,24 @@ impl Local {
                 text.push_str(&format!("{pid} {start}\n"));
             }
         }
+        let mut pid_zero_holders: Vec<_> = self.pid_zero_holders.values().copied().collect();
+        if let Some(prior) = &self.prior {
+            pid_zero_holders.extend(&prior.pid_zero_holders);
+        }
+        pid_zero_holders.sort_unstable();
+        pid_zero_holders.dedup();
+        for nonce in pid_zero_holders {
+            text.push_str(&format!("0 {nonce:032x}\n"));
+        }
         let _ = write_atomically(&self.directory.join(HOLDERS_FILE), text.as_bytes());
     }
 
-    /// Releases the previous run's hold once none of its processes can still be copying.
+    /// Releases the previous run's hold once all recorded holders are released.
     fn settle_prior(&mut self) {
         if self
             .prior
             .as_ref()
-            .is_some_and(|prior| prior.holders.is_empty())
+            .is_some_and(|prior| prior.holders.is_empty() && prior.pid_zero_holders.is_empty())
         {
             self.prior = None;
             self.held.store(false, std::sync::atomic::Ordering::Release);
@@ -365,20 +382,26 @@ impl Local {
     }
 
     /// Records a live pool process for restart recovery; the pool owns its pidfd.
-    pub fn accept(&mut self, connection: u64, pid: u32) -> Result<()> {
-        if pid == 0 {
+    pub fn accept(&mut self, connection: u64, pid: u32, nonce: Option<[u8; 16]>) -> Result<()> {
+        if pid != 0 {
+            self.holders.insert(connection, pid);
+        } else if let Some(nonce) = nonce {
+            self.pid_zero_holders
+                .insert(connection, u128::from_le_bytes(nonce));
+        } else {
             return Ok(());
         }
-        self.holders.insert(connection, pid);
-        // A process of the previous run that reconnects has drained what it did under the
-        // dead manager before it did (PROTOCOL.md section 8.1), so its hold is over.
+        // A reconnect follows drainage under the dead manager (PROTOCOL.md section 8.1).
         if let Some(prior) = &mut self.prior {
-            if prior.holders.remove(&pid).is_some() {
+            if pid != 0 && prior.holders.remove(&pid).is_some() {
                 eprintln!(
                     "selene: instance '{}': process {pid} of the previous run reconnected, {} left",
                     self.instance,
                     prior.holders.len()
                 );
+            }
+            if let Some(nonce) = nonce {
+                prior.pid_zero_holders.remove(&u128::from_le_bytes(nonce));
             }
             self.settle_prior();
         }
@@ -389,12 +412,17 @@ impl Local {
     /// The pool has proved this process no longer accesses the regions.
     pub fn close(&mut self, connection: u64) {
         self.holders.remove(&connection);
+        self.pid_zero_holders.remove(&connection);
         self.persist_holders();
     }
 
     pub fn poll_prior(&mut self) {
+        self.poll_prior_at(Instant::now());
+    }
+
+    fn poll_prior_at(&mut self, now: Instant) {
         if let Some(prior) = &mut self.prior {
-            let before = prior.holders.len();
+            let before = prior.holders.len() + prior.pid_zero_holders.len();
             let instance = &self.instance;
             prior.holders.retain(|pid, pidfd| {
                 let gone = pidfd.as_ref().is_some_and(pidfd_exited);
@@ -405,7 +433,20 @@ impl Local {
                 }
                 !gone
             });
-            if prior.holders.len() != before {
+            if now >= prior.pid_zero_deadline && !prior.pid_zero_holders.is_empty() {
+                let mut prefixes: Vec<_> = prior
+                    .pid_zero_holders
+                    .drain()
+                    .map(|nonce| format!("{nonce:032x}")[..8].to_owned())
+                    .collect();
+                prefixes.sort_unstable();
+                eprintln!(
+                    "selene: instance '{instance}': released pid-zero holders after {} s: {}",
+                    PID_ZERO_HOLD.as_secs(),
+                    prefixes.join(", ")
+                );
+            }
+            if prior.holders.len() + prior.pid_zero_holders.len() != before {
                 self.settle_prior();
                 self.persist_holders();
             }
@@ -419,15 +460,17 @@ impl Local {
         extent: &Extent,
         within: usize,
         length: u64,
+        packed: bool,
     ) -> Result<u64> {
         let length = usize::try_from(length).map_err(|_| invalid("window length overflows"))?;
-        if !within.is_multiple_of(PAGE_BYTES as usize)
-            || !length.is_multiple_of(PAGE_BYTES as usize)
-            || within
-                .checked_add(length)
-                .is_none_or(|end| end > extent.bytes().len())
+        if !packed && (!within.is_multiple_of(PAGE_BYTES as usize) || !length.is_multiple_of(PAGE_BYTES as usize)) {
+            return Err(invalid("raw window is not page aligned"));
+        }
+        if within
+            .checked_add(length)
+            .is_none_or(|end| end > extent.bytes().len())
         {
-            return Err(invalid("window exceeds its extent or is not page aligned"));
+            return Err(invalid("window exceeds its extent"));
         }
         let offset = extent
             .offset()
@@ -510,7 +553,7 @@ fn check_owned_file(path: &Path) -> Result<()> {
 /// With the instance lock held, remove only this manager's unfinished metadata writes.
 fn reclaim_stale(directory: &Path) -> Result<usize> {
     let mut removed = 0;
-    for name in ["generation.tmp", "holders.tmp"] {
+    for name in ["generation.tmp", "holders.tmp", "last-shutdown.tmp"] {
         let path = directory.join(name);
         check_owned_file(&path)?;
         match fs::remove_file(path) {
@@ -650,7 +693,7 @@ fn new_generation() -> Result<u64> {
 }
 
 /// Replaces `path` with `contents` in one step, so a crash leaves the old file or the new one.
-fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension("tmp");
     fs::write(&temporary, contents)?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o660))?;
@@ -669,10 +712,24 @@ fn process_start(pid: u32) -> Option<u64> {
 impl Prior {
     /// The processes the last run recorded that are still the same live processes. `None` when
     /// there are none, so nothing needs holding.
-    fn read(directory: &Path, arena: &Arena, staging: &Arena, instance: &str) -> Option<Self> {
+    fn read(
+        directory: &Path,
+        arena: &Arena,
+        staging: &Arena,
+        instance: &str,
+        started: Instant,
+    ) -> Option<Self> {
         let text = fs::read_to_string(directory.join(HOLDERS_FILE)).ok()?;
         let mut holders = HashMap::new();
+        let mut pid_zero_holders = HashSet::new();
         for line in text.lines() {
+            // PID 0 cannot name a client process; `0 <hex>` records its process nonce.
+            if let Some(nonce) = line.strip_prefix("0 ") {
+                if let Ok(nonce) = u128::from_str_radix(nonce, 16) {
+                    pid_zero_holders.insert(nonce);
+                }
+                continue;
+            }
             let mut fields = line.split_whitespace();
             let (Some(pid), Some(start)) = (
                 fields.next().and_then(|field| field.parse::<u32>().ok()),
@@ -688,20 +745,24 @@ impl Prior {
                 holders.insert(pid, pidfd);
             }
         }
-        if holders.is_empty() {
+        if holders.is_empty() && pid_zero_holders.is_empty() {
             return None;
         }
         let mut pids: Vec<_> = holders.keys().copied().collect();
         pids.sort_unstable();
         eprintln!(
-            "selene: instance '{instance}' holds its shared regions until {} process(es) of the \
-             previous run reconnect or exit (pids {pids:?})",
-            holders.len()
+            "selene: instance '{instance}' holds its shared regions for {} previous-run \
+             process(es) (visible pids {pids:?}, {} pid-zero holders held at most {} s)",
+            holders.len() + pid_zero_holders.len(),
+            pid_zero_holders.len(),
+            PID_ZERO_HOLD.as_secs()
         );
         let mut extents = arena.reserve_all();
         extents.extend(staging.reserve_all());
         Some(Self {
             holders,
+            pid_zero_holders,
+            pid_zero_deadline: started + PID_ZERO_HOLD,
             _extents: extents,
         })
     }
@@ -852,11 +913,13 @@ mod tests {
         }
         fs::write(directory.join("generation.tmp"), b"stale").unwrap();
         fs::write(directory.join("holders.tmp"), b"stale").unwrap();
+        fs::write(directory.join("last-shutdown.tmp"), b"stale").unwrap();
         fs::write(directory.join("leftover.tmp"), b"stale").unwrap();
         let second = reopen(&name);
         let _cleanup = Cleanup(directory.clone());
         assert!(!directory.join("generation.tmp").exists());
         assert!(!directory.join("holders.tmp").exists());
+        assert!(!directory.join("last-shutdown.tmp").exists());
         assert!(directory.join("leftover.tmp").exists());
         assert!(directory.join("lock").exists());
         assert!(second.arena_path().exists());
@@ -924,7 +987,7 @@ mod tests {
         let name = instance("reuse");
         let (first, cleanup) = local(&name, 64 * 1024, 64 * 1024);
         let mut first = first;
-        first.accept(1, std::process::id()).unwrap();
+        first.accept(1, std::process::id(), None).unwrap();
         let grant = first.staging().allocate(4096).unwrap();
         let offset = grant.offset();
         drop(grant);
@@ -948,7 +1011,7 @@ mod tests {
         assert_eq!(second.regions_generation(), generation);
         // The test process is the holder that was recorded, so it is held until it reconnects.
         assert!(second.held_for_previous_run());
-        second.accept(1, std::process::id()).unwrap();
+        second.accept(1, std::process::id(), None).unwrap();
         assert!(!second.held_for_previous_run());
         let again = second.staging().allocate(4096).unwrap();
         assert_eq!(again.offset(), offset, "regions keep the same offsets");
@@ -1106,8 +1169,8 @@ mod tests {
         let mut back = spawn_sleeper();
         let name = instance("prior");
         let (mut first, cleanup) = local(&name, 64 * 1024, 64 * 1024);
-        first.accept(1, gone.0.id()).unwrap();
-        first.accept(2, back.0.id()).unwrap();
+        first.accept(1, gone.0.id(), None).unwrap();
+        first.accept(2, back.0.id(), None).unwrap();
         // The manager dies without closing anything.
         drop(first);
 
@@ -1115,11 +1178,16 @@ mod tests {
         assert!(second.held_for_previous_run());
         let flag = second.held_flag();
         assert!(flag.load(std::sync::atomic::Ordering::Acquire));
-        second.accept(9, std::process::id()).unwrap();
+        second.poll_prior_at(Instant::now() + PID_ZERO_HOLD);
+        assert!(
+            second.held_for_previous_run(),
+            "visible pids have no timeout"
+        );
+        second.accept(9, std::process::id(), None).unwrap();
         assert!(second.staging().allocate(4096).is_none());
         assert!(second.arena().allocate(4096).is_none());
         // One holder reconnects: it drained before it did, but the other has not been heard from.
-        second.accept(3, back.0.id()).unwrap();
+        second.accept(3, back.0.id(), None).unwrap();
         assert!(second.held_for_previous_run());
         // The other exits.
         gone.0.kill().unwrap();
@@ -1140,17 +1208,92 @@ mod tests {
     }
 
     #[test]
+    fn pid_zero_live_holder_releases_after_restart_bound() {
+        let mut client = spawn_sleeper();
+        let name = instance("pid-zero-timeout");
+        let (mut first, _cleanup) = local(&name, 64 * 1024, 64 * 1024);
+        first.accept(1, 0, Some([1; 16])).unwrap();
+        first.accept(2, 0, Some([2; 16])).unwrap();
+        drop(first);
+        let started = Instant::now();
+        let mut second = reopen(&name);
+        let after_open = Instant::now();
+        let flag = second.held_flag();
+        second.poll_prior_at(started + Duration::from_secs(59));
+        assert!(second.held_for_previous_run());
+        assert!(second.staging().allocate(4096).is_none());
+        assert!(second.arena().allocate(4096).is_none());
+        second.poll_prior_at(after_open + Duration::from_secs(60));
+        assert!(
+            client.0.try_wait().unwrap().is_none(),
+            "the client is alive"
+        );
+        assert!(!second.held_for_previous_run());
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+        assert!(second.staging().allocate(4096).is_some());
+        assert!(second.arena().allocate(4096).is_some());
+        second.poll_prior_at(after_open + Duration::from_secs(61));
+        drop(second);
+        assert!(
+            !reopen(&name).held_for_previous_run(),
+            "expired holders stay cleared"
+        );
+    }
+
+    #[test]
+    fn pid_zero_restart_holds_until_each_nonce_reconnects() {
+        let name = instance("pid-zero-prior");
+        let (mut first, _cleanup) = local(&name, 64 * 1024, 64 * 1024);
+        first.accept(1, 0, Some([1; 16])).unwrap();
+        first.accept(2, 0, Some([2; 16])).unwrap();
+        drop(first);
+        let mut second = reopen(&name);
+        assert!(second.held_for_previous_run());
+        second.poll_prior();
+        assert!(second.staging().allocate(4096).is_none());
+        assert!(second.arena().allocate(4096).is_none());
+        second.accept(3, 0, Some([3; 16])).unwrap();
+        assert!(
+            second.held_for_previous_run(),
+            "another process cannot clear a holder"
+        );
+        second.close(3);
+        // Unresolved nonces survive another manager restart.
+        drop(second);
+        let mut third = reopen(&name);
+        // A nonce reconnect also resolves a hold when its pid has become visible.
+        third.accept(4, std::process::id(), Some([1; 16])).unwrap();
+        assert!(third.held_for_previous_run());
+        third.accept(5, 0, Some([2; 16])).unwrap();
+        assert!(!third.held_for_previous_run());
+        assert_eq!(
+            third.pid_zero_holders.values().copied().collect::<Vec<_>>(),
+            vec![u128::from_le_bytes([2; 16])],
+            "only pid-zero peers are recorded by nonce"
+        );
+        assert!(third.staging().allocate(4096).is_some());
+        assert!(third.arena().allocate(4096).is_some());
+        third.close(4);
+        third.close(5);
+        drop(third);
+        assert!(!reopen(&name).held_for_previous_run());
+    }
+
+    #[test]
     fn buffer_views_are_bounds_checked_and_hold_the_allocation() {
         let name = instance("views");
         let (local, _cleanup) = local(&name, 8192, 8192);
         let extent = Arc::new(local.staging().allocate(4096).unwrap());
         assert_eq!(
-            local.offset(Region::Staging, &extent, 0, 4096).unwrap(),
+            local.offset(Region::Staging, &extent, 0, 4096, false).unwrap(),
             extent.offset() as u64
         );
-        assert!(local.offset(Region::Staging, &extent, 1, 4096).is_err());
-        assert!(local.offset(Region::Staging, &extent, 0, 4097).is_err());
-        assert!(local.offset(Region::Staging, &extent, 4096, 4096).is_err());
+        assert!(local.offset(Region::Staging, &extent, 1, 4095, false).is_err());
+        assert!(local.offset(Region::Staging, &extent, 1, 4095, true).is_ok());
+        assert!(local.offset(Region::Staging, &extent, 1, 4096, true).is_err());
+        assert!(local.offset(Region::Staging, &extent, 1, 4096, false).is_err());
+        assert!(local.offset(Region::Staging, &extent, 0, 4097, false).is_err());
+        assert!(local.offset(Region::Staging, &extent, 4096, 4096, false).is_err());
         let hold = extent.clone();
         drop(extent);
         assert_eq!(local.staging_used(), 4096);

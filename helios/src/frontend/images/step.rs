@@ -72,6 +72,9 @@ fn plan(mut width: usize, mut height: usize) -> Plan {
 pub(super) fn geometry(limits: ImageLimits, width: usize, height: usize) -> Result<ImageGeometry> {
     check_input_extent(limits, width, height)?;
     let p = plan(width, height);
+    if p.width == 0 || p.height == 0 {
+        return Err("image aspect ratio exceeds prepared Step geometry".into());
+    }
     if p.square {
         check_input_extent(limits, width.max(height), width.max(height))?;
     }
@@ -232,5 +235,8 @@ mod tests {
             assert_eq!(g.tokens, 169 + rows as usize * cols as usize * 81);
         }
         assert!(geometry(limits, 3024, 32).is_err());
+        // Extreme aspect ratios that scale a dimension down to 0 must fail admission cleanly.
+        assert!(geometry(limits, 32, 97_000).is_err());
+        assert!(geometry(limits, 97_000, 32).is_err());
     }
 }

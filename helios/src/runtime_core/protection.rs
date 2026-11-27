@@ -137,7 +137,7 @@ impl CoreClaim {
                 development: claim.development,
             });
         }
-        let (_, _, _, bytes) = Archive::envelope(path)?;
+        let (_, _, _, bytes, _) = Archive::envelope(path)?;
         let envelope = wire::ProtectedIndex::decode(bytes.as_slice())
             .map_err(|e| invalid(format!("invalid signed envelope: {e}")))?;
         ExecutableEncoding::from_version(envelope.version)?;
@@ -303,6 +303,7 @@ fn open_descriptors() -> Option<u64> {
 
 fn preflight_open_files(
     metadata: &payload_reader::Metadata,
+    verified: &payload_auth::VerifiedCore,
     ids: &std::collections::BTreeSet<Vec<u8>>,
 ) -> Result<()> {
     let mut files = std::collections::BTreeSet::new();
@@ -312,17 +313,48 @@ fn preflight_open_files(
             files.insert(location.file.clone());
         }
     }
-    // Each selected companion needs one opened container and one direct-I/O handle, and every
-    // payload inside it shares that handle.
-    let required = (files.len() as u64).saturating_mul(2);
+    let mut engram_ids = std::collections::BTreeSet::new();
+    if let Some(engram) = verified.deployment().and_then(|deployment| deployment.engram.as_ref()) {
+        for table in &engram.tables {
+            for plane in [&table.weights, &table.scales] {
+                if let Some(slice) = plane.as_ref().and_then(|use_| use_.slice.as_ref()) {
+                    engram_ids.insert(slice.payload_id.as_slice());
+                }
+            }
+            for shard in &table.shards {
+                if verified.rank(shard.rank).is_some() {
+                    for plane in [&shard.weights, &shard.scales] {
+                        if let Some(slice) = plane.as_ref().and_then(|use_| use_.slice.as_ref()) {
+                            engram_ids.insert(slice.payload_id.as_slice());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let engram_files: std::collections::BTreeSet<&str> = metadata
+        .locations
+        .locations
+        .iter()
+        .filter(|location| engram_ids.contains(location.payload_id.as_slice()))
+        .map(|location| location.file.as_str())
+        .collect();
+    // Each selected companion needs one pinned descriptor; weight loading holds at most
+    // `READERS` temporary direct-I/O handles per rank, and Engram opens one direct handle per
+    // distinct table-plane file.
+    let loader_direct =
+        (verified.ranks().len().max(1) as u64).saturating_mul(super::payload::READERS as u64);
+    let required = (files.len() as u64)
+        .saturating_add(loader_direct)
+        .saturating_add(engram_files.len() as u64);
     #[cfg(unix)]
     {
-        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-        // SAFETY: getrlimit writes into the provided struct.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-            // Count what the process already holds rather than assuming fixed headroom.
-            let current = open_descriptors().unwrap_or(0);
-            return open_file_budget(current, required, limit.rlim_cur as u64);
+        // Count what the process already holds rather than assuming fixed headroom, and raise the
+        // soft limit toward the hard limit when the deployment requires more descriptors.
+        let current = open_descriptors().unwrap_or(0);
+        let desired = current.saturating_add(required).saturating_add(256);
+        if let Some(limit) = crate::os::raise_open_file_limit(desired) {
+            return open_file_budget(current, required, limit);
         }
         Ok(())
     }
@@ -481,6 +513,12 @@ impl super::payload::Files for FilesRef {
             FilesRef::Payload(source) => super::payload::Files::direct_files(source),
         }
     }
+    fn direct_file(&self, index: usize) -> Result<Arc<File>> {
+        match self {
+            FilesRef::Legacy(archive) => super::payload::Files::direct_file(archive, index),
+            FilesRef::Payload(source) => super::payload::Files::direct_file(source, index),
+        }
+    }
     fn retained_files(&self) -> Result<Vec<Arc<File>>> {
         match self {
             FilesRef::Legacy(archive) => super::payload::Files::retained_files(archive),
@@ -524,6 +562,31 @@ fn publisher_profiles(publishers: &[Publisher]) -> Result<Vec<Publisher>> {
         }
     }
     Ok(profiles)
+}
+
+fn merge_payload_publisher_profiles(
+    mut profiles: Vec<Publisher>,
+    publishers: &[Publisher],
+) -> Result<Vec<Publisher>> {
+    for publisher in publishers {
+        publisher.validate()?;
+        if let Some(previous) = profiles.iter().find(|p| {
+            p.public_key == publisher.public_key && p.namespace == publisher.namespace
+        }) {
+            if previous != publisher {
+                return Err(invalid(
+                    "conflicting identities for the same publisher key and namespace",
+                ));
+            }
+        } else {
+            profiles.push(publisher.clone());
+        }
+    }
+    Ok(profiles)
+}
+
+fn payload_publisher_profiles(publishers: &[Publisher]) -> Result<Vec<Publisher>> {
+    merge_payload_publisher_profiles(super::publishers::embedded()?, publishers)
 }
 
 /// Authenticate exact envelope bytes against publisher profiles without opening payload files.
@@ -642,16 +705,17 @@ impl VerifiedCore {
                             .map_err(|_| invalid("rank id exceeds the core rank domain"))
                     })
                     .transpose()?;
+                let profiles = payload_publisher_profiles(publishers)?;
                 let metadata = payload_reader::Metadata::open(path)?;
                 let verified = payload_auth::verify(
                     &metadata.envelope,
-                    publishers,
+                    &profiles,
                     payload_auth::Selection::Catalog,
                 )?;
                 let deployment = select_deployment(&verified, None)?;
                 Self::open_selected(
                     path,
-                    publishers,
+                    &profiles,
                     payload_auth::Selection::Deployment { deployment, rank },
                 )
             }
@@ -668,16 +732,17 @@ impl VerifiedCore {
         if tensor_parallel == 0 {
             return Err(invalid("tensor-parallel size must be positive"));
         }
+        let profiles = payload_publisher_profiles(publishers)?;
         let metadata = payload_reader::Metadata::open(path)?;
         let verified = payload_auth::verify(
             &metadata.envelope,
-            publishers,
+            &profiles,
             payload_auth::Selection::Catalog,
         )?;
         let deployment = select_deployment(&verified, Some(tensor_parallel))?;
         Self::open_selected(
             path,
-            publishers,
+            &profiles,
             payload_auth::Selection::Deployment { deployment, rank },
         )
     }
@@ -687,6 +752,13 @@ impl VerifiedCore {
         match self {
             Self::Legacy(core) => core.index.ranks.len(),
             Self::Payload(core) => core.verified.ranks().len(),
+        }
+    }
+    /// Number of Ed25519 signatures verified for this core selection.
+    pub fn signature_count(&self) -> usize {
+        match self {
+            Self::Legacy(core) => 3 + core.index.ranks.len(),
+            Self::Payload(core) => core.verified.signature_count(),
         }
     }
     pub fn open_selected(
@@ -800,75 +872,6 @@ pub(super) struct Protection {
     /// The one rank of a multi-host core verified, whose bundle alone the index then holds.
     rank: Option<usize>,
 }
-/// Initializer detail for memory-map inspection: destination placement plus the
-/// payload source range and its container location.
-fn initializer_detail(
-    body: &crate::core::schema::wire::RankBody,
-    locations: &crate::core::schema::wire::LocationSet,
-) -> Vec<serde_json::Value> {
-    let placed: std::collections::BTreeMap<Vec<u8>, (&str, &str)> = locations
-        .locations
-        .iter()
-        .map(|location| {
-            (
-                location.payload_id.clone(),
-                (location.file.as_str(), location.tensor.as_str()),
-            )
-        })
-        .collect();
-    let mut detail = Vec::new();
-    for initializer in &body.initializers {
-        let Some(slice) = initializer
-            .source
-            .as_ref()
-            .and_then(|use_| use_.slice.as_ref())
-        else {
-            continue;
-        };
-        if slice.nbytes == 0 {
-            continue;
-        }
-        let (file, tensor) = placed.get(&slice.payload_id).copied().unwrap_or(("", ""));
-        detail.push(serde_json::json!({
-            "allocation": initializer.allocation,
-            "destination_offset": initializer.destination_offset,
-            "payload_id": hex(&slice.payload_id),
-            "source_offset": slice.offset,
-            "nbytes": slice.nbytes,
-            "file": file,
-            "tensor": tensor,
-        }));
-    }
-    detail
-}
-
-fn initializer_spans(
-    body: &crate::core::schema::wire::RankBody,
-) -> std::collections::BTreeMap<String, Vec<wire::Span>> {
-    let mut spans: std::collections::BTreeMap<String, Vec<wire::Span>> = Default::default();
-    for initializer in &body.initializers {
-        let Some(slice) = initializer
-            .source
-            .as_ref()
-            .and_then(|use_| use_.slice.as_ref())
-        else {
-            continue;
-        };
-        if slice.nbytes == 0 {
-            continue;
-        }
-        spans
-            .entry(initializer.allocation.clone())
-            .or_default()
-            .push(wire::Span {
-                offset: initializer.destination_offset,
-                nbytes: slice.nbytes,
-                filename: String::new(),
-            });
-    }
-    spans
-}
-
 fn add_catalog(
     resources: &mut BTreeMap<u64, (bool, wire::ProtectedResource)>,
     catalog: wire::ResourceCatalog,
@@ -1568,9 +1571,11 @@ pub struct PayloadSource {
     #[cfg_attr(unix, allow(dead_code))]
     relative: BTreeMap<String, String>,
     placements: BTreeMap<Vec<u8>, super::format::Placement>,
+    tokens: BTreeMap<String, Vec<u8>>,
     files: BTreeMap<String, super::archive::PayloadFile>,
     executables: BTreeMap<String, payload_wire::ExecutableResource>,
     authorized: Arc<payload_auth::AuthorizedCore>,
+    supporting_verified: bool,
 }
 
 const HASH_CHUNK: usize = 4 << 20;
@@ -1791,6 +1796,13 @@ impl super::payload::Files for PayloadSource {
             return Ok(plaintext);
         }
         let span = self.span(core, key)?;
+        if !self.supporting_verified {
+            let id = self
+                .tokens
+                .get(&span.filename)
+                .ok_or_else(|| invalid("payload has no signed identity"))?;
+            self.hash_payload(id)?;
+        }
         let (file, offset) = self.source(span)?;
         let mut bytes = vec![0u8; super::protobuf::size(span.nbytes)?];
         FileReadAt::read_exact_at(&*file.file, &mut bytes, offset)
@@ -1849,24 +1861,47 @@ impl super::payload::Files for PayloadSource {
     fn direct_files(&self) -> Box<dyn Iterator<Item = Result<Arc<File>>> + '_> {
         Box::new(self.files.values().map(|file| file.direct()))
     }
-    fn retained_files(&self) -> Result<Vec<Arc<File>>> {
+    fn direct_file(&self, index: usize) -> Result<Arc<File>> {
         self.files
             .values()
-            .map(|payload| {
-                #[cfg(windows)]
-                {
-                    return Ok(Arc::new(
+            .nth(index)
+            .ok_or_else(|| invalid("payload container index out of range"))?
+            .direct()
+    }
+    fn retained_files(&self) -> Result<Vec<Arc<File>>> {
+        #[cfg(windows)]
+        {
+            return self
+                .files
+                .values()
+                .map(|payload| {
+                    Ok(Arc::new(
                         crate::os::direct_read_guard(&payload.file).map_err(|error| {
                             invalid(format!("retain read-only core: {error}"))
                         })?,
-                    ));
+                    ))
+                })
+                .collect();
+        }
+        #[cfg(unix)]
+        {
+            // On Unix, weights, kernels, and graphs finish uploading before serving begins, and
+            // the cache entry lease protects published entries. Keep only the files backing
+            // frontend assets so `/proc/self/fd/<fd>` paths in `server_config["assets"]` stay open.
+            let mut retained = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for asset in &self.authorized.verified().core().assets {
+                let Some(slice) = asset.payload.as_ref().and_then(|use_| use_.slice.as_ref())
+                else {
+                    continue;
+                };
+                let (file, _) = self.payload_file(&slice.payload_id)?;
+                if seen.insert(Arc::as_ptr(&file.file) as usize) {
+                    retained.push(file.file.clone());
                 }
-                #[cfg(unix)]
-                {
-                    Ok(payload.file.clone())
-                }
-            })
-            .collect()
+            }
+            Ok(retained)
+        }
     }
     fn resource_reader<'a>(
         &'a self,
@@ -1947,10 +1982,45 @@ fn push_peer(
     Ok(())
 }
 
-fn build_descriptor<F: Fn(&crate::core::schema::wire::PayloadUse) -> Result<wire::Span>>(
+/// Format-neutral model-level metadata consumed by [`super::model::NativeModel::load_agreeing`].
+/// Payload cores populate this directly from verified schema records without fabricating legacy
+/// `ModelIndex` or `BundleIndex` wire structs; legacy cores adapt into it once at load.
+#[derive(Debug)]
+pub(super) struct LoadedModelDescriptor {
+    pub cluster: Option<wire::Cluster>,
+    pub rank_roce: Vec<Option<wire::RoceTransport>>,
+    pub peer_memory: Vec<wire::PeerMemory>,
+    pub contract: Option<wire::ServingContract>,
+    pub sampling_defaults: Option<wire::DefaultSamplingParameters>,
+    pub frontend: Option<wire::FrontendSettings>,
+    pub assets: Vec<wire::Asset>,
+    pub engram: Option<wire::Engram>,
+}
+
+impl LoadedModelDescriptor {
+    pub(super) fn from_legacy(
+        mut index: wire::ModelIndex,
+    ) -> (Self, Vec<wire::BundleIndex>) {
+        let rank_roce = index.ranks.iter_mut().map(|b| b.roce.take()).collect();
+        let bundles = index.ranks;
+        let descriptor = Self {
+            cluster: index.cluster,
+            rank_roce,
+            peer_memory: index.peer_memory,
+            contract: index.contract,
+            sampling_defaults: index.sampling_defaults,
+            frontend: index.frontend,
+            assets: index.assets,
+            engram: index.engram,
+        };
+        (descriptor, bundles)
+    }
+}
+
+fn build_loaded_descriptor<F: Fn(&crate::core::schema::wire::PayloadUse) -> Result<wire::Span>>(
     verified: &payload_auth::VerifiedCore,
     token_span: F,
-) -> Result<wire::ModelIndex> {
+) -> Result<LoadedModelDescriptor> {
     let core = verified.core();
     let deployment = verified
         .deployment()
@@ -2039,30 +2109,22 @@ fn build_descriptor<F: Fn(&crate::core::schema::wire::PayloadUse) -> Result<wire
         .transpose()?;
     let mut peers = Vec::new();
     let mut peer_indices = BTreeMap::new();
-    let mut ranks = Vec::new();
+    let mut rank_roce = Vec::new();
     for body in verified.ranks() {
         for peer in &body.peers {
             push_peer(&mut peers, &mut peer_indices, peer)?;
         }
-        // The loader descriptor describes topology and transports only; inspection
-        // detail is added by the caller from the authenticated rank bodies.
-        ranks.push(wire::BundleIndex {
-            architecture: deployment.architecture.clone(),
-            roce: body.roce.clone(),
-            ..Default::default()
-        });
+        rank_roce.push(body.roce.clone());
     }
-    Ok(wire::ModelIndex {
-        version: 5,
-        ranks,
+    Ok(LoadedModelDescriptor {
+        cluster: deployment.cluster.clone(),
+        rank_roce,
         peer_memory: peers,
-        assets,
-        engram,
+        contract: deployment.contract.clone(),
         sampling_defaults: core.sampling_defaults.clone(),
         frontend: core.frontend.clone(),
-        cluster: deployment.cluster.clone(),
-        contract: deployment.contract.clone(),
-        ..Default::default()
+        assets,
+        engram,
     })
 }
 
@@ -2095,6 +2157,7 @@ impl PayloadVerifiedCore {
         ))
     }
 
+    #[cfg(test)]
     fn token_span(&self, use_: &crate::core::schema::wire::PayloadUse) -> Result<wire::Span> {
         let slice = use_
             .slice
@@ -2114,123 +2177,9 @@ impl PayloadVerifiedCore {
         })
     }
 
-    /// Inspection descriptor: the loader descriptor enriched from authenticated rank
-    /// bodies. Stored destination spans come from initializers, which are the
-    /// authoritative placement for payload cores; adapted allocation records do
-    /// not carry them, and a destination offset is never a payload source offset.
-    fn inspection_descriptor(&self) -> Result<wire::ModelIndex> {
-        let mut index = self.descriptor()?;
-        for (bundle, (body, core)) in index
-            .ranks
-            .iter_mut()
-            .zip(self.verified.ranks().iter().zip(&self.cores))
-        {
-            let relocations = |values: &[super::format::Relocation]| {
-                values
-                    .iter()
-                    .map(|relocation| wire::Relocation {
-                        offset: relocation.offset as u64,
-                        target: Some(wire::Reference {
-                            allocation: relocation.target.allocation.clone(),
-                            offset: relocation.target.offset as u64,
-                        }),
-                        kind: match relocation.kind {
-                            super::format::RelocationKind::Pointer => 0,
-                            super::format::RelocationKind::TensorMap => 1,
-                        },
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let spans = initializer_spans(body);
-            bundle.execution = core.execution.clone();
-            bundle.allocations = core
-                .allocations
-                .iter()
-                .map(|allocation| wire::Allocation {
-                    name: allocation.name.clone(),
-                    nbytes: allocation.nbytes as u64,
-                    alignment: allocation.alignment as u64,
-                    file: allocation.file.clone(),
-                    data_spans: spans.get(&allocation.name).cloned().unwrap_or_default(),
-                    relocations: relocations(&allocation.relocations),
-                    address: allocation.address,
-                    memory: match allocation.memory {
-                        super::format::Memory::Device => 0,
-                        super::format::Memory::MappedHost => 1,
-                        super::format::Memory::Peer => 2,
-                    },
-                    sizing: allocation.sizing.clone(),
-                })
-                .collect();
-            bundle.modules = core
-                .modules
-                .iter()
-                .map(|module| wire::Module {
-                    name: module.name.clone(),
-                    file: module.file.clone(),
-                    globals: module
-                        .globals
-                        .iter()
-                        .map(|global| wire::Global {
-                            symbol: global.symbol.clone(),
-                            file: global.file.clone(),
-                            nbytes: global.nbytes as u64,
-                            relocations: relocations(&global.relocations),
-                        })
-                        .collect(),
-                })
-                .collect();
-            bundle.functions = core
-                .functions
-                .iter()
-                .map(|function| wire::Function {
-                    module: function.module.clone(),
-                    symbol: function.symbol.clone(),
-                    parameter_sizes: function
-                        .parameter_sizes
-                        .iter()
-                        .map(|size| *size as u64)
-                        .collect(),
-                    attributes: function
-                        .attributes
-                        .iter()
-                        .map(|[id, value]| wire::FunctionAttribute {
-                            id: *id,
-                            value: *value,
-                        })
-                        .collect(),
-                })
-                .collect();
-            bundle.graphs = core
-                .graphs
-                .iter()
-                .map(|graph| wire::GraphIndex {
-                    name: graph.name.clone(),
-                    flags: graph.flags,
-                    resource: graph.resource.clone(),
-                    node_count: graph.node_count as u64,
-                    edge_count: graph.edge_count as u64,
-                    functions: graph.functions.iter().map(|index| *index as u64).collect(),
-                })
-                .collect();
-            bundle.resources = core.resources.clone();
-            bundle.reservations = core
-                .reservations
-                .iter()
-                .map(|reservation| wire::Reservation {
-                    address: reservation.address,
-                    nbytes: reservation.nbytes as u64,
-                })
-                .collect();
-            bundle.events = core.events.clone();
-        }
-        Ok(index)
-    }
-
-    /// Metadata-only descriptor for the shared loader and inspection. No acceptance or payload
-    /// opening is required: every referenced payload has a placement from the selected closure.
-    fn descriptor(&self) -> Result<wire::ModelIndex> {
-        build_descriptor(&self.verified, |use_| self.token_span(use_))
+    #[cfg(test)]
+    fn loaded_descriptor(&self) -> Result<LoadedModelDescriptor> {
+        build_loaded_descriptor(&self.verified, |use_| self.token_span(use_))
     }
 
     pub fn open(
@@ -2238,13 +2187,14 @@ impl PayloadVerifiedCore {
         publishers: &[Publisher],
         selection: payload_auth::Selection,
     ) -> Result<Self> {
+        let profiles = payload_publisher_profiles(publishers)?;
         let metadata = payload_reader::Metadata::open(path)?;
-        let verified = payload_auth::verify(&metadata.envelope, publishers, selection)?;
+        let verified = payload_auth::verify(&metadata.envelope, &profiles, selection)?;
         let deployment = verified
             .deployment()
             .ok_or_else(|| invalid("catalog verification selects no deployment"))?;
         let ids = payload_reader::required_payloads(&verified)?;
-        preflight_open_files(&metadata, &ids)?;
+        preflight_open_files(&metadata, &verified, &ids)?;
         let payloads = metadata.payloads(verified.catalog(), ids.iter().map(|id| id.as_slice()))?;
         let mut files = BTreeMap::new();
         let mut placements = BTreeMap::new();
@@ -2305,9 +2255,6 @@ impl PayloadVerifiedCore {
                 name: publisher.license_name.clone(),
                 link: publisher.license_link.clone(),
             });
-        if cores.is_empty() {
-            return Err(invalid("payload core authenticates no rank"));
-        }
         Ok(Self {
             metadata,
             verified,
@@ -2413,29 +2360,17 @@ impl PayloadVerifiedCore {
     ) -> Result<serde_json::Value> {
         let core = self.verified.core();
         let deployment = self.verified.deployment();
-        // A single verified rank (a selected rank copy) keeps its own id; a full
-        // deployment must let each bundle carry its own rank instead of applying
-        // the first rank to every bundle.
+        let selected_deployment = deployment
+            .ok_or_else(|| invalid("payload core authenticates no deployment"))?;
         let selected_ranks = self.verified.ranks();
-        let rank = match selected_ranks {
-            [single] => Some(single.rank as usize),
-            _ => None,
-        };
-        // The shared describer supplies the same model, cache, speculation, sampling, and frontend
-        // sections a legacy core reports; the payload document adds identity and storage.
-        let descriptor = self.inspection_descriptor()?;
-        let mut document = super::describe::describe_index(&descriptor, options, rank)?;
-        // Bundle indices carry no rank id; report the authenticated body ids, and
-        // keep initializer source/destination placement distinct under memory maps.
-        if let Some(entries) = document["ranks"].as_array_mut() {
-            for (entry, body) in entries.iter_mut().zip(selected_ranks) {
-                entry["rank"] = serde_json::json!(body.rank);
-                if (options.memory_map || options.all) && entry.get("memory_map").is_some() {
-                    entry["memory_map"]["initializers"] =
-                        serde_json::json!(initializer_detail(body, &self.metadata.locations));
-                }
-            }
-        }
+        let mut document = super::describe::describe_payload(
+            core,
+            selected_deployment,
+            selected_ranks,
+            &self.cores,
+            &self.metadata.locations,
+            options,
+        )?;
         let primary_bytes = self
             .metadata
             .primary()
@@ -2574,14 +2509,20 @@ impl PayloadVerifiedCore {
             }
         }
         let authorized = Arc::new(verified.authorize(accepted)?);
+        let tokens = placements
+            .iter()
+            .map(|(id, placement)| (placement.token.clone(), id.clone()))
+            .collect();
         let source = PayloadSource {
             path: metadata.path.clone(),
             primary: metadata.primary().file().clone(),
             relative,
             placements,
+            tokens,
             files,
             executables,
             authorized,
+            supporting_verified: verify_payloads,
         };
         if verify_payloads {
             let payloads = source.verification_payloads(verify_weights)?;
@@ -2597,7 +2538,7 @@ impl PayloadVerifiedCore {
                 }
             })?;
             if let Some(phase) = phase {
-                phase.finish(format!("{:.1} GiB", total as f64 / (1u64 << 30) as f64));
+                phase.finish(crate::core::progress::format_bytes(total));
             }
         }
         Ok(PayloadAuthorizedCore { source, cores })
@@ -2708,8 +2649,8 @@ impl PayloadAuthorizedCore {
             None,
         )
     }
-    pub(super) fn descriptor(&self) -> Result<wire::ModelIndex> {
-        build_descriptor(self.source.authorized.verified(), |use_| {
+    pub(super) fn loaded_descriptor(&self) -> Result<LoadedModelDescriptor> {
+        build_loaded_descriptor(self.source.authorized.verified(), |use_| {
             self.source.token_span(use_)
         })
     }
@@ -3325,6 +3266,7 @@ mod payload_core_tests {
                 },
             ]
         };
+        #[allow(deprecated)]
         let deployment = |id: &str, tp: u32, ranks: Vec<PublishRank>| PublishDeployment {
             body: pw::DeploymentBody {
                 deployment_id: id.into(),
@@ -3335,10 +3277,15 @@ mod payload_core_tests {
                     ..Default::default()
                 }),
                 cluster: None,
-                rebuild: None,
+                rebuild: (tp == 2).then(|| crate::runtime_core::wire::RebuildManifest {
+                    version: 99,
+                    source_identity: "tp2-source".into(),
+                    ..Default::default()
+                }),
                 engram: None,
                 payloads: vec![],
                 ranks: vec![],
+                preparation: None,
             },
             payloads: vec![],
             ranks,
@@ -3678,7 +3625,7 @@ mod payload_core_tests {
         )
         .unwrap();
         let rank_ids = selected.rank_ids();
-        let descriptor = selected.descriptor().unwrap();
+        let descriptor = selected.loaded_descriptor().unwrap();
         drop(selected);
         let _ = std::fs::remove_dir_all(root);
         (descriptor.peer_memory, rank_ids)
@@ -3743,7 +3690,7 @@ mod payload_core_tests {
                 },
             )
             .unwrap();
-            let error = selected.descriptor().unwrap_err();
+            let error = selected.loaded_descriptor().unwrap_err();
             assert!(error.to_string().contains("conflicting peer memory records"), "{error}");
             drop(selected);
             let _ = std::fs::remove_dir_all(root);
@@ -3956,6 +3903,57 @@ mod payload_core_tests {
     }
 
     #[test]
+    fn payload_inspection_reports_selected_deployment_rebuild_metadata() {
+        let (root, publishers, _) = two_deployment_core();
+        let packed = root.with_extension("safetensors");
+        crate::core::conversion::pack(&root, &packed).unwrap();
+        for path in [&root, &packed] {
+            for (tp, rank, expected_version, expected_source) in [
+                (1, None, None, None),
+                (2, None, Some(99), Some("tp2-source")),
+                (2, Some(1), Some(99), Some("tp2-source")),
+            ] {
+                let verified =
+                    VerifiedCore::open_tensor_parallel(path, &publishers, tp, rank).unwrap();
+                let description = verified
+                    .describe(crate::runtime_core::InspectionOptions::default())
+                    .unwrap();
+                assert_eq!(description["rebuild"]["version"].as_u64(), expected_version);
+                assert_eq!(
+                    description["rebuild"]["source_identity"].as_str(),
+                    expected_source
+                );
+                let unverified = crate::runtime_core::unverified_metadata_selected(
+                    path,
+                    crate::runtime_core::InspectionOptions::default(),
+                    rank.map(|value| value as usize),
+                    Some(tp),
+                )
+                .unwrap();
+                assert_eq!(unverified["core"]["signatures_verified"], false);
+                assert_eq!(unverified["rebuild"]["version"].as_u64(), expected_version);
+                assert_eq!(
+                    unverified["rebuild"]["source_identity"].as_str(),
+                    expected_source
+                );
+            }
+            let catalog = crate::runtime_core::unverified_metadata_selected(
+                path,
+                crate::runtime_core::InspectionOptions::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(catalog.get("rebuild"), Some(&serde_json::Value::Null));
+            let deployments = catalog["deployments"].as_array().unwrap();
+            let tp2 = deployments.iter().find(|d| d["tensor_parallel"] == 2).unwrap();
+            assert_eq!(tp2["rebuild"]["source_identity"], "tp2-source");
+        }
+        std::fs::remove_file(packed).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rank_selected_descriptor_resolves_only_the_selected_engram_shard() {
         let (root, publishers) = engram_core();
         let shards = |rank| {
@@ -3965,7 +3963,7 @@ mod payload_core_tests {
                 payload_auth::Selection::Deployment { deployment: 0, rank },
             )
             .unwrap();
-            let engram = selected.descriptor().unwrap().engram.unwrap();
+            let engram = selected.loaded_descriptor().unwrap().engram.unwrap();
             assert!(engram.tables[0].weights.is_some() && engram.tables[0].scales.is_some());
             engram.tables[1]
                 .shards
@@ -4257,5 +4255,127 @@ mod payload_core_tests {
                 .any(|file| file.filename == "weights/tp1.safetensors")
         );
         let _ = std::fs::remove_dir_all(moved);
+    }
+
+    #[test]
+    fn payload_publisher_profile_merge_preserves_embedded_and_rejects_conflicts() {
+        let key = [7u8; 32];
+        let embedded = Publisher {
+            name: "Embedded Publisher".into(),
+            namespace: "embedded".into(),
+            public_key: key,
+            development: false,
+        };
+        let promoted = Publisher {
+            name: "Promoted Namespace".into(),
+            namespace: "promoted".into(),
+            public_key: key,
+            development: false,
+        };
+        let merged =
+            merge_payload_publisher_profiles(vec![embedded.clone()], &[embedded.clone(), promoted.clone()])
+                .unwrap();
+        assert_eq!(merged, vec![embedded.clone(), promoted]);
+
+        let mut conflicting = embedded.clone();
+        conflicting.name = "Conflicting Embedded Publisher".into();
+        let error = merge_payload_publisher_profiles(vec![embedded.clone()], &[conflicting])
+            .err()
+            .expect("conflicting embedded/caller publisher profile must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting identities for the same publisher key and namespace"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn authorize_metadata_verifies_supporting_resources_on_read() {
+        use super::super::payload::Files;
+        let (root, publishers) = two_initializer_core();
+        let verified = VerifiedCore::open_tensor_parallel(&root, &publishers, 1, None).unwrap();
+        let authorized = verified
+            .authorize_metadata(&publishers[0].namespace, false)
+            .unwrap();
+        let AuthorizedKind::Payload(payload) = &authorized.kind else {
+            panic!("expected the payload backend");
+        };
+        let core = &payload.cores[0];
+        let key = core
+            .resources
+            .keys()
+            .find(|key| !payload.source.executables.contains_key(*key))
+            .cloned()
+            .expect("expected a non-executable supporting resource");
+        // Untampered read verifies and succeeds.
+        assert!(!payload.source.read(core, &key).unwrap().is_empty());
+
+        // Tampering the underlying primary file bytes must fail the read even though
+        // authorize_metadata skipped upfront payload verification.
+        let span = payload.source.span(core, &key).unwrap();
+        let (_, offset) = payload.source.source(span).unwrap();
+        let relative = payload
+            .source
+            .relative
+            .get(&span.filename)
+            .cloned()
+            .unwrap_or_default();
+        let target = if relative.is_empty() {
+            root.join("model.safetensors")
+        } else {
+            root.join(relative)
+        };
+        let mut raw = std::fs::read(&target).unwrap();
+        raw[offset as usize] ^= 0xff;
+        std::fs::write(&target, raw).unwrap();
+        let error = payload
+            .source
+            .read(core, &key)
+            .err()
+            .expect("tampered supporting resource must fail hash check on read");
+        assert!(
+            error
+                .to_string()
+                .contains("payload content verification failed"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_retained_files_keeps_only_asset_containers() {
+        use super::super::payload::Files;
+        use std::os::fd::AsRawFd;
+
+        let (root, publishers) = two_initializer_core();
+        let verified = VerifiedCore::open_tensor_parallel(&root, &publishers, 1, None).unwrap();
+        let authorized = verified.authorize(&publishers[0].namespace, false).unwrap();
+        let AuthorizedKind::Payload(payload) = &authorized.kind else {
+            panic!("expected the payload backend");
+        };
+        let retained = payload.source.retained_files().unwrap();
+        assert!(
+            retained.len() < payload.source.files.len(),
+            "Unix retained_files should not pin non-asset companions: {} vs {}",
+            retained.len(),
+            payload.source.files.len()
+        );
+        let retained_fds: std::collections::BTreeSet<i32> =
+            retained.iter().map(|file| file.as_raw_fd()).collect();
+        for asset in &payload.source.authorized.verified().core().assets {
+            let slice = asset
+                .payload
+                .as_ref()
+                .and_then(|use_| use_.slice.as_ref())
+                .unwrap();
+            let (file, _) = payload.source.payload_file(&slice.payload_id).unwrap();
+            assert!(
+                retained_fds.contains(&file.file.as_raw_fd()),
+                "asset descriptor must stay retained for /proc/self/fd reads"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -129,9 +129,12 @@ the checkpoint identifier or any alias, including repository IDs with slashes.
 Unknown names return a JSON 404.
 See [the API reference](../docs/api.md) for discovery fields and generation routes.
 HTTP admission reserves at most `queue_capacity + max_active` requests before
-reading JSON bodies. Admitted requests await a bounded CPU preparation worker;
-each of the `frontend_workers` permits, two by default, prepares one request at
-a time.
+reading JSON bodies. Admitted requests await one of `frontend_workers` CPU
+preparation permits (two by default), so at most `frontend_workers` requests
+prepare concurrently. `frontend_workers` also caps the shared thread budget
+(`min(frontend_workers, available_parallelism(), 16)`) for parallel long-prompt
+tokenization, bounding the helper threads any preparing request can borrow
+alongside its own worker thread.
 `ignition` cores set the queue to four times the concurrency limit, one worker per
 concurrent request, and a body limit of the recipe's per-image byte allowance
 times its image limit plus 32 bytes per context token.
@@ -179,13 +182,19 @@ statically. It performs no `pkg-config` discovery and uses no system
 `libturbojpeg` at build time or run time. Without NASM on `PATH`, libjpeg-turbo
 builds without SIMD extensions.
 
-Image admission accepts base64 `image/png`, `image/jpeg`, and `image/webp` data
-URLs. JPEG uses
+Image admission accepts base64 `image/png`, `image/jpeg`, `image/webp`, and
+`image/gif` data URLs. JPEG uses
 accurate IDCT, smooth chroma upsampling, and at most 100 progressive scans.
 Baseline/progressive Huffman JPEG is supported; lossless and arithmetic JPEG
 are rejected. Encoded byte and decoded pixel limits apply before pixel allocation.
+16-bit PNG samples follow Pillow's RGB conversion: RGB, RGBA, and grayscale-alpha
+keep the high byte, and grayscale clamps to 8 bits. Animated PNG is rejected.
+A GIF with a readable second image is rejected as animated. A single-frame GIF decodes as Pillow's
+RGB and RGBA conversions do, on a canvas that covers the logical screen and the
+frame. MoonViT and padded-grid preparation keep the transparent index as alpha.
 PNG and JPEG EXIF orientation is applied before resize; orientations 1–8 include
 mirrored and axis-swapped images. Invalid orientation metadata is rejected.
+GIF carries no EXIF orientation.
 RGB conversion discards alpha and does not apply embedded color profiles.
 Pillow is used only to generate test fixtures, never by native image admission.
 
@@ -355,7 +364,7 @@ estimated graph duration, less a duration-proportional waiting cost for requests
 that are decoding or awaiting terminal retirement. Each loaded
 prefill capacity up to `prefill_chunk_size` competes on the prompt tokens it can
 actually consume, which the next selected message boundary, atomic image spans,
-and the prompt end limit. No rule pads a logical length to the smallest covering
+and the prompt end limit. Candidate scoring does not require the smallest covering
 capacity. Among candidates of one graph kind and cohort that perform the same
 logical work, selection first discards any shape whose capacities are all at
 least as large as another candidate's and larger in at least one. An unmeasured
@@ -392,8 +401,11 @@ requires confirmed stream drain before `release_after_shutdown` releases
 resources associated with the attempted submission.
 
 Each request owns conditional draft-acceptance statistics by depth and proposal
-source. Validated speculative completions update only that request. The emitted
-accepted prefix supplies positive observations. When a correction token was
+source. Validated speculative completions update that request. On a model
+without GPU confidence they also move a population mean per depth, which
+starts each later request's MTP estimates. With GPU confidence the population
+comes from the confidence forecasts, seeds the forecasts, and acceptance
+estimates start at the geometric prior. The emitted accepted prefix supplies positive observations. When a correction token was
 emitted and an offered draft remained, the next draft supplies a rejection.
 Termination within an accepted prefix censors the remaining depths. Expected
 yield is clipped by the remaining output limit, context capacity, and available
@@ -412,7 +424,9 @@ when available. Host delays and queue wait do not enter graph estimates. An
 unmeasured candidate ranks ahead of every measured candidate; unmeasured
 candidates compete among themselves by expected useful value. Both
 unmeasured and stale physical dispatches require an empty queue and completion
-before another submission.
+before another submission. When multiple packed speculative shapes cover a
+`(batch, width)` duration lookup, Helios uses the minimum positive measured
+duration and returns zero only when every matching shape is unmeasured.
 
 Ordinary valid execution earns refresh credit at `0.002 / 0.998` times its
 measured duration, capped at 5 ms. Full credit permits a stale alternative to
@@ -423,12 +437,23 @@ verification work. Another refresh waits for full credit. Idle discards positive
 This bounds aggregate refresh expense, not individual stalls; see
 [funded timing refresh](../docs/scheduling-runtime-design.md#funded-timing-refresh).
 
-Speculative width selection combines this cost with request-local expected
-prefix survival. Complete programs learn from terminal verification and keep
-completed confidence forecasts separate from acceptance outcomes. Ordinary selection uses
-historical means, while a separate 1% raw-time budget funds optimistic
-acceptance probes. Observational weight ages without changing unobserved means;
-width-one rounds still measure cost. See
+Speculative width selection combines this cost with expected prefix survival,
+estimated per request and, on a model without GPU confidence, started from the
+population mean of earlier requests. Complete programs learn from terminal
+verification and keep stored confidence forecasts separate from acceptance
+outcomes. When pricing GPU-confidence shapes, stored per-depth forecasts are
+scaled by a request-local aged per-depth verification calibration ratio (seeded
+scale-invariantly with prior weight `2` from a once-per-round population prior
+capped at weight `64`, 128-token half-life, request EWMA cap `32`, clamped to
+`[0, 2]`), and crowded GPU-allocated packed shapes (`B >= 2`, `P < B * W`,
+`depth >= 1`) additionally apply a bounded empirical cross-lane order-statistic
+surplus (from dual 256-entry rolling windows—one for `depth >= 2` curves and a
+dedicated depth-1 ring for `W=2`—with conservative `eff_depth <= depth`
+fallback, excess scaled by `(1 - 1/b) * min(alpha, 1)` and capped at 100% draft
+survival) to capture the GPU allocator's per-step cherry-picking gain.
+Ordinary selection uses calibrated historical means, while a separate 1%
+raw-time budget funds optimistic acceptance probes. Observational weight ages
+without changing unobserved means; width-one rounds still measure cost. See
 [funded acceptance learning](../docs/scheduling-runtime-design.md#funded-acceptance-learning).
 
 Fairness enters selection through per-request service prices. Each resident
@@ -560,6 +585,41 @@ mapping. Image hints retain indices into the rendered image-source list and
 resolve to the ends of prepared image spans after expansion. Hints do not change
 prompt bytes, token IDs, image conditioning, or ordinary/special-token selection.
 
+The Jinja renderer records which output bytes come from the request. Every
+string and object key supplied by the request is ordinary text, and the record
+follows it through captures, namespace values and exact string operations;
+other builtins that receive request text mark their whole result ordinary. Text
+written in the template and every string in a template default, including
+strings nested in default arrays or objects, are controls unless the request
+overrides that default.
+
+The frontend encodes the whole prompt first. A control is an added token that is
+special, or that the chat template or one of its defaults names, or that the
+prepared contract names as a marker, or the placeholder text that an image
+layout lets request text spell. The server adds the contract's markers when it
+loads the core: its reasoning delimiters and terminal markers, the markers of
+the tool-call parser kind it selects (its delimiters and, for GLM, its argument
+tags), and its image feature and span tokens. The RADIO layout (the C-RADIO
+image encoder) is the one that lets request text spell a placeholder: its
+template lets message text place `<image>` placeholders, and cores prepared for
+it declare no placeholder token ID, so the layout supplies the text. Spelled
+RADIO placeholders stay controls when they and the placeholders the template
+wrote together account for every attached image; otherwise they are ordinary
+text.
+Other added tokens, such as GLM's `/nothink`, are lexical text, and request text
+that spells one tokenizes to that token. Only when a control overlaps ordinary
+text does the frontend re-encode the text between the other added tokens that
+contains the spelling, with a tokenizer built at load without added vocabulary, so
+a spelling of a control in request text never becomes that control's token, except
+for a spelled RADIO placeholder that positions an attached image. An added token
+that strips adjacent whitespace (`lstrip` or `rstrip`) counts as spelled only
+when the request wrote the token's own bytes, not the whitespace beside it.
+
+The output parser finds its markers in the rendered text and skips a match that
+lies entirely inside one ordinary range (`RenderedPrompt::ordinary`). A marker
+the template builds from request fields, such as `'<|im_start|>' + message.role`,
+has template-written bytes, so the parser finds it whether or not ranges exist.
+
 `Frontend::encode`, `decode`, and `incremental_decoder` use Hugging Face's Rust
 tokenizers library pinned to the fixture environment's version. Incremental
 decoding preserves incomplete UTF-8 between chunks and flushes remaining bytes
@@ -653,7 +713,7 @@ the prepared graph contract maps them to backing storage and padding sentinels.
 ## Native image preparation
 
 The `images` feature adds `frontend::images::ImageProcessor` and PNG, JPEG,
-and static WebP decoding; it also enables `frontend`. Typed core metadata
+static WebP, and non-animated GIF decoding; it also enables `frontend`. Typed core metadata
 selects the preparation profile and token layout independently. Profiles cover
 Qwen, MiMo, patch-merge, DeepSeek, DeepSeek row-major, Moonvit, Step, RADIO,
 and GLM inputs.
@@ -666,7 +726,7 @@ vision positions `[N,2]` int64, interpolation indices `[N,4]` int64 and weights
 `[N,4]` float32, and per-image cumulative patch offsets int32. Patch features
 are ordered by channel, temporal copy, pixel row, and pixel column; patches
 are ordered by 2×2 spatial merge blocks. `expand_prompt` consumes the rendered
-chat text, expands each image placeholder, tokenizes the result, and returns
+chat token IDs, expands only control-token image placeholders, and returns
 modality IDs and four unpadded position rows `[text,T,H,W]` plus the mRoPE delta.
 The model scheduler can transpose the last three rows into `[tokens,3]`.
 

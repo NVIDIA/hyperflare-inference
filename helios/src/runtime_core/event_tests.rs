@@ -80,7 +80,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
         let AuthorizedKind::Payload(payload) = authorized.kind else {
             panic!("Engram fixture must use a payload core");
         };
-        let index = payload.descriptor().unwrap();
+        let index = payload.loaded_descriptor().unwrap();
         let (archive, mut cores) = payload.into_parts();
         let core = cores.remove(0);
         core.validate().unwrap();
@@ -112,7 +112,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             owner.reserve(&core).unwrap();
             owner.allocate(&core, &phase).unwrap();
             owner.load_payload(&archive, &core, &phase, 1).unwrap();
-            owner.prepare_kernels(&archive, &core, &phase).unwrap();
+            owner.prepare_kernels(&archive, &core, &phase, None).unwrap();
             owner.prepare_graphs(&archive, &core, &phase).unwrap();
         }
         let failed_source = std::env::temp_dir().join(format!(

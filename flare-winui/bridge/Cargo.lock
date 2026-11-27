@@ -694,7 +694,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -765,7 +765,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -830,20 +830,31 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 name = "flare"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "flare-helios",
  "hf-hub 0.5.0",
+ "http",
+ "http-body-util",
  "httpdate",
+ "hyper",
+ "hyper-util",
  "libc",
  "libloading",
  "log",
  "ring",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tokio-rustls",
  "toml",
+ "tower-service",
  "ureq 3.4.2",
  "url",
+ "webpki-roots 1.0.9",
  "windows-sys 0.61.2",
 ]
 
@@ -873,6 +884,7 @@ dependencies = [
  "flare-selene",
  "flate2",
  "futures-util",
+ "gif",
  "httpdate",
  "image-webp",
  "io-uring",
@@ -883,6 +895,7 @@ dependencies = [
  "prost",
  "prost-build",
  "ratatui",
+ "rayon",
  "ring",
  "ryu",
  "serde",
@@ -902,11 +915,14 @@ name = "flare-selene"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "cc",
+ "crc32fast",
  "flare-eos",
  "hyper-util",
  "io-uring",
  "libc",
  "prost",
+ "rayon",
  "rustls",
  "tokio",
  "tokio-rustls",
@@ -917,11 +933,12 @@ dependencies = [
  "tower",
  "twox-hash",
  "windows-sys 0.61.2",
+ "zstd-safe",
 ]
 
 [[package]]
 name = "flare-winui-bridge"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "flare",
  "tempfile",
@@ -1108,6 +1125,15 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+]
+
+[[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "weezl",
 ]
 
 [[package]]
@@ -2136,7 +2162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -2157,7 +2183,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -2436,7 +2462,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2645,7 +2671,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2790,10 +2816,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3476,6 +3502,12 @@ checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
+
+[[package]]
+name = "weezl"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "winapi"

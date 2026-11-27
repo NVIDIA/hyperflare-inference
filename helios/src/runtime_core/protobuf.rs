@@ -15,6 +15,22 @@ pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/flare.runtime.rs"));
 }
 
+#[allow(deprecated)]
+impl wire::RebuildManifest {
+    /// Resolve the recorded draft-body conversion for preparation compatibility.
+    /// An omitted DFlash2 override inherits online conversion's `all` scope;
+    /// an omitted scope itself means `all` in persisted rebuild metadata.
+    pub fn effective_draft_body_quantization(&self) -> Option<&str> {
+        let speculation = self.speculation.as_ref()?;
+        speculation.draft_body_quantization.as_deref().or_else(|| {
+            (speculation.method == "dflash2"
+                && self.online_mxfp8
+                && matches!(self.online_mxfp8_scope.as_str(), "" | "all"))
+            .then_some("mxfp8")
+        })
+    }
+}
+
 impl wire::ExecutionGraph {
     pub(super) fn packed_tokens(&self) -> u64 {
         if self.kind == "mixed" {
@@ -158,6 +174,7 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                 Profile::Step(_) => serde_json::json!({"step": {}}),
                 Profile::Radio(_) => serde_json::json!({"radio": {}}),
                 Profile::Glm(_) => serde_json::json!({"glm": {}}),
+                Profile::PaddedGrid(_) => serde_json::json!({"padded_grid": {}}),
             })
         })
         .transpose()?;
@@ -236,15 +253,118 @@ pub(super) fn node(value: wire::Node) -> Result<Node> {
     })
 }
 
-pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
-    if let Some(execution) = &mut value.execution {
+fn normalize_execution(execution: &mut Option<wire::Execution>) -> Result<()> {
+    if let Some(execution) = execution {
         for graph in &mut execution.graphs {
             if graph.kind == "speculative" && graph.packed_token_capacity == 0 {
-                graph.packed_token_capacity = graph.batch_capacity.checked_mul(graph.token_capacity)
+                graph.packed_token_capacity = graph
+                    .batch_capacity
+                    .checked_mul(graph.token_capacity)
                     .ok_or_else(|| invalid("rectangular speculative capacity overflow"))?;
             }
         }
     }
+    Ok(())
+}
+
+pub(super) fn validate_persistent_workers(core: &Core, execution: &wire::Execution) -> Result<()> {
+    if execution.persistent_workers.len() > 1 {
+        return Err(invalid(
+            "at most one persistent worker is supported per rank",
+        ));
+    }
+    let Some(worker) = execution.persistent_workers.first() else {
+        return Ok(());
+    };
+    if worker.worker_sm_count == 0 {
+        return Err(invalid(
+            "persistent worker requires a positive worker_sm_count",
+        ));
+    }
+    if worker.graph.is_empty() || !core.graphs.iter().any(|g| g.name == worker.graph) {
+        return Err(invalid(
+            "persistent worker references an unknown graph",
+        ));
+    }
+    if execution.graphs.iter().any(|g| g.name == worker.graph)
+        || execution
+            .tuning_graphs
+            .iter()
+            .any(|g| g.name == worker.graph)
+    {
+        return Err(invalid(
+            "persistent worker graph must be distinct from serving and tuning graphs",
+        ));
+    }
+    let stop_flag = worker
+        .stop_flag
+        .as_ref()
+        .ok_or_else(|| invalid("persistent worker requires a stop_flag reference"))?;
+    let stop_alloc = core
+        .allocations
+        .iter()
+        .find(|a| {
+            a.name == stop_flag.allocation
+                && matches!(a.memory, Memory::MappedHost)
+                && a.sizing.is_none()
+        })
+        .ok_or_else(|| {
+            invalid("persistent worker stop flag must reside in a mapped host allocation")
+        })?;
+    let stop_offset = size(stop_flag.offset)?;
+    let stop_end = stop_offset
+        .checked_add(4)
+        .ok_or_else(|| invalid("persistent worker stop flag offset overflow"))?;
+    if stop_offset % 4 != 0 || stop_end > stop_alloc.nbytes {
+        return Err(invalid(
+            "persistent worker stop flag offset must be 4-byte aligned and in bounds",
+        ));
+    }
+    match (worker.metrics.as_ref(), worker.metrics_count) {
+        (None, 0) => {}
+        (Some(_), 0) => {
+            return Err(invalid(
+                "persistent worker metrics reference requires a positive metrics_count",
+            ));
+        }
+        (None, _) => {
+            return Err(invalid(
+                "persistent worker metrics_count requires a metrics reference",
+            ));
+        }
+        (Some(metrics), count) => {
+            let metrics_alloc = core
+                .allocations
+                .iter()
+                .find(|a| {
+                    a.name == metrics.allocation
+                        && matches!(a.memory, Memory::MappedHost)
+                        && a.sizing.is_none()
+                })
+                .ok_or_else(|| {
+                    invalid("persistent worker metrics must reside in a mapped host allocation")
+                })?;
+            let metrics_offset = size(metrics.offset)?;
+            let metrics_bytes = (count as usize)
+                .checked_mul(std::mem::size_of::<u64>())
+                .ok_or_else(|| invalid("persistent worker metrics size overflow"))?;
+            let metrics_end = metrics_offset
+                .checked_add(metrics_bytes)
+                .ok_or_else(|| invalid("persistent worker metrics offset overflow"))?;
+            if metrics_offset % std::mem::align_of::<u64>() != 0
+                || metrics_end > metrics_alloc.nbytes
+            {
+                return Err(invalid(
+                    "persistent worker metrics offset must be 8-byte aligned and in bounds",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Core> {
+    normalize_execution(&mut value.execution)?;
     let context = required(value.context, "CUDA context")?;
     let core = Core {
         resources: value.resources,
@@ -333,6 +453,47 @@ pub(super) fn edge(value: wire::Edge) -> Result<Edge> {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    #[allow(deprecated)]
+    fn draft_body_precision_resolves_only_documented_inheritance() {
+        for (method, online, scope, explicit, expected) in [
+            ("dflash2", true, "all", None, Some("mxfp8")),
+            ("dflash2", true, "", None, Some("mxfp8")),
+            ("dflash2", false, "all", None, None),
+            ("dflash2", false, "", None, None),
+            ("dflash2", true, "kda-input", None, None),
+            ("dflash2", true, "unknown", None, None),
+            ("mtp", true, "all", None, None),
+            ("", true, "all", None, None),
+            ("dflash2", true, "all", Some("mxfp8"), Some("mxfp8")),
+            ("dflash2", true, "kda-input", Some("mxfp8"), Some("mxfp8")),
+            ("dflash2", false, "all", Some("mxfp8"), Some("mxfp8")),
+            ("dflash2", true, "all", Some("unknown"), Some("unknown")),
+            ("dflash2", true, "all", Some(""), Some("")),
+        ] {
+            let manifest = wire::RebuildManifest {
+                online_mxfp8: online,
+                online_mxfp8_scope: scope.into(),
+                speculation: Some(wire::RebuildSpeculation {
+                    method: method.into(),
+                    draft_body_quantization: explicit.map(str::to_owned),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let encoded = manifest.encode_to_vec();
+            let decoded = wire::RebuildManifest::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.effective_draft_body_quantization(), expected);
+            assert_eq!(decoded.encode_to_vec(), encoded);
+        }
+        let no_draft = wire::RebuildManifest {
+            online_mxfp8: true,
+            online_mxfp8_scope: "all".into(),
+            ..Default::default()
+        };
+        assert_eq!(no_draft.effective_draft_body_quantization(), None);
+    }
 
     #[test]
     fn supported_contract_versions_preserve_their_declared_version() {
@@ -622,8 +783,30 @@ mod tests {
     }
 
     #[test]
+    fn serialized_padded_grid_profile_selects_only_image_preparation() {
+        // Field 10 adds the padded-grid profile without changing any preceding profile tag.
+        let bytes = &[0x0a, 0x00, 0x12, 0x02, 0x52, 0x00, 0x1a, 0x01, 0x01][..];
+        let decoded = wire::FrontendSettings::decode(bytes).unwrap();
+        let json = frontend_settings(decoded).unwrap();
+        assert_eq!(json["image"], serde_json::json!({"padded_grid": {}}));
+        #[cfg(feature = "server")]
+        {
+            let frontend: crate::frontend::FrontendSettings = serde_json::from_value(json).unwrap();
+            let settings = frontend.image.unwrap();
+            assert_eq!(
+                settings.preparation_kind(),
+                crate::model::contract::ImagePreparationKind::PaddedGrid
+            );
+            let processor =
+                crate::frontend::images::ImageProcessor::load(settings, Default::default())
+                    .unwrap();
+            assert_eq!(processor.geometry(81, 40).unwrap().tokens, 3);
+        }
+    }
+
+    #[test]
     fn prompt_encoder_round_trip_preserves_explicit_image_token_and_rejects_unknown_encoder() {
-        for encoder in [1, 2] {
+        for encoder in [1, 2, 3] {
             let value = wire::FrontendSettings {
                 tokenizer: Some(wire::TokenizerSettings::default()),
                 eos_token_ids: vec![1],
@@ -705,6 +888,29 @@ mod tests {
         );
         assert_eq!(execution.draft_tokens, None);
         assert_eq!(execution.packed_tokens(), 64);
+    }
+
+    #[test]
+    fn serialized_terminal_prefill_preserves_operation_and_kind() {
+        // GraphContract(graph="terminal", kind=14)
+        let graph = wire::GraphContract::decode(b"\x0a\x08terminal\x40\x0e".as_slice()).unwrap();
+        let contract: crate::model::contract::GraphContract =
+            serde_json::from_value(serde_json::to_value(graph).unwrap()).unwrap();
+        assert_eq!(
+            contract.kind,
+            crate::model::contract::GraphOperation::TerminalPrefill
+        );
+        // ExecutionGraph(kind="terminal_prefill", batch_capacity=1, token_capacity=256)
+        let execution = wire::ExecutionGraph::decode(
+            b"\x12\x10terminal_prefill\x20\x01\x28\x80\x02".as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::execution::GraphKind::try_from(execution.kind.as_str()).unwrap(),
+            crate::execution::GraphKind::TerminalPrefill
+        );
+        assert_eq!(execution.draft_tokens, None);
+        assert_eq!(execution.packed_tokens(), 256);
     }
 
     #[test]
@@ -1048,6 +1254,8 @@ pub(super) fn payload_rank(
         .context
         .clone()
         .ok_or_else(|| invalid("rank has no CUDA context description"))?;
+    let mut execution = rank.execution.clone();
+    normalize_execution(&mut execution)?;
     let core = Core {
         resources,
         architecture,
@@ -1061,7 +1269,7 @@ pub(super) fn payload_rank(
                 nbytes: size(value.nbytes)?,
             })
         })?,
-        execution: rank.execution.clone(),
+        execution,
         context: Context {
             flags: context.flags,
             cache: context.cache,
@@ -1310,5 +1518,198 @@ mod payload_tests {
             (vec![4u8; 32], placement("globals", 0, 32)),
         ]);
         payload_rank(&rank(), [12, 0], &placements).unwrap();
+    }
+
+    #[test]
+    fn payload_rank_normalizes_zero_packed_token_capacity_for_speculative_graphs() {
+        let mut body = rank();
+        body.execution = Some(wire::Execution {
+            abi_version: 6,
+            max_active: 4,
+            input_frame_bytes: 64,
+            completion_token_capacity: 8,
+            graphs: vec![wire::ExecutionGraph {
+                name: "spec_b4_w6".into(),
+                kind: "speculative".into(),
+                sampling_mode: "general".into(),
+                batch_capacity: 4,
+                token_capacity: 6,
+                draft_tokens: Some(5),
+                packed_token_capacity: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let placements = Placements::from([
+            (vec![1u8; 32], placement("weights-a", 0, 4096)),
+            (vec![2u8; 32], placement("weights-b", 0, 8192)),
+            (vec![3u8; 32], placement("graphs", 0, 64)),
+            (vec![4u8; 32], placement("globals", 0, 32)),
+        ]);
+        let core = payload_rank(&body, [12, 0], &placements).unwrap();
+        let graph = &core.execution.unwrap().graphs[0];
+        assert_eq!(graph.packed_token_capacity, 24);
+    }
+
+    #[test]
+    fn persistent_worker_validation_enforces_schema_bounds_and_cardinality() {
+        use prost::Message;
+        let base_core = |workers: Vec<wire::PersistentWorker>| {
+            let execution = wire::Execution {
+                abi_version: 6,
+                max_active: 1,
+                input_frame_bytes: 64,
+                graphs: vec![wire::ExecutionGraph {
+                    name: "serve".into(),
+                    kind: "decode".into(),
+                    sampling_mode: "general".into(),
+                    batch_capacity: 1,
+                    token_capacity: 1,
+                    ..Default::default()
+                }],
+                tuning_graphs: vec![wire::TuningGraph {
+                    name: "tune".into(),
+                    outputs: vec!["out".into()],
+                    status_buffer: "status".into(),
+                }],
+                persistent_workers: workers,
+                ..Default::default()
+            };
+            Core {
+                resources: HashMap::new(),
+                events: vec![],
+                architecture: [10, 3],
+                allocations: vec![
+                    Allocation {
+                        name: "device_buf".into(),
+                        nbytes: 4096,
+                        alignment: 256,
+                        file: None,
+                        data_spans: vec![],
+                        sources: vec![],
+                        relocations: vec![],
+                        address: None,
+                        memory: Memory::Device,
+                        sizing: None,
+                    },
+                    Allocation {
+                        name: "worker_ctrl".into(),
+                        nbytes: 4096,
+                        alignment: 4096,
+                        file: None,
+                        data_spans: vec![],
+                        sources: vec![],
+                        relocations: vec![],
+                        address: Some(0x2000_0000_0000),
+                        memory: Memory::MappedHost,
+                        sizing: None,
+                    },
+                ],
+                modules: vec![],
+                functions: vec![],
+                graphs: vec![
+                    Graph {
+                        name: "serve".into(),
+                        flags: 0,
+                        resource: "serve".into(),
+                        node_count: 1,
+                        edge_count: 0,
+                        functions: vec![],
+                    },
+                    Graph {
+                        name: "tune".into(),
+                        flags: 0,
+                        resource: "tune".into(),
+                        node_count: 1,
+                        edge_count: 0,
+                        functions: vec![],
+                    },
+                    Graph {
+                        name: "worker_launch".into(),
+                        flags: 0,
+                        resource: "worker_launch".into(),
+                        node_count: 1,
+                        edge_count: 0,
+                        functions: vec![],
+                    },
+                    Graph {
+                        name: "worker_launch_2".into(),
+                        flags: 0,
+                        resource: "worker_launch_2".into(),
+                        node_count: 1,
+                        edge_count: 0,
+                        functions: vec![],
+                    },
+                ],
+                reservations: vec![],
+                execution: Some(execution),
+                context: Context::default(),
+            }
+        };
+        let valid = wire::PersistentWorker {
+            worker_sm_count: 8,
+            graph: "worker_launch".into(),
+            stop_flag: Some(wire::Reference {
+                allocation: "worker_ctrl".into(),
+                offset: 0,
+            }),
+            metrics: None,
+            metrics_count: 0,
+        };
+        // Round-trip through protobuf wire encoding without metrics.
+        let encoded = valid.encode_to_vec();
+        let decoded = wire::PersistentWorker::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, valid);
+        base_core(vec![decoded.clone()]).validate().unwrap();
+
+        // Round-trip with optional mapped-host u64 counters.
+        let valid_with_metrics = wire::PersistentWorker {
+            metrics: Some(wire::Reference {
+                allocation: "worker_ctrl".into(),
+                offset: 64,
+            }),
+            metrics_count: 8,
+            ..valid.clone()
+        };
+        let encoded_metrics = valid_with_metrics.encode_to_vec();
+        let decoded_metrics = wire::PersistentWorker::decode(encoded_metrics.as_slice()).unwrap();
+        assert_eq!(decoded_metrics, valid_with_metrics);
+        base_core(vec![decoded_metrics.clone()]).validate().unwrap();
+
+        // Declaring more than one persistent worker is rejected explicitly.
+        let mut second = decoded.clone();
+        second.graph = "worker_launch_2".into();
+        let err = base_core(vec![decoded.clone(), second])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most one persistent worker"), "{err}");
+
+        for mutation in 0..13 {
+            let mut bad = if mutation < 8 {
+                decoded.clone()
+            } else {
+                decoded_metrics.clone()
+            };
+            match mutation {
+                0 => bad.worker_sm_count = 0,
+                1 => bad.graph = "missing".into(),
+                2 => bad.graph = "serve".into(),
+                3 => bad.graph = "tune".into(),
+                4 => bad.stop_flag = None,
+                5 => bad.stop_flag.as_mut().unwrap().allocation = "device_buf".into(),
+                6 => bad.stop_flag.as_mut().unwrap().offset = 2,
+                7 => bad.stop_flag.as_mut().unwrap().offset = 4096,
+                8 => bad.metrics = None,
+                9 => bad.metrics_count = 0,
+                10 => bad.metrics.as_mut().unwrap().allocation = "device_buf".into(),
+                11 => bad.metrics.as_mut().unwrap().offset = 68,
+                _ => bad.metrics.as_mut().unwrap().offset = 4096 - 56,
+            }
+            assert!(
+                base_core(vec![bad]).validate().is_err(),
+                "expected mutation {mutation} to fail validation"
+            );
+        }
     }
 }

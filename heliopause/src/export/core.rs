@@ -20,39 +20,11 @@ use std::{
     time::SystemTime,
 };
 
-pub(crate) fn align(value: u64) -> Result<u64> {
-    value
-        .checked_add(4095)
-        .map(|v| v & !4095)
-        .ok_or_else(|| invalid("payload extent overflow"))
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum SpanKey {
-    Resource(usize, String),
-    Asset(usize),
-    Table(usize, Option<usize>, bool),
-}
 #[derive(Clone, Debug)]
 pub(crate) struct Role {
     pub kind: u32,
     pub owner: Option<usize>,
     pub span: wire::Span,
-}
-pub(crate) fn span_mut<'a>(index: &'a mut wire::ModelIndex, key: &SpanKey) -> &'a mut wire::Span {
-    match key {
-        SpanKey::Resource(rank, name) => index.ranks[*rank].resources.get_mut(name).unwrap(),
-        SpanKey::Asset(i) => index.assets[*i].payload.as_mut().unwrap(),
-        SpanKey::Table(i, shard, scales) => {
-            let table = &mut index.engram.as_mut().unwrap().tables[*i];
-            match (shard, scales) {
-                (Some(j), true) => table.shards[*j].scales.get_or_insert_default(),
-                (Some(j), false) => table.shards[*j].weights.get_or_insert_default(),
-                (None, true) => table.scales.get_or_insert_default(),
-                (None, false) => table.weights.get_or_insert_default(),
-            }
-        }
-    }
 }
 pub(crate) fn roles(index: &wire::ModelIndex) -> Result<Vec<Role>> {
     let mut result = Vec::new();
@@ -383,87 +355,69 @@ pub(crate) fn locate(parts: &[FilePart], span: &wire::Span) -> Result<Vec<FileSo
     ))
 }
 
-pub(crate) fn combine(
+/// Validate captured rank outputs directly against their per-rank payloads without
+/// synthesizing an intermediate merged legacy v4 `ModelIndex`.
+pub(crate) fn validate_ranks(
     ranks: &[RankOutput],
-    peer_memory: Vec<wire::PeerMemory>,
-    cluster: Option<wire::Cluster>,
-) -> Result<(wire::ModelIndex, Vec<FilePart>)> {
+    cluster: Option<&wire::Cluster>,
+) -> Result<()> {
     let hardware = ranks
         .iter()
         .filter_map(|rank| rank.hardware.as_deref())
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     if hardware.len() > 1 {
         return Err(invalid("rank exports disagree about the preparing device"));
     }
-    let mut index = wire::ModelIndex {
-        version: 4,
-        peer_memory,
-        ..Default::default()
-    };
-    let mut storage = Vec::new();
-    let mut execution = Vec::new();
+    if let Some(cluster) = cluster
+        && ranks.len() != cluster.world as usize
+    {
+        return Err(invalid(
+            "a multi-host core holds every rank of its cluster",
+        ));
+    }
     for (rank, source) in ranks.iter().enumerate() {
         if source.index.ranks.len() != 1 {
             return Err(invalid("rank export must contain one resource bundle"));
         }
-        index.ranks.push(source.index.ranks[0].clone());
-        let bundle = &index.ranks[rank];
-        let stored: BTreeSet<_> = bundle
+        let bundle = &source.index.ranks[0];
+        if bundle
             .allocations
             .iter()
-            .filter_map(|a| a.file.as_ref())
-            .collect();
-        let mut names: Vec<_> = bundle.resources.keys().collect();
-        names.sort();
-        for name in names {
-            let key = SpanKey::Resource(rank, name.clone());
-            let pieces = locate(&source.payload, &bundle.resources[name])?;
-            if stored.contains(name) {
-                storage.push((key, pieces));
-            } else {
-                execution.push((key, pieces));
-            }
+            .flat_map(|a| &a.data_spans)
+            .any(|s| !s.filename.is_empty())
+        {
+            return Err(invalid("allocation destination spans cannot name a file"));
+        }
+        for span in bundle.resources.values() {
+            locate(&source.payload, span)?;
         }
         if rank == 0 {
-            index.contract = source.index.contract.clone();
-            index.rebuild = source.index.rebuild.clone();
-            index.sampling_defaults = source.index.sampling_defaults.clone();
-            index.frontend = source.index.frontend.clone();
-            index.engram = source.index.engram.clone();
-            index.assets = source.index.assets.clone();
-            if let Some(engram) = &index.engram {
-                for (i, table) in engram.tables.iter().enumerate() {
-                    let shards = if table.shards.is_empty() {
-                        vec![None]
+            for asset in &source.index.assets {
+                let span = asset
+                    .payload
+                    .as_ref()
+                    .ok_or_else(|| invalid("asset lacks payload"))?;
+                locate(&source.payload, span)?;
+            }
+            if let Some(engram) = &source.index.engram {
+                for table in &engram.tables {
+                    if table.shards.is_empty() {
+                        for span in [&table.weights, &table.scales] {
+                            locate(&source.payload, span.as_ref().unwrap_or(&wire::Span::default()))?;
+                        }
                     } else {
-                        (0..table.shards.len()).map(Some).collect()
-                    };
-                    for shard in shards {
-                        for scales in [false, true] {
-                            let key = SpanKey::Table(i, shard, scales);
-                            let span = match (shard, scales) {
-                                (Some(j), true) => table.shards[j].scales.clone(),
-                                (Some(j), false) => table.shards[j].weights.clone(),
-                                (None, true) => table.scales.clone(),
-                                (None, false) => table.weights.clone(),
+                        if table.weights.is_some() || table.scales.is_some() {
+                            return Err(invalid(
+                                "partitioned embedding tables cannot also hold shared planes",
+                            ));
+                        }
+                        for shard in &table.shards {
+                            for span in [&shard.weights, &shard.scales] {
+                                locate(&source.payload, span.as_ref().unwrap_or(&wire::Span::default()))?;
                             }
-                            .unwrap_or_default();
-                            storage.push((key, locate(&source.payload, &span)?));
                         }
                     }
                 }
-            }
-            for (i, asset) in index.assets.iter().enumerate() {
-                execution.push((
-                    SpanKey::Asset(i),
-                    locate(
-                        &source.payload,
-                        asset
-                            .payload
-                            .as_ref()
-                            .ok_or_else(|| invalid("asset lacks payload"))?,
-                    )?,
-                ));
             }
         } else if source.index.engram.is_some() {
             return Err(invalid(
@@ -471,37 +425,15 @@ pub(crate) fn combine(
             ));
         }
     }
-    let mut payload = Vec::new();
-    let mut cursor = 0;
-    for (key, pieces) in storage.into_iter().chain(execution) {
-        cursor = align(cursor)?;
-        let span = span_mut(&mut index, &key);
-        span.offset = cursor;
-        span.filename.clear();
-        for source in pieces {
-            let size = source.nbytes;
-            payload.push(FilePart {
-                offset: cursor,
-                source,
-            });
-            cursor = cursor
-                .checked_add(size)
-                .ok_or_else(|| invalid("payload extent overflow"))?;
-        }
-    }
-    if let Some(cluster) = cluster {
-        if index.ranks.len() != cluster.world as usize {
-            return Err(invalid(
-                "a multi-host core holds every rank of its cluster",
-            ));
-        }
-        index.cluster = Some(cluster);
-    }
-    validate_index(&index, cursor)?;
-    Ok((index, payload))
+    Ok(())
 }
 
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
+
+/// Signed hardware identity and deployment label of a core exported without a
+/// device identity; it names no platform.
+const UNKNOWN_DEVICE: &str = "unknown-device";
+
 fn py_error(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
@@ -716,29 +648,32 @@ pub(crate) fn publish_payload(
     let progress = helios_core::startup::StartupProgress::stderr_rows();
     let result = (|| -> Result<serde_json::Value> {
         let assembly = progress.phase("Assemble core payloads", Some(ranks.len() as u64));
-        let (index, payload) = combine(ranks, peer_memory, cluster.clone())?;
-        let rank_count = u32::try_from(index.ranks.len()).map_err(|_| invalid("too many ranks"))?;
-        let architecture = index.ranks[0].architecture.clone();
-        let platform = ranks
-            .iter()
-            .find_map(|rank| rank.hardware.clone())
-            .ok_or_else(|| {
-                invalid("export naming requires the capture device identity")
-            })?;
+        validate_ranks(ranks, cluster.as_ref())?;
+        let root_rank = &ranks[0].index;
+        let root_payload = &ranks[0].payload;
+        let rank_count = u32::try_from(ranks.len()).map_err(|_| invalid("too many ranks"))?;
+        let architecture = root_rank.ranks[0].architecture.clone();
+        // Capture records a platform unless the request asked for no device
+        // identity (`device_identity: "none"`). Such a core claims no platform:
+        // its signed hardware identity and deployment use the unknown-device label.
+        let platform = ranks.iter().find_map(|rank| rank.hardware.clone());
+        let hardware_identity = platform
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_DEVICE.to_string());
         let deployment_id = cluster
             .as_ref()
             .map(|c| c.export_id.clone())
             .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| format!("{platform}-tp{rank_count}"));
+            .unwrap_or_else(|| format!("{hardware_identity}-tp{rank_count}"));
         let mut core_payloads = Vec::new();
         let mut assets = Vec::new();
-        for (position, asset) in index.assets.iter().enumerate() {
+        for (position, asset) in root_rank.assets.iter().enumerate() {
             let span = asset
                 .payload
                 .as_ref()
                 .ok_or_else(|| invalid("frontend asset lacks a payload"))?;
             let (id, nbytes, source) = payload_source(
-                &payload,
+                root_payload,
                 span,
                 &staging,
                 &format!("frontend-{position}.payload"),
@@ -775,13 +710,13 @@ pub(crate) fn publish_payload(
         let core = pwire::CoreBody {
             format_version: helios_core::core::schema::FORMAT_VERSION,
             core_id: core_id.to_vec(),
-            model_identity: index
+            model_identity: root_rank
                 .contract
                 .as_ref()
                 .map(|c| c.model_id.clone())
                 .filter(|id| !id.is_empty())
                 .unwrap_or_else(|| "model".into()),
-            hardware_identity: platform.clone(),
+            hardware_identity: hardware_identity.clone(),
             publisher: Some(pwire::PublisherMetadata {
                 namespace: publisher.namespace.clone(),
                 official_source: publisher.official_source.clone(),
@@ -801,8 +736,8 @@ pub(crate) fn publish_payload(
                 // independently exported tensor-parallel sizes into one core.
                 ranks: 0,
             }),
-            frontend: index.frontend.clone(),
-            sampling_defaults: index.sampling_defaults.clone(),
+            frontend: root_rank.frontend.clone(),
+            sampling_defaults: root_rank.sampling_defaults.clone(),
             payloads: vec![],
             assets,
             deployments: vec![],
@@ -811,19 +746,23 @@ pub(crate) fn publish_payload(
             Some(path) => Some(helios_core::core::cache::Root::open(path)?),
             None => None,
         };
-        let mut leases = Vec::new();
+        preflight_export_fds(ranks, core_payloads.len())?;
+        let mut leases: BTreeMap<
+            helios_core::core::PayloadId,
+            helios_core::core::cache::PayloadObject,
+        > = BTreeMap::new();
         let mut engram_payloads = Vec::new();
         let reused_engram = ranks[0].weight_payload.as_ref().and_then(|sources| sources.engram.as_ref());
         let engram = if let Some(engram) = reused_engram {
             Some(cached_engram(engram, cache_root.as_ref().ok_or_else(|| invalid("Engram reuse requires the core cache"))?,
                 &deployment_id, &mut engram_payloads, &mut leases)?)
-        } else { index
+        } else { root_rank
             .engram
             .as_ref()
             .map(|engram| {
                 core_engram(
                     engram,
-                    &payload,
+                    root_payload,
                     &staging,
                     &deployment_id,
                     &mut engram_payloads,
@@ -853,7 +792,7 @@ pub(crate) fn publish_payload(
                 rank,
                 position as u32,
                 rank_count,
-                &index.peer_memory,
+                &peer_memory,
                 &staging,
                 &deployment_id,
                 cache_root.as_ref(),
@@ -861,16 +800,18 @@ pub(crate) fn publish_payload(
             )?);
             assembly.advance(1);
         }
+        #[allow(deprecated)]
         let deployment = pwire::DeploymentBody {
             deployment_id: deployment_id.clone(),
             architecture,
             tensor_parallel: rank_count,
-            contract: index.contract.clone(),
-            cluster: index.cluster.clone(),
-            rebuild: index.rebuild.clone(),
+            contract: root_rank.contract.clone(),
+            cluster: cluster.clone(),
+            rebuild: root_rank.rebuild.clone(),
             engram,
             payloads: vec![],
             ranks: vec![],
+            preparation: root_rank.preparation.clone(),
         };
         let staged_payloads =
             core_payloads.len() + rank_plans.iter().map(|r| r.payloads.len()).sum::<usize>();
@@ -905,18 +846,21 @@ pub(crate) fn publish_payload(
                     }
                 }
             }
-            leases.iter().filter(|object| ids.contains(&object.id())).cloned().collect()
+            leases
+                .iter()
+                .filter(|(id, _)| ids.contains(*id))
+                .map(|(_, object)| object.clone())
+                .collect()
         } else { Vec::new() };
         let cached_sources: Vec<_> = cached_weights.iter().map(|object|
             super::io::Source::from_file(object.file().clone(), object.slice().offset(), object.length()))
             .collect::<Result<_>>()?;
-        if let Some(cache) = &cache {
-            let root = helios_core::core::cache::Root::open(cache)?;
+        if let Some(root) = cache_root {
             // The cache owns model-key encoding: an unusable identity is an
             // error, never a lossy rewrite that could merge two models.
             let model = helios_core::core::cache::model_key(&request.core.model_identity)?;
             let candidate = helios_core::core::naming::deployment_candidate(
-                Some(&platform),
+                platform.as_deref(),
                 &[rank_count],
                 SystemTime::now(),
             )
@@ -985,7 +929,7 @@ pub(crate) fn publish_payload(
                         })?;
                         // The core is published; a stale temporary is not a failure.
                         let _ = fs::remove_file(&packed);
-                        sync_parent(path)?;
+                        helios_core::core::export::sync_destination_parent(path)?;
                     } else {
                         root.export_entry(&committed, path)?;
                     }
@@ -1251,21 +1195,6 @@ fn group_covers(
     false
 }
 
-fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    {
-        let directory =
-            File::open(parent).map_err(|error| invalid(format!("open export parent: {error}")))?;
-        directory
-            .sync_all()
-            .map_err(|error| invalid(format!("sync export parent: {error}")))?;
-    }
-    Ok(())
-}
-
 fn random_id() -> Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
     let rng = ring::rand::SystemRandom::new();
@@ -1287,12 +1216,64 @@ fn safe_group(name: &str) -> Result<String> {
     }
 }
 
+fn preflight_export_fds(ranks: &[RankOutput], core_payloads: usize) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut distinct_cached = BTreeSet::new();
+        let mut uncached_groups = 0usize;
+        for rank in ranks {
+            if let Some(sources) = &rank.weight_payload {
+                for group in sources
+                    .groups
+                    .iter()
+                    .chain(std::iter::once(&sources.initial_state))
+                {
+                    if !group.payload_id.is_empty() {
+                        distinct_cached.insert(group.payload_id.as_slice());
+                    } else if !group.spans.is_empty() {
+                        uncached_groups += 1;
+                    }
+                }
+                if let Some(engram) = &sources.engram {
+                    for source in super::weight_reuse::engram_uses(engram) {
+                        if let Some(slice) = source.slice.as_ref() {
+                            distinct_cached.insert(slice.payload_id.as_slice());
+                        }
+                    }
+                }
+            }
+        }
+        // Each deduplicated cache lease holds 2 FDs (data + flock); each uncached payload and
+        // rank staging file holds 1 FD, plus headroom for standard/runtime FDs and worker I/O.
+        let required = distinct_cached.len() * 2 + uncached_groups + core_payloads + ranks.len() * 4 + 64;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0
+            && limit.rlim_cur != libc::RLIM_INFINITY
+            && (required as u64) > limit.rlim_cur
+        {
+            return Err(invalid(format!(
+                "TP core export needs approximately {required} open file descriptors ({} cached leases, \
+                 {uncached_groups} uncached weight payloads), exceeding the current soft limit of {}; \
+                 raise it with `ulimit -n {required}` before exporting",
+                distinct_cached.len(),
+                limit.rlim_cur
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (ranks, core_payloads);
+    Ok(())
+}
+
 fn cached_engram(
     engram: &helios_core::core::schema::wire::Engram,
     root: &helios_core::core::cache::Root,
     deployment: &str,
     installed: &mut Vec<helios_core::core::export::PublishPayload>,
-    leases: &mut Vec<helios_core::core::cache::PayloadObject>,
+    leases: &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
 ) -> Result<helios_core::core::schema::wire::Engram> {
     use helios_core::core::{PayloadId, export::PublishPayload, schema::wire as pwire};
     for (index, table) in engram.tables.iter().enumerate() {
@@ -1317,9 +1298,16 @@ fn cached_engram(
                 .as_ref()
                 .ok_or_else(|| invalid("cached Engram plane has no slice"))?;
             let id = PayloadId::from_bytes(slice.payload_id.as_slice().try_into()?);
-            let object = root
-                .payload(id)?
-                .ok_or_else(|| invalid(format!("missing cached Engram payload {id}")))?;
+            let object = match leases.get(&id) {
+                Some(existing) => existing.clone(),
+                None => {
+                    let opened = root
+                        .payload(id)?
+                        .ok_or_else(|| invalid(format!("missing cached Engram payload {id}")))?;
+                    leases.insert(id, opened.clone());
+                    opened
+                }
+            };
             if slice
                 .offset
                 .checked_add(slice.nbytes)
@@ -1334,7 +1322,6 @@ fn cached_engram(
                 id,
                 tensor: None,
             });
-            leases.push(object);
         }
     }
     Ok(engram.clone())
@@ -1548,7 +1535,7 @@ fn rank_plan(
     staging: &Path,
     deployment_id: &str,
     cache: Option<&helios_core::core::cache::Root>,
-    leases: &mut Vec<helios_core::core::cache::PayloadObject>,
+    leases: &mut BTreeMap<helios_core::core::PayloadId, helios_core::core::cache::PayloadObject>,
 ) -> Result<helios_core::core::export::PublishRank> {
     use helios_core::core::{export as payload_export, schema::wire as pwire};
     let bundle = &rank.index.ranks[0];
@@ -1599,11 +1586,18 @@ fn rank_plan(
                     .try_into()
                     .map_err(|_| invalid("declared payload identity is not 32 bytes"))?;
                 let id = helios_core::core::PayloadId::from_bytes(id_bytes);
-                let object = root.payload(id)?.ok_or_else(|| {
-                    invalid(format!(
-                        "declared payload {id} is absent from the core cache"
-                    ))
-                })?;
+                let object = match leases.get(&id) {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        let opened = root.payload(id)?.ok_or_else(|| {
+                            invalid(format!(
+                                "declared payload {id} is absent from the core cache"
+                            ))
+                        })?;
+                        leases.insert(id, opened.clone());
+                        opened
+                    }
+                };
                 if object.length() != group.nbytes {
                     return Err(invalid(format!(
                         "declared payload {id} length {} differs from group {} length {}",
@@ -1640,7 +1634,6 @@ fn rank_plan(
                     id,
                     tensor: None,
                 });
-                leases.push(object);
                 if group.spans.is_empty() {
                     return Err(invalid(format!(
                         "declared payload {} has no spans",
@@ -2040,17 +2033,21 @@ pub(crate) fn convert_prepared(
         let allocation = *index_of
             .get(storage.allocation.as_str())
             .ok_or_else(|| invalid("prepared weight names an absent allocation"))?;
-        let extent = tensor
-            .shape
-            .iter()
-            .zip(&tensor.stride)
-            .try_fold(1u64, |value, (&size, &stride)| {
-                (size - 1)
-                    .checked_mul(stride)
-                    .and_then(|span| value.checked_add(span))
-            })
-            .and_then(|value| value.checked_mul(u64::from(tensor.element_bytes)))
-            .ok_or_else(|| invalid("prepared weight extent overflow"))?;
+        let extent = if tensor.shape.contains(&0) {
+            0u64
+        } else {
+            tensor
+                .shape
+                .iter()
+                .zip(&tensor.stride)
+                .try_fold(1u64, |value, (&size, &stride)| {
+                    (size - 1)
+                        .checked_mul(stride)
+                        .and_then(|span| value.checked_add(span))
+                })
+                .and_then(|value| value.checked_mul(u64::from(tensor.element_bytes)))
+                .ok_or_else(|| invalid("prepared weight extent overflow"))?
+        };
         // Prefer the declared semantic group for this view; retained-coverage
         // inference exists only for older captures without declarations.
         let mut group = groups
@@ -2771,6 +2768,7 @@ mod payload_export_tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn reuse_weights_publishes_cached_payloads_without_live_weight_sources() -> Result<()> {
         use crate::export::{
             CaptureRequest, WeightPayloadGroup, WeightPayloadSourceSpan, WeightPayloadSources,
@@ -2879,8 +2877,18 @@ mod payload_export_tests {
         )?;
         assert!(stored_rank.prepared_weights.is_none());
         assert!(stored_rank.compressed_prepared_weights.is_some());
-        metadata["rebuild_manifest"] = serde_json::json!({"version":1,"recipe":"fixture",
-            "checkpoint_repository":"fixture/model","checkpoint_revision":"revision-a","tensor_parallel":1});
+        // A new export carrying `PreparationManifest` can reuse weights from a cached
+        // legacy `RebuildManifest` deployment when target-weight semantics agree.
+        metadata["preparation_manifest"] = serde_json::json!({
+            "version": 1,
+            "recipe": "fixture",
+            "checkpoint_repository": "fixture/model",
+            "checkpoint_revision": "revision-a",
+            "parameters": [
+                {"key": "online_mxfp8", "scope": "PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT", "value": {"bool_value": false}},
+                {"key": "online_mxfp8_scope", "scope": "PREPARATION_PARAMETER_SCOPE_TARGET_WEIGHT", "value": {"string_value": "all"}}
+            ]
+        });
         // Live sources contain only fresh state; the weight bytes cannot be read here.
         fs::write(stages.join("storage-0.bin"), vec![0x77u8; 32])?;
         let bundle = &mut rank.index.ranks[0];
@@ -3038,7 +3046,7 @@ mod payload_export_tests {
         // Reuse rejects a changed checkpoint or a changed tuned layout.
         let original = request.options.reuse_weights.clone();
         let mut changed = metadata.clone();
-        changed["rebuild_manifest"]["checkpoint_revision"] = "revision-b".into();
+        changed["preparation_manifest"]["checkpoint_revision"] = "revision-b".into();
         request.options.reuse_weights = Some(serde_json::from_value(changed)?);
         assert!(super::super::capture::resolve_staged_weight_payload(&request, &mut rank).is_err());
         request.options.reuse_weights = original;
@@ -3524,14 +3532,17 @@ mod payload_export_tests {
             let root = Root::open(directory.path().join("cache"))?;
             let mut rank = staged_rank(&stages);
             let world = if partitioned { 2 } else { 1 };
-            rank.index.rebuild = Some(wire::RebuildManifest {
-                version: 1,
-                recipe: "fixture".into(),
-                checkpoint_repository: "fixture/model".into(),
-                checkpoint_revision: "revision-a".into(),
-                tensor_parallel: world,
-                ..Default::default()
-            });
+            #[allow(deprecated)]
+            {
+                rank.index.rebuild = Some(wire::RebuildManifest {
+                    version: 1,
+                    recipe: "fixture".into(),
+                    checkpoint_repository: "fixture/model".into(),
+                    checkpoint_revision: "revision-a".into(),
+                    tensor_parallel: world,
+                    ..Default::default()
+                });
+            }
             let mut table = wire::EngramTable {
                 layer: 1,
                 rows: world as u64,
@@ -4662,9 +4673,8 @@ mod payload_export_tests {
         let read = read_sources(&path).unwrap();
         assert_eq!(read.hardware.as_deref(), Some("gb202"));
         assert!(
-            combine(
+            validate_ranks(
                 &[empty_rank(Some("gb202")), empty_rank(Some("gb10"))],
-                vec![],
                 None
             )
             .is_err()
@@ -4718,7 +4728,7 @@ mod payload_export_tests {
         std::fs::create_dir_all(&directory).unwrap();
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(&directory).unwrap();
-        let result = sync_parent(Path::new("model.safetensors"));
+        let result = helios_core::core::export::sync_destination_parent(Path::new("model.safetensors"));
         std::env::set_current_dir(previous).unwrap();
         let _ = std::fs::remove_dir_all(&directory);
         result.unwrap();

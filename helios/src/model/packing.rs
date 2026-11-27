@@ -121,7 +121,7 @@ impl Inputs {
                             }
                             LiveRows | PrefillRow => binding.indexing == Scalar,
                             ImageFeatureSlot => binding.indexing == Scalar && elements == 1
-                                && matches!(graph.kind, GraphKind::Vision | GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Mixed),
+                                && matches!(graph.kind, GraphKind::Vision | GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill | GraphKind::Mixed),
                             PageTable | LiveStateRows => binding.indexing == RequestRow,
                             PromptToken | PromptTargetToken
                             | PromptAndPendingToken
@@ -401,7 +401,7 @@ impl Inputs {
                 if frame.step.lane_kind(row) == GraphKind::Speculative && live.copy_allowed() {
                     history_proposals[row] = Some(frame.scheduler.history_proposal(
                         live.tokens(),
-                        frame.step.token_capacity - 1,
+                        lane.tokens.saturating_sub(1),
                     ));
                 }
             }

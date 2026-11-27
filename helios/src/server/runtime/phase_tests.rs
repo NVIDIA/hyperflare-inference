@@ -257,6 +257,7 @@ impl Fixture {
                 pool_lookup_started: None,
                 host_lookup_outcome: None,
                 pool_plan: None,
+                restore_wait: RestoreWait::default(),
             },
             Generation {
                 events: receiver,
@@ -530,7 +531,7 @@ fn reasoning_budget_cuts_or_plainly_continues_with_exact_history_and_usage() {
             incoming.prompt.reasoning_cut = Some(budget_cut(4, after));
             sender.send(vec![incoming]).unwrap();
             let mut worker = fixture.worker(receiver);
-            worker.admit().unwrap();
+            let _ = worker.admit().unwrap();
             let mut first = [1; 3];
             if let Some(at) = close_at {
                 first[at] = 4;
@@ -596,7 +597,7 @@ fn reasoning_budget_cuts_when_ignored_eos_is_the_last_pass_token() {
     incoming.prompt.ignore_eos = true;
     sender.send(vec![incoming]).unwrap();
     let mut worker = fixture.worker(receiver);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     let mut sequence = 0;
     budget_pass(&mut worker, &mut sequence, &[1, 1, 5]);
     let (incoming, parked) = worker.parked.front().unwrap();
@@ -604,7 +605,7 @@ fn reasoning_budget_cuts_when_ignored_eos_is_the_last_pass_token() {
     assert_eq!(incoming.prompt.max_new_tokens, 2);
     assert_eq!(parked.carried.generated_tokens, 4);
     assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 1);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     budget_pass(&mut worker, &mut sequence, &[2, 2]);
     assert_eq!(
         budget_events(&mut generation),
@@ -624,7 +625,7 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
     let mut worker = fixture.worker(receiver);
     worker.scheduler.enable_speculation(&[1, 4]).unwrap();
     worker.scheduler.fixed_speculative_width(Some(4)).unwrap();
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     advance(&mut worker, GraphKind::Init, 1, None);
     advance(&mut worker, GraphKind::Prefill, 2, Some(1));
     advance(&mut worker, GraphKind::Snapshot, 3, None);
@@ -666,7 +667,7 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
             .render()
             .contains("flare_reasoning_budget_cuts_total 1\n")
     );
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     budget_pass(&mut worker, &mut sequence, &[2]);
     assert_eq!(
         budget_events(&mut generation),
@@ -745,7 +746,7 @@ fn reasoning_budget_does_not_inject_a_close_inside_a_tool_call() {
         let (sender, receiver) = mpsc::channel();
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         let token = |text| fixture.frontend.tokenizer().token_to_id(text).unwrap();
         let samples = [
@@ -767,7 +768,7 @@ fn reasoning_budget_does_not_inject_a_close_inside_a_tool_call() {
         assert_eq!(incoming.prompt.max_new_tokens, (8 - budget) as u32);
         assert_eq!(parked.carried.generated_tokens, budget as u32);
         assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         budget_pass(&mut worker, &mut sequence, &samples[budget..]);
         let (tail, finished, _) = budget_events(&mut generation);
         tokens.extend(tail);
@@ -825,10 +826,10 @@ fn reasoning_budget_streams_reasoning_then_content_on_chat_and_messages() {
         let (sender, receiver) = mpsc::channel();
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         budget_pass(&mut worker, &mut sequence, &[1, 1]);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         budget_pass(&mut worker, &mut sequence, &[2, 2]);
         while let Ok(event) = generation.events.try_recv() {
             match event {
@@ -907,7 +908,7 @@ fn reasoning_budget_does_not_readmit_eos_or_user_stops() {
         incoming.prompt.stop_sequences = sequences;
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         budget_pass(&mut worker, &mut 0, &samples);
         assert_eq!(
             budget_events(&mut generation).1,
@@ -928,7 +929,7 @@ fn forced_reasoning_close_obeys_text_stops_and_park_cancellation() {
         incoming.prompt.stop_strings = vec![if mode == 0 { "bx" } else { "xc" }.into()];
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         budget_pass(&mut worker, &mut sequence, &[1, 1]);
         let (tokens, finished, _) = budget_events(&mut generation);
@@ -940,13 +941,21 @@ fn forced_reasoning_close_obeys_text_stops_and_park_cancellation() {
             assert!(finished.is_empty());
             assert_eq!(worker.parked.len(), 1);
             if mode == 1 {
-                generation.cancelled.store(true, Ordering::Release);
-                worker.admit().unwrap();
+                let carried = worker.parked[0].1.carried;
+                generation.cancel();
+                let _ = worker.admit().unwrap();
+                let event = generation.events.try_recv().unwrap();
+                assert!(matches!(event, GenerationEvent::Finished {
+                    prompt_tokens: 1, generated_tokens: 3, reused_prompt_tokens,
+                    termination: crate::output::Termination::Cancelled, stop_sequence: None, ..
+                } if reused_prompt_tokens == carried.reused_prompt_tokens.unwrap_or(0)));
+                let _ = worker.admit().unwrap();
+                assert!(generation.events.try_recv().is_err(), "duplicate terminal event");
                 assert!(worker.parked.is_empty());
                 assert!(worker.active.iter().all(Option::is_none));
                 assert_eq!(worker.metrics.cancelled.load(Ordering::Relaxed), 1);
             } else {
-                worker.admit().unwrap();
+                let _ = worker.admit().unwrap();
                 budget_pass(&mut worker, &mut sequence, &[2]);
                 assert_eq!(budget_events(&mut generation).1, vec![(1, 4, "stop")]);
                 assert!(worker.parked.is_empty());
@@ -980,7 +989,7 @@ fn reasoning_budget_only_injects_a_close_allowed_by_the_grammar() {
         );
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         budget_pass(&mut worker, &mut sequence, &[1, 1]);
         if allows_close {
@@ -994,7 +1003,7 @@ fn reasoning_budget_only_injects_a_close_allowed_by_the_grammar() {
                 .as_ref()
                 .unwrap();
             assert!(grammar.allows(2));
-            worker.admit().unwrap();
+            let _ = worker.admit().unwrap();
             budget_pass(&mut worker, &mut sequence, &[2, 2]);
             assert_eq!(
                 budget_events(&mut generation),
@@ -1006,7 +1015,7 @@ fn reasoning_budget_only_injects_a_close_allowed_by_the_grammar() {
             assert_eq!(incoming.prompt.max_new_tokens, 3);
             assert_eq!(parked.carried.generated_tokens, 2);
             assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
-            worker.admit().unwrap();
+            let _ = worker.admit().unwrap();
             budget_pass(&mut worker, &mut sequence, &[2, 2, 2]);
             assert_eq!(
                 budget_events(&mut generation),
@@ -1030,10 +1039,10 @@ fn reasoning_budget_omits_only_the_forced_tokens_logprob() {
         }
         sender.send(vec![incoming]).unwrap();
         let mut worker = fixture.worker(receiver);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         let mut sequence = 0;
         budget_pass(&mut worker, &mut sequence, &[1, 1]);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         budget_pass(&mut worker, &mut sequence, &[2, 2]);
         let (tokens, finished, logprobs) = budget_events(&mut generation);
         assert_eq!(finished, vec![(1, 5, "length")]);
@@ -1781,7 +1790,11 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
 fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion() {
     use crate::model::contract::{GraphOperation, InputIndexing, ValueSource};
     use crate::scheduler::speculation::ProposalSource;
-    for source in [ProposalSource::Copy, ProposalSource::Mtp] {
+    for (source, output_limit, expected_copies) in [
+        (ProposalSource::Copy, 16, 2),
+        (ProposalSource::Mtp, 16, 2),
+        (ProposalSource::Mtp, 3, 1),
+    ] {
         let mut fixture = Fixture::new();
         fixture.config.speculative_widths = vec![1, 8];
         fixture.config.speculative_fixed_width = Some(8);
@@ -1847,26 +1860,34 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
         }
         worker.publish().unwrap();
         assert!(worker.active.iter().all(Option::is_none));
-        let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], 16);
+        let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], output_limit);
         sender.send(vec![incoming]).unwrap();
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
         advance(&mut worker, GraphKind::Init, 10, None);
         advance(&mut worker, GraphKind::Prefill, 11, Some(3));
         advance(&mut worker, GraphKind::Snapshot, 12, None);
         let step = planned(&mut worker, GraphKind::Speculative, 13);
+        if output_limit == 3 {
+            assert_eq!(step.token_capacity, 8);
+            assert_eq!(step.lanes[0].tokens, 2);
+        }
         let live = worker.scheduler.request(step.lanes[0].request).unwrap();
         let uploads = worker.inputs.as_ref().unwrap().uploads();
         let bytes = |name| uploads.iter().find(|u| u.buffer == name).unwrap().bytes;
         assert_eq!(
             i32::from_le_bytes(bytes("copy_count").try_into().unwrap()),
-            2
+            expected_copies
         );
         assert_eq!(
             bytes("copy_ids")
                 .chunks_exact(8)
                 .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
                 .collect::<Vec<_>>(),
-            [4, 2, -1, -1, -1, -1, -1]
+            if expected_copies == 1 {
+                [4, -1, -1, -1, -1, -1, -1]
+            } else {
+                [4, 2, -1, -1, -1, -1, -1]
+            }
         );
         assert_eq!(
             i64::from_le_bytes(bytes("copy_consumed").try_into().unwrap()),
@@ -1988,7 +2009,7 @@ struct FakeStore {
     reused: Vec<crate::cache::PrefixKey>,
     /// Whether each `lookup_for` call carried a ticket.
     tickets_seen: Vec<bool>,
-    /// Tickets dropped without an answer.
+    /// Tickets released by their request.
     withdrawn: Arc<AtomicUsize>,
     exports: Vec<(flare_selene::ExportId, flare_selene::ExportChain)>,
     refused: Vec<(flare_selene::ExportId, flare_selene::ExportRefusal)>,
@@ -1996,6 +2017,7 @@ struct FakeStore {
     evictions_lost: usize,
     /// Tickets stay unanswered instead of answering with nothing.
     pending_tickets: bool,
+    refused_lookups: usize,
     /// Each eviction notice with the number of `store` calls made before it.
     evicted: Vec<(
         crate::cache::PrefixKey,
@@ -2030,6 +2052,7 @@ impl FakeStore {
             reject_export: false,
             evictions_lost: 0,
             pending_tickets: false,
+            refused_lookups: 0,
             evicted: Vec::new(),
         }
     }
@@ -2047,12 +2070,18 @@ impl flare_selene::HostStore for FakeStore {
         history: &dyn flare_selene::History,
     ) -> Option<flare_selene::pool::LookupTicket> {
         self.begun.push(history.token_count());
+        if self.refused_lookups != 0 {
+            self.refused_lookups -= 1;
+            return Some(flare_selene::pool::LookupTicket::none());
+        }
         let withdrawn = self.withdrawn.clone();
         Some(flare_selene::pool::LookupTicket::watched(
             if self.pending_tickets {
                 flare_selene::pool::LookupState::Pending
             } else {
-                flare_selene::pool::LookupState::None
+                flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+                    candidates: vec![],
+                }))
             },
             move || {
                 withdrawn.fetch_add(1, Ordering::Relaxed);
@@ -2328,9 +2357,126 @@ fn a_gpu_hit_refreshes_the_host_record_at_admission() {
     worker.attach_store(Some(Box::new(FakeStore::new(None))));
     let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
     sender.send(vec![incoming]).unwrap();
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert_eq!(fake_store(&mut worker).reused, [key]);
+}
+
+fn two_prompt_store(identity: [u8; 32]) -> flare_selene::memory::MemoryStore {
+    use flare_selene::{Layout, memory::MemoryStore, slab::SlabPool, testing::{SimulatedGpu, geometry}};
+    let geometry = [geometry(64, &[("kv", 4096)], 4096)];
+    let layout = Layout::new(&geometry).unwrap();
+    let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    for (buffers, bytes) in [(&gpu.pages, layout.page_record_bytes), (&gpu.rows, layout.row_record_bytes)] {
+        buffers.lock().unwrap().extend((0..64).map(|id| (id, vec![0; bytes as usize])));
+    }
+    // Each independent prompt occupies one page slot and one row slot.
+    let pool = SlabPool::new(layout.page_record_bytes, 4, 0).unwrap();
+    MemoryStore::new(identity, pool, copier).unwrap()
+}
+
+fn prompt_capture_worker<'a>(fixture: &'a Fixture, receiver: mpsc::Receiver<Vec<Incoming>>) -> Worker<'a> {
+    let mut worker = fixture.worker(receiver);
+    let mut graphs = crate::model::testing::manifest(&fixture.config).graphs;
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
+    }
+    worker.scheduler.measured_graph_durations(&graphs).unwrap();
+    worker
+}
+
+fn capture_store_prompt(fixture: &Fixture, worker: &mut Worker<'_>, sender: &mpsc::Sender<Vec<Incoming>>, token: u32, limit: u32, fence: u64) -> Generation {
+    let (incoming, generation) = fixture.incoming(vec![token; 64], limit);
+    sender.send(vec![incoming]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    advance(worker, GraphKind::Init, fence, None);
+    advance(worker, GraphKind::Prefill, fence + 1, Some(1));
+    advance(worker, GraphKind::Snapshot, fence + 2, None);
+    generation
+}
+
+#[test]
+fn completion_refreshes_resident_host_endpoint_after_interleaved_store() {
+    fn run_interleaved(forward_completion_reused: bool) -> (bool, bool) {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut worker = prompt_capture_worker(&fixture, receiver);
+        let store = two_prompt_store(fixture.config.identity);
+        worker.attach_store(Some(Box::new(store)));
+        let prompt_hit = |worker: &mut Worker<'_>, token| {
+            let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+            history.append(&[token; 64], &[]).unwrap();
+            worker.store.as_mut().unwrap().lookup(&history, 0, 65)
+                .is_some_and(|hit| Some(hit.key) == history.key_at(64))
+        };
+        let settle = |worker: &mut Worker<'_>| {
+            assert!(worker.service_store().unwrap()); // submit the copy
+            assert!(worker.service_store().unwrap()); // consume its completion
+        };
+
+        let _long = capture_store_prompt(&fixture, &mut worker, &sender, 3, 2, 1);
+        settle(&mut worker);
+        assert!(prompt_hit(&mut worker, 3));
+        let _short = capture_store_prompt(&fixture, &mut worker, &sender, 2, 1, 4);
+        assert!(worker.publish().unwrap());
+        settle(&mut worker);
+        assert!(prompt_hit(&mut worker, 2));
+
+        advance(&mut worker, GraphKind::Decode, 7, Some(2));
+        advance(&mut worker, GraphKind::Snapshot, 8, None);
+        assert!(worker.publish().unwrap());
+        if !forward_completion_reused {
+            let _ = worker.scheduler.take_reused();
+        }
+        worker.service_store().unwrap();
+
+        let _evictor = capture_store_prompt(&fixture, &mut worker, &sender, 4, 1, 9);
+        assert!(worker.publish().unwrap());
+        settle(&mut worker);
+        assert!(prompt_hit(&mut worker, 4));
+        (prompt_hit(&mut worker, 3), prompt_hit(&mut worker, 2))
+    }
+    assert_eq!(run_interleaved(false), (false, true));
+    assert_eq!(run_interleaved(true), (true, false));
+}
+
+#[test]
+fn completion_reuse_follows_copy_settlement_and_precedes_store_submission() {
+    use flare_selene::{History, HostHit, HostStore, InboundTicket, PrefixKey, PublishedCheckpoint, Result as StoreResult, StoreEvent, StoreOutcome, StoreStats, memory::MemoryStore};
+    struct OrderStore(MemoryStore, mpsc::Sender<(&'static str, PrefixKey)>);
+    impl HostStore for OrderStore {
+        fn lookup(&mut self, h: &dyn History, r: u64, b: u64) -> Option<HostHit> { self.0.lookup(h, r, b) }
+        fn fetch(&mut self, h: HostHit, t: InboundTicket) -> StoreResult<()> { self.0.fetch(h, t) }
+        fn stats(&self) -> StoreStats { self.0.stats() }
+        fn close(&mut self) -> StoreResult<()> { self.0.close() }
+        fn reused(&mut self, k: PrefixKey) { self.1.send(("reuse", k)).unwrap(); self.0.reused(k); }
+        fn store(&mut self, p: &PublishedCheckpoint) -> StoreResult<StoreOutcome> {
+            self.1.send(("store", p.key)).unwrap(); self.0.store(p)
+        }
+        fn poll(&mut self, events: &mut Vec<StoreEvent>) -> StoreResult<()> {
+            self.0.poll(events)?;
+            for event in events {
+                if let StoreEvent::Stored { key, result: Ok(_), .. } = event { self.1.send(("settled", *key)).unwrap(); }
+            }
+            Ok(())
+        }
+    }
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let (log, calls) = mpsc::channel();
+    let mut worker = prompt_capture_worker(&fixture, receiver);
+    worker.attach_store(Some(Box::new(OrderStore(two_prompt_store(fixture.config.identity), log))));
+    let _first = capture_store_prompt(&fixture, &mut worker, &sender, 3, 1, 1);
+    assert!(worker.service_store().unwrap());
+    let (submitted, first) = calls.try_recv().unwrap();
+    assert_eq!(submitted, "store");
+    assert!(worker.publish().unwrap());
+    let _second = capture_store_prompt(&fixture, &mut worker, &sender, 4, 1, 4);
+    assert!(worker.service_store().unwrap());
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&[4; 64], &[]).unwrap();
+    assert_eq!(calls.try_iter().collect::<Vec<_>>(), [("settled", first), ("reuse", first), ("store", history.key_at(64).unwrap())]);
+    assert!(worker.service_store().unwrap());
 }
 
 #[test]
@@ -2361,7 +2507,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
             worker.scheduler.stats().host_lookups,
             worker.scheduler.stats().host_hits
         ),
-        (1, 1)
+        (1, 0)
     );
     let (hit, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
     assert_eq!((ticket.key, ticket.pages.len()), (hit.key, 1));
@@ -2372,6 +2518,8 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
             result: Ok(1 << 20),
         });
     assert!(worker.service_store().unwrap());
+    let stats = worker.scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 70));
     let live = worker.scheduler.request(handle).unwrap();
     assert_eq!(
         (live.phase, live.pages().count()),
@@ -2424,6 +2572,242 @@ fn host_hit_recomputes_when_snapshot_backing_would_prevent_admission() {
     assert_eq!(worker.scheduler.free_page_count(), 14);
     assert_eq!(worker.scheduler.free_snapshot_count(), 16);
     assert!(fake_store(&mut worker).fetched.is_empty());
+}
+
+#[test]
+fn host_hit_waits_for_snapshot_backing_held_by_a_running_request() {
+    for pooled in [false, true] {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        // Every snapshot row aliases pages reserved by the running request.
+        worker
+            .scheduler
+            .share_snapshot_pages(&vec![0..2; 16])
+            .unwrap();
+        let (running, running_generation) = fixture.incoming(vec![7; 70], 4);
+        sender.send(vec![running]).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let (requests, _generations): (Vec<_>, Vec<_>) =
+            (0..2).map(|_| fixture.incoming(vec![0; 70], 4)).unzip();
+        let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+        history.append(&requests[0].prompt.tokens, &[]).unwrap();
+        let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+        store.pooled = pooled;
+        worker.attach_store(Some(Box::new(store)));
+        worker.prefill_rate = 1.0;
+        sender.send(requests).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        assert_eq!(worker.pending.len(), 2);
+        assert_eq!(worker.scheduler.stats().host_lookups, 0);
+        assert!(fake_store(&mut worker).fetched.is_empty());
+        for incoming in &worker.pending {
+            assert!(incoming.restore_wait.started.is_some());
+            assert_eq!(incoming.pool_plan.is_some(), pooled);
+        }
+        let attempts = fake_store(&mut worker).tickets_seen.len();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+        assert_eq!(fake_store(&mut worker).tickets_seen.len(), attempts);
+
+        running_generation.cancelled.store(true, Ordering::Release);
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        assert!(worker.pending.is_empty());
+        for active in worker.active.iter().flatten() {
+            let live = worker.scheduler.request(active.request).unwrap();
+            assert_eq!(
+                (
+                    live.phase,
+                    live.consumed_tokens,
+                    live.reused_prompt_tokens()
+                ),
+                (RequestPhase::Inbound, 70, 70)
+            );
+            assert!(active.incoming.restore_wait.started.is_none());
+        }
+        assert_eq!(worker.scheduler.stats().host_lookups, 2);
+        assert_eq!(worker.scheduler.stats().inbound_waiting, 2);
+        let store = fake_store(&mut worker);
+        assert_eq!(store.fetched.len(), 1);
+        assert!(store.tickets_seen.iter().all(|seen| *seen == pooled));
+        assert_eq!(store.begun.len(), if pooled { 2 } else { 0 });
+    }
+}
+
+#[test]
+fn host_restore_wait_expires_without_a_resource_change() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker
+        .scheduler
+        .share_snapshot_pages(&vec![0..2; 16])
+        .unwrap();
+    let (running, _running_generation) = fixture.incoming(vec![7; 70], 4);
+    sender.send(vec![running]).unwrap();
+    let _ = worker.admit().unwrap();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(&history, 70))))));
+    worker.prefill_rate = 1.0;
+    sender.send(vec![incoming]).unwrap();
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.pending.len(), 1);
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    worker.pending[0].restore_wait.started = Some(expired);
+    worker.pending[0].restore_wait.retry_at = Some(expired);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.pending.is_empty());
+    let active = worker.active[1].as_ref().unwrap();
+    assert_eq!(
+        worker.scheduler.request(active.request).unwrap().phase,
+        RequestPhase::Initialize
+    );
+    assert!(matches!(
+        active.incoming.host_lookup_outcome,
+        Some(crate::offload::LookupOutcome::CapacityRejected)
+    ));
+    assert!(fake_store(&mut worker).fetched.is_empty());
+}
+
+#[test]
+fn host_restore_wait_does_not_block_other_requests_or_cancellation() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker
+        .scheduler
+        .share_snapshot_pages(&vec![0..2; 16])
+        .unwrap();
+    let (running, _running_generation) = fixture.incoming(vec![7; 70], 4);
+    sender.send(vec![running]).unwrap();
+    let _ = worker.admit().unwrap();
+    let (waiting, waiting_generation) = fixture.incoming(vec![0; 70], 4);
+    let (unrelated, _unrelated_generation) = fixture.incoming(vec![1; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&waiting.prompt.tokens, &[]).unwrap();
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = true;
+    let withdrawn = store.withdrawn.clone();
+    worker.attach_store(Some(Box::new(store)));
+    worker.prefill_rate = 1.0;
+    sender.send(vec![waiting, unrelated]).unwrap();
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.pending.len(), 1);
+    assert_eq!(worker.scheduler.stats().active_requests, 2);
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 1);
+    waiting_generation.cancelled.store(true, Ordering::Release);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.pending.is_empty());
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 2);
+    assert_eq!(worker.scheduler.stats().active_requests, 2);
+    assert!(fake_store(&mut worker).fetched.is_empty());
+}
+
+#[test]
+fn host_restore_wait_expires_once_when_recomputation_also_needs_capacity() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let (running, _running_generation) = fixture.incoming(vec![7; 70], 4);
+    sender.send(vec![running]).unwrap();
+    let _ = worker.admit().unwrap();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(&history, 70))))));
+    worker.prefill_rate = 1.0;
+    sender.send(vec![incoming]).unwrap();
+    let _ = worker.admit().unwrap();
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    worker.pending[0].restore_wait.started = Some(expired);
+    worker.pending[0].restore_wait.retry_at = Some(expired);
+    let attempts = fake_store(&mut worker).tickets_seen.len();
+    let _ = worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).tickets_seen.len(), attempts + 1);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].restore_wait.retry_at.is_none());
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).tickets_seen.len(), attempts + 1);
+}
+
+#[test]
+fn host_restore_waits_for_a_transfer_after_its_last_waiter_is_cancelled() {
+    for success in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.snapshots = 1;
+        let (sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let (first, first_generation) = fixture.incoming(vec![1; 70], 4);
+        let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+        history.append(&first.prompt.tokens, &[]).unwrap();
+        worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(&history, 70))))));
+        worker.prefill_rate = 1.0;
+        sender.send(vec![first]).unwrap();
+        let _ = worker.admit().unwrap();
+        let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
+        first_generation.cancelled.store(true, Ordering::Release);
+        let _ = worker.admit().unwrap();
+        assert_eq!(worker.scheduler.stats().active_requests, 0);
+        assert_eq!(worker.scheduler.free_snapshot_count(), 0);
+
+        let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+        let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+        history.append(&incoming.prompt.tokens, &[]).unwrap();
+        fake_store(&mut worker).hit = Some(host_hit(&history, 70));
+        sender.send(vec![incoming]).unwrap();
+        let _ = worker.admit().unwrap();
+        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(worker.scheduler.stats().active_requests, 0);
+        fake_store(&mut worker)
+            .events
+            .push_back(flare_selene::StoreEvent::Fetched {
+                key: ticket.key,
+                result: if success {
+                    Ok(1 << 20)
+                } else {
+                    Err("transfer failed".into())
+                },
+            });
+        worker.service_store().unwrap();
+        let _ = worker.admit().unwrap();
+        assert!(worker.pending.is_empty());
+        assert_eq!(worker.scheduler.stats().inbound_waiting, 1);
+        assert_eq!(fake_store(&mut worker).fetched.len(), 1);
+    }
+}
+
+#[test]
+fn host_restore_waits_for_a_copyout_pin_without_live_requests() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.snapshots = 1;
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store
+        .store_outcomes
+        .push_back(flare_selene::StoreOutcome::Queued);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 1, 64);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 1);
+    assert_eq!(worker.scheduler.stats().active_requests, 0);
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    fake_store(&mut worker).hit = Some(host_hit(&history, 70));
+    worker.prefill_rate = 1.0;
+    sender.send(vec![incoming]).unwrap();
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.pending.len(), 1);
+    assert!(fake_store(&mut worker).fetched.is_empty());
+    complete_store(&mut worker, id, true);
+    worker.service_store().unwrap();
+    let _ = worker.admit().unwrap();
+    assert!(worker.pending.is_empty());
+    assert_eq!(worker.scheduler.stats().inbound_waiting, 1);
+    assert_eq!(fake_store(&mut worker).fetched.len(), 1);
 }
 
 #[test]
@@ -2537,7 +2921,7 @@ fn pins(worker: &Worker<'_>, id: crate::cache::CheckpointId) -> u64 {
 fn export_request(
     export: u64,
     key: crate::cache::PrefixKey,
-    generation: u64,
+    _generation: u64,
     begin_tokens: u64,
 ) -> flare_selene::StoreEvent {
     flare_selene::StoreEvent::ExportRequested {
@@ -2697,7 +3081,7 @@ fn only_pooled_stores_hear_of_evictions() {
         let (queued, generation) = fixture.incoming(vec![9; 150], 4);
         std::mem::forget(generation);
         worker.pending.push_back(queued);
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         worker.service_store().unwrap();
         let evicted = &fake_store(&mut worker).evicted;
         assert_eq!(evicted.len(), usize::from(pooled));
@@ -2727,7 +3111,7 @@ fn a_pooled_lookup_starts_at_arrival_and_ends_at_admission() {
         group.push(incoming);
     }
     sender.send(group).unwrap();
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert_eq!(fake_store(&mut worker).begun, [70; 5]);
     // Admission consulted the ticket and then released it.
     assert_eq!(fake_store(&mut worker).tickets_seen, [true; 4]);
@@ -2743,7 +3127,7 @@ fn a_pooled_lookup_starts_at_arrival_and_ends_at_admission() {
     assert!(worker.pending[0].pool_lookup.is_some());
     // Cancelling the waiting request withdraws its lookup with it.
     generations[4].cancelled.store(true, Ordering::Release);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert!(worker.pending.is_empty());
     assert_eq!(withdrawn.load(Ordering::Relaxed), 5);
 }
@@ -2764,10 +3148,146 @@ fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
     assert!(fake_store(&mut worker).begun.is_empty());
     assert!(worker.pending[0].pool_lookup.is_none());
     assert_eq!(worker.pending[0].pool_plan.as_ref().unwrap().history().token_count(), 70);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert!(fake_store(&mut worker).tickets_seen.is_empty());
     assert_eq!(fake_store(&mut worker).reused, [key]);
+}
+
+#[test]
+fn a_refused_pool_lookup_retries_only_when_admission_is_eligible() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker.scheduler.share_snapshot_pages(&vec![0..2; 16]).unwrap();
+    let (running, running_generation) = fixture.incoming(vec![7; 70], 4);
+    worker.enqueue(vec![running]);
+    let _ = worker.admit().unwrap();
+
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = true;
+    store.refused_lookups = 2;
+    worker.attach_store(Some(Box::new(store)));
+    worker.prefill_rate = 1.0;
+    worker.enqueue(vec![incoming]);
+    assert_eq!(fake_store(&mut worker).begun, [70]);
+
+    let _ = worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].blocked.is_some());
+    assert!(worker.pending[0].pool_lookup_started.is_none());
+    assert!(matches!(
+        worker.pending[0].pool_lookup.as_ref().unwrap().state(),
+        flare_selene::pool::LookupState::None
+    ));
+    assert_eq!(worker.scheduler.stats().host_lookups, 0);
+
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(fake_store(&mut worker).tickets_seen.len(), 1);
+    assert_eq!(worker.scheduler.stats().cache_lookups, 1);
+
+    running_generation.cancelled.store(true, Ordering::Release);
+    let _ = worker.admit().unwrap();
+    assert!(worker.pending.is_empty());
+    assert_eq!(fake_store(&mut worker).begun, [70; 3]);
+    assert_eq!(fake_store(&mut worker).fetched.len(), 1);
+    assert_eq!(worker.scheduler.stats().host_lookups, 1);
+    assert_eq!(worker.scheduler.stats().cache_lookups, 2);
+    assert_eq!(fixture.metrics.admitted.load(Ordering::Relaxed), 2);
+    let active = worker.active.iter().flatten().next().unwrap();
+    assert_eq!(
+        worker.scheduler.request(active.request).unwrap().phase,
+        RequestPhase::Inbound
+    );
+    drop(worker);
+    assert!(fixture.metrics.render().contains(
+        "flare_host_cache_lookup_outcomes_total{reason=\"admitted\"} 1\n"
+    ));
+}
+
+#[test]
+fn refused_pool_lookups_retry_only_for_selected_requests() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.refused_lookups = usize::MAX;
+    worker.attach_store(Some(Box::new(store)));
+    let mut generations = Vec::new();
+    let mut group = Vec::new();
+    for fill in 0..6 {
+        let (incoming, generation) = fixture.incoming(vec![fill; 70], 4);
+        generations.push(generation);
+        group.push(incoming);
+    }
+    worker.enqueue(group);
+    assert_eq!(fake_store(&mut worker).begun, [70; 6]);
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.active.iter().flatten().count(), 4);
+    assert_eq!(worker.pending.len(), 2);
+    assert_eq!(fake_store(&mut worker).begun, [70; 10]);
+    assert_eq!(fake_store(&mut worker).tickets_seen, [true; 4]);
+}
+
+// Retry on selection itself is covered by refused_pool_lookups_retry_only_for_selected_requests.
+#[test]
+fn a_first_pool_lookup_starts_while_blocked_and_retries_when_selected() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.refused_lookups = 1;
+    worker.attach_store(Some(Box::new(store)));
+    let (mut incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    incoming.prompt_score_end = 70;
+    let stats = worker.scheduler.stats();
+    incoming.blocked = Some((
+        worker.scheduler.completed(),
+        stats.free_pages,
+        stats.free_snapshots,
+        stats.free_slots,
+    ));
+    worker.enqueue(vec![incoming]);
+    assert!(fake_store(&mut worker).begun.is_empty());
+    worker.pending[0].prompt_scored = 70;
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70]);
+    assert!(worker.pending[0].blocked.is_some());
+    assert!(worker.pending[0].pool_lookup_started.is_none());
+
+    fake_store(&mut worker).pending_tickets = true;
+    worker.pending[0].blocked = None;
+    let mut incoming = worker.pending.pop_front().unwrap();
+    begin_pool_lookup(
+        &mut worker.scheduler,
+        worker.store.as_mut().unwrap().as_mut(),
+        &mut incoming,
+    );
+    incoming.pool_lookup_started =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    worker.pending.push_back(incoming);
+    let _ = worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.active.iter().all(Option::is_none));
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(false));
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    worker.pending[0].pool_lookup.as_ref().unwrap().set_state(
+        flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+            candidates: vec![],
+        })),
+    );
+    let _ = worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 2]);
+    assert!(worker.pending.is_empty());
+    assert!(worker.active[0].is_some());
 }
 
 #[test]
@@ -2777,14 +3297,16 @@ fn gpu_residency_is_rechecked_using_the_queued_history() {
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
     store.pooled = true;
+    store.refused_lookups = 1;
     worker.attach_store(Some(Box::new(store)));
     let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
     worker.enqueue(vec![incoming]);
     assert_eq!(worker.pending[0].pool_plan.as_ref().unwrap().resident_tokens(), 0);
     let checkpoint = unpinned_checkpoint(&mut worker, 0, 70);
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     let handle = worker.active[0].as_ref().unwrap().request;
     assert_eq!(worker.scheduler.request(handle).unwrap().prefix(), Some(checkpoint));
+    assert_eq!(fake_store(&mut worker).begun, [70]);
     assert!(fake_store(&mut worker).tickets_seen.is_empty());
 }
 
@@ -2829,7 +3351,9 @@ fn late_pool_replies_retry_all_capacity_blocked_requests() {
             .pool_lookup
             .as_ref()
             .unwrap()
-            .set_state(LookupState::Ready(Arc::new(Answer { candidates: vec![] })));
+            .set_state(LookupState::Ready(Arc::new(Answer {
+                candidates: vec![],
+            })));
     }
     fake_store(&mut worker).hit = Some(hit);
     let attempts = fake_store(&mut worker).tickets_seen.len();
@@ -2864,7 +3388,7 @@ fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
     let mut store = FakeStore::new(Some(host_hit(&history, 70)));
     store.pooled = true;
     worker.attach_store(Some(Box::new(store)));
-    worker.admit().unwrap();
+    let _ = worker.admit().unwrap();
     let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
     fake_store(&mut worker)
         .events
@@ -3024,7 +3548,9 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
     use std::time::{Duration, Instant};
 
     for answer in [
-        Some(LookupState::Ready(Arc::new(Answer { candidates: vec![] }))),
+        Some(LookupState::Ready(Arc::new(Answer {
+            candidates: vec![],
+        }))),
         Some(LookupState::None),
         None,
     ] {
@@ -3045,13 +3571,17 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
         assert_eq!(grace, Duration::from_millis(2));
         assert!(worker.pending[0].awaits_pool(started + grace - Duration::from_nanos(1)));
         assert!(!worker.pending[0].awaits_pool(started + grace));
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         assert!(worker.active.iter().all(Option::is_none));
         assert_eq!(worker.pending.len(), 1);
         assert_eq!(worker.idle_wait(), Duration::from_micros(100));
         assert_eq!(withdrawn.load(Ordering::Relaxed), 0);
 
         let pending = answer.is_none();
+        let retry = matches!(&answer, Some(LookupState::None));
+        if retry {
+            fake_store(&mut worker).pending_tickets = false;
+        }
         if let Some(answer) = answer {
             worker.pending[0]
                 .pool_lookup
@@ -3061,11 +3591,12 @@ fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
         } else {
             worker.pending[0].pool_lookup_started = Some(Instant::now() - grace);
         }
-        worker.admit().unwrap();
+        let _ = worker.admit().unwrap();
         assert!(worker.active[0].is_some());
         assert!(worker.pending.is_empty());
         assert_eq!(worker.idle_wait(), Duration::from_millis(2));
-        assert_eq!(withdrawn.load(Ordering::Relaxed), usize::from(!pending));
+        assert_eq!(withdrawn.load(Ordering::Relaxed), usize::from(!pending) + usize::from(retry));
+        assert_eq!(fake_store(&mut worker).begun.len(), 1 + usize::from(retry));
         if pending {
             assert!(worker.active[0].as_ref().unwrap().incoming.pool_lookup.is_some());
             advance(&mut worker, GraphKind::Init, 1, None);
@@ -3095,8 +3626,12 @@ fn a_pending_pool_lookup_does_not_hold_other_requests() {
         Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
     let (ready, _ready_generation) = fixture.incoming(vec![1; 70], 4);
     worker.enqueue(vec![ready]);
-    worker.pending[1].pool_lookup.as_ref().unwrap().set_state(flare_selene::pool::LookupState::None);
-    worker.admit().unwrap();
+    worker.pending[1].pool_lookup.as_ref().unwrap().set_state(
+        flare_selene::pool::LookupState::Ready(Arc::new(flare_selene::pool::Answer {
+            candidates: vec![],
+        })),
+    );
+    let _ = worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert_eq!(worker.pending.len(), 1);
     assert!(worker.pending[0].pool_lookup.is_some());
@@ -3442,7 +3977,7 @@ fn exercise_text_preemption(
             if forced {
                 expected.push(cut.close);
             }
-            worker.admit().unwrap();
+            let _ = worker.admit().unwrap();
             budget_pass(
                 &mut worker,
                 &mut sequence,
@@ -3600,13 +4135,14 @@ fn http_state(
     sender: mpsc::SyncSender<Vec<Incoming>>,
     api_key: Option<String>,
 ) -> Arc<super::super::HttpState> {
-    http_state_for(Fixture::new(), sender, api_key)
+    http_state_for(Fixture::new(), sender, api_key, &[])
 }
 
 fn http_state_for(
     mut fixture: Fixture,
     sender: mpsc::SyncSender<Vec<Incoming>>,
     api_key: Option<String>,
+    served_names: &[String],
 ) -> Arc<super::super::HttpState> {
     use super::super::HttpState;
     use tokio::sync::Semaphore;
@@ -3637,6 +4173,8 @@ fn http_state_for(
         metrics: fixture.metrics,
         input_store: None,
     });
+    let response_model =
+        super::super::models::response_name(model.config(), served_names).to_owned();
     Arc::new(HttpState {
         first_response: Arc::new(super::super::latency::FirstResponseSamples::default()),
         log_to_stderr: false,
@@ -3655,6 +4193,7 @@ fn http_state_for(
         thinking_token_budget: None,
         context_hint: String::new(),
         capacity_hint: String::new(),
+        response_model,
         started: std::time::Instant::now(),
         generated: Default::default(),
         accepting: Mutex::new(true),
@@ -3820,13 +4359,14 @@ async fn http_generation_request(
     tokio::task::JoinHandle<axum::response::Response>,
     Vec<Incoming>,
 ) {
-    let (response, incoming, _) = http_generation_request_observed(path, body).await;
+    let (response, incoming, _) = http_generation_request_observed(path, body, &[]).await;
     (response, incoming)
 }
 
 async fn http_generation_request_observed(
     path: &str,
     body: serde_json::Value,
+    served_names: &[String],
 ) -> (
     tokio::task::JoinHandle<axum::response::Response>,
     Vec<Incoming>,
@@ -3835,7 +4375,7 @@ async fn http_generation_request_observed(
     use super::super::http;
     use axum::{Extension, extract::State};
     let (sender, receiver) = mpsc::sync_channel(4);
-    let state = http_state(sender, None);
+    let state = http_state_for(Fixture::new(), sender, None, served_names);
     let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
     let request = axum::http::Request::builder()
         .method("POST")
@@ -3860,6 +4400,7 @@ async fn first_response_http_stream_excludes_pretext_failures_and_unpolled_bodie
         let (response, incoming, state) = http_generation_request_observed(
             "/v1/completions",
             serde_json::json!({"prompt":"a", "max_tokens":2, "stream":true}),
+            &[],
         ).await;
         let response = response.await.unwrap();
         incoming[0].notify_admission(Ok(()));
@@ -3884,6 +4425,7 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
         let (response, incoming, state) = http_generation_request_observed(
             "/v1/completions",
             serde_json::json!({"prompt":"a", "max_tokens":2, "stream":false}),
+            &[],
         ).await;
         incoming[0].notify_admission(Ok(()));
         incoming[0].emit_token(1);
@@ -3957,6 +4499,135 @@ async fn unread_http_stream_preserves_all_tokens_and_its_terminal_event() {
 }
 
 #[tokio::test]
+async fn disabled_parallel_calls_complete_http_and_stop_decoding() {
+    use axum::{Extension, extract::State};
+    use crate::model::contract::{ToolParser, ToolParserKind};
+    use serde_json::{Value, json};
+    for path in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+        for stream in [false, true] {
+            let mut fixture = Fixture::reasoning();
+            fixture.config.contract.frontend.tools = Some(ToolParser {
+                kind: ToolParserKind::QwenCoder, wrapping_newlines: 0, tag_separator: String::new(),
+            });
+            let samples = ["</think>", "<tool_call>", "<function=lookup>",
+                "<parameter=n>", "c", "</parameter>", "</function>", "</tool_call>",
+                "<tool_call>", "<function=lookup>", "<parameter=n>", "d",
+                "</parameter>", "</function>", "</tool_call>"]
+                .map(|text| fixture.frontend.tokenizer().token_to_id(text).unwrap());
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let state = http_state_for(fixture, sender, None, &[]);
+            let mut body = json!({"messages":[{"role":"user","content":"a"}],
+                "max_tokens":64, "stream":stream, "parallel_tool_calls":false,
+                "stream_options":{"include_usage":true},
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{
+                    "type":"object","properties":{"n":{"type":"string"}}}}}]});
+            if path == "/v1/messages" {
+                body["tools"] = json!([{"name":"lookup","input_schema":{"type":"object",
+                    "properties":{"n":{"type":"string"}}}}]);
+                body["tool_choice"] = json!({"type":"auto","disable_parallel_tool_use":true});
+            } else if path == "/v1/responses" {
+                body["input"] = json!("a");
+                body.as_object_mut().unwrap().remove("messages");
+                body["tools"] = json!([{"type":"function","name":"lookup","parameters":{
+                    "type":"object","properties":{"n":{"type":"string"}}}}]);
+            }
+            let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+            let request = axum::http::Request::builder().method("POST").uri(path)
+                .header("content-type", "application/json").header("anthropic-version", "2023-06-01")
+                .body(axum::body::Body::from(body.to_string())).unwrap();
+            let response = tokio::spawn(super::super::http::generate(State(state.clone()), Extension(ingress), request));
+            let mut incoming = tokio::task::spawn_blocking(move || {
+                receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+            }).await.unwrap();
+            let cancellation = incoming[0].cancelled.clone();
+            let fixture = Fixture::reasoning();
+            // The worker consumes the prepared HTTP prompt through the ordinary scheduler.
+            let (worker_tx, worker_rx) = mpsc::channel();
+            incoming[0].prompt.data.vision_token_indices = vec![-1; incoming[0].prompt.tokens.len()];
+            worker_tx.send(incoming).unwrap();
+            let mut worker = fixture.worker(worker_rx);
+            assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+            let reader = tokio::spawn(async move {
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                axum::body::to_bytes(response.into_body(), 65536).await.unwrap()
+            });
+            let mut generated = 0;
+            for sequence in 1..64 {
+                if generated == samples.len() { break; }
+                let step = worker.plan(0).unwrap().0.unwrap();
+                worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
+                let lane = &step.lanes[0];
+                let live = worker.scheduler.request(lane.request).unwrap();
+                let generates = matches!(step.kind, GraphKind::Decode | GraphKind::Resume)
+                    || (step.kind == GraphKind::Prefill
+                        && lane.start_position + lane.tokens as u64 == live.prompt_tokens as u64);
+                let token = generates.then(|| { let token = samples[generated]; generated += 1; token });
+                let frame = completion(&worker, &step, sequence, token);
+                worker.complete(step.kind, frame).unwrap();
+                worker.publish().unwrap();
+            }
+            assert_eq!(generated, samples.len());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !cancellation.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+            }).await.unwrap();
+            assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+            assert!(worker.active.iter().all(Option::is_none));
+            assert!(worker.plan(0).unwrap().0.is_none(), "request must not keep decoding");
+            let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), reader).await.unwrap().unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains(r#""d""#) && !text.contains(r#"\"d\""#), "{text}");
+            let frames: Vec<Value> = if stream {
+                text.lines().filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]").map(|data| serde_json::from_str(data).unwrap()).collect()
+            } else { vec![serde_json::from_slice(&bytes).unwrap()] };
+            assert!(frames.iter().all(|v| v["error"].is_null()), "{text}");
+            let last = frames.last().unwrap();
+            let response = if stream && path == "/v1/responses" { &last["response"] } else { last };
+            if path == "/v1/chat/completions" {
+                assert_eq!(response["usage"]["completion_tokens"], generated);
+                if stream {
+                    assert!(text.ends_with("data: [DONE]\n\n"));
+                    assert!(frames.iter().any(|v| v["choices"][0]["finish_reason"] == "tool_calls"));
+                    let calls: Vec<_> = frames.iter().filter_map(|v| v["choices"][0]["delta"]["tool_calls"].as_array()).flatten().collect();
+                    assert_eq!(calls.iter().filter(|v| v["id"].is_string()).count(), 1);
+                    assert!(calls.iter().all(|v| v["index"] == 0));
+                    assert_eq!(calls.iter().filter_map(|v| v["function"]["arguments"].as_str()).collect::<String>(), "{\"n\":\"c\"}");
+                } else {
+                    assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+                    assert_eq!(response["choices"][0]["message"]["tool_calls"].as_array().unwrap().len(), 1);
+                    assert_eq!(response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"n\":\"c\"}");
+                }
+            } else if path == "/v1/messages" {
+                if stream {
+                    assert_eq!(last["type"], "message_stop");
+                    let delta = frames.iter().find(|v| v["type"] == "message_delta").unwrap();
+                    assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+                    assert_eq!(delta["usage"]["output_tokens"], generated);
+                    assert_eq!(frames.iter().filter(|v| v["type"] == "content_block_start" && v["content_block"]["type"] == "tool_use").count(), 1);
+                } else {
+                    assert_eq!(response["stop_reason"], "tool_use");
+                    assert_eq!(response["usage"]["output_tokens"], generated);
+                    let calls: Vec<_> = response["content"].as_array().unwrap().iter().filter(|v| v["type"] == "tool_use").collect();
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0]["input"], json!({"n":"c"}));
+                }
+            } else {
+                assert_eq!(response["status"], "completed");
+                assert_eq!(response["usage"]["output_tokens"], generated);
+                let calls: Vec<_> = response["output"].as_array().unwrap().iter().filter(|v| v["type"] == "function_call").collect();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0]["arguments"], "{\"n\":\"c\"}");
+                if stream {
+                    assert_eq!(last["type"], "response.completed");
+                    assert_eq!(frames.iter().filter(|v| v["type"] == "response.output_item.added" && v["item"]["type"] == "function_call").count(), 1);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() {
     use axum::{Extension, extract::State};
     use futures_util::StreamExt;
@@ -3987,7 +4658,7 @@ async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() 
         let mut fixture = Fixture::new();
         fixture.config.limits.max_sequence_tokens = 4096;
         fixture.config.prepared_sequence_tokens = 4096;
-        let state = http_state_for(fixture, sender, None);
+        let state = http_state_for(fixture, sender, None, &[]);
         body["model"] = json!("qwen-worker-phases");
         body["stream"] = json!(true);
         let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
@@ -4071,7 +4742,7 @@ async fn http_operator_thinking_budget_defaults_and_request_overrides() {
         for explicit in [None, Some(3)] {
             let fixture = Fixture::reasoning();
             let (sender, receiver) = mpsc::sync_channel(4);
-            let mut state = http_state_for(fixture, sender, None);
+            let mut state = http_state_for(fixture, sender, None, &[]);
             Arc::get_mut(&mut state).unwrap().thinking_token_budget = Some(2);
             let mut body = json!({"model":"qwen-worker-phases", "max_tokens":8,
                 "max_output_tokens":8, "add_generation_prompt":true});
@@ -4223,6 +4894,80 @@ async fn http_stream_headers_precede_admission_and_late_failure_has_no_success_t
 }
 
 #[tokio::test]
+async fn responses_carry_the_first_non_empty_served_name() {
+    let aliased = vec![String::new(), "served-alias".to_owned()];
+    let (response, incoming, _state) = http_generation_request_observed(
+        "/v1/chat/completions",
+        serde_json::json!({"messages":[{"role":"user","content":"a"}], "max_tokens":4,
+            "stream":true, "return_token_ids":true}),
+        &aliased,
+    ).await;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+        .await.unwrap().unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    incoming[0].notify_admission(Ok(()));
+    incoming[0].observe_token(1);
+    incoming[0].emit_token(1);
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
+        reused_prompt_tokens: 0, reason: "stop", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let bytes = axum::body::to_bytes(response.into_body(), 131072).await.unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    let events = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|line| *line != "[DONE]")
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| event["model"] == "served-alias"));
+    // The token-id observation chunk carries the same name as the text chunks.
+    assert!(
+        events
+            .iter()
+            .any(|event| event["choices"][0]["token_ids"].is_array())
+    );
+
+    // A non-streaming body carries the same name.
+    let (response, incoming, _state) = http_generation_request_observed(
+        "/v1/chat/completions",
+        serde_json::json!({"messages":[{"role":"user","content":"a"}], "max_tokens":2}),
+        &aliased,
+    ).await;
+    incoming[0].notify_admission(Ok(()));
+    incoming[0].emit_token(1);
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
+        reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let response = response.await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["model"], "served-alias");
+
+    // An empty served name falls back to the loaded model's identifier.
+    let (response, incoming, state) = http_generation_request_observed(
+        "/v1/chat/completions",
+        serde_json::json!({"messages":[{"role":"user","content":"a"}], "max_tokens":2}),
+        &[String::new()],
+    ).await;
+    incoming[0].notify_admission(Ok(()));
+    incoming[0].emit_token(1);
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
+        reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let response = response.await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["model"].as_str(), Some(state.model.config().model_id.as_str()));
+}
+
+#[tokio::test]
 async fn request_ids_differ_across_server_starts() {
     let mut ids = vec![];
     for _ in 0..2 {
@@ -4252,7 +4997,7 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
             request["stop_token_sequences"] = serde_json::json!([[1, 2]]);
         }
         let (response, mut incoming, state) =
-            http_generation_request_observed("/v1/chat/completions", request).await;
+            http_generation_request_observed("/v1/chat/completions", request, &[]).await;
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
             .await
             .unwrap()
@@ -5425,6 +6170,31 @@ fn publication_copy_pins_survive_ancestor_compaction() {
     let notice = &fake_store(&mut worker).evicted[0];
     assert_eq!(notice.1.as_ref().unwrap().id, b);
     drop(generation);
+}
+
+#[test]
+fn reoffer_counters_count_actual_store_calls_and_present_replies() {
+    use flare_selene::StoreOutcome;
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.extend([
+        StoreOutcome::Present,
+        StoreOutcome::Present,
+        StoreOutcome::Queued,
+    ]);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    worker.service_store().unwrap();
+    for _ in 0..2 {
+        worker.scheduler.reoffer_publication(id);
+        worker.scheduler.reoffer_publication(id);
+        worker.service_store().unwrap();
+    }
+    let metrics = worker.metrics.render();
+    assert!(metrics.contains("flare_host_cache_reoffer_calls_total 2\n"));
+    assert!(metrics.contains("flare_host_cache_reoffer_present_total 1\n"));
 }
 
 #[test]

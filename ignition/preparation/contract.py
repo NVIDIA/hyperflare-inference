@@ -26,12 +26,12 @@ def text_inputs(kind):
     if kind != "resume":
         values += [b("page_tables", p.PAGE_TABLE, p.REQUEST_ROW),
                    b("draft_page_tables", p.PAGE_TABLE, p.REQUEST_ROW)]
-    if kind in ("prefill", "scored_prefill", "decode", "speculative", "mixed", "resume"):
+    if kind in ("prefill", "terminal_prefill", "scored_prefill", "decode", "speculative", "mixed", "resume"):
         values += [b("sampling_grammar_mask", p.GRAMMAR_MASK, p.REQUEST_ROW)]
         if kind != "resume":
             values += [b("sample_enabled", p.SAMPLE_ENABLED)]
             values += [b("query_lengths", p.QUERY_LENGTH)]
-    if kind in ("prefill", "scored_prefill", "mixed"):
+    if kind in ("prefill", "terminal_prefill", "scored_prefill", "mixed"):
         values += [b("token_ids", p.PROMPT_TOKEN, p.PACKED_TOKEN),
                    b("prefill_positions", p.PROMPT_POSITION, p.PACKED_TOKEN),
                    b("vision_token_indices", p.IMAGE_FEATURE_INDEX, p.PACKED_TOKEN),
@@ -84,7 +84,7 @@ def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, r
             state_rows_per_request=signature.token_capacity if rows is None and kind == "speculative" else (rows or 1),
             draft_cursor=cursor if signature.speculation_enabled and kind in ("speculative", "mixed") else None,
             embedding_tables=list(embedding_tables) if kind in (
-                "prefill", "scored_prefill", "decode", "speculative", "mixed") else [],
+                "prefill", "terminal_prefill", "scored_prefill", "decode", "speculative", "mixed") else [],
             pending_token=pending if kind not in ("init", "restore", "snapshot", "vision") else None))
     return result
 
@@ -107,10 +107,32 @@ def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_sta
 
 
 def model_contract(*, vocabulary, input_vocabulary=None, vision=None, page_tokens, page_tables, graphs, frontend,
-                   regions):
+                   regions, codec_layout=None):
     return dict(version=3, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
         vision={"feature_slots": 0, **(vision or dict(features_per_request=0, max_images=0, patches_per_feature=0, patch_capacities=[]))},
-        cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions), graphs=graphs, frontend=frontend)
+        cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions,
+                   **({"codec_layout": codec_layout} if codec_layout else {})), graphs=graphs, frontend=frontend)
+
+
+def codec_layout(pool, regions, buffers, *, field_encoding=None):
+    """Serialize the recipe's encoding for each contiguous checkpoint field."""
+    row_regions = getattr(pool.layout, "regions", ())
+    if field_encoding is None or not row_regions:
+        return None
+    fields = [dict(buffer="state_pool", offset=r.offset, length=r.nbytes,
+                   encoding=field_encoding(r.name, r.dtype, r.shape)) for r in row_regions]
+    for region in regions:
+        view = region["storage"]
+        name = view["buffer"]
+        tensor = buffers[name]
+        if view["offset"] or not tensor[0].is_contiguous():
+            return None
+        length = tensor[0].numel() * tensor.element_size()
+        if length > view["stride"] or view["nbytes"] != view["stride"]:
+            return None
+        fields.append(dict(buffer=name, offset=0, length=length,
+                           encoding=field_encoding(name, tensor.dtype, tensor.shape[1:])))
+    return dict(revision=1, fields=fields)
 
 
 def vision_inputs(fields):

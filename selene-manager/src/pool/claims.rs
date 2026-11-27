@@ -58,6 +58,19 @@ pub struct Participant {
     pub state: Party,
 }
 
+impl Participant {
+    pub(super) fn window_holder(&self) -> Option<ProcKey> {
+        match self.owner {
+            Owner::Proc(proc)
+                if self.memory && matches!(self.state, Party::Pending | Party::Quarantined) =>
+            {
+                Some(proc)
+            }
+            _ => None,
+        }
+    }
+}
+
 pub fn party_state(parties: &[Participant], owner: Owner) -> Party {
     parties
         .iter()
@@ -137,6 +150,7 @@ pub enum Phase {
 }
 
 pub struct Win {
+    pub packed: Option<v2::PackedWindow>,
     pub plan: PlannedWindow,
     pub region: i32,
     pub offset: u64,
@@ -306,6 +320,7 @@ impl Claim {
     pub(super) fn spec(&self, index: usize) -> v2::WindowSpec {
         let window = &self.windows[index];
         v2::WindowSpec {
+            packed: window.packed.clone(),
             index: window.plan.index,
             region: window.region,
             offset: window.offset,
@@ -342,6 +357,13 @@ impl Core {
         self.sessions
             .get(&sid)
             .map(|session| (session.instance, session.nonce))
+    }
+
+    pub(super) fn process_connected(&self, process: ProcKey) -> bool {
+        self.sessions
+            .values()
+            .any(|s| (s.instance, s.nonce) == process)
+            || self.agents.values().any(|a| a.proc() == process)
     }
 
     fn proc_exited_flag(&self, key: &ProcKey) -> bool {
@@ -415,14 +437,7 @@ impl Core {
         {
             let state = match p.owner {
                 Owner::Proc(proc) if self.proc_exited_flag(&proc) => Party::Drained,
-                Owner::Proc(proc)
-                    if p.state == Party::Pending
-                        && !self
-                            .sessions
-                            .values()
-                            .any(|s| (s.instance, s.nonce) == proc)
-                        && !self.agents.values().any(|a| a.proc() == proc) =>
-                {
+                Owner::Proc(proc) if p.state == Party::Pending && !self.process_connected(proc) => {
                     Party::Quarantined
                 }
                 Owner::Leg(_) if p.state == Party::Pending => Party::Quarantined,
@@ -563,7 +578,26 @@ impl Core {
         let Some(state) = self.scopes.get(&scope_id) else {
             return refuse(self, v2::ClaimReason::UnknownSource);
         };
-        let Some(entry) = state.index.get(source, endpoint, tier).cloned() else {
+        // The manager's index holds one tier per record. A candidate that named the
+        // arena tier goes stale when write-back releases the arena copy of a record
+        // that is still held on disk, so a claim on the manager's own record is served
+        // from whichever tier holds it. The store reads a chain by key and does not
+        // depend on the tier. Another instance's entry describes that instance's memory
+        // and is never substituted.
+        let entry = state.index.get(source, endpoint, tier).or_else(|| {
+            let other = match tier {
+                Tier::Dram => Tier::Nvme,
+                Tier::Nvme => Tier::Dram,
+                Tier::Gpu => return None,
+            };
+            if source == SourceId::Manager {
+                state.index.get(source, endpoint, other)
+            } else {
+                None
+            }
+        });
+        let entry = entry.cloned();
+        let Some(entry) = entry else {
             return refuse(self, v2::ClaimReason::UnknownSource);
         };
         if m.want_row && !entry.row {
@@ -588,9 +622,22 @@ impl Core {
         ) else {
             return refuse(self, v2::ClaimReason::ChainGap);
         };
-        let shapes = shapes_of(&walk, m.want_row);
+        if walk.nodes.iter().any(|n| {
+            !flare_selene::shared::packed::permits_holding(
+                self.sessions[&sid].codec.as_ref(),
+                n.packed,
+                &n.required_profiles,
+            )
+        }) {
+            self.count("codec_incompatible_total", "action=\"claim\"");
+            return refuse(self, v2::ClaimReason::ChainGap);
+        }
+        if source == SourceId::Manager {
+            return self.manager_claim(sid, key, &m, walk, &geometry, mode);
+        }
+        // Pinning supplies the stored lengths. Until then the raw shape bounds every packet.
         let Some(plan) = windows::plan(
-            &shapes,
+            &shapes_of(&walk, m.want_row),
             geometry.page_bytes(),
             geometry.row_bytes(),
             self.cfg.limits.max_window_bytes,
@@ -598,9 +645,6 @@ impl Core {
             return refuse(self, v2::ClaimReason::InvalidClaim);
         };
         let total = windows::total_bytes(&plan);
-        if source == SourceId::Manager {
-            return self.manager_claim(sid, key, &m, walk, &geometry, mode);
-        }
 
         // Retained staging: required for a GPU export, preferred for host tiers.
         let mut block = None;
@@ -768,11 +812,11 @@ impl Core {
             core.refused_claim(sid, key, m, reason);
             Ok(())
         };
-        let (scope, pid) = {
+        let (scope, pid, shm) = {
             let session = &self.sessions[&sid];
-            (session.scope, session.pid)
+            (session.scope, session.pid, session.shm)
         };
-        if self.link_for((key.0, key.1), scope, pid).is_none() {
+        if self.link_for((key.0, key.1), scope, pid, shm).is_none() {
             return refuse(self, v2::ClaimReason::SourceBusy);
         }
         let slices = self.requester_slices(sid);
@@ -805,6 +849,7 @@ impl Core {
             .map(|(index, node)| {
                 let first_page = if index == 0 { walk.skip_pages } else { 0 };
                 v2::Record {
+                    packed: None,
                     key: Some(key_to(node.key)),
                     first_page,
                     pages: node.tail_pages - first_page,
@@ -852,7 +897,23 @@ impl Core {
         }
         let terminal = claim.is_terminal();
         match answer {
-            Ok(GetAnswer::Leased { windows, .. }) => {
+            Ok(GetAnswer::Leased {
+                windows, packed, ..
+            }) => {
+                let caps = self
+                    .sessions
+                    .get(&claim.requester_sid)
+                    .and_then(|s| s.codec.as_ref());
+                if packed.iter().flatten().any(|offer| {
+                    !flare_selene::shared::packed::permits_offer(caps, offer)
+                }) {
+                    self.count("codec_incompatible_total", "action=\"claim\"");
+                    self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::ChainGap);
+                    return;
+                }
+                for (record, offer) in claim.records.iter_mut().zip(packed) {
+                    record.packed = offer
+                }
                 claim.manager.as_mut().unwrap().remaining = windows;
                 if terminal || claim.state != v2::ClaimState::Requested {
                     return;
@@ -913,6 +974,11 @@ impl Core {
                             .get(first..first + count)
                             .map(|pages| (pages.to_vec(), *row_sum))
                     });
+                let sums = if grant.packed.is_some() {
+                    Some((Vec::new(), 0))
+                } else {
+                    sums
+                };
                 let Some((page_xxh3, row_xxh3)) = sums else {
                     self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
                     return;
@@ -926,6 +992,7 @@ impl Core {
                     length: grant.length,
                 };
                 let window = Win {
+                    packed: grant.packed,
                     plan,
                     region: grant.region,
                     offset: grant.offset,
@@ -940,6 +1007,7 @@ impl Core {
                 while claim.windows.len() <= index {
                     // A window index the store skipped is not in anyone's hands.
                     let mut filler = Win {
+                        packed: None,
                         plan,
                         region: grant.region,
                         offset: 0,
@@ -968,12 +1036,7 @@ impl Core {
             }
             Ok(GetAnswer::Done) => {
                 attest(&mut claim.parties, Owner::Store, Party::Drained, false);
-                // Every window is queued: the handler ends the transfer after them.
-                if let Some(hub) = self.cfg.channel.as_ref() {
-                    for leg in claim.legs.iter().filter(|leg| !leg.source) {
-                        hub.finish(leg.ch.transfer);
-                    }
-                }
+                self.finish_req_legs_if_delivered(key);
                 self.complete_if_latched(key);
             }
             Ok(GetAnswer::Refused(refused)) => {
@@ -1082,15 +1145,109 @@ impl Core {
         {
             return bad(self, v2::ClaimReason::CopyError);
         }
-        let Some(plan) = windows::plan(
-            &shapes,
-            claim.page_bytes,
-            claim.row_bytes,
-            limits.max_window_bytes,
-        ) else {
-            return bad(self, v2::ClaimReason::CopyError);
+        let any_packed = ack.records.iter().any(|record| record.packed.is_some());
+        let planned: Vec<(PlannedWindow, Option<v2::PackedWindow>)> = if any_packed {
+            let Some(session) = self.sessions.get(&claim.requester_sid) else {
+                return bad(self, v2::ClaimReason::RequesterLost);
+            };
+            let caps = session.codec.as_ref();
+            let Some(descriptor) = self
+                .scopes
+                .get(&session.scope)
+                .map(|s| s.valid.descriptor.clone())
+            else {
+                return bad(self, v2::ClaimReason::CopyError);
+            };
+            if ack
+                .records
+                .iter()
+                .filter_map(|record| record.packed.as_ref())
+                .any(|offer| !flare_selene::shared::packed::permits_offer(caps, offer))
+            {
+                self.count("codec_incompatible_total", "action=\"claim\"");
+                return bad(self, v2::ClaimReason::ChainGap);
+            }
+            let page_bytes = claim.page_bytes;
+            let row_bytes = claim.row_bytes;
+            let mut planned = Vec::new();
+            for (rec_idx, (record, shape)) in ack.records.iter().zip(&shapes).enumerate() {
+                if let Some(offer) = &record.packed {
+                    let Ok(rec_key) = key_from(record.key.as_ref()) else {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    };
+                    let Some(first) = (rec_key.consumed_tokens / descriptor.page_tokens)
+                        .checked_sub(u64::from(record.pages))
+                    else {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    };
+                    let Ok(layout) = flare_selene::shared::packed::Layout::new(
+                        offer.clone(),
+                        &descriptor.ranks,
+                        first,
+                        record.pages,
+                    ) else {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    };
+                    if record.row != (layout.row_bytes() != 0) {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    }
+                    for span in layout.windows(0, record.row, limits.max_window_bytes) {
+                        let Some(units) =
+                            layout.units(span.first as usize, span.pages as usize, span.row)
+                        else {
+                            return bad(self, v2::ClaimReason::CopyError);
+                        };
+                        let first_page = if span.pages == 0 && span.row {
+                            0
+                        } else {
+                            record.first_page + span.first
+                        };
+                        planned.push((
+                            PlannedWindow {
+                                index: planned.len() as u32,
+                                record: rec_idx as u32,
+                                first_page,
+                                page_count: span.pages,
+                                row: span.row,
+                                length: span.length,
+                            },
+                            Some(v2::PackedWindow {
+                                units: units.to_vec(),
+                            }),
+                        ));
+                    }
+                } else {
+                    let Some(mut sub) = windows::plan(
+                        std::slice::from_ref(shape),
+                        page_bytes,
+                        row_bytes,
+                        limits.max_window_bytes,
+                    ) else {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    };
+                    for w in &mut sub {
+                        w.index = planned.len() as u32;
+                        w.record = rec_idx as u32;
+                        planned.push((*w, None));
+                    }
+                }
+            }
+            if planned.is_empty() {
+                return bad(self, v2::ClaimReason::CopyError);
+            }
+            planned
+        } else {
+            let Some(plan) = windows::plan(
+                &shapes,
+                claim.page_bytes,
+                claim.row_bytes,
+                limits.max_window_bytes,
+            ) else {
+                return bad(self, v2::ClaimReason::CopyError);
+            };
+            plan.into_iter().map(|w| (w, None)).collect()
         };
-        let total = windows::total_bytes(&plan);
+        let total: u64 = planned.iter().map(|(w, _)| w.length).sum();
         let claim = self.claims.get_mut(&key).expect("claim exists");
         if claim.retained {
             let capacity = claim
@@ -1106,14 +1263,15 @@ impl Core {
             .as_ref()
             .map_or(0, |block| block.offset() as u64);
         let mut running = 0u64;
-        claim.windows = plan
+        claim.windows = planned
             .into_iter()
-            .map(|plan| {
+            .map(|(plan, packed)| {
                 let offset = base + running;
                 if claim.retained {
                     running += plan.length;
                 }
                 Win {
+                    packed,
                     plan,
                     region: v2::Region::Staging as i32,
                     offset,
@@ -1240,6 +1398,7 @@ impl Core {
                             shape: shape_for(spec, layout, *rank as usize),
                             region,
                             offset: spec.offset,
+                            packed: spec.packed.is_some(),
                         },
                     );
                 }
@@ -1286,6 +1445,25 @@ impl Core {
         }
         if status != v2::FillStatus::FillOk {
             return Err(Violation::new("WindowFilled without a status"));
+        }
+        if window.packed.is_some() {
+            if !m.page_xxh3.is_empty() || m.has_row || !m.rank_sums.is_empty() {
+                self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+                return Ok(());
+            }
+            self.window_parts(
+                ChanOwner::Source(key),
+                m.index,
+                vec![(
+                    0,
+                    SliceSums {
+                        pages: Vec::new(),
+                        row: None,
+                    },
+                )],
+                0,
+            );
+            return Ok(());
         }
         if claim.mp.src.layout.world() > 1 && (!m.page_xxh3.is_empty() || m.rank_sums.is_empty()) {
             self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
@@ -2018,12 +2196,15 @@ impl Core {
         }
     }
 
-    /// A session ended: its claims, as requester and as source, fail.
+    /// A session ended: fail its active claims and end its unanswered source exports.
     pub(super) fn session_claims_lost(&mut self, sid: u64, session: &Session) {
         let keys: Vec<(ClaimKey, bool)> = self
             .claims
             .iter()
-            .filter(|(_, claim)| !claim.is_terminal())
+            .filter(|(_, claim)| {
+                !claim.is_terminal()
+                    || (claim.source_sid == sid && claim.export == ExportState::Requested)
+            })
             .filter_map(|(key, claim)| {
                 if claim.requester_sid == sid {
                     Some((*key, true))
@@ -2036,11 +2217,10 @@ impl Core {
             .collect();
         for (key, as_requester) in keys {
             if !as_requester {
-                // A source without shared memory reaches the claim's windows only through
-                // the manager's handler, whose exit is the fence. Its session ending
-                // clears what it owed for the export itself.
+                // No windows were issued before PINNED. A channel source reaches them only
+                // through the manager's handler, whose exit fences its accesses.
                 if let Some(claim) = self.claims.get_mut(&key) {
-                    if claim.source_channel().is_some() {
+                    if claim.export == ExportState::Requested || claim.source_channel().is_some() {
                         claim.export = ExportState::Ended;
                         if let Some(proc) = claim.source_proc {
                             attest(&mut claim.parties, Owner::Proc(proc), Party::Drained, false);
@@ -2075,7 +2255,10 @@ pub(super) fn shape_for(
         first_page: spec.first_page,
         page_count: spec.page_count,
         row: spec.row,
-        length: layout.slice_bytes(rank, spec.page_count, spec.row),
+        length: spec.packed.as_ref().map_or_else(
+            || layout.slice_bytes(rank, spec.page_count, spec.row),
+            |_| spec.length,
+        ),
     }
 }
 
@@ -2124,6 +2307,8 @@ mod tests {
         core.sessions.insert(
             1,
             Session {
+                offered_codec: None,
+                codec: None,
                 sid: 1,
                 instance: INSTANCE,
                 nonce: NONCE,
@@ -2177,6 +2362,7 @@ mod tests {
         claim.row = true;
         claim.granted_at = Some(now);
         claim.windows = vec![Win {
+            packed: None,
             plan,
             region: v2::Region::Staging as i32,
             offset: 0,
@@ -2209,6 +2395,141 @@ mod tests {
         });
         core.claims.insert(key, claim);
         key
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pid_zero_exit_reclaims_windows_and_cancels_puts() {
+        use crate::pool::{
+            core::OpenPeer,
+            mp::PutMp,
+            store_bridge::{Link, PutPhase, PutRec, StoreHandle},
+        };
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pidfd = std::sync::Arc::new(crate::local::watch_pid(child.id()).0.unwrap());
+        let (mut core, _old_out) = core();
+        core.sessions.clear();
+        let (tx, _out) = mpsc::channel(64);
+        let sid = core
+            .open(
+                OpenPeer {
+                    unix: true,
+                    pid: 0,
+                    uid: core.euid,
+                    gid: core.egid,
+                    pidfd: Some(pidfd.clone()),
+                },
+                v2::OpenSession {
+                    manager_incarnation: core.incarnation,
+                    instance_id: INSTANCE.to_vec(),
+                    process_nonce: NONCE.to_vec(),
+                    scope: Some(v2::Scope {
+                        model_identity: vec![1; 32],
+                        layout_fingerprint: vec![2; 16],
+                        geometry: Some(v2::Geometry {
+                            page_tokens: 64,
+                            ranks: vec![v2::RankPlanes {
+                                plane_bytes: vec![4096],
+                                row_bytes: 4096,
+                            }],
+                            page_record_bytes: 4096,
+                            row_record_bytes: 4096,
+                        }),
+                    }),
+                    export_slots: 2,
+                    claim_slots: 2,
+                    ..Default::default()
+                },
+                tx,
+            )
+            .unwrap();
+        assert!(core.sessions[&sid].shm);
+        let process = (INSTANCE, NONCE);
+        assert!(core.procs[&process].pid.is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            core.procs[&process].pidfd.as_ref().unwrap(),
+            &pidfd
+        ));
+        let key = delivered(&mut core);
+        let window = &mut core.claims.get_mut(&key).unwrap().windows[0];
+        window.phase = Phase::RequesterRead;
+        window.extent = Some(std::sync::Arc::new(
+            core.staging.allocate(6 * 4096).unwrap(),
+        ));
+        core.get_answer(key, Ok(GetAnswer::Done));
+        core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
+        let link = Link {
+            connection: 7,
+            namespace: [0; 32],
+        };
+        let put = (INSTANCE, NONCE, 2);
+        core.puts.insert(
+            put,
+            PutRec {
+                phase: PutPhase::Open,
+                link,
+                pending_windows: 0,
+                remaining: 0,
+                windows: [(0, std::sync::Arc::new(core.staging.allocate(4096).unwrap()))].into(),
+                parties: vec![Participant {
+                    owner: Owner::Proc(process),
+                    source: true,
+                    memory: true,
+                    state: Party::Quarantined,
+                }],
+                refused: false,
+                key: crate::Key::default(),
+                chain_pages: 1,
+                row: true,
+                packed: false,
+                accepted: None,
+                legs: Vec::new(),
+                deferred_commit: None,
+                mp: PutMp {
+                    layout: rank_layout(1),
+                    peers: Vec::new(),
+                    windows: Default::default(),
+                    passes: 0,
+                    whole: Vec::new(),
+                    row: None,
+                },
+            },
+        );
+        let (commands, mut received) = mpsc::channel(64);
+        core.store = Some(StoreHandle {
+            commands,
+            next_connection: 7,
+        });
+        core.tick();
+        assert!(!core.procs[&process].exited);
+        assert_eq!(core.staging.used(), 9 * 4096);
+        assert!(core.puts.contains_key(&put));
+        assert!(received.try_recv().is_err());
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !core.procs[&process].exited {
+            core.tick();
+            assert!(Instant::now() < deadline, "the child exit was not observed");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(core.staging.used(), 0);
+        assert!(!core.puts.contains_key(&put));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(crate::store::StoreCommand::Cancel {
+                connection: 7,
+                transfer: 2
+            })
+        ));
+        core.session_lost(sid);
+        core.tick();
+        assert!(!core.procs.contains_key(&process));
+        assert!(child.wait().unwrap().success());
     }
 
     fn copy_ok() -> v2::CopyResult {

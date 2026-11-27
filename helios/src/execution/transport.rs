@@ -15,7 +15,7 @@ use crate::{
 use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQUEST_LANES, COMPLETION_METADATA_FIELDS, ReadinessIntervals};
 
 /// Frame-completion wake for threads that would otherwise poll a running frame in a
-/// `sched_yield` loop. On aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
+/// `sched_yield` loop. On Linux aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
 /// cores of GB10), the copy stream writes each frame's fence to a mapped host word right after
 /// the frame's `transferred` event, and [`GraphExecutor::park`] waits in WFET with the exclusive
 /// monitor armed on that word. The event query in [`GraphExecutor::poll`] stays the only
@@ -23,11 +23,12 @@ use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQ
 /// write to the coherent mapped word clearing the monitor). `PARK_LIMIT_US` is the longest
 /// intentional wait per park; scheduling can add to it.
 struct CompletionWake {
+    #[cfg_attr(not(all(target_arch = "aarch64", target_os = "linux")), allow(dead_code))]
     word: PinnedHost,
     device: usize,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 mod host_wait {
     use std::sync::OnceLock;
 
@@ -81,6 +82,7 @@ mod host_wait {
 /// Longest intentional wait per park. The GPU's wake-word write may end it early; anything that
 /// cannot touch the word (a peer's socket message, a new request, a deadline check) waits for the
 /// deadline, GB10's ~100-130 us WFE event stream, or a spurious wake, whichever comes first.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 const PARK_LIMIT_US: u64 = 100;
 
 pub struct Upload<'a> {
@@ -536,7 +538,7 @@ impl GraphExecutor {
             })
         };
         let frames = [frame()?, frame()?];
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         let wake = if host_wait::available() {
             let word = copy.mapped_host_buffer(64)?;
             let device = copy.mapped_address(&word)?;
@@ -546,7 +548,7 @@ impl GraphExecutor {
         } else {
             None
         };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
         let wake = None;
         let engram = manifest
             .engram
@@ -633,12 +635,29 @@ impl GraphExecutor {
         if self.startup_next != self.manifest.referenced_tuning_graphs().len() {
             return Err("startup tuning graphs have not completed".into());
         }
+        if let Some(worker) = self.manifest.persistent_workers.first() {
+            let control = worker.control.as_ref().ok_or_else(|| {
+                Error::execution(
+                    ExecutionError::Manifest,
+                    "persistent worker requires green-context runtime control (export a core and serve with flare run)",
+                )
+            })?;
+            control.start()?;
+        }
         self.startup_ready = true;
         Ok(())
     }
 
     pub fn manifest(&self) -> &ExecutionManifest {
         &self.manifest
+    }
+
+    /// Lock-free telemetry snapshot from the manifest's persistent worker, when present.
+    pub fn persistent_worker_snapshot(&self) -> Option<super::PersistentWorkerSnapshot> {
+        self.manifest
+            .persistent_workers
+            .first()
+            .and_then(super::PersistentWorkerDescriptor::snapshot)
     }
     pub fn completed_fence(&self) -> Fence {
         self.completed
@@ -685,7 +704,7 @@ impl GraphExecutor {
     /// without waiting, when no frame is pending, the wake word already reached the frame, or
     /// this CPU has no WFxT; the caller then keeps its own polling step.
     pub fn park(&self) -> bool {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         {
             let Some(resources) = self.resources.as_ref() else { return false };
             let Some(wake) = resources.wake.as_ref() else { return false };
@@ -710,7 +729,7 @@ impl GraphExecutor {
             unsafe { host_wait::wait_change(word, seen, deadline) };
             true
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
         false
     }
 
@@ -771,6 +790,12 @@ impl GraphExecutor {
                 error.clone(),
             ))
             .into());
+        }
+        if !self.startup_ready {
+            return Err(Error::execution(
+                ExecutionError::State,
+                "startup tuning has not completed",
+            ));
         }
         let resources = self
             .resources
@@ -1126,11 +1151,19 @@ impl GraphExecutor {
             .as_ref()
             .map_or(Ok(()), |e| e.drain())
             .map_err(Error::drain);
-        let drained = compute.is_ok() && copy.is_ok() && engram.is_ok();
+        let worker = self
+            .manifest
+            .persistent_workers
+            .first()
+            .and_then(|worker| worker.control.as_ref())
+            .map_or(Ok(()), |control| control.stop())
+            .map_err(Error::drain);
+        let drained = compute.is_ok() && copy.is_ok() && engram.is_ok() && worker.is_ok();
         let error = compute
             .err()
             .or(copy.err())
             .or(engram.err())
+            .or(worker.err())
             .or(self.poison.take());
         if drained {
             drop(resources);

@@ -18,11 +18,12 @@
 //! reports `Closed`: the engine frees nothing a task could still touch.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
+    net::IpAddr,
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -57,9 +58,9 @@ const ALIGN: u64 = 4096;
 
 /// Fixed-size slots in one registered region, for windows in transit.
 pub(crate) struct Staging {
-    /// The region registered for RDMA, once it was asked for. Declared first so it is
+    /// Registrations by local data socket address. Declared first so staging is
     /// unregistered before the region is unmapped.
-    rdma: OnceLock<Option<Arc<rdma::Device>>>,
+    rdma: Mutex<HashMap<IpAddr, Option<Arc<rdma::Device>>>>,
     region: Region,
     slot_bytes: u64,
     free: Mutex<Vec<u32>>,
@@ -87,7 +88,7 @@ impl Staging {
         let mut region = Region::anonymous(total)?;
         region.register(registrar, context)?;
         Ok(Self {
-            rdma: OnceLock::new(),
+            rdma: Mutex::new(HashMap::new()),
             region,
             slot_bytes,
             free: Mutex::new((0..slots).rev().collect()),
@@ -100,15 +101,20 @@ impl Staging {
         &self.region
     }
 
-    /// The staging registered for RDMA: opened on first use, `None` (with one warning)
-    /// when this host has no usable device or the build has no RDMA.
-    fn rdma(&self) -> Option<Arc<rdma::Device>> {
+    /// Staging registered on first use of each local address; warn once per address
+    /// when no matching device is available or the build has no RDMA. The route to a
+    /// manager normally keeps one local address; each further address pins the staging
+    /// again (memlock), so this is not keyed by device.
+    fn rdma(&self, local_address: IpAddr) -> Option<Arc<rdma::Device>> {
         self.rdma
-            .get_or_init(|| {
+            .lock()
+            .unwrap()
+            .entry(local_address)
+            .or_insert_with(|| {
                 // SAFETY: the region stays mapped at this address for as long as `self`
                 // lives, and the device is dropped first (field order).
                 match unsafe {
-                    rdma::Device::open(self.region.base() as *mut u8, self.region.len())
+                    rdma::Device::open(self.region.base() as *mut u8, self.region.len(), local_address)
                 } {
                     Ok(device) => Some(device),
                     Err(error) => {
@@ -345,6 +351,9 @@ pub(crate) struct Open {
 
 /// Opens transfers. The engine owns one per session; tests substitute their own.
 pub(crate) trait Dial: Send + Sync {
+    fn may_use_rdma(&self) -> bool {
+        false
+    }
     fn open(&self, request: Open) -> io::Result<Channel>;
 }
 
@@ -362,7 +371,14 @@ pub(crate) struct Tcp {
     pub rdma_broken: Arc<AtomicBool>,
 }
 
+pub(crate) fn can_negotiate_rdma(offered: bool, tls: bool) -> bool {
+    cfg!(feature = "rdma") && offered && !tls
+}
 impl Dial for Tcp {
+    fn may_use_rdma(&self) -> bool {
+        can_negotiate_rdma(self.rdma_offered, self.tls.is_some())
+            && !self.rdma_broken.load(Ordering::Relaxed)
+    }
     fn open(&self, request: Open) -> io::Result<Channel> {
         let token: [u8; TOKEN_BYTES] = request
             .reference
@@ -385,9 +401,7 @@ impl Dial for Tcp {
             token,
             staging: self.staging.clone(),
             events: self.events.clone(),
-            rdma: transport == wire::DataTransport::Rdma as i32
-                && self.rdma_offered
-                && !self.rdma_broken.load(Ordering::Relaxed),
+            rdma: transport == wire::DataTransport::Rdma as i32 && self.may_use_rdma(),
             rdma_broken: self.rdma_broken.clone(),
         };
         let (events, id) = (self.events.clone(), request.id);
@@ -582,6 +596,7 @@ async fn connect(target: &Target, claim: bool) -> io::Result<Link> {
         TcpStream::connect((host, port)),
     )
     .await?;
+    let local_address = stream.local_addr()?.ip();
     stream.set_nodelay(true)?;
     let mut conn: Box<dyn Conn> = match &target.tls {
         Some((connector, name)) => Box::new(
@@ -600,7 +615,7 @@ async fn connect(target: &Target, claim: bool) -> io::Result<Link> {
     let pair = if claim && target.rdma && target.tls.is_none() {
         target
             .staging
-            .rdma()
+            .rdma(local_address)
             .and_then(|device| match rdma::Pair::new(&device) {
                 Ok(pair) => Some(pair),
                 Err(error) => {
@@ -649,8 +664,11 @@ fn note_failure(target: &Target, link_was_rdma: bool, result: &io::Result<()>) {
 }
 
 /// The length of a window must fit a slot and the page grid.
+fn fits_slot(target: &Target, length: u64) -> bool {
+    length != 0 && length <= target.staging.slot_bytes()
+}
 fn usable_length(target: &Target, length: u64) -> bool {
-    length != 0 && length.is_multiple_of(ALIGN) && length <= target.staging.slot_bytes()
+    length.is_multiple_of(ALIGN) && fits_slot(target, length)
 }
 
 /// A claim: windows arrive until the manager ends the transfer.
@@ -752,7 +770,12 @@ async fn receive_windows(
         match frame {
             ToInstance::Window(window) => {
                 let length = window.shape.length;
-                if !usable_length(target, length) {
+                let usable = if window.packed.is_some() {
+                    fits_slot(target, length)
+                } else {
+                    usable_length(target, length)
+                };
+                if !usable {
                     return Err(invalid(format!(
                         "window {} has an unusable length ({length})",
                         window.shape.index
@@ -828,7 +851,7 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
             match frame {
                 ToInstance::Grant(shape) => {
                     let length = shape.length;
-                    if !usable_length(target, length) {
+                    if !fits_slot(target, length) {
                         return Err(invalid(format!(
                             "window {} has an unusable length ({length})",
                             shape.index
@@ -1048,6 +1071,7 @@ mod tests {
 
     fn window_frame(shape: Shape, bytes: &[u8]) -> Window {
         Window {
+            packed: None,
             shape,
             page_xxh3: (0..shape.page_count as usize)
                 .map(|i| checksum(&bytes[i * PAGE..(i + 1) * PAGE]))
@@ -1222,6 +1246,7 @@ mod tests {
                 .await
                 .unwrap();
             ToInstance::Window(Window {
+                packed: None,
                 shape: shape(0, 1, false),
                 page_xxh3: vec![0],
                 row_xxh3: 0,
@@ -1327,6 +1352,7 @@ mod tests {
             let mut odd = shape(0, 1, false);
             odd.length = length;
             ToInstance::Window(Window {
+                packed: None,
                 shape: odd,
                 page_xxh3: vec![0],
                 row_xxh3: 0,
