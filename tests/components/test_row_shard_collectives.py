@@ -909,3 +909,48 @@ def test_tp16_island_row_shard_and_all_to_all_dispatch(monkeypatch):
     assert p_ag_direct.source is rs_dst
     assert p_a2a_direct.source is a2a_src
     assert started[-3:] == [("rs", rs_src), ("ag", rs_dst), ("a2a", a2a_src)]
+
+
+def test_concurrent_all_to_all_torch_compile_fullgraph():
+    from ignition.components.collectives import ConcurrentAllToAll, ConcurrentRowToColAllToAll
+
+    for cls, attr, expected_ops in (
+        (
+            ConcurrentAllToAll,
+            "dma",
+            ("flare.start_all_to_all", "flare.join_all_to_all"),
+        ),
+        (
+            ConcurrentRowToColAllToAll,
+            "pcie",
+            ("flare.start_row_to_col_all_to_all", "flare.join_row_to_col_all_to_all"),
+        ),
+    ):
+        fake_a2a = SimpleNamespace(
+            single=False,
+            output=None,
+            output_layout=((4, 16), (16, 1), torch.bfloat16),
+            concurrent_input=None,
+            handle=999,
+        )
+        setattr(fake_a2a, attr, True)
+        wrapper = object.__new__(cls)
+        wrapper.all_to_all = fake_a2a
+        wrapper.stream_handle = 12345
+
+        def fn(x, dep):
+            pending = wrapper.start(x, dependencies=(dep,))
+            return wrapper.finish(pending, dep)
+
+        captured_ops = []
+
+        def backend(gm, example_inputs):
+            captured_ops.append([str(n.target) for n in gm.graph.nodes if n.op == "call_function"])
+            return gm.forward
+
+        x = torch.empty((4, 16), dtype=torch.bfloat16, device="meta")
+        dep = torch.empty((1,), dtype=torch.bfloat16, device="meta")
+        torch.compile(fn, fullgraph=True, backend=backend)(x, dep)
+        assert len(captured_ops) == 1
+        for op_name in expected_ops:
+            assert any(op_name in name for name in captured_ops[0]), captured_ops[0]

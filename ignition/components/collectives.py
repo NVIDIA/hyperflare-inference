@@ -1053,8 +1053,6 @@ class _ConcurrentAllToAll:
 
     _channel_attr: str
     _label: str
-    _start_op_name: str
-    _join_op_name: str
     _pending_cls: type
 
     def __init__(self, all_to_all, *, workspace, session, parallel_plans, send_buffer=None):
@@ -1089,13 +1087,11 @@ class _ConcurrentAllToAll:
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         send = source.clone() if (clone and self.all_to_all.concurrent_input is None) else source
         deps = list(dependencies)
-        globals()[self._start_op_name](send, output, deps, self.all_to_all.handle, self.stream_handle)
+        self._launch_start(send, output, deps)
         return self._pending_cls(send, output, deps)
 
     def finish(self, pending, dependency):
-        globals()[self._join_op_name](
-            pending.source, pending.output, pending.dependencies, dependency, self.stream_handle
-        )
+        self._launch_join(pending.source, pending.output, pending.dependencies, dependency)
         return pending.output
 
 
@@ -1104,9 +1100,13 @@ class ConcurrentAllToAll(_ConcurrentAllToAll):
 
     _channel_attr = "dma"
     _label = "concurrent all-to-all"
-    _start_op_name = "_start_all_to_all"
-    _join_op_name = "_join_all_to_all"
     _pending_cls = PendingAllToAll
+
+    def _launch_start(self, send, output, deps):
+        _start_all_to_all(send, output, deps, self.all_to_all.handle, self.stream_handle)
+
+    def _launch_join(self, source, output, deps, dependency):
+        _join_all_to_all(source, output, deps, dependency, self.stream_handle)
 
 
 class PreparedAllToAll:
@@ -1202,9 +1202,13 @@ class ConcurrentRowToColAllToAll(_ConcurrentAllToAll):
 
     _channel_attr = "pcie"
     _label = "concurrent row-to-column all-to-all"
-    _start_op_name = "_start_row_to_col_all_to_all"
-    _join_op_name = "_join_row_to_col_all_to_all"
     _pending_cls = PendingRowToColAllToAll
+
+    def _launch_start(self, send, output, deps):
+        _start_row_to_col_all_to_all(send, output, deps, self.all_to_all.handle, self.stream_handle)
+
+    def _launch_join(self, source, output, deps, dependency):
+        _join_row_to_col_all_to_all(source, output, deps, dependency, self.stream_handle)
 
 
 class PreparedRowToColAllToAll:
