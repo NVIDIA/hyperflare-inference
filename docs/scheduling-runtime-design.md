@@ -40,10 +40,10 @@ For learned proposals D counts produced candidate positions, including greedy
 proposals. For copy proposals it bounds the supplied prefix and contributes no
 learned-proposal draws to sampling metrics.
 
-Ignition captures supported request buckets from `BATCH_CAPACITIES`
+Ignition captures request buckets from its preparation catalog
 (`1, 2, 4, 6, 8, 12, 16, 24, 32, 64`) through padded concurrency; Helios
-requires only the power-of-two subset `REQUIRED_BATCH_CAPACITIES` of a loaded
-core.
+enumerates and schedules whatever valid batch capacities (`1..=request_slots`)
+the loaded core declares.
 The `--speculative-token-capacity R` envelope bounds aggregate target rows for
 wider programs. Rectangular programs require B × W <= R; ragged programs require
 P <= R. Each recipe captures its concrete supported shapes. Load-time selection
@@ -635,9 +635,8 @@ preferences, not latency bounds. `--mtp-adaptive-verification-alpha` sets
 
 A mixed graph declares `batch_capacity` total physical request rows,
 `token_capacity` decode verification positions per row, and `prefill_capacity`
-prompt tokens. The batch capacity belongs to `BATCH_CAPACITIES` from 2 through
-64 (`2, 4, 6, 8, 12, 16, 24, 32, 64`, with only the power-of-two subset
-`REQUIRED_BATCH_CAPACITIES` required of a core); decode
+prompt tokens. The batch capacity is an integer from 2 through `request_slots`
+(at most 64), enumerated from the loaded core metadata; decode
 width is 1 through the core's completion token capacity, which is eight when
 the core declares none; prompt capacity is positive and aligned to 64. Other graph
 families set `prefill_capacity` to zero. Core selection retains the explicit

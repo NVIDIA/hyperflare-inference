@@ -34,11 +34,11 @@ pub use worker::{ExecutionWorker, OwnedUpload};
 mod tests;
 
 pub use manifest::{
-    ABI_VERSION, BATCH_CAPACITIES, BufferDescriptor, CollectiveHealth, Dtype, ExecutionManifest,
+    ABI_VERSION, BufferDescriptor, CollectiveHealth, Dtype, ExecutionManifest,
     GraphDescriptor, TuningGraphDescriptor, TunedBinding, GraphKind, PersistentWorkerControl,
     PersistentWorkerDescriptor, PersistentWorkerReader, PersistentWorkerSnapshot, PrefixAllocation,
     InputBinding, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, DEFAULT_COMPLETION_TOKEN_CAPACITY,
-    COMPLETION_METADATA_FIELDS, REQUIRED_BATCH_CAPACITIES, resolve_completion_token_capacity,
+    COMPLETION_METADATA_FIELDS, resolve_completion_token_capacity,
     MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, PROMPT_FIELDS, REQUEST_LANES, SamplingMode,
-    WorkerState, batch_capacity_index,
+    WorkerState,
 };

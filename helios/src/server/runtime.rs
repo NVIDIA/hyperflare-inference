@@ -1175,12 +1175,11 @@ impl<'a> Worker<'a> {
             });
             if !progress {
                 if executor.outstanding() > 0 {
-                    // Skip the cooperative yield when park observed the wake word advance so
-                    // completion polling runs immediately without a sched_yield round-trip.
+                    // A park is bounded; the yield keeps the old loop's cooperative handoff.
                     if !executor.park() {
                         std::hint::spin_loop();
-                        thread::yield_now();
                     }
+                    thread::yield_now();
                 } else {
                     self.scheduler.idle()?;
                     let wait = self.idle_wait();

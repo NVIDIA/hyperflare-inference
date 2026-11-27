@@ -72,7 +72,7 @@ fn admission_and_completion_cover_configured_concurrency() {
         let step = scheduler.plan().unwrap();
         assert_eq!(step.kind, GraphKind::Init);
         assert_eq!(step.lanes.len(), active);
-        let expected_batch = crate::execution::BATCH_CAPACITIES
+        let expected_batch = [1, 2, 4, 6, 8, 12, 16, 24, 32, 64]
             .into_iter()
             .find(|&batch| batch >= active)
             .unwrap();
@@ -107,10 +107,13 @@ fn admission_and_completion_cover_configured_concurrency() {
 
 #[test]
 fn verification_catalog_covers_all_prepared_concurrencies_through_64() {
-    let catalog = speculation::graph_catalog(&[1, 2, 3, 4], None, 64);
-    assert!(catalog.iter().all(|widths| widths == &[1, 2, 3, 4]));
-    let fixed = speculation::graph_catalog(&[1, 2, 3, 4], Some(4), 64);
-    assert!(fixed.iter().all(|widths| widths == &[4]));
+    let batches = [1, 2, 4, 6, 8, 12, 16, 24, 32, 64];
+    let catalog = speculation::graph_catalog(&batches, &[1, 2, 3, 4], None, 64);
+    assert_eq!(catalog.len(), batches.len());
+    assert!(catalog.iter().all(|(_, widths)| widths == &[1, 2, 3, 4]));
+    let fixed = speculation::graph_catalog(&batches, &[1, 2, 3, 4], Some(4), 64);
+    assert_eq!(fixed.len(), batches.len());
+    assert!(fixed.iter().all(|(_, widths)| widths == &[4]));
 }
 
 pub(super) fn scheduler(active: usize, pages: u32, snapshots: u32) -> RequestScheduler {
@@ -152,10 +155,14 @@ fn scheduler_with_geometry(active: usize, pages: u32, snapshots: u32, page_token
     scheduler
 }
 pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescriptor> {
+    duration_graphs_for_batches(active, &[1, 2, 4, 6, 8, 12, 16, 24, 32, 64])
+}
+
+fn duration_graphs_for_batches(active: usize, batches: &[usize]) -> Vec<crate::execution::GraphDescriptor> {
     let mut graphs = Vec::new();
-    for batch in crate::execution::BATCH_CAPACITIES
-        .into_iter()
-        .filter(|b| *b <= active.next_power_of_two())
+    for &batch in batches
+        .iter()
+        .filter(|&&b| b <= active.next_power_of_two())
     {
         for kind in [
             GraphKind::Init,
@@ -3974,16 +3981,11 @@ fn state_slot_extent_uses_storage_geometry_independently_of_completion_capacity(
 }
 
 #[test]
-fn intermediate_batch_capacities_select_tight_buckets_and_preserve_legacy_cores() {
-    let plan_for = |batches: &[usize], speculative: bool, concurrency: usize, legacy: bool| {
+fn scheduler_enumerates_arbitrary_prepared_batch_capacities_and_preserves_legacy_cores() {
+    let plan_for = |batches: &[usize], speculative: bool, concurrency: usize| {
         let mut s = scheduler(32, 512, 64);
-        if legacy {
-            let legacy_graphs: Vec<_> = duration_graphs(32)
-                .into_iter()
-                .filter(|g| batches.contains(&g.batch_capacity))
-                .collect();
-            s.measured_graph_durations(&legacy_graphs).unwrap();
-        }
+        let graphs = duration_graphs_for_batches(32, batches);
+        s.measured_graph_durations(&graphs).unwrap();
         if speculative {
             s.enable_speculation(&[1, 8]).unwrap();
             let shapes: Vec<_> = batches
@@ -3996,18 +3998,16 @@ fn intermediate_batch_capacities_select_tight_buckets_and_preserve_legacy_cores(
         }
         for &batch in batches.iter().filter(|&&b| b <= 32) {
             let ns = 6_000_000 + batch as u64 * 100_000;
-            if !legacy {
-                s.costs.set_measured(&ScheduledStep {
-                    kind: GraphKind::Decode,
-                    batch_capacity: batch,
-                    token_capacity: 1,
-                    draft_tokens: 0,
-                    packed_token_capacity: 0,
-                    lanes: vec![],
-                    mixed: None,
-                    requires_feedback: false,
-                }, ns);
-            }
+            s.costs.set_measured(&ScheduledStep {
+                kind: GraphKind::Decode,
+                batch_capacity: batch,
+                token_capacity: 1,
+                draft_tokens: 0,
+                packed_token_capacity: 0,
+                lanes: vec![],
+                mixed: None,
+                requires_feedback: false,
+            }, ns);
             if speculative {
                 for width in [1usize, 8] {
                     s.costs.set_measured(&ScheduledStep {
@@ -4036,9 +4036,10 @@ fn intermediate_batch_capacities_select_tight_buckets_and_preserve_legacy_cores(
 
     // 1) Core with intermediate batch buckets (6, 12, 24) selects B=6 for C=5, B=12 for C=10,
     //    and B=24 for C=20 across both ordinary decode and speculative rounds.
+    let intermediate = [1, 2, 4, 6, 8, 12, 16, 24, 32];
     for (concurrency, expected_batch) in [(5usize, 6usize), (10, 12), (20, 24)] {
         for speculative in [false, true] {
-            let step = plan_for(&crate::execution::BATCH_CAPACITIES, speculative, concurrency, false);
+            let step = plan_for(&intermediate, speculative, concurrency);
             assert_eq!(
                 step.kind,
                 if speculative { GraphKind::Speculative } else { GraphKind::Decode }
@@ -4048,12 +4049,33 @@ fn intermediate_batch_capacities_select_tight_buckets_and_preserve_legacy_cores(
         }
     }
 
-    // 2) Legacy core with only power-of-two batch capacities (1, 2, 4, 8, 16, 32) validates
-    //    and schedules C=5 -> B=8, C=10 -> B=16, C=20 -> B=32 without requiring B=6/12/24.
+    // 2) Legacy power-of-two core (1, 2, 4, 8, 16, 32) schedules C=5 -> B=8, C=10 -> B=16,
+    //    C=20 -> B=32 across both ordinary decode and speculative rounds.
+    let power_of_two = [1, 2, 4, 8, 16, 32];
     for (concurrency, expected_legacy_batch) in [(5usize, 8usize), (10, 16), (20, 32)] {
-        let step = plan_for(&crate::execution::REQUIRED_BATCH_CAPACITIES, true, concurrency, true);
-        assert_eq!(step.kind, GraphKind::Speculative);
-        assert_eq!(step.batch_capacity, expected_legacy_batch);
-        assert_eq!(step.lanes.len(), concurrency);
+        for speculative in [false, true] {
+            let step = plan_for(&power_of_two, speculative, concurrency);
+            assert_eq!(
+                step.kind,
+                if speculative { GraphKind::Speculative } else { GraphKind::Decode }
+            );
+            assert_eq!(step.batch_capacity, expected_legacy_batch);
+            assert_eq!(step.lanes.len(), concurrency);
+        }
+    }
+
+    // 3) Arbitrary non-power-of-two prepared catalog (e.g., 1, 3, 7, 11) is enumerated
+    //    directly from the core's graph metadata without hardcoded bucket lists.
+    let custom = [1, 3, 7, 11];
+    for (concurrency, expected_custom_batch) in [(2usize, 3usize), (5, 7), (9, 11)] {
+        for speculative in [false, true] {
+            let step = plan_for(&custom, speculative, concurrency);
+            assert_eq!(
+                step.kind,
+                if speculative { GraphKind::Speculative } else { GraphKind::Decode }
+            );
+            assert_eq!(step.batch_capacity, expected_custom_batch);
+            assert_eq!(step.lanes.len(), concurrency);
+        }
     }
 }
