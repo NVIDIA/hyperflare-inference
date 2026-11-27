@@ -445,19 +445,9 @@ the prepared graphs.
 
 Preparation flags are declared on each recipe's `RecipeParameters` hierarchy and
 grouped in `MODEL --help` by capacity/compression, speculative decoding, and
-advanced options. Core `ignition` owns the universal `RecipeParameters` fields
-(`--max-concurrency`, `--prefill-chunk-size`, `--autotune-effort`,
-`--compile-workers`, `--lock-gpu-clocks`, `--no-compile`, `--roce-ring`,
-`--roce-chain`) and the four Helios `GraphOperation` ABI parameter groups
-(`SpeculationParameters`, `VisionParameters`, `PromptLogprobsParameters`, and
-`MixedPrefillParameters`). Recipes compose additional domain parameter groups
-and subclasses (such as `--expert-scale-compression`, `--online-mxfp8`,
-`--online-mxfp8-scope`, `--native-dense-activations`, `--no-stream-overlap`,
-`--no-context-parallel`, `--dcp-size`, `--draft-head-quantization`,
-`--draft-body-quantization`, `--markov-head-quantization`,
-`--mla-compute-mode`, `--vocabulary-parallel-sampling`, `--row-shard-prefill`,
-`--row-shard-attention`, `--force-moe-decode-a16`, and
-`--shard-hyperconnections`) directly in the recipe package. Passing a flag that
+advanced options. See `ignition/parameters.py` (`RecipeParameters`) for the
+universal fields and the four Helios `GraphOperation` ABI parameter groups.
+Recipes compose additional domain parameter groups and subclasses. Passing a flag that
 the selected recipe does not declare fails with a usage error naming the flag
 and alias. Recipe values apply when flags are omitted; explicit flags take
 precedence.
@@ -465,6 +455,7 @@ precedence.
 | Flag | Meaning | Default |
 |---|---|---|
 | `--prefill-chunk-size N` | Most prompt tokens processed in one prefill step, aligned to the recipe's chunk alignment. A larger chunk reaches a long prompt's first token sooner; while it runs, other active requests wait for their next token. Command line only. | The recipe's chunk |
+| `--request-context N` | Cap the prepared per-request context and `max_sequence_tokens` at `N` tokens; resolves to the smaller of N and the recipe maximum. A request whose prompt plus requested output exceeds `N` is rejected at admission. Command line only; a core's catalog is fixed at export, so changing it requires re-export. | The recipe's maximum context |
 | `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Available on recipes declaring `MixedPrefillParameters` with concurrency of at least two; `--speculative-method dflash2` rejects it. Command line only; a core's catalog is fixed at export, so changing this flag requires re-export. | Disabled |
 | `--prompt-logprobs` | Capture separate scored prefill graphs for raw prompt token logprobs. Available on recipes declaring `PromptLogprobsParameters`. See [the logprob contract](logprobs-design.md#prompt-scoring). Command line only. | Disabled |
 | `--speculative-method METHOD` | Select the recipe's learned proposal method from the choices declared on `SpeculationParameters.supported_methods`. Command line only. Recorded in `PreparationManifest`; native serving replays the exported graphs. | Recipe declaration |
@@ -1435,7 +1426,7 @@ Configuration assigns each decision to one owner:
 | Concurrent requests | `--max-concurrency` |
 | Active image requests and feature slots | `--image-concurrency`, otherwise `min(4, max_concurrency)` for vision recipes |
 | Listener | Ignition and native Flare `--host` and `--port` |
-| Context limit | Checkpoint maximum; admission still requires sufficient shared cache capacity |
+| Context limit | The recipe maximum context, capped by `--request-context` at export; admission still requires sufficient shared cache capacity |
 | KV pages and GPU prefix-cache rows | Derived from available memory, graph cost, and concurrency |
 | KV history ceiling | Runtime `--kv-cache-limit` |
 | Serving memory budget | Runtime `--memory-limit`, then configured `[memory] reserve`, then the core reserve |

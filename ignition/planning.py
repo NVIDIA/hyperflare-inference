@@ -183,6 +183,11 @@ class Plan:
             object.__setattr__(self, "parameters", replace(self.parameters, tensor_parallel=self.world_size))
         context = self.parameter_context
         self.parameters.validate(context)
+        target = self.parameters.context_target
+        if target is not None and target <= self.recipe.context and target % self.page_tokens != 0:
+            raise UsageError(
+                f"--request-context {target:,} is not a multiple of the {self.page_tokens:,}-token page size"
+            )
         if self.benchmark_selection is not None:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
@@ -204,7 +209,7 @@ class Plan:
                 raise UsageError("benchmark batches exceed --max-concurrency")
             if not selection.prefill_chunk and selection.max_batch * selection.width > self.speculative_token_capacity:
                 raise UsageError("benchmark rounds exceed the speculative token capacity")
-            if selection.required_context > self.context:
+            if selection.required_context > min(self.context, self.prepared_context):
                 raise UsageError("benchmark workload and output allowance exceed the prepared context")
             if selection.prefill_chunk and selection.prefill_chunk != self.prefill_chunk:
                 raise UsageError("benchmark chunk must match --prefill-chunk-size")
@@ -350,9 +355,17 @@ class Plan:
         return min(self.recipe.context, self.tokens)
 
     @property
+    def prepared_context(self) -> int:
+        """The context the prepared core serves per request; the recipe max when no target is set."""
+        target = self.parameters.context_target
+        if target is None:
+            return self.recipe.context
+        return min(self.recipe.context, target)
+
+    @property
     def guaranteed_tokens(self) -> int:
         """Tokens every request can hold while all admitted requests are active."""
-        return min(self.recipe.context, self.pages // self.concurrency * self.page_tokens)
+        return min(self.prepared_context, self.pages // self.concurrency * self.page_tokens)
 
     @property
     def snapshots(self) -> int:
@@ -380,7 +393,7 @@ class Plan:
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "benchmark_selection": None if self.benchmark_selection is None else self.benchmark_selection.to_dict(),
             "context": self.context,
-            "checkpoint_context": self.recipe.context,
+            "prepared_context": self.prepared_context,
             "weights_bytes": self.weights_bytes,
             "mapped_host_bytes": self.checkpoint.mapped_host_bytes,
             "graph_bytes": self.graph_bytes,
@@ -578,8 +591,9 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *,
 
     result = attempt(params, flags=explicit_flags)
     if result is not None:
-        if params.prefill_chunk > result.context:
-            raise UsageError(f"--prefill-chunk-size {params.prefill_chunk:,} exceeds the {result.context:,}-token context"
+        effective = min(result.context, result.prepared_context)
+        if params.prefill_chunk > effective:
+            raise UsageError(f"--prefill-chunk-size {params.prefill_chunk:,} exceeds the {effective:,}-token context"
                              " this plan allows")
         return result
 

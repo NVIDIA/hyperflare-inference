@@ -292,6 +292,49 @@ def test_preparation_manifest_resolves_scopes_and_heliopause_round_trip(monkeypa
     assert decoded_index.preparation.SerializeToString(deterministic=True) == expected.SerializeToString(deterministic=True)
 
 
+def test_request_context_target_prepared_context_and_manifest(monkeypatch):
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    recipe = _recipe()
+    gpus = (_gpu(0), _gpu(1))
+    base_params = recipe.parameters
+
+    stock_plan = planning.plan(recipe, recipe.checkpoints[0], gpus, selected=(0, 1))
+    assert stock_plan.parameters.context_target is None
+    assert stock_plan.prepared_context == recipe.context
+    assert stock_plan.context == min(recipe.context, stock_plan.tokens)
+
+    capped_params = replace(base_params, context_target=131072)
+    capped = planning.plan(recipe, recipe.checkpoints[0], gpus, selected=(0, 1), parameters=capped_params)
+    assert capped.parameters.context_target == 131072
+    assert capped.prepared_context == 131072
+
+    oversized_params = replace(base_params, context_target=500000)
+    oversized = planning.plan(recipe, recipe.checkpoints[0], gpus, selected=(0, 1), parameters=oversized_params)
+    assert oversized.parameters.context_target == 500000
+    assert oversized.prepared_context == recipe.context
+
+    from ignition.preparation.bootstrap import common_preparation_kwargs
+    kwargs = common_preparation_kwargs(capped, kernel_cache=None, retain_graphs=False)
+    assert kwargs["context"] == capped.prepared_context == 131072
+    assert kwargs["context"] != recipe.context
+
+    with pytest.raises(UsageError, match="--request-context"):
+        planning.plan(recipe, recipe.checkpoints[0], gpus, selected=(0, 1),
+                      parameters=replace(base_params, context_target=0))
+
+    with pytest.raises(UsageError, match="multiple of the"):
+        planning.plan(recipe, recipe.checkpoints[0], gpus, selected=(0, 1),
+                      parameters=replace(base_params, context_target=100))
+
+    manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), capped, compiled_forwards=True)
+    assert "--request-context" in manifest["reproduction_args"]
+    assert "131072" in manifest["reproduction_args"]
+    encoded = json_format.ParseDict(manifest, proto.PreparationManifest())
+    decoded = proto.PreparationManifest.FromString(encoded.SerializeToString())
+    by_key = {p.key: p for p in decoded.parameters}
+    assert by_key["context_target"].scope == proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT
+
+
 def test_weight_adjustment_hook_sizes_gpus_and_records_manifest(monkeypatch):
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     per_layer = 128 * MIB
