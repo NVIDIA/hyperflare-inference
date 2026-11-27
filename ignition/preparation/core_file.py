@@ -109,7 +109,7 @@ def read_sources(path):
 
 
 def combine(path, ranks, peer_memory, *, publisher=None,
-            cluster=None, form=None, cache_only=False):
+            cluster=None, form=None, cache_only=False, stage=None):
     import flare_heliopause
     from types import SimpleNamespace
     options = _options(path)
@@ -120,10 +120,11 @@ def combine(path, ranks, peer_memory, *, publisher=None,
     publisher_request = None if publisher is None else json.dumps(publisher.native_request)
     cluster_request = None if cluster is None else json.dumps(cluster)
     form = core_form(path if path is not None else 'cache', form)
+    stage_option = {} if stage is None else {"stage": stage}
     value = _export_native(path, form,
         lambda destination, selected: flare_heliopause.export_combine(
             destination, sources, peers, publisher_request, cluster_request,
-            options['cache'], options['no_weights'], selected),
+            options['cache'], options['no_weights'], selected, **stage_option),
         cache_only=cache_only)
     result = json.loads(value)
     result.setdefault('form', form)

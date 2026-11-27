@@ -1378,7 +1378,7 @@ hub_cache = "~/.cache/huggingface/hub"
 kernel_cache = "~/.cache/flare/kernels"
 core_cache = "~/.cache/flare/cores"
 prefix_cache = ""                # Host checkpoint directory; empty: disk retention disabled.
-export_staging = ""               # Rank files an export assembles from; empty: beside the core.
+export_staging = ""               # Rank and assembly workspace. Empty uses the output parent or the cache for cache-only exports.
 cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native builds.
 ```
 
@@ -1511,7 +1511,11 @@ Export accepts no output path or form selection. Use `ignition convert` on the
 printed cache entry path to create a standalone packed file or directory.
 For multi-host export, the coordinator stages rank resources through Heliopause
 and publishes the complete entry in its shared model cache.
-`[paths] export_staging` selects the export workspace. `--no-weights` requires exact
+`[paths] export_staging` selects the workspace for rank capture and temporary
+payload assembly, including plaintext CUDA modules and graphs. For example,
+`export_staging = "/local/flare/export"` uses local storage while publishing
+into a shared cache. Standalone files and directories are committed beside
+their requested destination. `--no-weights` requires exact
 cached weight payloads; initial state and executable resources may be produced
 fresh. Export closes the prepared model and exits without starting a listener.
 Preparation failures publish no entry.

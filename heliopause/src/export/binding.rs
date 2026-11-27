@@ -632,7 +632,7 @@ fn append_planes(
 
 #[pyclass(module = "flare_heliopause")]
 pub(crate) struct NativeExportStage {
-    directory: std::sync::Mutex<Option<tempfile::TempDir>>,
+    directory: std::sync::RwLock<Option<tempfile::TempDir>>,
     cache: Option<std::path::PathBuf>,
     leases: std::sync::Mutex<Vec<crate::core::cache::PayloadObject>>,
     #[pyo3(get)]
@@ -640,6 +640,18 @@ pub(crate) struct NativeExportStage {
 }
 
 impl NativeExportStage {
+    /// Keep staged rank sources and their cache leases alive through publication.
+    pub(super) fn with_workspace<T>(
+        &self,
+        run: impl FnOnce(&std::path::Path) -> super::Result<T>,
+    ) -> super::Result<T> {
+        let directory = self.directory.read().unwrap_or_else(|e| e.into_inner());
+        let directory = directory
+            .as_ref()
+            .ok_or_else(|| super::invalid("export stage is closed"))?;
+        run(directory.path())
+    }
+
     /// Retain payload object leases for the export's lifetime.
     ///
     /// A closed stage rejects retention instead of accepting leases it will drop
@@ -650,7 +662,7 @@ impl NativeExportStage {
     ) -> super::Result<()> {
         let directory = self
             .directory
-            .lock()
+            .read()
             .unwrap_or_else(|error| error.into_inner());
         if directory.is_none() {
             return Err(super::invalid("export stage is closed"));
@@ -670,7 +682,7 @@ impl NativeExportStage {
     #[cfg(test)]
     pub(crate) fn for_test(cache: Option<std::path::PathBuf>, closed: bool) -> Self {
         Self {
-            directory: std::sync::Mutex::new(if closed {
+            directory: std::sync::RwLock::new(if closed {
                 None
             } else {
                 Some(tempfile::tempdir().unwrap())
@@ -708,31 +720,25 @@ impl NativeExportStage {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {
             path: directory.path().to_string_lossy().into_owned(),
-            directory: std::sync::Mutex::new(Some(directory)),
+            directory: std::sync::RwLock::new(Some(directory)),
             cache: cache.map(|path| path.to_path_buf()),
             leases: std::sync::Mutex::new(Vec::new()),
         })
     }
     /// Reserve one rank's staged source path inside the live workspace.
     fn rank_path(&self, py: Python<'_>, rank: usize) -> PyResult<String> {
-        let directory = self
-            .directory
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let directory = directory
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("export stage is closed"))?;
-        if !py
-            .detach(|| directory.path().try_exists())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        {
-            return Err(PyRuntimeError::new_err("export stage is closed"));
-        }
-        Ok(directory
-            .path()
-            .join(format!("rank-{rank}.json"))
-            .to_string_lossy()
-            .into_owned())
+        py.detach(|| {
+            self.with_workspace(|directory| {
+                if !directory.try_exists()? {
+                    return Err(super::invalid("export stage is closed"));
+                }
+                Ok(directory
+                    .join(format!("rank-{rank}.json"))
+                    .to_string_lossy()
+                    .into_owned())
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
     /// Lease every cache payload named by staged rank sources.
     ///
@@ -743,43 +749,35 @@ impl NativeExportStage {
             .cache
             .clone()
             .ok_or_else(|| PyRuntimeError::new_err("export stage has no core cache"))?;
-        let retained = py
-            .detach(|| -> super::Result<Vec<crate::core::cache::PayloadObject>> {
-                let root = crate::core::cache::Root::open(&cache)?;
-                let mut objects = Vec::new();
-                for path in paths {
-                    for id in super::core::source_payload_ids(&path)? {
-                        let object = root
-                            .payload(id)?
-                            .ok_or_else(|| super::invalid(format!("staged source names missing payload {id}")))?;
-                        objects.push(object);
-                    }
+        py.detach(|| -> super::Result<usize> {
+            let root = crate::core::cache::Root::open(&cache)?;
+            let mut objects = Vec::new();
+            for path in paths {
+                for id in super::core::source_payload_ids(&path)? {
+                    let object = root
+                        .payload(id)?
+                        .ok_or_else(|| super::invalid(format!("staged source names missing payload {id}")))?;
+                    objects.push(object);
                 }
-                Ok(objects)
-            })
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        let count = retained.len();
-        // Route through the checked lifecycle path so a concurrent close cannot
-        // accept leases after the stage has closed.
-        self.retain_payload_leases(crate::export::PayloadLeases(retained))
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        Ok(count)
+            }
+            let count = objects.len();
+            // Route through the checked lifecycle path while detached so a
+            // concurrent close cannot accept leases after closing or contend on the GIL.
+            self.retain_payload_leases(crate::export::PayloadLeases(objects))?;
+            Ok(count)
+        })
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let directory = self
-            .directory
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        self.leases
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-        if let Some(directory) = directory {
-            py.detach(|| directory.close())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-        Ok(())
+        py.detach(|| {
+            let directory = self.directory.write().unwrap_or_else(|e| e.into_inner()).take();
+            self.leases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            directory.map_or(Ok(()), tempfile::TempDir::close)
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
@@ -813,6 +811,63 @@ pub(crate) fn staging_parent(
 mod stage_tests {
     use super::staging_parent;
     use std::path::Path;
+
+    #[test]
+    fn assembly_retains_the_workspace_until_publication_returns() {
+        let stage = super::NativeExportStage::for_test(None, false);
+        stage
+            .with_workspace(|directory| {
+                assert!(directory.is_dir());
+                assert!(stage.directory.try_read().is_ok());
+                assert!(matches!(
+                    stage.directory.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let directory = stage.directory.try_write().unwrap().take().unwrap();
+        directory.close().unwrap();
+        assert!(stage.with_workspace(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn concurrent_close_waits_for_active_workspace_publication() {
+        use std::sync::{Arc, Barrier, atomic::{AtomicBool, Ordering}};
+
+        let stage = Arc::new(super::NativeExportStage::for_test(None, false));
+        let entered = Arc::new(Barrier::new(2));
+        let released = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+
+        let closer_stage = Arc::clone(&stage);
+        let closer_entered = Arc::clone(&entered);
+        let closer_released = Arc::clone(&released);
+        let closer_closed = Arc::clone(&closed);
+        let handle = std::thread::spawn(move || {
+            closer_entered.wait();
+            let dir = closer_stage.directory.write().unwrap().take();
+            assert!(closer_released.load(Ordering::Acquire));
+            closer_stage.leases.lock().unwrap().clear();
+            dir.unwrap().close().unwrap();
+            closer_closed.store(true, Ordering::Release);
+        });
+
+        let workspace_path = stage
+            .with_workspace(|directory| {
+                entered.wait();
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                assert!(!closed.load(Ordering::Acquire));
+                assert!(directory.is_dir());
+                released.store(true, Ordering::Release);
+                Ok(directory.to_path_buf())
+            })
+            .unwrap();
+        handle.join().unwrap();
+        assert!(closed.load(Ordering::Acquire));
+        assert!(!workspace_path.exists());
+        assert!(stage.with_workspace(|_| Ok(())).is_err());
+    }
 
     #[test]
     fn staging_parent_normalizes_relative_and_absent_destinations() {
