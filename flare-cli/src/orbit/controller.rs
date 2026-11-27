@@ -2290,8 +2290,9 @@ fn describe(
         .ok_or("the core path names no file")?
         .to_owned();
     let cluster = runtime_core::core_cluster(authorized);
+    let hardware = authorized.identity().map_err(|e| e.to_string())?.hardware;
     let needs = CoreNeeds {
-        revision: super::gpu::capability_revision(first.architecture[0], first.architecture[1]),
+        revision: super::gpu::core_revision(&hardware, first.architecture[0], first.architecture[1]),
         multi_host: cluster.is_some(),
         rank_bytes: rank_needs.iter().map(|r| r.device_bytes).collect(),
         reserve_bytes: runtime_core::reserve_bytes(authorized),

@@ -318,8 +318,9 @@ Orbit allocates GPUs within hosts. A DGX Spark is a node with one
 GPU; a workstation with sixteen RTX PRO 6000 GPUs is a node with sixteen,
 running one agent. The agent reads its GPUs through NVML, loaded dynamically
 like the CUDA driver, without creating a context: index, UUID, name, hardware
-revision (`gb10`, `gb202`, `gb300` from the PCI device id or compute
-capability), memory total and free, and utilization, memory-controller
+revision (`ga102`, `gb10`, `gb202`, `gb203`, `gb300` from the PCI device id, or
+`sm{major}{minor}` for a compute capability that names no platform), memory total and free,
+and utilization, memory-controller
 utilization (the share of the sample period with memory reads or writes),
 temperature, and SM clock where NVML reports them. These utilization values are
 not measurements of bytes per second. Integrated GPUs whose NVML memory query

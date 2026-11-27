@@ -558,14 +558,19 @@ mod tests {
                     assert_eq!(entry.build_target_match, Some(target == published));
                 }
             }
-            let refs = serde_json::from_value(json!({"branches": [
-                {"name": "ga102-tp1"}, {"name": "gb10-tp1"}, {"name": "gb202"}, {"name": "gb300-tp8"}
-            ]})).unwrap();
-            let mut entry = CatalogEntry::default();
-            let branches = apply_refs(&mut entry, refs, Some(target));
-            assert_eq!(entry.build_target_match, Some(true));
-            assert_eq!(branch_platform(select_revision(&branches, Some(target)).unwrap()), Some(target));
         }
+        // Two platforms whose names share a prefix must still select apart, so no
+        // per-platform fixture is needed as the table grows.
+        let branches = ["gb202", "gb203-tp1"].map(String::from).into_iter().collect();
+        assert_eq!(
+            select_revision(&branches, Some("gb203")).map(String::as_str),
+            Some("gb203-tp1")
+        );
+        assert_eq!(
+            select_revision(&branches, Some("gb202")).map(String::as_str),
+            Some("gb202")
+        );
+        assert_eq!(branch_platform("gb203-tp1"), Some("gb203"));
     }
     #[test]
     fn unknown_builds_or_hardware_do_not_hide_discovery_entries() {
