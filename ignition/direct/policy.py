@@ -7,7 +7,8 @@
 Direct execution keeps its own fixed choice of step kinds, but chooses every
 decode round's graph as Helios's `RequestScheduler::select_plan`
 (helios/src/scheduler/policy.rs) chooses among that kind's candidates: every
-prepared batch capacity up to the concurrency's power of two, at every loaded
+prepared batch capacity from `BATCH_CAPACITIES` (`1, 2, 4, 6, 8, 12, 16, 24, 32, 64`)
+up to the concurrency's power of two, at every loaded
 verification width (only the fixed width when verification is not adaptive),
 carries its highest-valued requests (`best_cohort`), and the graph with the best
 expected value per graph time wins. A request's value is its expected output
@@ -43,7 +44,7 @@ DECODE_AGE_PRICE = .1
 ADAPTATION_MS = 100.
 ESTIMATE_TTL_NS = 30_000_000_000
 # helios/src/execution/manifest.rs.
-BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
+BATCH_CAPACITIES = (1, 2, 4, 6, 8, 12, 16, 24, 32, 64)
 REQUEST_LANES = 64
 
 _KINDS = {"init": "init", "restore": "restore", "prefill": "prefill", "resume": "resume", "snapshot": "snapshot"}

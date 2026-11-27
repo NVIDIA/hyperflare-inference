@@ -22,7 +22,17 @@ pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
 pub const LOGPROB_PAIR_FIELDS: usize = 2;
 pub const LOGPROB_FIELDS: usize = LOGPROB_PAIR_FIELDS * (1 + MAX_LOGPROB_TOKEN_IDS);
 pub const PROMPT_FIELDS: usize = 3 + 2 * MAX_TOP_LOGPROBS;
-pub const BATCH_CAPACITIES: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+/// Power-of-two batch capacities required in every compatible runtime core.
+pub const REQUIRED_BATCH_CAPACITIES: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+/// All supported request batch capacities, including intermediate buckets (6, 12, 24)
+/// that cut slot padding at non-power-of-two concurrencies without increasing max scratch.
+pub const BATCH_CAPACITIES: [usize; 10] = [1, 2, 4, 6, 8, 12, 16, 24, 32, 64];
+
+/// Dense index of a supported batch capacity within [`BATCH_CAPACITIES`].
+#[inline]
+pub fn batch_capacity_index(batch: usize) -> Option<usize> {
+    BATCH_CAPACITIES.iter().position(|&value| value == batch)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Dtype {
