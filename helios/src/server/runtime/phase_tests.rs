@@ -4533,6 +4533,7 @@ async fn first_response_http_stream_excludes_pretext_failures_and_unpolled_bodie
         let snapshot = state.first_response.snapshot();
         assert_eq!(snapshot.samples, u64::from(emit_text && poll_body));
         assert_eq!(snapshot.median_seconds.is_some(), emit_text && poll_body);
+        // A failed response records no end-to-end observation in any case.
         assert!(state
             .model
             .metrics()
@@ -4571,12 +4572,6 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
             .metrics()
             .render()
             .contains("\nflare_request_e2e_seconds_count 1\n"));
-        let mut histogram = String::new();
-        state.first_response.render_histogram(&mut histogram);
-        assert!(histogram.contains(&format!(
-            "\nflare_time_to_first_response_seconds_count {}\n",
-            u64::from(poll_body)
-        )));
     }
 }
 

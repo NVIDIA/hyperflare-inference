@@ -299,22 +299,32 @@ start. Host prefix-store histograms report lookup cost and retirement:
 `flare_host_cache_estimated_prefill_ns`, and
 `flare_host_cache_retirement_seconds`.
 
-The HTTP histograms observe delivery. `flare_request_e2e_seconds` counts each
-successful generation from admission to the completed response; for a stream it
-is observed when delivery completes, which requires the client to drain the
-body. `flare_time_to_first_response_seconds` counts each response that offers
-answer or reasoning text, from admission to that text, once the client reads it.
+The HTTP histograms observe delivery. `flare_request_e2e_seconds` observes each
+successful generation response once, from admission to the completed response;
+it excludes `/v1/messages/count_tokens` and responses the runtime records as
+cancelled, such as a parallel tool-limit stop. It is observed once per delivered
+response, while the runtime counts one completion per model request, so a
+multi-choice response adds fewer observations than completions, and a stream the
+client abandons before draining adds none. For a stream it is observed when
+delivery completes, which requires the client to drain the body.
+`flare_time_to_first_response_seconds` counts each response that offers answer or
+reasoning text, from admission to that text, once the client reads it; a stream
+that offers text before it fails still records this observation.
 With `flare_request_e2e_seconds`, each response also adds one observation per
 prompt to `flare_request_choices`, the requested choice count `n`, and to
 `flare_request_max_choice_generated_tokens`, the largest generated-token count
 among that prompt's choices. Only `/v1/completions` accepts `n` above one or a
 list of prompts; Flare runs each choice as its own model request.
 
-The runtime histograms observe completed generations. `flare_request_queue_seconds`
-spans model-scheduler arrival to the first model step that includes the request,
-which can be a vision step; `flare_request_prefill_seconds` spans that step to
-the request's first committed generated token, and
-`flare_request_inference_seconds` spans it to the last committed generated token.
+The runtime histograms observe requests whose model generation completes
+successfully. `flare_request_queue_seconds` spans model-scheduler arrival to the
+first model step that includes the request, which can be a vision step; it is
+recorded only if the request reached such a step.
+`flare_request_prefill_seconds` spans that step to the request's first committed
+generated token, and `flare_request_inference_seconds` spans it to the last
+committed generated token. A completion that committed no generated token still
+increments `flare_requests_completed_total` and enters the token histograms
+below, but records no time-to-first-token, prefill, or inference observation.
 `flare_time_to_first_token_seconds` spans model-scheduler arrival to the first
 committed generated token; unlike `flare_time_to_first_response_seconds`, it
 excludes HTTP preparation and counts tokens that produce no visible text.
@@ -339,8 +349,10 @@ by the remaining context, including tokens a reasoning budget defers.
 Prompt-scoring requests with a zero limit are not observed.
 `flare_request_preemptions` counts how many times each request was preempted and
 readmitted; its buckets are vLLM's preemption bounds with an added zero bound.
-Cancelled and failed requests enter only `flare_requests_cancelled_total` and
-`flare_requests_failed_total`.
+Cancelled and failed requests contribute no observation to the runtime histograms
+here. Apart from counters, the only series that can observe them is
+`flare_time_to_first_response_seconds`, and only when text was offered before the
+failure.
 
 `flare_requests_output_limited_total` counts completed requests that stopped at
 their output token limit; the rest of `flare_requests_completed_total` stopped at
@@ -464,8 +476,10 @@ failed lanes, and terminal rounds without progress do not enter this average.
 
 Flare exports no `vllm:` names. The table gives the Flare series that measure
 each metric in vLLM's production metric list, named here without the `vllm:`
-prefix, and the metrics Flare does not provide. Flare's per-request histograms
-exclude cancelled and failed requests, which vLLM's include.
+prefix, and the metrics Flare does not provide. Flare's request histograms cover
+successful completions, where vLLM's also observe failed and cancelled requests;
+only `flare_time_to_first_response_seconds` can observe a response that later
+fails.
 
 | vLLM metric | Flare series |
 | --- | --- |
@@ -473,7 +487,7 @@ exclude cancelled and failed requests, which vLLM's include.
 | `num_requests_waiting` | `flare_pending_requests` + `flare_parked_requests` |
 | `num_requests_waiting_by_reason` | No capacity or deferred split; `flare_pending_requests` (first admission) and `flare_parked_requests` (readmission) |
 | `num_requests_kv_fetch_by_stage` | `flare_host_cache_inbound_waiting` and `flare_host_cache_inbound_in_flight` |
-| `kv_cache_usage_perc` | (`flare_request_kv_pages` + `flare_reserved_kv_pages`) / `flare_total_kv_pages` |
+| `kv_cache_usage_perc` | Not provided as one ratio; `flare_free_kv_pages`, `flare_cached_kv_pages`, and `flare_total_kv_pages` bound it |
 | `prompt_tokens`, `prompt_tokens_by_source` | `flare_prefill_tokens_total` (computed, including recomputation after preemption), `flare_cache_reused_tokens_total` (GPU), `flare_host_cache_reused_tokens_total` (host) |
 | `prompt_tokens_cached`, `prompt_tokens_cached_by_source` | `flare_cache_reused_tokens_total` (device) + `flare_host_cache_reused_tokens_total` (host DRAM, disk, or shared pool) |
 | `prefix_cache_queries`, `prefix_cache_hits` | `flare_cache_lookup_tokens_total`, `flare_cache_reused_tokens_total`; both include readmissions |
@@ -484,8 +498,8 @@ exclude cancelled and failed requests, which vLLM's include.
 | `request_success{finished_reason}` | `stop`: `flare_requests_completed_total` − `flare_requests_output_limited_total`; `length`: `flare_requests_output_limited_total`; `abort`: `flare_requests_cancelled_total`; `error`: `flare_requests_failed_total`; `repetition`: not provided |
 | `admission_rejections{reason}` | `flare_admission_rejections_total{reason}`, with Flare's queue limits as reasons |
 | `iteration_tokens_total` | `flare_model_step_tokens` |
-| `e2e_request_latency_seconds` | `flare_request_e2e_seconds`, from HTTP admission |
-| `time_to_first_token_seconds` | `flare_time_to_first_token_seconds`, from model-scheduler arrival; `flare_time_to_first_response_seconds` from HTTP admission to visible text |
+| `e2e_request_latency_seconds` | `flare_request_e2e_seconds`, from HTTP admission, for successful delivered responses and excluding token counting and tool-limit cancellations |
+| `time_to_first_token_seconds` | `flare_time_to_first_token_seconds`, from model-scheduler arrival; `flare_time_to_first_response_seconds` from HTTP admission to visible text, also recorded when a stream that offered text later fails |
 | `inter_token_latency_seconds` | `flare_inter_token_latency_seconds` |
 | `request_queue_time_seconds`, `request_prefill_time_seconds`, `request_decode_time_seconds`, `request_inference_time_seconds` | `flare_request_queue_seconds`, `flare_request_prefill_seconds`, `flare_request_decode_seconds`, `flare_request_inference_seconds` |
 | `request_time_per_output_token_seconds` | `flare_time_per_output_token_seconds` |
