@@ -1640,12 +1640,9 @@ impl RequestScheduler {
         } else {
             None
         };
+        let request_pin = inbound.is_none();
         if let Some(id) = pinned {
-            if inbound.is_none() {
-                self.cache.pin_request(id)?;
-            } else {
-                self.cache.pin(id)?;
-            }
+            self.pin_prefix(id, request_pin)?;
         }
         let execution_limit = self.execution_limit(spec.prompt.len(), spec.max_new_tokens);
         let reserved_count = self.admission_pages(
@@ -1656,11 +1653,7 @@ impl RequestScheduler {
         );
         if reserved_count + (consumed / page_tokens) as usize > self.limits.pages as usize {
             if let Some(id) = pinned {
-                if inbound.is_none() {
-                    self.cache.unpin_request(id)?;
-                } else {
-                    self.cache.unpin(id)?;
-                }
+                self.unpin_prefix(id, request_pin)?;
             }
             return Err(crate::Error::admission(
                 crate::AdmissionError::Context,
@@ -1682,11 +1675,7 @@ impl RequestScheduler {
             self.ensure_resources(reserved_count + ticket_pages, ticket_snapshots)
         } {
             if let Some(id) = pinned {
-                if inbound.is_none() {
-                    self.cache.unpin_request(id)?;
-                } else {
-                    self.cache.unpin(id)?;
-                }
+                self.unpin_prefix(id, request_pin)?;
             }
             return Err(error);
         }
@@ -2030,6 +2019,23 @@ impl RequestScheduler {
         self.free_pages.extend(update.reusable.pages);
         for snapshot in update.reusable.snapshots {
             self.release_snapshot(snapshot);
+        }
+    }
+
+    /// Pins `id` for an active request, or for a host admission ticket's parent.
+    fn pin_prefix(&mut self, id: CheckpointId, request: bool) -> Result<()> {
+        if request {
+            self.cache.pin_request(id)
+        } else {
+            self.cache.pin(id)
+        }
+    }
+
+    fn unpin_prefix(&mut self, id: CheckpointId, request: bool) -> Result<()> {
+        if request {
+            self.cache.unpin_request(id)
+        } else {
+            self.cache.unpin(id)
         }
     }
 
@@ -3140,6 +3146,14 @@ impl RequestScheduler {
                 self.reused.push(self.cache.checkpoint(id)?.prefix());
             }
         }
+        // Release the request pin before the slot is emptied, so a failed release
+        // leaves the request inspectable instead of dropping it silently.
+        if let Some(prefix) = self.request(handle)?.prefix {
+            if !publish || self.request(handle)?.error_code.is_some() {
+                self.record_publication(prefix);
+            }
+            self.cache.unpin_request(prefix)?;
+        }
         let mut request = self.slots[handle.slot as usize].request.take().unwrap();
         if let Some(guard) = request.anchor_guard.take() { self.release_snapshot(guard); }
         let mut snapshot = request.terminal_snapshot;
@@ -3151,12 +3165,6 @@ impl RequestScheduler {
                 .private_pages
                 .drain(..publication.as_ref().unwrap().tail_pages.len());
             snapshot = None;
-        }
-        if let Some(prefix) = request.prefix {
-            if !publish || request.error_code.is_some() {
-                self.record_publication(prefix);
-            }
-            self.cache.unpin_request(prefix)?;
         }
         if request.preempted
             && let Some(

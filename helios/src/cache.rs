@@ -545,9 +545,9 @@ impl PrefixCheckpointCache {
         Ok(())
     }
 
-    /// Pins a checkpoint on behalf of an active request. Request pins also track the
-    /// pages the request keeps referenced: its private pages plus the pinned
-    /// ancestors' pages, each page counted once.
+    /// Pins a checkpoint on behalf of an active request. Request pins also count the
+    /// tail pages of the pinned checkpoints, each page once; a request's own private
+    /// pages are counted by the scheduler, which holds them.
     pub fn pin_request(&mut self, id: CheckpointId) -> Result<()> {
         self.pin(id)?;
         self.nodes.get_mut(&id).unwrap().direct_request_pins += 1;

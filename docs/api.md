@@ -299,10 +299,17 @@ augments learned proposals in the serving process.
 reference: their private pages plus the tail pages of the prefix checkpoints they
 pin, each page counted once even when several requests reference it.
 `flare_reserved_kv_pages` counts pages reserved for active requests' future
-growth that are neither free, cached, nor written yet. Both are gauges read from
-scheduler state on each scrape. Dividing `flare_request_kv_pages` by
-`flare_total_kv_pages` gives the KV share held by live requests; idle cached
-prefixes and snapshot backing pages are outside that share.
+growth that are neither free, cached, nor written yet. The worker publishes both
+on every scheduler pass and a scrape reads the last published values. Pages of
+request-pinned checkpoints also appear in `flare_cached_kv_pages` because those
+checkpoints stay cached; the request gauge adds the requests' private pages to
+them. Neither gauge counts pages still draining through retirement or an
+admission ticket's in-flight restore. Reserved pages are outside the request
+gauge, so `flare_request_kv_pages + flare_reserved_kv_pages` is the figure
+comparable to another runtime's used KV cache. Dividing either gauge by
+`flare_total_kv_pages` excludes idle cached prefixes and snapshot backing pages,
+and the test-only assertion in `Cache::stats` compares the maintained
+request-pinned count with a full scan of every checkpoint on each read.
 
 The route returns one JSON object instead when the query contains `format=json`,
 or when the `Accept` header gives `application/json` a higher quality than
