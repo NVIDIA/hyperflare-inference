@@ -460,6 +460,46 @@ capacity. For packed speculation, completion records report the prefixes allocat
 on the GPU before target verification. Prefill, resume sampling, inactive padding,
 failed lanes, and terminal rounds without progress do not enter this average.
 
+### Correspondence with vLLM metrics
+
+Flare exports no `vllm:` names. The table gives the Flare series that measure
+each metric in vLLM's production metric list, named here without the `vllm:`
+prefix, and the metrics Flare does not provide. Flare's per-request histograms
+exclude cancelled and failed requests, which vLLM's include.
+
+| vLLM metric | Flare series |
+| --- | --- |
+| `num_requests_running` | `flare_active_requests`, which includes admitted requests waiting for a host restore (`flare_host_cache_inbound_waiting`) |
+| `num_requests_waiting` | `flare_pending_requests` + `flare_parked_requests` |
+| `num_requests_waiting_by_reason` | No capacity or deferred split; `flare_pending_requests` (first admission) and `flare_parked_requests` (readmission) |
+| `num_requests_kv_fetch_by_stage` | `flare_host_cache_inbound_waiting` and `flare_host_cache_inbound_in_flight` |
+| `kv_cache_usage_perc` | (`flare_request_kv_pages` + `flare_reserved_kv_pages`) / `flare_total_kv_pages` |
+| `prompt_tokens`, `prompt_tokens_by_source` | `flare_prefill_tokens_total` (computed, including recomputation after preemption), `flare_cache_reused_tokens_total` (GPU), `flare_host_cache_reused_tokens_total` (host) |
+| `prompt_tokens_cached`, `prompt_tokens_cached_by_source` | `flare_cache_reused_tokens_total` (device) + `flare_host_cache_reused_tokens_total` (host DRAM, disk, or shared pool) |
+| `prefix_cache_queries`, `prefix_cache_hits` | `flare_cache_lookup_tokens_total`, `flare_cache_reused_tokens_total`; both include readmissions |
+| `external_prefix_cache_queries`, `external_prefix_cache_hits` | `flare_host_cache_lookups_total` (lookups, not tokens), `flare_host_cache_reused_tokens_total` |
+| `mm_cache_queries`, `mm_cache_hits` | `flare_input_cache_payload_hits_total` + `flare_input_cache_payload_misses_total`, `flare_input_cache_payload_hits_total` |
+| `generation_tokens` | `flare_generated_tokens_total` |
+| `num_preemptions` | `flare_preemptions_total` |
+| `request_success{finished_reason}` | `stop`: `flare_requests_completed_total` − `flare_requests_output_limited_total`; `length`: `flare_requests_output_limited_total`; `abort`: `flare_requests_cancelled_total`; `error`: `flare_requests_failed_total`; `repetition`: not provided |
+| `admission_rejections{reason}` | `flare_admission_rejections_total{reason}`, with Flare's queue limits as reasons |
+| `iteration_tokens_total` | `flare_model_step_tokens` |
+| `e2e_request_latency_seconds` | `flare_request_e2e_seconds`, from HTTP admission |
+| `time_to_first_token_seconds` | `flare_time_to_first_token_seconds`, from model-scheduler arrival; `flare_time_to_first_response_seconds` from HTTP admission to visible text |
+| `inter_token_latency_seconds` | `flare_inter_token_latency_seconds` |
+| `request_queue_time_seconds`, `request_prefill_time_seconds`, `request_decode_time_seconds`, `request_inference_time_seconds` | `flare_request_queue_seconds`, `flare_request_prefill_seconds`, `flare_request_decode_seconds`, `flare_request_inference_seconds` |
+| `request_time_per_output_token_seconds` | `flare_time_per_output_token_seconds` |
+| `request_prompt_tokens`, `request_generation_tokens`, `request_prefill_kv_computed_tokens` | `flare_request_prompt_tokens`, `flare_request_generated_tokens`, `flare_request_prefill_computed_tokens` |
+| `request_params_max_tokens`, `request_params_n`, `request_max_num_generation_tokens` | `flare_request_max_tokens`, `flare_request_choices`, `flare_request_max_choice_generated_tokens` |
+| `request_num_preemptions` | `flare_request_preemptions` |
+| `spec_decode_num_drafts`, `spec_decode_num_draft_tokens`, `spec_decode_num_accepted_tokens` | `flare_draft_request_rounds_total`, `flare_verification_draft_tokens_total`, `flare_accepted_draft_tokens_total` |
+| `spec_decode_num_verified_tokens_per_pos`, `spec_decode_num_accepted_tokens_per_pos`, `spec_decode_num_verified_tokens` | `flare_speculative_drafts_total{depth,source,outcome}` with `outcome` `offered` or `accepted`, summed over `source` (and over `depth` for the total) |
+| `corrupted_requests` | Not provided: Flare does not inspect logits for NaN values |
+| `kv_block_lifetime_seconds`, `kv_block_idle_before_evict_seconds`, `kv_block_reuse_gap_seconds` | Not provided: Flare does not sample KV page residency |
+| `estimated_flops_per_gpu_total`, `estimated_read_bytes_per_gpu_total`, `estimated_write_bytes_per_gpu_total` | Not provided; `flare_decode_weight_bytes` gives the weight bytes one decode step reads per request |
+| `lora_requests_info`, `watermark_requests`, `engine_sleep_state` | Not provided: Flare has no LoRA adapters, output watermarking, or sleep mode |
+| KV connector metrics (`nixl_*`, `hisparse_*`, `simple_kv_offload_*`) | Not provided: Flare has no KV connectors; `flare_host_cache_*` series report its host prefix store |
+
 ## Conversation and tool semantics
 
 The neutral request representation in `helios/src/server/inference.rs` separates
