@@ -287,30 +287,33 @@ requires the serving key: both report aggregate state without request content.
 `GET /metrics` returns Prometheus text exposition format 0.0.4 by default.
 Counter and gauge names start with `flare_`, such as
 `flare_generated_tokens_total`, `flare_active_requests`, and
-`flare_free_kv_pages`. Beyond the JSON fields below, the
+`flare_free_kv_pages`, except the standard `process_*` series described below.
+Beyond the JSON fields below, the
 text includes speculative and proposal counters by batch, width, or depth, graph
 launches by kind, embedding row-cache counters, HTTP admission gauges, and
 uptime. `flare_history_drafts_enabled` reports whether shared decoded history
 augments learned proposals in the serving process.
 
-Histograms appear in the Prometheus format only. Host prefix-store histograms
-report lookup cost and retirement: `flare_host_cache_missing_tokens`,
-`flare_host_cache_estimated_transfer_ns`,
+Histograms appear in the Prometheus format only and accumulate since server
+start. Host prefix-store histograms report lookup cost and retirement:
+`flare_host_cache_missing_tokens`, `flare_host_cache_estimated_transfer_ns`,
 `flare_host_cache_estimated_prefill_ns`, and
-`flare_host_cache_retirement_seconds`. Request histograms observe the served
-response. `flare_request_e2e_seconds` counts each successful generation from
-admission to the completed response, and
-`flare_time_to_first_response_seconds` counts each response that offers answer
-or reasoning text, from admission to that text, once the client reads it. The
-runtime records one observation per completed generation in
-`flare_request_queue_seconds` from model-scheduler arrival to the first model
-step that includes the request, `flare_request_prefill_seconds` from that step to
-the request's first committed generated token, `flare_request_decode_seconds`
-from the first to the last committed generated token,
-`flare_time_per_output_token_seconds` as decode time divided by generated tokens
-after the first, and `flare_request_prompt_tokens` for prompt tokens including
-tokens reused from the prefix cache. Cancelled and failed requests enter only
-`flare_requests_cancelled_total` and `flare_requests_failed_total`.
+`flare_host_cache_retirement_seconds`.
+
+The HTTP histograms observe delivery. `flare_request_e2e_seconds` counts each
+successful generation from admission to the completed response; for a stream it
+is observed when delivery completes, which requires the client to drain the
+body. `flare_time_to_first_response_seconds` counts each response that offers
+answer or reasoning text, from admission to that text, once the client reads it.
+
+The runtime histograms observe completed generations. `flare_request_queue_seconds`
+spans model-scheduler arrival to the first model step that includes the request,
+which can be a vision step; `flare_request_prefill_seconds` spans that step to
+the request's first committed generated token; `flare_request_decode_seconds`
+and `flare_time_per_output_token_seconds` are recorded only for requests with at
+least two generated tokens; `flare_request_prompt_tokens` counts prompt tokens
+including tokens reused from the prefix cache. Cancelled and failed requests
+enter only `flare_requests_cancelled_total` and `flare_requests_failed_total`.
 
 On Linux the text also carries `process_cpu_seconds_total`,
 `process_resident_memory_bytes`, `process_virtual_memory_bytes`,

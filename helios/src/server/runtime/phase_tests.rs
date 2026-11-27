@@ -4601,6 +4601,16 @@ async fn disabled_parallel_calls_complete_http_and_stop_decoding() {
             assert!(worker.plan(0).unwrap().0.is_none(), "request must not keep decoding");
             let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), reader).await.unwrap().unwrap();
             let text = std::str::from_utf8(&bytes).unwrap();
+            // A tool-limit cancellation completes delivery but is not a successful
+            // generation, so it records no end-to-end observation.
+            assert!(
+                state
+                    .model
+                    .metrics()
+                    .render()
+                    .contains("\nflare_request_e2e_seconds_count 0\n"),
+                "{path} {stream}"
+            );
             assert!(!text.contains(r#""d""#) && !text.contains(r#"\"d\""#), "{text}");
             let frames: Vec<Value> = if stream {
                 text.lines().filter_map(|line| line.strip_prefix("data: "))

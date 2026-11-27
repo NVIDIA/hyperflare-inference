@@ -595,12 +595,19 @@ pub(super) async fn generate(
                 false,
             );
         }
+        // One observation per successful response: a tool-limit cancellation reaches
+        // this point but the runtime counts it as cancelled, so it is excluded.
+        if !count && !encoder.tool_limit_reached {
+            state.model.metrics().request_e2e.observe(
+                &super::metrics::REQUEST_SECONDS,
+                admitted_at.elapsed().as_nanos() as u64,
+            );
+        }
         yield Delivery::Complete(response);
     };
     if streaming {
         let request_id = id.clone();
         let log_to_stderr = state.log_to_stderr;
-        let metrics = state.model.metrics_handle();
         let events = delivery.filter_map(move |event| {
             let event = match event {
                 Delivery::Frame(frame) => {
@@ -611,10 +618,7 @@ pub(super) async fn generate(
                     if log_to_stderr { log_failure(&request_id, "stream", &error); }
                     Some(Ok::<_, Infallible>(frame.sse()))
                 }
-                Delivery::Complete(_) => {
-                    if !count { metrics.request_e2e.observe(&super::metrics::REQUEST_SECONDS, admitted_at.elapsed().as_nanos() as u64); }
-                    None
-                }
+                Delivery::Complete(_) => None,
             };
             std::future::ready(event)
         });
@@ -629,7 +633,6 @@ pub(super) async fn generate(
         while let Some(event) = delivery.next().await {
             match event {
                 Delivery::Complete(body) => {
-                    if !count { state.model.metrics().request_e2e.observe(&super::metrics::REQUEST_SECONDS, admitted_at.elapsed().as_nanos() as u64); }
                     let visible = super::latency::response_text(&body);
                     let response = with_request_id(Json(body).into_response(), &id);
                     if !visible { return response; }

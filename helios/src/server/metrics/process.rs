@@ -52,29 +52,17 @@ fn metric(text: &mut String, name: &str, kind: &str, help: &str, value: impl std
 fn render_linux(text: &mut String) {
     // SAFETY: sysconf has no preconditions.
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    // SAFETY: sysconf has no preconditions.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let ticks = (ticks > 0).then_some(ticks as u64);
-    let page = (page > 0).then_some(page as u64);
+    let page = crate::os::page_size() as u64;
     let stat = std::fs::read_to_string("/proc/self/stat")
         .ok()
         .and_then(|line| parse_stat(&line));
     let btime = std::fs::read_to_string("/proc/stat")
         .ok()
         .and_then(|contents| parse_btime(&contents));
-    let open_fds = std::fs::read_dir("/proc/self/fd")
-        .ok()
-        .map(|entries| entries.filter_map(Result::ok).count() as u64);
-    let max_fds = {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes into `limit`, which outlives the call and is a
-        // valid `rlimit` for `RLIMIT_NOFILE`.
-        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-        (result == 0).then_some(limit.rlim_cur)
-    };
+    let open_fds = crate::runtime_core::open_descriptors();
+    // A zero target only reads the current soft limit.
+    let max_fds = crate::os::raise_open_file_limit(0);
 
     if let (Some(stat), Some(ticks)) = (stat, ticks) {
         metric(
@@ -94,7 +82,7 @@ fn render_linux(text: &mut String) {
             stat[3],
         );
     }
-    if let (Some(stat), Some(page)) = (stat, page) {
+    if let Some(stat) = stat {
         metric(
             text,
             "process_resident_memory_bytes",
