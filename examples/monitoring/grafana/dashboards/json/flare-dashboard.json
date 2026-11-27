@@ -1,0 +1,679 @@
+{
+  "uid": "flare-inference",
+  "title": "Flare inference",
+  "schemaVersion": 39,
+  "version": 8,
+  "tags": [
+    "flare"
+  ],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "Server",
+        "description": "Flare server shown by every panel: the instance label of its Prometheus target.",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(up{job=\"flare\"}, instance)",
+        "query": {
+          "qryType": 1,
+          "query": "label_values(up{job=\"flare\"}, instance)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "options": [],
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Output tokens served · since Flare start",
+      "description": "Exact current counter. Resets when Flare restarts.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "w": 6,
+        "h": 5,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "flare_generated_tokens_total{job=\"flare\", instance=\"$instance\"}",
+          "legendFormat": "Output tokens served · since Flare start",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Output tokens served · selected range",
+      "description": "Prometheus increase estimates committed generated tokens across observed counter resets.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "w": 6,
+        "h": 5,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(increase(flare_generated_tokens_total{job=\"flare\", instance=\"$instance\"}[$__range]))",
+          "legendFormat": "Output tokens served · selected range",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Draft token acceptance",
+      "description": "Selected range. Percentage of offered draft tokens accepted by the target model. Blank when no drafts were offered.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "w": 6,
+        "h": 5,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "decimals": 1,
+          "noValue": "—",
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "100 * sum(increase(flare_accepted_draft_tokens_total{job=\"flare\", instance=\"$instance\"}[$__range])) / (sum(increase(flare_verification_draft_tokens_total{job=\"flare\", instance=\"$instance\"}[$__range])) > 0)",
+          "legendFormat": "Accepted drafts (%)",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Prefill tokens processed · selected range",
+      "description": "Fresh prefill work. Reused prompt tokens are excluded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "w": 6,
+        "h": 5,
+        "x": 18,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(increase(flare_prefill_tokens_total{job=\"flare\", instance=\"$instance\"}[$__range]))",
+          "legendFormat": "Prefill tokens processed · selected range",
+          "range": false,
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Decode throughput",
+      "description": "Aggregate generation across requests, averaged over the rate window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 0,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: tok/s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(flare_generated_tokens_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])",
+          "legendFormat": "Output",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Prefill throughput",
+      "description": "New prompt tokens processed per second, excluding prefix reuse.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 12,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: tok/s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(flare_prefill_tokens_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])",
+          "legendFormat": "Prefill",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Request load",
+      "description": "Live scheduler slots and requests waiting.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 0,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "flare_active_requests{job=\"flare\", instance=\"$instance\"}",
+          "legendFormat": "Active",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "flare_pending_requests{job=\"flare\", instance=\"$instance\"}",
+          "legendFormat": "Queued",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "KV cache capacity",
+      "description": "Logical token capacity of the KV cache. Free excludes pages owned by prefix-cache checkpoints, shown as Cached; resource pressure evicts the unpinned ones.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 12,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: tokens",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "flare_free_kv_pages{job=\"flare\", instance=\"$instance\"} * flare_kv_page_tokens{job=\"flare\", instance=\"$instance\"}",
+          "legendFormat": "Free",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "flare_total_kv_pages{job=\"flare\", instance=\"$instance\"} * flare_kv_page_tokens{job=\"flare\", instance=\"$instance\"}",
+          "legendFormat": "Total",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "flare_cached_kv_pages{job=\"flare\", instance=\"$instance\"} * flare_kv_page_tokens{job=\"flare\", instance=\"$instance\"}",
+          "legendFormat": "Cached",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Draft token acceptance",
+      "description": "Rolling window. Percentage of offered draft tokens accepted by the target model. Shows zero during idle windows after the first offered draft. Empty when the server has offered no drafts since it started.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "Draft acceptance"
+          },
+          "max": 100,
+          "decimals": 1,
+          "noValue": "No drafts offered"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "((100 * sum(rate(flare_accepted_draft_tokens_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])) / (sum(rate(flare_verification_draft_tokens_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])) > 0)) or ((sum(rate(flare_verification_draft_tokens_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])) == 0) and (sum(flare_verification_draft_tokens_total{job=\"flare\", instance=\"$instance\"}) > 0))) and (max(up{job=\"flare\", instance=\"$instance\"}) == 1)",
+          "legendFormat": "Accepted drafts (%)",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Average draft tokens accepted per request step",
+      "description": "Each request offered at least one draft contributes one observation per drafting step. A fully rejected draft contributes zero. Rolling average across those observations. Shows zero during idle windows after the first offered draft. Empty when the server has offered no drafts since it started.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "Accepted tokens per request step"
+          },
+          "decimals": 2,
+          "noValue": "No drafts offered"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "((sum(rate(flare_accepted_draft_tokens_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])) / (sum(rate(flare_draft_request_rounds_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])) > 0)) or ((sum(rate(flare_draft_request_rounds_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])) == 0) and (sum(flare_draft_request_rounds_total{job=\"flare\", instance=\"$instance\"}) > 0))) and (max(up{job=\"flare\", instance=\"$instance\"}) == 1)",
+          "legendFormat": "Accepted tokens per request step",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Request outcomes",
+      "description": "Request outcomes per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: req/s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(flare_requests_completed_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])",
+          "legendFormat": "Completed",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(flare_requests_failed_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])",
+          "legendFormat": "Failed",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Cache restores by tier",
+      "description": "Restore activity for GPU, DRAM and NVMe.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 29,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: restores/s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(flare_host_cache_restores_total{job=\"flare\", instance=\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{tier}}",
+          "range": true
+        }
+      ]
+    }
+  ]
+}
