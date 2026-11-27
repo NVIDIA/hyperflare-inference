@@ -2314,3 +2314,177 @@ fn strict_tool_wires_reach_encoder_only_after_parser_completion() {
         );
     }
 }
+
+fn metered(protocol: Protocol, prompts: usize, choices: usize, include_usage: bool) -> Encoder {
+    Encoder::new(
+        protocol,
+        "metered".into(),
+        "model".into(),
+        1,
+        choices,
+        vec![PromptUsage { tokens: 5, image_tokens: 0 }; prompts],
+        vec![],
+        ToolChoice::Auto,
+        true,
+        include_usage,
+        json!({}),
+    )
+}
+
+/// Feed one generation that reasons in its first committed step and answers in
+/// its second, then finish it, returning every frame.
+fn metered_generation(encoder: &mut Encoder, times: crate::server::metrics::RequestTimes) -> Vec<crate::server::protocol::Frame> {
+    let mut frames = encoder.start();
+    encoder.record_commit(10_000_000);
+    frames.extend(encoder.apply(0, vec![Event::Reasoning("think".into())]).unwrap());
+    encoder.record_commit(25_000_000);
+    frames.extend(encoder.apply(0, vec![Event::Content(String::new()), Event::Content("answer".into())]).unwrap());
+    encoder.record_commit(40_000_000);
+    frames.extend(encoder.apply(0, vec![Event::Content(" more".into())]).unwrap());
+    encoder.record_times(1_000_000, times, 4);
+    frames.extend(encoder.finish(0, Termination::Eos, 4, 0, None).unwrap());
+    frames
+}
+
+#[test]
+fn per_request_metrics_follow_vllm_placement_and_null_rules() {
+    use crate::server::metrics::RequestTimes;
+    let times = RequestTimes {
+        first_scheduled_ns: Some(3_000_000),
+        first_token_ns: Some(10_000_000),
+        last_token_ns: 40_000_000,
+    };
+    let expected = |content: Value| {
+        json!({
+            "time_to_first_token_ms": 7.0,
+            "time_to_first_content_token_ms": content,
+            "generation_time_ms": 30.0,
+            "queue_time_ms": 2.0,
+            "mean_itl_ms": 10.0,
+            "tokens_per_second": 4e9 / 37e6,
+        })
+    };
+    let carriers = |frames: &[crate::server::protocol::Frame]| {
+        frames
+            .iter()
+            .filter_map(|frame| {
+                frame.data.get("metrics").or_else(|| frame.data.get("response")?.get("metrics"))
+                    .map(|metrics| (frame.data.clone(), metrics.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    for protocol in [Protocol::Chat, Protocol::Completions, Protocol::Responses] {
+        // A stream reports the step that first produced text, after the reasoning
+        // step and skipping empty content, on its final usage chunk or terminal response.
+        let mut encoder = metered(protocol, 1, 1, true);
+        assert!(encoder.enable_request_metrics(true));
+        let frames = metered_generation(&mut encoder, times);
+        let carried = carriers(&frames);
+        assert_eq!(carried.len(), 1, "{protocol:?}");
+        let (frame, metrics) = &carried[0];
+        assert_eq!(metrics, &expected(json!(22.0)), "{protocol:?}");
+        if protocol == Protocol::Responses {
+            assert_eq!(frame["type"], "response.completed");
+        } else {
+            assert_eq!(frame["choices"], json!([]));
+            assert!(frame["usage"].is_object());
+        }
+
+        // A JSON body has no content instant; `http::generate` places the object at
+        // the top level of the body built from `response`.
+        let mut encoder = metered(protocol, 1, 1, false);
+        assert!(!encoder.enable_request_metrics(false));
+        let _ = metered_generation(&mut encoder, times);
+        assert!(encoder.response().get("metrics").is_none());
+        assert_eq!(encoder.metrics_value(), Some(expected(Value::Null)));
+    }
+
+    // Without usage reporting a Chat or Completions stream has no chunk to carry it.
+    for protocol in [Protocol::Chat, Protocol::Completions] {
+        let mut encoder = metered(protocol, 1, 1, false);
+        assert!(!encoder.enable_request_metrics(true));
+        assert!(carriers(&metered_generation(&mut encoder, times)).is_empty());
+        assert_eq!(encoder.metrics_value(), None);
+    }
+
+    // Messages has no vLLM metrics, in a stream or a body.
+    for streaming in [false, true] {
+        let mut encoder = metered(Protocol::Messages, 1, 1, true);
+        assert!(!encoder.enable_request_metrics(streaming));
+        assert!(carriers(&metered_generation(&mut encoder, times)).is_empty());
+        assert_eq!(encoder.metrics_value(), None);
+    }
+
+    // Several choices of one prompt make the object null; several prompts omit it.
+    for (prompts, choices, metrics) in [(1, 2, Some(Value::Null)), (2, 1, None)] {
+        for streaming in [false, true] {
+            let mut encoder = metered(Protocol::Completions, prompts, choices, true);
+            assert!(!encoder.enable_request_metrics(streaming));
+            let mut frames = Vec::new();
+            for index in 0..prompts * choices {
+                encoder.record_times(1_000_000, times, 4);
+                frames.extend(encoder.finish(index, Termination::Eos, 4, 0, None).unwrap());
+            }
+            let usage = frames.iter().find(|frame| frame.data["choices"] == json!([])).unwrap();
+            assert_eq!(usage.data.get("metrics").cloned(), metrics.clone());
+            assert_eq!(encoder.metrics_value(), metrics);
+        }
+    }
+
+    // Instants the generation did not reach are null: a single token has no
+    // inter-token interval, and a choice that recorded no times has none at all.
+    let mut encoder = metered(Protocol::Chat, 1, 1, true);
+    encoder.enable_request_metrics(false);
+    encoder.record_times(
+        1_000_000,
+        RequestTimes { last_token_ns: 10_000_000, ..times },
+        1,
+    );
+    let single = encoder.metrics_value().unwrap();
+    assert_eq!(single["mean_itl_ms"], Value::Null);
+    assert_eq!(single["generation_time_ms"], 0.0);
+    assert_eq!(single["tokens_per_second"], 1e9 / 7e6);
+    let mut encoder = metered(Protocol::Chat, 1, 1, true);
+    encoder.enable_request_metrics(false);
+    let _ = encoder.finish(0, Termination::OutputLimit, 0, 0, None).unwrap();
+    let unrecorded = encoder.metrics_value().unwrap();
+    assert_eq!(unrecorded.as_object().unwrap().len(), 6);
+    assert!(unrecorded.as_object().unwrap().values().all(Value::is_null));
+}
+
+#[test]
+fn content_instant_excludes_reasoning_tool_calls_and_suppressed_text() {
+    // Reasoning and a tool call commit first; the first text arrives in a later step.
+    let mut encoder = metered(Protocol::Chat, 1, 1, true);
+    assert!(encoder.enable_request_metrics(true));
+    encoder.record_commit(5_000_000);
+    encoder.apply(0, vec![Event::Reasoning("r".into())]).unwrap();
+    encoder.record_commit(6_000_000);
+    let mut call = events();
+    call.retain(|event| !matches!(event, Event::Reasoning(_) | Event::Content(_)));
+    encoder.apply(0, call).unwrap();
+    encoder.record_commit(9_000_000);
+    encoder.apply(0, vec![Event::Content("text".into())]).unwrap();
+    encoder.record_times(0, crate::server::metrics::RequestTimes {
+        first_scheduled_ns: Some(1_000_000),
+        first_token_ns: Some(5_000_000),
+        last_token_ns: 9_000_000,
+    }, 3);
+    let metrics = encoder.metrics_value().unwrap();
+    assert_eq!(metrics["time_to_first_token_ms"], 4.0);
+    assert_eq!(metrics["time_to_first_content_token_ms"], 8.0);
+
+    // A named tool choice drops answer text, so no text content is produced.
+    let mut encoder = Encoder::new(Protocol::Chat, "named".into(), "model".into(), 1, 1,
+        vec![PromptUsage { tokens: 5, image_tokens: 0 }], tools(),
+        ToolChoice::Named("lookup".into()), true, true, json!({}));
+    assert!(encoder.enable_request_metrics(true));
+    encoder.record_commit(5_000_000);
+    encoder.apply(0, events()).unwrap();
+    encoder.record_times(0, crate::server::metrics::RequestTimes {
+        first_scheduled_ns: Some(1_000_000),
+        first_token_ns: Some(5_000_000),
+        last_token_ns: 5_000_000,
+    }, 1);
+    assert_eq!(encoder.metrics_value().unwrap()["time_to_first_content_token_ms"], Value::Null);
+}

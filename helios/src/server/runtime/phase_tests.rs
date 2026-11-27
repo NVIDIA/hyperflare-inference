@@ -252,6 +252,7 @@ impl Fixture {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation: Some(false),
+                commits: false,
                 record: Default::default(),
                 host_lookup: true,
                 readmitted: false,
@@ -3745,7 +3746,7 @@ fn unread_responses_finish_and_release_model_resources_but_retain_admission_capa
         let mut slow_prompt = prompt(512);
         slow_prompt.logprobs = logprobs;
         slow_prompt.stop_sequences = vec![vec![2, 3]];
-        let mut slow = runtime.generate_observed(slow_prompt, true).unwrap();
+        let mut slow = runtime.generate_observed(slow_prompt, true, false).unwrap();
         let mut worker = fixture.worker(receiver);
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
         let mut tokens = vec![1; 512];
@@ -3799,7 +3800,7 @@ fn unread_response_keeps_its_budget_through_a_reasoning_continuation() {
         positions: vec![[0; 3]], vision_token_indices: vec![-1], ..Default::default()
     });
     prompt.reasoning_cut = Some(budget_cut(4, 81));
-    let mut generation = runtime.generate_observed(prompt, false).unwrap();
+    let mut generation = runtime.generate_observed(prompt, false, false).unwrap();
     let mut worker = fixture.worker(receiver);
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     let mut sequence = 0;
@@ -4312,6 +4313,7 @@ fn http_state_for(
         ids: Default::default(),
         api_key,
         thinking_token_budget: None,
+        per_request_metrics: false,
         context_hint: String::new(),
         capacity_hint: String::new(),
         response_model,
@@ -4558,16 +4560,19 @@ fn timed_pass(worker: &mut Worker<'_>, samples: &[u32]) -> Vec<StepBounds> {
 }
 
 /// Serve one HTTP request through a worker that `timed_pass` drives, returning the
-/// step bounds and the JSON body, or the SSE `data` payloads of a stream.
+/// step bounds, the JSON body or the SSE `data` payloads of a stream, and whether
+/// the request asked the worker for commit instants.
 async fn served_through_worker(
     fixture: fn() -> Fixture,
+    per_request_metrics: bool,
     path: &str,
     body: serde_json::Value,
     samples: &[u32],
-) -> (Vec<StepBounds>, Vec<serde_json::Value>) {
+) -> (Vec<StepBounds>, Vec<serde_json::Value>, bool) {
     use axum::{Extension, extract::State};
     let (sender, receiver) = mpsc::sync_channel(4);
-    let state = http_state_for(fixture(), sender, None, &[]);
+    let mut state = http_state_for(fixture(), sender, None, &[]);
+    Arc::get_mut(&mut state).unwrap().per_request_metrics = per_request_metrics;
     let stream = body["stream"] == true;
     let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
     let request = axum::http::Request::builder()
@@ -4582,6 +4587,7 @@ async fn served_through_worker(
     })
     .await
     .unwrap();
+    let commits = group[0].commits;
     let steps = {
         let worker_fixture = fixture();
         let (queue, inbound) = mpsc::channel();
@@ -4603,15 +4609,16 @@ async fn served_through_worker(
     } else {
         vec![serde_json::from_slice(&bytes).unwrap()]
     };
-    (steps, values)
+    (steps, values, commits)
 }
 
 #[tokio::test]
 async fn performance_reports_the_first_scheduled_model_step() {
     use serde_json::json;
     for stream in [false, true] {
-        let (steps, values) = served_through_worker(
+        let (steps, values, _) = served_through_worker(
             || Fixture::new().text_inputs(),
+            false,
             "/v1/chat/completions",
             json!({"model":"qwen-worker-phases","messages":[{"role":"user","content":"a"}],
                 "max_tokens":2,"stream":stream,"return_token_ids":true,"return_token_timestamps":true}),
@@ -4636,6 +4643,231 @@ async fn performance_reports_the_first_scheduled_model_step() {
         assert_eq!(timestamps.len(), 2);
         assert!(scheduled <= timestamps[0]);
         assert!((first.start_ns..=first.end_ns).contains(&timestamps[0]));
+    }
+}
+
+/// Absolute instants of a served response: `performance` supplies the first
+/// scheduled step and the `metrics` intervals the others.
+struct Served {
+    arrival_ns: u64,
+    scheduled_ns: u64,
+    first_ns: u64,
+    content_ns: Option<u64>,
+    last_ns: u64,
+}
+
+fn served_instants(values: &[serde_json::Value]) -> (serde_json::Value, Served) {
+    let metrics = values
+        .iter()
+        .find_map(|value| value.get("metrics"))
+        .expect("response carries metrics")
+        .clone();
+    let performance = &values
+        .iter()
+        .find(|value| value.get("performance").is_some())
+        .unwrap()["performance"];
+    let scheduled_ns = performance["first_scheduled_ns"].as_u64().unwrap();
+    let after = |field: &str| {
+        metrics[field].as_f64().map(|ms| scheduled_ns + (ms * 1e6).round() as u64)
+    };
+    let first_ns = after("time_to_first_token_ms").unwrap();
+    let served = Served {
+        arrival_ns: scheduled_ns - (metrics["queue_time_ms"].as_f64().unwrap() * 1e6).round() as u64,
+        scheduled_ns,
+        first_ns,
+        content_ns: after("time_to_first_content_token_ms"),
+        last_ns: first_ns + (metrics["generation_time_ms"].as_f64().unwrap() * 1e6).round() as u64,
+    };
+    // The HTTP ingress precedes model-queue arrival, which precedes enqueue_ns.
+    assert!(performance["ingress_ns"].as_u64().unwrap() <= served.arrival_ns);
+    assert!(served.arrival_ns <= performance["enqueue_ns"].as_u64().unwrap() + 1);
+    (metrics, served)
+}
+
+fn within(step: &StepBounds, instant: u64) -> bool {
+    // One nanosecond absorbs rounding through the millisecond fields.
+    step.start_ns <= instant + 1 && instant <= step.end_ns + 1
+}
+
+#[tokio::test]
+async fn per_request_metrics_report_the_runtime_instants_of_a_stopped_reasoning_answer() {
+    use serde_json::{Value, json};
+    let fixture = Fixture::reasoning();
+    let token = |text| fixture.frontend.tokenizer().token_to_id(text).unwrap();
+    // Reasoning, its close, the first answer text, then the stop string.
+    let samples = [token("b"), token("</think>"), token("c"), token("d")];
+    for stream in [true, false] {
+        let (steps, values, commits) = served_through_worker(
+            Fixture::reasoning,
+            true,
+            "/v1/chat/completions",
+            json!({"model":"qwen-worker-phases","messages":[{"role":"user","content":"a"}],
+                "add_generation_prompt":true,"max_tokens":8,"stop":["d"],"stream":stream,
+                "stream_options":if stream { json!({"include_usage":true}) } else { Value::Null },
+                "return_token_ids":true,"return_token_timestamps":true}),
+            &samples,
+        )
+        .await;
+        assert_eq!(commits, stream);
+        let carriers: Vec<_> = values.iter().filter(|value| value.get("metrics").is_some()).collect();
+        assert_eq!(carriers.len(), 1);
+        if stream {
+            assert_eq!(carriers[0]["choices"], json!([]));
+            let content: String = values.iter()
+                .filter_map(|value| value["choices"][0]["delta"]["content"].as_str()).collect();
+            assert_eq!(content, "c");
+        } else {
+            assert_eq!(values[0]["choices"][0]["message"]["content"], "c");
+        }
+        assert_eq!(carriers[0]["usage"]["completion_tokens"], 4);
+        let (metrics, served) = served_instants(&values);
+        let generating: Vec<_> = steps.iter().filter(|step| step.generated).collect();
+        assert_eq!(generating.len(), 4);
+        // Every instant falls inside the worker step that produced it, not in HTTP
+        // rendering, which runs after the last step.
+        assert!(within(&steps[0], served.scheduled_ns));
+        assert!(within(generating[0], served.first_ns));
+        assert!(within(generating[3], served.last_ns));
+        if stream {
+            // Reasoning and its close precede the first answer text by two steps.
+            assert!(within(generating[2], served.content_ns.unwrap()));
+            assert!(metrics["time_to_first_content_token_ms"].as_f64() > metrics["time_to_first_token_ms"].as_f64());
+        } else {
+            assert_eq!(served.content_ns, None);
+        }
+        let ms = |ns: u64| ns as f64 / 1e6;
+        assert!((metrics["mean_itl_ms"].as_f64().unwrap() - ms(served.last_ns - served.first_ns) / 3.0).abs() < 1e-5);
+        assert!((metrics["tokens_per_second"].as_f64().unwrap() * ms(served.last_ns - served.scheduled_ns) / 1e3 - 4.0).abs() < 1e-6);
+        assert!(served.arrival_ns <= served.scheduled_ns);
+    }
+}
+
+#[tokio::test]
+async fn per_request_metrics_reach_completions_and_responses_where_vllm_places_them() {
+    use serde_json::{Value, json};
+    for (path, mut body) in [
+        ("/v1/completions", json!({"prompt":"a","max_tokens":2})),
+        ("/v1/responses", json!({"input":"a","max_output_tokens":2})),
+    ] {
+        for stream in [false, true] {
+            body["model"] = json!("qwen-worker-phases");
+            body["stream"] = json!(stream);
+            if path == "/v1/completions" && stream {
+                body["stream_options"] = json!({"include_usage":true});
+            }
+            let (steps, values, commits) = served_through_worker(
+                || Fixture::new().text_inputs(),
+                true,
+                path,
+                body.clone(),
+                &[1, 2],
+            )
+            .await;
+            assert_eq!(commits, stream);
+            let carriers: Vec<(&Value, &Value)> = values
+                .iter()
+                .filter_map(|value| {
+                    let metrics = value.get("metrics")
+                        .or_else(|| value.get("response")?.get("metrics"))?;
+                    Some((value, metrics))
+                })
+                .collect();
+            assert_eq!(carriers.len(), 1, "{path} {stream}");
+            let (carrier, metrics) = carriers[0];
+            match (path, stream) {
+                ("/v1/completions", true) => assert_eq!(carrier["choices"], json!([])),
+                // Two tokens reach the output limit, so the stream ends incomplete.
+                ("/v1/responses", true) => assert_eq!(carrier["type"], "response.incomplete"),
+                _ => assert!(carrier.get("metrics").is_some()),
+            }
+            let generating: Vec<_> = steps.iter().filter(|step| step.generated).collect();
+            let ttft = metrics["time_to_first_token_ms"].as_f64().unwrap();
+            let generation = metrics["generation_time_ms"].as_f64().unwrap();
+            // The two tokens commit in different steps, at least one pause apart.
+            assert!(generation >= 3.0 && generation * 1e6 <= (generating[1].end_ns - generating[0].start_ns) as f64);
+            assert!(ttft >= 0.0 && metrics["queue_time_ms"].as_f64().unwrap() >= 0.0);
+            assert_eq!(metrics["mean_itl_ms"], metrics["generation_time_ms"]);
+            // Plain text is content from the first token.
+            assert_eq!(
+                metrics["time_to_first_content_token_ms"],
+                if stream { metrics["time_to_first_token_ms"].clone() } else { Value::Null }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn per_request_metrics_are_absent_without_the_option_and_null_for_several_choices() {
+    use serde_json::{Value, json};
+    for stream in [false, true] {
+        let (_, values, commits) = served_through_worker(
+            || Fixture::new().text_inputs(),
+            false,
+            "/v1/completions",
+            json!({"model":"qwen-worker-phases","prompt":"a","max_tokens":2,"stream":stream,
+                "stream_options":if stream { json!({"include_usage":true}) } else { Value::Null }}),
+            &[1, 2],
+        )
+        .await;
+        assert!(!commits);
+        assert!(values.iter().all(|value| value.get("metrics").is_none()));
+        assert!(values.iter().any(|value| value["usage"]["completion_tokens"] == 2));
+    }
+    for stream in [false, true] {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut state = http_state_for(Fixture::new(), sender, None, &[]);
+        Arc::get_mut(&mut state).unwrap().per_request_metrics = true;
+        let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+        let body = json!({"model":"qwen-worker-phases","prompt":"a","max_tokens":1,"n":2,
+            "stream":stream,"stream_options":if stream { json!({"include_usage":true}) } else { Value::Null }});
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = tokio::spawn(super::super::http::generate(
+            axum::extract::State(state),
+            axum::Extension(ingress),
+            request,
+        ));
+        let group = tokio::task::spawn_blocking(move || {
+            receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(group.iter().all(|incoming| !incoming.commits));
+        for incoming in &group {
+            incoming.notify_admission(Ok(()));
+            incoming.observe_token(1);
+            incoming.emit_token(1);
+            incoming.emit(GenerationEvent::Finished {
+                prompt_tokens: incoming.prompt.tokens.len(),
+                generated_tokens: 1,
+                reused_prompt_tokens: 0,
+                reason: "length",
+                termination: crate::output::Termination::OutputLimit,
+                stop_sequence: None,
+                arrival_ns: 1,
+                times: crate::server::metrics::RequestTimes {
+                    first_scheduled_ns: Some(2),
+                    first_token_ns: Some(3),
+                    last_token_ns: 3,
+                },
+            });
+        }
+        let bytes = axum::body::to_bytes(response.await.unwrap().into_body(), 1 << 20).await.unwrap();
+        let carrier: serde_json::Value = if stream {
+            std::str::from_utf8(&bytes).unwrap().lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|value| value["choices"] == json!([]))
+                .unwrap()
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        assert_eq!(carrier.get("metrics"), Some(&Value::Null));
+        assert_eq!(carrier["usage"]["completion_tokens"], 2);
     }
 }
 
@@ -4683,7 +4915,7 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
         incoming[0].emit(GenerationEvent::Finished {
             prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
             reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
-            termination: crate::output::Termination::OutputLimit, times: Default::default(),
+            termination: crate::output::Termination::OutputLimit, arrival_ns: 0, times: Default::default(),
         });
         let response = response.await.unwrap();
         assert_eq!(state.first_response.snapshot().samples, 0);
@@ -4727,7 +4959,7 @@ async fn unread_http_stream_preserves_all_tokens_and_its_terminal_event() {
             incoming[0].emit(GenerationEvent::Finished {
                 prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 100,
                 reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
-                termination: crate::output::Termination::OutputLimit, times: Default::default(),
+                termination: crate::output::Termination::OutputLimit, arrival_ns: 0, times: Default::default(),
             });
         }
         assert!(!incoming[0].cancelled.load(Ordering::Acquire));
@@ -4957,6 +5189,7 @@ async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() 
             reason: "length",
             termination: crate::output::Termination::OutputLimit,
             stop_sequence: None,
+            arrival_ns: 0,
             times: Default::default(),
         });
         assert!(!incoming.cancelled.load(Ordering::Acquire));
@@ -5178,7 +5411,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
     incoming[0].emit(GenerationEvent::Finished {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "stop", stop_sequence: None,
-        termination: crate::output::Termination::OutputLimit, times: Default::default(),
+        termination: crate::output::Termination::OutputLimit, arrival_ns: 0, times: Default::default(),
     });
     let bytes = axum::body::to_bytes(response.into_body(), 131072).await.unwrap();
     let body = std::str::from_utf8(&bytes).unwrap();
@@ -5208,7 +5441,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
     incoming[0].emit(GenerationEvent::Finished {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
-        termination: crate::output::Termination::OutputLimit, times: Default::default(),
+        termination: crate::output::Termination::OutputLimit, arrival_ns: 0, times: Default::default(),
     });
     let response = response.await.unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
@@ -5226,7 +5459,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
     incoming[0].emit(GenerationEvent::Finished {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
-        termination: crate::output::Termination::OutputLimit, times: Default::default(),
+        termination: crate::output::Termination::OutputLimit, arrival_ns: 0, times: Default::default(),
     });
     let response = response.await.unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();

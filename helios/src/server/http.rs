@@ -329,32 +329,6 @@ pub(super) async fn generate(
         state.run,
         state.ids.fetch_add(1, Ordering::Relaxed)
     );
-    let submitted = if prompts.is_empty() {
-        Ok(vec![])
-    } else if continuous_usage {
-        state.model.generate_many_observed(prompts, observation.timestamps)
-    } else if observation.token_ids && size == 1 {
-        state
-            .model
-            .generate_observed(prompts.remove(0), observation.timestamps)
-            .map(|g| vec![g])
-    } else {
-        state.model.generate_many(prompts)
-    };
-    let mut generation = match submitted {
-        Ok(g) => g,
-        Err(e) => return rejection(&state, protocol, &id, "admission", e),
-    };
-    if !decoded.stream
-        && let Err(e) = runtime::await_admission(&mut generation).await
-    {
-        return rejection(&state, protocol, &id, "admission", e);
-    }
-    let enqueue_ns = generation.first().and_then(|g| g.enqueue_ns);
-    let mut iter = generation.into_iter();
-    let mut generations: Vec<Option<Generation>> = (0..size)
-        .map(|i| if zero.contains(&i) { None } else { iter.next() })
-        .collect();
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -384,6 +358,35 @@ pub(super) async fn generate(
     encoder.set_tool_grammars(tool_grammars);
     encoder.set_strict_validators(strict_validators);
     encoder.set_continuous_usage(continuous_usage);
+    // The encoder decides where per-request metrics appear, and so whether the
+    // generation must report its model steps' completion instants.
+    let commits = state.per_request_metrics && encoder.enable_request_metrics(decoded.stream);
+    let submitted = if prompts.is_empty() {
+        Ok(vec![])
+    } else if continuous_usage {
+        state.model.generate_many_observed(prompts, Some(observation.timestamps), commits)
+    } else if observation.token_ids && size == 1 {
+        state
+            .model
+            .generate_observed(prompts.remove(0), observation.timestamps, commits)
+            .map(|g| vec![g])
+    } else {
+        state.model.generate_many_observed(prompts, None, commits)
+    };
+    let mut generation = match submitted {
+        Ok(g) => g,
+        Err(e) => return rejection(&state, protocol, &id, "admission", e),
+    };
+    if !decoded.stream
+        && let Err(e) = runtime::await_admission(&mut generation).await
+    {
+        return rejection(&state, protocol, &id, "admission", e);
+    }
+    let enqueue_ns = generation.first().and_then(|g| g.enqueue_ns);
+    let mut iter = generation.into_iter();
+    let mut generations: Vec<Option<Generation>> = (0..size)
+        .map(|i| if zero.contains(&i) { None } else { iter.next() })
+        .collect();
     let streaming = decoded.stream;
     let stream_state = state.clone();
     let stream_id = id.clone();
@@ -521,17 +524,23 @@ pub(super) async fn generate(
                     }
                     Ok(vec![])
                 }
+                GenerationEvent::Committed { at_ns } => {
+                    encoder.record_commit(at_ns);
+                    Ok(vec![])
+                }
                 GenerationEvent::Finished {
                     generated_tokens,
                     reused_prompt_tokens,
                     termination,
                     stop_sequence,
+                    arrival_ns,
                     times,
                     ..
                 } => {
                     reused_total += reused_prompt_tokens;
                     generated[index] = generated_tokens;
                     first_scheduled_ns = times.first_scheduled_ns;
+                    encoder.record_times(arrival_ns, times, generated_tokens);
                     let result = decoders[index]
                         .finish(if encoder.tool_limit_reached { crate::output::Termination::Cancelled } else { termination })
                         .and_then(|events| encoder.apply(index, events))
@@ -604,6 +613,9 @@ pub(super) async fn generate(
                 (ingress_ns, enqueue_ns, first_scheduled_ns),
                 false,
             );
+        }
+        if !streaming && let Some(metrics) = encoder.metrics_value() {
+            response["metrics"] = metrics;
         }
         // One observation per successful response: a tool-limit cancellation reaches
         // this point but the runtime counts it as cancelled, so it is excluded.

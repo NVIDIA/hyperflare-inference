@@ -350,6 +350,11 @@ impl Bootstrap {
                     .filter(|&value| value > 0)
                     .ok_or("server configuration thinking_token_budget must be a positive 32-bit integer"))
                 .transpose()?,
+            per_request_metrics: match object.get("per_request_metrics") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err("server configuration per_request_metrics must be a boolean".into()),
+            },
             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
             served_names,
             context_hint: optional_text("context_hint")?,
@@ -719,6 +724,19 @@ mod tests {
         let loaded = Bootstrap::load(&legacy.to_string(), &manifest).unwrap();
         assert_eq!(loaded.frontend.prompt_encoder(), PromptEncoder::Jinja);
         assert_eq!(loaded.server.scheduling_policy.adaptive_verification_alpha, 1.0);
+        assert!(!loaded.server.per_request_metrics);
+        for (value, expected) in [(json!(true), true), (json!(false), false)] {
+            let mut configured = legacy.clone();
+            configured["per_request_metrics"] = value;
+            let loaded = Bootstrap::load(&configured.to_string(), &manifest).unwrap();
+            assert_eq!(loaded.server.per_request_metrics, expected);
+        }
+        for invalid in [json!(1), json!("true"), json!(null)] {
+            let mut configured = legacy.clone();
+            configured["per_request_metrics"] = invalid;
+            assert!(Bootstrap::load(&configured.to_string(), &manifest).err().unwrap()
+                .to_string().contains("per_request_metrics"));
+        }
         for preference in ["balanced", "throughput"] {
             let mut configured = legacy.clone();
             configured["scheduler_policy"] = preference.into();

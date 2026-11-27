@@ -159,6 +159,7 @@ impl Responses {
                         reason: "length",
                         stop_sequence: None,
                         termination: crate::output::Termination::OutputLimit,
+                        arrival_ns: 0,
                         times: Default::default(),
                     });
                 row.sent += 1;
@@ -377,6 +378,7 @@ async fn terminal_stream_frames_retain_http_admission_after_native_retirement() 
                 reason: "length",
                 stop_sequence: None,
                 termination: crate::output::Termination::OutputLimit,
+                arrival_ns: 0,
                 times: Default::default(),
             });
             drop(incoming);
