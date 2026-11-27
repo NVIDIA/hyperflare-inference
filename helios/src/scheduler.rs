@@ -1199,12 +1199,16 @@ impl RequestScheduler {
     }
     pub fn stats(&self) -> SchedulerStats {
         let cache = self.cache.stats();
+        let mut active_requests = 0;
+        let mut request_pages = 0;
+        let mut reserved_pages = 0;
+        for request in self.slots.iter().filter_map(|slot| slot.request.as_ref()) {
+            active_requests += 1;
+            request_pages += request.private_pages.len();
+            reserved_pages += request.reserved_pages.len();
+        }
         SchedulerStats {
-            active_requests: self
-                .slots
-                .iter()
-                .filter(|slot| slot.request.is_some())
-                .count(),
+            active_requests,
             free_slots: self.free_slot_count(),
             retiring_slots: self.slots.iter().filter(|slot| slot.retiring).count(),
             free_pages: self.free_pages.len(),
@@ -1213,19 +1217,8 @@ impl RequestScheduler {
             snapshot_capacity: self.limits.snapshots as usize,
             cached_checkpoints: cache.published_checkpoints,
             cached_pages: cache.cached_pages,
-            request_pages: self
-                .slots
-                .iter()
-                .filter_map(|slot| slot.request.as_ref())
-                .map(|request| request.private_pages.len())
-                .sum::<usize>()
-                + cache.request_pinned_pages,
-            reserved_pages: self
-                .slots
-                .iter()
-                .filter_map(|slot| slot.request.as_ref())
-                .map(|request| request.reserved_pages.len())
-                .sum(),
+            request_pages: request_pages + cache.request_pinned_pages,
+            reserved_pages,
             inbound_waiting: if self.tickets.is_empty() {
                 0
             } else {

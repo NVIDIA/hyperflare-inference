@@ -318,30 +318,6 @@ fn duplicate_publication_retains_unused_resources_with_caller() {
 }
 
 #[test]
-fn request_pins_count_each_shared_page_once() {
-    let mut cache = cache();
-    let left = history(2, 0);
-    let mut right = history(1, 0);
-    right.append(&[999; 64], &[]).unwrap();
-    let parent = created(&mut cache, &left, &proposal(None, 64, &[0], 0, 0));
-    let left_id = created(&mut cache, &left, &proposal(Some(parent), 128, &[1], 1, 0));
-    let right_id = created(&mut cache, &right, &proposal(Some(parent), 128, &[2], 2, 0));
-    cache.pin_request(left_id).unwrap();
-    cache.pin_request(right_id).unwrap();
-    // Both requests pin the shared parent, whose page counts once for both.
-    assert_eq!(cache.stats().request_pinned_pages, 3);
-    cache.pin(right_id).unwrap();
-    assert_eq!(cache.stats().request_pinned_pages, 3);
-    assert!(cache.unpin_request(parent).is_err());
-    cache.unpin_request(left_id).unwrap();
-    assert_eq!(cache.stats().request_pinned_pages, 2);
-    cache.unpin(right_id).unwrap();
-    assert_eq!(cache.stats().request_pinned_pages, 2);
-    cache.unpin_request(right_id).unwrap();
-    assert_eq!(cache.stats().request_pinned_pages, 0);
-}
-
-#[test]
 fn branching_pins_ancestors_and_prevents_direct_ancestor_unpin() {
     let mut cache = cache();
     let left = history(2, 0);
@@ -352,13 +328,21 @@ fn branching_pins_ancestors_and_prevents_direct_ancestor_unpin() {
     let right_id = created(&mut cache, &right, &proposal(Some(parent), 128, &[2], 2, 0));
     assert_eq!(cache.page_chain(left_id).unwrap(), [PageId(0), PageId(1)]);
     assert_eq!(cache.page_chain(right_id).unwrap(), [PageId(0), PageId(2)]);
-    cache.pin(left_id).unwrap();
-    cache.pin(right_id).unwrap();
+    cache.pin_request(left_id).unwrap();
+    cache.pin_request(right_id).unwrap();
+    // Both requests pin the shared parent, whose page counts once for both.
+    assert_eq!(cache.stats().request_pinned_pages, 3);
     assert_eq!(cache.checkpoint(parent).unwrap().pin_count(), 2);
     assert!(cache.unpin(parent).is_err());
     assert_eq!(cache.checkpoint(parent).unwrap().pin_count(), 2);
-    cache.unpin(left_id).unwrap();
+    cache.unpin_request(left_id).unwrap();
     assert_eq!(cache.checkpoint(parent).unwrap().pin_count(), 1);
+    assert_eq!(cache.stats().request_pinned_pages, 2);
+    // A plain pin for host copy-out neither adds nor removes request-pinned pages.
+    cache.pin(right_id).unwrap();
+    assert_eq!(cache.stats().request_pinned_pages, 2);
+    cache.unpin(right_id).unwrap();
+    assert_eq!(cache.stats().request_pinned_pages, 2);
     let evicted = cache.evict(EvictionTarget {
         pages: 99,
         snapshots: 99,
@@ -370,7 +354,10 @@ fn branching_pins_ancestors_and_prevents_direct_ancestor_unpin() {
     assert_eq!(cache.checkpoint(right_id).unwrap().parent(), None);
     assert_eq!(cache.page_chain(right_id).unwrap(), [PageId(0), PageId(2)]);
     assert_eq!(cache.lookup(&right).unwrap().checkpoint, Some(right_id));
-    cache.unpin(right_id).unwrap();
+    // The shared parent's page moved into the pinned heir and stays counted once.
+    assert_eq!(cache.stats().request_pinned_pages, 2);
+    cache.unpin_request(right_id).unwrap();
+    assert_eq!(cache.stats().request_pinned_pages, 0);
     let evicted = cache.evict(EvictionTarget {
         pages: 2,
         snapshots: 2,

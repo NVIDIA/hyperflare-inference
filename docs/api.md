@@ -295,21 +295,19 @@ launches by kind, embedding row-cache counters, HTTP admission gauges, and
 uptime. `flare_history_drafts_enabled` reports whether shared decoded history
 augments learned proposals in the serving process.
 
-`flare_request_kv_pages` counts the distinct KV pages that active requests
-reference: their private pages plus the tail pages of the prefix checkpoints they
-pin, each page counted once even when several requests reference it.
-`flare_reserved_kv_pages` counts pages reserved for active requests' future
-growth that are neither free, cached, nor written yet. The worker publishes both
-on every scheduler pass and a scrape reads the last published values. Pages of
-request-pinned checkpoints also appear in `flare_cached_kv_pages` because those
-checkpoints stay cached; the request gauge adds the requests' private pages to
-them. Neither gauge counts pages still draining through retirement or an
-admission ticket's in-flight restore. Reserved pages are outside the request
-gauge, so `flare_request_kv_pages + flare_reserved_kv_pages` is the figure
-comparable to another runtime's used KV cache. Dividing either gauge by
-`flare_total_kv_pages` excludes idle cached prefixes and snapshot backing pages,
-and the test-only assertion in `Cache::stats` compares the maintained
-request-pinned count with a full scan of every checkpoint on each read.
+`flare_request_kv_pages` counts the distinct KV pages that requests owning a
+model slot reference: their private pages plus the tail pages of the prefix
+checkpoints they pin, each page counted once even when several requests
+reference it. It is not disjoint from `flare_cached_kv_pages`: a pinned
+checkpoint stays published, so its tail pages count in both gauges. Neither
+gauge counts pages draining after a request retires, or a restore ticket's
+in-flight pages. `flare_reserved_kv_pages` counts pages reserved for those
+requests' growth that are neither free, cached, nor written yet. The worker
+publishes both when a scheduler pass makes progress, and again at startup and
+after the shutdown drain; a scrape reads the last published values.
+`(flare_request_kv_pages + flare_reserved_kv_pages)` over
+`flare_total_kv_pages` is the share comparable to vLLM's `kv_cache_usage_perc`;
+idle cached prefixes and snapshot backing pages are outside it.
 
 The route returns one JSON object instead when the query contains `format=json`,
 or when the `Accept` header gives `application/json` a higher quality than

@@ -516,7 +516,7 @@ impl PrefixCheckpointCache {
         Ok(pages)
     }
 
-    pub fn pin(&mut self, id: CheckpointId) -> Result<()> {
+    fn pin_with(&mut self, id: CheckpointId, request: bool) -> Result<()> {
         if !self.checkpoint(id)?.ready {
             return Err("cannot pin a checkpoint before GPU readiness".into());
         }
@@ -527,56 +527,65 @@ impl PrefixCheckpointCache {
             return Err("checkpoint reference count exhausted".into());
         }
         self.nodes.get_mut(&id).unwrap().direct_pins += 1;
+        if request {
+            self.nodes.get_mut(&id).unwrap().direct_request_pins += 1;
+        }
         for ancestor in chain {
-            self.nodes.get_mut(&ancestor).unwrap().pins += 1;
+            let node = self.nodes.get_mut(&ancestor).unwrap();
+            node.pins += 1;
+            if request {
+                node.request_pins += 1;
+                if node.request_pins == 1 {
+                    self.request_pinned_pages += node.tail_pages.len();
+                }
+            }
         }
         Ok(())
     }
 
-    pub fn unpin(&mut self, id: CheckpointId) -> Result<()> {
+    fn unpin_with(&mut self, id: CheckpointId, request: bool) -> Result<()> {
+        if request && self.checkpoint(id)?.direct_request_pins == 0 {
+            return Err("checkpoint has no request pin to release".into());
+        }
         if self.checkpoint(id)?.direct_pins == 0 {
             return Err("checkpoint has no direct pin to release".into());
         }
         let chain = self.chain(id)?;
         self.nodes.get_mut(&id).unwrap().direct_pins -= 1;
+        if request {
+            self.nodes.get_mut(&id).unwrap().direct_request_pins -= 1;
+        }
         for ancestor in chain {
-            self.nodes.get_mut(&ancestor).unwrap().pins -= 1;
+            let node = self.nodes.get_mut(&ancestor).unwrap();
+            node.pins -= 1;
+            if request {
+                debug_assert!(node.request_pins > 0);
+                node.request_pins -= 1;
+                if node.request_pins == 0 {
+                    self.request_pinned_pages -= node.tail_pages.len();
+                }
+            }
         }
         Ok(())
+    }
+
+    pub fn pin(&mut self, id: CheckpointId) -> Result<()> {
+        self.pin_with(id, false)
+    }
+
+    pub fn unpin(&mut self, id: CheckpointId) -> Result<()> {
+        self.unpin_with(id, false)
     }
 
     /// Pins a checkpoint on behalf of an active request. Request pins also count the
     /// tail pages of the pinned checkpoints, each page once; a request's own private
     /// pages are counted by the scheduler, which holds them.
     pub fn pin_request(&mut self, id: CheckpointId) -> Result<()> {
-        self.pin(id)?;
-        self.nodes.get_mut(&id).unwrap().direct_request_pins += 1;
-        let chain = self.chain(id)?;
-        for ancestor in chain {
-            let node = self.nodes.get_mut(&ancestor).unwrap();
-            node.request_pins += 1;
-            if node.request_pins == 1 {
-                self.request_pinned_pages += node.tail_pages.len();
-            }
-        }
-        Ok(())
+        self.pin_with(id, true)
     }
 
     pub fn unpin_request(&mut self, id: CheckpointId) -> Result<()> {
-        if self.checkpoint(id)?.direct_request_pins == 0 {
-            return Err("checkpoint has no request pin to release".into());
-        }
-        self.unpin(id)?;
-        self.nodes.get_mut(&id).unwrap().direct_request_pins -= 1;
-        let chain = self.chain(id)?;
-        for ancestor in chain {
-            let node = self.nodes.get_mut(&ancestor).unwrap();
-            node.request_pins -= 1;
-            if node.request_pins == 0 {
-                self.request_pinned_pages -= node.tail_pages.len();
-            }
-        }
-        Ok(())
+        self.unpin_with(id, true)
     }
 
     /// Record GPU reads before submission; pinning alone does not track GPU use.
