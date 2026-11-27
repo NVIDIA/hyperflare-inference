@@ -107,6 +107,17 @@ fn configure(socket: &TcpStream, timeout: Duration) -> Result<(), Failure> {
     socket.set_write_timeout(Some(timeout))?;
     Ok(())
 }
+/// Reads a serving rank's join frame, reporting a connection that closed without
+/// sending anything as no join at all. Such a connection is not a rank: nothing
+/// was promised to it and it promised nothing, so rank zero must keep waiting for
+/// its real ranks until the rendezvous deadline instead of failing the launch. A
+/// frame that begins and stops short stays fatal, because that peer died joining.
+fn join_rank(socket: &mut TcpStream) -> Result<Option<Join>, Failure> {
+    if socket.peek(&mut [0])? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(read(socket)?))
+}
 fn membership(socket: TcpStream) -> Result<flare_helios::execution::RankStream, Failure> {
     socket.set_read_timeout(None)?;
     socket.set_write_timeout(None)?;
@@ -198,7 +209,12 @@ pub fn root(
         match listener.accept() {
             Ok((mut socket, _)) => {
                 configure(&socket, IO_TIMEOUT)?;
-                let join: Join = read(&mut socket)?;
+                let Some(join) = join_rank(&mut socket)? else {
+                    eprintln!(
+                        "[core cluster] a connection closed before joining; continuing to wait for serving ranks"
+                    );
+                    continue;
+                };
                 if join.version != VERSION
                     || join.rank == 0
                     || join.rank >= world
@@ -1102,6 +1118,13 @@ fn serve_source(
 ) -> Result<(), Failure> {
     configure(&socket, IO_TIMEOUT)?;
     let mut bytes = [0; 8];
+    // A relay that closes before naming its rank and stream is gone, not corrupt: no
+    // payload was promised on this channel, so end the thread instead of shutting
+    // down the transfer the way a returned error does through `Channels::stop`.
+    if socket.peek(&mut [0])? == 0 {
+        eprintln!("[core source] a channel closed before it named its destination rank and stream");
+        return Ok(());
+    }
     socket.read_exact(&mut bytes)?;
     let rank = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
     let stream = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
@@ -1527,6 +1550,98 @@ mod tests {
         .unwrap();
         assert!(socket.read_exact(&mut [0; 8]).is_err());
         assert!(source.finish().is_err());
+    }
+
+    #[test]
+    fn join_rank_reports_a_silent_close_as_absent_and_a_short_frame_as_fatal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // A peer that connects and leaves without joining is not a serving rank.
+        drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let (mut socket, _) = listener.accept().unwrap();
+        assert!(
+            join_rank(&mut socket).unwrap().is_none(),
+            "a silent close must not fail the rendezvous"
+        );
+
+        // A complete frame still returns the rank that sent it.
+        let joined = thread::spawn(move || {
+            let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write(
+                &mut socket,
+                &Join {
+                    version: VERSION,
+                    rank: 2,
+                    endpoint: Endpoint {
+                        record: vec![7],
+                        port: 30_000,
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let (mut socket, _) = listener.accept().unwrap();
+        let join = join_rank(&mut socket)
+            .unwrap()
+            .expect("a complete join frame");
+        assert_eq!(join.rank, 2);
+        assert_eq!(join.endpoint.port, 30_000);
+        joined.join().unwrap();
+
+        // A frame that begins and stops short is a peer that died while joining, and
+        // must stay fatal: treating it as absent would wait out the whole deadline.
+        let broken = thread::spawn(move || {
+            let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            socket.write_all(&24u32.to_le_bytes()).unwrap();
+        });
+        let (mut socket, _) = listener.accept().unwrap();
+        assert!(
+            join_rank(&mut socket).is_err(),
+            "a truncated join frame must stay fatal"
+        );
+        broken.join().unwrap();
+    }
+
+    #[test]
+    fn source_survives_a_channel_that_closed_before_naming_itself() {
+        let temporary = tempfile::tempfile().unwrap();
+        temporary.set_len(1024).unwrap();
+        let files = vec![vec![Arc::new(temporary)]; 2];
+        let specs = vec![
+            vec![FileSpec {
+                name: "file".into(),
+                size: 1024,
+                ranges: vec![(0, 64)],
+            }];
+            2
+        ];
+        // Two streams, so the abandoned channel does not also exercise the capacity
+        // bound: finished channels continue to count against it, which is a separate
+        // defect reported apart from this one.
+        let source = Source::start(files, specs, 2).unwrap();
+        drop(TcpStream::connect(("127.0.0.1", source.port)).unwrap());
+
+        let mut socket = TcpStream::connect(("127.0.0.1", source.port)).unwrap();
+        configure(&socket, Duration::from_secs(2)).unwrap();
+        socket.write_all(&[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        write(
+            &mut socket,
+            &Request {
+                file: 0,
+                ranges: vec![(0, 64)],
+            },
+        )
+        .unwrap();
+        let mut length = [0; 8];
+        socket.read_exact(&mut length).unwrap();
+        assert_eq!(u64::from_le_bytes(length), 64);
+        let mut payload = [0; 64];
+        socket.read_exact(&mut payload).unwrap();
+        assert!(
+            source.finish().is_ok(),
+            "a channel that closed unnamed must not abort the distribution"
+        );
     }
 }
 
