@@ -43,6 +43,12 @@ needs only Flare, the driver, and the core.
   collectives use RoCEnante over the Sparks' ConnectX-7 ports.
 - Free GPU memory and disk space on each selected node. Spark shares host and
   GPU memory; see [DGX Spark preparation](model-preparation.md#dgx-spark).
+  A cold peer stages payload containers whole, because they are immutable
+  content-addressed objects, so for a packed single-file core each fetching host
+  needs free space in its model cache for the primary's full size, not only that
+  rank's share. Place a complete copy on each host and launch it from its own
+  path, or publish the core in directory form, so a peer reuses verified files
+  and opens no payload connections.
 
 Linux aarch64 builds include RoCE transport by default. To enable it on Linux
 x86_64, install the libibverbs development package and build with
@@ -278,7 +284,10 @@ flare orbit run ORG/MODEL --revision gb10
 Replace `ORG/MODEL` with the core repository. If the revision contains several
 primary files, select the multi-host core with `--filename FILE`. `gb10` selects the Spark hardware revision even from
 a controller without a GPU. Without an explicit revision, Orbit infers one
-from available candidate GPUs and refuses ambiguous mixed hardware.
+from available candidate GPUs and refuses ambiguous mixed hardware. Hardware
+revisions exist only where the publisher created those refs: a repository
+published on a single branch resolves with `--revision` naming that branch, and a
+missing ref is reported as an HTTP 404 that names neither repository nor ref.
 `--filename` and `--offline` apply on the downloading node, which uses its own
 configured model cache and download transport cache; the controller's
 `--cache-dir` and `--core-cache` paths are not sent. `--token-file`
