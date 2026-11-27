@@ -27,6 +27,7 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 #[derive(Default)]
@@ -230,11 +231,20 @@ impl Requests {
                 rows,
             } => {
                 let ready = unsafe { &*(flag as *const AtomicU64) };
+                // The graph publishes these ids part-way through the step that
+                // consumes them, so this wait spins only while they may still be in
+                // flight and gives the core up once they are not.
+                let mut spins = 0u32;
                 while ready.load(Ordering::Acquire) != sequence {
                     if cancelled.load(Ordering::Acquire) {
                         return Err("n-gram request cancelled".into());
                     }
-                    std::hint::spin_loop();
+                    if spins < SPIN_ROUNDS {
+                        std::hint::spin_loop();
+                    } else {
+                        yield_core(spins - SPIN_ROUNDS);
+                    }
+                    spins = spins.saturating_add(1);
                 }
                 Ok(unsafe { std::slice::from_raw_parts(address as *const i64, rows) }.to_vec())
             }
@@ -242,6 +252,30 @@ impl Requests {
     }
 }
 const STAGING_FRAMES: usize = 2;
+/// Rounds a waiting gather spins before it starts napping, enough to catch ids
+/// the graph published before the wait began.
+const SPIN_ROUNDS: u32 = 1 << 12;
+/// Nap growth per round after the spin; the tenth round reaches `NAP_MAX`.
+const NAP_GROWTH: Duration = Duration::from_micros(25);
+/// Longest nap between rounds, under one decode step so that a nap delays the
+/// published ids by no more than its own length.
+const NAP_MAX: Duration = Duration::from_micros(250);
+
+/// Gives up the core for one round of a wait that has spent its spin, napping
+/// `NAP_GROWTH` longer each round up to `NAP_MAX`.
+///
+/// Windows keeps the spin: its timer granularity is longer than `NAP_MAX`, so a
+/// nap there could delay the ids by more than the decode step this wait stays
+/// under.
+#[cfg(not(windows))]
+fn yield_core(rounds: u32) {
+    thread::sleep(NAP_GROWTH.saturating_mul(rounds.saturating_add(1)).min(NAP_MAX));
+}
+
+#[cfg(windows)]
+fn yield_core(_: u32) {
+    std::hint::spin_loop();
+}
 
 struct Job {
     frame: usize,
@@ -417,6 +451,8 @@ impl Shared {
             let row_bytes = planes.iter().map(|p| p.row_bytes).sum::<usize>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stop = cancelled.clone();
+            // One worker serves every rank whose rows this table holds; a rank-partitioned
+            // table becomes a separate `Shared` with its own workers.
             let worker = thread::Builder::new()
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
@@ -787,24 +823,61 @@ mod tests {
         assert!(state.prepare(1, 1, 24, 2).is_err());
     }
 
-    #[test]
-    fn device_request_wait_observes_publication_and_cancellation() {
-        let ids = [17i64, 31, 47];
-        let flag = AtomicU64::new(0);
-        let cancelled = AtomicBool::new(false);
-        let request = || Requests::Device {
+    /// A device row set whose publication flag and cancellation the test owns.
+    fn device_request(flag: &AtomicU64, ids: &[i64]) -> Requests {
+        Requests::Device {
             address: ids.as_ptr() as usize,
-            flag: &flag as *const AtomicU64 as usize,
+            flag: flag as *const AtomicU64 as usize,
             sequence: 7,
             rows: ids.len(),
-        };
+        }
+    }
+
+    /// Waits out the spin budget on any host, so a flag stored after it is stored
+    /// while the reader is napping.
+    const AFTER_SPIN: Duration = Duration::from_millis(5);
+
+    #[test]
+    fn device_request_wait_returns_ids_already_published() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(7);
+        assert_eq!(
+            device_request(&flag, &ids).read(&AtomicBool::new(false)).unwrap(),
+            ids
+        );
+    }
+
+    #[test]
+    fn device_request_wait_returns_ids_published_after_the_spin() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(0);
         thread::scope(|scope| {
-            let worker = scope.spawn(|| request().read(&cancelled));
+            let worker = scope.spawn(|| device_request(&flag, &ids).read(&AtomicBool::new(false)));
+            thread::sleep(AFTER_SPIN);
             flag.store(7, Ordering::Release);
             assert_eq!(worker.join().unwrap().unwrap(), ids);
         });
-        flag.store(0, Ordering::Release);
-        cancelled.store(true, Ordering::Release);
-        assert!(request().read(&cancelled).is_err());
+    }
+
+    #[test]
+    fn device_request_wait_observes_cancellation_before_publication() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(0);
+        assert!(device_request(&flag, &ids)
+            .read(&AtomicBool::new(true))
+            .is_err());
+    }
+
+    #[test]
+    fn device_request_wait_observes_cancellation_after_the_spin() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(0);
+        let cancelled = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| device_request(&flag, &ids).read(&cancelled));
+            thread::sleep(AFTER_SPIN);
+            cancelled.store(true, Ordering::Release);
+            assert!(worker.join().unwrap().is_err());
+        });
     }
 }
