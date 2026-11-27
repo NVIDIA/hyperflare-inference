@@ -99,6 +99,8 @@ pub enum GenerationEvent {
         reason: &'static str,
         termination: crate::output::Termination,
         stop_sequence: Option<String>,
+        times: super::metrics::RequestTimes,
+        drafts: DraftCounts,
     },
     AdmissionRejected(Error),
     Error(Error),
@@ -192,6 +194,9 @@ struct Incoming {
     observation: Option<bool>,
     /// Lifecycle instants for completion histograms; preserved when a preempted request is parked.
     times: super::metrics::RequestTimes,
+    /// Drafts offered and accepted by this request's rounds; preserved when a preempted
+    /// request is parked, like `times`.
+    drafts: DraftCounts,
     /// Consult the host prefix store at admission; cleared after a failed restore.
     host_lookup: bool,
     /// Admitted once already, so the admission counter is not advanced again.
@@ -298,6 +303,8 @@ impl Incoming {
             reason: "stop",
             termination: crate::output::Termination::Cancelled,
             stop_sequence: None,
+            times: self.times,
+            drafts: self.drafts,
         });
     }
 
@@ -398,6 +405,13 @@ struct Carried {
     generated_tokens: u32,
     /// The request's own sampling seed, from which each continuation's seed derives.
     seed: Option<u64>,
+}
+
+/// Speculative drafts offered for verification and accepted, summed over a request's lifetime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DraftCounts {
+    pub offered: u64,
+    pub accepted: u64,
 }
 
 /// The sampling seed of a preempted request's continuation after `generated` tokens.
@@ -911,6 +925,7 @@ impl ModelRuntime {
                 metrics: self.metrics.clone(),
                 observation,
                 times: Default::default(),
+                drafts: Default::default(),
                 host_lookup: true,
                 readmitted: false,
                 blocked: None,
@@ -1651,6 +1666,8 @@ impl<'a> Worker<'a> {
         let mut draft_rounds = 0;
         let mut verification_drafts = 0;
         let mut verification_rounds = 0;
+        // Per-request drafts, applied once the scheduler accepts the completion.
+        let mut drafts = Vec::new();
         if matches!(
             kind,
             GraphKind::Prefill
@@ -1679,11 +1696,14 @@ impl<'a> Worker<'a> {
                     if let Some(vector) = record.vector.as_ref() {
                         let offered =
                             (vector.offered_drafts as usize).min(lane.tokens.saturating_sub(1));
+                        let accepted_drafts =
+                            (vector.accepted_drafts as usize).min(offered) as u64;
                         verification_drafts += offered as u64;
                         if offered > 0 {
-                            accepted += (vector.accepted_drafts as usize).min(offered) as u64;
+                            accepted += accepted_drafts;
                             draft_rounds += 1;
                         }
+                        drafts.push((lane.request, offered as u64, accepted_drafts));
                     }
                 }
             }
@@ -1703,6 +1723,15 @@ impl<'a> Worker<'a> {
         self.metrics
             .progress(prefill, generated.len(), accepted, draft_rounds,
                 verification_drafts, verification_rounds);
+        for (request, offered, accepted_drafts) in drafts {
+            if let Some(active) = self.active[request.slot as usize]
+                .as_mut()
+                .filter(|active| active.request == request)
+            {
+                active.incoming.drafts.offered += offered;
+                active.incoming.drafts.accepted += accepted_drafts;
+            }
+        }
         self.metrics.replay_completed(completed_at_ns, completion.timing, prefill);
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
@@ -1859,6 +1888,8 @@ impl<'a> Worker<'a> {
                                 .text_stops
                                 .as_ref()
                                 .and_then(|s| s.matched().map(str::to_owned)),
+                            times: request.incoming.times,
+                            drafts: request.incoming.drafts,
                         });
                     stopped.push(token.request);
                 }
@@ -2033,6 +2064,8 @@ impl<'a> Worker<'a> {
                                 } else {
                                     crate::output::Termination::OutputLimit
                                 },
+                                times: request.incoming.times,
+                                drafts: request.incoming.drafts,
                             });
                         if user_stop {
                             self.scheduler.cancel(request.request)?;
@@ -3252,6 +3285,7 @@ mod tests {
             metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
             observation: None,
             times: Default::default(),
+            drafts: Default::default(),
             host_lookup: true,
             readmitted: false,
             prompt_score_end: 0,

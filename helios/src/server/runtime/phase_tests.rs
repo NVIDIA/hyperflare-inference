@@ -249,6 +249,7 @@ impl Fixture {
                 metrics: self.metrics.clone(),
                 observation: Some(false),
                 times: Default::default(),
+                drafts: Default::default(),
                 host_lookup: true,
                 readmitted: false,
                 prompt_score_end: 0,
@@ -508,8 +509,13 @@ fn budget_events(
                 prompt_tokens,
                 generated_tokens,
                 reason,
+                times,
                 ..
             } => {
+                // A completed generation reports the instants its histograms record.
+                assert!(times.first_scheduled_ns.is_some());
+                assert!(times.first_token_ns.is_some());
+                assert!(times.last_token_ns >= times.first_token_ns.unwrap());
                 finished.push((prompt_tokens, generated_tokens, reason));
             }
             GenerationEvent::Error(error) | GenerationEvent::AdmissionRejected(error) => {
@@ -1664,6 +1670,20 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
         let metrics = fixture.metrics.snapshot(!copy);
         assert_eq!((metrics.prefill_tokens, metrics.generated_tokens), (13, 4));
         assert_eq!((metrics.accepted_drafts, metrics.draft_rounds), (2, 1));
+        assert_eq!(
+            worker
+                .active
+                .iter()
+                .flatten()
+                .next()
+                .unwrap()
+                .incoming
+                .drafts,
+            DraftCounts {
+                offered: 3,
+                accepted: 2
+            }
+        );
         assert_eq!(
             (metrics.verification_drafts, metrics.verification_rounds),
             (3, 1)
@@ -4447,6 +4467,7 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
             prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
             reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
             termination: crate::output::Termination::OutputLimit,
+            times: Default::default(), drafts: Default::default(),
         });
         let response = response.await.unwrap();
         assert_eq!(state.first_response.snapshot().samples, 0);
@@ -4497,6 +4518,7 @@ async fn unread_http_stream_preserves_all_tokens_and_its_terminal_event() {
                 prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 100,
                 reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
                 termination: crate::output::Termination::OutputLimit,
+                times: Default::default(), drafts: Default::default(),
             });
         }
         assert!(!incoming[0].cancelled.load(Ordering::Acquire));
@@ -4716,6 +4738,8 @@ async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() 
             reason: "length",
             termination: crate::output::Termination::OutputLimit,
             stop_sequence: None,
+            times: Default::default(),
+            drafts: Default::default(),
         });
         assert!(!incoming.cancelled.load(Ordering::Acquire));
         assert_eq!(incoming.publications.get(), 3000);
@@ -4750,6 +4774,108 @@ async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() 
         }
         assert_eq!(content, "b".repeat(3000), "{path}");
         assert_eq!(state.model.capacity.available_permits(), 4);
+    }
+}
+
+#[tokio::test]
+async fn http_final_output_reports_timings_for_every_protocol() {
+    use axum::{Extension, extract::State};
+    use serde_json::json;
+    let times = crate::server::metrics::RequestTimes {
+        first_scheduled_ns: Some(1_000_000_000),
+        first_token_ns: Some(1_500_000_000),
+        last_token_ns: 2_500_000_000,
+    };
+    for (path, mut body) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"a"}], "max_tokens":2}),
+        ),
+        (
+            "/v1/completions",
+            json!({"prompt":"a", "max_tokens":2}),
+        ),
+        (
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":"a"}], "max_tokens":2}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":"a", "max_output_tokens":2}),
+        ),
+    ] {
+        for stream in [false, true] {
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let state = http_state_for(Fixture::new(), sender, None, &[]);
+            body["model"] = json!("qwen-worker-phases");
+            body["stream"] = json!(stream);
+            let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let response = tokio::spawn(super::super::http::generate(
+                State(state.clone()),
+                Extension(ingress),
+                request,
+            ));
+            let incoming = tokio::task::spawn_blocking(move || {
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            let incoming = incoming.into_iter().next().unwrap();
+            let prompt_tokens = incoming.prompt.tokens.len();
+            incoming.notify_admission(Ok(()));
+            for _ in 0..2 {
+                incoming.observe_token(1);
+                incoming.emit_token(1);
+            }
+            incoming.emit(GenerationEvent::Finished {
+                prompt_tokens,
+                generated_tokens: 2,
+                reused_prompt_tokens: 0,
+                reason: "length",
+                termination: crate::output::Termination::OutputLimit,
+                stop_sequence: None,
+                times,
+                drafts: DraftCounts {
+                    offered: 6,
+                    accepted: 4,
+                },
+            });
+            let response = response.await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 131072).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let events: Vec<serde_json::Value> = if stream {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect()
+            } else {
+                vec![serde_json::from_str(text).unwrap()]
+            };
+            let carrying: Vec<_> = events
+                .iter()
+                .filter(|event| event.get("timings").is_some())
+                .collect();
+            assert_eq!(carrying.len(), 1, "{path} stream={stream}");
+            let timings = &carrying[0]["timings"];
+            assert_eq!(timings["prompt_ms"], 500.0, "{path} stream={stream}");
+            assert_eq!(timings["predicted_ms"], 1000.0, "{path} stream={stream}");
+            assert_eq!(
+                timings["predicted_per_second"], 1.0,
+                "{path} stream={stream}"
+            );
+            assert_eq!(timings["prompt_n"], prompt_tokens, "{path} stream={stream}");
+            assert_eq!(timings["draft_n"], 6, "{path} stream={stream}");
+            assert_eq!(timings["draft_n_accepted"], 4, "{path} stream={stream}");
+        }
     }
 }
 
@@ -4937,6 +5063,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "stop", stop_sequence: None,
         termination: crate::output::Termination::OutputLimit,
+        times: Default::default(), drafts: Default::default(),
     });
     let bytes = axum::body::to_bytes(response.into_body(), 131072).await.unwrap();
     let body = std::str::from_utf8(&bytes).unwrap();
@@ -4967,6 +5094,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
         termination: crate::output::Termination::OutputLimit,
+        times: Default::default(), drafts: Default::default(),
     });
     let response = response.await.unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
@@ -4985,6 +5113,7 @@ async fn responses_carry_the_first_non_empty_served_name() {
         prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
         reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
         termination: crate::output::Termination::OutputLimit,
+        times: Default::default(), drafts: Default::default(),
     });
     let response = response.await.unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();

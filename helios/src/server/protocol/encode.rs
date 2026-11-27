@@ -94,6 +94,7 @@ pub(crate) struct Encoder {
     choices_per_prompt: usize,
     usage: Vec<Usage>,
     reasons: Vec<Option<&'static str>>,
+    timings: Vec<Option<(crate::server::metrics::RequestTimes, crate::server::runtime::DraftCounts)>>,
     stop: Option<String>,
     sequence: u64,
     metadata: Value,
@@ -133,6 +134,7 @@ impl Encoder {
             outputs: (0..choices).map(|_| ResponseOutput::default()).collect(),
             usage: vec![Usage::default(); choices],
             reasons: vec![None; choices],
+            timings: vec![None; choices],
             id,
             model,
             created,
@@ -222,6 +224,16 @@ impl Encoder {
     /// refresh it with the decoder's running total on every chunk.
     pub fn report_reasoning_tokens(&mut self, index: usize, tokens: u32) {
         self.usage[index].reasoning = tokens;
+    }
+    /// Record one choice's lifecycle instants and draft counts. `finish` renders
+    /// them as the `timings` object of the request's final output.
+    pub fn record_timing(
+        &mut self,
+        index: usize,
+        times: crate::server::metrics::RequestTimes,
+        drafts: crate::server::runtime::DraftCounts,
+    ) {
+        self.timings[index] = Some((times, drafts));
     }
     fn named(&mut self, name: &str, mut data: Value) -> Frame {
         data["type"] = json!(name);
@@ -645,13 +657,22 @@ impl Encoder {
             ));
         }
         if self.reasons.iter().all(Option::is_some) {
+            let timings = self.timings_value();
             match self.protocol {
                 Protocol::Chat | Protocol::Completions => {
                     if self.include_usage {
                         let mut frame = self.chunk(0, Value::Null, Value::Null);
                         frame.data["choices"] = json!([]);
                         frame.data["usage"] = self.usage_value();
+                        if let Some(timings) = timings {
+                            frame.data["timings"] = timings;
+                        }
                         frames.push(frame);
+                    } else if let Some(timings) = timings
+                        && let Some(last) = frames.last_mut()
+                    {
+                        // The chunk pushed above completes the last choice.
+                        last.data["timings"] = timings;
                     }
                     frames.push(Frame {
                         event: None,
@@ -661,29 +682,36 @@ impl Encoder {
                 }
                 Protocol::Messages => {
                     let response = self.response();
-                    frames.push(self.named("message_delta",json!({"delta":{"stop_reason":response["stop_reason"],"stop_sequence":response["stop_sequence"]},"usage":self.usage_value()})));
+                    let mut data = json!({"delta":{"stop_reason":response["stop_reason"],"stop_sequence":response["stop_sequence"]},"usage":self.usage_value()});
+                    if let Some(timings) = timings {
+                        data["timings"] = timings;
+                    }
+                    frames.push(self.named("message_delta", data));
                     frames.push(self.named("message_stop", json!({})));
                 }
                 Protocol::Responses => {
                     let response = self.response();
+                    let mut data = json!({"response":response});
+                    if let Some(timings) = timings {
+                        data["timings"] = timings;
+                    }
                     frames.push(self.named(
                         if reason == "length" {
                             "response.incomplete"
                         } else {
                             "response.completed"
                         },
-                        json!({"response":response}),
+                        data,
                     ));
                 }
             }
         }
         Ok(frames)
     }
-    pub fn usage_value(&self) -> Value {
+    /// Prompt, cached prompt, and generated token counts shared by usage and timings.
+    fn totals(&self) -> (usize, u64, u64) {
         let prompt_tokens: usize = self.prompts.iter().map(|p| p.tokens).sum();
-        let image_tokens: usize = self.prompts.iter().map(|p| p.image_tokens).sum();
         let generated: u64 = self.usage.iter().map(|u| u.generated as u64).sum();
-        let reasoning: u64 = self.usage.iter().map(|u| u.reasoning as u64).sum();
         // Prompt usage counts each input once even with n > 1. Use its first
         // choice's admission lookup, independent of completion order or reuse
         // by later siblings after that choice has published a checkpoint.
@@ -693,6 +721,68 @@ impl Encoder {
             .step_by(self.choices_per_prompt)
             .map(|u| u.cached)
             .sum();
+        (prompt_tokens, cached, generated)
+    }
+    /// llama.cpp-compatible request timing: prefill from the earliest scheduled
+    /// model step that included the request to the earliest committed generated
+    /// token, decode from the earliest to the latest committed token. `None`
+    /// until a choice records its times.
+    pub fn timings_value(&self) -> Option<Value> {
+        let recorded: Vec<&(crate::server::metrics::RequestTimes, crate::server::runtime::DraftCounts)> =
+            self.timings.iter().flatten().collect();
+        if recorded.is_empty() {
+            return None;
+        }
+        let (prompt_tokens, cached, generated) = self.totals();
+        let first_scheduled = recorded
+            .iter()
+            .filter_map(|(times, _)| times.first_scheduled_ns)
+            .min();
+        let first_token = recorded
+            .iter()
+            .filter_map(|(times, _)| times.first_token_ns)
+            .min();
+        let last_token = recorded.iter().map(|(times, _)| times.last_token_ns).max();
+        let prompt_n = (prompt_tokens as u64).saturating_sub(cached);
+        let prompt_ms = match (first_scheduled, first_token) {
+            (Some(scheduled), Some(first)) => first.saturating_sub(scheduled) as f64 / 1e6,
+            _ => 0.0,
+        };
+        let predicted_n = generated;
+        let predicted_ms = match (first_token, last_token) {
+            (Some(first), Some(last)) => last.saturating_sub(first) as f64 / 1e6,
+            _ => 0.0,
+        };
+        // Each recorded choice's first token is counted in `predicted_n` but starts
+        // decode rather than advancing it, so its interval count is one less.
+        let first_tokens = recorded
+            .iter()
+            .filter(|(times, _)| times.first_token_ns.is_some())
+            .count() as u64;
+        let intervals = predicted_n.saturating_sub(first_tokens);
+        let mut timings = json!({
+            "cache_n": cached,
+            "prompt_n": prompt_n,
+            "prompt_ms": prompt_ms,
+            "prompt_per_token_ms": if prompt_n == 0 { 0.0 } else { prompt_ms / prompt_n as f64 },
+            "prompt_per_second": if prompt_ms == 0.0 { 0.0 } else { prompt_n as f64 * 1000.0 / prompt_ms },
+            "predicted_n": predicted_n,
+            "predicted_ms": predicted_ms,
+            "predicted_per_token_ms": if intervals == 0 { 0.0 } else { predicted_ms / intervals as f64 },
+            "predicted_per_second": if predicted_ms == 0.0 { 0.0 } else { intervals as f64 * 1000.0 / predicted_ms },
+        });
+        let offered: u64 = recorded.iter().map(|(_, drafts)| drafts.offered).sum();
+        if offered > 0 {
+            timings["draft_n"] = json!(offered);
+            timings["draft_n_accepted"] =
+                json!(recorded.iter().map(|(_, drafts)| drafts.accepted).sum::<u64>());
+        }
+        Some(timings)
+    }
+    pub fn usage_value(&self) -> Value {
+        let (prompt_tokens, cached, generated) = self.totals();
+        let image_tokens: usize = self.prompts.iter().map(|p| p.image_tokens).sum();
+        let reasoning: u64 = self.usage.iter().map(|u| u.reasoning as u64).sum();
         match self.protocol {
             Protocol::Chat | Protocol::Completions => {
                 let mut details = json!({"cached_tokens":cached});

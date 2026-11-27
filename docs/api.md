@@ -901,6 +901,26 @@ before the final usage chunk arrives. Each emitted chunk carries cumulative
 native token counts; text chunks can combine multiple tokens, so counting
 chunks does not measure generated tokens. The final usage chunk is also emitted.
 
+Final output from Chat Completions, Completions, Messages, and Responses also
+carries a llama.cpp-compatible `timings` object. `prompt_ms` spans from the first
+model step that included the request to the earliest committed generated token,
+and `prompt_n` counts the prompt tokens that step had to prefill, which is
+`cache_n` fewer than the prompt total. `predicted_ms` spans the earliest to the
+latest committed generated token, and `predicted_n` is the generated-token count
+usage reports. `predicted_per_token_ms` and `predicted_per_second` divide that
+span by the token intervals after each choice's first token, so one choice
+reports its decode rate over its remaining tokens. `draft_n` and
+`draft_n_accepted` count speculative drafts offered for verification and accepted;
+both keys appear only when drafts were offered. `prompt_per_token_ms`,
+`prompt_per_second`, `predicted_per_token_ms`, and `predicted_per_second` report
+zero rather than an undefined value when their interval or token count is zero.
+
+Streams carry `timings` on the usage chunk when `stream_options.include_usage` is
+set, otherwise on the chunk that completes the last choice. Messages reports it on
+the `message_delta` event, and Responses reports it beside `response` on
+`response.completed` or `response.incomplete`. The `[DONE]` sentinel, cancelled
+requests, and failed requests carry no `timings`.
+
 ## Raw completions
 
 `prompt` accepts a string, an array of strings, a token-ID array, or an array of

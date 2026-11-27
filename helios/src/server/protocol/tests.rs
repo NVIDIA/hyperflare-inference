@@ -1362,6 +1362,101 @@ fn image_usage_is_a_prompt_subset_and_stream_usage_remains_opt_in() {
 }
 
 #[test]
+fn timings_report_prefill_decode_and_drafts_on_final_output() {
+    let times = crate::server::metrics::RequestTimes {
+        first_scheduled_ns: Some(1_000_000_000),
+        first_token_ns: Some(1_500_000_000),
+        last_token_ns: 2_500_000_000,
+    };
+    let drafts = crate::server::runtime::DraftCounts {
+        offered: 6,
+        accepted: 4,
+    };
+    let expected = json!({"cache_n":9,"prompt_n":8,"prompt_ms":500.0,
+        "prompt_per_token_ms":62.5,"prompt_per_second":16.0,
+        "predicted_n":5,"predicted_ms":1000.0,
+        "predicted_per_token_ms":250.0,"predicted_per_second":4.0,
+        "draft_n":6,"draft_n_accepted":4});
+    for protocol in [
+        Protocol::Chat,
+        Protocol::Completions,
+        Protocol::Messages,
+        Protocol::Responses,
+    ] {
+        let mut enc = encoder(protocol);
+        let mut frames = enc.start();
+        enc.record_timing(0, times, drafts);
+        frames.extend(enc.finish(0, Termination::OutputLimit, 5, 9, None).unwrap());
+        assert_eq!(enc.timings_value().unwrap(), expected, "value for {protocol:?}");
+        let carrying: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.data.get("timings").is_some())
+            .collect();
+        assert_eq!(carrying.len(), 1, "one frame carries timings for {protocol:?}");
+        assert_eq!(carrying[0].data["timings"], expected, "frame for {protocol:?}");
+        let placed = match protocol {
+            Protocol::Chat | Protocol::Completions => &frames[frames.len() - 2],
+            Protocol::Messages => frames
+                .iter()
+                .find(|frame| frame.data["type"] == "message_delta")
+                .unwrap(),
+            Protocol::Responses => frames
+                .iter()
+                .find(|frame| frame.data["type"] == "response.incomplete")
+                .unwrap(),
+        };
+        assert_eq!(placed.data["timings"], expected, "placement for {protocol:?}");
+    }
+    // Without recorded times every protocol omits the object.
+    let mut enc = encoder(Protocol::Chat);
+    let mut frames = enc.start();
+    frames.extend(enc.finish(0, Termination::Eos, 5, 9, None).unwrap());
+    assert!(enc.timings_value().is_none());
+    assert!(frames.iter().all(|frame| frame.data.get("timings").is_none()));
+    // A Chat stream without stream usage carries timings on the finish chunk.
+    let mut enc = Encoder::new(
+        Protocol::Chat,
+        "c".into(),
+        "m".into(),
+        1,
+        1,
+        vec![PromptUsage {
+            tokens: 17,
+            image_tokens: 0,
+        }],
+        vec![],
+        ToolChoice::Auto,
+        true,
+        false,
+        json!({}),
+    );
+    let mut frames = enc.start();
+    enc.record_timing(0, times, drafts);
+    frames.extend(enc.finish(0, Termination::OutputLimit, 5, 9, None).unwrap());
+    let finish = frames
+        .iter()
+        .find(|frame| frame.data["choices"][0]["finish_reason"].is_string())
+        .unwrap();
+    assert_eq!(finish.data["timings"], expected);
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.data.get("timings").is_some())
+            .count(),
+        1
+    );
+    // Draft keys appear only when drafts were offered.
+    let mut enc = encoder(Protocol::Chat);
+    let mut frames = enc.start();
+    enc.record_timing(0, times, crate::server::runtime::DraftCounts::default());
+    frames.extend(enc.finish(0, Termination::OutputLimit, 5, 9, None).unwrap());
+    let timings = enc.timings_value().unwrap();
+    assert!(timings.get("draft_n").is_none());
+    assert!(timings.get("draft_n_accepted").is_none());
+    assert_eq!(timings["predicted_per_second"], 4.0);
+}
+
+#[test]
 fn continuous_usage_counts_hidden_and_merged_tokens_without_extra_text_frames() {
     for protocol in [Protocol::Chat, Protocol::Completions] {
         let mut encoder = Encoder::new(protocol, "c".into(), "m".into(), 1, 1,

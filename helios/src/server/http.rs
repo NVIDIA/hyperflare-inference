@@ -519,9 +519,12 @@ pub(super) async fn generate(
                     reused_prompt_tokens,
                     termination,
                     stop_sequence,
+                    times,
+                    drafts,
                     ..
                 } => {
                     reused_total += reused_prompt_tokens;
+                    encoder.record_timing(index, times, drafts);
                     let result = decoders[index]
                         .finish(if encoder.tool_limit_reached { crate::output::Termination::Cancelled } else { termination })
                         .and_then(|events| encoder.apply(index, events))
@@ -579,6 +582,9 @@ pub(super) async fn generate(
             }
         }
         let mut response = encoder.response();
+        if let Some(timings) = encoder.timings_value() {
+            response["timings"] = timings;
+        }
         if protocol == Protocol::Chat {
             if let Some(ids) = prompt_ids {
                 response["prompt_token_ids"] = json!(ids);

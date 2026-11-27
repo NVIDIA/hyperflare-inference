@@ -299,7 +299,7 @@ impl<const N: usize> Histogram<N> {
 
 /// Request lifecycle instants on the `observation::monotonic_ns` clock, kept across preemption.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct RequestTimes {
+pub struct RequestTimes {
     pub first_scheduled_ns: Option<u64>,
     pub first_token_ns: Option<u64>,
     pub last_token_ns: u64,
