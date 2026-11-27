@@ -332,9 +332,10 @@ impl RequestScheduler {
                 } else {
                     entry.non_terminal_ns
                 };
-                // Pure prefill dispatch runs an unmeasured graph only at the natural-fit
-                // capacity, so an unmeasured capacity other than this step's pricing
-                // target is never selected for this chunk.
+                // An unmeasured capacity other than this step's pricing capacity is
+                // skipped: the pricing capacity covers at least as much work, so the
+                // skip loses no capacity that could cover more. An unmeasured pricing
+                // capacity makes the price unknown.
                 let Some(nanos) = nanos else {
                     if !adds_work || Some(entry.capacity) != target_capacity {
                         continue;
@@ -884,7 +885,8 @@ mod tests {
         measure(scheduler, GraphKind::Snapshot, 1, 1);
     }
 
-    /// The interval walk as it was before catalog costs were resolved once per selection.
+    /// The interval walk with per-step cost lookups, as before catalog costs were resolved
+    /// once per selection, and with the interval walk's pricing-capacity rule.
     fn reference_interval_prefill_ns(
         scheduler: &RequestScheduler,
         request: &LiveRequest,
@@ -1707,9 +1709,7 @@ mod tests {
 
     #[test]
     fn span_shortened_chunk_prices_at_measured_capacities() {
-        // A span starting at 200 cuts both 256 and 512 to 200 tokens, so dispatch's
-        // natural fit is 256 while the pricing target, from the 700 remaining tokens,
-        // is 512. The unmeasured 256 is skipped and the chunk is priced at 512.
+        // The unmeasured 256 is skipped and the chunk is priced at 512.
         let mut scheduler = super::super::tests::scheduler(1, 128, 16);
         scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
         scheduler

@@ -556,10 +556,11 @@ of `scheduler_checkpoint_extra_work_fraction` times estimated uncached prefill
 work, defaulting to 0.05. Prefill predictions use measured costs, including stale
 estimates retained for dispatch ranking. Pricing skips unmeasured capacities
 that add no tokens, and unmeasured capacities other than the chunk's pricing
-capacity: the smallest capacity covering its remaining tokens, or the largest.
-Pure prefill dispatch discovers only natural-fit capacities, and an atomic span
-can make the natural fit smaller than the pricing capacity. An unmeasured
-pricing capacity leaves the prefill cost unknown. Unknown prefill costs and
+capacity: the smallest catalog capacity covering the chunk's remaining tokens,
+falling back to the largest catalog capacity when none does. Pure prefill
+dispatch discovers only the natural-fit capacity, and an atomic span can make
+the natural fit smaller than the pricing capacity. An unmeasured pricing
+capacity leaves the prefill cost unknown. Unknown prefill costs and
 unknown or stale snapshot-copy costs disable extras while preserving anchor
 eligibility. Productive completed decode earns the same fraction of measured
 time for a distinct terminal capture. There is no fixed capture count or
