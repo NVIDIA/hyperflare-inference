@@ -55,7 +55,6 @@ pub use protection::{
     AuthorizedCore, CoreClaim, CoreLicense, PayloadAuthorizedCore, PayloadSource,
     PayloadVerifiedCore, Publisher, VerifiedCore, verify_core_metadata,
 };
-pub(crate) use protection::open_descriptors;
 use std::path::Path;
 mod selection;
 mod serving;

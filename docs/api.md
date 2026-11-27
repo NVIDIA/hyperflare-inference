@@ -287,8 +287,7 @@ requires the serving key: both report aggregate state without request content.
 `GET /metrics` returns Prometheus text exposition format 0.0.4 by default.
 Counter and gauge names start with `flare_`, such as
 `flare_generated_tokens_total`, `flare_active_requests`, and
-`flare_free_kv_pages`, except the standard `process_*` series described below.
-Beyond the JSON fields below, the
+`flare_free_kv_pages`. Beyond the JSON fields below, the
 text includes speculative and proposal counters by batch, width, or depth, graph
 launches by kind, embedding row-cache counters, HTTP admission gauges, and
 uptime. `flare_history_drafts_enabled` reports whether shared decoded history
@@ -314,11 +313,6 @@ and `flare_time_per_output_token_seconds` are recorded only for requests with at
 least two generated tokens; `flare_request_prompt_tokens` counts prompt tokens
 including tokens reused from the prefix cache. Cancelled and failed requests
 enter only `flare_requests_cancelled_total` and `flare_requests_failed_total`.
-
-On Linux the text also carries `process_cpu_seconds_total`,
-`process_resident_memory_bytes`, `process_virtual_memory_bytes`,
-`process_start_time_seconds`, `process_open_fds`, and `process_max_fds` for the
-serving process. Other platforms omit them.
 
 The route returns one JSON object instead when the query contains `format=json`,
 or when the `Accept` header gives `application/json` a higher quality than

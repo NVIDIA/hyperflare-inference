@@ -706,7 +706,6 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
     ] {
         metrics::metric(&mut text, name, "gauge", help, value as u64);
     }
-    metrics::process::render(&mut text);
     (
         [
             (header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),

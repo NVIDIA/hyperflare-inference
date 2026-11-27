@@ -288,7 +288,7 @@ fn open_file_budget(current: u64, required: u64, limit: u64) -> Result<()> {
 }
 
 /// Descriptors this process currently holds, when the platform can report them.
-pub(crate) fn open_descriptors() -> Option<u64> {
+fn open_descriptors() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_dir("/proc/self/fd")

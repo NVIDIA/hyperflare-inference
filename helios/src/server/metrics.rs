@@ -9,7 +9,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub(super) mod process;
 pub(super) mod scheduler;
 
 pub(super) fn input_metrics(

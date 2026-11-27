@@ -5395,8 +5395,6 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
         body.contains("\nflare_request_e2e_seconds_bucket{le=\"+Inf\"} 0\n"),
         "{body}"
     );
-    #[cfg(target_os = "linux")]
-    assert!(body.contains("\nprocess_resident_memory_bytes "), "{body}");
     assert_eq!(get("/metrics?format=yaml", None).await.unwrap().0, 400);
     assert_eq!(get("/health", None).await.unwrap().0, 200);
     assert_eq!(get("/v1/models", None).await.unwrap().0, 401);
