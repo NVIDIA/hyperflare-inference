@@ -313,7 +313,7 @@ class Plan:
 
     @property
     def demand_pages(self) -> int:
-        return self.concurrency * (self.recipe.context // self.page_tokens)
+        return self.concurrency * (self.declared_context // self.page_tokens)
 
     @property
     def page_tokens(self) -> int:
@@ -345,14 +345,19 @@ class Plan:
         return self.pages * self.page_tokens
 
     @property
+    def declared_context(self) -> int:
+        """The longest sequence the checkpoint's configuration serves."""
+        return self.checkpoint.context or self.recipe.context
+
+    @property
     def context(self) -> int:
         """The longest sequence one request may reach."""
-        return min(self.recipe.context, self.tokens)
+        return min(self.declared_context, self.tokens)
 
     @property
     def guaranteed_tokens(self) -> int:
         """Tokens every request can hold while all admitted requests are active."""
-        return min(self.recipe.context, self.pages // self.concurrency * self.page_tokens)
+        return min(self.declared_context, self.pages // self.concurrency * self.page_tokens)
 
     @property
     def snapshots(self) -> int:
@@ -380,7 +385,9 @@ class Plan:
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "benchmark_selection": None if self.benchmark_selection is None else self.benchmark_selection.to_dict(),
             "context": self.context,
-            "checkpoint_context": self.recipe.context,
+            "checkpoint_context": self.declared_context,
+            **({} if self.checkpoint.rope_parameters is None
+               else {"rope_parameters": dict(self.checkpoint.rope_parameters)}),
             "weights_bytes": self.weights_bytes,
             "mapped_host_bytes": self.checkpoint.mapped_host_bytes,
             "graph_bytes": self.graph_bytes,
