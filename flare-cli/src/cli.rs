@@ -517,6 +517,7 @@ impl OrbitPush {
             host: "127.0.0.1".parse().unwrap(),
             port: 8000,
             served_model_name: None,
+            enable_per_request_metrics: false,
             roce_ring: self.roce_ring,
             roce_chain: self.roce_chain,
             rendezvous: None,
@@ -620,6 +621,10 @@ pub struct OrbitRun {
     #[arg(long, value_name = "ALIAS", value_parser = served_model_name, help_heading = "Serving options")]
     pub served_model_name: Option<String>,
 
+    /// Include per-request timing metrics in OpenAI chat and completion responses.
+    #[arg(long, help_heading = "Serving options")]
+    pub enable_per_request_metrics: bool,
+
     /// Favor throughput or output cadence [default: saved group or balanced].
     #[arg(long, value_name = "MODE",
         value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
@@ -689,6 +694,9 @@ impl OrbitRun {
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
         }
+        if self.enable_per_request_metrics {
+            options.push("--enable-per-request-metrics".into());
+        }
         options
     }
 
@@ -699,6 +707,7 @@ impl OrbitRun {
             host: self.host.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
             port: self.port.unwrap_or(8000),
             served_model_name: self.served_model_name.clone(),
+            enable_per_request_metrics: self.enable_per_request_metrics,
             roce_ring: self.roce_ring,
             roce_chain: self.roce_chain,
             rendezvous: None,
@@ -763,6 +772,10 @@ pub struct Run {
     /// Replace the core's serving alias; the canonical model ID remains accepted.
     #[arg(long, value_name = "ALIAS", value_parser = served_model_name, help_heading = "Serving options")]
     pub served_model_name: Option<String>,
+
+    /// Include per-request timing metrics in OpenAI chat and completion responses.
+    #[arg(long, help_heading = "Serving options")]
+    pub enable_per_request_metrics: bool,
 
     /// Experimental ring in rank order: only neighbor RoCE QPs connect;
     /// native CPU relays forward non-neighbor traffic. Also emulates a ring on a switch.
@@ -1500,6 +1513,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn per_request_metrics_flag_is_off_by_default_and_forwards_to_rank_zero() {
+        assert!(!run(&["flare", "run", "model"]).enable_per_request_metrics);
+        assert!(run(&["flare", "run", "model", "--enable-per-request-metrics"])
+            .enable_per_request_metrics);
     }
 
     fn run(arguments: &[&str]) -> Run {

@@ -879,6 +879,30 @@ before the final usage chunk arrives. Each emitted chunk carries cumulative
 native token counts; text chunks can combine multiple tokens, so counting
 chunks does not measure generated tokens. The final usage chunk is also emitted.
 
+## Per-request metrics
+
+`--enable-per-request-metrics`, or `[server] per_request_metrics = true`, makes
+OpenAI Chat and Completions responses carry a `metrics` object with the timing
+of that request, matching vLLM's per-request metrics. The option is off by
+default. A non-streaming response carries the object at the top level; a
+streaming response carries it only on the final usage chunk, so a stream needs
+`"stream_options": {"include_usage": true}` to receive it. With `n` choices the
+object is null, because one sequence's timing cannot describe the whole
+response. Anthropic Messages and OpenAI Responses responses do not include it.
+
+| Field | Meaning |
+| --- | --- |
+| `time_to_first_token_ms` | HTTP admission to the first output token; vLLM measures from scheduler admission, which the HTTP layer cannot observe |
+| `time_to_first_content_token_ms` | HTTP admission to the first non-empty answer or reasoning text; streaming only, and null for non-streaming requests |
+| `generation_time_ms` | First output token to the last output token |
+| `queue_time_ms` | Always null: the HTTP layer does not separate queueing from prefill |
+| `mean_itl_ms` | `generation_time_ms` divided by output tokens after the first; null for a single-token response |
+| `tokens_per_second` | Output tokens over the interval from HTTP admission to the last output token |
+
+Fields are null when the request produced no such interval. Enabling the option
+makes the serving process read the clock once per output token and keep the
+first and last instants; disabling it reads no clock for timing.
+
 ## Raw completions
 
 `prompt` accepts a string, an array of strings, a token-ID array, or an array of

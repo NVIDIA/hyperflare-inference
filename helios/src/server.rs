@@ -128,6 +128,9 @@ pub struct ServerConfig {
     pub context_hint: String,
     /// Setting that raises request or page capacity, appended to capacity rejections.
     pub capacity_hint: String,
+    /// Include vLLM-compatible per-request timing metrics in OpenAI chat and
+    /// completion responses.
+    pub per_request_metrics: bool,
     pub scheduling_policy: crate::scheduler::PolicyConfig,
 }
 impl Default for ServerConfig {
@@ -144,6 +147,7 @@ impl Default for ServerConfig {
             thinking_token_budget: None,
             context_hint: String::new(),
             capacity_hint: String::new(),
+            per_request_metrics: false,
             scheduling_policy: crate::scheduler::PolicyConfig::default(),
         }
     }
@@ -169,6 +173,7 @@ struct HttpState {
     thinking_token_budget: Option<u32>,
     context_hint: String,
     capacity_hint: String,
+    per_request_metrics: bool,
     response_model: String,
     started: Instant,
     generated: Mutex<VecDeque<(Instant, u64)>>,
@@ -327,6 +332,7 @@ impl Server {
             thinking_token_budget: config.thinking_token_budget,
             context_hint: config.context_hint.clone(),
             capacity_hint: config.capacity_hint.clone(),
+            per_request_metrics: config.per_request_metrics,
             response_model: models::response_name(model.config(), &config.served_names).to_owned(),
             started: Instant::now(),
             generated: Mutex::new(VecDeque::new()),

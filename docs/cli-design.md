@@ -735,6 +735,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--port N` | Listener port | `[server] port`, otherwise `8000` |
 | `--served-model-name ALIAS` | Replace the core's serving aliases with this nonblank alias | Core aliases |
 | `--api-key-file PATH` | File containing the serving API key; an empty file disables authentication | `[server] api_key`, otherwise no authentication |
+| `--enable-per-request-metrics` | Add a `metrics` timing object to OpenAI Chat and Completions responses | `[server] per_request_metrics`, otherwise off |
 | `--max-concurrency N` | Reduce concurrency within captured batch capacities | Model/default configuration, otherwise core default |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise core serving reserve |
@@ -1316,7 +1317,7 @@ An absent default file supplies no overrides; an explicitly selected missing
 file or an invalid runtime setting is an error. Help does not read the file.
 
 Native `flare run` applies `[server] host`, `port`, `api_key`, `thinking_token_budget`,
-and `scheduler_checkpoint_extra_work_fraction`,
+`per_request_metrics`, and `scheduler_checkpoint_extra_work_fraction`,
 `[memory] reserve`, `[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
 settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
 use `[paths] core_cache`. Flags override these defaults, including explicit

@@ -31,6 +31,7 @@ pub struct Server {
     pub api_key: Option<String>,
     pub thinking_token_budget: Option<std::num::NonZeroU32>,
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
+    pub per_request_metrics: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -130,6 +131,10 @@ impl Configuration {
         self.server
             .thinking_token_budget
             .map(std::num::NonZeroU32::get)
+    }
+
+    pub fn per_request_metrics(&self) -> bool {
+        self.server.per_request_metrics.unwrap_or(false)
     }
 }
 

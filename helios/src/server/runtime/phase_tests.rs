@@ -4139,10 +4139,20 @@ fn http_state(
 }
 
 fn http_state_for(
+    fixture: Fixture,
+    sender: mpsc::SyncSender<Vec<Incoming>>,
+    api_key: Option<String>,
+    served_names: &[String],
+) -> Arc<super::super::HttpState> {
+    http_state_with(fixture, sender, api_key, served_names, false)
+}
+
+fn http_state_with(
     mut fixture: Fixture,
     sender: mpsc::SyncSender<Vec<Incoming>>,
     api_key: Option<String>,
     served_names: &[String],
+    per_request_metrics: bool,
 ) -> Arc<super::super::HttpState> {
     use super::super::HttpState;
     use tokio::sync::Semaphore;
@@ -4193,6 +4203,7 @@ fn http_state_for(
         thinking_token_budget: None,
         context_hint: String::new(),
         capacity_hint: String::new(),
+        per_request_metrics,
         response_model,
         started: std::time::Instant::now(),
         generated: Default::default(),
@@ -4372,10 +4383,23 @@ async fn http_generation_request_observed(
     Vec<Incoming>,
     Arc<super::super::HttpState>,
 ) {
+    http_generation_request_with(path, body, served_names, false).await
+}
+
+async fn http_generation_request_with(
+    path: &str,
+    body: serde_json::Value,
+    served_names: &[String],
+    per_request_metrics: bool,
+) -> (
+    tokio::task::JoinHandle<axum::response::Response>,
+    Vec<Incoming>,
+    Arc<super::super::HttpState>,
+) {
     use super::super::http;
     use axum::{Extension, extract::State};
     let (sender, receiver) = mpsc::sync_channel(4);
-    let state = http_state_for(Fixture::new(), sender, None, served_names);
+    let state = http_state_with(Fixture::new(), sender, None, served_names, per_request_metrics);
     let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
     let request = axum::http::Request::builder()
         .method("POST")
@@ -4445,6 +4469,134 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
         }
         assert_eq!(state.first_response.snapshot().samples, u64::from(poll_body));
     }
+}
+
+#[tokio::test]
+async fn per_request_metrics_report_vllm_timings_when_enabled() {
+    let request = serde_json::json!({
+        "messages": [{"role": "user", "content": "a"}],
+        "max_tokens": 2, "stream": false,
+    });
+    let (response, incoming, _state) =
+        http_generation_request_with("/v1/chat/completions", request, &[], true).await;
+    incoming[0].notify_admission(Ok(()));
+    incoming[0].emit_token(1);
+    incoming[0].emit_token(2);
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: 1, generated_tokens: 2, reused_prompt_tokens: 0,
+        reason: "length", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let bytes = axum::body::to_bytes(response.await.unwrap().into_body(), 65536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let metrics = &body["metrics"];
+    assert!(metrics["time_to_first_token_ms"].as_f64().is_some_and(|v| v > 0.0), "{body}");
+    assert!(metrics["generation_time_ms"].as_f64().is_some_and(|v| v >= 0.0), "{body}");
+    assert!(metrics["mean_itl_ms"].as_f64().is_some(), "{body}");
+    assert!(metrics["tokens_per_second"].as_f64().is_some_and(|v| v > 0.0), "{body}");
+    assert!(metrics["time_to_first_content_token_ms"].is_null(), "{body}");
+    assert!(metrics["queue_time_ms"].is_null(), "{body}");
+
+    // The same response without the option carries no metrics object.
+    let request = serde_json::json!({
+        "messages": [{"role": "user", "content": "a"}],
+        "max_tokens": 1, "stream": false,
+    });
+    let (response, incoming, _state) =
+        http_generation_request_observed("/v1/chat/completions", request, &[]).await;
+    incoming[0].notify_admission(Ok(()));
+    incoming[0].emit_token(1);
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: 1, generated_tokens: 1, reused_prompt_tokens: 0,
+        reason: "length", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let bytes = axum::body::to_bytes(response.await.unwrap().into_body(), 65536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body.get("metrics").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn per_request_metrics_ride_the_final_usage_chunk() {
+    let request = serde_json::json!({
+        "messages": [{"role": "user", "content": "a"}],
+        "max_tokens": 2, "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    let (response, incoming, _state) =
+        http_generation_request_with("/v1/chat/completions", request, &[], true).await;
+    let response = response.await.unwrap();
+    incoming[0].notify_admission(Ok(()));
+    for token in [1, 2] {
+        incoming[0].observe_token(token);
+        incoming[0].emit_token(token);
+    }
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: 1, generated_tokens: 2, reused_prompt_tokens: 0,
+        reason: "length", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.contains("\"metrics\""))
+        .unwrap_or_else(|| panic!("no metrics chunk in {text}"));
+    let value: serde_json::Value =
+        serde_json::from_str(line.trim_start_matches("data: ")).unwrap();
+    assert_eq!(value["choices"], serde_json::json!([]), "metrics ride the usage chunk");
+    let metrics = &value["metrics"];
+    assert!(
+        metrics["time_to_first_content_token_ms"].as_f64().is_some_and(|v| v >= 0.0),
+        "{value}"
+    );
+    assert!(metrics["mean_itl_ms"].as_f64().is_some(), "{value}");
+
+    // Without usage reporting there is no final usage chunk to carry the object.
+    let request = serde_json::json!({
+        "messages": [{"role": "user", "content": "a"}],
+        "max_tokens": 2, "stream": true,
+    });
+    let (response, incoming, _state) =
+        http_generation_request_with("/v1/chat/completions", request, &[], true).await;
+    let response = response.await.unwrap();
+    incoming[0].notify_admission(Ok(()));
+    for token in [1, 2] {
+        incoming[0].observe_token(token);
+        incoming[0].emit_token(token);
+    }
+    incoming[0].emit(GenerationEvent::Finished {
+        prompt_tokens: 1, generated_tokens: 2, reused_prompt_tokens: 0,
+        reason: "length", stop_sequence: None,
+        termination: crate::output::Termination::OutputLimit,
+    });
+    let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!text.contains("\"metrics\""), "{text}");
+}
+
+#[tokio::test]
+async fn per_request_metrics_suppress_multi_choice_responses() {
+    let request = serde_json::json!({
+        "prompt": "a", "max_tokens": 1, "n": 2, "stream": false,
+    });
+    let (response, incoming, _state) =
+        http_generation_request_with("/v1/completions", request, &[], true).await;
+    for handle in &incoming {
+        handle.notify_admission(Ok(()));
+    }
+    for handle in &incoming {
+        handle.emit_token(1);
+        handle.emit(GenerationEvent::Finished {
+            prompt_tokens: 1, generated_tokens: 1, reused_prompt_tokens: 0,
+            reason: "length", stop_sequence: None,
+            termination: crate::output::Termination::OutputLimit,
+        });
+    }
+    let bytes = axum::body::to_bytes(response.await.unwrap().into_body(), 65536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["choices"].as_array().map(Vec::len), Some(2), "{body}");
+    assert!(body["metrics"].is_null(), "{body}");
 }
 
 #[tokio::test]

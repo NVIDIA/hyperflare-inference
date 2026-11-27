@@ -29,6 +29,7 @@ pub struct Settings {
     pub publisher_keys: Vec<PathBuf>,
     pub thinking_token_budget: Option<u32>,
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
+    pub per_request_metrics: bool,
     pub prefix_cache: PrefixCacheOffload,
     pub model_concurrency: std::collections::HashMap<String, usize>,
 }
@@ -155,6 +156,7 @@ impl Settings {
             pool: None,
         };
         let thinking_token_budget = configuration.thinking_token_budget();
+        let per_request_metrics = configuration.per_request_metrics();
         let model_concurrency = configuration
             .models
             .into_iter()
@@ -207,6 +209,7 @@ impl Settings {
             publisher_keys: Vec::new(),
             thinking_token_budget,
             scheduler_checkpoint_extra_work_fraction: configuration.server.scheduler_checkpoint_extra_work_fraction,
+            per_request_metrics,
             prefix_cache,
             model_concurrency,
         })
@@ -277,6 +280,23 @@ mod runtime_tests {
         assert_eq!(desired.api_key.as_deref(),Some("unchanged-secret"));
         assert!(!serde_json::to_string(&desired.runtime).unwrap().contains("secret"));
     }
+    #[test]
+    fn per_request_metrics_default_to_off_and_follow_the_server_section() {
+        for (text, expected) in [
+            ("", false),
+            ("[server]\nper_request_metrics=true\n", true),
+            ("[server]\nper_request_metrics=false\n", false),
+        ] {
+            let settings = Settings::resolve(
+                Configuration::parse(text).unwrap(),
+                Path::new("user"),
+                Path::new("config.toml"),
+            )
+            .unwrap();
+            assert_eq!(settings.per_request_metrics, expected, "{text}");
+        }
+    }
+
     #[test]
     fn explicit_desktop_concurrency_wins_over_conflicting_model_aliases() {
         let config=Configuration::parse("[models.first]\nmax_concurrency=2\n[models.second]\nmax_concurrency=3\n").unwrap();

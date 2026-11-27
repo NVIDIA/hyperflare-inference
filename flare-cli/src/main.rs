@@ -352,6 +352,8 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     }
     config["api_key"] = key.into();
     config["thinking_token_budget"] = serde_json::json!(configuration.thinking_token_budget());
+    config["per_request_metrics"] =
+        (args.enable_per_request_metrics || configuration.per_request_metrics()).into();
     phase.finish(config["model_id"].as_str().unwrap_or_default());
     serve(owner, config, progress, cluster, routing)?;
     #[cfg(unix)]

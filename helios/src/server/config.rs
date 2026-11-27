@@ -354,6 +354,11 @@ impl Bootstrap {
             served_names,
             context_hint: optional_text("context_hint")?,
             capacity_hint: optional_text("capacity_hint")?,
+            per_request_metrics: match object.get("per_request_metrics") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                _ => return Err("per_request_metrics must be a boolean".into()),
+            },
             bind: object
                 .get("bind")
                 .and_then(Value::as_str)

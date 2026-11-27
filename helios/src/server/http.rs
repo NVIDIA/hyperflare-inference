@@ -119,6 +119,80 @@ enum Delivery {
     Failed(Error, Frame),
 }
 
+/// Per-request instants for the `metrics` response object. Field names follow
+/// vLLM's per-request metrics; the interval starts at HTTP admission because the
+/// HTTP layer has no earlier scheduler boundary.
+struct RequestTiming {
+    started: Instant,
+    first_token: Option<Instant>,
+    last_token: Option<Instant>,
+    first_content: Option<Instant>,
+    seen_tokens: u64,
+    committed_tokens: u64,
+    streaming: bool,
+}
+
+impl RequestTiming {
+    fn new(started: Instant, streaming: bool) -> Self {
+        Self {
+            started,
+            first_token: None,
+            last_token: None,
+            first_content: None,
+            seen_tokens: 0,
+            committed_tokens: 0,
+            streaming,
+        }
+    }
+
+    fn token(&mut self) {
+        let now = Instant::now();
+        self.first_token.get_or_insert(now);
+        self.last_token = Some(now);
+        self.seen_tokens += 1;
+    }
+
+    fn content(&mut self) {
+        self.first_content.get_or_insert_with(Instant::now);
+    }
+
+    /// Elapsed milliseconds between two instants.
+    fn millis(start: Instant, end: Instant) -> f64 {
+        end.saturating_duration_since(start).as_secs_f64() * 1000.0
+    }
+
+    fn value(&self) -> Value {
+        let first = self.first_token;
+        let last = self.last_token;
+        let generation = first
+            .zip(last)
+            .filter(|(first, last)| last > first)
+            .map(|(first, last)| Self::millis(first, last));
+        let mean_itl = match (first, last) {
+            (Some(first), Some(last)) if self.seen_tokens > 1 => {
+                Some(Self::millis(first, last) / (self.seen_tokens - 1) as f64)
+            }
+            _ => None,
+        };
+        let throughput = last.map(|last| {
+            let seconds = last.saturating_duration_since(self.started).as_secs_f64();
+            self.committed_tokens as f64 / seconds.max(f64::MIN_POSITIVE)
+        });
+        json!({
+            "time_to_first_token_ms": first.map(|first| Self::millis(self.started, first)),
+            "time_to_first_content_token_ms": if self.streaming {
+                self.first_content.map(|content| Self::millis(self.started, content))
+            } else {
+                None
+            },
+            "generation_time_ms": generation,
+            "queue_time_ms": Value::Null,
+            "mean_itl_ms": mean_itl,
+            "tokens_per_second": throughput,
+        })
+    }
+}
+
 pub(super) async fn generate(
     State(state): State<Arc<HttpState>>,
     Extension(ingress): Extension<Arc<OwnedSemaphorePermit>>,
@@ -381,6 +455,11 @@ pub(super) async fn generate(
     encoder.set_strict_validators(strict_validators);
     encoder.set_continuous_usage(continuous_usage);
     let streaming = decoded.stream;
+    let per_request_metrics =
+        state.per_request_metrics && matches!(protocol, Protocol::Chat | Protocol::Completions);
+    // vLLM suppresses the object for n > 1: one sequence's timing cannot describe
+    // the whole response.
+    let single_choice = decoded.request.choices == 1;
     let stream_state = state.clone();
     let stream_id = id.clone();
     let delivery = async_stream::stream! {
@@ -400,6 +479,7 @@ pub(super) async fn generate(
         let mut raw_tokens = Vec::new();
         let mut timestamps = Vec::new();
         let mut reused_total = 0;
+        let mut timing = RequestTiming::new(admitted_at, streaming);
         if streaming && protocol == Protocol::Chat {
             // Chat has one choice and rejects streamed prompt logprobs, so no
             // output queue needs draining before the first raw token is ready.
@@ -422,6 +502,12 @@ pub(super) async fn generate(
                 match encoder.apply(i, vec![crate::output::Event::Content(echo)]) {
                     Ok(frames) => {
                         for frame in frames {
+                            if per_request_metrics
+                                && streaming
+                                && super::latency::stream_text(&frame.data)
+                            {
+                                timing.content();
+                            }
                             yield Delivery::Frame(frame)
                         }
                     }
@@ -476,12 +562,18 @@ pub(super) async fn generate(
             }
             let result = match event {
                 GenerationEvent::PromptLogprobs { start, tokens, values } => encoder.prompt_logprobs(index, start, &tokens, &values),
-                GenerationEvent::LogprobToken(value) => decoders[index]
-                    .push_logprob(value)
-                    .and_then(|events| encoder.apply(index, events)),
-                GenerationEvent::Token(token) => decoders[index]
-                    .push(token)
-                    .and_then(|events| encoder.apply(index, events)),
+                GenerationEvent::LogprobToken(value) => {
+                    timing.token();
+                    decoders[index]
+                        .push_logprob(value)
+                        .and_then(|events| encoder.apply(index, events))
+                }
+                GenerationEvent::Token(token) => {
+                    timing.token();
+                    decoders[index]
+                        .push(token)
+                        .and_then(|events| encoder.apply(index, events))
+                }
                 GenerationEvent::Protocol(pieces) => decoders[index]
                     .push_protocol(pieces)
                     .and_then(|events| encoder.apply(index, events)),
@@ -522,6 +614,7 @@ pub(super) async fn generate(
                     ..
                 } => {
                     reused_total += reused_prompt_tokens;
+                    timing.committed_tokens += u64::from(generated_tokens);
                     let result = decoders[index]
                         .finish(if encoder.tool_limit_reached { crate::output::Termination::Cancelled } else { termination })
                         .and_then(|events| encoder.apply(index, events))
@@ -566,7 +659,26 @@ pub(super) async fn generate(
                 }
             }
             match result {
-                Ok(frames) => {
+                Ok(mut frames) => {
+                    if per_request_metrics && streaming {
+                        for frame in &frames {
+                            if super::latency::stream_text(&frame.data) {
+                                timing.content();
+                            }
+                        }
+                        // vLLM attaches metrics to the final usage chunk, which a
+                        // stream carries only when usage reporting is enabled.
+                        if observation.include_usage
+                            && let Some(done) = frames.iter().position(|frame| frame.done)
+                            && let Some(target) = frames[..done].last_mut()
+                        {
+                            target.data["metrics"] = if single_choice {
+                                timing.value()
+                            } else {
+                                Value::Null
+                            };
+                        }
+                    }
                     for frame in frames {
                         yield Delivery::Frame(frame)
                     }
@@ -579,6 +691,13 @@ pub(super) async fn generate(
             }
         }
         let mut response = encoder.response();
+        if per_request_metrics && !streaming {
+            response["metrics"] = if single_choice {
+                timing.value()
+            } else {
+                Value::Null
+            };
+        }
         if protocol == Protocol::Chat {
             if let Some(ids) = prompt_ids {
                 response["prompt_token_ids"] = json!(ids);
