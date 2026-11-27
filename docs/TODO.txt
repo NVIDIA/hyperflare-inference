@@ -347,12 +347,18 @@
     tensor-parallel export with replicated attention weights and native flare
     run serving pass on that hardware and transport.
 
-[ ] Build and test fabric Engram storage: cargo check and cargo test for
-    helios, flare and flare-cli with and without the engram-rdma feature, the
-    loopback tests with FLARE_RUN_RDMA_TESTS=1 on rdma_rxe, and
-    verification/helios-lifecycle/check.py for the failed-frame retirement in
-    the runtime worker. Close when both configurations pass and the loopback
-    gather, store-restart and refusal tests pass. See engram-store.md.
+[ ] Run the fabric Engram loopback tests on a host with a RoCE v2 device on
+    loopback, such as rdma_rxe: FLARE_RUN_RDMA_TESTS=1 cargo test
+    --manifest-path helios/Cargo.toml --features
+    runtime-core,server,engram-rdma fabric. Close when the gather comparison
+    with the disk reader, the store death and restart test and the identity and
+    layout refusals pass. See engram-store.md.
+
+[ ] Model failed-frame retirement in verification/helios-lifecycle: a frame
+    whose Engram gather failed, and frames already submitted for its requests,
+    emit no token and take no snapshot. The runtime worker rewrites their
+    completions (helios/src/server/runtime.rs, withhold). Close when the model
+    and check.py pass.
 
 [ ] Confirm that the Engram row-cache miss workspace registers and that an RDMA
     READ into it reproduces the store's bytes between the real serving and store
@@ -386,10 +392,10 @@
     one lane, whose depth is the device's confirmed max_qp_rd_atom. Close when
     the measured gather time is bandwidth-bound or the depth is accepted.
 
-[ ] Carry a transient Engram store failure across rank processes of a
-    multi-host core. A rank process fails its rank instead, because its frame
-    completion has no failure field. Close when the rank wire reports the
-    failed frame and rank zero retires its requests.
+[ ] Allow fabric Engram storage on multi-host cores. LoadOptions::select
+    rejects it with --rank because a rank process's frame completion carries
+    no Engram failure to rank zero. Close when the rank wire reports the failed
+    frame and rank zero retires its requests.
 
 [ ] Add a test that a transient fabric gather error leaves a Shared Engram layer
     usable for the next sequence of the same frame. It needs CUDA staging frames

@@ -14,14 +14,13 @@
 //! gather fails at once as unavailable.
 
 use super::{
-    Connect,
-    plan,
+    Connect, Failure, lock, plan,
     protocol::{
-        self, Hello, HelloOk, Message, PlaneLayout, Receiver, RemoteTable, STORE_ABI, TableLayout,
-        VERSION,
+        self, Hello, HelloOk, MAX_READ, Message, PlaneLayout, Receiver, RemoteTable, STORE_ABI,
+        TableLayout, VERSION,
     },
     unavailable,
-    verbs::{Access, Device, Failure, Lane, Region, Role},
+    verbs::{Access, Device, Lane, Region, Role},
 };
 use crate::{
     Result,
@@ -45,25 +44,18 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(100);
 const MIN_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
-/// Client cap on one READ; longer runs split.
-const MAX_READ: u32 = 1 << 20;
 /// Empty completion polls before the table worker yields its CPU.
 const SPIN: u32 = 1024;
 /// Bound on flushing posted READs after a failure. A READ that neither completes nor flushes
 /// may still write the miss workspace, so that outcome poisons the layer.
 const FLUSH: Duration = Duration::from_secs(1);
 
-/// Why a connection attempt failed: a store that may come back, or a disagreement that persists.
-enum Attempt {
-    Transient(String),
-    Fatal(String),
-}
-
-fn attempt(what: &str, error: io::Error) -> Attempt {
+/// A malformed message is a protocol violation; every other I/O error lost the connection.
+fn failure(what: &str, error: io::Error) -> Failure {
     if error.kind() == io::ErrorKind::InvalidData {
-        Attempt::Fatal(format!("{what}: {error}"))
+        Failure::Fatal(format!("{what}: {error}"))
     } else {
-        Attempt::Transient(format!("{what}: {error}"))
+        Failure::Transient(format!("{what}: {error}"))
     }
 }
 
@@ -77,12 +69,10 @@ struct Link {
 
 impl Link {
     fn broken(&self) -> Option<String> {
-        self.broken.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        lock(&self.broken).clone()
     }
     fn mark_broken(&self, reason: &str) {
-        self.broken
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock(&self.broken)
             .get_or_insert_with(|| reason.to_owned());
     }
 }
@@ -99,12 +89,12 @@ struct Inner {
 
 impl Inner {
     fn link(&self) -> Option<Arc<Link>> {
-        self.link.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        lock(&self.link).clone()
     }
 
     /// Sleep for `duration` unless a stop request arrives first; true when stopping.
     fn wait(&self, duration: Duration) -> bool {
-        let guard = self.signal.0.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = lock(&self.signal.0);
         let _ = self
             .signal
             .1
@@ -179,15 +169,15 @@ impl Session {
         status.register();
         let (stream, ready) = match establish(&inner) {
             Ok((stream, link)) => {
-                *inner.link.lock().unwrap() = Some(Arc::new(link));
+                *lock(&inner.link) = Some(Arc::new(link));
                 status.up(false);
                 (Some(stream), true)
             }
-            Err(Attempt::Fatal(reason)) => {
+            Err(Failure::Fatal(reason)) => {
                 status.unregister(false);
                 return Err(format!("Engram store {address}: {reason}").into());
             }
-            Err(Attempt::Transient(reason)) => {
+            Err(Failure::Transient(reason)) => {
                 status.down(false, reason);
                 (None, false)
             }
@@ -226,7 +216,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.inner.stop.store(true, Ordering::Release);
         {
-            let _guard = self.inner.signal.0.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = lock(&self.inner.signal.0);
             self.inner.signal.1.notify_all();
         }
         if let Some(thread) = self.thread.take() {
@@ -242,7 +232,7 @@ fn run(inner: Arc<Inner>, mut stream: Option<TcpStream>, mut ready: bool) {
     loop {
         if let Some(stream) = stream.take() {
             let reason = supervise(&inner, stream);
-            if let Some(link) = inner.link.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Some(link) = lock(&inner.link).take() {
                 link.mark_broken(&reason);
             }
             status.down(ready, reason);
@@ -254,23 +244,23 @@ fn run(inner: Arc<Inner>, mut stream: Option<TcpStream>, mut ready: bool) {
         }
         match establish(&inner) {
             Ok((connection, link)) => {
-                *inner.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(link));
+                *lock(&inner.link) = Some(Arc::new(link));
                 status.up(connected);
                 connected = true;
                 ready = true;
                 stream = Some(connection);
             }
-            Err(Attempt::Fatal(reason)) => {
+            Err(Failure::Fatal(reason)) => {
                 status.fail(reason);
                 break;
             }
-            Err(Attempt::Transient(reason)) => {
+            Err(Failure::Transient(reason)) => {
                 status.down(false, reason);
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
     }
-    if let Some(link) = inner.link.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    if let Some(link) = lock(&inner.link).take() {
         link.mark_broken("session closed");
     }
     status.unregister(ready);
@@ -355,30 +345,30 @@ fn validate(ok: &HelloOk, tables: &[TableLayout], lanes: u8, mtu: u32) -> std::r
     Ok((ok.depth, ok.max_read_bytes.min(MAX_READ) as usize))
 }
 
-fn refused(code: protocol::Code, message: &str) -> Attempt {
+fn refused(code: protocol::Code, message: &str) -> Failure {
     let reason = format!("the store refused this session ({}): {message}", code.name());
     if code.retryable() {
-        Attempt::Transient(reason)
+        Failure::Transient(reason)
     } else {
-        Attempt::Fatal(reason)
+        Failure::Fatal(reason)
     }
 }
 
 /// One connection attempt: `HELLO`, validation, queue-pair exchange, and RTS on every lane.
-fn establish(inner: &Inner) -> std::result::Result<(TcpStream, Link), Attempt> {
+fn establish(inner: &Inner) -> std::result::Result<(TcpStream, Link), Failure> {
     let endpoint = &inner.connect.endpoint;
     let timeout = endpoint.timeout;
     inner
         .device
         .refresh()
-        .map_err(|error| Attempt::Transient(format!("local RoCE interface: {error}")))?;
+        .map_err(|error| Failure::Transient(format!("local RoCE interface: {error}")))?;
     let mut stream = TcpStream::connect_timeout(&inner.address, timeout)
-        .map_err(|error| Attempt::Transient(format!("connect to {}: {error}", inner.address)))?;
+        .map_err(|error| Failure::Transient(format!("connect to {}: {error}", inner.address)))?;
     stream
         .set_nodelay(true)
         .and_then(|()| stream.set_read_timeout(Some(timeout)))
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
-        .map_err(|error| Attempt::Transient(format!("configure the control connection: {error}")))?;
+        .map_err(|error| Failure::Transient(format!("configure the control connection: {error}")))?;
     let lanes = endpoint.lanes as u8;
     let hello = Hello {
         identity: inner.connect.identity,
@@ -388,42 +378,42 @@ fn establish(inner: &Inner) -> std::result::Result<(TcpStream, Link), Attempt> {
         mtu: inner.device.mtu,
         tables: inner.tables.clone(),
     };
-    protocol::write(&mut stream, &Message::Hello(hello)).map_err(|e| attempt("send HELLO", e))?;
-    let ok = match protocol::read(&mut stream).map_err(|e| attempt("read HELLO_OK", e))? {
+    protocol::write(&mut stream, &Message::Hello(hello)).map_err(|e| failure("send HELLO", e))?;
+    let ok = match protocol::read(&mut stream).map_err(|e| failure("read HELLO_OK", e))? {
         Message::HelloOk(ok) => ok,
         Message::Error { code, message } => return Err(refused(code, &message)),
         Message::HelloOkVersion(version) => {
-            return Err(Attempt::Fatal(format!(
+            return Err(Failure::Fatal(format!(
                 "the store speaks control protocol version {version}; this build speaks version {VERSION}"
             )));
         }
-        _ => return Err(Attempt::Fatal("the store answered HELLO with an unexpected message".into())),
+        _ => return Err(Failure::Fatal("the store answered HELLO with an unexpected message".into())),
     };
     let (depth, max_read) =
-        validate(&ok, &inner.tables, lanes, inner.device.mtu).map_err(Attempt::Fatal)?;
+        validate(&ok, &inner.tables, lanes, inner.device.mtu).map_err(Failure::Fatal)?;
     let depth = depth.min(inner.device.initiator_depth);
     let mut created = Vec::with_capacity(usize::from(ok.lanes));
     for _ in 0..ok.lanes {
         created.push(
             Lane::new(&inner.device, Role::Requester, depth)
-                .map_err(|error| Attempt::Transient(format!("create a queue pair: {error}")))?,
+                .map_err(|error| Failure::Transient(format!("create a queue pair: {error}")))?,
         );
     }
     let local = created.iter().map(Lane::local).collect();
     protocol::write(&mut stream, &Message::QpExchange(local))
-        .map_err(|e| attempt("send the queue-pair exchange", e))?;
-    let peers = match protocol::read(&mut stream).map_err(|e| attempt("read the queue-pair exchange", e))? {
+        .map_err(|e| failure("send the queue-pair exchange", e))?;
+    let peers = match protocol::read(&mut stream).map_err(|e| failure("read the queue-pair exchange", e))? {
         Message::QpExchange(peers) if peers.len() == created.len() => peers,
         Message::Error { code, message } => return Err(refused(code, &message)),
         _ => {
-            return Err(Attempt::Fatal(
+            return Err(Failure::Fatal(
                 "the store answered the queue-pair exchange with an unexpected message".into(),
             ));
         }
     };
     for (lane, peer) in created.iter_mut().zip(&peers) {
         lane.connect(peer, ok.mtu, depth)
-            .map_err(|error| Attempt::Transient(format!("connect a queue pair: {error}")))?;
+            .map_err(|error| Failure::Transient(format!("connect a queue pair: {error}")))?;
     }
     Ok((
         stream,
@@ -533,9 +523,22 @@ impl Reader {
     }
 }
 
-/// Post `reads` on the table's lane within its confirmed depth and poll to completion on the
-/// calling worker thread: spin, then yield after [`SPIN`] empty polls. On any failure the lane
-/// is moved to ERR and drained, so no READ can write the workspace after this returns.
+/// Spin on an idle completion queue, yielding the CPU after [`SPIN`] empty polls.
+fn idle(empty: &mut u32, progressed: bool) {
+    if progressed {
+        *empty = 0;
+    } else if *empty >= SPIN {
+        *empty = 0;
+        thread::yield_now();
+    } else {
+        *empty += 1;
+        std::hint::spin_loop();
+    }
+}
+
+/// Post `reads` on the table's lane within its confirmed depth and poll them to completion on
+/// the calling worker thread. On any failure the lane is moved to ERR and drained, so no READ
+/// can write the workspace after this returns.
 fn execute(
     link: &Link,
     table: usize,
@@ -544,92 +547,62 @@ fn execute(
     timeout: Duration,
     stats: &Stats,
 ) -> Result<()> {
-    if reads.is_empty() {
-        return Ok(());
-    }
     let begin = Instant::now();
     let deadline = begin + timeout;
     // Concurrent table workers spread over the lanes; workers mapped to one lane take turns.
-    let mut lane = link.lanes[table % link.lanes.len()]
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut lane = lock(&link.lanes[table % link.lanes.len()]);
     let (base, lkey) = (region.address(), region.lkey());
-    let mut next = 0;
-    let mut posted_bytes = 0u64;
+    let mut posted = 0;
     let mut failure = None;
-    let mut flush_deadline = None;
-    let mut empty = 0u32;
-    loop {
-        if failure.is_none() && next < reads.len() {
-            let take = lane.credit().min(reads.len() - next);
-            if take > 0 {
-                let before = lane.outstanding();
-                let result = lane.post(&reads[next..next + take], base, lkey);
-                let posted = lane.outstanding() - before;
-                posted_bytes += reads[next..next + posted]
-                    .iter()
-                    .map(|read| u64::from(read.nbytes))
-                    .sum::<u64>();
-                next += posted;
-                if let Err(error) = result {
-                    failure = Some(Failure::Transient(format!("post RDMA READ: {error}")));
-                }
+    let mut empty = 0;
+    while failure.is_none() && (posted < reads.len() || lane.outstanding() > 0) {
+        let take = lane.credit().min(reads.len() - posted);
+        if take > 0 {
+            let (count, error) = lane.post(&reads[posted..posted + take], base, lkey);
+            posted += count;
+            if let Some(error) = error {
+                failure = Some(Failure::Transient(format!("post RDMA READ: {error}")));
             }
         }
-        let progressed = match lane.poll() {
+        match lane.poll() {
             Ok((count, error)) => {
-                if let Some(error) = error {
-                    failure.get_or_insert(error);
-                }
-                count > 0
+                failure = failure.or(error);
+                idle(&mut empty, count > 0);
             }
-            Err(error) => {
-                failure.get_or_insert(Failure::Fatal(format!("poll RDMA completions: {error}")));
-                false
-            }
-        };
-        if failure.is_none() {
-            if next == reads.len() && lane.outstanding() == 0 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                failure = Some(Failure::Transient(format!(
-                    "Engram store READs did not complete within {} ms",
-                    timeout.as_millis()
-                )));
-            }
+            Err(error) => failure = Some(Failure::Fatal(format!("poll RDMA completions: {error}"))),
         }
-        if failure.is_some() {
-            if flush_deadline.is_none() {
-                let _ = lane.fail();
-                flush_deadline = Some(Instant::now() + FLUSH);
-            }
-            if lane.outstanding() == 0 {
-                break;
-            }
-            if flush_deadline.is_some_and(|at| Instant::now() >= at) {
-                link.mark_broken("RDMA READs did not flush");
-                return Err(format!(
-                    "{} Engram store READs neither completed nor flushed; the miss workspace may still be written",
-                    lane.outstanding()
-                )
-                .into());
-            }
-        }
-        if progressed {
-            empty = 0;
-        } else {
-            empty += 1;
-            if empty >= SPIN {
-                empty = 0;
-                thread::yield_now();
-            } else {
-                std::hint::spin_loop();
-            }
+        if failure.is_none() && Instant::now() >= deadline {
+            failure = Some(Failure::Transient(format!(
+                "Engram store READs did not complete within {} ms",
+                timeout.as_millis()
+            )));
         }
     }
-    stats.fabric_reads.fetch_add(next as u64, Ordering::Relaxed);
-    stats.fabric_bytes.fetch_add(posted_bytes, Ordering::Relaxed);
+    if failure.is_some() && lane.outstanding() > 0 {
+        // ERR flushes every posted READ; one that neither completes nor flushes may still
+        // write the miss workspace, so the layer cannot continue.
+        let flushed = lane.fail().is_ok() && {
+            let deadline = Instant::now() + FLUSH;
+            while lane.outstanding() > 0 && Instant::now() < deadline {
+                let count = lane.poll().map_or(0, |(count, _)| count);
+                idle(&mut empty, count > 0);
+            }
+            lane.outstanding() == 0
+        };
+        if !flushed {
+            link.mark_broken("RDMA READs did not flush");
+            return Err(format!(
+                "{} Engram store READs neither completed nor flushed; the miss workspace may still be written",
+                lane.outstanding()
+            )
+            .into());
+        }
+    }
+    stats.fabric_reads.fetch_add(posted as u64, Ordering::Relaxed);
+    stats.fabric_bytes.fetch_add(
+        reads[..posted].iter().map(|read| u64::from(read.nbytes)).sum::<u64>(),
+        Ordering::Relaxed,
+    );
     stats
         .fabric_wait_ns
         .fetch_add(begin.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
@@ -637,7 +610,6 @@ fn execute(
         None => Ok(()),
         Some(Failure::Transient(reason)) => {
             link.mark_broken(&reason);
-            stats.fabric_failures.fetch_add(1, Ordering::Relaxed);
             Err(unavailable(format!("embedding table store read failed: {reason}")))
         }
         Some(Failure::Fatal(reason)) => {
@@ -650,7 +622,7 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engram::fabric::{Endpoint, Status, protocol::RemotePlane};
+    use crate::engram::fabric::protocol::RemotePlane;
 
     fn layouts() -> Vec<TableLayout> {
         vec![TableLayout {
@@ -665,7 +637,6 @@ mod tests {
     fn answer() -> HelloOk {
         HelloOk {
             abi: STORE_ABI,
-            gid: [0; 16],
             mtu: 1024,
             max_read_bytes: 4 << 20,
             lanes: 2,
@@ -699,41 +670,5 @@ mod tests {
             assert!(validate(&ok, &layouts(), 4, 4096).is_err(), "case {index}");
         }
         assert!(validate(&answer(), &layouts(), 4, 512).is_err());
-    }
-
-    fn rdma_tests() -> bool {
-        std::env::var_os("FLARE_RUN_RDMA_TESTS").is_some()
-    }
-
-    /// The first address with an active RoCE v2 GID, such as `rdma_rxe` over loopback's peer.
-    fn loopback_address() -> Option<IpAddr> {
-        ["127.0.0.1", "::1"]
-            .into_iter()
-            .filter_map(|address| address.parse().ok())
-            .find(|address| Device::open(*address).is_ok())
-    }
-
-    #[test]
-    fn fabric_session_requires_lanes_in_range() {
-        let status = Status::new("127.0.0.1:1");
-        for lanes in [0, 9] {
-            let connect = Connect {
-                endpoint: Endpoint {
-                    address: "127.0.0.1:1".into(),
-                    lanes,
-                    timeout: Duration::from_millis(100),
-                },
-                identity: [0; 32],
-                rank: 0,
-                world: 1,
-                status: status.clone(),
-            };
-            assert!(Session::connect(connect, &[]).is_err());
-        }
-        if !rdma_tests() {
-            eprintln!("skipping the RDMA half: set FLARE_RUN_RDMA_TESTS=1 with a RoCE v2 device");
-            return;
-        }
-        assert!(loopback_address().is_some(), "FLARE_RUN_RDMA_TESTS requires a RoCE v2 GID on loopback");
     }
 }

@@ -27,10 +27,6 @@ pub struct RuntimeSettings {
     pub prefix_cache_drain_on_shutdown: String,
     pub embedding_table_storage: String,
     pub embedding_table_cache_size: String,
-    /// `HOST:PORT` of the Engram store; used only by fabric storage.
-    pub embedding_table_store: String,
-    pub embedding_table_store_lanes: Option<usize>,
-    pub embedding_table_store_timeout_ms: Option<u64>,
     pub mtp_draft_tokens: Option<usize>,
     pub history_drafts: Option<bool>,
     pub adaptive_verification: Option<bool>,
@@ -52,9 +48,6 @@ impl Default for RuntimeSettings {
             prefix_cache_drain_on_shutdown: "off".into(),
             embedding_table_storage: "auto".into(),
             embedding_table_cache_size: String::new(),
-            embedding_table_store: String::new(),
-            embedding_table_store_lanes: None,
-            embedding_table_store_timeout_ms: None,
             mtp_draft_tokens: None,
             history_drafts: None,
             adaptive_verification: None,
@@ -95,7 +88,6 @@ impl RuntimeSettings {
             ("shutdown drain", &self.prefix_cache_drain_on_shutdown),
             ("embedding storage", &self.embedding_table_storage),
             ("embedding cache", &self.embedding_table_cache_size),
-            ("embedding store", &self.embedding_table_store),
         ] {
             if value.len() > 64 {
                 return Err(format!("{name} value is too long"));
@@ -121,36 +113,8 @@ impl RuntimeSettings {
             "" | "auto" => None,
             "disk" => Some(Storage::Disk),
             "ram" => Some(Storage::Ram),
-            "fabric" => Some(Storage::Fabric),
-            _ => return Err("Embedding storage must be auto, disk, ram, or fabric".into()),
+            _ => return Err("Embedding storage must be auto, disk, or ram".into()),
         };
-        let store = self.embedding_table_store.trim();
-        base.embedding_table_store = (!store.is_empty()).then(|| store.to_owned());
-        base.embedding_table_store_lanes = self.embedding_table_store_lanes;
-        base.embedding_table_store_timeout_ms = self.embedding_table_store_timeout_ms;
-        let fabric = base.embedding_table_storage == Some(Storage::Fabric);
-        if fabric && base.embedding_table_store.is_none() {
-            return Err("Fabric embedding storage requires an embedding store as HOST:PORT".into());
-        }
-        if !fabric
-            && (base.embedding_table_store.is_some()
-                || self.embedding_table_store_lanes.is_some()
-                || self.embedding_table_store_timeout_ms.is_some())
-        {
-            return Err("Embedding store settings require fabric embedding storage".into());
-        }
-        if self
-            .embedding_table_store_lanes
-            .is_some_and(|lanes| !(1..=8).contains(&lanes))
-        {
-            return Err("Embedding store lanes must be 1 through 8".into());
-        }
-        if self
-            .embedding_table_store_timeout_ms
-            .is_some_and(|timeout| !(1..=600_000).contains(&timeout))
-        {
-            return Err("Embedding store timeout must be 1 through 600000 milliseconds".into());
-        }
         base.embedding_table_cache_bytes =
             budget(&self.embedding_table_cache_size, "Embedding row cache")?;
         if base.embedding_table_storage == Some(Storage::Ram)
@@ -205,7 +169,6 @@ pub(crate) struct RuntimeIdentity {
     adaptive_verification: Option<bool>,
     embedding_table_storage: Option<Storage>,
     embedding_table_cache_bytes: Option<u64>,
-    embedding_store: Option<flare_helios::engram::fabric::Endpoint>,
     prefix_cache: flare_helios::offload::PrefixCacheOffload,
 }
 impl RuntimeIdentity {
@@ -221,7 +184,6 @@ impl RuntimeIdentity {
             adaptive_verification: options.adaptive_verification,
             embedding_table_storage: Some(options.embedding_table_storage.unwrap_or_default()),
             embedding_table_cache_bytes: options.embedding_table_cache_bytes,
-            embedding_store: options.embedding_store(),
             prefix_cache: options.prefix_cache.clone(),
         })
     }
@@ -341,60 +303,9 @@ mod tests {
                 prefix_cache_max_age: "invalid".into(),
                 ..Default::default()
             },
-            RuntimeSettings {
-                embedding_table_storage: "fabric".into(),
-                ..Default::default()
-            },
-            RuntimeSettings {
-                embedding_table_store: "10.0.0.5:7700".into(),
-                ..Default::default()
-            },
-            RuntimeSettings {
-                embedding_table_storage: "ram".into(),
-                embedding_table_store_lanes: Some(2),
-                ..Default::default()
-            },
-            RuntimeSettings {
-                embedding_table_storage: "fabric".into(),
-                embedding_table_store: "10.0.0.5:7700".into(),
-                embedding_table_store_lanes: Some(9),
-                ..Default::default()
-            },
-            RuntimeSettings {
-                embedding_table_storage: "fabric".into(),
-                embedding_table_store: "10.0.0.5:7700".into(),
-                embedding_table_store_timeout_ms: Some(0),
-                ..Default::default()
-            },
-            RuntimeSettings {
-                embedding_table_storage: "remote".into(),
-                ..Default::default()
-            },
         ] {
             assert!(runtime.validate().is_err());
         }
-        let error = RuntimeSettings {
-            embedding_table_storage: "remote".into(),
-            ..Default::default()
-        }
-        .validate()
-        .unwrap_err();
-        assert_eq!(error, "Embedding storage must be auto, disk, ram, or fabric");
-        let options = RuntimeSettings {
-            embedding_table_storage: "fabric".into(),
-            embedding_table_store: " 10.0.0.5:7700 ".into(),
-            embedding_table_store_lanes: Some(2),
-            embedding_table_store_timeout_ms: Some(750),
-            ..Default::default()
-        }
-        .apply(LoadOptions::default(), "prefix".into())
-        .unwrap();
-        assert_eq!(options.embedding_table_storage, Some(Storage::Fabric));
-        let endpoint = options.embedding_store().unwrap();
-        assert_eq!(
-            (endpoint.address.as_str(), endpoint.lanes, endpoint.timeout.as_millis()),
-            ("10.0.0.5:7700", 2, 750)
-        );
         assert!(
             RuntimeSettings {
                 embedding_table_storage: String::new(),

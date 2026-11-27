@@ -1673,15 +1673,16 @@ impl<'a> Worker<'a> {
             }
         }
         // The graph of a failed frame consumed zeroed rows, and frames submitted after it
-        // continue from that state, so none of their records may emit tokens. Each becomes
-        // a device-error record at the request's committed progress, which retires the
+        // continue from that state, so none of their results may be delivered. Each lane
+        // becomes a device-error lane at the request's committed progress, which retires the
         // request without a snapshot.
         for lane in &measured_step.lanes {
             if self.engram_failures.iter().any(|(handle, _)| *handle == lane.request)
                 && let Ok(live) = self.scheduler.request(lane.request)
             {
-                withhold_record(
-                    &mut completion.records[lane.request.slot as usize],
+                withhold(
+                    &mut completion,
+                    lane.request.slot as usize,
                     live.consumed_tokens,
                     live.generated_tokens,
                 );
@@ -2899,8 +2900,26 @@ fn admit_with_host_store(
     result
 }
 
-/// Replace a completion record with one that reports a device error at the request's
-/// committed progress and emits no token.
+/// Replace one lane of a completion with a device error at the request's committed progress:
+/// its record emits no token, and its survival row observes no prefix, so every sidecar the
+/// scheduler checks against the record agrees with it. Logprob sidecars are decoded only
+/// for emitted tokens, and scored prompt logprobs only for records other than device errors.
+fn withhold(
+    completion: &mut crate::execution::FrameCompletion,
+    slot: usize,
+    consumed_tokens: u64,
+    generated_tokens: u32,
+) {
+    if let Some(row) = completion
+        .speculative_survival
+        .as_mut()
+        .and_then(|rows| rows.get_mut(slot))
+    {
+        row.fill(-1.0);
+    }
+    withhold_record(&mut completion.records[slot], consumed_tokens, generated_tokens);
+}
+
 fn withhold_record(
     record: &mut crate::execution::CompletionRecord,
     consumed_tokens: u64,

@@ -8,7 +8,8 @@
 //! The row cache passes its misses as sorted, unique row IDs and one output buffer laid out as
 //! `[count × weight rows][count × scale rows]`. Consecutive IDs are contiguous in both the
 //! store's plane and the output, so each run of consecutive IDs is one READ per plane, split
-//! only where a run exceeds the store's per-request limit.
+//! only where a run exceeds the store's per-request limit. Any other order is still read
+//! correctly, one run per break in the sequence.
 
 /// One plane to read: rows of `row_bytes` at `remote` under `rkey`, written to the output
 /// starting at byte offset `local`.
@@ -29,24 +30,21 @@ pub(crate) struct Read {
     pub nbytes: u32,
 }
 
-/// Append the READs for `ids` to `reads`. `ids` must be strictly increasing and nonnegative,
-/// as the row cache produces them; `max_read` caps every READ and must be nonzero.
+/// Append the READs for the nonnegative row `ids` to `reads`; `max_read` caps every READ.
 pub(crate) fn plan(
     ids: &[i64],
     planes: &[Plane],
     max_read: usize,
     reads: &mut Vec<Read>,
 ) -> Result<(), &'static str> {
+    // A zero limit would never finish splitting a run.
     if max_read == 0 || max_read > u32::MAX as usize {
         return Err("Engram store READ limit is out of range");
     }
-    if ids.first().is_some_and(|id| *id < 0) || ids.windows(2).any(|pair| pair[1] <= pair[0]) {
-        return Err("Engram store gathers require sorted, unique, nonnegative row IDs");
+    if ids.iter().any(|id| *id < 0) {
+        return Err("Engram store gathers read only nonnegative row IDs");
     }
     for plane in planes {
-        if plane.row_bytes == 0 {
-            return Err("Engram store plane has empty rows");
-        }
         let mut begin = 0;
         while begin < ids.len() {
             let first = ids[begin];
@@ -122,14 +120,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_id_order_and_limits_are_rejected() {
+    fn negative_ids_and_a_zero_read_limit_are_rejected() {
         let mut reads = Vec::new();
-        for ids in [&[2i64, 2][..], &[3, 1], &[-1, 4]] {
-            assert!(plan(ids, &planes(2), 4096, &mut reads).is_err(), "{ids:?}");
-        }
+        assert!(plan(&[3, -1], &planes(2), 4096, &mut reads).is_err());
         assert!(plan(&[1], &planes(1), 0, &mut reads).is_err());
-        let empty = Plane { row_bytes: 0, rkey: 0, remote: 0, local: 0 };
-        assert!(plan(&[1], &[empty], 4096, &mut reads).is_err());
         assert!(reads.is_empty());
         plan(&[], &planes(0), 4096, &mut reads).unwrap();
         assert!(reads.is_empty());
@@ -142,7 +136,12 @@ mod tests {
         let (weights, scales, rows) = (80usize, 10usize, 64usize);
         let weight_plane: Vec<u8> = (0..rows * weights).map(|i| (i * 7 % 251) as u8).collect();
         let scale_plane: Vec<u8> = (0..rows * scales).map(|i| (i * 13 % 241) as u8).collect();
-        let ids = [0i64, 1, 2, 7, 8, 30, 63];
+        for ids in [&[0i64, 1, 2, 7, 8, 30, 63][..], &[8, 7, 7, 0, 63, 1]] {
+            check(&weight_plane, &scale_plane, weights, scales, ids);
+        }
+    }
+
+    fn check(weight_plane: &[u8], scale_plane: &[u8], weights: usize, scales: usize, ids: &[i64]) {
         let count = ids.len();
         let mut expected = vec![0u8; count * (weights + scales)];
         for (row, id) in ids.iter().map(|id| *id as usize).enumerate() {
@@ -161,12 +160,12 @@ mod tests {
             assert!(reads.iter().all(|read| read.nbytes as usize <= max_read));
             let mut output = vec![0xaau8; expected.len()];
             for read in &reads {
-                let source = if read.rkey == 0 { &weight_plane } else { &scale_plane };
+                let source = if read.rkey == 0 { weight_plane } else { scale_plane };
                 let remote = read.remote as usize;
                 output[read.local..read.local + read.nbytes as usize]
                     .copy_from_slice(&source[remote..remote + read.nbytes as usize]);
             }
-            assert_eq!(output, expected, "max_read {max_read}");
+            assert_eq!(output, expected, "ids {ids:?}, max_read {max_read}");
         }
     }
 }

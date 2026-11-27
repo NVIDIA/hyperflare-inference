@@ -7,9 +7,10 @@ READ. A serving host selects it with `--embedding-table-storage fabric` and
 host RAM plan of disk storage; the store host holds the table bytes.
 
 Fabric storage is implemented behind the `engram-rdma` Cargo feature of
-`flare-helios`, `flare`, and `flare-cli`, which links `libibverbs`. Release
-builds do not enable it. It is not qualified on any hardware or core; see
-[Qualification](#qualification).
+`flare-helios` and `flare-cli`, which links `libibverbs` and requires Linux.
+Release builds do not enable it. A core whose ranks run in separate processes,
+such as a multi-host core served with `--rank`, cannot use it. It is not
+qualified on any hardware or core; see [Qualification](#qualification).
 
 ## Dataflow
 
@@ -53,8 +54,8 @@ without interpreting the rest of the body.
 1. `HELLO` (client to store): core identity, rank, tensor-parallel world,
    requested lanes, the client port's active MTU, and per table the weight and
    scale plane layout `{row_bytes, nbytes}`.
-2. `HELLO_OK` (store to client): store ABI 1, the store's GID, the selected MTU
-   (the smaller of both ports), the largest READ the store accepts (1 MiB), the
+2. `HELLO_OK` (store to client): store ABI 1, the selected MTU (the smaller of
+   both ports), the largest READ the store accepts (1 MiB), the
    confirmed lanes, the READ depth each store queue pair accepts, and per table
    and plane `{rkey, remote_addr, nbytes, row_bytes}`. The store may instead
    answer `ERROR {code, message}` with `version_unsupported`, `core_mismatch`,
@@ -76,9 +77,9 @@ are loaded and registered once; row-sharded planes are rank-specific, and
 together they cover every table row, so the store holds the full table set
 whichever ranks connect.
 
-The core identity is the SHA-256 digest of the signed core envelope, which the
-signature covers along with the digest of every companion file. A client
-presents the identity of the core it loaded. The store answers `core_mismatch`
+The store's identity is the SHA-256 digest of the core's signed envelope; the
+signature also covers the digest of every companion file the store reads. A
+client presents the identity of the core it loaded. The store answers `core_mismatch`
 for another identity or another tensor-parallel size, and
 `plane_layout_mismatch` for a rank it does not serve or a table layout that
 differs from its catalog, so it cannot serve bytes that do not belong to the
@@ -98,8 +99,10 @@ row_bytes` into the run's offset in the miss workspace: weights at
 `row × weight_bytes`, scales at `count × weight_bytes + row × scale_bytes`. A
 READ longer than 1 MiB is split. Every READ is signalled.
 
-A gather takes the lane `table mod lanes`, so concurrent table workers spread
-over the lanes and workers mapped to one lane take turns. A lane's READs in
+Each serving process opens four lanes (reliable-connected queue pairs) per
+table group. A gather takes the lane `table mod 4`, so concurrent table workers
+spread over the lanes and workers mapped to one lane take turns. Connecting,
+each control exchange, and each gather's READs are bounded by five seconds. A lane's READs in
 flight never exceed its confirmed depth: the client requests the smaller of its
 device's `max_qp_init_rd_atom` and the store's `max_qp_rd_atom`, and reads back
 the depth the device set. The worker polls completions on its own thread,
@@ -119,13 +122,16 @@ spinning and yielding after 1024 empty polls.
 A transient gather failure does not disable the table. The worker zero-fills
 the frame only so the frame handshake can drain, and stores the error for that
 sequence. The executor reports the frame as failed instead of poisoning
-itself. The runtime replaces every record of the frame, and of any frame
-already submitted for the same requests, with a device-error record at the
-request's committed progress, so no token computed from the zeroed rows is
-emitted and no snapshot is taken; each affected request fails with
-`embedding_store_unavailable`. The next sequence that reuses the frame clears
-the stored error. A rank process of a multi-host core cannot report a failed
-frame to rank zero, so it fails as it does for any reader error.
+itself. The runtime replaces every lane of the frame, and of any frame already
+submitted for the same requests, with a device error at the request's committed
+progress: the record emits no token, and its speculative-survival row reports
+no observed prefix, so the scheduler's sidecar checks agree with it. No token
+computed from the zeroed rows is emitted and no snapshot is taken; each
+affected request fails with `embedding_store_unavailable`. The next sequence
+that reuses the frame clears the stored error. Fabric storage requires every
+rank in one process because a rank process cannot report a failed frame to rank
+zero; a rank process that observes one anyway fails as it does for any reader
+error.
 
 On a transient failure the worker moves its lane to the error state and waits
 up to one second for every posted READ to complete or flush before returning,
@@ -140,18 +146,19 @@ has started streaming receives the same error as a terminal stream event.
 `engram_store: {state, endpoint, last_error, reconnects}`, where `state` is
 `ready`, `down`, or `failed`, so an orchestrator does not restart a healthy
 process for a remote outage. Metrics add `flare_engram_fabric_reads_total`,
-`flare_engram_fabric_bytes_total`, `flare_engram_fabric_wait_nanoseconds_total`,
-`flare_engram_fabric_failures_total`, `flare_engram_fabric_reconnects_total`,
-and the gauge `flare_engram_fabric_ready`. Other storage modes render none of
+`flare_engram_fabric_bytes_total`, and
+`flare_engram_fabric_wait_nanoseconds_total`, the terms of the
+[performance model](#performance-model); other storage modes render none of
 them.
 
 ## Operator requirements
 
 ```sh
-flare engram-store --package /models/deepseek-v41 --listen 10.0.0.5:7700 --tensor-parallel 4
+flare engram-store /models/deepseek-v41 --listen 10.0.0.5:7700 --tensor-parallel 4
 flare run CORE --gpus 0,1,2,3 --embedding-table-storage fabric --embedding-table-store 10.0.0.5:7700
 ```
 
+- **Ranks.** The store serves every rank of the selected deployment.
 - **Memory.** The store reads every served plane into RAM and registers it,
   which page-locks it; registered memory cannot be reclaimed under pressure.
   The store needs the table bytes plus process overhead, and its locked-memory
@@ -203,10 +210,6 @@ latencies, not a measurement.
 
 ## Qualification
 
-Not qualified. The control framing, READ planning, store-status accounting,
-configuration validation, memory plan, admission mapping, and failed-frame
-retirement have unit tests. Loopback tests of the data path, store loss and
-restart, and identity refusal run with `FLARE_RUN_RDMA_TESTS=1` on a host with
-a RoCE v2 device on loopback, such as `rdma_rxe`. No core has been served with
-fabric storage, and no serving measurement exists; [the TODO list](TODO.txt)
-records the pending checks.
+Not qualified: no core has been served with fabric storage and no serving
+measurement exists. [The TODO list](TODO.txt) records the checks and
+measurements that qualification needs.

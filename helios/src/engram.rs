@@ -48,18 +48,15 @@ pub(crate) struct Stats {
     disk_submit_ns: AtomicU64,
     disk_wait_ns: AtomicU64,
     disk_complete_ns: AtomicU64,
-    // Written by the fabric reader and read by the metrics renderer.
-    #[cfg_attr(not(any(feature = "server", feature = "engram-rdma")), allow(dead_code))]
+    /// Fabric storage, whose counters are rendered only then.
+    #[cfg(feature = "engram-rdma")]
+    fabric: bool,
+    #[cfg(feature = "engram-rdma")]
     fabric_reads: AtomicU64,
-    #[cfg_attr(not(any(feature = "server", feature = "engram-rdma")), allow(dead_code))]
+    #[cfg(feature = "engram-rdma")]
     fabric_bytes: AtomicU64,
-    #[cfg_attr(not(any(feature = "server", feature = "engram-rdma")), allow(dead_code))]
+    #[cfg(feature = "engram-rdma")]
     fabric_wait_ns: AtomicU64,
-    #[cfg_attr(not(any(feature = "server", feature = "engram-rdma")), allow(dead_code))]
-    fabric_failures: AtomicU64,
-    /// Present only for fabric storage; its counters are rendered only then.
-    #[cfg_attr(not(feature = "server"), allow(dead_code))]
-    store: Option<Arc<fabric::Status>>,
 }
 
 impl Stats {
@@ -163,51 +160,34 @@ impl Stats {
                 counter.load(Ordering::Relaxed)
             );
         }
-        let Some(store) = &self.store else {
-            return;
-        };
-        for (name, kind, help, value) in [
-            (
-                "fabric_reads_total",
-                "counter",
-                "RDMA READ requests posted to the Engram store.",
-                self.fabric_reads.load(Ordering::Relaxed),
-            ),
-            (
-                "fabric_bytes_total",
-                "counter",
-                "Bytes requested by RDMA READs from the Engram store.",
-                self.fabric_bytes.load(Ordering::Relaxed),
-            ),
-            (
-                "fabric_wait_nanoseconds_total",
-                "counter",
-                "Cumulative worker wall time posting and completing Engram store READs.",
-                self.fabric_wait_ns.load(Ordering::Relaxed),
-            ),
-            (
-                "fabric_failures_total",
-                "counter",
-                "Miss gathers failed because the Engram store was unreachable; each fails its requests and leaves the table usable.",
-                self.fabric_failures.load(Ordering::Relaxed),
-            ),
-            (
-                "fabric_reconnects_total",
-                "counter",
-                "Engram store sessions re-established after a loss.",
-                store.reconnects(),
-            ),
-            (
-                "fabric_ready",
-                "gauge",
-                "1 while every Engram store session of this process is ready.",
-                u64::from(store.ready()),
-            ),
-        ] {
-            let _ = writeln!(
-                text,
-                "# HELP flare_engram_{name} {help}\n# TYPE flare_engram_{name} {kind}\nflare_engram_{name} {value}",
-            );
+        #[cfg(feature = "engram-rdma")]
+        if self.fabric {
+            for (name, kind, help, counter) in [
+                (
+                    "fabric_reads_total",
+                    "counter",
+                    "RDMA READ requests posted to the Engram store.",
+                    &self.fabric_reads,
+                ),
+                (
+                    "fabric_bytes_total",
+                    "counter",
+                    "Bytes requested by RDMA READs from the Engram store.",
+                    &self.fabric_bytes,
+                ),
+                (
+                    "fabric_wait_nanoseconds_total",
+                    "counter",
+                    "Cumulative worker wall time posting and completing Engram store READs.",
+                    &self.fabric_wait_ns,
+                ),
+            ] {
+                let _ = writeln!(
+                    text,
+                    "# HELP flare_engram_{name} {help}\n# TYPE flare_engram_{name} {kind}\nflare_engram_{name} {}",
+                    counter.load(Ordering::Relaxed)
+                );
+            }
         }
     }
 }
@@ -398,6 +378,9 @@ pub(crate) struct Shared {
     ranks: usize,
     max_tokens: usize,
     stats: Arc<Stats>,
+    /// Reachability of the Engram store for fabric storage.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    store: Option<Arc<fabric::Status>>,
 }
 impl Shared {
     #[cfg(test)]
@@ -408,6 +391,7 @@ impl Shared {
             ranks,
             max_tokens: 4096,
             stats: Arc::new(Stats::default()),
+            store: None,
         })
     }
 
@@ -427,22 +411,28 @@ impl Shared {
         if storage == Storage::Ram && cache_bytes != 0 {
             return Err("embedding row cache requires disk table storage".into());
         }
+        if (storage == Storage::Fabric) != store.is_some() {
+            return Err("fabric embedding-table storage and a store endpoint require each other".into());
+        }
+        let status = store.as_ref().map(|connect| connect.status.clone());
+        #[cfg(not(feature = "engram-rdma"))]
+        if store.is_some() {
+            return Err(fabric::NO_RDMA.into());
+        }
+        #[cfg(feature = "engram-rdma")]
         let stats = Arc::new(Stats {
-            store: store.as_ref().map(|connect| connect.status.clone()),
+            fabric: store.is_some(),
             ..Stats::default()
         });
-        let session = match (storage, store) {
-            (Storage::Fabric, Some(connect)) => {
+        #[cfg(not(feature = "engram-rdma"))]
+        let stats = Arc::new(Stats::default());
+        #[cfg(feature = "engram-rdma")]
+        let session = match store {
+            Some(connect) => {
                 let planes = index.tables.iter().map(|table| table.planes).collect::<Vec<_>>();
                 Some(fabric::Session::connect(connect, &planes)?)
             }
-            (Storage::Fabric, None) => {
-                return Err("fabric embedding-table storage requires a store endpoint".into());
-            }
-            (_, Some(_)) => {
-                return Err("an embedding table store endpoint requires fabric storage".into());
-            }
-            (_, None) => None,
+            None => None,
         };
         let index = Arc::new(index);
         let table_bytes: u128 = index
@@ -462,8 +452,9 @@ impl Shared {
                 let rows = max_tokens
                     .checked_mul(table.heads)
                     .ok_or("embedding row capacity exceeds host range")?;
-                match &session {
-                    Some(session) => reader::Reader::from_fabric(
+                #[cfg(feature = "engram-rdma")]
+                if let Some(session) = &session {
+                    return reader::Reader::from_fabric(
                         files,
                         &table.planes,
                         session.clone(),
@@ -472,21 +463,22 @@ impl Shared {
                         rows,
                         stats.clone(),
                         resident_scales,
-                    ),
-                    None => reader::Reader::from_files(
-                        files,
-                        &table.planes,
-                        storage == Storage::Ram,
-                        budget,
-                        rows,
-                        stats.clone(),
-                        workers,
-                        resident_scales,
-                    ),
+                    );
                 }
+                let _ = ordinal;
+                reader::Reader::from_files(
+                    files,
+                    &table.planes,
+                    storage == Storage::Ram,
+                    budget,
+                    rows,
+                    stats.clone(),
+                    workers,
+                    resident_scales,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::with_readers(index, readers, ranks, max_tokens, context, device, stats)
+        Self::with_readers(index, readers, ranks, max_tokens, context, device, stats, status)
     }
 
     fn with_readers(
@@ -497,6 +489,7 @@ impl Shared {
         context: usize,
         device: i32,
         stats: Arc<Stats>,
+        store: Option<Arc<fabric::Status>>,
     ) -> Result<Arc<Self>> {
         if ranks == 0 || ranks > 16 || max_tokens == 0 || readers.len() != index.tables.len() {
             return Err("invalid embedding delivery geometry".into());
@@ -575,6 +568,7 @@ impl Shared {
             ranks,
             max_tokens,
             stats,
+            store,
         }))
     }
 
@@ -590,7 +584,7 @@ impl Shared {
     /// Reachability of the Engram store for fabric storage.
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn store_status(&self) -> Option<Arc<fabric::Status>> {
-        self.stats.store.clone()
+        self.store.clone()
     }
     fn validate_start(&self, table: usize, rank: usize, sequence: u64, rows: usize) -> Result<()> {
         if rows > self.max_tokens * self.index.tables[table].heads {

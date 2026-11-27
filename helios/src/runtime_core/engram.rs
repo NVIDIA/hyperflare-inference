@@ -296,6 +296,29 @@ pub(super) fn decode<F: super::payload::Files>(
     Ok(Index { tables })
 }
 
+/// Open direct-I/O handles only for the containers that carry embedding planes, rather than
+/// every weight companion in the deployment, and point each plane at its handle's position.
+pub(super) fn direct_files<'a, F: super::payload::Files>(
+    indexes: impl Iterator<Item = &'a mut Index>,
+    files: &F,
+) -> Result<Vec<std::sync::Arc<std::fs::File>>> {
+    let mut mapped = std::collections::BTreeMap::new();
+    let mut direct = Vec::new();
+    for index in indexes {
+        for table in &mut index.tables {
+            for plane in &mut table.planes {
+                let next = direct.len();
+                let target = *mapped.entry(plane.file).or_insert(next);
+                if target == next {
+                    direct.push(files.direct_file(plane.file)?);
+                }
+                plane.file = target;
+            }
+        }
+    }
+    Ok(direct)
+}
+
 /// Engram planes of every rank of an authorized core, decoded as the loader decodes them, for
 /// a store that serves them without a GPU.
 #[cfg(feature = "engram-rdma")]
@@ -351,22 +374,8 @@ pub(crate) fn catalog(authorized: super::AuthorizedCore) -> Result<Catalog> {
             .ok_or_else(|| invalid("rank is outside the verified deployment"))?;
         ranks.push((rank, decode(engram.clone(), &files, std::slice::from_ref(core), rank, world)?));
     }
-    // Open direct-I/O handles only for containers that carry embedding planes.
-    let mut mapped = std::collections::BTreeMap::new();
-    let mut direct = Vec::new();
-    for (_, index) in &mut ranks {
-        for table in &mut index.tables {
-            for plane in &mut table.planes {
-                let next = direct.len();
-                let target = *mapped.entry(plane.file).or_insert(next);
-                if target == next {
-                    direct.push(files.direct_file(plane.file)?);
-                }
-                plane.file = target;
-            }
-        }
-    }
-    Ok(Catalog { identity, world, ranks, files: direct })
+    let files = direct_files(ranks.iter_mut().map(|(_, index)| index), &files)?;
+    Ok(Catalog { identity, world, ranks, files })
 }
 
 #[cfg(test)]

@@ -6,9 +6,12 @@
 //! Control messages between a serving process and its Engram store.
 //!
 //! Every message is a big-endian `u32` length followed by that many bytes: one kind byte and
-//! the body. `HELLO` and `HELLO_OK` begin with a four-byte magic and a protocol version; a
-//! peer that implements a different version is refused before the rest of its body is read.
-//! Decoding failures are `InvalidData`; every other I/O error means the connection failed.
+//! the body. Fields use network byte order because the two ends run on different hosts and
+//! may be different builds; the in-process rank wire and Selene's handshake stay
+//! little-endian. `HELLO` and `HELLO_OK` begin with a four-byte magic and a protocol version;
+//! a peer that implements a different version is refused before the rest of its body is
+//! read. Decoding failures are `InvalidData`; every other I/O error means the connection
+//! failed.
 
 use std::io::{self, Read, Write};
 
@@ -19,6 +22,8 @@ pub(crate) const STORE_ABI: u16 = 1;
 pub(crate) const MAX_MESSAGE: usize = 1 << 20;
 pub(crate) const MAX_TABLES: usize = 4096;
 pub(crate) const MAX_LANES: usize = 8;
+/// Largest RDMA READ the store accepts and the client posts.
+pub(crate) const MAX_READ: u32 = 1 << 20;
 const PLANES: u8 = 2;
 
 const HELLO: u8 = 1;
@@ -75,42 +80,36 @@ pub(crate) enum Code {
     NotReady,
 }
 
+/// Each code's wire value and name, and whether a later attempt may succeed: a store that is
+/// still loading or short of queue-pair memory may accept one; a version, identity, or layout
+/// disagreement persists until an operator changes a host.
+const CODES: [(Code, u16, &str, bool); 5] = [
+    (Code::VersionUnsupported, 1, "version_unsupported", false),
+    (Code::CoreMismatch, 2, "core_mismatch", false),
+    (Code::PlaneLayoutMismatch, 3, "plane_layout_mismatch", false),
+    (Code::InsufficientMemory, 4, "insufficient_memory", true),
+    (Code::NotReady, 5, "not_ready", true),
+];
+
 impl Code {
-    fn wire(self) -> u16 {
-        match self {
-            Self::VersionUnsupported => 1,
-            Self::CoreMismatch => 2,
-            Self::PlaneLayoutMismatch => 3,
-            Self::InsufficientMemory => 4,
-            Self::NotReady => 5,
-        }
+    fn entry(self) -> (Code, u16, &'static str, bool) {
+        *CODES.iter().find(|entry| entry.0 == self).unwrap()
     }
 
     fn from_wire(value: u16) -> io::Result<Self> {
-        Ok(match value {
-            1 => Self::VersionUnsupported,
-            2 => Self::CoreMismatch,
-            3 => Self::PlaneLayoutMismatch,
-            4 => Self::InsufficientMemory,
-            5 => Self::NotReady,
-            _ => return Err(invalid("unknown Engram store error code")),
-        })
+        CODES
+            .iter()
+            .find(|entry| entry.1 == value)
+            .map(|entry| entry.0)
+            .ok_or_else(|| invalid("unknown Engram store error code"))
     }
 
     pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::VersionUnsupported => "version_unsupported",
-            Self::CoreMismatch => "core_mismatch",
-            Self::PlaneLayoutMismatch => "plane_layout_mismatch",
-            Self::InsufficientMemory => "insufficient_memory",
-            Self::NotReady => "not_ready",
-        }
+        self.entry().2
     }
 
-    /// A store that is still loading or short of queue-pair memory may accept a later attempt;
-    /// a version, identity, or layout disagreement persists until an operator changes a host.
     pub(crate) fn retryable(self) -> bool {
-        matches!(self, Self::InsufficientMemory | Self::NotReady)
+        self.entry().3
     }
 }
 
@@ -128,7 +127,6 @@ pub(crate) struct Hello {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HelloOk {
     pub abi: u16,
-    pub gid: [u8; 16],
     pub mtu: u32,
     pub max_read_bytes: u32,
     pub lanes: u8,
@@ -186,7 +184,6 @@ pub(crate) fn encode(message: &Message) -> io::Result<Vec<u8>> {
             body.extend_from_slice(&MAGIC);
             body.extend_from_slice(&VERSION.to_be_bytes());
             body.extend_from_slice(&ok.abi.to_be_bytes());
-            body.extend_from_slice(&ok.gid);
             body.extend_from_slice(&ok.mtu.to_be_bytes());
             body.extend_from_slice(&ok.max_read_bytes.to_be_bytes());
             body.push(ok.lanes);
@@ -208,7 +205,7 @@ pub(crate) fn encode(message: &Message) -> io::Result<Vec<u8>> {
         }
         Message::Error { code, message } => {
             body.push(ERROR);
-            body.extend_from_slice(&code.wire().to_be_bytes());
+            body.extend_from_slice(&code.entry().1.to_be_bytes());
             let text = message.as_bytes();
             let text = &text[..text.len().min(4096)];
             body.extend_from_slice(&(text.len() as u32).to_be_bytes());
@@ -254,14 +251,19 @@ pub(crate) fn write(stream: &mut impl Write, message: &Message) -> io::Result<()
     stream.flush()
 }
 
-pub(crate) fn read(stream: &mut impl Read) -> io::Result<Message> {
-    let mut prefix = [0u8; 4];
-    stream.read_exact(&mut prefix)?;
-    let length = u32::from_be_bytes(prefix) as usize;
+fn length(prefix: &[u8]) -> io::Result<usize> {
+    let length = u32::from_be_bytes(prefix[..4].try_into().unwrap()) as usize;
     if length == 0 || length > MAX_MESSAGE {
         return Err(invalid("Engram store control message length is out of range"));
     }
-    let mut body = vec![0u8; length];
+    Ok(length)
+}
+
+/// Read one message, blocking up to the stream's read timeout; used during the handshake.
+pub(crate) fn read(stream: &mut impl Read) -> io::Result<Message> {
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix)?;
+    let mut body = vec![0u8; length(&prefix)?];
     stream.read_exact(&mut body)?;
     decode(&body)
 }
@@ -278,10 +280,7 @@ impl Receiver {
     pub(crate) fn poll(&mut self, stream: &mut impl Read) -> io::Result<Option<Message>> {
         loop {
             if self.buffer.len() >= 4 {
-                let length = u32::from_be_bytes(self.buffer[..4].try_into().unwrap()) as usize;
-                if length == 0 || length > MAX_MESSAGE {
-                    return Err(invalid("Engram store control message length is out of range"));
-                }
+                let length = length(&self.buffer)?;
                 if self.buffer.len() >= 4 + length {
                     let message = decode(&self.buffer[4..4 + length]);
                     self.buffer.drain(..4 + length);
@@ -402,7 +401,6 @@ pub(crate) fn decode(body: &[u8]) -> io::Result<Message> {
                 return Ok(Message::HelloOkVersion(version));
             }
             let abi = cursor.u16()?;
-            let gid = cursor.array::<16>()?;
             let mtu = cursor.u32()?;
             let max_read_bytes = cursor.u32()?;
             let lanes = cursor.u8()?;
@@ -423,7 +421,7 @@ pub(crate) fn decode(body: &[u8]) -> io::Result<Message> {
                 let planes = [plane()?, plane()?];
                 tables.push(RemoteTable { id, planes });
             }
-            Message::HelloOk(HelloOk { abi, gid, mtu, max_read_bytes, lanes, depth, tables })
+            Message::HelloOk(HelloOk { abi, mtu, max_read_bytes, lanes, depth, tables })
         }
         ERROR => {
             let code = Code::from_wire(cursor.u16()?)?;
@@ -483,7 +481,6 @@ mod tests {
     fn hello_ok() -> HelloOk {
         HelloOk {
             abi: STORE_ABI,
-            gid: [0xfe; 16],
             mtu: 1024,
             max_read_bytes: 1 << 20,
             lanes: 2,
@@ -630,7 +627,7 @@ mod tests {
             (Code::InsufficientMemory, 4, "insufficient_memory", true),
             (Code::NotReady, 5, "not_ready", true),
         ] {
-            assert_eq!(code.wire(), wire);
+            assert_eq!(code.entry().1, wire);
             assert_eq!(Code::from_wire(wire).unwrap(), code);
             assert_eq!(code.name(), name);
             assert_eq!(code.retryable(), retryable);

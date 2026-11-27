@@ -707,6 +707,7 @@ fn gather_thread_count(work_items: usize) -> usize {
 /// and the `[weights][scales]` miss layout are shared.
 enum Miss {
     Disk(DiskReader),
+    #[cfg(feature = "engram-rdma")]
     Fabric(super::fabric::Reader),
 }
 
@@ -714,6 +715,7 @@ impl Miss {
     fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
         match self {
             Self::Disk(reader) => reader.gather(planes, ids, output),
+            #[cfg(feature = "engram-rdma")]
             Self::Fabric(reader) => reader.gather(planes, ids, output),
         }
     }
@@ -797,7 +799,7 @@ fn copy_cached_hits(
 
 impl CachedReader {
     fn new(
-        mut miss: Miss,
+        miss: Miss,
         stats: Arc<Stats>,
         planes: &[Plane; 2],
         budget: usize,
@@ -840,16 +842,20 @@ impl CachedReader {
         miss_ids.clear();
         miss_groups.clear();
         hit_groups.clear();
-        let mut miss_output = allocated(max_rows * row_bytes, 0u8)?;
-        if let Miss::Fabric(reader) = &mut miss {
-            // RDMA READs land in this workspace, never in the CUDA-mapped staging frames.
-            reader.register(&mut miss_output)?;
-        }
+        let miss_output = allocated(max_rows * row_bytes, 0u8)?;
         let cache = RowCache::new(
             payload_budget,
             planes[0].nbytes / planes[0].row_bytes,
             row_bytes,
         )?;
+        // RDMA READs land in this workspace, never in the CUDA-mapped staging frames. Register
+        // it after the last fallible step, so an error never frees it while registered.
+        #[cfg(feature = "engram-rdma")]
+        let (mut miss, mut miss_output) = (miss, miss_output);
+        #[cfg(feature = "engram-rdma")]
+        if let Miss::Fabric(reader) = &mut miss {
+            reader.register(&mut miss_output)?;
+        }
         let bytes = cache.bytes() + workspace;
         stats
             .capacity_rows
@@ -1061,6 +1067,7 @@ impl Reader {
     /// Fabric storage: misses read from the store into the row cache's registered workspace.
     /// The row cache is required; resident scales, when enabled, are loaded from the local
     /// companions exactly as for disk storage and never read from the store.
+    #[cfg(feature = "engram-rdma")]
     pub fn from_fabric(
         files: &[Arc<File>],
         planes: &[Plane; 2],

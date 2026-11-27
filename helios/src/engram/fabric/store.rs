@@ -16,8 +16,8 @@
 
 use super::{
     protocol::{
-        self, Code, HelloOk, MAX_LANES, Message, PlaneLayout, Receiver, RemotePlane, RemoteTable,
-        STORE_ABI, TableLayout,
+        self, Code, HelloOk, MAX_LANES, MAX_READ, Message, PlaneLayout, Receiver, RemotePlane,
+        RemoteTable, STORE_ABI, TableLayout,
     },
     verbs::{Access, Device, Lane, Region, Role},
 };
@@ -39,8 +39,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Largest READ a client may post.
-const MAX_READ: u32 = 1 << 20;
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
 /// A client that sends no heartbeat for this long is dropped and its queue pairs destroyed.
@@ -50,8 +48,6 @@ pub struct Options {
     /// Address of the control listener. It must be an address of the RoCE interface whose
     /// GID the store's queue pairs use.
     pub listen: SocketAddr,
-    /// Ranks to serve; all ranks of the deployment when absent.
-    pub ranks: Option<Vec<usize>>,
 }
 
 /// One distinct plane registered for remote READ. The registration is declared first so it is
@@ -120,18 +116,6 @@ pub struct Running {
     pub address: SocketAddr,
 }
 
-impl Running {
-    /// Block until `stop` is set.
-    pub fn wait(mut self) {
-        while !self.state.stop.load(Ordering::Acquire) {
-            thread::sleep(POLL);
-        }
-        if let Some(accept) = self.accept.take() {
-            let _ = accept.join();
-        }
-    }
-}
-
 impl Drop for Running {
     fn drop(&mut self) {
         self.state.stop.store(true, Ordering::Release);
@@ -141,8 +125,9 @@ impl Drop for Running {
     }
 }
 
-/// Verify-time identity and catalog of the core, then load, register and serve its planes.
-/// `report` receives the startup lines. Returns once serving has started.
+/// Decode the authorized core's catalog, then load, register and serve the planes of every
+/// rank of its deployment. `report` receives the startup lines. Returns once serving has
+/// started; dropping the result stops it.
 pub fn start(
     core: AuthorizedCore,
     options: &Options,
@@ -154,16 +139,10 @@ pub fn start(
     let ranks = catalog
         .ranks
         .into_iter()
-        .filter(|(rank, _)| options.ranks.as_ref().is_none_or(|selected| selected.contains(rank)))
         .map(|(rank, index)| {
             (rank, index.tables.iter().map(|table| table.planes).collect::<Vec<[Plane; 2]>>())
         })
         .collect::<Vec<_>>();
-    if let Some(selected) = &options.ranks {
-        if let Some(missing) = selected.iter().find(|rank| !ranks.iter().any(|(r, _)| r == *rank)) {
-            return Err(format!("the core has no rank {missing}; its deployment has {world} ranks").into());
-        }
-    }
     serve(options.listen, catalog.identity, world, &catalog.files, &ranks, stop, report)
 }
 
@@ -203,10 +182,9 @@ fn serve(
     let running = Running { state: state.clone(), accept: Some(accept), address };
     let total: u64 = layout.sources.iter().map(|(_, plane)| plane.nbytes as u64).sum();
     report(format!(
-        "Engram store: {} distinct planes, {:.1} GiB, for {} of {world} ranks on {} at {address}",
+        "Engram store: {} distinct planes, {:.1} GiB, for {world} ranks on {} at {address}",
         layout.sources.len(),
         total as f64 / (1u64 << 30) as f64,
-        state.ranks.len(),
         device.name,
     ));
     let loading = Instant::now();
@@ -339,7 +317,6 @@ fn handle(mut stream: TcpStream, state: &State) -> io::Result<()> {
         &mut stream,
         &Message::HelloOk(HelloOk {
             abi: STORE_ABI,
-            gid: state.device.gid(),
             mtu,
             max_read_bytes: MAX_READ,
             lanes: hello.lanes,

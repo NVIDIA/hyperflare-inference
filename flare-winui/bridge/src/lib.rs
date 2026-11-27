@@ -1393,10 +1393,6 @@ unsafe fn runtime_input(
         prefix_cache_drain_on_shutdown: copy(s.prefix_cache_drain_on_shutdown)?,
         embedding_table_storage: copy(s.embedding_table_storage)?,
         embedding_table_cache_size: copy(s.embedding_table_cache_size)?,
-        // The desktop client has no RDMA build and offers no fabric storage.
-        embedding_table_store: String::new(),
-        embedding_table_store_lanes: None,
-        embedding_table_store_timeout_ms: None,
         mtp_draft_tokens: optional(s.has_mtp_draft_tokens, s.mtp_draft_tokens)?,
         history_drafts: optional_bool(s.history_drafts)?,
         adaptive_verification: optional_bool(s.adaptive_verification)?,

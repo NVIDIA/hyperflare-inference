@@ -12,33 +12,40 @@
 //! and the captured graphs are unchanged.
 //!
 //! A store that cannot be reached is a transient condition: the affected gather fails with
-//! [`AdmissionError::EngramUnavailable`], the request that consumed it fails, the layer stays
+//! [`AdmissionError::EngramUnavailable`], the requests that consumed it fail, the layer stays
 //! usable, and the session reconnects in the background. Admission rejects new requests until
 //! every session is ready again. A store that answers with the wrong core, a plane layout that
 //! disagrees, or a protocol violation is fatal and poisons the layer like a disk read error.
-
-mod plan;
-mod protocol;
+//!
+//! Only builds with the `engram-rdma` feature contain the client and the store; without it,
+//! `LoadOptions::select` rejects fabric storage before any table is opened.
 
 #[cfg(feature = "engram-rdma")]
 mod client;
+#[cfg(feature = "engram-rdma")]
+mod plan;
+#[cfg(feature = "engram-rdma")]
+mod protocol;
 #[cfg(feature = "engram-rdma")]
 pub mod store;
 #[cfg(feature = "engram-rdma")]
 mod verbs;
 
+#[cfg(feature = "engram-rdma")]
+pub(crate) use client::{Reader, Session};
+
 use crate::{AdmissionError, Error};
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-/// Queue pairs between one serving process and its store when the flag is absent.
+/// Queue pairs between one serving process and its store.
 pub const DEFAULT_LANES: usize = 4;
-pub const MAX_LANES: usize = protocol::MAX_LANES;
+/// Bound on connecting, each control exchange, and each gather's RDMA reads.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5000);
 pub(crate) const NO_RDMA: &str = "fabric embedding-table storage requires a Flare build with the engram-rdma feature; this build has no RDMA support";
 
@@ -48,12 +55,12 @@ pub struct Endpoint {
     /// `HOST:PORT` of the store's control listener.
     pub address: String,
     pub lanes: usize,
-    /// Bound on connecting, each control exchange, and each gather's RDMA reads.
     pub timeout: Duration,
 }
 
 /// The identity and rank a session presents in `HELLO`.
 #[derive(Clone)]
+#[cfg_attr(not(feature = "engram-rdma"), allow(dead_code))]
 pub(crate) struct Connect {
     pub endpoint: Endpoint,
     /// SHA-256 of the signed core envelope; the store refuses any other core.
@@ -63,7 +70,22 @@ pub(crate) struct Connect {
     pub status: Arc<Status>,
 }
 
+/// Whether a connection or gather failure may clear on a later attempt.
+#[cfg(feature = "engram-rdma")]
+pub(crate) enum Failure {
+    /// A lost store, link or connection; reconnecting may succeed.
+    Transient(String),
+    /// A disagreement that persists until an operator changes a host.
+    Fatal(String),
+}
+
+/// Lock a mutex whose protected state stays valid when a holder panicked.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Failure that leaves the layer usable: the request fails and admission waits for the store.
+#[cfg(any(test, feature = "engram-rdma"))]
 pub(crate) fn unavailable(message: impl Into<String>) -> Error {
     Error::admission(AdmissionError::EngramUnavailable, message)
 }
@@ -110,11 +132,11 @@ impl Status {
         let sessions = self.sessions.load(Ordering::Acquire);
         sessions != 0
             && self.ready.load(Ordering::Acquire) == sessions
-            && self.failed.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+            && lock(&self.failed).is_none()
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
-        let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let failed = lock(&self.failed).clone();
         StatusSnapshot {
             state: if failed.is_some() {
                 "failed"
@@ -124,27 +146,24 @@ impl Status {
                 "down"
             },
             endpoint: self.endpoint.clone(),
-            last_error: failed
-                .or_else(|| self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            last_error: failed.or_else(|| lock(&self.last_error).clone()),
             reconnects: self.reconnects.load(Ordering::Relaxed),
         }
     }
+}
 
-    pub(crate) fn reconnects(&self) -> u64 {
-        self.reconnects.load(Ordering::Relaxed)
-    }
-
+/// Session transitions, driven by the client's session threads.
+#[cfg(any(test, feature = "engram-rdma"))]
+impl Status {
     /// A fatal session failure, after which gathers poison their layers.
     pub(crate) fn failure(&self) -> Option<String> {
-        self.failed.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        lock(&self.failed).clone()
     }
 
-    #[cfg_attr(not(feature = "engram-rdma"), allow(dead_code))]
     fn register(&self) {
         self.sessions.fetch_add(1, Ordering::AcqRel);
     }
 
-    #[cfg_attr(not(feature = "engram-rdma"), allow(dead_code))]
     fn unregister(&self, ready: bool) {
         if ready {
             self.ready.fetch_sub(1, Ordering::AcqRel);
@@ -152,7 +171,6 @@ impl Status {
         self.sessions.fetch_sub(1, Ordering::AcqRel);
     }
 
-    #[cfg_attr(not(feature = "engram-rdma"), allow(dead_code))]
     fn up(&self, reconnect: bool) {
         if reconnect {
             self.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -160,64 +178,17 @@ impl Status {
         self.ready.fetch_add(1, Ordering::AcqRel);
     }
 
-    #[cfg_attr(not(feature = "engram-rdma"), allow(dead_code))]
     fn down(&self, was_ready: bool, reason: String) {
         if was_ready {
             self.ready.fetch_sub(1, Ordering::AcqRel);
         }
-        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+        *lock(&self.last_error) = Some(reason);
     }
 
-    #[cfg_attr(not(feature = "engram-rdma"), allow(dead_code))]
     fn fail(&self, reason: String) {
-        self.failed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert(reason);
+        lock(&self.failed).get_or_insert(reason);
     }
 }
-
-#[cfg(feature = "engram-rdma")]
-pub(crate) use client::{Reader, Session};
-
-/// Builds without `engram-rdma` keep these types so the reader compiles, but neither can be
-/// constructed: [`Session::connect`] always fails and a [`Reader`] needs a session.
-#[cfg(not(feature = "engram-rdma"))]
-mod unsupported {
-    use super::{Connect, NO_RDMA};
-    use crate::{Result, engram::{Plane, Stats, reader::Resident}};
-    use std::{convert::Infallible, sync::Arc};
-
-    pub(crate) struct Session(Infallible);
-
-    impl Session {
-        pub(crate) fn connect(_connect: Connect, _tables: &[[Plane; 2]]) -> Result<Arc<Self>> {
-            Err(NO_RDMA.into())
-        }
-    }
-
-    pub(crate) struct Reader(Infallible);
-
-    impl Reader {
-        pub(crate) fn new(
-            session: Arc<Session>,
-            _table: usize,
-            _resident_scales: Option<Resident>,
-            _stats: Arc<Stats>,
-        ) -> Self {
-            match session.0 {}
-        }
-        pub(crate) fn register(&mut self, _workspace: &mut [u8]) -> Result<()> {
-            match self.0 {}
-        }
-        pub(crate) fn gather(&mut self, _planes: &[Plane; 2], _ids: &[i64], _output: &mut [u8]) -> Result<()> {
-            match self.0 {}
-        }
-    }
-}
-
-#[cfg(not(feature = "engram-rdma"))]
-pub(crate) use unsupported::{Reader, Session};
 
 #[cfg(test)]
 mod tests {
@@ -247,6 +218,7 @@ mod tests {
         assert!(!status.ready());
         assert_eq!(snapshot.state, "failed");
         assert_eq!(snapshot.last_error.as_deref(), Some("store holds another core"));
+        assert_eq!(status.failure().as_deref(), Some("store holds another core"));
         status.unregister(true);
         status.unregister(true);
         assert!(!status.ready());
