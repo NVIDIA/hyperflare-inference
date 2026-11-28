@@ -1015,7 +1015,7 @@ string, which the worker matches, does not change how they are measured:
 
 | Field | Definition |
 | --- | --- |
-| `queue_time_ms` | Model-scheduler arrival to the first model step that includes the request |
+| `queue_time_ms` | Model-queue arrival to the first model step that includes the request |
 | `time_to_first_token_ms` | That first scheduled step to the completion of the step that committed the first generated token |
 | `time_to_first_content_token_ms` | Always null: Flare does not report when answer text first appeared, as vLLM permits for a value it cannot provide |
 | `generation_time_ms` | First to last committed generated token |
@@ -1023,26 +1023,29 @@ string, which the worker matches, does not change how they are measured:
 | `tokens_per_second` | Generated tokens, as `usage` counts them, over the first scheduled step to the last committed generated token |
 
 A step's completion instant is read once when the worker processes that step's
-results, so tokens committed by one speculative step share it.
+results, so tokens committed by one speculative step share it. The runtime reads
+model-queue arrival when it builds the request group, before publishing the group
+to the worker channel, so `queue_time_ms` includes the channel send and worker
+pickup and starts later than vLLM's engine-core scheduler queue.
 
-A JSON body carries `metrics` at the top level. A Chat or Completions stream
-carries it only on the final usage chunk, whose `choices` is empty, so the stream
-needs `"stream_options": {"include_usage": true}`; without that option no chunk
-carries it. A Responses stream carries it in the `response` object of
-`response.completed` or `response.incomplete`; earlier events do not. Responses
-requests always run one generation, so every Responses output carries it.
+A JSON body carries `metrics` at the top level, and a Responses stream carries it
+in the `response` object of `response.completed` or `response.incomplete`. A Chat
+or Completions stream carries it only on the final usage chunk, so a client that
+does not send `"stream_options": {"include_usage": true}` receives none, and
+gateways that read rates from the response body, such as llama-swap, show none
+for those streams. Flare has no equivalent of vLLM's
+`--enable-force-include-usage` server option, which forces the usage chunk and
+would close this gap.
 
-Every field is present and is null when the request did not reach the instants
-it spans: `mean_itl_ms` is null for a single generated token, the token fields
-are null when nothing was generated, and every field is null for a choice that
-never reached a model step. With `n` greater than one, `metrics` is null,
-because one choice's instants do not describe the response. Completions with
-several prompts omit `metrics`. Failed requests return error bodies without it.
+All six fields are always present, and a field is null when the request did not
+reach the instants it spans, such as `mean_itl_ms` for a single generated token.
+With `n` greater than one `metrics` is null, and Completions with several prompts
+omit it.
 
-The option adds no clock reads: the encoder reads the instants on each
-request's terminal event. Chat token
-observation reports the same first scheduled step as `performance.first_scheduled_ns`,
-beside per-token timestamps; the
+A Chat request with `return_token_timestamps: true` also receives a top-level
+`performance` object holding `ingress_ns`, `enqueue_ns`, `first_scheduled_ns` and
+`reused_prompt_tokens`; the three instants are absolute nanoseconds on the same
+process-local origin as `choices[0].token_timestamps_ns`. The
 [prepared model contract](../helios/model-contract.md#token-and-timing-observation)
 defines those fields.
 
