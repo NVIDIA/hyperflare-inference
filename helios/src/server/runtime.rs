@@ -2440,7 +2440,14 @@ impl<'a> Worker<'a> {
         }
         let resources = CopyoutResources {
             completed: self.scheduler.completed(),
-            scheduler: self.scheduler.stats(),
+            // Decode moves request and reserved page counts without moving cache
+            // resources; zeroing them keeps deferred host copy-outs keyed on the
+            // cache state they actually depend on.
+            scheduler: crate::scheduler::SchedulerStats {
+                request_pages: 0,
+                reserved_pages: 0,
+                ..self.scheduler.stats()
+            },
             exports: self.exports.len(),
             next: next_admission(&self.scheduler, &self.parked, &self.pending)
                 .map(|next| (next.prompt_tokens, next.max_new_tokens, next.growable)),

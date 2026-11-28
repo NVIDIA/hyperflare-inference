@@ -1018,11 +1018,28 @@ fn branching_requests_own_distinct_tail_pages_and_terminal_snapshots() {
             Default::default(),
         )
         .unwrap();
-    let first = scheduler.request(first).unwrap();
-    let second = scheduler.request(second).unwrap();
-    assert_eq!(first.shared_pages, second.shared_pages);
-    assert_ne!(first.private_pages, second.private_pages);
-    assert!(first.terminal_snapshot.is_none() && second.terminal_snapshot.is_none());
+    let first_request = scheduler.request(first).unwrap();
+    let second_request = scheduler.request(second).unwrap();
+    assert_eq!(first_request.shared_pages, second_request.shared_pages);
+    assert!(!first_request.shared_pages.is_empty());
+    assert_ne!(first_request.private_pages, second_request.private_pages);
+    assert!(first_request.terminal_snapshot.is_none() && second_request.terminal_snapshot.is_none());
+    let (shared, private, reserved) = (
+        first_request.shared_pages.len(),
+        first_request.private_pages.len() + second_request.private_pages.len(),
+        first_request.reserved_pages.len() + second_request.reserved_pages.len(),
+    );
+    let stats = scheduler.stats();
+    assert_eq!(stats.request_pages, shared + private);
+    assert_eq!(stats.reserved_pages, reserved);
+    // Cancellation retires both requests: the shared page is counted once while
+    // both are live, and retirement releases the request pins before the slots
+    // empty, so both gauges drain.
+    scheduler.cancel(first).unwrap();
+    scheduler.cancel(second).unwrap();
+    let stats = scheduler.stats();
+    assert_eq!((stats.request_pages, stats.reserved_pages), (0, 0));
+    assert!(stats.cached_pages > 0);
 }
 
 #[test]

@@ -295,6 +295,20 @@ launches by kind, embedding row-cache counters, HTTP admission gauges, and
 uptime. `flare_history_drafts_enabled` reports whether shared decoded history
 augments learned proposals in the serving process.
 
+`flare_request_kv_pages` counts the distinct KV pages that requests owning a
+model slot reference: their private pages plus the tail pages of the prefix
+checkpoints they pin, each page counted once even when several requests
+reference it. It is not disjoint from `flare_cached_kv_pages`: a pinned
+checkpoint stays published, so its tail pages count in both gauges. Neither
+gauge counts pages draining after a request retires, or a restore ticket's
+in-flight pages. `flare_reserved_kv_pages` counts pages reserved for those
+requests' growth that are neither free, cached, nor written yet. The worker
+publishes both when a scheduler pass makes progress, and again at startup and
+after the shutdown drain; a scrape reads the last published values.
+`(flare_request_kv_pages + flare_reserved_kv_pages)` over
+`flare_total_kv_pages` is the share comparable to vLLM's `kv_cache_usage_perc`;
+idle cached prefixes and snapshot backing pages are outside it.
+
 The route returns one JSON object instead when the query contains `format=json`,
 or when the `Accept` header gives `application/json` a higher quality than
 `text/plain`; at equal quality the earlier media range wins. `format=prometheus`

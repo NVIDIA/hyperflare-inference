@@ -79,6 +79,10 @@ pub struct Checkpoint {
     child_count: usize,
     direct_pins: u64,
     pins: u64,
+    /// Direct pins held by active requests, a subset of `direct_pins`.
+    direct_request_pins: u64,
+    /// Request pins held on this checkpoint or a descendant, a subset of `pins`.
+    request_pins: u64,
     accessed: u64,
     role: RetentionRole,
 }
@@ -181,6 +185,8 @@ pub struct CacheStats {
     pub published_checkpoints: usize,
     pub pending_checkpoints: usize,
     pub cached_pages: usize,
+    /// Distinct tail pages of checkpoints pinned by active requests.
+    pub request_pinned_pages: usize,
     pub retired_pages: usize,
     pub retired_snapshots: usize,
     pub owned_pages: usize,
@@ -213,6 +219,9 @@ pub struct PrefixCheckpointCache {
     ready_checkpoints: usize,
     unready_checkpoints: usize,
     tail_pages: usize,
+    /// Tail pages of checkpoints with `request_pins > 0`, kept as pins change so
+    /// `stats` does not scan `nodes`.
+    request_pinned_pages: usize,
 }
 
 impl PrefixCheckpointCache {
@@ -241,6 +250,7 @@ impl PrefixCheckpointCache {
             ready_checkpoints: 0,
             unready_checkpoints: 0,
             tail_pages: 0,
+            request_pinned_pages: 0,
         })
     }
 
@@ -448,6 +458,8 @@ impl PrefixCheckpointCache {
             child_count: 0,
             direct_pins: 0,
             pins: 0,
+            direct_request_pins: 0,
+            request_pins: 0,
             accessed: use_epoch,
             role,
         };
@@ -504,7 +516,7 @@ impl PrefixCheckpointCache {
         Ok(pages)
     }
 
-    pub fn pin(&mut self, id: CheckpointId) -> Result<()> {
+    fn pin_with(&mut self, id: CheckpointId, request: bool) -> Result<()> {
         if !self.checkpoint(id)?.ready {
             return Err("cannot pin a checkpoint before GPU readiness".into());
         }
@@ -515,22 +527,65 @@ impl PrefixCheckpointCache {
             return Err("checkpoint reference count exhausted".into());
         }
         self.nodes.get_mut(&id).unwrap().direct_pins += 1;
+        if request {
+            self.nodes.get_mut(&id).unwrap().direct_request_pins += 1;
+        }
         for ancestor in chain {
-            self.nodes.get_mut(&ancestor).unwrap().pins += 1;
+            let node = self.nodes.get_mut(&ancestor).unwrap();
+            node.pins += 1;
+            if request {
+                node.request_pins += 1;
+                if node.request_pins == 1 {
+                    self.request_pinned_pages += node.tail_pages.len();
+                }
+            }
         }
         Ok(())
     }
 
-    pub fn unpin(&mut self, id: CheckpointId) -> Result<()> {
+    fn unpin_with(&mut self, id: CheckpointId, request: bool) -> Result<()> {
+        if request && self.checkpoint(id)?.direct_request_pins == 0 {
+            return Err("checkpoint has no request pin to release".into());
+        }
         if self.checkpoint(id)?.direct_pins == 0 {
             return Err("checkpoint has no direct pin to release".into());
         }
         let chain = self.chain(id)?;
         self.nodes.get_mut(&id).unwrap().direct_pins -= 1;
+        if request {
+            self.nodes.get_mut(&id).unwrap().direct_request_pins -= 1;
+        }
         for ancestor in chain {
-            self.nodes.get_mut(&ancestor).unwrap().pins -= 1;
+            let node = self.nodes.get_mut(&ancestor).unwrap();
+            node.pins -= 1;
+            if request {
+                debug_assert!(node.request_pins > 0);
+                node.request_pins -= 1;
+                if node.request_pins == 0 {
+                    self.request_pinned_pages -= node.tail_pages.len();
+                }
+            }
         }
         Ok(())
+    }
+
+    pub fn pin(&mut self, id: CheckpointId) -> Result<()> {
+        self.pin_with(id, false)
+    }
+
+    pub fn unpin(&mut self, id: CheckpointId) -> Result<()> {
+        self.unpin_with(id, false)
+    }
+
+    /// Pins a checkpoint on behalf of an active request. Request pins also count the
+    /// tail pages of the pinned checkpoints, each page once; a request's own private
+    /// pages are counted by the scheduler, which holds them.
+    pub fn pin_request(&mut self, id: CheckpointId) -> Result<()> {
+        self.pin_with(id, true)
+    }
+
+    pub fn unpin_request(&mut self, id: CheckpointId) -> Result<()> {
+        self.unpin_with(id, true)
     }
 
     /// Record GPU reads before submission; pinning alone does not track GPU use.
@@ -577,6 +632,8 @@ impl PrefixCheckpointCache {
         debug_assert_eq!(node.direct_pins, 0);
         debug_assert_eq!(node.child_count, 1);
         debug_assert_eq!(node.pins, child.pins);
+        // Both nodes are counted or neither is, and the pages move into the counted heir.
+        debug_assert_eq!(node.request_pins, child.request_pins);
         let heir = child.id;
         let mut pages = node.tail_pages;
         pages.append(&mut child.tail_pages);
@@ -769,11 +826,21 @@ impl PrefixCheckpointCache {
         // Tests check the kept counts against a full scan on every read.
         #[cfg(test)]
         assert_eq!(
-            (self.ready_checkpoints, self.unready_checkpoints, self.tail_pages),
+            (
+                self.ready_checkpoints,
+                self.unready_checkpoints,
+                self.tail_pages,
+                self.request_pinned_pages
+            ),
             (
                 self.nodes.values().filter(|node| node.ready).count(),
                 self.nodes.values().filter(|node| !node.ready).count(),
                 self.nodes.values().map(|node| node.tail_pages.len()).sum::<usize>(),
+                self.nodes
+                    .values()
+                    .filter(|node| node.request_pins > 0)
+                    .map(|node| node.tail_pages.len())
+                    .sum::<usize>(),
             ),
             "cache counts drifted from the checkpoints they count"
         );
@@ -781,6 +848,7 @@ impl PrefixCheckpointCache {
             published_checkpoints: self.ready_checkpoints,
             pending_checkpoints: self.unready_checkpoints,
             cached_pages: self.tail_pages,
+            request_pinned_pages: self.request_pinned_pages,
             retired_pages: self
                 .retirement
                 .iter()
