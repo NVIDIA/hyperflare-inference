@@ -76,12 +76,6 @@ struct Timing {
     arrival_ns: u64,
     times: RequestTimes,
     generated: u32,
-    /// Only a stream reports when text content first appeared.
-    streaming: bool,
-    /// Completion of the latest model step whose output the encoder received.
-    step_ns: Option<u64>,
-    /// Completion of the model step whose output first produced text content.
-    content_ns: Option<u64>,
 }
 pub(crate) struct Encoder {
     logprob_format: Option<(crate::server::inference::LogprobOptions, std::sync::Arc<crate::frontend::Frontend>)>,
@@ -239,25 +233,14 @@ impl Encoder {
     /// chunk of a Chat or Completions stream, on the terminal `response` of a
     /// Responses stream, and at the top level of a JSON body. Messages and
     /// multi-prompt Completions omit the object; several choices make it null.
-    /// Returns whether the content instant applies, which needs the generation's
-    /// `Committed` events.
-    pub fn enable_request_metrics(&mut self, streaming: bool) -> bool {
+    pub fn enable_request_metrics(&mut self, streaming: bool) {
         let placed = !streaming || self.include_usage || self.protocol == Protocol::Responses;
         self.metrics = match self.protocol {
             Protocol::Messages => None,
             _ if !placed || self.prompts.len() > 1 => None,
             _ if self.choices_per_prompt > 1 => Some(RequestMetrics::Suppressed),
-            _ => Some(RequestMetrics::Single(Timing { streaming, ..Timing::default() })),
+            _ => Some(RequestMetrics::Single(Timing::default())),
         };
-        streaming && matches!(self.metrics, Some(RequestMetrics::Single(_)))
-    }
-    /// Record the completion instant of the model step whose output follows.
-    pub fn record_commit(&mut self, at_ns: u64) {
-        if let Some(RequestMetrics::Single(timing)) = &mut self.metrics
-            && timing.streaming
-        {
-            timing.step_ns = Some(at_ns);
-        }
     }
     /// Record the terminal instants and generated-token count of the generation.
     pub fn record_times(&mut self, arrival_ns: u64, times: RequestTimes, generated: u32) {
@@ -266,7 +249,8 @@ impl Encoder {
         }
     }
     /// The `metrics` object, `null` when suppressed, or `None` when omitted. Each
-    /// interval is null when the generation did not reach its instants.
+    /// interval is null when the generation did not reach its instants; Flare does
+    /// not report the content instant.
     pub fn metrics_value(&self) -> Option<Value> {
         let timing = match self.metrics.as_ref()? {
             RequestMetrics::Suppressed => return Some(Value::Null),
@@ -279,7 +263,7 @@ impl Encoder {
         let generation = first.zip(last).map(|(first, last)| ms(first, last));
         Some(json!({
             "time_to_first_token_ms": scheduled.zip(first).map(|(s, f)| ms(s, f)),
-            "time_to_first_content_token_ms": scheduled.zip(timing.content_ns).map(|(s, c)| ms(s, c)),
+            "time_to_first_content_token_ms": Value::Null,
             "generation_time_ms": generation,
             "queue_time_ms": scheduled.map(|s| ms(timing.arrival_ns, s)),
             "mean_itl_ms": generation
@@ -542,12 +526,6 @@ impl Encoder {
                 && matches!(&event, Event::Content(_) | Event::ContentLogprobs(_))
             {
                 continue;
-            }
-            if let Event::Content(text) = &event
-                && !text.is_empty()
-                && let Some(RequestMetrics::Single(timing)) = &mut self.metrics
-            {
-                timing.content_ns = timing.content_ns.or(timing.step_ns);
             }
             match &event {
                 Event::TokenLogprobs(entries) => {

@@ -252,7 +252,6 @@ impl Fixture {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation: Some(false),
-                commits: false,
                 record: Default::default(),
                 host_lookup: true,
                 readmitted: false,
@@ -3746,7 +3745,7 @@ fn unread_responses_finish_and_release_model_resources_but_retain_admission_capa
         let mut slow_prompt = prompt(512);
         slow_prompt.logprobs = logprobs;
         slow_prompt.stop_sequences = vec![vec![2, 3]];
-        let mut slow = runtime.generate_observed(slow_prompt, true, false).unwrap();
+        let mut slow = runtime.generate_observed(slow_prompt, true).unwrap();
         let mut worker = fixture.worker(receiver);
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
         let mut tokens = vec![1; 512];
@@ -3800,7 +3799,7 @@ fn unread_response_keeps_its_budget_through_a_reasoning_continuation() {
         positions: vec![[0; 3]], vision_token_indices: vec![-1], ..Default::default()
     });
     prompt.reasoning_cut = Some(budget_cut(4, 81));
-    let mut generation = runtime.generate_observed(prompt, false, false).unwrap();
+    let mut generation = runtime.generate_observed(prompt, false).unwrap();
     let mut worker = fixture.worker(receiver);
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     let mut sequence = 0;
@@ -4560,15 +4559,14 @@ fn timed_pass(worker: &mut Worker<'_>, samples: &[u32]) -> Vec<StepBounds> {
 }
 
 /// Serve one HTTP request through a worker that `timed_pass` drives, returning the
-/// step bounds, the JSON body or the SSE `data` payloads of a stream, and whether
-/// the request asked the worker for commit instants.
+/// step bounds and the JSON body or the SSE `data` payloads of a stream.
 async fn served_through_worker(
     fixture: fn() -> Fixture,
     per_request_metrics: bool,
     path: &str,
     body: serde_json::Value,
     samples: &[u32],
-) -> (Vec<StepBounds>, Vec<serde_json::Value>, bool) {
+) -> (Vec<StepBounds>, Vec<serde_json::Value>) {
     use axum::{Extension, extract::State};
     let (sender, receiver) = mpsc::sync_channel(4);
     let mut state = http_state_for(fixture(), sender, None, &[]);
@@ -4587,7 +4585,6 @@ async fn served_through_worker(
     })
     .await
     .unwrap();
-    let commits = group[0].commits;
     let steps = {
         let worker_fixture = fixture();
         let (queue, inbound) = mpsc::channel();
@@ -4609,14 +4606,14 @@ async fn served_through_worker(
     } else {
         vec![serde_json::from_slice(&bytes).unwrap()]
     };
-    (steps, values, commits)
+    (steps, values)
 }
 
 #[tokio::test]
 async fn performance_reports_the_first_scheduled_model_step() {
     use serde_json::json;
     for stream in [false, true] {
-        let (steps, values, _) = served_through_worker(
+        let (steps, values) = served_through_worker(
             || Fixture::new().text_inputs(),
             false,
             "/v1/chat/completions",
@@ -4652,7 +4649,6 @@ struct Served {
     arrival_ns: u64,
     scheduled_ns: u64,
     first_ns: u64,
-    content_ns: Option<u64>,
     last_ns: u64,
 }
 
@@ -4667,15 +4663,11 @@ fn served_instants(values: &[serde_json::Value]) -> (serde_json::Value, Served) 
         .find(|value| value.get("performance").is_some())
         .unwrap()["performance"];
     let scheduled_ns = performance["first_scheduled_ns"].as_u64().unwrap();
-    let after = |field: &str| {
-        metrics[field].as_f64().map(|ms| scheduled_ns + (ms * 1e6).round() as u64)
-    };
-    let first_ns = after("time_to_first_token_ms").unwrap();
+    let first_ns = scheduled_ns + (metrics["time_to_first_token_ms"].as_f64().unwrap() * 1e6).round() as u64;
     let served = Served {
         arrival_ns: scheduled_ns - (metrics["queue_time_ms"].as_f64().unwrap() * 1e6).round() as u64,
         scheduled_ns,
         first_ns,
-        content_ns: after("time_to_first_content_token_ms"),
         last_ns: first_ns + (metrics["generation_time_ms"].as_f64().unwrap() * 1e6).round() as u64,
     };
     // The HTTP ingress precedes model-queue arrival, which precedes enqueue_ns.
@@ -4697,7 +4689,7 @@ async fn per_request_metrics_report_the_runtime_instants_of_a_stopped_reasoning_
     // Reasoning, its close, the first answer text, then the stop string.
     let samples = [token("b"), token("</think>"), token("c"), token("d")];
     for stream in [true, false] {
-        let (steps, values, commits) = served_through_worker(
+        let (steps, values) = served_through_worker(
             Fixture::reasoning,
             true,
             "/v1/chat/completions",
@@ -4708,7 +4700,6 @@ async fn per_request_metrics_report_the_runtime_instants_of_a_stopped_reasoning_
             &samples,
         )
         .await;
-        assert_eq!(commits, stream);
         let carriers: Vec<_> = values.iter().filter(|value| value.get("metrics").is_some()).collect();
         assert_eq!(carriers.len(), 1);
         if stream {
@@ -4728,13 +4719,7 @@ async fn per_request_metrics_report_the_runtime_instants_of_a_stopped_reasoning_
         assert!(within(&steps[0], served.scheduled_ns));
         assert!(within(generating[0], served.first_ns));
         assert!(within(generating[3], served.last_ns));
-        if stream {
-            // Reasoning and its close precede the first answer text by two steps.
-            assert!(within(generating[2], served.content_ns.unwrap()));
-            assert!(metrics["time_to_first_content_token_ms"].as_f64() > metrics["time_to_first_token_ms"].as_f64());
-        } else {
-            assert_eq!(served.content_ns, None);
-        }
+        assert_eq!(metrics["time_to_first_content_token_ms"], Value::Null);
         let ms = |ns: u64| ns as f64 / 1e6;
         assert!((metrics["mean_itl_ms"].as_f64().unwrap() - ms(served.last_ns - served.first_ns) / 3.0).abs() < 1e-5);
         assert!((metrics["tokens_per_second"].as_f64().unwrap() * ms(served.last_ns - served.scheduled_ns) / 1e3 - 4.0).abs() < 1e-6);
@@ -4755,7 +4740,7 @@ async fn per_request_metrics_reach_completions_and_responses_where_vllm_places_t
             if path == "/v1/completions" && stream {
                 body["stream_options"] = json!({"include_usage":true});
             }
-            let (steps, values, commits) = served_through_worker(
+            let (steps, values) = served_through_worker(
                 || Fixture::new().text_inputs(),
                 true,
                 path,
@@ -4763,7 +4748,6 @@ async fn per_request_metrics_reach_completions_and_responses_where_vllm_places_t
                 &[1, 2],
             )
             .await;
-            assert_eq!(commits, stream);
             let carriers: Vec<(&Value, &Value)> = values
                 .iter()
                 .filter_map(|value| {
@@ -4787,11 +4771,7 @@ async fn per_request_metrics_reach_completions_and_responses_where_vllm_places_t
             assert!(generation >= 3.0 && generation * 1e6 <= (generating[1].end_ns - generating[0].start_ns) as f64);
             assert!(ttft >= 0.0 && metrics["queue_time_ms"].as_f64().unwrap() >= 0.0);
             assert_eq!(metrics["mean_itl_ms"], metrics["generation_time_ms"]);
-            // Plain text is content from the first token.
-            assert_eq!(
-                metrics["time_to_first_content_token_ms"],
-                if stream { metrics["time_to_first_token_ms"].clone() } else { Value::Null }
-            );
+            assert_eq!(metrics["time_to_first_content_token_ms"], Value::Null);
         }
     }
 }
@@ -4800,7 +4780,7 @@ async fn per_request_metrics_reach_completions_and_responses_where_vllm_places_t
 async fn per_request_metrics_are_absent_without_the_option_and_null_for_several_choices() {
     use serde_json::{Value, json};
     for stream in [false, true] {
-        let (_, values, commits) = served_through_worker(
+        let (_, values) = served_through_worker(
             || Fixture::new().text_inputs(),
             false,
             "/v1/completions",
@@ -4809,7 +4789,6 @@ async fn per_request_metrics_are_absent_without_the_option_and_null_for_several_
             &[1, 2],
         )
         .await;
-        assert!(!commits);
         assert!(values.iter().all(|value| value.get("metrics").is_none()));
         assert!(values.iter().any(|value| value["usage"]["completion_tokens"] == 2));
     }
@@ -4836,7 +4815,6 @@ async fn per_request_metrics_are_absent_without_the_option_and_null_for_several_
         })
         .await
         .unwrap();
-        assert!(group.iter().all(|incoming| !incoming.commits));
         for incoming in &group {
             incoming.notify_admission(Ok(()));
             incoming.observe_token(1);

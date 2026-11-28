@@ -59,17 +59,15 @@ impl Prompt {
         !self.stop_sequences.is_empty() || !self.stop_strings.is_empty()
     }
 
-    fn output_event_capacity(&self, minimum: usize, observed: bool, commits: bool) -> Result<usize> {
-        // Each generated token produces at most one presentation event, one
-        // optional observation, and one optional commit instant, because every
-        // step that reports a commit instant generated at least one token.
-        // A reasoning cut's forced token is part of `after`.
+    fn output_event_capacity(&self, minimum: usize, observed: bool) -> Result<usize> {
+        // Each generated token produces at most one presentation event and one
+        // optional observation. A reasoning cut's forced token is part of `after`.
         // Prompt-score chunks cover disjoint, nonempty ranges of the original prompt.
         let tokens = u64::from(self.max_new_tokens)
             + u64::from(self.reasoning_cut.as_ref().map_or(0, |cut| cut.after));
         let events = usize::try_from(tokens)
             .ok()
-            .and_then(|tokens| tokens.checked_mul(1 + usize::from(observed) + usize::from(commits)))
+            .and_then(|tokens| tokens.checked_mul(if observed { 2 } else { 1 }))
             .and_then(|events| {
                 events.checked_add(if self.prompt_logprobs { self.tokens.len() } else { 0 })
             })
@@ -105,12 +103,6 @@ pub enum GenerationEvent {
         arrival_ns: u64,
         /// The request's lifecycle instants, as its completion histograms record them.
         times: super::metrics::RequestTimes,
-    },
-    /// The completion instant of the model step whose output events follow, on the
-    /// `observation::monotonic_ns` clock. Sent only to requests submitted with
-    /// `commits`, once per step that generated a token for the request.
-    Committed {
-        at_ns: u64,
     },
     AdmissionRejected(Error),
     Error(Error),
@@ -202,8 +194,6 @@ struct Incoming {
     failure: Arc<Mutex<Option<Error>>>,
     metrics: Arc<super::metrics::Metrics>,
     observation: Option<bool>,
-    /// Send `GenerationEvent::Committed` before each model step's output.
-    commits: bool,
     /// Values for the completion histograms; preserved when a preempted request is parked.
     record: super::metrics::RequestRecord,
     /// Consult the host prefix store at admission; cleared after a failed restore.
@@ -841,38 +831,30 @@ impl ModelRuntime {
         self.healthy()
     }
     pub fn generate(&self, prompt: Prompt) -> Result<Generation> {
-        self.enqueue(prompt, None, false)
+        self.enqueue(prompt, None)
     }
 
-    pub(super) fn generate_observed(&self, prompt: Prompt, timestamps: bool, commits: bool) -> Result<Generation> {
-        self.enqueue(prompt, Some(timestamps), commits)
+    pub(super) fn generate_observed(&self, prompt: Prompt, timestamps: bool) -> Result<Generation> {
+        self.enqueue(prompt, Some(timestamps))
     }
 
-    fn enqueue(&self, prompt: Prompt, observation: Option<bool>, commits: bool) -> Result<Generation> {
-        self.enqueue_many(vec![prompt], observation, commits)
+    fn enqueue(&self, prompt: Prompt, observation: Option<bool>) -> Result<Generation> {
+        self.enqueue_many(vec![prompt], observation)
             .map(|mut group| group.remove(0))
     }
 
     pub fn generate_many(&self, prompts: Vec<Prompt>) -> Result<Vec<Generation>> {
-        self.enqueue_many(prompts, None, false)
+        self.enqueue_many(prompts, None)
     }
 
-    /// `observation` adds an `ObservedToken` per committed token, timestamped when
-    /// `Some(true)`; `commits` adds a `Committed` event before each model step's output.
-    pub(super) fn generate_many_observed(
-        &self,
-        prompts: Vec<Prompt>,
-        observation: Option<bool>,
-        commits: bool,
-    ) -> Result<Vec<Generation>> {
-        self.enqueue_many(prompts, observation, commits)
+    pub(super) fn generate_many_observed(&self, prompts: Vec<Prompt>, timestamps: bool) -> Result<Vec<Generation>> {
+        self.enqueue_many(prompts, Some(timestamps))
     }
 
     fn enqueue_many(
         &self,
         prompts: Vec<Prompt>,
         observation: Option<bool>,
-        commits: bool,
     ) -> Result<Vec<Generation>> {
         if !self.healthy() {
             return Err(Error::admission(
@@ -917,7 +899,7 @@ impl ModelRuntime {
                 .map_err(|error| error.admission_context(AdmissionError::Invalid))?;
             // Tokio allocates queue blocks as events arrive, not at this capacity.
             let event_capacity =
-                prompt.output_event_capacity(self.event_capacity, observation.is_some(), commits)?;
+                prompt.output_event_capacity(self.event_capacity, observation.is_some())?;
             let (events, receiver) = async_mpsc::channel(event_capacity);
             let (admission, admitted) = oneshot::channel();
             let (first_token, first_token_ready) = oneshot::channel();
@@ -937,7 +919,6 @@ impl ModelRuntime {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation,
-                commits,
                 record: Default::default(),
                 host_lookup: true,
                 readmitted: false,
@@ -1818,9 +1799,6 @@ impl<'a> Worker<'a> {
                 // speculative round, adds one inter-token interval.
                 if position == 0 {
                     request.incoming.record.tokens_committed(completed_at_ns);
-                    if request.incoming.commits {
-                        request.incoming.emit(GenerationEvent::Committed { at_ns: completed_at_ns });
-                    }
                 }
                 request.incoming.observe_token(token.token);
                 request.last_token = Some(token.token);
@@ -3310,7 +3288,6 @@ mod tests {
             failure: failure.clone(),
             metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
             observation: None,
-            commits: false,
             record: Default::default(),
             host_lookup: true,
             readmitted: false,
@@ -3342,17 +3319,15 @@ mod tests {
         let (mut incoming, _generation) = stream(2);
         let prompt = &mut incoming.prompt;
         prompt.max_new_tokens = 1_000_000;
-        assert_eq!(prompt.output_event_capacity(128, false, false).unwrap(), 1_000_003);
-        assert_eq!(prompt.output_event_capacity(128, true, false).unwrap(), 2_000_003);
-        assert_eq!(prompt.output_event_capacity(128, false, true).unwrap(), 2_000_003);
-        assert_eq!(prompt.output_event_capacity(128, true, true).unwrap(), 3_000_003);
+        assert_eq!(prompt.output_event_capacity(128, false).unwrap(), 1_000_003);
+        assert_eq!(prompt.output_event_capacity(128, true).unwrap(), 2_000_003);
         prompt.reasoning_cut = Some(ReasoningCut { close: 8, after: 20, output: None });
         prompt.prompt_logprobs = true;
-        assert_eq!(prompt.output_event_capacity(128, true, false).unwrap(), 2_000_044);
+        assert_eq!(prompt.output_event_capacity(128, true).unwrap(), 2_000_044);
         prompt.max_new_tokens = 0;
         prompt.reasoning_cut = None;
-        assert_eq!(prompt.output_event_capacity(128, false, false).unwrap(), 128);
-        assert!(prompt.output_event_capacity(usize::MAX, true, false).is_err());
+        assert_eq!(prompt.output_event_capacity(128, false).unwrap(), 128);
+        assert!(prompt.output_event_capacity(usize::MAX, true).is_err());
     }
 
     #[test]

@@ -1016,17 +1016,13 @@ string, which the worker matches, does not change how they are measured:
 | --- | --- |
 | `queue_time_ms` | Model-scheduler arrival to the first model step that includes the request |
 | `time_to_first_token_ms` | That first scheduled step to the completion of the step that committed the first generated token |
-| `time_to_first_content_token_ms` | Streams only: the first scheduled step to the completion of the step whose output first produced non-empty answer text |
+| `time_to_first_content_token_ms` | Always null: Flare does not report when answer text first appeared, as vLLM permits for a value it cannot provide |
 | `generation_time_ms` | First to last committed generated token |
 | `mean_itl_ms` | `generation_time_ms` divided by the generated tokens after the first |
 | `tokens_per_second` | Generated tokens, as `usage` counts them, over the first scheduled step to the last committed generated token |
 
 A step's completion instant is read once when the worker processes that step's
-results, so tokens committed by one speculative step share it. Reasoning text,
-tool-call output, and answer text that a named tool choice discards do not count
-as content; text that stop-string matching holds back counts from the step whose
-output releases it. `time_to_first_content_token_ms` equals
-`time_to_first_token_ms` when the first generated step produces answer text.
+results, so tokens committed by one speculative step share it.
 
 A JSON body carries `metrics` at the top level. A Chat or Completions stream
 carries it only on the final usage chunk, whose `choices` is empty, so the stream
@@ -1036,18 +1032,14 @@ carries it. A Responses stream carries it in the `response` object of
 requests always run one generation, so every Responses output carries it.
 
 Every field is present and is null when the request did not reach the instants
-it spans: `time_to_first_content_token_ms` is null in JSON bodies and in streams
-that produced no answer text, `mean_itl_ms` is null for a single generated token,
-the token fields are null when nothing was generated, and every field is null for
-a choice that never reached a model step. With `n` greater than one, `metrics` is
-null, because one choice's instants do not describe the response. Completions
-with several prompts omit `metrics`. Failed requests return error bodies without
-it.
+it spans: `mean_itl_ms` is null for a single generated token, the token fields
+are null when nothing was generated, and every field is null for a choice that
+never reached a model step. With `n` greater than one, `metrics` is null,
+because one choice's instants do not describe the response. Completions with
+several prompts omit `metrics`. Failed requests return error bodies without it.
 
-The option adds no clock reads. A stream that reports
-`time_to_first_content_token_ms` receives one additional runtime event per model
-step that generated a token for it, carrying that step's completion instant;
-other requests receive only the instants on their terminal event. Chat token
+The option adds no clock reads: the encoder reads the instants on each
+request's terminal event. Chat token
 observation reports the same first scheduled step as `performance.first_scheduled_ns`,
 beside per-token timestamps; the
 [prepared model contract](../helios/model-contract.md#token-and-timing-observation)

@@ -359,10 +359,8 @@ its time to first token.
 observed stream includes usage on its terminal choice chunk. Observation flags
 and `include_usage` accept only booleans or null; null is equivalent to false.
 The response event budget includes one observation per generated token when
-requested, in addition to presentation events, and one model-step completion
-instant per generated token for a stream that reports
-[per-request metrics](../docs/api.md#per-request-metrics) with a content instant.
-Observation changes no CUDA graph, device allocation or replay ABI.
+requested, in addition to presentation events. Observation changes no CUDA
+graph, device allocation or replay ABI.
 
 `stop_token_ids` and `stop_token_sequences` accept explicit vocabulary IDs.
 At most sixteen sequences of at most 64 tokens are supported. Matching tokens
