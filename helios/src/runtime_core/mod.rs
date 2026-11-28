@@ -909,6 +909,11 @@ impl NativeResources {
                 driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
                 self.templates.push(handle);
                 let mut nodes = Vec::with_capacity(graph.node_count);
+                // Zero-valued attributes rejected by this replay driver are skipped
+                // per node but reported once per graph, keyed by attribute id and
+                // driver status, so a large core does not log one line per node.
+                let mut skipped_attributes: std::collections::BTreeMap<(i32, i32), u64> =
+                    std::collections::BTreeMap::new();
                 let mut records = files.records(core, &graph.resource)?;
                 for _ in 0..graph.node_count {
                     let node = protobuf::node(records.read()?)?;
@@ -1008,6 +1013,15 @@ impl NativeResources {
                                         attribute.id,
                                         value.as_ptr().cast(),
                                     );
+                                }
+                                if status != 0 && value.iter().all(|word| *word == 0) {
+                                    // Drivers reject kernel-node attributes added after their
+                                    // CUDA release. A zero-valued attribute carries no behavior,
+                                    // so a replay driver older than the preparing driver can
+                                    // safely skip it instead of failing the whole core load.
+                                    *skipped_attributes.entry((attribute.id, status)).or_insert(0) +=
+                                        1;
+                                    continue;
                                 }
                                 driver.check("cuGraphKernelNodeSetAttribute", status)?;
                             }
@@ -1167,6 +1181,12 @@ impl NativeResources {
                     }
                     nodes.push(result);
                     phase.advance(1);
+                }
+                for ((id, status), count) in &skipped_attributes {
+                    eprintln!(
+                        "graph {}: skipping zero-valued kernel-node attribute id={} on {} node(s); rejected by this driver (status={})",
+                        graph.name, id, count, status
+                    );
                 }
                 let mut dependencies = format::Dependencies::new(graph.node_count);
                 let add_dependencies = |sources: &mut Vec<Handle>,
