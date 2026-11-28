@@ -313,6 +313,8 @@ pub fn unpack_with(
     if directory_form(source, &verified.metadata) {
         return Err(invalid("core is already in directory form"));
     }
+    crate::core::cache::preflight_directory_publication(output)
+        .map_err(|error| invalid(format!("directory export preflight: {error}")))?;
     let payloads = verified.payload_files()?;
     // No signature is authenticated here; conversion validates structure, commitment
     // digests, and payload closure. Authentication belongs to `protection::verify`, which
