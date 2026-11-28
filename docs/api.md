@@ -293,6 +293,15 @@ launches by kind, embedding row-cache counters, HTTP admission gauges, and
 uptime. `flare_history_drafts_enabled` reports whether shared decoded history
 augments learned proposals in the serving process.
 
+The route returns one JSON object instead when the query contains `format=json`,
+or when the `Accept` header gives `application/json` a higher quality than
+`text/plain`; at equal quality the earlier media range wins. `format=prometheus`
+selects text regardless of `Accept`, and any other `format` value returns HTTP
+400. Requests without an `Accept` header, and Prometheus scrapers, receive text.
+`flare_helios::server::Snapshot` deserializes the object, reading absent fields
+as zero, and `flare_helios::server::view` holds the rate history and plots of
+the serving terminal dashboard.
+
 Histograms appear in the Prometheus format only and accumulate since server
 start. Host prefix-store histograms report lookup cost and retirement:
 `flare_host_cache_missing_tokens`, `flare_host_cache_estimated_transfer_ns`,
@@ -375,15 +384,6 @@ unavailable runtime return HTTP 503 and are not counted.
 speculative, or mixed graph, the prompt tokens it computed plus the generated
 tokens it committed; rejected draft positions and padding are excluded, and
 initialization, restore, vision, and snapshot graphs are not observed.
-
-The route returns one JSON object instead when the query contains `format=json`,
-or when the `Accept` header gives `application/json` a higher quality than
-`text/plain`; at equal quality the earlier media range wins. `format=prometheus`
-selects text regardless of `Accept`, and any other `format` value returns HTTP
-400. Requests without an `Accept` header, and Prometheus scrapers, receive text.
-`flare_helios::server::Snapshot` deserializes the object, reading absent fields
-as zero, and `flare_helios::server::view` holds the rate history and plots of
-the serving terminal dashboard.
 
 The fields in the table are integers except `learned_drafter`. Totals count from
 server start; `active`, `pending`, the page fields, and the host record fields are

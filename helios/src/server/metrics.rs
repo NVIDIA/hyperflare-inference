@@ -2296,11 +2296,11 @@ mod tests {
             reused_tokens: 192,
             free_pages: 10,
             cached_pages: 3,
-            cache_lookup_tokens: 320,
             host_lookups: 4,
             host_hits: 1,
             host_reused_tokens: 640,
             inbound_waiting: 1,
+            cache_lookup_tokens: 320,
             ..SchedulerStats::default()
         });
         metrics.launched(GraphKind::Restore);
@@ -2350,10 +2350,10 @@ mod tests {
             ("free_kv_tokens", 1280),
             ("cached_kv_pages", 3),
             ("cached_kv_tokens", 384),
-            ("parked_requests", 2),
             ("host_cache_slots_in_use", 3),
             ("host_cache_slots_total", 8),
             ("host_cache_intake_slots", 2),
+            ("parked_requests", 2),
         ] {
             assert!(text.contains(&format!("# TYPE flare_{name} gauge\n")));
             assert!(text.contains(&format!("\nflare_{name} {value}\n")));
