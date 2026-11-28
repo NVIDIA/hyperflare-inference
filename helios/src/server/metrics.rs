@@ -942,7 +942,7 @@ impl Metrics {
         }
         for (name, help, count) in [
             ("replay_gpu_nanoseconds_total", "Sum of maximum rank-local CUDA durations of completed graphs, including readiness waits.", &self.replay_gpu_ns),
-            ("replay_readiness_wait_nanoseconds_total", "Exposed embedding readiness delay measured across ranks; includes RAM and disk delivery.", &self.replay_readiness_wait_ns),
+            ("replay_readiness_wait_nanoseconds_total", "Exposed embedding readiness delay measured across ranks; includes RAM, disk and fabric delivery.", &self.replay_readiness_wait_ns),
             ("replay_readiness_samples_total", "Completed graphs with prepared readiness timing outputs.", &self.replay_readiness_samples),
         ] {
             let _ = writeln!(text, "# HELP flare_{name} {help}\n# TYPE flare_{name} counter\nflare_{name} {}",

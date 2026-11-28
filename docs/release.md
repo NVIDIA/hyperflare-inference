@@ -31,6 +31,10 @@ libraries, and no build links the CUDA toolkit.
   later.
 - The arm64 Linux executable links `libibverbs` for multi-host RoCE serving.
   Install `libibverbs1` and `ibverbs-providers`.
+- No release executable enables the `engram-rdma` feature. Fabric Engram table
+  storage and `flare engram-store` need a source build with
+  `--features engram-rdma`, which links `libibverbs`; see
+  [the Engram store](engram-store.md).
 - The Windows desktop requires Windows 11. It bundles its Windows App SDK and
   Visual C++ runtime files. `Flare.exe` is unsigned.
 

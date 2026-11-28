@@ -70,6 +70,8 @@ pub use model::{
     rank_ranges, reserve_bytes,
 };
 pub use selection::LoadOptions;
+#[cfg(feature = "engram-rdma")]
+pub(crate) use engram::catalog as engram_catalog;
 
 use std::collections::HashMap;
 use std::ffi::CString;

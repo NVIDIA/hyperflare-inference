@@ -87,6 +87,8 @@ fn help_exits_successfully_before_accessing_files() {
         vec!["download", "--help"],
         vec!["download", "-h"],
         vec!["help", "download"],
+        vec!["engram-store", "--help"],
+        vec!["help", "engram-store"],
         vec![
             "download",
             "owner/model",
@@ -117,6 +119,7 @@ fn help_exits_successfully_before_accessing_files() {
         assert!(help.contains("Usage: flare"), "{arguments:?}: {help}");
         if arguments.contains(&"run") {
             assert!(help.contains("--embedding-table-storage"), "{help}");
+            assert!(help.contains("--embedding-table-store "), "{help}");
             assert!(help.contains("--no-mtp-adaptive-verification"), "{help}");
             assert!(help.contains("--mtp-adaptive-verification-alpha"), "{help}");
             assert!(help.contains("--prefix-cache-pool-ca"), "{help}");
@@ -131,6 +134,13 @@ fn help_exits_successfully_before_accessing_files() {
             assert!(help.contains("--scheduler-terminal-age-price"), "{help}");
             assert!(help.contains("127.0.0.1"), "{help}");
             assert!(!help.contains("--bind"), "{help}");
+        }
+        if arguments.contains(&"engram-store") {
+            for flag in ["<CORE>", "--listen", "--tensor-parallel", "--dangerously-approve-key"] {
+                assert!(help.contains(flag), "{flag}: {help}");
+            }
+            let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("The RDMA fabric between store and serving hosts is trusted"), "{help}");
         }
     }
 }

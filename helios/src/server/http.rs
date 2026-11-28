@@ -31,10 +31,20 @@ fn rejection(
     failure: Error,
 ) -> Response {
     if state.log_to_stderr { log_failure(id, stage, &failure); }
+    let retry = matches!(failure, Error::Admission(AdmissionError::EngramUnavailable(_)));
     let mut body = protocol.failure(&failure);
     let (status, message) = rejection_details(state, failure);
     body["error"]["message"] = message.into();
-    with_request_id((status, Json(body)).into_response(), id)
+    let mut response = (status, Json(body)).into_response();
+    if retry {
+        // The Engram store session retries in the background with a delay capped at a few
+        // seconds; clients retry on the same scale.
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    with_request_id(response, id)
 }
 fn with_request_id(mut response: Response, id: &str) -> Response {
     response

@@ -595,7 +595,21 @@ fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize)
 
 async fn health(State(state): State<Arc<HttpState>>) -> Response {
     if state.model.healthy() {
-        Json(json!({"status":"ok"})).into_response()
+        // An unreachable Engram store leaves the process healthy: admission rejects requests
+        // with 503 until the store session is ready again.
+        match state.model.engram_store() {
+            Some(store) => Json(json!({
+                "status": "ok",
+                "engram_store": {
+                    "state": store.state,
+                    "endpoint": store.endpoint,
+                    "last_error": store.last_error,
+                    "reconnects": store.reconnects,
+                },
+            }))
+            .into_response(),
+            None => Json(json!({"status":"ok"})).into_response(),
+        }
     } else {
         error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -728,9 +742,11 @@ fn readiness_failure(
 
 fn status(failure: &Error) -> StatusCode {
     match failure {
-        Error::Admission(AdmissionError::Capacity(_) | AdmissionError::Unavailable(_)) => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        Error::Admission(
+            AdmissionError::Capacity(_)
+            | AdmissionError::Unavailable(_)
+            | AdmissionError::EngramUnavailable(_),
+        ) => StatusCode::SERVICE_UNAVAILABLE,
         Error::Admission(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -740,6 +756,7 @@ fn error_code(failure: &Error) -> &'static str {
     match failure {
         Error::Admission(AdmissionError::Capacity(_)) => "capacity_exhausted",
         Error::Admission(AdmissionError::Unavailable(_)) => "server_unavailable",
+        Error::Admission(AdmissionError::EngramUnavailable(_)) => "embedding_store_unavailable",
         Error::Admission(AdmissionError::Context(_)) => "context_length_exceeded",
         Error::Admission(AdmissionError::Feature(_)) => "unsupported_feature",
         Error::Admission(AdmissionError::Grammar(_)) => "invalid_grammar",

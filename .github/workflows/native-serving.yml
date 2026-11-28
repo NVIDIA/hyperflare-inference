@@ -111,3 +111,8 @@ jobs:
           cargo check --locked --manifest-path selene/Cargo.toml --tests --features rdma
           cargo check --locked --manifest-path selene-manager/Cargo.toml --tests --features rdma
           cargo check --locked --manifest-path flare-cli/Cargo.toml --tests --features roce,rdma
+      - name: Compile and test fabric Engram storage
+        run: |
+          cargo check --locked --manifest-path helios/Cargo.toml --tests --features runtime-core,server,engram-rdma
+          cargo check --locked --manifest-path flare-cli/Cargo.toml --tests --features engram-rdma
+          cargo test --locked --manifest-path helios/Cargo.toml --features runtime-core,server,engram-rdma fabric

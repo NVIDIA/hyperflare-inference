@@ -111,6 +111,34 @@ fn roce_spec(
     Ok(spec)
 }
 
+/// Host bytes the embedding tables need beyond the core's own allocations: resident planes
+/// (both planes in RAM storage; scale planes when resident scales are enabled), the staging
+/// frames, and the row cache including its miss workspace. Fabric storage needs exactly what
+/// disk storage needs: its RDMA registration pins the miss workspace the cache budget already
+/// holds and allocates no second copy of any plane.
+fn embedding_host_bytes<'a>(
+    indexes: impl Iterator<Item = &'a crate::engram::Index>,
+    ram: bool,
+    resident_scales: bool,
+    staging_bytes: u64,
+    cache_bytes: u64,
+) -> Result<u64> {
+    let mut resident = 0u64;
+    for table in indexes.flat_map(|index| &index.tables) {
+        for (ordinal, plane) in table.planes.iter().enumerate() {
+            if ram || (resident_scales && ordinal == 1) {
+                resident = resident
+                    .checked_add(plane.resident_bytes()? as u64)
+                    .ok_or_else(|| invalid("resident embedding tables exceed the memory budget"))?;
+            }
+        }
+    }
+    resident
+        .checked_add(staging_bytes)
+        .and_then(|bytes| bytes.checked_add(cache_bytes))
+        .ok_or_else(|| invalid("embedding tables, staging, and row cache exceed the memory budget"))
+}
+
 fn validate_persistent_worker_topology(
     cores: &[Core],
     cluster: Option<&ClusterRank>,
@@ -300,6 +328,8 @@ impl NativeModel {
             return Err(invalid("GPU label count must match selected devices"));
         }
         let phase = progress.phase("Prepare model", None);
+        // An Engram store must hold exactly this signed core before it serves rows.
+        let core_identity = authorized.envelope_digest();
         let (mut descriptor, mut legacy_bundles, mut ready_cores, files) = match authorized.kind {
             AuthorizedKind::Legacy { archive, index } => {
                 let (descriptor, bundles) = super::protection::LoadedModelDescriptor::from_legacy(index);
@@ -726,28 +756,17 @@ impl NativeModel {
                 !engram.is_empty(),
                 model.ranks.iter().any(|rank| rank.integrated),
             );
-            let resident_bytes = engram
-                .iter()
-                .flat_map(|(index, _)| &index.tables)
-                .flat_map(|table| table.planes.iter().enumerate())
-                .filter(|(ordinal, _)| {
-                    ram || (embedding_table_resident_scales && *ordinal == 1)
-                })
-                .try_fold(0u64, |bytes, (_, plane)| {
-                    bytes
-                        .checked_add(plane.resident_bytes()? as u64)
-                        .ok_or_else(|| invalid("resident embedding tables exceed the memory budget"))
-                })?;
             let embedding_table_cache_bytes = options.embedding_cache_bytes(
                 !engram.is_empty(),
                 model.ranks.iter().any(|rank| rank.integrated),
             );
-            let embedding_host_bytes = resident_bytes
-                .checked_add(staging_bytes)
-                .and_then(|bytes| bytes.checked_add(embedding_table_cache_bytes))
-                .ok_or_else(|| {
-                    invalid("embedding tables, staging, and row cache exceed the memory budget")
-                })?;
+            let embedding_host_bytes = embedding_host_bytes(
+                engram.iter().map(|(index, _)| index),
+                ram,
+                embedding_table_resident_scales,
+                staging_bytes,
+                embedding_table_cache_bytes,
+            )?;
             let initial = match before_contexts {
                 Some(initial) => initial,
                 None => model
@@ -815,30 +834,34 @@ impl NativeModel {
                 let phase = progress.phase("Prepare embedding tables", None);
                 let storage = options.embedding_table_storage.unwrap_or_default();
                 let group_budget = embedding_table_cache_bytes / engram.len() as u64;
-                // Open direct-I/O handles only for containers that actually carry embedding
-                // planes rather than every weight companion in the deployment.
-                let mut mapped_files = std::collections::BTreeMap::new();
-                let mut direct_files = Vec::new();
-                for (index, _) in &mut engram {
-                    for table in &mut index.tables {
-                        for plane in &mut table.planes {
-                            let target = match mapped_files.entry(plane.file) {
-                                std::collections::btree_map::Entry::Occupied(entry) => {
-                                    *entry.get()
-                                }
-                                std::collections::btree_map::Entry::Vacant(slot) => {
-                                    let next = direct_files.len();
-                                    direct_files.push(files.direct_file(plane.file)?);
-                                    *slot.insert(next)
-                                }
-                            };
-                            plane.file = target;
-                        }
-                    }
-                }
+                let direct_files =
+                    super::engram::direct_files(engram.iter_mut().map(|(index, _)| index), &files)?;
+                let store_status = options
+                    .embedding_store()
+                    .map(|endpoint| crate::engram::fabric::Status::new(&endpoint.address));
                 let mut bindings = Vec::new();
                 for ((index, ranks), tokens) in engram.into_iter().zip(engram_tokens) {
                     let first = ranks[0];
+                    // Ranks with identical catalogs share one table group and one session;
+                    // the store serves any of them the same planes.
+                    let store = match (options.embedding_store(), &store_status) {
+                        (Some(endpoint), Some(status)) => {
+                            let (rank, world) = model
+                                .cluster
+                                .as_ref()
+                                .map_or((first, cores.len()), |c| (c.rank, c.world));
+                            Some(crate::engram::fabric::Connect {
+                                endpoint,
+                                identity: core_identity,
+                                rank: u32::try_from(rank)
+                                    .map_err(|_| invalid("rank exceeds the store protocol range"))?,
+                                world: u32::try_from(world)
+                                    .map_err(|_| invalid("rank count exceeds the store protocol range"))?,
+                                status: status.clone(),
+                            })
+                        }
+                        _ => None,
+                    };
                     let shared = crate::engram::Shared::new(
                         index,
                         &direct_files,
@@ -850,6 +873,7 @@ impl NativeModel {
                         group_budget,
                         options.embedding_workers(),
                         embedding_table_resident_scales,
+                        store,
                     )?;
                     for (delivery_rank, local) in ranks.into_iter().enumerate() {
                         bindings.push((local, shared.clone(), delivery_rank));
@@ -866,6 +890,10 @@ impl NativeModel {
                     }
                     crate::engram::Storage::Disk => "disk",
                     crate::engram::Storage::Ram => "RAM",
+                    crate::engram::Storage::Fabric if embedding_table_resident_scales => {
+                        "fabric weights, RAM scales"
+                    }
+                    crate::engram::Storage::Fabric => "fabric",
                 };
                 let cache_bytes: u64 = model
                     .engram
@@ -1180,6 +1208,51 @@ fn validate_peer_memory(cores: &[Core], peers: &[protobuf::wire::PeerMemory]) ->
 mod tests {
     use super::*;
     use protobuf::wire;
+
+    #[test]
+    fn fabric_memory_plan_equals_the_disk_plan_and_disk_and_ram_are_unchanged() {
+        use crate::engram::{Index, Plane, Storage, Table};
+        let table = |rows: usize| Table {
+            planes: [
+                Plane { file: 0, offset: 123, nbytes: rows * 256, row_bytes: 256 },
+                Plane { file: 0, offset: 7, nbytes: rows * 8, row_bytes: 8 },
+            ],
+            heads: 24,
+            weights: "w".into(),
+            scales: "s".into(),
+            hashes: "h".into(),
+            event: "e".into(),
+            request: None,
+        };
+        let index = Index { tables: vec![table(1000), table(4096)] };
+        let plan = |storage: Option<Storage>, store: Option<&str>, integrated: bool| {
+            let options = LoadOptions {
+                embedding_table_storage: storage,
+                embedding_table_store: store.map(str::to_owned),
+                ..Default::default()
+            };
+            embedding_host_bytes(
+                std::iter::once(&index),
+                options.embedding_table_storage == Some(Storage::Ram),
+                options.embedding_resident_scales(true, integrated),
+                1 << 20,
+                options.embedding_cache_bytes(true, integrated),
+            )
+            .unwrap()
+        };
+        let scales = index.tables.iter().map(|t| t.planes[1].resident_bytes().unwrap() as u64).sum::<u64>();
+        let weights = index.tables.iter().map(|t| t.planes[0].resident_bytes().unwrap() as u64).sum::<u64>();
+        for integrated in [false, true] {
+            assert_eq!(
+                plan(Some(Storage::Fabric), Some("10.0.0.5:7700"), integrated),
+                plan(Some(Storage::Disk), None, integrated)
+            );
+            assert_eq!(plan(None, None, integrated), plan(Some(Storage::Disk), None, integrated));
+        }
+        assert_eq!(plan(None, None, false), scales + (1 << 20) + (4 << 30));
+        assert_eq!(plan(None, None, true), (1 << 20) + (1 << 30));
+        assert_eq!(plan(Some(Storage::Ram), None, false), weights + scales + (1 << 20));
+    }
 
     #[test]
     fn actual_imports_preserve_tp16_static_access_and_scope_dcp_cache_access() {

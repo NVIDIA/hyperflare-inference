@@ -26,6 +26,9 @@ pub struct LoadOptions {
     pub embedding_table_resident_scales: Option<bool>,
     /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
     pub embedding_table_workers: Option<usize>,
+    /// `HOST:PORT` of the Engram store's control listener; required by fabric storage and
+    /// rejected with every other storage mode.
+    pub embedding_table_store: Option<String>,
     pub max_concurrency: Option<usize>,
     pub mtp_draft_tokens: Option<usize>,
     pub history_drafts: Option<bool>,
@@ -48,22 +51,94 @@ impl LoadOptions {
             .unwrap_or(if cfg!(windows) { 4 } else { 1 })
     }
 
+    /// Disk and fabric storage both read row-cache misses from outside host RAM, so they share
+    /// the row-cache and resident-scale defaults.
+    fn cached_storage(&self) -> bool {
+        matches!(
+            self.embedding_table_storage.unwrap_or_default(),
+            crate::engram::Storage::Disk | crate::engram::Storage::Fabric
+        )
+    }
+
+    /// The Engram store endpoint with its fixed lane count and timeout.
+    pub fn embedding_store(&self) -> Option<crate::engram::fabric::Endpoint> {
+        use crate::engram::fabric::{DEFAULT_LANES, DEFAULT_TIMEOUT, Endpoint};
+        self.embedding_table_store.as_ref().map(|address| Endpoint {
+            address: address.clone(),
+            lanes: DEFAULT_LANES,
+            timeout: DEFAULT_TIMEOUT,
+        })
+    }
+
     pub(super) fn embedding_resident_scales(&self, has_tables: bool, integrated: bool) -> bool {
         has_tables
-            && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
+            && self.cached_storage()
             && self.embedding_table_resident_scales.unwrap_or(!integrated)
     }
 
     pub(super) fn embedding_cache_bytes(&self, has_tables: bool, integrated: bool) -> u64 {
         self.embedding_table_cache_bytes.unwrap_or_else(|| {
-            if has_tables
-                && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
-            {
+            if has_tables && self.cached_storage() {
                 if integrated { 1 << 30 } else { 4 << 30 }
             } else {
                 0
             }
         })
+    }
+
+    /// Fabric storage needs a store endpoint and the row cache, takes no disk-reader setting,
+    /// serves only cores whose ranks share one process, and is rejected by a build without RDMA
+    /// support. Configuration errors are reported before the build check so each misuse names
+    /// its own cause in every build.
+    fn validate_embedding_store(&self) -> Result<()> {
+        let fabric = self.embedding_table_storage == Some(crate::engram::Storage::Fabric);
+        let Some(address) = &self.embedding_table_store else {
+            if fabric {
+                return Err(invalid(
+                    "fabric embedding-table storage requires a store endpoint (--embedding-table-store HOST:PORT)",
+                ));
+            }
+            return Ok(());
+        };
+        if !fabric {
+            return Err(invalid(
+                "an embedding table store endpoint requires --embedding-table-storage fabric",
+            ));
+        }
+        // A host name or IPv4 address with a port, or a bracketed IPv6 address with a port.
+        let endpoint = match address.parse::<std::net::SocketAddr>() {
+            Ok(socket) => socket.port() != 0,
+            Err(_) => address.rsplit_once(':').is_some_and(|(host, port)| {
+                !host.is_empty()
+                    && !host.contains(':')
+                    && port.parse::<u16>().is_ok_and(|port| port != 0)
+            }),
+        };
+        if !endpoint {
+            return Err(invalid(format!(
+                "embedding table store {address:?} must be HOST:PORT with a nonzero port"
+            )));
+        }
+        if self.embedding_table_cache_bytes == Some(0) {
+            return Err(invalid(
+                "fabric embedding-table storage requires the row cache; the embedding row cache size must be nonzero",
+            ));
+        }
+        if self.embedding_table_workers.is_some() {
+            return Err(invalid(
+                "embedding table workers configure the disk reader and do not apply to fabric storage",
+            ));
+        }
+        // A rank process cannot report a frame that read zeroed rows to rank zero.
+        if self.cluster_rank.is_some() {
+            return Err(invalid(
+                "fabric embedding-table storage requires every rank in one process",
+            ));
+        }
+        if !cfg!(feature = "engram-rdma") {
+            return Err(invalid(crate::engram::fabric::NO_RDMA));
+        }
+        Ok(())
     }
 
     pub(super) fn select(&self, cores: &mut [Core], config: &mut Value) -> Result<usize> {
@@ -103,6 +178,7 @@ impl LoadOptions {
                 "resident embedding scales require disk table storage; RAM storage already retains all planes",
             ));
         }
+        self.validate_embedding_store()?;
         let execution = cores
             .first()
             .and_then(|p| p.execution.as_ref())
@@ -874,6 +950,79 @@ mod tests {
                 .to_string()
                 .contains("require disk storage")
         );
+    }
+
+    fn fabric(store: Option<&str>) -> LoadOptions {
+        LoadOptions {
+            embedding_table_storage: Some(crate::engram::Storage::Fabric),
+            embedding_table_store: store.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    fn rejection(options: LoadOptions) -> String {
+        options
+            .select(&mut [core()], &mut config())
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn fabric_storage_rejects_each_misuse_with_its_cause() {
+        use crate::engram::Storage;
+        let store = Some("10.0.0.5:7700");
+        let mut cases = vec![
+            (fabric(None), "requires a store endpoint"),
+            (LoadOptions { embedding_table_cache_bytes: Some(0), ..fabric(store) }, "requires the row cache"),
+            (LoadOptions { embedding_table_workers: Some(1), ..fabric(store) }, "workers configure the disk reader"),
+            (LoadOptions { cluster_rank: Some(1), ..fabric(store) }, "every rank in one process"),
+        ];
+        for address in ["store", ":7700", "store:0", "store:http", "::1:7700", "[::1]:0"] {
+            cases.push((fabric(Some(address)), "must be HOST:PORT"));
+        }
+        for storage in [None, Some(Storage::Disk), Some(Storage::Ram)] {
+            cases.push((
+                LoadOptions { embedding_table_storage: storage, ..fabric(store) },
+                "requires --embedding-table-storage fabric",
+            ));
+        }
+        for (options, cause) in cases {
+            let error = rejection(options.clone());
+            assert!(error.contains(cause), "{options:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn fabric_storage_keeps_the_disk_row_cache_and_resident_scale_defaults() {
+        let options = fabric(Some("[fd00::5]:7700"));
+        for integrated in [false, true] {
+            let disk = LoadOptions::default();
+            assert_eq!(options.embedding_resident_scales(true, integrated), disk.embedding_resident_scales(true, integrated));
+            assert_eq!(options.embedding_cache_bytes(true, integrated), disk.embedding_cache_bytes(true, integrated));
+        }
+        assert!(options.embedding_resident_scales(true, false));
+        let endpoint = options.embedding_store().unwrap();
+        assert_eq!((endpoint.lanes, endpoint.timeout.as_millis()), (4, 5000));
+        assert!(LoadOptions::default().embedding_store().is_none());
+    }
+
+    #[cfg(not(feature = "engram-rdma"))]
+    #[test]
+    fn a_build_without_rdma_rejects_fabric_storage() {
+        assert!(rejection(fabric(Some("10.0.0.5:7700"))).contains("this build has no RDMA support"));
+    }
+
+    #[cfg(feature = "engram-rdma")]
+    #[test]
+    fn an_rdma_build_accepts_a_complete_fabric_configuration() {
+        for address in ["10.0.0.5:7700", "store.example:7700", "[fd00::5]:7700"] {
+            let options = LoadOptions {
+                embedding_table_resident_scales: Some(true),
+                embedding_table_cache_bytes: Some(8 << 30),
+                ..fabric(Some(address))
+            };
+            options.select(&mut [core()], &mut config()).unwrap();
+        }
     }
 
     #[test]

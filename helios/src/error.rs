@@ -82,6 +82,10 @@ pub enum AdmissionError {
     Image(Failure),
     #[error(transparent)]
     Unavailable(Failure),
+    /// The Engram embedding-table store is unreachable. Fabric storage never substitutes
+    /// local reads, so requests wait for the store session to recover.
+    #[error(transparent)]
+    EngramUnavailable(Failure),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

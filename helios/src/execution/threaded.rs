@@ -941,6 +941,11 @@ impl ThreadedExecutor {
             agreement(&root, &completion)
                 .map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
             root.timing.merge_rank(index + 1, completion.timing)?;
+            // Partitioned tables give each rank its own store session; any rank's failure
+            // invalidates the frame for every rank.
+            if root.engram_failure.is_none() {
+                root.engram_failure = completion.engram_failure;
+            }
         }
         root.timing.queued = frame.queued;
         root.timing.wall_ns = frame.dispatched.elapsed().as_nanos().min(u64::MAX as u128) as u64;

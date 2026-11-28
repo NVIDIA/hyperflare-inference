@@ -74,6 +74,45 @@ pub enum Command {
     /// Monitor live Parallax expert-movement and persistent-worker telemetry.
     #[command(alias = "worker")]
     Parallax(ParallaxArgs),
+    /// Hold a core's Engram embedding tables in this host's RAM and serve them over RDMA to
+    /// Flare processes using fabric embedding-table storage.
+    EngramStore(Box<EngramStore>),
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "Example:\n  flare engram-store /models/deepseek-v41 --listen 10.0.0.5:7700 --tensor-parallel 4\n\nThe store serves every rank of the deployment. It verifies the core's signature, then page-locks every table byte it serves; its\nlocked-memory limit (ulimit -l, or LimitMEMLOCK) must cover them, so it is normally unlimited.\nThe RDMA fabric between store and serving hosts is trusted: READs are neither encrypted nor\nauthenticated.")]
+pub struct EngramStore {
+    /// Local core holding the Engram tables to serve; the same signed core the serving hosts load.
+    #[arg(value_name = "CORE")]
+    pub core: PathBuf,
+
+    /// Control listener: an address of the RoCE interface the store serves from, and a port.
+    #[arg(long, value_name = "IP:PORT")]
+    pub listen: std::net::SocketAddr,
+
+    /// Tensor-parallel size of the deployment to serve [default: the core's sole deployment].
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub tensor_parallel: Option<u32>,
+
+    /// Additional publisher verification profiles (JSON); does not grant execution trust.
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub publisher_keys: Vec<PathBuf>,
+
+    /// Verify stored table ranges against the signed digests before serving them.
+    #[arg(long)]
+    pub verify_weights: bool,
+
+    /// Permanently accept this exact signing key together with --dangerously-accept-publisher.
+    #[arg(long, requires = "dangerously_accept_publisher", value_name = "FINGERPRINT")]
+    pub dangerously_approve_key: Option<String>,
+
+    /// Exact Hugging Face publisher namespace acknowledged for unattended first use.
+    #[arg(long, requires = "dangerously_approve_key", value_name = "NAMESPACE")]
+    pub dangerously_accept_publisher: Option<String>,
+
+    /// Persistent trust file [default: ~/.config/flare/trust.toml].
+    #[arg(long, value_name = "PATH")]
+    pub trust_store: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -735,7 +774,7 @@ pub enum TrustCommand {
 #[derive(Debug, Args)]
 #[command(
     args_override_self = true,
-    after_help = "Examples:\n  flare run model.safetensors --gpus 0 --host 127.0.0.1 --port 8000\n  flare run model.safetensors --embedding-table-storage ram --mtp-draft-tokens 3\n\nConcurrency and draft limits must fit the core's prepared capacities.\nOmitted options use host configuration, then core defaults."
+    after_help = "Examples:\n  flare run model.safetensors --gpus 0 --host 127.0.0.1 --port 8000\n  flare run model.safetensors --embedding-table-storage ram --mtp-draft-tokens 3\n  flare run model.safetensors --embedding-table-storage fabric --embedding-table-store 10.0.0.5:7700\n\nConcurrency and draft limits must fit the core's prepared capacities.\nOmitted options use host configuration, then core defaults."
 )]
 pub struct Run {
     /// Local core, MODEL[@VERSION], or Hugging Face repository; local models resolve first.
@@ -921,11 +960,21 @@ pub struct ServingOptions {
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub max_concurrency: Option<NonZeroUsize>,
 
-    /// Storage for auxiliary embedding tables (PLE/Engram) [default: disk].
+    /// Storage for auxiliary embedding tables (PLE/Engram) [default: disk]. fabric reads row-cache
+    /// misses over RDMA from an Engram store host and requires --embedding-table-store.
     #[arg(long, value_name = "MODE", help_heading = "Serving options",
-        value_parser = PossibleValuesParser::new(["disk", "ram"])
-            .map(|value| if value == "disk" { Storage::Disk } else { Storage::Ram }))]
+        value_parser = PossibleValuesParser::new(["disk", "ram", "fabric"])
+            .map(|value| match value.as_str() {
+                "disk" => Storage::Disk,
+                "ram" => Storage::Ram,
+                _ => Storage::Fabric,
+            }))]
     pub embedding_table_storage: Option<Storage>,
+
+    /// Engram store control address for fabric embedding-table storage; requests are rejected
+    /// while it is unreachable.
+    #[arg(long, value_name = "HOST:PORT", help_heading = "Serving options")]
+    pub embedding_table_store: Option<String>,
 
     /// Per-host RAM budget for disk-backed embedding rows, including index, counters and miss
     /// workspace; 0 disables [default: 4GiB on discrete GPUs, 1GiB on unified-memory GPUs].
@@ -1178,13 +1227,16 @@ impl ServingOptions {
         if let Some(storage) = self.embedding_table_storage {
             options.extend([
                 "--embedding-table-storage".into(),
-                if storage == Storage::Disk {
-                    "disk"
-                } else {
-                    "ram"
+                match storage {
+                    Storage::Disk => "disk",
+                    Storage::Ram => "ram",
+                    Storage::Fabric => "fabric",
                 }
                 .into(),
             ]);
+        }
+        if let Some(address) = &self.embedding_table_store {
+            options.extend(["--embedding-table-store".into(), address.clone()]);
         }
         if let Some(workers) = self.embedding_table_workers {
             options.extend(["--embedding-table-workers".into(), workers.to_string()]);
@@ -1250,6 +1302,7 @@ impl ServingOptions {
                 None
             },
             embedding_table_workers: self.embedding_table_workers,
+            embedding_table_store: self.embedding_table_store.clone(),
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
             history_drafts: if self.history_drafts {
@@ -1590,6 +1643,45 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn fabric_storage_flags_reach_the_loader_and_every_rank() {
+        let absent = run(&["flare", "run", "model.safetensors"]);
+        assert_eq!(absent.load_options().embedding_table_store, None);
+        assert!(!absent.rank_options().iter().any(|value| value == "--embedding-table-store"));
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--embedding-table-storage",
+            "fabric",
+            "--embedding-table-store",
+            "10.0.0.5:7700",
+        ]);
+        let options = args.load_options();
+        assert_eq!(options.embedding_table_storage, Some(Storage::Fabric));
+        assert_eq!(options.embedding_store().unwrap().address, "10.0.0.5:7700");
+        let forwarded = args.rank_options();
+        for pair in [["--embedding-table-storage", "fabric"], ["--embedding-table-store", "10.0.0.5:7700"]] {
+            assert!(forwarded.windows(2).any(|values| values == pair), "{pair:?}: {forwarded:?}");
+        }
+    }
+
+    #[test]
+    fn engram_store_takes_a_core_and_requires_a_listener() {
+        let parse = |argv: &[&str]| match Cli::try_parse_from(argv).map(|cli| cli.command) {
+            Ok(Command::EngramStore(store)) => Ok(*store),
+            Ok(_) => panic!("parsed another command"),
+            Err(error) => Err(error),
+        };
+        let store = parse(&["flare", "engram-store", "/models/core", "--listen", "10.0.0.5:7700", "--tensor-parallel", "4"]).unwrap();
+        assert_eq!(store.core, PathBuf::from("/models/core"));
+        assert_eq!(store.listen, "10.0.0.5:7700".parse().unwrap());
+        assert_eq!(store.tensor_parallel, Some(4));
+        assert!(parse(&["flare", "engram-store", "/models/core"]).is_err());
+        assert!(parse(&["flare", "engram-store", "--listen", "10.0.0.5:7700"]).is_err());
+        assert!(parse(&["flare", "engram-store", "/models/core", "--listen", "10.0.0.5:7700", "--dangerously-approve-key", "abc"]).is_err());
     }
 
     #[test]

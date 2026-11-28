@@ -111,7 +111,9 @@ mod verbs {
         port: u8,
         lid: u16,
         gid: [u8; 16],
-        gid_index: u32,
+        /// The kernel rebuilds the GID table when the interface or its address changes;
+        /// [`Device::refresh`] finds the address again.
+        gid_index: std::sync::atomic::AtomicU32,
     }
 
     // SAFETY: libibverbs handles allow concurrent use and stay live until the last owner drops.
@@ -199,7 +201,7 @@ mod verbs {
                             port: entry.port,
                             lid: entry.lid,
                             gid: entry.gid,
-                            gid_index: entry.gid_index,
+                            gid_index: std::sync::atomic::AtomicU32::new(entry.gid_index),
                         }));
                     }
                     // SAFETY: no PD or registration uses this context.
@@ -213,12 +215,88 @@ mod verbs {
         }
     }
 
+    impl Device {
+        /// The port that carries the selected address's GID.
+        pub fn port(&self) -> u8 {
+            self.port
+        }
+
+        /// The selected address's RoCE v2 GID.
+        pub fn gid(&self) -> [u8; 16] {
+            self.gid
+        }
+
+        /// Look the selected address up in the port's GID table again. Fails while the port
+        /// is down or no longer holds the address.
+        pub fn refresh(&self) -> io::Result<()> {
+            let mut attr = ffi::ibv_port_attr::default();
+            // SAFETY: the compat cast matches libibverbs' inline wrapper; the context is open.
+            let status = unsafe {
+                ffi::ibv_query_port(
+                    self.context,
+                    self.port,
+                    &mut attr as *mut ffi::ibv_port_attr as *mut ffi::_compat_ibv_port_attr,
+                )
+            };
+            if status != 0 {
+                return Err(io::Error::from_raw_os_error(status));
+            }
+            if attr.state != ffi::ibv_port_state::IBV_PORT_ACTIVE {
+                return Err(io::Error::other("the RDMA port is not active"));
+            }
+            for gid_index in 0..attr.gid_tbl_len.max(0) as u32 {
+                let mut entry = unsafe { std::mem::zeroed::<ffi::ibv_gid_entry>() };
+                // SAFETY: the context is open and entry has the supplied size.
+                let status = unsafe {
+                    ffi::_ibv_query_gid_ex(
+                        self.context,
+                        u32::from(self.port),
+                        gid_index,
+                        &mut entry,
+                        0,
+                        std::mem::size_of::<ffi::ibv_gid_entry>(),
+                    )
+                };
+                // SAFETY: libibverbs filled the union.
+                if status == 0
+                    && entry.gid_type == ffi::IBV_GID_TYPE_ROCE_V2
+                    && unsafe { entry.gid.raw } == self.gid
+                {
+                    self.gid_index
+                        .store(gid_index, std::sync::atomic::Ordering::Release);
+                    return Ok(());
+                }
+            }
+            Err(io::Error::other("the RDMA port no longer holds the address's GID"))
+        }
+    }
+
     impl Drop for Device {
         fn drop(&mut self) {
             // SAFETY: registrations and pairs release their handles before their device owner.
             unsafe {
                 ffi::ibv_dealloc_pd(self.pd);
                 ffi::ibv_close_device(self.context);
+            }
+        }
+    }
+
+    /// Path MTU and RDMA READ depths of a connection: `max_rd_atomic` READs this end may have
+    /// in flight, `max_dest_rd_atomic` it serves for the peer.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Path {
+        pub mtu: ffi::ibv_mtu,
+        pub max_rd_atomic: u8,
+        pub max_dest_rd_atomic: u8,
+    }
+
+    impl Default for Path {
+        /// The pool's RDMA WRITE channel: a 1024-byte MTU and one READ each way.
+        fn default() -> Self {
+            Self {
+                mtu: ffi::IBV_MTU_1024,
+                max_rd_atomic: 1,
+                max_dest_rd_atomic: 1,
             }
         }
     }
@@ -318,12 +396,17 @@ mod verbs {
 
         /// Bring the pair up against the manager's description.
         pub fn connect(&self, peer: &Handshake) -> io::Result<()> {
+            self.connect_path(peer, Path::default())
+        }
+
+        /// Bring the pair up with an explicit path MTU and RDMA READ depths.
+        pub fn connect_path(&self, peer: &Handshake, path: Path) -> io::Result<()> {
             let mut attr = ffi::ibv_qp_attr {
                 qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
-                path_mtu: ffi::IBV_MTU_1024,
+                path_mtu: path.mtu,
                 dest_qp_num: peer.qpn,
                 rq_psn: peer.psn,
-                max_dest_rd_atomic: 1,
+                max_dest_rd_atomic: path.max_dest_rd_atomic,
                 min_rnr_timer: 12,
                 ah_attr: ffi::ibv_ah_attr {
                     dlid: peer.lid,
@@ -331,7 +414,11 @@ mod verbs {
                     is_global: u8::from(peer.gid != [0; 16]),
                     grh: ffi::ibv_global_route {
                         dgid: ffi::ibv_gid { raw: peer.gid },
-                        sgid_index: self.device.gid_index as u8,
+                        sgid_index: self
+                            .device
+                            .gid_index
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            as u8,
                         hop_limit: 64,
                         ..Default::default()
                     },
@@ -356,7 +443,7 @@ mod verbs {
                 retry_cnt: 7,
                 rnr_retry: 7,
                 sq_psn: PSN,
-                max_rd_atomic: 1,
+                max_rd_atomic: path.max_rd_atomic,
                 ..Default::default()
             };
             let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE.0
@@ -422,7 +509,7 @@ mod verbs {
 }
 
 #[cfg(feature = "rdma")]
-pub use verbs::{Device, Qp, ffi};
+pub use verbs::{Device, Path, Qp, ffi};
 #[cfg(test)]
 mod tests {
     use super::*;

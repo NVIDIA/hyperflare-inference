@@ -251,8 +251,12 @@ invalid key returns 401 (`authentication_error`); an encoded or decoded body
 over `max_body_bytes` returns 413 (`request_too_large`); an unknown
 `Content-Encoding` returns 415; exhausted HTTP admission slots return 429
 (`rate_limit_error`); and a full model request queue, paused admission, or an
-unavailable runtime return 503. Execution and output-validation failures
-return 500. 5xx errors use `server_error`, or `api_error` on Messages.
+unavailable runtime return 503. With fabric embedding-table storage, an
+unreachable Engram store also returns 503 with code
+`embedding_store_unavailable` and `Retry-After: 1`, both at admission and for a
+request whose embedding rows could not be read; Flare never substitutes local
+reads (see [the Engram store](engram-store.md)). Execution and output-validation
+failures return 500. 5xx errors use `server_error`, or `api_error` on Messages.
 Responses for requests that reach model submission carry an `x-request-id`
 header.
 
@@ -281,8 +285,13 @@ but occupy no model execution slot or live KV cache.
 ## Health and metrics
 
 `GET /health` returns `{"status":"ok"}` while the model runtime is healthy and
-HTTP 503 with an error object otherwise. Neither this route nor `/metrics`
-requires the serving key: both report aggregate state without request content.
+HTTP 503 with an error object otherwise. With fabric embedding-table storage the
+healthy object also carries
+`"engram_store": {"state", "endpoint", "last_error", "reconnects"}`, where
+`state` is `ready`, `down`, or `failed`; an unreachable store leaves the route at
+200, because restarting the process cannot repair a remote outage. Neither this
+route nor `/metrics` requires the serving key: both report aggregate state
+without request content.
 
 `GET /metrics` returns Prometheus text exposition format 0.0.4 by default.
 Counter and gauge names start with `flare_`, such as
@@ -292,7 +301,10 @@ Counter and gauge names start with `flare_`, such as
 `flare_host_cache_estimated_prefill_ns`. Beyond the JSON fields below, the
 text includes speculative and proposal counters by batch, width, or depth, graph
 launches by kind, embedding row-cache counters, HTTP admission gauges, and
-uptime. `flare_history_drafts_enabled` reports whether shared decoded history
+uptime. Fabric embedding-table storage adds `flare_engram_fabric_reads_total`,
+`flare_engram_fabric_bytes_total`, and
+`flare_engram_fabric_wait_nanoseconds_total`; other storage modes render none
+of them. `flare_history_drafts_enabled` reports whether shared decoded history
 augments learned proposals in the serving process.
 
 The route returns one JSON object instead when the query contains `format=json`,
@@ -330,7 +342,7 @@ without the `flare_` prefix, such as `input_decoded_images_total`.
 | `reasoning_budget_cuts` | Requests whose reasoning was closed by their hard token budget | `flare_reasoning_budget_cuts_total` |
 | `failed` | Requests failed by admission, execution, grammar, or output processing | `flare_requests_failed_total` |
 | `replay_gpu_ns` | Sum of maximum rank-local CUDA durations of completed graphs, including readiness waits | `flare_replay_gpu_nanoseconds_total` |
-| `replay_readiness_wait_ns` | Exposed embedding readiness delay measured across ranks, for both RAM and disk delivery | `flare_replay_readiness_wait_nanoseconds_total` |
+| `replay_readiness_wait_ns` | Exposed embedding readiness delay measured across ranks, for RAM, disk, and fabric delivery | `flare_replay_readiness_wait_nanoseconds_total` |
 | `replay_readiness_samples` | Completed graphs with prepared readiness timing outputs; zero for cores without them | `flare_replay_readiness_samples_total` |
 | `reused_tokens` | Tokens covered by GPU prefix-cache hits | `flare_cache_reused_tokens_total` |
 | `cached_pages` | KV pages owned by immutable checkpoints | `flare_cached_kv_pages` |

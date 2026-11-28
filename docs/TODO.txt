@@ -346,3 +346,67 @@
     on SM103 GPUs alongside --row-shard-prefill. Close each target when
     tensor-parallel export with replicated attention weights and native flare
     run serving pass on that hardware and transport.
+
+[ ] Run the fabric Engram loopback tests on a host with a RoCE v2 device on
+    loopback, such as rdma_rxe: FLARE_RUN_RDMA_TESTS=1 cargo test
+    --manifest-path helios/Cargo.toml --features
+    runtime-core,server,engram-rdma fabric. Close when the gather comparison
+    with the disk reader, the store death and restart test and the identity and
+    layout refusals pass. See engram-store.md.
+
+[ ] Model failed-frame retirement in verification/helios-lifecycle: a frame
+    whose Engram gather failed, and frames already submitted for its requests,
+    emit no token and take no snapshot. The runtime worker rewrites their
+    completions (helios/src/server/runtime.rs, withhold). Close when the model
+    and check.py pass.
+
+[ ] Confirm that the Engram row-cache miss workspace registers and that an RDMA
+    READ into it reproduces the store's bytes between the real serving and store
+    NICs. Close when the loopback gather comparison passes on that pair.
+
+[ ] Measure single-row RDMA READ latency and coalesced 256 KiB READ bandwidth
+    between the serving and store hosts. Close when both are recorded in
+    engram-store.md; above about 30 us per row, revisit the READ design.
+
+[ ] Load and register the gb202 DeepSeek V4.1 Flash Engram tables (188.8 GiB)
+    in flare engram-store with the store host's memlock unlimited and its
+    shared-memory huge page setting recorded. Close when the startup report's
+    load and registration times are recorded.
+
+[ ] Serve gb202 DeepSeek V4.1 Flash on 4x RTX PRO 6000 with fabric storage and
+    record TTFT, tokens per second and
+    flare_engram_replay_readiness_wait_nanoseconds_total against disk (4 GiB
+    cache) and ram: cold prefill at 8k, 32k and 128k, decode at concurrency 1,
+    8 and 32 with 512 output tokens, a 30-minute coding session, a store restart
+    during that session, and all four ranks missing at once. Close when fabric
+    is not slower than disk and within 10% of ram TTFT at 8k, with the commands
+    and package revision recorded.
+
+[ ] Fault-inject fabric storage on a served core: kill the store mid-gather
+    (503, the process stays healthy), restart it (the next request succeeds), and
+    drop the RoCE link (state down, then ready). Check that no streamed token
+    follows the failure. Close when the three cases pass.
+
+[ ] Spread one Engram gather's READs over more queue pairs if measurement
+    shows the per-lane READ depth bounds fabric gather time. Each gather uses
+    one lane, whose depth is the device's confirmed max_qp_rd_atom. Close when
+    the measured gather time is bandwidth-bound or the depth is accepted.
+
+[ ] Allow fabric Engram storage on multi-host cores. LoadOptions::select
+    rejects it with --rank because a rank process's frame completion carries
+    no Engram failure to rank zero. Close when the rank wire reports the failed
+    frame and rank zero retires its requests.
+
+[ ] Add a test that a transient fabric gather error leaves a Shared Engram layer
+    usable for the next sequence of the same frame. It needs CUDA staging frames
+    (FLARE_RUN_CUDA_TESTS=1). Close when the test passes on a GPU host.
+
+[ ] Allow fabric storage without the local Engram companion files. Signature
+    verification covers every companion and loading reads them, so the serving
+    host still downloads the 188.8 GiB of tables; see
+    helios/src/runtime_core/payload.rs (trait Files). Close when a serving host
+    can verify and load a core whose Engram planes it does not store.
+
+[ ] Choose the GRH traffic class of Engram store queue pairs from the RoCE
+    configuration instead of class 0. Close when hosts whose lossless class is
+    not 0 can serve with PFC.

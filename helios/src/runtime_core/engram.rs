@@ -313,6 +313,88 @@ pub(super) fn decode<F: super::payload::Files>(
     Ok(Index { tables })
 }
 
+/// Open direct-I/O handles only for the containers that carry embedding planes, rather than
+/// every weight companion in the deployment, and point each plane at its handle's position.
+pub(super) fn direct_files<'a, F: super::payload::Files>(
+    indexes: impl Iterator<Item = &'a mut Index>,
+    files: &F,
+) -> Result<Vec<std::sync::Arc<std::fs::File>>> {
+    let mut mapped = std::collections::BTreeMap::new();
+    let mut direct = Vec::new();
+    for index in indexes {
+        for table in &mut index.tables {
+            for plane in &mut table.planes {
+                let next = direct.len();
+                let target = *mapped.entry(plane.file).or_insert(next);
+                if target == next {
+                    direct.push(files.direct_file(plane.file)?);
+                }
+                plane.file = target;
+            }
+        }
+    }
+    Ok(direct)
+}
+
+/// Engram planes of every rank of an authorized core, decoded as the loader decodes them, for
+/// a store that serves them without a GPU.
+#[cfg(feature = "engram-rdma")]
+pub(crate) struct Catalog {
+    /// SHA-256 of the signed envelope, which serving processes present to the store.
+    pub identity: [u8; 32],
+    pub world: usize,
+    /// Every rank with its table catalog; plane file indexes refer to `files`.
+    pub ranks: Vec<(usize, Index)>,
+    pub files: Vec<std::sync::Arc<std::fs::File>>,
+}
+
+#[cfg(feature = "engram-rdma")]
+pub(crate) fn catalog(authorized: super::AuthorizedCore) -> Result<Catalog> {
+    use super::{
+        payload::Files,
+        protection::{AuthorizedKind, FilesRef, LoadedModelDescriptor},
+    };
+    let identity = authorized.envelope_digest();
+    let (descriptor, cores, files) = match authorized.kind {
+        AuthorizedKind::Legacy { archive, index } => {
+            let (descriptor, bundles) = LoadedModelDescriptor::from_legacy(index);
+            let cores = bundles
+                .into_iter()
+                .map(super::protobuf::decode)
+                .collect::<Result<Vec<_>>>()?;
+            (descriptor, cores, FilesRef::Legacy(archive))
+        }
+        AuthorizedKind::Payload(core) => {
+            let descriptor = core.loaded_descriptor()?;
+            let (source, cores) = core.into_parts();
+            (descriptor, cores, FilesRef::Payload(source))
+        }
+    };
+    let engram = descriptor
+        .engram
+        .ok_or_else(|| invalid("the core has no Engram embedding tables"))?;
+    for core in &cores {
+        core.validate()?;
+        Files::validate(&files, core)?;
+    }
+    let world = descriptor
+        .cluster
+        .as_ref()
+        .map_or(cores.len(), |cluster| cluster.world as usize);
+    if world == 0 || cores.len() != world {
+        return Err(invalid("an Engram store requires every rank of the deployment"));
+    }
+    let mut ranks = Vec::with_capacity(world);
+    for rank in 0..world {
+        let core = cores
+            .get(files.rank_position(rank)?)
+            .ok_or_else(|| invalid("rank is outside the verified deployment"))?;
+        ranks.push((rank, decode(engram.clone(), &files, std::slice::from_ref(core), rank, world)?));
+    }
+    let files = direct_files(ranks.iter_mut().map(|(_, index)| index), &files)?;
+    Ok(Catalog { identity, world, ranks, files })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
