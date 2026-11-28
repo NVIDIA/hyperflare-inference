@@ -779,6 +779,13 @@ fn encode_with_budget(
     Ok((ids, offsets))
 }
 
+/// Prompt-only special tokens (such as GLM's `[gMASK]` and `<sop>`) that are
+/// marked `special: true` in the tokenizer and are never valid model output text.
+/// Suppressing them during output decoding aligns with vLLM's
+/// `skip_special_tokens=True` while preserving every declared reasoning, tool,
+/// and conversation-role delimiter.
+const PROMPT_ONLY_SPECIAL_TOKENS: &[&str] = &["[gMASK]", "[MASK]", "[sMASK]", "<sop>", "<eop>"];
+
 pub struct Frontend {
     prompt_encoder: PromptEncoder,
     image_placeholder_token_id: Option<u32>,
@@ -790,6 +797,8 @@ pub struct Frontend {
     /// `with_controls`). Other added tokens, such as `/nothink`, are lexical: request text that
     /// spells one tokenizes to that token.
     controls: std::collections::HashSet<u32>,
+    /// Prompt-only `special: true` tokens suppressed from decoded output text.
+    silent_output_tokens: std::collections::HashSet<u32>,
     /// The control that request text positions images with, when the image layout allows it.
     spelled_image_placeholder: Option<u32>,
     template_encoding: TemplateEncoding,
@@ -822,6 +831,10 @@ impl Frontend {
     }
     pub fn bos_token_id(&self) -> Option<u32> {
         self.bos_token_id
+    }
+    /// Whether `token` is a prompt-only special token suppressed from decoded output text.
+    pub fn is_silent_output_token(&self, token: u32) -> bool {
+        self.silent_output_tokens.contains(&token)
     }
 
     /// Resolves advisory effort against the vocabulary accepted by the prepared template.
@@ -1103,6 +1116,15 @@ impl Frontend {
             .map(|(&id, _)| id)
             .chain(image_placeholder_token_id)
             .collect();
+        let silent_output_tokens = tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .iter()
+            .filter(|(_, token)| {
+                token.special && PROMPT_ONLY_SPECIAL_TOKENS.contains(&token.content.as_str())
+            })
+            .map(|(&id, _)| id)
+            .collect();
         let frontend = Self {
             prompt_encoder,
             image_placeholder_token_id,
@@ -1113,6 +1135,7 @@ impl Frontend {
             tokenizer,
             ordinary_tokenizer,
             controls,
+            silent_output_tokens,
             spelled_image_placeholder: None,
             template_encoding: TemplateEncoding::Text,
             template,
@@ -1635,6 +1658,7 @@ mod tests {
             image_placeholder_token_id: None,
             ordinary_tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             controls: Default::default(),
+            silent_output_tokens: Default::default(),
             spelled_image_placeholder: None,
             template_encoding: TemplateEncoding::Text,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
@@ -1738,6 +1762,7 @@ mod tests {
                 image_placeholder_token_id: None,
                 ordinary_tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
                 controls: Default::default(),
+                silent_output_tokens: Default::default(),
                 spelled_image_placeholder: None,
                 template_encoding: TemplateEncoding::Text,
                 tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
@@ -1803,6 +1828,7 @@ mod tests {
             inline_system_messages: Default::default(),
             ordinary_tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             controls: Default::default(),
+            silent_output_tokens: Default::default(),
             spelled_image_placeholder: None,
             template_encoding: TemplateEncoding::Text,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
