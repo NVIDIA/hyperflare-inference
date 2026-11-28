@@ -103,6 +103,11 @@ class Checkpoint:
     plain_ranks: Mapping[int, "RankCosts"] | None = None
     # API model name advertised for this checkpoint; empty uses the recipe's `served_model_name`.
     served_model_name: str = ""
+    # Longest sequence this checkpoint's configuration serves when it differs from the recipe's
+    # `context`, and the rotary position parameters of that configuration which set it. A recipe
+    # derives both from the checkpoint's own configuration; None uses the recipe's `context`.
+    context: int | None = None
+    rope_parameters: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)

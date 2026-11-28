@@ -356,3 +356,28 @@ def test_weight_adjustment_hook_sizes_gpus_and_records_manifest(monkeypatch):
     by_key = {p.key: p for p in encoded.parameters}
     assert by_key["sharded_attention"].scope == proto.PREPARATION_PARAMETER_SCOPE_DEPLOYMENT
     assert by_key["sharded_attention"].value.bool_value is True
+
+
+def test_checkpoint_context_replaces_the_recipe_ceiling():
+    recipe = _recipe(device_gib=20)
+    native = recipe.checkpoints[0]
+    rope = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144}
+    scaled = replace(native, context=1048576, rope_parameters=MappingProxyType(rope))
+    gpus = (_gpu(0),)
+    parameters = replace(recipe.parameters, max_concurrency=1)
+
+    native_plan = planning.plan(recipe, native, gpus, selected=(0,), parameters=parameters)
+    scaled_plan = planning.plan(recipe, scaled, gpus, selected=(0,), parameters=parameters)
+
+    assert native_plan.declared_context == native_plan.context == 262144
+    assert native_plan.to_dict()["checkpoint_context"] == 262144
+    assert "rope_parameters" not in native_plan.to_dict()
+    assert scaled_plan.declared_context == scaled_plan.context == 1048576
+    assert scaled_plan.guaranteed_tokens == 1048576
+    assert scaled_plan.demand_pages == 1048576 // 64
+    assert scaled_plan.to_dict()["checkpoint_context"] == 1048576
+    assert scaled_plan.to_dict()["rope_parameters"] == rope
+    context = replace(scaled_plan.parameter_context, checkpoint=scaled)
+    assert replace(parameters, prefill_chunk=524288).validate(context) is None
+    with pytest.raises(UsageError):
+        replace(parameters, prefill_chunk=524288).validate(replace(context, checkpoint=native))

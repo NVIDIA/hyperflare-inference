@@ -1291,7 +1291,9 @@ class MixedPrefillParameters(ParameterGroup):
 
 
 def _recipe_context_limit(_group: RecipeParameters, context: ParameterContext) -> int | None:
-    return None if context.recipe is None else context.recipe.context
+    if context.recipe is None:
+        return None
+    return (context.checkpoint and context.checkpoint.context) or context.recipe.context
 
 
 @dataclass(frozen=True)
@@ -1467,10 +1469,11 @@ class RecipeParameters(ParameterGroup):
                 f"--max-concurrency for {ctx.alias} must be 1 through {concurrency_limit}"
             )
         if ctx.recipe is not None:
-            if self.prefill_chunk % 64 or not 64 <= self.prefill_chunk <= ctx.recipe.context:
+            limit = _recipe_context_limit(self, ctx)
+            if self.prefill_chunk % 64 or not 64 <= self.prefill_chunk <= limit:
                 raise UsageError(
                     f"--prefill-chunk-size for {ctx.alias} must be a multiple of 64"
-                    f" from 64 through {ctx.recipe.context:,}"
+                    f" from 64 through {limit:,}"
                 )
         super().validate(ctx)
 
