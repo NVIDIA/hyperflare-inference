@@ -58,7 +58,7 @@ impl ObservationOptions {
         response: &mut Value,
         usage: &Value,
         reused: u64,
-        timing: (Option<u64>, Option<u64>),
+        timing: (Option<u64>, Option<u64>, Option<u64>),
         stream: bool,
     ) {
         if self.token_ids {
@@ -68,9 +68,9 @@ impl ObservationOptions {
             }
         }
         if self.timestamps {
-            let (ingress_ns, enqueue_ns) = timing;
+            let (ingress_ns, enqueue_ns, first_scheduled_ns) = timing;
             response["performance"] = json!({"ingress_ns":ingress_ns,"enqueue_ns":enqueue_ns,
-                "reused_prompt_tokens":reused});
+                "first_scheduled_ns":first_scheduled_ns,"reused_prompt_tokens":reused});
         }
     }
 }
@@ -132,7 +132,7 @@ mod tests {
         let usage = json!({"prompt_tokens":17,"completion_tokens":3,"total_tokens":20,
             "prompt_tokens_details":{"cached_tokens":16,"multimodal_tokens":{"image":8}}});
         let mut value = original.clone();
-        ObservationOptions::default().finish(&mut value, &usage, 16, (None, None), true);
+        ObservationOptions::default().finish(&mut value, &usage, 16, (None, None, None), true);
         assert_eq!(value, original);
         let options = ObservationOptions {
             token_ids: true,
@@ -140,12 +140,12 @@ mod tests {
             include_usage: false,
             continuous_usage: false,
         };
-        options.finish(&mut value, &usage, 16, (Some(10), Some(20)), true);
+        options.finish(&mut value, &usage, 16, (Some(10), Some(20), Some(30)), true);
         assert_eq!(value["choices"], original["choices"]);
         assert_eq!(value["usage"], usage);
         assert_eq!(
             value["performance"],
-            json!({"ingress_ns":10,"enqueue_ns":20,"reused_prompt_tokens":16})
+            json!({"ingress_ns":10,"enqueue_ns":20,"first_scheduled_ns":30,"reused_prompt_tokens":16})
         );
         assert_eq!(value["reused_prompt_tokens"], 16);
         let mut separate = original.clone();
@@ -153,9 +153,9 @@ mod tests {
             include_usage: true,
             ..options
         }
-        .finish(&mut separate, &usage, 16, (Some(10), Some(20)), true);
+        .finish(&mut separate, &usage, 16, (Some(10), Some(20), Some(30)), true);
         assert!(separate.get("usage").is_none());
-        options.finish(&mut value, &usage, 16, (Some(10), Some(20)), false);
+        options.finish(&mut value, &usage, 16, (Some(10), Some(20), Some(30)), false);
         assert_eq!(value["usage"], usage);
     }
 }

@@ -59,15 +59,17 @@ impl Prompt {
         !self.stop_sequences.is_empty() || !self.stop_strings.is_empty()
     }
 
-    fn output_event_capacity(&self, minimum: usize, observed: bool) -> Result<usize> {
-        // Each generated token produces at most one presentation event and one
-        // optional observation. A reasoning cut's forced token is part of `after`.
+    fn output_event_capacity(&self, minimum: usize, observed: bool, commits: bool) -> Result<usize> {
+        // Each generated token produces at most one presentation event, one
+        // optional observation, and one optional commit instant, because every
+        // step that reports a commit instant generated at least one token.
+        // A reasoning cut's forced token is part of `after`.
         // Prompt-score chunks cover disjoint, nonempty ranges of the original prompt.
         let tokens = u64::from(self.max_new_tokens)
             + u64::from(self.reasoning_cut.as_ref().map_or(0, |cut| cut.after));
         let events = usize::try_from(tokens)
             .ok()
-            .and_then(|tokens| tokens.checked_mul(if observed { 2 } else { 1 }))
+            .and_then(|tokens| tokens.checked_mul(1 + usize::from(observed) + usize::from(commits)))
             .and_then(|events| {
                 events.checked_add(if self.prompt_logprobs { self.tokens.len() } else { 0 })
             })
@@ -99,6 +101,16 @@ pub enum GenerationEvent {
         reason: &'static str,
         termination: crate::output::Termination,
         stop_sequence: Option<String>,
+        /// Model-queue arrival on the `observation::monotonic_ns` clock.
+        arrival_ns: u64,
+        /// The request's lifecycle instants, as its completion histograms record them.
+        times: super::metrics::RequestTimes,
+    },
+    /// The completion instant of the model step whose output events follow, on the
+    /// `observation::monotonic_ns` clock. Sent only to requests submitted with
+    /// `commits`, once per step that generated a token for the request.
+    Committed {
+        at_ns: u64,
     },
     AdmissionRejected(Error),
     Error(Error),
@@ -190,6 +202,10 @@ struct Incoming {
     failure: Arc<Mutex<Option<Error>>>,
     metrics: Arc<super::metrics::Metrics>,
     observation: Option<bool>,
+    /// Send `GenerationEvent::Committed` before each model step's output.
+    commits: bool,
+    /// Values for the completion histograms; preserved when a preempted request is parked.
+    record: super::metrics::RequestRecord,
     /// Consult the host prefix store at admission; cleared after a failed restore.
     host_lookup: bool,
     /// Admitted once already, so the admission counter is not advanced again.
@@ -296,6 +312,8 @@ impl Incoming {
             reason: "stop",
             termination: crate::output::Termination::Cancelled,
             stop_sequence: None,
+            arrival_ns: self.arrival_ns,
+            times: self.record.times,
         });
     }
 
@@ -745,6 +763,7 @@ impl ModelRuntime {
                     worker_metrics.scheduler(worker.scheduler.stats());
                 }
                 worker_metrics.pending.store(0, Ordering::Relaxed);
+                worker_metrics.parked.store(0, Ordering::Relaxed);
                 if shutdown.error.is_none() {
                     shutdown.error = error;
                 }
@@ -822,30 +841,30 @@ impl ModelRuntime {
         self.healthy()
     }
     pub fn generate(&self, prompt: Prompt) -> Result<Generation> {
-        self.enqueue(prompt, None)
-    }
-
-    pub(super) fn generate_observed(&self, prompt: Prompt, timestamps: bool) -> Result<Generation> {
-        self.enqueue(prompt, Some(timestamps))
-    }
-
-    fn enqueue(&self, prompt: Prompt, observation: Option<bool>) -> Result<Generation> {
-        self.enqueue_many(vec![prompt], observation)
+        self.enqueue_many(vec![prompt], None, false)
             .map(|mut group| group.remove(0))
     }
 
     pub fn generate_many(&self, prompts: Vec<Prompt>) -> Result<Vec<Generation>> {
-        self.enqueue_many(prompts, None)
+        self.enqueue_many(prompts, None, false)
     }
 
-    pub(super) fn generate_many_observed(&self, prompts: Vec<Prompt>, timestamps: bool) -> Result<Vec<Generation>> {
-        self.enqueue_many(prompts, Some(timestamps))
+    /// `observation` adds an `ObservedToken` per committed token, timestamped when
+    /// `Some(true)`; `commits` adds a `Committed` event before each model step's output.
+    pub(super) fn generate_many_observed(
+        &self,
+        prompts: Vec<Prompt>,
+        observation: Option<bool>,
+        commits: bool,
+    ) -> Result<Vec<Generation>> {
+        self.enqueue_many(prompts, observation, commits)
     }
 
     fn enqueue_many(
         &self,
         prompts: Vec<Prompt>,
         observation: Option<bool>,
+        commits: bool,
     ) -> Result<Vec<Generation>> {
         if !self.healthy() {
             return Err(Error::admission(
@@ -862,6 +881,8 @@ impl ModelRuntime {
                 .clone()
                 .try_acquire_many_owned(count)
                 .map_err(|_| {
+                    self.metrics
+                        .admission_rejected(super::metrics::AdmissionLimit::GenerationCapacity);
                     Error::admission(
                         AdmissionError::Capacity,
                         "native generation capacity is full",
@@ -888,7 +909,7 @@ impl ModelRuntime {
                 .map_err(|error| error.admission_context(AdmissionError::Invalid))?;
             // Tokio allocates queue blocks as events arrive, not at this capacity.
             let event_capacity =
-                prompt.output_event_capacity(self.event_capacity, observation.is_some())?;
+                prompt.output_event_capacity(self.event_capacity, observation.is_some(), commits)?;
             let (events, receiver) = async_mpsc::channel(event_capacity);
             let (admission, admitted) = oneshot::channel();
             let (first_token, first_token_ready) = oneshot::channel();
@@ -908,6 +929,8 @@ impl ModelRuntime {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation,
+                commits,
+                record: Default::default(),
                 host_lookup: true,
                 readmitted: false,
                 blocked: None,
@@ -935,6 +958,8 @@ impl ModelRuntime {
             .try_send(incoming_group)
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => {
+                    self.metrics
+                        .admission_rejected(super::metrics::AdmissionLimit::RequestQueue);
                     Error::admission(AdmissionError::Capacity, "native request queue is full")
                 }
                 mpsc::TrySendError::Disconnected(_) => Error::admission(
@@ -1146,10 +1171,7 @@ impl<'a> Worker<'a> {
                 progress |= self.submit(executor, &step)?;
             }
             if progress {
-                self.metrics.scheduler(self.scheduler.stats());
-                self.metrics
-                    .pending
-                    .store(self.pending.len() as u64, Ordering::Relaxed);
+                self.publish_gauges();
             }
             self.metrics.scheduler_trace.details(|| {
                 use super::metrics::scheduler::{RequestDetail, SchedulerDetail};
@@ -1192,6 +1214,17 @@ impl<'a> Worker<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Publishes the scheduler statistics and the depth of each waiting queue.
+    fn publish_gauges(&self) {
+        self.metrics.scheduler(self.scheduler.stats());
+        self.metrics
+            .pending
+            .store(self.pending.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .parked
+            .store(self.parked.len() as u64, Ordering::Relaxed);
     }
 
     fn idle_wait(&self) -> std::time::Duration {
@@ -1549,6 +1582,8 @@ impl<'a> Worker<'a> {
             };
             if !incoming.readmitted {
                 self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+                incoming.record.max_tokens = incoming.prompt.max_new_tokens
+                    + incoming.prompt.reasoning_cut.as_ref().map_or(0, |cut| cut.after);
             }
             self.scheduler.resume_decoded_sequence(handle, parked.carried.decoded_sequence)?;
             if !pending_pool_answer {
@@ -1700,6 +1735,9 @@ impl<'a> Worker<'a> {
         self.metrics
             .progress(prefill, generated.len(), accepted, draft_rounds,
                 verification_drafts, verification_rounds);
+        if kind.samples() {
+            self.metrics.model_step(prefill + generated.len() as u64);
+        }
         self.metrics.replay_completed(completed_at_ns, completion.timing, prefill);
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
@@ -1768,6 +1806,14 @@ impl<'a> Worker<'a> {
                 .as_mut()
                 .filter(|a| a.request == token.request)
             {
+                // A step that commits several tokens for one request, such as a
+                // speculative round, adds one inter-token interval.
+                if position == 0 {
+                    request.incoming.record.tokens_committed(completed_at_ns);
+                    if request.incoming.commits {
+                        request.incoming.emit(GenerationEvent::Committed { at_ns: completed_at_ns });
+                    }
+                }
                 request.incoming.observe_token(token.token);
                 request.last_token = Some(token.token);
                 if let Some(reasoning) = &mut request.reasoning {
@@ -1829,27 +1875,38 @@ impl<'a> Worker<'a> {
                         .published_output(token.request, completion.fence)?;
                 }
                 if stop {
-                    self.metrics.completed.fetch_add(1, Ordering::Relaxed);
                     let live = self.scheduler.request(token.request)?;
+                    let prompt_tokens =
+                        request.carried.prompt_tokens.unwrap_or(live.prompt_tokens);
+                    let generated_tokens = request.carried.generated_tokens + live.generated_tokens;
+                    let reused_prompt_tokens = request
+                        .carried
+                        .reused_prompt_tokens
+                        .unwrap_or(live.reused_prompt_tokens());
+                    self.metrics.request_completed(
+                        request.incoming.arrival_ns,
+                        &request.incoming.record,
+                        super::metrics::CompletedRequest {
+                            prompt_tokens,
+                            reused_prompt_tokens,
+                            generated_tokens,
+                            output_limit: false,
+                        },
+                    );
                     request
                         .incoming
                         .emit(GenerationEvent::Finished {
-                            prompt_tokens: request
-                                .carried
-                                .prompt_tokens
-                                .unwrap_or(live.prompt_tokens),
-                            generated_tokens: request.carried.generated_tokens
-                                + live.generated_tokens,
-                            reused_prompt_tokens: request
-                                .carried
-                                .reused_prompt_tokens
-                                .unwrap_or(live.reused_prompt_tokens()),
+                            prompt_tokens,
+                            generated_tokens,
+                            reused_prompt_tokens,
                             reason: "stop",
                             termination: crate::output::Termination::UserStop,
                             stop_sequence: request
                                 .text_stops
                                 .as_ref()
                                 .and_then(|s| s.matched().map(str::to_owned)),
+                            arrival_ns: request.incoming.arrival_ns,
+                            times: request.incoming.record.times,
                         });
                     stopped.push(token.request);
                 }
@@ -1981,7 +2038,26 @@ impl<'a> Worker<'a> {
                         } else {
                             false
                         } || budget_stop;
-                        self.metrics.completed.fetch_add(1, Ordering::Relaxed);
+                        let prompt_tokens =
+                            request.carried.prompt_tokens.unwrap_or(prompt_tokens);
+                        let generated_tokens = request.carried.generated_tokens + generated;
+                        let reused_prompt_tokens =
+                            request.carried.reused_prompt_tokens.unwrap_or(reused);
+                        let eos = !request.incoming.prompt.ignore_eos
+                            && request
+                                .last_token
+                                .is_some_and(|token| self.config.eos_token_ids.contains(&token));
+                        let reason = if user_stop || eos { "stop" } else { "length" };
+                        self.metrics.request_completed(
+                            request.incoming.arrival_ns,
+                            &request.incoming.record,
+                            super::metrics::CompletedRequest {
+                                prompt_tokens,
+                                reused_prompt_tokens,
+                                generated_tokens,
+                                output_limit: reason == "length",
+                            },
+                        );
                         for token in request.stops.finish() {
                             request
                                 .incoming
@@ -1990,23 +2066,12 @@ impl<'a> Worker<'a> {
                                     None => GenerationEvent::Token(token),
                                 });
                         }
-                        let eos = !request.incoming.prompt.ignore_eos
-                            && request
-                                .last_token
-                                .is_some_and(|token| self.config.eos_token_ids.contains(&token));
-                        let reason = if user_stop || eos { "stop" } else { "length" };
                         request
                             .incoming
                             .emit(GenerationEvent::Finished {
-                                prompt_tokens: request
-                                    .carried
-                                    .prompt_tokens
-                                    .unwrap_or(prompt_tokens),
-                                generated_tokens: request.carried.generated_tokens + generated,
-                                reused_prompt_tokens: request
-                                    .carried
-                                    .reused_prompt_tokens
-                                    .unwrap_or(reused),
+                                prompt_tokens,
+                                generated_tokens,
+                                reused_prompt_tokens,
                                 reason,
                                 stop_sequence: request
                                     .text_stops
@@ -2019,6 +2084,8 @@ impl<'a> Worker<'a> {
                                 } else {
                                     crate::output::Termination::OutputLimit
                                 },
+                                arrival_ns: request.incoming.arrival_ns,
+                                times: request.incoming.record.times,
                             });
                         if user_stop {
                             self.scheduler.cancel(request.request)?;
@@ -2053,13 +2120,9 @@ impl<'a> Worker<'a> {
         {
             return Ok(false);
         }
-        let remaining = self.active[slot]
-            .as_ref()
-            .unwrap()
-            .incoming
-            .prompt
-            .max_new_tokens
-            - live.generated_tokens;
+        let active = self.active[slot].as_mut().unwrap();
+        let remaining = active.incoming.prompt.max_new_tokens - live.generated_tokens;
+        active.incoming.record.preemptions += 1;
         self.park(slot, &[], remaining)?;
         Ok(true)
     }
@@ -2216,6 +2279,23 @@ impl<'a> Worker<'a> {
                 step,
                 &self.admissions,
             )?;
+        }
+        // Stamp after packing so the instant marks a step whose inputs were accepted,
+        // including requests driven through reserve_and_pack directly. A failed pack
+        // leaves first_scheduled_ns unset.
+        let scheduled_ns = super::observation::monotonic_ns();
+        for lane in &step.lanes {
+            if let Some(active) = self.active[lane.request.slot as usize]
+                .as_mut()
+                .filter(|a| a.request == lane.request)
+            {
+                active
+                    .incoming
+                    .record
+                    .times
+                    .first_scheduled_ns
+                    .get_or_insert(scheduled_ns);
+            }
         }
         Ok(())
     }
@@ -3222,6 +3302,8 @@ mod tests {
             failure: failure.clone(),
             metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
             observation: None,
+            commits: false,
+            record: Default::default(),
             host_lookup: true,
             readmitted: false,
             prompt_score_end: 0,
@@ -3252,15 +3334,17 @@ mod tests {
         let (mut incoming, _generation) = stream(2);
         let prompt = &mut incoming.prompt;
         prompt.max_new_tokens = 1_000_000;
-        assert_eq!(prompt.output_event_capacity(128, false).unwrap(), 1_000_003);
-        assert_eq!(prompt.output_event_capacity(128, true).unwrap(), 2_000_003);
+        assert_eq!(prompt.output_event_capacity(128, false, false).unwrap(), 1_000_003);
+        assert_eq!(prompt.output_event_capacity(128, true, false).unwrap(), 2_000_003);
+        assert_eq!(prompt.output_event_capacity(128, false, true).unwrap(), 2_000_003);
+        assert_eq!(prompt.output_event_capacity(128, true, true).unwrap(), 3_000_003);
         prompt.reasoning_cut = Some(ReasoningCut { close: 8, after: 20, output: None });
         prompt.prompt_logprobs = true;
-        assert_eq!(prompt.output_event_capacity(128, true).unwrap(), 2_000_044);
+        assert_eq!(prompt.output_event_capacity(128, true, false).unwrap(), 2_000_044);
         prompt.max_new_tokens = 0;
         prompt.reasoning_cut = None;
-        assert_eq!(prompt.output_event_capacity(128, false).unwrap(), 128);
-        assert!(prompt.output_event_capacity(usize::MAX, true).is_err());
+        assert_eq!(prompt.output_event_capacity(128, false, false).unwrap(), 128);
+        assert!(prompt.output_event_capacity(usize::MAX, true, false).is_err());
     }
 
     #[test]

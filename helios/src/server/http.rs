@@ -234,6 +234,10 @@ pub(super) async fn generate(
                     .clone()
                     .try_acquire_many_owned((size - 1) as u32)
                     .map_err(|_| {
+                        prepare_state
+                            .model
+                            .metrics()
+                            .admission_rejected(super::metrics::AdmissionLimit::HttpSlots);
                         (
                             StatusCode::TOO_MANY_REQUESTS,
                             "native generation admission is full".into(),
@@ -325,32 +329,6 @@ pub(super) async fn generate(
         state.run,
         state.ids.fetch_add(1, Ordering::Relaxed)
     );
-    let submitted = if prompts.is_empty() {
-        Ok(vec![])
-    } else if continuous_usage {
-        state.model.generate_many_observed(prompts, observation.timestamps)
-    } else if observation.token_ids && size == 1 {
-        state
-            .model
-            .generate_observed(prompts.remove(0), observation.timestamps)
-            .map(|g| vec![g])
-    } else {
-        state.model.generate_many(prompts)
-    };
-    let mut generation = match submitted {
-        Ok(g) => g,
-        Err(e) => return rejection(&state, protocol, &id, "admission", e),
-    };
-    if !decoded.stream
-        && let Err(e) = runtime::await_admission(&mut generation).await
-    {
-        return rejection(&state, protocol, &id, "admission", e);
-    }
-    let enqueue_ns = generation.first().and_then(|g| g.enqueue_ns);
-    let mut iter = generation.into_iter();
-    let mut generations: Vec<Option<Generation>> = (0..size)
-        .map(|i| if zero.contains(&i) { None } else { iter.next() })
-        .collect();
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -380,6 +358,30 @@ pub(super) async fn generate(
     encoder.set_tool_grammars(tool_grammars);
     encoder.set_strict_validators(strict_validators);
     encoder.set_continuous_usage(continuous_usage);
+    // The encoder decides where per-request metrics appear, and so whether the
+    // generation must report its model steps' completion instants.
+    let commits = state.per_request_metrics && encoder.enable_request_metrics(decoded.stream);
+    let submitted = if prompts.is_empty() {
+        Ok(vec![])
+    } else {
+        let observed = (continuous_usage || observation.token_ids && size == 1)
+            .then_some(observation.timestamps);
+        state.model.generate_many_observed(prompts, observed, commits)
+    };
+    let mut generation = match submitted {
+        Ok(g) => g,
+        Err(e) => return rejection(&state, protocol, &id, "admission", e),
+    };
+    if !decoded.stream
+        && let Err(e) = runtime::await_admission(&mut generation).await
+    {
+        return rejection(&state, protocol, &id, "admission", e);
+    }
+    let enqueue_ns = generation.first().and_then(|g| g.enqueue_ns);
+    let mut iter = generation.into_iter();
+    let mut generations: Vec<Option<Generation>> = (0..size)
+        .map(|i| if zero.contains(&i) { None } else { iter.next() })
+        .collect();
     let streaming = decoded.stream;
     let stream_state = state.clone();
     let stream_id = id.clone();
@@ -400,6 +402,9 @@ pub(super) async fn generate(
         let mut raw_tokens = Vec::new();
         let mut timestamps = Vec::new();
         let mut reused_total = 0;
+        let mut generated = vec![0u32; size];
+        // The earliest model step that included any of the response's generations.
+        let mut first_scheduled_ns = None;
         if streaming && protocol == Protocol::Chat {
             // Chat has one choice and rejects streamed prompt logprobs, so no
             // output queue needs draining before the first raw token is ready.
@@ -514,14 +519,23 @@ pub(super) async fn generate(
                     }
                     Ok(vec![])
                 }
+                GenerationEvent::Committed { at_ns } => {
+                    encoder.record_commit(at_ns);
+                    Ok(vec![])
+                }
                 GenerationEvent::Finished {
                     generated_tokens,
                     reused_prompt_tokens,
                     termination,
                     stop_sequence,
+                    arrival_ns,
+                    times,
                     ..
                 } => {
                     reused_total += reused_prompt_tokens;
+                    generated[index] = generated_tokens;
+                    first_scheduled_ns = first_scheduled_ns.into_iter().chain(times.first_scheduled_ns).min();
+                    encoder.record_times(arrival_ns, times, generated_tokens);
                     let result = decoders[index]
                         .finish(if encoder.tool_limit_reached { crate::output::Termination::Cancelled } else { termination })
                         .and_then(|events| encoder.apply(index, events))
@@ -546,7 +560,7 @@ pub(super) async fn generate(
                                             &mut frame.data,
                                             &encoder.usage_value(),
                                             reused_prompt_tokens,
-                                            (ingress_ns, enqueue_ns),
+                                            (ingress_ns, enqueue_ns, times.first_scheduled_ns),
                                             true,
                                         );
                                     }
@@ -591,8 +605,20 @@ pub(super) async fn generate(
                 &mut response,
                 &encoder.usage_value(),
                 reused_total,
-                (ingress_ns, enqueue_ns),
+                (ingress_ns, enqueue_ns, first_scheduled_ns),
                 false,
+            );
+        }
+        if !streaming && let Some(metrics) = encoder.metrics_value() {
+            response["metrics"] = metrics;
+        }
+        // One observation per successful response: a tool-limit cancellation reaches
+        // this point but the runtime counts it as cancelled, so it is excluded.
+        if !count && !encoder.tool_limit_reached {
+            state.model.metrics().response_completed(
+                admitted_at.elapsed().as_nanos() as u64,
+                decoded.request.choices,
+                &generated,
             );
         }
         yield Delivery::Complete(response);

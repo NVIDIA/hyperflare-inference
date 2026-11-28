@@ -177,7 +177,7 @@ defaulting to `~/.config/flare/orbit.toml` and
 `~/.config/flare/orbit/controller.key`. `flare orbit run` takes the serving
 flags of `flare run` and applies them to every rank; `--host`, `--port`,
 `--served-model-name`, `--scheduler-policy`, `--scheduler-terminal-value`,
-`--scheduler-terminal-age-price`, and `--api-key-file` apply to rank zero. `--api-key-file` names a file rank zero must be able to read; Orbit does
+`--scheduler-terminal-age-price`, `--api-key-file`, and `--enable-per-request-metrics` apply to rank zero. `--api-key-file` names a file rank zero must be able to read; Orbit does
 not upload it. Core inputs are Hugging Face repositories
 `ORG/NAME[@REVISION]`, controller-local files, or `NODE:/absolute/path` on a
 paired node. Orbit downloads repository cores on a candidate node and
@@ -738,6 +738,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--port N` | Listener port | `[server] port`, otherwise `8000` |
 | `--served-model-name ALIAS` | Replace the core's serving aliases with this nonblank alias | Core aliases |
 | `--api-key-file PATH` | File containing the serving API key; an empty file disables authentication | `[server] api_key`, otherwise no authentication |
+| `--enable-per-request-metrics` | Add vLLM's per-request `metrics` timing object to OpenAI Chat, Completions, and Responses output; see [per-request metrics](api.md#per-request-metrics) | `[server] per_request_metrics`, otherwise off |
 | `--max-concurrency N` | Reduce concurrency within captured batch capacities | Model/default configuration, otherwise core default |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise core serving reserve |
@@ -1319,7 +1320,7 @@ An absent default file supplies no overrides; an explicitly selected missing
 file or an invalid runtime setting is an error. Help does not read the file.
 
 Native `flare run` applies `[server] host`, `port`, `api_key`, `thinking_token_budget`,
-and `scheduler_checkpoint_extra_work_fraction`,
+`scheduler_checkpoint_extra_work_fraction`, and `per_request_metrics`,
 `[memory] reserve`, `[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
 settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
 use `[paths] core_cache`. Flags override these defaults, including explicit
@@ -1350,6 +1351,7 @@ port = 8000
 api_key = ""                      # Empty: no authentication.
 # thinking_token_budget = 1536    # Optional default reasoning-token cap.
 # scheduler_checkpoint_extra_work_fraction = 0.05  # Fraction of productive work for extra captures.
+# per_request_metrics = false     # Add vLLM's per-request `metrics` to OpenAI output.
 
 [defaults]
 model = "qwen3.8-flash"
