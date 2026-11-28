@@ -282,7 +282,7 @@ impl RequestScheduler {
             }
             let remaining = end.saturating_sub(start);
             let step_remaining = limit.saturating_sub(start);
-            let target_capacity = catalog
+            let pricing_capacity = catalog
                 .iter()
                 .map(|entry| entry.capacity)
                 .find(|&capacity| capacity >= step_remaining)
@@ -332,10 +332,11 @@ impl RequestScheduler {
                 } else {
                     entry.non_terminal_ns
                 };
+                // Only an unmeasured pricing capacity that adds work makes the price
+                // unknown: the pricing capacity covers at least as much work, so the
+                // skip loses no capacity that could cover more.
                 let Some(nanos) = nanos else {
-                    if !adds_work
-                        || (has_terminal_catalog && Some(entry.capacity) != target_capacity)
-                    {
+                    if !adds_work || Some(entry.capacity) != pricing_capacity {
                         continue;
                     }
                     return None;
@@ -883,7 +884,8 @@ mod tests {
         measure(scheduler, GraphKind::Snapshot, 1, 1);
     }
 
-    /// The interval walk as it was before catalog costs were resolved once per selection.
+    /// Reference walk that looks each step's cost up directly instead of from the
+    /// once-per-selection catalog, used to check that both price a request identically.
     fn reference_interval_prefill_ns(
         scheduler: &RequestScheduler,
         request: &LiveRequest,
@@ -906,6 +908,11 @@ mod tests {
                 .min()
                 .unwrap_or(end)
                 .min(end);
+            let pricing_capacity = catalog
+                .iter()
+                .copied()
+                .find(|&capacity| capacity >= limit - start)
+                .or_else(|| catalog.last().copied());
             let mut best: Option<(usize, u64)> = None;
             let mut max_work = 0usize;
             for &capacity in catalog {
@@ -928,7 +935,7 @@ mod tests {
                     .duration(request.prefill_kind(), 1, capacity)
                     .filter(|&nanos| nanos != 0)
                 else {
-                    if !adds_work {
+                    if !adds_work || Some(capacity) != pricing_capacity {
                         continue;
                     }
                     return None;
@@ -1675,5 +1682,47 @@ mod tests {
         );
         assert!(!partial_budget);
         assert_eq!(partial_selected.initial_prefill_ns, Some(150_000));
+    }
+
+    #[test]
+    fn uniform_prefill_catalog_skips_unmeasured_non_pricing_capacities() {
+        // Natural-fit discovery leaves capacities below a full chunk unmeasured.
+        let mut scheduler = super::super::tests::scheduler(1, 128, 16);
+        scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+        scheduler
+            .graph_durations(&super::super::tests::duration_graphs(1))
+            .unwrap();
+        measure(&mut scheduler, GraphKind::Prefill, 512, 400_000);
+        measure(&mut scheduler, GraphKind::Snapshot, 1, 1_000);
+        let mut spec = super::super::tests::spec(1024, 3);
+        spec.message_boundaries = vec![512];
+        let handle = scheduler.admit(spec).unwrap();
+        let (selected, unknown, _) =
+            scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
+        assert!(
+            !unknown,
+            "uniform catalog must not fail on unmeasured non-pricing capacities"
+        );
+        assert_eq!(selected.initial_prefill_ns, Some(800_000));
+    }
+
+    #[test]
+    fn span_shortened_chunk_prices_at_measured_capacities() {
+        // The unmeasured 256 is skipped and the chunk is priced at 512.
+        let mut scheduler = super::super::tests::scheduler(1, 128, 16);
+        scheduler.prefill_graphs(&[128, 256, 512]).unwrap();
+        scheduler
+            .graph_durations(&super::super::tests::duration_graphs(1))
+            .unwrap();
+        measure(&mut scheduler, GraphKind::Prefill, 128, 200_000);
+        measure(&mut scheduler, GraphKind::Prefill, 512, 200_000);
+        let handle = scheduler.admit(super::super::tests::spec(700, 3)).unwrap();
+        scheduler.set_prefill_spans(handle, &[200..600]).unwrap();
+        let request = scheduler.request(handle).unwrap();
+        let catalog = scheduler.prefill_catalog_costs(request);
+        assert_eq!(
+            RequestScheduler::interval_prefill_ns(request, &catalog, 0, 0, 700),
+            Some(400_000)
+        );
     }
 }
