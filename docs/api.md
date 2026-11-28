@@ -1004,8 +1004,9 @@ chunks does not measure generated tokens. The final usage chunk is also emitted.
 
 ## Per-request metrics
 
-`flare run --enable-per-request-metrics` adds vLLM's per-request `metrics`
-object to OpenAI Chat Completions, Completions, and Responses output. The option
+`flare run --enable-per-request-metrics`, or `[server] per_request_metrics = true`
+in the host configuration, adds vLLM's per-request `metrics` object to OpenAI
+Chat Completions, Completions, and Responses output. The option
 is off by default, and no response carries the key without it. Anthropic Messages
 output never carries the object. The fields are milliseconds, except
 `tokens_per_second`, and come from the instants the model worker records for the

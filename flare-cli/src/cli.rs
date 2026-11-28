@@ -643,7 +643,8 @@ pub struct OrbitRun {
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
-    /// Report vLLM's per-request `metrics` timing object in rank zero's OpenAI responses.
+    /// Add vLLM's per-request `metrics` timing object to OpenAI Chat, Completions,
+    /// and Responses output.
     #[arg(long, help_heading = "Serving options")]
     pub enable_per_request_metrics: bool,
 
@@ -856,7 +857,7 @@ pub struct Run {
     #[arg(long, help_heading = "Serving options")]
     pub bypass_performance_check: bool,
 
-    /// Report vLLM's per-request `metrics` timing object in OpenAI Chat, Completions,
+    /// Add vLLM's per-request `metrics` timing object to OpenAI Chat, Completions,
     /// and Responses output.
     #[arg(long, help_heading = "Serving options")]
     pub enable_per_request_metrics: bool,
