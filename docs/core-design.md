@@ -1448,9 +1448,11 @@ snapshot-copy time. Prefill estimates retain measured costs after expiry, as
 ordinary dispatch does. Unknown prefill costs or unknown or stale snapshot-copy
 costs exclude extras without excluding the anchor. Productive completed decode
 earns the same fraction of measured decode time for a distinct terminal
-endpoint. A coincident prompt and terminal endpoint uses one capture. Mandatory
-conditioned-input state transfers do not consume this allowance. Preemption
-preserves the logical request's earned and spent allowance.
+endpoint. For requests with message boundaries, terminal capture uses a free
+snapshot that preserves decode headroom. It is skipped if it would evict a
+checkpoint. A coincident prompt and terminal endpoint uses one capture.
+Mandatory conditioned-input state transfers do not consume this allowance.
+Preemption preserves the logical request's earned and spent allowance.
 
 Snapshot rows come from the global allocator, which accounts for their physical
 KV-page aliases. Selection checks a conservative feasible set of rows for the

@@ -805,17 +805,22 @@ impl RequestScheduler {
             self.stats.checkpoint_skip_work_budget += 1;
             return Ok(None);
         }
-        let rank = RetentionRank {
-            use_epoch: accounting.demand_epoch,
-            role: RetentionRole::Endpoint,
-            consumed_tokens: request.consumed_tokens,
+        let headroom = self.checkpoint_headroom();
+        let snapshot = if request.message_boundaries.is_empty() {
+            let rank = RetentionRank {
+                use_epoch: accounting.demand_epoch,
+                role: RetentionRole::Endpoint,
+                consumed_tokens: request.consumed_tokens,
+            };
+            match self.quote_snapshots(1, headroom, rank) {
+                Some(quote) => self
+                    .apply_snapshot_quote(&quote)?
+                    .and_then(|rows| rows.first().copied()),
+                None => None,
+            }
+        } else {
+            self.reserve_snapshot(headroom.max(self.decode_growth_pages()))
         };
-        let quote = self.quote_snapshots(1, self.checkpoint_headroom(), rank);
-        let rows = match quote {
-            Some(quote) => self.apply_snapshot_quote(&quote)?,
-            None => None,
-        };
-        let snapshot = rows.and_then(|rows| rows.first().copied());
         if snapshot.is_some() {
             accounting.reserved_ns = cost;
             let request = self.request_mut(handle)?;

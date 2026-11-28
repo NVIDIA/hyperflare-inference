@@ -1250,15 +1250,22 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
 
 #[test]
 fn snapshot_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
-    capture_under_reused_chain_pressure(0);
+    capture_under_reused_chain_pressure(0, vec![]);
 }
 
 #[test]
 fn page_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
-    capture_under_reused_chain_pressure(16);
+    capture_under_reused_chain_pressure(16, vec![]);
 }
 
-fn capture_under_reused_chain_pressure(alias_pages: u32) {
+#[test]
+fn terminal_capture_with_message_boundaries_preserves_checkpoints_under_pressure() {
+    for alias_pages in [0, 16] {
+        capture_under_reused_chain_pressure(alias_pages, vec![32]);
+    }
+}
+
+fn capture_under_reused_chain_pressure(alias_pages: u32, message_boundaries: Vec<usize>) {
     let rows = if alias_pages == 0 { 9 } else { 10 };
     let mut scheduler = scheduler(2, 64.max(32 + rows * alias_pages), rows);
     scheduler.enable_publications();
@@ -1302,6 +1309,8 @@ fn capture_under_reused_chain_pressure(alias_pages: u32) {
     let tip = *chain.last().unwrap();
     let pages = scheduler.cache.page_chain(tip).unwrap();
     let mut pending_spec = spec(64, 1);
+    let marked = !message_boundaries.is_empty();
+    pending_spec.message_boundaries = message_boundaries;
     pending_spec.prompt.fill(999);
     let pending = scheduler.admit(pending_spec).unwrap();
     let mut other_history = PrefixHistory::new([9; 32]);
@@ -1337,6 +1346,15 @@ fn capture_under_reused_chain_pressure(alias_pages: u32) {
     );
     assert!(scheduler.available_snapshot(0).is_none());
     let capture = scheduler.allocate_terminal_capture(pending).unwrap();
+    if marked {
+        assert!(capture.is_none());
+        assert_eq!(scheduler.stats().checkpoint_skip_storage, 1);
+        assert!(scheduler.take_evictions().is_empty());
+        assert_eq!(scheduler.cache.page_chain(tip).unwrap(), pages);
+        scheduler.cancel(pending).unwrap();
+        scheduler.cancel(hot).unwrap();
+        return;
+    }
     assert!(
         capture.is_some(),
         "older interior rows must fund the pending capture"
