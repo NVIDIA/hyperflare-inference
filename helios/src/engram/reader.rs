@@ -68,7 +68,9 @@ struct Read {
     fragments: std::ops::Range<usize>,
 }
 
+#[cfg(windows)]
 struct Aligned(usize, usize);
+#[cfg(windows)]
 impl Aligned {
     fn new(nbytes: usize) -> Result<Self> {
         Ok(Self(
@@ -78,6 +80,36 @@ impl Aligned {
     }
     fn at(&self, slot: usize) -> *mut u8 {
         (self.0 + slot * CHUNK) as *mut u8
+    }
+}
+
+/// Pre-faulted, huge-page-advised direct-I/O staging mapping for Unix `io_uring` lanes.
+#[cfg(unix)]
+struct MappedRegion {
+    address: usize,
+    nbytes: usize,
+}
+
+#[cfg(unix)]
+impl MappedRegion {
+    fn new(nbytes: usize) -> Result<Self> {
+        Ok(Self {
+            address: crate::os::map_host(nbytes)
+                .map_err(|e| format!("Engram allocation: {e}"))?,
+            nbytes,
+        })
+    }
+    fn at(&self, slot: usize) -> *mut u8 {
+        (self.address + slot * CHUNK) as *mut u8
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MappedRegion {
+    fn drop(&mut self) {
+        // SAFETY: `address` and `nbytes` came from `map_host`, and `UnixLane`
+        // drops its `IoUring` before releasing this registered staging mapping.
+        unsafe { crate::os::unmap_host(self.address, self.nbytes) };
     }
 }
 
@@ -348,18 +380,38 @@ impl Resident {
         unsafe { std::slice::from_raw_parts((address + self.skip) as *const u8, self.nbytes) }
     }
 }
+#[cfg(windows)]
 impl Drop for Aligned {
     fn drop(&mut self) {
         unsafe { crate::os::free_aligned(self.0, self.1) };
     }
 }
 
+/// Build a per-lane `io_uring` with cooperative completion task work when the
+/// kernel supports it, falling back to plain defaults on older kernels.
+///
+/// `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN` are omitted
+/// because multi-worker gathers drive helper lanes from fresh scoped threads,
+/// which would fail with `EEXIST` once a ring is bound to its first submitter.
+#[cfg(unix)]
+fn open_ring(entries: u32) -> std::io::Result<IoUring> {
+    IoUring::builder()
+        .setup_coop_taskrun()
+        .setup_taskrun_flag()
+        .build(entries)
+        .or_else(|_| IoUring::builder().setup_coop_taskrun().build(entries))
+        .or_else(|_| IoUring::new(entries))
+}
+
 #[cfg(unix)]
 struct UnixLane {
-    // Drop the ring before releasing the registered staging allocation.
+    // Drop the ring before releasing the registered staging mapping.
     ring: IoUring,
-    staging: Aligned,
+    staging: MappedRegion,
     depth: usize,
+    fixed_files: bool,
+    free_slots: Vec<u16>,
+    slot_read: Vec<usize>,
 }
 
 #[cfg(unix)]
@@ -389,21 +441,31 @@ impl UnixOutput {
 
 #[cfg(unix)]
 impl UnixLane {
-    fn new(depth: usize) -> Result<Self> {
-        let staging = Aligned::new(depth * CHUNK)?;
-        let ring = IoUring::new(depth as u32).map_err(|e| format!("Engram io_uring: {e}"))?;
+    fn new(depth: usize, files: &[Arc<File>]) -> Result<Self> {
+        let staging = MappedRegion::new(depth * CHUNK)?;
+        let ring = open_ring(depth as u32).map_err(|e| format!("Engram io_uring: {e}"))?;
         let buffers: Vec<_> = (0..depth)
             .map(|i| libc::iovec {
                 iov_base: staging.at(i).cast(),
                 iov_len: CHUNK,
             })
             .collect();
+        // SAFETY: Each descriptor addresses `CHUNK` bytes inside `staging`, which
+        // is declared after `ring` so the kernel releases registered buffers first.
         unsafe { ring.submitter().register_buffers(&buffers) }
             .map_err(|e| format!("register Engram staging: {e}"))?;
+        let raw_fds: Vec<_> = files.iter().map(|file| file.as_raw_fd()).collect();
+        let fixed_files = !raw_fds.is_empty()
+            && u32::try_from(raw_fds.len()).is_ok()
+            && ring.submitter().register_files(&raw_fds).is_ok();
+        debug_assert!(depth <= u16::MAX as usize);
         Ok(Self {
             ring,
             staging,
             depth,
+            fixed_files,
+            free_slots: Vec::with_capacity(depth),
+            slot_read: vec![0; depth],
         })
     }
 
@@ -415,6 +477,9 @@ impl UnixLane {
         output: UnixOutput,
         stats: &Stats,
     ) -> Result<()> {
+        if reads.is_empty() {
+            return Ok(());
+        }
         let mut timing = DiskTimings {
             stats,
             plan: 0,
@@ -422,56 +487,102 @@ impl UnixLane {
             wait: 0,
             complete: 0,
         };
-        for batch in reads.chunks(self.depth) {
-            let begin = Instant::now();
-            for (slot, read) in batch.iter().enumerate() {
-                let entry = opcode::ReadFixed::new(
-                    types::Fd(files[read.file].as_raw_fd()),
-                    self.staging.at(slot),
-                    read.nbytes as u32,
-                    slot as u16,
-                )
-                .offset(read.offset)
-                .build()
-                .user_data(slot as u64);
-                unsafe { self.ring.submission().push(&entry) }
-                    .map_err(|_| "Engram submission queue full")?;
-            }
-            stats
-                .disk_reads
-                .fetch_add(batch.len() as u64, Ordering::Relaxed);
-            stats.disk_bytes.fetch_add(
-                batch.iter().map(|read| read.nbytes as u64).sum(),
-                Ordering::Relaxed,
-            );
-            timing.submit += begin.elapsed().as_nanos() as u64;
-            let mut completed = 0;
-            let mut failure = None;
-            while completed < batch.len() {
-                let begin = Instant::now();
-                let result = self.ring.submit_and_wait(1);
-                timing.wait += begin.elapsed().as_nanos() as u64;
-                match result {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(format!("submit Engram reads: {error}").into()),
+        // Refill freed slots across the full gather so the submission queue stays
+        // saturated without draining to zero at chunk boundaries.
+        self.free_slots.clear();
+        self.free_slots.extend((0..self.depth as u16).rev());
+        let wait_target = (self.depth / 4).clamp(1, 16);
+        let mut next_read = 0usize;
+        let mut in_flight = 0usize;
+        let mut queued_reads = 0u64;
+        let mut queued_bytes = 0u64;
+        let mut failure: Option<String> = None;
+
+        while (failure.is_none() && next_read < reads.len()) || in_flight > 0 {
+            let mut now = Instant::now();
+            if failure.is_none() && next_read < reads.len() && !self.free_slots.is_empty() {
+                {
+                    let mut sq = self.ring.submission();
+                    while next_read < reads.len() && !sq.is_full() {
+                        let Some(slot) = self.free_slots.pop() else {
+                            break;
+                        };
+                        let read = &reads[next_read];
+                        let entry = if self.fixed_files {
+                            opcode::ReadFixed::new(
+                                types::Fixed(read.file as u32),
+                                self.staging.at(slot as usize),
+                                read.nbytes as u32,
+                                slot,
+                            )
+                            .offset(read.offset)
+                            .build()
+                            .user_data(slot as u64)
+                        } else {
+                            opcode::ReadFixed::new(
+                                types::Fd(files[read.file].as_raw_fd()),
+                                self.staging.at(slot as usize),
+                                read.nbytes as u32,
+                                slot,
+                            )
+                            .offset(read.offset)
+                            .build()
+                            .user_data(slot as u64)
+                        };
+                        // SAFETY: `slot` came from `free_slots`, so no in-flight read
+                        // references its registered buffer, and `sq` was checked non-full.
+                        if unsafe { sq.push(&entry) }.is_err() {
+                            self.free_slots.push(slot);
+                            failure = Some("Engram submission queue full".to_string());
+                            break;
+                        }
+                        self.slot_read[slot as usize] = next_read;
+                        next_read += 1;
+                        in_flight += 1;
+                        queued_reads += 1;
+                        queued_bytes += read.nbytes as u64;
+                    }
                 }
-                let begin = Instant::now();
-                for entry in self.ring.completion() {
-                    completed += 1;
-                    let slot = entry.user_data() as usize;
-                    let read = &batch[slot];
-                    let count = entry.result();
-                    if count < 0 || (count as usize) < read.required {
-                        failure = Some(format!(
+                let after_submit = Instant::now();
+                timing.submit += after_submit.duration_since(now).as_nanos() as u64;
+                now = after_submit;
+            }
+            if in_flight == 0 {
+                break;
+            }
+            let remaining = reads.len() - next_read;
+            let want = if failure.is_some() || remaining == 0 {
+                1
+            } else {
+                in_flight.min(wait_target).min(remaining)
+            };
+            let result = self.ring.submit_and_wait(want);
+            let after_wait = Instant::now();
+            timing.wait += after_wait.duration_since(now).as_nanos() as u64;
+            match result {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    failure = Some(format!("submit Engram reads: {error}"));
+                    break;
+                }
+            }
+            for entry in self.ring.completion() {
+                in_flight -= 1;
+                let slot = entry.user_data() as usize;
+                let read = &reads[self.slot_read[slot]];
+                let count = entry.result();
+                if count < 0 || (count as usize) < read.required {
+                    failure.get_or_insert_with(|| {
+                        format!(
                             "Engram read at {} returned {count}, requires {} bytes",
                             read.offset, read.required
-                        ));
-                        continue;
-                    }
+                        )
+                    });
+                } else if failure.is_none() {
                     for fragment in &fragments[read.fragments.clone()] {
                         // SAFETY: This lane exclusively owns each fragment; the
-                        // staging slot stays untouched until completion finishes.
+                        // staging slot stays untouched until returned to `free_slots`.
                         unsafe {
                             output.copy(
                                 fragment,
@@ -482,11 +593,14 @@ impl UnixLane {
                         }
                     }
                 }
-                timing.complete += begin.elapsed().as_nanos() as u64;
+                self.free_slots.push(slot as u16);
             }
-            if let Some(error) = failure {
-                return Err(error.into());
-            }
+            timing.complete += after_wait.elapsed().as_nanos() as u64;
+        }
+        stats.disk_reads.fetch_add(queued_reads, Ordering::Relaxed);
+        stats.disk_bytes.fetch_add(queued_bytes, Ordering::Relaxed);
+        if let Some(error) = failure {
+            return Err(error.into());
         }
         Ok(())
     }
@@ -539,7 +653,7 @@ impl DiskReader {
             let depth = DEPTH / workers;
             let mut lanes = Vec::with_capacity(workers);
             for _ in 0..workers {
-                lanes.push(UnixLane::new(depth)?);
+                lanes.push(UnixLane::new(depth, files)?);
             }
             lanes
         };
@@ -1777,6 +1891,116 @@ mod tests {
             .set_len(4096)
             .unwrap();
         assert!(reader.gather(&planes, &ids, &mut vec![0u8; expected.len()]).is_err());
+        // Restoring the file after mid-window truncation confirms the lane drained
+        // every in-flight completion and recycled all slots cleanly.
+        std::fs::write(&path, &bytes).unwrap();
+        let mut recovered = vec![0xA5u8; expected.len()];
+        reader.gather(&planes, &ids, &mut recovered).unwrap();
+        assert_eq!(recovered, expected);
+        reader.gather(&planes, &[], &mut []).unwrap();
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_disk_multi_file_fixed_and_fd_fallback_recover_after_truncation() {
+        let root = std::env::temp_dir().join(format!(
+            "helios-engram-unix-multifile-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let rows = 4096;
+        let width = 4109;
+        let offset = 4093;
+        let planes = std::array::from_fn(|file| Plane {
+            file,
+            offset: offset as u64,
+            nbytes: rows * width,
+            row_bytes: width,
+        });
+        let paths: Vec<_> = (0..2).map(|file| root.join(format!("{file}.bin"))).collect();
+        let bytes: Vec<Vec<u8>> = (0..2)
+            .map(|file| {
+                (0..offset + rows * width)
+                    .map(|i| ((i * 19 + i / 37 + file * 83) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        for (path, data) in paths.iter().zip(&bytes) {
+            std::fs::write(path, data).unwrap();
+        }
+        // Stride 20 rows (~82 KiB > 64 KiB CHUNK) across 2 files yields > DEPTH distinct reads.
+        let ids: Vec<i64> = (0..180)
+            .map(|i| match i % 23 {
+                0 => -1,
+                1 => 20,
+                _ => ((i * 20) % rows) as i64,
+            })
+            .collect();
+        let check = |reader: &mut DiskReader, subset: &[i64]| {
+            let mut expected = Vec::with_capacity(subset.len() * width * 2);
+            for plane in planes {
+                for &id in subset {
+                    if id < 0 {
+                        expected.extend(std::iter::repeat_n(0, width));
+                    } else {
+                        let start = offset + id as usize * width;
+                        expected.extend_from_slice(&bytes[plane.file][start..start + width]);
+                    }
+                }
+            }
+            let mut guarded = vec![0xA5u8; expected.len() + 64];
+            reader
+                .gather(&planes, subset, &mut guarded[32..32 + expected.len()])
+                .unwrap();
+            assert_eq!(&guarded[32..32 + expected.len()], expected);
+            assert!(
+                guarded[..32]
+                    .iter()
+                    .chain(&guarded[32 + expected.len()..])
+                    .all(|&b| b == 0xA5)
+            );
+        };
+        let files: Vec<_> = paths
+            .iter()
+            .map(|path| Arc::new(open_file(path).unwrap()))
+            .collect();
+        let mut baseline_reads = None;
+        for workers in [1, 2, 4, 8] {
+            for force_raw_fd in [false, true] {
+                let stats = Arc::new(Stats::default());
+                let mut reader = DiskReader::from_files(&files, stats.clone(), workers).unwrap();
+                if force_raw_fd {
+                    for lane in &mut reader.lanes {
+                        lane.fixed_files = false;
+                    }
+                }
+                for count in [0, 1, 17, ids.len()] {
+                    check(&mut reader, &ids[..count]);
+                }
+                let reads = stats.disk_reads.load(Ordering::Relaxed);
+                assert!(reads > DEPTH as u64);
+                if let Some(expected) = baseline_reads {
+                    assert_eq!(reads, expected);
+                } else {
+                    baseline_reads = Some(reads);
+                }
+                OpenOptions::new()
+                    .write(true)
+                    .open(&paths[1])
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                assert!(
+                    reader
+                        .gather(&planes, &ids, &mut vec![0u8; ids.len() * width * 2])
+                        .is_err()
+                );
+                std::fs::write(&paths[1], &bytes[1]).unwrap();
+                check(&mut reader, &ids);
+                check(&mut reader, &[rows as i64 - 1, -1, 0]);
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
