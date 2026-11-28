@@ -273,3 +273,126 @@ fn unused_anchor_guards_revoke_oldest_first_without_cancelling_requests() {
     assert_eq!(scheduler.stats().snapshot_backing_pages, 0);
     assert!(!scheduler.revoke_unused_anchor_guards());
 }
+
+#[test]
+fn marked_terminal_capture_preserves_running_decode_headroom() {
+    let mut s = tests::scheduler(2, 5, 1);
+    s.share_snapshot_pages(&[4..5]).unwrap();
+    let mut marked = tests::spec(64, 1);
+    marked.message_boundaries = vec![32];
+    let pending = s.admit(marked).unwrap();
+    let mut growing = tests::spec(60, 400);
+    growing.growable_output = true;
+    let decoder = s.admit(growing).unwrap();
+    let request = s.request_mut(decoder).unwrap();
+    request.phase = RequestPhase::Decode;
+    request.scheduled_consumed = 127;
+    assert_eq!(s.decode_growth_pages(), 1);
+    assert_eq!(s.available_snapshot(0), Some(SnapshotId(0)));
+    assert!(s.available_snapshot(1).is_none());
+    assert_eq!(s.allocate_terminal_capture(pending).unwrap(), None);
+    assert_eq!(s.stats().checkpoint_skip_storage, 1);
+    assert!(s.free_pages.contains(&PageId(4)));
+    assert_eq!(s.request(pending).unwrap().checkpoint_copy_ns, 0);
+    s.cancel(decoder).unwrap();
+    let row = s.allocate_terminal_capture(pending).unwrap().unwrap();
+    assert!(s.request(pending).unwrap().checkpoint_copy_ns > 0);
+    assert_eq!(s.stats().checkpoint_skip_storage, 1);
+    s.release_snapshot(row);
+    s.cancel(pending).unwrap();
+}
+
+#[test]
+fn terminal_reservations_match_lifecycle_model() {
+    for occupied in [2, 3] {
+        for (marked, early) in [
+            (true, None),
+            (false, None),
+            (true, Some(false)),
+            (true, Some(true)),
+        ] {
+            let mut s = tests::scheduler(2, 64, 3);
+            s.enable_evictions();
+            let mut observation = Observation {
+                origin: 0,
+                owners: [0; 3],
+                uses: [0; 3],
+                published: vec![],
+            };
+            for n in 0..occupied {
+                let mut history = PrefixHistory::new([9; 32]);
+                history.append(&[900 + n; 64], &[]).unwrap();
+                let snapshot = s.reserve_snapshot(0).unwrap();
+                let page = s.free_pages.pop_first().unwrap();
+                let id = s
+                    .cache
+                    .publish(
+                        &history,
+                        &Publication {
+                            parent: None,
+                            consumed_tokens: 64,
+                            tail_pages: vec![page],
+                            snapshot: StateSnapshot {
+                                id: snapshot,
+                                consumed_tokens: 64,
+                            },
+                            ready_after: Fence(0),
+                        },
+                    )
+                    .unwrap()
+                    .id();
+                observation.published.push((id, 2));
+            }
+            let mut spec = tests::spec(64, 4);
+            spec.growable_output = early.is_some();
+            if marked {
+                spec.message_boundaries = vec![32];
+            }
+            let h = s.admit(spec).unwrap();
+            let before = observation.project(&s);
+            let row = match early {
+                None => s.allocate_terminal_capture(h).unwrap(),
+                Some(preempted) => {
+                    let request = s.request_mut(h).unwrap();
+                    request.phase = RequestPhase::Decode;
+                    request.consumed_tokens = 64;
+                    request.scheduled_consumed = 64;
+                    let prompt_page = request.reserved_pages.pop().unwrap();
+                    request.private_pages.push(prompt_page);
+                    if preempted {
+                        s.preempt_newest().unwrap();
+                    } else {
+                        s.finish_early(h, false).unwrap();
+                    }
+                    assert_eq!(s.request(h).unwrap().preempted, preempted);
+                    s.request(h).unwrap().terminal_snapshot
+                }
+            };
+            let can_evict = !marked || early.is_some();
+            let skipped = occupied == 3 && !can_evict;
+            assert_eq!(row.is_none(), skipped);
+            assert_eq!(s.stats().checkpoint_skip_storage, u64::from(skipped));
+            assert_eq!(
+                s.take_evictions().len(),
+                usize::from(occupied == 3 && can_evict)
+            );
+            let mut after = observation.project(&s);
+            // The allocation returns a reserved row to the caller before it submits the copy.
+            if let Some(id) = row {
+                assert!(!s.free_snapshots.contains(&id));
+                let start = 3 + 4 * id.0 as usize;
+                assert_eq!(after[start], 0, "reserved row still has a previous owner");
+                after[start..start + 4].copy_from_slice(&[2, h.slot as u64 + 1, 0, 0]);
+            }
+            edge(
+                before,
+                [
+                    if can_evict { 19 } else { 18 },
+                    h.slot as u64 + 1,
+                    row.map_or(0, |id| id.0 as u64 + 1),
+                ],
+                after,
+            );
+        }
+    }
+}

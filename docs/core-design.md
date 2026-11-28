@@ -1448,9 +1448,16 @@ snapshot-copy time. Prefill estimates retain measured costs after expiry, as
 ordinary dispatch does. Unknown prefill costs or unknown or stale snapshot-copy
 costs exclude extras without excluding the anchor. Productive completed decode
 earns the same fraction of measured decode time for a distinct terminal
-endpoint. A coincident prompt and terminal endpoint uses one capture. Mandatory
-conditioned-input state transfers do not consume this allowance. Preemption
-preserves the logical request's earned and spent allowance.
+endpoint. At ordinary completion, message boundaries identify prefixes the
+renderer has made available for later turns or document reuse. Saving the final
+generated state is optional. For these requests, favor the existing prefixes
+over that extra endpoint by using only a free row with backing beyond the next
+decode rounds. For a raw prompt with no message boundaries, the scheduler has
+no message-level reuse signal and uses ranked allocation for its terminal
+endpoint. Published checkpoints from either path keep their usual eviction
+ranks. A coincident prompt and terminal endpoint uses one capture.
+Mandatory conditioned-input state transfers do not consume this allowance.
+Preemption preserves the logical request's earned and spent allowance.
 
 Snapshot rows come from the global allocator, which accounts for their physical
 KV-page aliases. Selection checks a conservative feasible set of rows for the
@@ -1545,6 +1552,10 @@ Completion refreshes at most two checkpoints. Grandparents retain their own dema
 epochs: sharing their pages does not require restoring their rows. Older single-child
 ancestors can therefore be compacted under pressure without discarding descendant
 pages. When no terminal is published, completion refreshes only the retained prefix.
+A continuation then replays the consumed tokens beyond its restored prefix.
+Early finish under page pressure, including preemption for readmission, releases
+unused page reservations first and may reclaim storage for the current decoder
+state even when the request has message boundaries.
 Cancellation after completed inference also refreshes only that prefix, including
 client stop sequences. Cancellation before inference and execution failure do not
 refresh recency. Preemption carries the admission epoch into readmission without

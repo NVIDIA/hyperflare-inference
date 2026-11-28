@@ -706,8 +706,10 @@ when timing estimates are unavailable or the fraction is zero. Earlier messages
 and a distinct prompt end consume the fraction of estimated uncached prefill
 work; a distinct terminal endpoint earns its allowance from completed productive
 decode. Extra work includes snapshot copies and additional prefill caused by
-splitting chunks. Snapshot storage remains globally shared and reclaimable for
-mandatory execution. This option requires no core re-export.
+splitting chunks. Storage also limits optional captures. At ordinary
+completion, requests with message boundaries save generated state only in spare
+storage. See [exact endpoint capture](core-design.md#exact-endpoint-capture) for
+reuse and early-finish behavior. This option requires no core re-export.
 
 `flare run CORE` loads an exported file and reads host defaults from
 `~/.config/flare/config.toml` using its Rust configuration reader. `--config PATH`
