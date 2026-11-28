@@ -42,6 +42,38 @@ pub(crate) fn subtract_ranges(start: u64, end: u64, excluded: &[(u64, u64)]) -> 
     spans
 }
 
+/// A kernel argument value inside the recorded address envelope that resolves
+/// to no live recorded allocation, including a value in an inactive range.
+/// Such a value may be a stale pointer or a numeric constant; argument typing
+/// cannot yet distinguish the two, so export reports these for operator review.
+pub(crate) struct UnresolvedCandidate {
+    pub graph: String,
+    pub node: usize,
+    pub function: usize,
+    pub argument: usize,
+    pub offset: usize,
+}
+
+struct UnresolvedEntry {
+    first: UnresolvedCandidate,
+    order: usize,
+    occurrences: usize,
+}
+
+/// The call site a kernel argument blob was scanned for. Every occurrence of
+/// the same argument bytes is recorded separately so a report can name the
+/// graph, node, kernel, and parameter that carried an unresolved candidate.
+pub(crate) struct Site<'a> {
+    pub graph: &'a str,
+    pub node: usize,
+    pub function: usize,
+    pub argument: usize,
+}
+
+/// The number of distinct addresses shown in a rank's report. The examples
+/// retain the first call site for each address in graph and node order.
+const UNRESOLVED_EXAMPLES: usize = 10;
+
 pub(crate) struct Reachability {
     allocations: HashMap<String, Allocation>,
     intervals: Vec<(u64, u64, String)>,
@@ -49,7 +81,8 @@ pub(crate) struct Reachability {
     inactive: Vec<(u64, u64)>,
     pub(crate) reached: HashSet<String>,
     pending: VecDeque<String>,
-    blobs: HashSet<(Vec<u8>, Vec<(usize, usize)>)>,
+    blobs: HashMap<(Vec<u8>, Vec<(usize, usize)>), Vec<(usize, u64)>>,
+    unresolved: HashMap<u64, UnresolvedEntry>,
     tail: Option<(String, u64, Vec<u8>)>,
 }
 
@@ -74,7 +107,8 @@ impl Reachability {
             inactive: merge_ranges(inactive.to_vec()),
             reached: HashSet::new(),
             pending: VecDeque::new(),
-            blobs: HashSet::new(),
+            blobs: HashMap::new(),
+            unresolved: HashMap::new(),
             tail: None,
         };
         this.intervals.sort_unstable();
@@ -115,10 +149,10 @@ impl Reachability {
         Ok(())
     }
 
-    pub(crate) fn pointer(&mut self, value: u64) -> ExportResult<()> {
+    fn candidate(&mut self, value: u64) -> ExportResult<bool> {
         let inactive = self.inactive.partition_point(|&(start, _)| start <= value);
         if inactive > 0 && value < self.inactive[inactive - 1].1 {
-            return Ok(());
+            return Ok(true);
         }
         let index = self
             .intervals
@@ -126,44 +160,148 @@ impl Reachability {
         if index > 0 && value < self.intervals[index - 1].1 {
             let name = self.intervals[index - 1].2.clone();
             self.reference(&name)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn blob(&mut self, data: &[u8], numeric: &[(usize, usize)], site: &Site) -> ExportResult<()> {
+        let key = (data.to_vec(), numeric.to_vec());
+        let misses = match self.blobs.get(&key) {
+            Some(misses) => misses.clone(),
+            None => {
+                let excluded = merge_ranges(
+                    numeric
+                        .iter()
+                        .map(|&(start, end)| (start as u64, end as u64))
+                        .collect(),
+                );
+                let mut misses = Vec::new();
+                for (start, end) in subtract_ranges(0, data.len() as u64, &excluded) {
+                    self.scan(
+                        &data[start as usize..end as usize],
+                        start as usize,
+                        Some(&mut misses),
+                    )?;
+                }
+                self.blobs.insert(key, misses.clone());
+                misses
+            }
+        };
+        for (offset, address) in misses {
+            let order = self.unresolved.len();
+            self.unresolved
+                .entry(address)
+                .and_modify(|entry| entry.occurrences += 1)
+                .or_insert_with(|| UnresolvedEntry {
+                    first: UnresolvedCandidate {
+                        graph: site.graph.to_owned(),
+                        node: site.node,
+                        function: site.function,
+                        argument: site.argument,
+                        offset,
+                    },
+                    order,
+                    occurrences: 1,
+                });
         }
         Ok(())
     }
 
-    pub(crate) fn blob(&mut self, data: &[u8], numeric: &[(usize, usize)]) -> ExportResult<()> {
-        if !self.blobs.insert((data.to_vec(), numeric.to_vec())) {
-            return Ok(());
-        }
-        let excluded = merge_ranges(
-            numeric
-                .iter()
-                .map(|&(start, end)| (start as u64, end as u64))
-                .collect(),
-        );
-        for (start, end) in subtract_ranges(0, data.len() as u64, &excluded) {
-            self.scan(&data[start as usize..end as usize])?;
-        }
-        Ok(())
+    pub(crate) fn unresolved_count(&self) -> usize {
+        self.unresolved
+            .values()
+            .map(|entry| entry.occurrences)
+            .sum()
     }
 
-    fn scan(&mut self, data: &[u8]) -> ExportResult<()> {
+    pub(crate) fn unresolved_unique_addresses(&self) -> usize {
+        self.unresolved.len()
+    }
+
+    /// Lines describing the unresolved candidates: a summary line, one line per
+    /// distinct address up to the example limit, and a final line when occurrences
+    /// outnumber examples. The caller supplies the recorded functions and adds
+    /// the export prefix.
+    pub(crate) fn unresolved_report(&self, functions: &[wire::Function]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let occurrences = self.unresolved_count();
+        if occurrences == 0 {
+            return lines;
+        }
+        lines.push(format!(
+            "kernel argument scan: {} and {} fall inside the recorded address envelope but \
+             outside every live recorded allocation, so each may be a stale pointer or a numeric \
+             constant",
+            with_count(occurrences, "occurrence", "occurrences"),
+            with_count(
+                self.unresolved_unique_addresses(),
+                "distinct address",
+                "distinct addresses"
+            ),
+        ));
+        let mut examples: Vec<_> = self.unresolved.iter().collect();
+        examples.sort_unstable_by_key(|(_, entry)| entry.order);
+        for &(address, entry) in examples.iter().take(UNRESOLVED_EXAMPLES) {
+            let address = *address;
+            let candidate = &entry.first;
+            let function = functions.get(candidate.function);
+            lines.push(format!(
+                "  graph {:?} node {} kernel {} ({}), argument {}, offset {}: {address:#x}",
+                candidate.graph,
+                candidate.node,
+                function.map_or("unknown", |function| function.symbol.as_str()),
+                function.map_or("unknown", |function| function.module.as_str()),
+                candidate.argument,
+                candidate.offset,
+            ));
+        }
+        let hidden = occurrences - examples.len().min(UNRESOLVED_EXAMPLES);
+        if hidden > 0 {
+            lines.push(format!(
+                "  … {} not shown",
+                with_count(hidden, "more occurrence", "more occurrences")
+            ));
+        }
+        lines
+    }
+
+    fn scan(
+        &mut self,
+        data: &[u8],
+        base: usize,
+        mut misses: Option<&mut Vec<(usize, u64)>>,
+    ) -> ExportResult<()> {
         if self.intervals.is_empty() {
             return Ok(());
         }
         let floor = self.intervals[0].0;
         let ceiling = self.intervals.last().unwrap().1;
-        for bytes in data.windows(8) {
+        for (offset, bytes) in data.windows(8).enumerate() {
             let pointer = u64::from_le_bytes(bytes.try_into().unwrap());
             if pointer >= floor && pointer < ceiling {
-                self.pointer(pointer)?;
+                let inactive = self
+                    .inactive
+                    .partition_point(|&(start, _)| start <= pointer);
+                let in_free_block = inactive > 0 && pointer < self.inactive[inactive - 1].1;
+                if (!self.candidate(pointer)? || in_free_block)
+                    && let Some(misses) = misses.as_deref_mut()
+                {
+                    misses.push((base + offset, pointer));
+                }
             }
         }
         Ok(())
     }
 
-    pub(crate) fn graph(&mut self, nodes: &[wire::Node], kernels: &[Kernel]) -> ExportResult<()> {
+    pub(crate) fn graph(
+        &mut self,
+        name: &str,
+        nodes: &[wire::Node],
+        kernels: &[Kernel],
+    ) -> ExportResult<()> {
         use wire::node::Operation;
-        for node in nodes {
+        for (node_index, node) in nodes.iter().enumerate() {
             match node
                 .operation
                 .as_ref()
@@ -176,7 +314,9 @@ impl Reachability {
                     if node.arguments.len() != kernel.arguments.len() {
                         return Err(invalid("kernel argument count differs from its function"));
                     }
-                    for (blob, argument) in node.arguments.iter().zip(&kernel.arguments) {
+                    for (position, (blob, argument)) in
+                        node.arguments.iter().zip(&kernel.arguments).enumerate()
+                    {
                         for relocation in &blob.relocations {
                             self.reference(
                                 &relocation
@@ -186,7 +326,16 @@ impl Reachability {
                                     .allocation,
                             )?;
                         }
-                        self.blob(&blob.data, &argument.numeric)?;
+                        self.blob(
+                            &blob.data,
+                            &argument.numeric,
+                            &Site {
+                                graph: name,
+                                node: node_index,
+                                function: node.function as usize,
+                                argument: position,
+                            },
+                        )?;
                     }
                     for attribute in &node.attributes {
                         if let Some(value) = &attribute.value {
@@ -239,11 +388,15 @@ impl Reachability {
                 .checked_add(data.len() as u64)
                 .ok_or_else(|| invalid("allocation scan extent overflow"))?;
             for (start, stop) in subtract_ranges(address, end, &self.numeric) {
-                self.scan(&data[(start - address) as usize..(stop - address) as usize])?;
+                self.scan(
+                    &data[(start - address) as usize..(stop - address) as usize],
+                    0,
+                    None,
+                )?;
             }
             Ok(())
         } else {
-            self.scan(data)
+            self.scan(data, 0, None)
         }
     }
 
@@ -317,6 +470,14 @@ impl Reachability {
             self.reference(&relocation.target.allocation)?;
         }
         Ok(Some(allocation))
+    }
+}
+
+fn with_count(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{count} {many}")
     }
 }
 
@@ -430,7 +591,7 @@ mod tests {
         let allocations = [allocation("target", 0x2000)];
         let mut reach = Reachability::new(&allocations, &[], &[], &[]).unwrap();
         let bytes = [0x2000u64.to_le_bytes(), 0x2000u64.to_le_bytes()].concat();
-        reach.blob(&bytes, &[(0, 8)]).unwrap();
+        reach.blob(&bytes, &[(0, 8)], &SITE).unwrap();
         assert!(reach.reached.contains("target"));
     }
 
@@ -482,8 +643,8 @@ mod tests {
         let bytes = target.address.to_le_bytes();
         let mut reach =
             Reachability::new(&[source.clone(), target.clone()], &[], &[], &[]).unwrap();
-        reach.blob(&bytes[..4], &[]).unwrap();
-        reach.blob(&bytes[4..], &[]).unwrap();
+        reach.blob(&bytes[..4], &[], &SITE).unwrap();
+        reach.blob(&bytes[4..], &[], &SITE).unwrap();
         reach.contents(&source, 0, &bytes[..4]).unwrap();
         reach.contents(&source, 128, &bytes[4..]).unwrap();
         assert!(reach.reached.is_empty());
@@ -491,6 +652,7 @@ mod tests {
             .blob(
                 &[b"abc".as_slice(), bytes.as_slice(), b"xyz".as_slice()].concat(),
                 &[],
+                &SITE,
             )
             .unwrap();
         assert_eq!(reach.reached, HashSet::from([target.name]));
@@ -533,6 +695,7 @@ mod tests {
         let mut reach = Reachability::new(&[scalar.clone(), input.clone()], &[], &[], &[]).unwrap();
         reach
             .graph(
+                "graph",
                 &[wire::Node {
                     operation: Some(wire::node::Operation::Kernel(node.clone())),
                 }],
@@ -543,6 +706,7 @@ mod tests {
         node.arguments[1].data = node.arguments[0].data.clone();
         reach
             .graph(
+                "graph",
                 &[wire::Node {
                     operation: Some(wire::node::Operation::Kernel(node)),
                 }],
@@ -552,8 +716,238 @@ mod tests {
         assert_eq!(reach.reached, HashSet::from([input.name, scalar.name]));
     }
 
+    fn kernel_graph(argument_data: &[u8], numeric: Vec<(usize, usize)>) -> (wire::Node, Kernel) {
+        let kernel = Kernel {
+            function: 1,
+            module: "module".into(),
+            arguments: vec![super::super::Argument {
+                size: argument_data.len(),
+                relocations: vec![],
+                numeric,
+            }],
+        };
+        let node = wire::Node {
+            operation: Some(wire::node::Operation::Kernel(wire::Kernel {
+                function: 0,
+                arguments: vec![wire::Blob {
+                    data: argument_data.to_vec(),
+                    relocations: vec![],
+                }],
+                ..Default::default()
+            })),
+        };
+        (node, kernel)
+    }
+
+    const SITE: Site = Site {
+        graph: "graph",
+        node: 0,
+        function: 0,
+        argument: 0,
+    };
+
+    fn first(reach: &Reachability, address: u64) -> &UnresolvedCandidate {
+        &reach.unresolved[&address].first
+    }
+
     #[test]
-    fn freed_interval_boundaries_exclude_candidates_but_not_explicit_bindings() {
+    fn kernel_argument_gap_candidate_is_reported_with_site_context() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        let (node, kernel) = kernel_graph(&0x3008u64.to_le_bytes(), vec![]);
+        let mut reach = Reachability::new(&[low, high], &[], &[], &[]).unwrap();
+        reach.graph("prefill-4096", &[node], &[kernel]).unwrap();
+        assert_eq!(reach.unresolved_count(), 1);
+        assert_eq!(reach.unresolved.len(), 1);
+        let candidate = first(&reach, 0x3008);
+        assert_eq!(candidate.graph, "prefill-4096");
+        assert_eq!(candidate.node, 0);
+        assert_eq!(candidate.function, 0);
+        assert_eq!(candidate.argument, 0);
+        assert_eq!(candidate.offset, 0);
+        assert_eq!(reach.unresolved_unique_addresses(), 1);
+    }
+
+    #[test]
+    fn unresolved_examples_are_capped_while_occurrences_are_counted() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        let data: Vec<u8> = (0..12u64)
+            .flat_map(|index| (0x3000 + 8 * index).to_le_bytes())
+            .collect();
+        let (node, kernel) = kernel_graph(&data, vec![]);
+        let mut reach = Reachability::new(&[low, high], &[], &[], &[]).unwrap();
+        reach.graph("graph", &[node], &[kernel]).unwrap();
+        assert_eq!(reach.unresolved_count(), 12);
+        assert_eq!(reach.unresolved.len(), 12);
+        assert_eq!(reach.unresolved_unique_addresses(), 12);
+        for index in 0..12 {
+            let address = 0x3000 + 8 * index as u64;
+            assert_eq!(first(&reach, address).graph, "graph");
+            assert_eq!(first(&reach, address).offset, 8 * index);
+            assert_eq!(reach.unresolved[&address].order, index);
+            assert_eq!(reach.unresolved[&address].occurrences, 1);
+        }
+    }
+
+    #[test]
+    fn kernel_argument_candidate_offset_counts_from_the_argument_start() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        let data = [
+            0x3008u64.to_le_bytes().as_slice(),
+            &[0u8; 8],
+            0x3010u64.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        let (node, kernel) = kernel_graph(&data, vec![(0, 8)]);
+        let mut reach = Reachability::new(&[low, high], &[], &[], &[]).unwrap();
+        reach.graph("graph", &[node], &[kernel]).unwrap();
+        assert_eq!(reach.unresolved_count(), 1);
+        let candidate = first(&reach, 0x3010);
+        assert_eq!(candidate.offset, 16);
+        assert_eq!(candidate.argument, 0);
+        assert_eq!(candidate.node, 0);
+    }
+
+    #[test]
+    fn shared_argument_bytes_record_one_example_per_address() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        let (node, kernel) = kernel_graph(&0x3008u64.to_le_bytes(), vec![]);
+        let mut reach = Reachability::new(&[low, high], &[], &[], &[]).unwrap();
+        reach
+            .graph("graph-a", &[node.clone()], &[kernel.clone()])
+            .unwrap();
+        reach.graph("graph-b", &[node], &[kernel]).unwrap();
+        assert_eq!(reach.unresolved_count(), 2);
+        assert_eq!(reach.unresolved.len(), 1);
+        assert_eq!(first(&reach, 0x3008).graph, "graph-a");
+        assert_eq!(reach.unresolved[&0x3008].occurrences, 2);
+        assert_eq!(reach.unresolved_unique_addresses(), 1);
+    }
+
+    #[test]
+    fn unresolved_report_names_the_kernel_and_its_symbol() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        let (node, kernel) = kernel_graph(&0x3008u64.to_le_bytes(), vec![]);
+        let mut reach = Reachability::new(&[low, high], &[], &[], &[]).unwrap();
+        reach.graph("prefill-8192", &[node], &[kernel]).unwrap();
+        let functions = vec![
+            wire::Function {
+                module: "module".into(),
+                symbol: "cublasLt::splitKreduce_kernel".into(),
+                parameter_sizes: vec![8],
+                attributes: vec![],
+            },
+            wire::Function {
+                module: "wrong-module".into(),
+                symbol: "wrong-symbol".into(),
+                parameter_sizes: vec![8],
+                attributes: vec![],
+            },
+        ];
+        assert_eq!(
+            reach.unresolved_report(&functions),
+            vec![
+                "kernel argument scan: 1 occurrence and 1 distinct address fall inside the \
+                 recorded address envelope but outside every live recorded allocation, so each may be \
+                 a stale pointer or a numeric constant"
+                    .to_owned(),
+                "  graph \"prefill-8192\" node 0 kernel cublasLt::splitKreduce_kernel (module), \
+                 argument 0, offset 0: 0x3008"
+                    .to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unresolved_report_bounds_examples_and_counts_hidden_occurrences() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        let data: Vec<u8> = (0..12u64)
+            .rev()
+            .flat_map(|index| (0x3000 + 8 * index).to_le_bytes())
+            .collect();
+        let (node, kernel) = kernel_graph(&data, vec![]);
+        let mut reach = Reachability::new(&[low, high], &[], &[], &[]).unwrap();
+        reach
+            .graph("graph-a", &[node.clone()], &[kernel.clone()])
+            .unwrap();
+        reach.graph("graph-b", &[node], &[kernel]).unwrap();
+        let lines = reach.unresolved_report(&[]);
+        assert_eq!(lines.len(), 12);
+        assert_eq!(
+            lines[0],
+            "kernel argument scan: 24 occurrences and 12 distinct addresses fall inside the \
+             recorded address envelope but outside every live recorded allocation, so each may be a \
+             stale pointer or a numeric constant"
+        );
+        assert!(lines[1].contains("graph \"graph-a\" node 0 kernel unknown (unknown)"));
+        assert!(lines[1].ends_with("0x3058"));
+        assert!(lines[10].ends_with("0x3010"));
+        assert_eq!(lines[11], "  … 14 more occurrences not shown");
+    }
+
+    #[test]
+    fn unresolved_report_is_empty_without_candidates() {
+        let reach = Reachability::new(&[allocation("only", 0x2000)], &[], &[], &[]).unwrap();
+        assert!(reach.unresolved_report(&[]).is_empty());
+    }
+
+    #[test]
+    fn kernel_argument_boundaries_and_external_values_follow_the_recorded_contract() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        for (value, reported) in [
+            (low.address, false),
+            (low.address + 255, false),
+            (low.address + 256, true),
+            (high.address - 1, true),
+            (high.address, false),
+            (0x1000, false),
+            (high.address + 256, false),
+        ] {
+            let (node, kernel) = kernel_graph(&value.to_le_bytes(), vec![]);
+            let mut reach = Reachability::new(&[low.clone(), high.clone()], &[], &[], &[]).unwrap();
+            reach.graph("graph", &[node], &[kernel]).unwrap();
+            assert_eq!(
+                reach.unresolved.contains_key(&value),
+                reported,
+                "value {value:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_argument_inactive_ranges_are_reported_but_numeric_ranges_stay_lenient() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        let (node, kernel) = kernel_graph(&0x3008u64.to_le_bytes(), vec![]);
+        let mut reach =
+            Reachability::new(&[low.clone(), high.clone()], &[], &[(0x3000, 0x3100)], &[]).unwrap();
+        reach.graph("graph", &[node], &[kernel]).unwrap();
+        assert_eq!(reach.unresolved_count(), 1);
+        assert!(reach.unresolved.contains_key(&0x3008));
+        let (node, kernel) = kernel_graph(&0x3008u64.to_le_bytes(), vec![(0, 8)]);
+        let mut reach = Reachability::new(&[low, high], &[], &[], &[]).unwrap();
+        reach.graph("graph", &[node], &[kernel]).unwrap();
+        assert!(reach.unresolved.is_empty());
+    }
+
+    #[test]
+    fn allocation_contents_still_tolerate_gap_candidates() {
+        let low = allocation("low", 0x2000);
+        let high = allocation("high", 0x4000);
+        let mut reach = Reachability::new(&[low.clone(), high], &[], &[], &[]).unwrap();
+        reach.contents(&low, 0, &0x3008u64.to_le_bytes()).unwrap();
+        assert!(reach.reached.is_empty());
+        assert!(reach.unresolved.is_empty());
+    }
+
+    #[test]
+    fn freed_interval_boundaries_report_kernel_candidates_without_retaining_storage() {
         let mut storage = allocation("segment", 0x200000000000);
         storage.nbytes = 4096;
         for (offset, retained) in [
@@ -579,9 +973,14 @@ mod tests {
                     ]
                     .concat(),
                     &[],
+                    &SITE,
                 )
                 .unwrap();
             assert_eq!(!reach.reached.is_empty(), retained);
+            assert_eq!(
+                reach.unresolved.contains_key(&(storage.address + offset)),
+                !retained,
+            );
             reach.reference(&storage.name).unwrap();
             assert!(reach.reached.contains(&storage.name));
         }

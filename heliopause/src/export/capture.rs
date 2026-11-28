@@ -3181,7 +3181,7 @@ pub(crate) fn capture_rank(
             &indices,
             &request.events,
         )?;
-        reach.graph(&nodes, &kernels)?;
+        reach.graph(&graph.name, &nodes, &kernels)?;
         let file = format!("graph-{index}.bin");
         let path = stage.path.join(&file);
         let mut writer = BufWriter::new(File::create(&path)?);
@@ -3216,6 +3216,11 @@ pub(crate) fn capture_rank(
         "{} graphs, {graph_bytes} bytes",
         request.graphs.len()
     ));
+    if reach.unresolved_count() > 0 {
+        for line in reach.unresolved_report(&output.index.ranks[0].functions) {
+            eprintln!("export: rank {}: {line}", request.rank);
+        }
+    }
     let module_phase = progress.phase("Capture compiled modules and globals", None);
     let mut module_bytes = 0u64;
     let mut downloader = Downloader::new(&cuda)?;
