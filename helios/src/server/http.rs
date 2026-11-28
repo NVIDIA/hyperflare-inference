@@ -329,32 +329,6 @@ pub(super) async fn generate(
         state.run,
         state.ids.fetch_add(1, Ordering::Relaxed)
     );
-    let submitted = if prompts.is_empty() {
-        Ok(vec![])
-    } else if continuous_usage {
-        state.model.generate_many_observed(prompts, observation.timestamps)
-    } else if observation.token_ids && size == 1 {
-        state
-            .model
-            .generate_observed(prompts.remove(0), observation.timestamps)
-            .map(|g| vec![g])
-    } else {
-        state.model.generate_many(prompts)
-    };
-    let mut generation = match submitted {
-        Ok(g) => g,
-        Err(e) => return rejection(&state, protocol, &id, "admission", e),
-    };
-    if !decoded.stream
-        && let Err(e) = runtime::await_admission(&mut generation).await
-    {
-        return rejection(&state, protocol, &id, "admission", e);
-    }
-    let enqueue_ns = generation.first().and_then(|g| g.enqueue_ns);
-    let mut iter = generation.into_iter();
-    let mut generations: Vec<Option<Generation>> = (0..size)
-        .map(|i| if zero.contains(&i) { None } else { iter.next() })
-        .collect();
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -384,9 +358,30 @@ pub(super) async fn generate(
     encoder.set_tool_grammars(tool_grammars);
     encoder.set_strict_validators(strict_validators);
     encoder.set_continuous_usage(continuous_usage);
-    if state.per_request_metrics {
-        encoder.enable_request_metrics(decoded.stream);
+    // The encoder decides where per-request metrics appear, and so whether the
+    // generation must report its model steps' completion instants.
+    let commits = state.per_request_metrics && encoder.enable_request_metrics(decoded.stream);
+    let submitted = if prompts.is_empty() {
+        Ok(vec![])
+    } else {
+        let observed = (continuous_usage || observation.token_ids && size == 1)
+            .then_some(observation.timestamps);
+        state.model.generate_many_observed(prompts, observed, commits)
+    };
+    let mut generation = match submitted {
+        Ok(g) => g,
+        Err(e) => return rejection(&state, protocol, &id, "admission", e),
+    };
+    if !decoded.stream
+        && let Err(e) = runtime::await_admission(&mut generation).await
+    {
+        return rejection(&state, protocol, &id, "admission", e);
     }
+    let enqueue_ns = generation.first().and_then(|g| g.enqueue_ns);
+    let mut iter = generation.into_iter();
+    let mut generations: Vec<Option<Generation>> = (0..size)
+        .map(|i| if zero.contains(&i) { None } else { iter.next() })
+        .collect();
     let streaming = decoded.stream;
     let stream_state = state.clone();
     let stream_id = id.clone();
@@ -522,6 +517,10 @@ pub(super) async fn generate(
                             done: false,
                         });
                     }
+                    Ok(vec![])
+                }
+                GenerationEvent::Committed { at_ns } => {
+                    encoder.record_commit(at_ns);
                     Ok(vec![])
                 }
                 GenerationEvent::Finished {

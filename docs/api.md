@@ -1017,16 +1017,21 @@ string, which the worker matches, does not change how they are measured:
 | --- | --- |
 | `queue_time_ms` | Model-queue arrival to the first model step that includes the request |
 | `time_to_first_token_ms` | That first scheduled step to the completion of the step that committed the first generated token |
-| `time_to_first_content_token_ms` | Always null: Flare does not report when answer text first appeared, as vLLM permits for a value it cannot provide |
+| `time_to_first_content_token_ms` | Streams only: the first scheduled step to the completion of the step whose output first produced non-empty answer text |
 | `generation_time_ms` | First to last committed generated token |
 | `mean_itl_ms` | `generation_time_ms` divided by the generated tokens after the first |
 | `tokens_per_second` | Generated tokens, as `usage` counts them, over the first scheduled step to the last committed generated token |
 
 A step's completion instant is read once when the worker processes that step's
-results, so tokens committed by one speculative step share it. The runtime reads
-model-queue arrival when it builds the request group, before publishing the group
-to the worker channel, so `queue_time_ms` includes the channel send and worker
-pickup and starts later than vLLM's engine-core scheduler queue.
+results, so tokens committed by one speculative step share it. Reasoning text,
+tool-call output, and answer text that a named tool choice discards do not count
+as content; text that stop-string matching holds back counts from the step whose
+output releases it. `time_to_first_content_token_ms` equals
+`time_to_first_token_ms` when the first generated step produces answer text. The
+runtime reads model-queue arrival when it builds the request group, before
+publishing the group to the worker channel, so `queue_time_ms` includes the
+channel send and worker pickup and starts later than vLLM's engine-core
+scheduler queue.
 
 A JSON body carries `metrics` at the top level, and a Responses stream carries it
 in the `response` object of `response.completed` or `response.incomplete`. A Chat
@@ -1038,9 +1043,10 @@ for those streams. Flare has no equivalent of vLLM's
 would close this gap.
 
 All six fields are always present, and a field is null when the request did not
-reach the instants it spans, such as `mean_itl_ms` for a single generated token.
-With `n` greater than one `metrics` is null, and Completions with several prompts
-omit it.
+reach the instants it spans, such as `mean_itl_ms` for a single generated token
+or `time_to_first_content_token_ms` in a JSON body or a stream without answer
+text. With `n` greater than one `metrics` is null, and Completions with several
+prompts omit it.
 
 A Chat request with `return_token_timestamps: true` also receives a top-level
 `performance` object holding `ingress_ns`, `enqueue_ns`, `first_scheduled_ns` and
