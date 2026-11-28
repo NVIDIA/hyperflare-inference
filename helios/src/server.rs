@@ -30,7 +30,7 @@ pub use session::{LoadedSession, ServingSession};
 pub(crate) mod token_spans;
 pub use config::Bootstrap;
 pub use dashboard::view;
-pub use metrics::Snapshot;
+pub use metrics::{RequestTimes, Snapshot};
 pub use runtime::{Generation, GenerationEvent, ModelRuntime, Prompt};
 pub use crate::execution::{PersistentWorkerSnapshot, WorkerState};
 

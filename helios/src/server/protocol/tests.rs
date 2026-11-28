@@ -2351,14 +2351,18 @@ fn per_request_metrics_follow_vllm_placement_and_null_rules() {
         first_token_ns: Some(10_000_000),
         last_token_ns: 40_000_000,
     };
-    let expected = json!({
-        "time_to_first_token_ms": 7.0,
-        "time_to_first_content_token_ms": null,
-        "generation_time_ms": 30.0,
-        "queue_time_ms": 2.0,
-        "mean_itl_ms": 10.0,
-        "tokens_per_second": 4e9 / 37e6,
-    });
+    let object = |values: [Value; 6]| {
+        let keys = [
+            "time_to_first_token_ms",
+            "time_to_first_content_token_ms",
+            "generation_time_ms",
+            "queue_time_ms",
+            "mean_itl_ms",
+            "tokens_per_second",
+        ];
+        Value::Object(keys.into_iter().map(String::from).zip(values).collect())
+    };
+    let expected = object([json!(7.0), Value::Null, json!(30.0), json!(2.0), json!(10.0), json!(4e9 / 37e6)]);
     let carriers = |frames: &[crate::server::protocol::Frame]| {
         frames
             .iter()
@@ -2441,7 +2445,5 @@ fn per_request_metrics_follow_vllm_placement_and_null_rules() {
     let mut encoder = metered(Protocol::Chat, 1, 1, true);
     encoder.enable_request_metrics(false);
     let _ = encoder.finish(0, Termination::OutputLimit, 0, 0, None).unwrap();
-    let unrecorded = encoder.metrics_value().unwrap();
-    assert_eq!(unrecorded.as_object().unwrap().len(), 6);
-    assert!(unrecorded.as_object().unwrap().values().all(Value::is_null));
+    assert_eq!(encoder.metrics_value(), Some(object(std::array::from_fn(|_| Value::Null))));
 }

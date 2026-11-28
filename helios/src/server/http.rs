@@ -408,7 +408,7 @@ pub(super) async fn generate(
         let mut timestamps = Vec::new();
         let mut reused_total = 0;
         let mut generated = vec![0u32; size];
-        // `performance` is Chat-only, and Chat has one choice.
+        // The earliest model step that included any of the response's generations.
         let mut first_scheduled_ns = None;
         if streaming && protocol == Protocol::Chat {
             // Chat has one choice and rejects streamed prompt logprobs, so no
@@ -535,7 +535,7 @@ pub(super) async fn generate(
                 } => {
                     reused_total += reused_prompt_tokens;
                     generated[index] = generated_tokens;
-                    first_scheduled_ns = times.first_scheduled_ns;
+                    first_scheduled_ns = first_scheduled_ns.into_iter().chain(times.first_scheduled_ns).min();
                     encoder.record_times(arrival_ns, times, generated_tokens);
                     let result = decoders[index]
                         .finish(if encoder.tool_limit_reached { crate::output::Termination::Cancelled } else { termination })

@@ -229,10 +229,7 @@ impl Encoder {
         self.continuous_usage = self.include_usage && enabled;
     }
 
-    /// Report vLLM's per-request `metrics` where it places them: on the final usage
-    /// chunk of a Chat or Completions stream, on the terminal `response` of a
-    /// Responses stream, and at the top level of a JSON body. Messages and
-    /// multi-prompt Completions omit the object; several choices make it null.
+    /// Report vLLM's per-request `metrics`, placed as `docs/api.md` describes.
     pub fn enable_request_metrics(&mut self, streaming: bool) {
         let placed = !streaming || self.include_usage || self.protocol == Protocol::Responses;
         self.metrics = match self.protocol {
