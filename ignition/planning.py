@@ -313,7 +313,7 @@ class Plan:
 
     @property
     def demand_pages(self) -> int:
-        return self.concurrency * (self.recipe.context // self.page_tokens)
+        return self.concurrency * (self.declared_context // self.page_tokens)
 
     @property
     def page_tokens(self) -> int:
@@ -345,14 +345,19 @@ class Plan:
         return self.pages * self.page_tokens
 
     @property
+    def declared_context(self) -> int:
+        """The serving context ceiling the checkpoint's declaration admits, before page limits."""
+        return self.checkpoint.context or self.recipe.context
+
+    @property
     def context(self) -> int:
         """The longest sequence one request may reach."""
-        return min(self.recipe.context, self.tokens)
+        return min(self.declared_context, self.tokens)
 
     @property
     def guaranteed_tokens(self) -> int:
         """Tokens every request can hold while all admitted requests are active."""
-        return min(self.recipe.context, self.pages // self.concurrency * self.page_tokens)
+        return min(self.declared_context, self.pages // self.concurrency * self.page_tokens)
 
     @property
     def snapshots(self) -> int:
@@ -381,6 +386,10 @@ class Plan:
             "benchmark_selection": None if self.benchmark_selection is None else self.benchmark_selection.to_dict(),
             "context": self.context,
             "checkpoint_context": self.recipe.context,
+            "declared_context": self.declared_context,
+            "rope_scaling": None if self.checkpoint.rope_scaling is None else {
+                "factor": self.checkpoint.rope_scaling.factor,
+                "original_max_position_embeddings": self.checkpoint.rope_scaling.original_max_position_embeddings},
             "weights_bytes": self.weights_bytes,
             "mapped_host_bytes": self.checkpoint.mapped_host_bytes,
             "graph_bytes": self.graph_bytes,
