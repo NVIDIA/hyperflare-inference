@@ -1718,16 +1718,7 @@ impl<'a> Worker<'a> {
         self.metrics
             .progress(prefill, generated.len(), accepted, draft_rounds,
                 verification_drafts, verification_rounds);
-        if matches!(
-            kind,
-            GraphKind::Prefill
-                | GraphKind::TerminalPrefill
-                | GraphKind::ScoredPrefill
-                | GraphKind::Resume
-                | GraphKind::Decode
-                | GraphKind::Speculative
-                | GraphKind::Mixed
-        ) {
+        if kind.samples() {
             self.metrics.model_step(prefill + generated.len() as u64);
         }
         self.metrics.replay_completed(completed_at_ns, completion.timing, prefill);
@@ -2220,22 +2211,6 @@ impl<'a> Worker<'a> {
 
     fn reserve_and_pack(&mut self, step: &ScheduledPlan, fence: crate::cache::Fence) -> Result<()> {
         self.scheduler.commit(step, fence)?;
-        // Stamp here rather than at submission so a request that reaches a model step
-        // has one, including requests driven through reserve_and_pack directly.
-        let scheduled_ns = super::observation::monotonic_ns();
-        for lane in &step.lanes {
-            if let Some(active) = self.active[lane.request.slot as usize]
-                .as_mut()
-                .filter(|a| a.request == lane.request)
-            {
-                active
-                    .incoming
-                    .record
-                    .times
-                    .first_scheduled_ns
-                    .get_or_insert(scheduled_ns);
-            }
-        }
         let inputs = self
             .inputs
             .as_mut()
@@ -2280,6 +2255,23 @@ impl<'a> Worker<'a> {
                 step,
                 &self.admissions,
             )?;
+        }
+        // Stamp after packing so the instant marks a step whose inputs were accepted,
+        // including requests driven through reserve_and_pack directly. A failed pack
+        // leaves first_scheduled_ns unset.
+        let scheduled_ns = super::observation::monotonic_ns();
+        for lane in &step.lanes {
+            if let Some(active) = self.active[lane.request.slot as usize]
+                .as_mut()
+                .filter(|a| a.request == lane.request)
+            {
+                active
+                    .incoming
+                    .record
+                    .times
+                    .first_scheduled_ns
+                    .get_or_insert(scheduled_ns);
+            }
         }
         Ok(())
     }
