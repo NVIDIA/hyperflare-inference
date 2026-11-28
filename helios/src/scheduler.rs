@@ -113,6 +113,8 @@ pub struct SchedulerCapabilities {
 pub struct SchedulerStats {
     pub cache_lookups: u64,
     pub cache_hits: u64,
+    /// Prompt tokens of admitted requests offered to GPU prefix lookups.
+    pub cache_lookup_tokens: u64,
     pub reused_tokens: u64,
     pub snapshot_publications: u64,
     pub snapshot_evictions: u64,
@@ -1599,6 +1601,7 @@ impl RequestScheduler {
         let AdmissionPlan { history, lookup } = plan;
         // Lookups count once per admitted request, not per attempt of a waiting one.
         let (hit, reused) = (lookup.checkpoint.is_some(), lookup.consumed_tokens);
+        let looked_up = if spec.prompt_logprobs { 0 } else { spec.prompt.len() as u64 };
         let page_tokens = self.capabilities.page_tokens as u64;
         if let Some(inbound) = &inbound {
             let consumed = inbound.consumed_tokens;
@@ -1799,6 +1802,7 @@ impl RequestScheduler {
             ticket.role = ticket.role.max(role);
         }
         self.stats.cache_lookups += u64::from(!spec.prompt_logprobs);
+        self.stats.cache_lookup_tokens += looked_up;
         self.stats.cache_hits += u64::from(hit);
         self.stats.reused_tokens += reused;
         if inbound.is_none()

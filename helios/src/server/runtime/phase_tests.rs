@@ -248,6 +248,7 @@ impl Fixture {
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
                 observation: Some(false),
+                record: Default::default(),
                 host_lookup: true,
                 readmitted: false,
                 prompt_score_end: 0,
@@ -572,6 +573,14 @@ fn reasoning_budget_cuts_or_plainly_continues_with_exact_history_and_usage() {
             assert_eq!(tokens.iter().filter(|&&token| token == 4).count(), 1);
             assert_eq!(finished, vec![(1, 3 + after, "length")]);
             assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 1);
+            let text = worker.metrics.render();
+            for expected in [
+                "\nflare_request_queue_seconds_count 1\n",
+                "\nflare_request_prefill_seconds_count 1\n",
+                "\nflare_request_prompt_tokens_sum 1\n",
+            ] {
+                assert!(text.contains(expected), "missing {expected}");
+            }
             assert_eq!(worker.metrics.admitted.load(Ordering::Relaxed), 1);
             assert_eq!(
                 worker.metrics.snapshot(false).generated_tokens,
@@ -673,6 +682,21 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
         budget_events(&mut generation),
         (vec![2], vec![(13, 6, "length")], vec![])
     );
+    // Committing steps: the prefill token, the three-token speculative round, and
+    // the token after readmission; the forced close is no model step. The reasoning
+    // park is not a preemption, and the output limit spans budget and remainder.
+    let text = worker.metrics.render();
+    for expected in [
+        "\nflare_inter_token_latency_seconds_count 2\n",
+        "\nflare_time_to_first_token_seconds_count 1\n",
+        "\nflare_request_inference_seconds_count 1\n",
+        "\nflare_request_generated_tokens_sum 6\n",
+        "\nflare_request_max_tokens_sum 6\n",
+        "\nflare_request_prefill_computed_tokens_sum 13\n",
+        "\nflare_request_preemptions_bucket{le=\"0\"} 1\n",
+    ] {
+        assert!(text.contains(expected), "missing {expected}");
+    }
 }
 
 fn prepared_budget_request(
@@ -916,6 +940,10 @@ fn reasoning_budget_does_not_readmit_eos_or_user_stops() {
         );
         assert!(worker.parked.is_empty());
         assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+        // EOS, a text stop, and a token stop each complete without an output limit.
+        let text = worker.metrics.render();
+        assert!(text.contains("\nflare_requests_completed_total 1\n"));
+        assert!(text.contains("\nflare_requests_output_limited_total 0\n"));
     }
 }
 
@@ -1468,6 +1496,45 @@ fn ignored_eos_at_the_output_limit_finishes_for_length() {
         finished,
         vec![(2, "length", crate::output::Termination::OutputLimit)]
     );
+    // The prefill step computes one prompt token and commits one generated token,
+    // the decode step commits one; initialization and snapshots are no text steps.
+    let text = fixture.metrics.render();
+    for expected in [
+        "\nflare_requests_output_limited_total 1\n",
+        "\nflare_model_step_tokens_count 2\n",
+        "\nflare_model_step_tokens_sum 3\n",
+    ] {
+        assert!(text.contains(expected), "missing {expected}");
+    }
+}
+
+#[test]
+fn prefill_computed_tokens_exclude_the_prefix_reused_at_admission() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut sequence = 0;
+    let mut reused = vec![];
+    for token in [1, 2] {
+        let (incoming, mut generation) = fixture.incoming(vec![0; 13], 1);
+        sender.send(vec![incoming]).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let handle = worker.active.iter().flatten().next().unwrap().request;
+        reused.push(worker.scheduler.request(handle).unwrap().reused_prompt_tokens());
+        budget_pass(&mut worker, &mut sequence, &[token]);
+        assert_eq!(budget_events(&mut generation).1, vec![(13, 1, "length")]);
+    }
+    // The second request restores the first one's terminal checkpoint.
+    assert_eq!(reused, [0, 13]);
+    let text = fixture.metrics.render();
+    for expected in [
+        "\nflare_request_prompt_tokens_sum 26\n",
+        "\nflare_request_prefill_computed_tokens_bucket{le=\"1\"} 1\n",
+        "\nflare_request_prefill_computed_tokens_sum 13\n",
+        "\nflare_request_prefill_computed_tokens_count 2\n",
+    ] {
+        assert!(text.contains(expected), "missing {expected}");
+    }
 }
 
 #[test]
@@ -3744,6 +3811,40 @@ fn unread_response_keeps_its_budget_through_a_reasoning_continuation() {
 }
 
 #[test]
+fn full_runtime_queue_limits_count_admission_rejections() {
+    let fixture = Fixture::new();
+    let (runtime, _receiver) = group_runtime(&fixture, 3);
+    let prompt = || {
+        Fixture::prompt_for(
+            vec![1, 2],
+            4,
+            PromptData {
+                positions: vec![[0; 3], [1; 3]],
+                vision_token_indices: vec![-1; 2],
+                ..Default::default()
+            },
+        )
+    };
+    // The worker channel holds two groups; the third is refused at the channel and
+    // releases its capacity, after which two choices exceed the one free permit.
+    let held = (0..2)
+        .map(|_| runtime.generate(prompt()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(runtime.generate(prompt()).is_err());
+    assert_eq!(runtime.capacity.available_permits(), 1);
+    assert!(runtime.generate_many(vec![prompt(), prompt()]).is_err());
+    let text = fixture.metrics.render();
+    for line in [
+        "flare_admission_rejections_total{reason=\"http_slots\"} 0",
+        "flare_admission_rejections_total{reason=\"generation_capacity\"} 1",
+        "flare_admission_rejections_total{reason=\"request_queue\"} 1",
+    ] {
+        assert!(text.lines().any(|value| value == line), "{line}");
+    }
+    drop(held);
+}
+
+#[test]
 fn grouped_submission_validates_all_children_before_enqueue_and_releases_capacity() {
     let fixture = Fixture::new();
     let (runtime, receiver) = group_runtime(&fixture, 4);
@@ -3852,6 +3953,12 @@ fn exercise_text_preemption(
     assert!(worker.scheduler.stats().preemptions > 0);
     let (incoming, parked) = worker.parked.front_mut().unwrap();
     assert!(parked.carried.generated_tokens > 0);
+    assert_eq!(incoming.record.preemptions, 1);
+    worker.publish_gauges();
+    let text = worker.metrics.render();
+    assert!(text.contains("\nflare_parked_requests 1\n"));
+    assert!(text.contains("\nflare_pending_requests 0\n"));
+    let (incoming, parked) = worker.parked.front_mut().unwrap();
     assert_eq!(
         incoming
             .prompt
@@ -3989,6 +4096,16 @@ fn exercise_text_preemption(
             assert_eq!(emitted[index], expected);
             assert_eq!(finished, vec![(60, budget + cut.after, "length")]);
             assert!(worker.parked.is_empty());
+            // The count taken at the park reaches the completed request's histogram.
+            let text = worker.metrics.render();
+            for expected in [
+                "\nflare_request_preemptions_bucket{le=\"0\"} 0\n",
+                "\nflare_request_preemptions_bucket{le=\"1\"} 1\n",
+                "\nflare_request_preemptions_count 1\n",
+                format!("\nflare_request_max_tokens_sum {}\n", budget + cut.after).as_str(),
+            ] {
+                assert!(text.contains(expected), "missing {expected}");
+            }
             return;
         }
     }
@@ -4416,6 +4533,12 @@ async fn first_response_http_stream_excludes_pretext_failures_and_unpolled_bodie
         let snapshot = state.first_response.snapshot();
         assert_eq!(snapshot.samples, u64::from(emit_text && poll_body));
         assert_eq!(snapshot.median_seconds.is_some(), emit_text && poll_body);
+        // A failed response records no end-to-end observation in any case.
+        assert!(state
+            .model
+            .metrics()
+            .render()
+            .contains("\nflare_request_e2e_seconds_count 0\n"));
     }
 }
 
@@ -4444,6 +4567,11 @@ async fn first_response_http_nonstream_records_only_when_completed_body_is_offer
             drop(response);
         }
         assert_eq!(state.first_response.snapshot().samples, u64::from(poll_body));
+        assert!(state
+            .model
+            .metrics()
+            .render()
+            .contains("\nflare_request_e2e_seconds_count 1\n"));
     }
 }
 
@@ -4576,6 +4704,16 @@ async fn disabled_parallel_calls_complete_http_and_stop_decoding() {
             assert!(worker.plan(0).unwrap().0.is_none(), "request must not keep decoding");
             let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), reader).await.unwrap().unwrap();
             let text = std::str::from_utf8(&bytes).unwrap();
+            // A tool-limit cancellation completes delivery but is not a successful
+            // generation, so it records no end-to-end observation.
+            assert!(
+                state
+                    .model
+                    .metrics()
+                    .render()
+                    .contains("\nflare_request_e2e_seconds_count 0\n"),
+                "{path} {stream}"
+            );
             assert!(!text.contains(r#""d""#) && !text.contains(r#"\"d\""#), "{text}");
             let frames: Vec<Value> = if stream {
                 text.lines().filter_map(|line| line.strip_prefix("data: "))
@@ -5278,6 +5416,47 @@ async fn ollama_discovery_uses_bearer_auth_without_generation_admission() {
 }
 
 #[tokio::test]
+async fn full_http_admission_counts_a_queue_limit_rejection() {
+    use std::io::{Read, Write};
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let held = state
+        .ingress_slots
+        .clone()
+        .acquire_many_owned(state.ingress_capacity as u32)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state.clone(), &[], 65536);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let status = tokio::task::spawn_blocking(move || {
+        let body = r#"{"prompt":"a","max_tokens":1}"#;
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        write!(
+            stream,
+            "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.split(' ').nth(1).unwrap().parse::<u16>().unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 429);
+    assert!(state
+        .model
+        .metrics()
+        .render()
+        .lines()
+        .any(|line| line == "flare_admission_rejections_total{reason=\"http_slots\"} 1"));
+    server.abort();
+    drop(held);
+}
+
+#[tokio::test]
 async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     use std::io::{Read, Write};
     let (sender, _receiver) = mpsc::sync_channel(4);
@@ -5352,6 +5531,14 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     assert!(value["first_response"]["median_seconds"].is_number());
     let (_, _, body) = get("/metrics", None).await.unwrap();
     assert!(body.contains("\nflare_first_response_median_seconds "));
+    assert!(
+        body.contains("\nflare_time_to_first_response_seconds_count 1\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("\nflare_request_e2e_seconds_bucket{le=\"+Inf\"} 0\n"),
+        "{body}"
+    );
     assert_eq!(get("/metrics?format=yaml", None).await.unwrap().0, 400);
     assert_eq!(get("/health", None).await.unwrap().0, 200);
     assert_eq!(get("/v1/models", None).await.unwrap().0, 401);

@@ -668,6 +668,7 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
         use std::fmt::Write;
         let _ = writeln!(text, "# HELP flare_first_response_median_seconds Server-side HTTP admission to first offered answer or reasoning text.\n# TYPE flare_first_response_median_seconds gauge\nflare_first_response_median_seconds {median}");
     }
+    state.first_response.render_histogram(&mut text);
     for (name, kind, help, value) in input_metrics {
         metrics::metric(&mut text, name, kind, help, value);
     }
@@ -812,6 +813,7 @@ async fn admit_http(
         Err(IngressRejection::Paused) => return http::error(protocol, StatusCode::SERVICE_UNAVAILABLE, "HTTP admission is paused"),
         Ok(permit) => Arc::new(permit),
         Err(IngressRejection::Full) => {
+            state.model.metrics().admission_rejected(metrics::AdmissionLimit::HttpSlots);
             let mut message = format!(
                 "native HTTP admission is full: {} requests are active or queued",
                 state.ingress_capacity
