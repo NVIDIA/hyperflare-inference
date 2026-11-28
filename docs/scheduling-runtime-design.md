@@ -560,8 +560,10 @@ work, defaulting to 0.05. Prefill predictions use measured costs, including stal
 estimates retained for dispatch ranking. Unknown prefill costs and unknown or
 stale snapshot-copy costs disable extras while preserving anchor eligibility.
 Productive completed decode earns the same fraction of measured time for a
-distinct terminal capture. There is no fixed capture count or
-concurrency-based snapshot share.
+distinct terminal capture. After ordinary completion of a request with message
+boundaries, the generated endpoint also needs a free row with enough backing
+to preserve decode headroom. Early finish under page pressure may reclaim
+storage for the decoder state.
 
 An extra prefill cut is selected only with an obtainable snapshot destination.
 If its cost expires after dispatch, its copy can be skipped after the split has

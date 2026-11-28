@@ -155,23 +155,6 @@ impl RequestScheduler {
         true
     }
 
-    fn checkpoint_headroom(&self) -> usize {
-        self.slots
-            .iter()
-            .filter_map(|slot| slot.request.as_ref())
-            .filter(|request| request.growable_output && request.phase == RequestPhase::Decode)
-            .map(|request| {
-                self.pages_through(
-                    request,
-                    request
-                        .scheduled_consumed
-                        .saturating_add(self.decode_horizon()),
-                )
-                .saturating_sub(request.reserved_pages.len())
-            })
-            .fold(0usize, usize::saturating_add)
-    }
-
     /// Each prefill capacity this request can use, with its measured non-terminal and terminal
     /// costs when known and nonzero. Selection reads the costs once instead of once per chunk of
     /// every interval.
@@ -519,7 +502,7 @@ impl RequestScheduler {
                 .count()
                 - usize::from(request.anchor_guard.is_some() && start < anchor);
             if quote_storage && self
-                .quote_snapshots_preserving(1, rows, self.checkpoint_headroom(), rank)
+                .quote_snapshots_preserving(1, rows, 0, rank)
                 .is_none()
             {
                 continue;
@@ -594,7 +577,7 @@ impl RequestScheduler {
                 self.quote_snapshots_preserving(
                     rows,
                     planned_rows,
-                    self.checkpoint_headroom(),
+                    0,
                     rank,
                 )
             } else {
@@ -623,7 +606,7 @@ impl RequestScheduler {
                         .request(plan.handle)
                         .is_ok_and(|request| request.anchor_guard.is_none())
                     && plan.quote.is_none()
-                    && self.pending_resources(self.checkpoint_headroom(), 1)
+                    && self.pending_resources(self.decode_growth_pages(), 1)
             })
     }
 
@@ -675,7 +658,7 @@ impl RequestScheduler {
                         role: cut.role,
                         consumed_tokens: cut.endpoint as u64,
                     };
-                    quote = self.quote_snapshots(1, self.checkpoint_headroom(), rank);
+                    quote = self.quote_snapshots(1, 0, rank);
                 }
                 if let Some(quote) = quote {
                     if let Some(mut rows) = self.apply_snapshot_quote(&quote)? {
@@ -696,7 +679,7 @@ impl RequestScheduler {
                     role: RetentionRole::Anchor,
                     consumed_tokens: plan.anchor as u64,
                 };
-                if let Some(quote) = self.quote_snapshots(1, self.checkpoint_headroom(), rank) {
+                if let Some(quote) = self.quote_snapshots(1, 0, rank) {
                     if let Some(rows) = self.apply_snapshot_quote(&quote)? {
                         self.request_mut(handle)?.anchor_guard = rows.first().copied();
                     }
@@ -805,21 +788,20 @@ impl RequestScheduler {
             self.stats.checkpoint_skip_work_budget += 1;
             return Ok(None);
         }
-        let headroom = self.checkpoint_headroom();
         let snapshot = if request.message_boundaries.is_empty() {
             let rank = RetentionRank {
                 use_epoch: accounting.demand_epoch,
                 role: RetentionRole::Endpoint,
                 consumed_tokens: request.consumed_tokens,
             };
-            match self.quote_snapshots(1, headroom, rank) {
+            match self.quote_snapshots(1, 0, rank) {
                 Some(quote) => self
                     .apply_snapshot_quote(&quote)?
                     .and_then(|rows| rows.first().copied()),
                 None => None,
             }
         } else {
-            self.reserve_snapshot(headroom.max(self.decode_growth_pages()))
+            self.reserve_snapshot(self.decode_growth_pages())
         };
         if snapshot.is_some() {
             accounting.reserved_ns = cost;

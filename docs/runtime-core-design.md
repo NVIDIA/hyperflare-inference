@@ -844,10 +844,11 @@ An owned snapshot excludes all conflicting page ids; overlapping exclusions
 are reference-counted. A snapshot fitting entirely in execution-allocation
 alignment padding excludes no pages. Execution rows never alias KV pages.
 
-Admission reserves the request's KV pages. System, prompt, and terminal snapshots
-acquire backing at their capture boundaries, evicting unpinned checkpoints when
-needed. If active requests or transfers hold all suitable backing, optional
-retention is skipped. An inbound host restore reserves both its row and pages
+Admission reserves the request's KV pages. Snapshot destinations acquire backing
+at their capture boundaries under the [checkpoint retention policy](core-design.md#exact-endpoint-capture).
+At ordinary completion a request with message boundaries uses only spare
+backing for its generated endpoint. If active requests or transfers hold all
+suitable backing, optional retention is skipped. An inbound host restore reserves both its row and pages
 before transfer. A capacity-blocked restore waits while requests, transfers,
 or fenced retirement may release backing and its accumulated wait plus estimated
 transfer time remains below half the estimated prefill time it replaces. Wait-budget expiry

@@ -251,6 +251,14 @@ releases unused guards and retains outstanding destinations through their final
 fence. Publication requires copy completion. Submitted and completed fences do
 not wrap, and rows can be reused within those bounds.
 
+Terminal reservation can take a free row or report a storage skip. The
+single-victim case can reuse one reclaimable published row whose final fence
+has completed. The Rust trace covers both ordinary message-aware and raw
+requests, and early finish with and without readmission. At ordinary completion
+a request with message boundaries must preserve the published row. Rust tests
+separately check physical page aliases and the next decode rounds' headroom.
+The row projection does not represent multi-victim ranking or page geometry.
+
 `scheduler::checkpoint_lifecycle_tests` calls the production scheduler's planning,
 commit, completion, and cancellation methods. It cancels an anchor capture during
 its producing submission, while waiting to copy, during its copy submission, and

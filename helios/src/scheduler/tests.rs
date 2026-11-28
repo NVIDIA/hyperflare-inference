@@ -1249,19 +1249,11 @@ fn concurrent_identical_terminal_publications_release_duplicate_resources() {
 }
 
 #[test]
-fn snapshot_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
-    capture_under_reused_chain_pressure(0, vec![]);
-}
-
-#[test]
-fn page_pressure_reclaims_untouched_ancestors_of_a_reused_prefix() {
-    capture_under_reused_chain_pressure(16, vec![]);
-}
-
-#[test]
-fn terminal_capture_with_message_boundaries_preserves_checkpoints_under_pressure() {
+fn terminal_capture_under_snapshot_and_aliased_page_pressure() {
     for alias_pages in [0, 16] {
-        capture_under_reused_chain_pressure(alias_pages, vec![32]);
+        for boundaries in [vec![], vec![32]] {
+            capture_under_reused_chain_pressure(alias_pages, boundaries);
+        }
     }
 }
 
@@ -1350,33 +1342,21 @@ fn capture_under_reused_chain_pressure(alias_pages: u32, message_boundaries: Vec
         assert!(capture.is_none());
         assert_eq!(scheduler.stats().checkpoint_skip_storage, 1);
         assert!(scheduler.take_evictions().is_empty());
-        assert_eq!(scheduler.cache.page_chain(tip).unwrap(), pages);
-        scheduler.cancel(pending).unwrap();
-        scheduler.cancel(hot).unwrap();
-        return;
+        assert!(scheduler.cache.checkpoint(chain[0]).is_ok());
+    } else {
+        let row = capture.expect("older interior rows must fund the unmarked capture");
+        assert_eq!(scheduler.stats().checkpoint_skip_storage, 0);
+        assert!(scheduler.cache.checkpoint(chain[0]).is_err());
+        let evictions = scheduler.take_evictions();
+        assert_eq!(evictions.len(), 1);
+        let heir = evictions[0].heir.as_ref().unwrap();
+        assert_eq!(heir.parent(), None);
+        assert_eq!(heir.chain_pages, pages[..2]);
+        scheduler.release_snapshot(row);
     }
-    assert!(
-        capture.is_some(),
-        "older interior rows must fund the pending capture"
-    );
-    assert_eq!(scheduler.stats().checkpoint_skip_storage, 0);
-    assert!(scheduler.cache.checkpoint(chain[0]).is_err());
-    assert!(scheduler.cache.checkpoint(other).is_ok());
     assert_eq!(scheduler.cache.page_chain(tip).unwrap(), pages);
-    assert_eq!(
-        scheduler.cache.lookup(&long_history).unwrap().checkpoint,
-        Some(tip)
-    );
-    assert_eq!(
-        scheduler.cache.lookup(&other_history).unwrap().checkpoint,
-        Some(other)
-    );
-    let evictions = scheduler.take_evictions();
-    assert_eq!(evictions.len(), 1);
-    let heir = evictions[0].heir.as_ref().unwrap();
-    assert_eq!(heir.parent(), None);
-    assert_eq!(heir.chain_pages, pages[..2]);
-    scheduler.release_snapshot(capture.unwrap());
+    assert_eq!(scheduler.cache.lookup(&long_history).unwrap().checkpoint, Some(tip));
+    assert_eq!(scheduler.cache.lookup(&other_history).unwrap().checkpoint, Some(other));
     scheduler.cancel(pending).unwrap();
     scheduler.cancel(hot).unwrap();
 }

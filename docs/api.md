@@ -349,7 +349,9 @@ GPU checkpoint retention exports `flare_checkpoint_captures_total{role}` with
 `anchor`, `message`, and `endpoint` roles, and
 `flare_checkpoint_skips_total{reason}` with `unknown_cost`, `work_budget`, and
 `storage` reasons. Skip counters count selection or capture rejections, not failed
-requests. `flare_checkpoint_extra_work_nanoseconds_total` sums charged predicted
+requests. The storage reason includes an optional terminal capture declined
+under memory pressure to preserve resident checkpoints or decode headroom.
+`flare_checkpoint_extra_work_nanoseconds_total` sums charged predicted
 extra prefill and copy work; it is not a GPU timing measurement.
 `flare_checkpoint_anchor_reservations` reports unused anchor guards, excluding
 armed destinations and in-flight copies.
