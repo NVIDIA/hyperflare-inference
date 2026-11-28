@@ -30,7 +30,7 @@ pub use session::{LoadedSession, ServingSession};
 pub(crate) mod token_spans;
 pub use config::Bootstrap;
 pub use dashboard::view;
-pub use metrics::Snapshot;
+pub use metrics::{RequestTimes, Snapshot};
 pub use runtime::{Generation, GenerationEvent, ModelRuntime, Prompt};
 pub use crate::execution::{PersistentWorkerSnapshot, WorkerState};
 
@@ -124,6 +124,9 @@ pub struct ServerConfig {
     pub served_names: Vec<String>,
     /// Default reasoning-token cap for conversational requests without a budget.
     pub thinking_token_budget: Option<u32>,
+    /// Report vLLM's per-request `metrics` object on OpenAI Chat, Completions, and
+    /// Responses output.
+    pub per_request_metrics: bool,
     /// Setting that raises the per-request context, appended to context rejections.
     pub context_hint: String,
     /// Setting that raises request or page capacity, appended to capacity rejections.
@@ -142,6 +145,7 @@ impl Default for ServerConfig {
             api_key: None,
             served_names: Vec::new(),
             thinking_token_budget: None,
+            per_request_metrics: false,
             context_hint: String::new(),
             capacity_hint: String::new(),
             scheduling_policy: crate::scheduler::PolicyConfig::default(),
@@ -167,6 +171,7 @@ struct HttpState {
     ids: AtomicU64,
     api_key: Option<String>,
     thinking_token_budget: Option<u32>,
+    per_request_metrics: bool,
     context_hint: String,
     capacity_hint: String,
     response_model: String,
@@ -325,6 +330,7 @@ impl Server {
             ids: AtomicU64::new(1),
             api_key: config.api_key.clone(),
             thinking_token_budget: config.thinking_token_budget,
+            per_request_metrics: config.per_request_metrics,
             context_hint: config.context_hint.clone(),
             capacity_hint: config.capacity_hint.clone(),
             response_model: models::response_name(model.config(), &config.served_names).to_owned(),
@@ -668,6 +674,7 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
         use std::fmt::Write;
         let _ = writeln!(text, "# HELP flare_first_response_median_seconds Server-side HTTP admission to first offered answer or reasoning text.\n# TYPE flare_first_response_median_seconds gauge\nflare_first_response_median_seconds {median}");
     }
+    state.first_response.render_histogram(&mut text);
     for (name, kind, help, value) in input_metrics {
         metrics::metric(&mut text, name, kind, help, value);
     }
@@ -812,6 +819,7 @@ async fn admit_http(
         Err(IngressRejection::Paused) => return http::error(protocol, StatusCode::SERVICE_UNAVAILABLE, "HTTP admission is paused"),
         Ok(permit) => Arc::new(permit),
         Err(IngressRejection::Full) => {
+            state.model.metrics().admission_rejected(metrics::AdmissionLimit::HttpSlots);
             let mut message = format!(
                 "native HTTP admission is full: {} requests are active or queued",
                 state.ingress_capacity

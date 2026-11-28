@@ -29,6 +29,7 @@ pub struct Settings {
     pub publisher_keys: Vec<PathBuf>,
     pub thinking_token_budget: Option<u32>,
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
+    pub per_request_metrics: bool,
     pub prefix_cache: PrefixCacheOffload,
     pub model_concurrency: std::collections::HashMap<String, usize>,
 }
@@ -70,6 +71,19 @@ mod tests {
             let settings = Settings::resolve(configuration, Path::new("user"), Path::new("config.toml")).unwrap();
             assert_eq!(settings.scheduler_checkpoint_extra_work_fraction, fraction);
         }
+    }
+    #[test]
+    fn per_request_metrics_reach_application_settings() {
+        for (text, expected) in [
+            ("", false),
+            ("[server]\nper_request_metrics=true", true),
+            ("[server]\nper_request_metrics=false", false),
+        ] {
+            let configuration = Configuration::parse(text).unwrap();
+            let settings = Settings::resolve(configuration, Path::new("user"), Path::new("config.toml")).unwrap();
+            assert_eq!(settings.per_request_metrics, expected, "{text}");
+        }
+        assert!(Configuration::parse("[server]\nper_request_metrics='true'").is_err());
     }
 
     #[test]
@@ -207,6 +221,7 @@ impl Settings {
             publisher_keys: Vec::new(),
             thinking_token_budget,
             scheduler_checkpoint_extra_work_fraction: configuration.server.scheduler_checkpoint_extra_work_fraction,
+            per_request_metrics: configuration.server.per_request_metrics.unwrap_or(false),
             prefix_cache,
             model_concurrency,
         })

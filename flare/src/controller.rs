@@ -2563,6 +2563,7 @@ impl Worker {
         if let Some(fraction) = self.settings.scheduler_checkpoint_extra_work_fraction {
             config["scheduler_checkpoint_extra_work_fraction"] = fraction.into();
         }
+        config["per_request_metrics"] = self.settings.per_request_metrics.into();
         let mut loaded = match LoadedSession::new(owner, config) {
             Ok(loaded) => loaded,
             Err(error) => {

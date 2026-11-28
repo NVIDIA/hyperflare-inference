@@ -10,6 +10,7 @@ use crate::{
     output::{Event, Termination},
     server::{
         inference::{Tool, ToolChoice},
+        metrics::RequestTimes,
         output::{Accumulator, Block, Change, ResponseOutput},
     },
 };
@@ -63,6 +64,19 @@ pub(crate) struct PromptUsage {
     pub tokens: usize,
     pub image_tokens: usize,
 }
+/// vLLM's per-request `metrics` for one response.
+enum RequestMetrics {
+    /// The response holds several sequences, whose separate times cannot describe it.
+    Suppressed,
+    Single(Timing),
+}
+/// Instants of a response's one generation, on the `observation::monotonic_ns` clock.
+#[derive(Default)]
+struct Timing {
+    arrival_ns: u64,
+    times: RequestTimes,
+    generated: u32,
+}
 pub(crate) struct Encoder {
     logprob_format: Option<(crate::server::inference::LogprobOptions, std::sync::Arc<crate::frontend::Frontend>)>,
     logprob_entries: Vec<Vec<crate::server::logprobs::Formatted>>,
@@ -98,6 +112,7 @@ pub(crate) struct Encoder {
     sequence: u64,
     metadata: Value,
     incomplete_item: Option<usize>,
+    metrics: Option<RequestMetrics>,
 }
 impl Encoder {
     pub fn new(
@@ -151,6 +166,7 @@ impl Encoder {
             sequence: 0,
             metadata,
             incomplete_item: None,
+            metrics: None,
         }
     }
     pub fn set_tool_grammars(
@@ -211,6 +227,51 @@ impl Encoder {
 
     pub fn set_continuous_usage(&mut self, enabled: bool) {
         self.continuous_usage = self.include_usage && enabled;
+    }
+
+    /// Report vLLM's per-request `metrics`, placed as `docs/api.md` describes.
+    pub fn enable_request_metrics(&mut self, streaming: bool) {
+        let placed = !streaming || self.include_usage || self.protocol == Protocol::Responses;
+        self.metrics = match self.protocol {
+            Protocol::Messages => None,
+            _ if !placed || self.prompts.len() > 1 => None,
+            _ if self.choices_per_prompt > 1 => Some(RequestMetrics::Suppressed),
+            _ => Some(RequestMetrics::Single(Timing::default())),
+        };
+    }
+    /// Record the terminal instants and generated-token count of the generation.
+    pub fn record_times(&mut self, arrival_ns: u64, times: RequestTimes, generated: u32) {
+        if let Some(RequestMetrics::Single(timing)) = &mut self.metrics {
+            (timing.arrival_ns, timing.times, timing.generated) = (arrival_ns, times, generated);
+        }
+    }
+    /// The `metrics` object, `null` when suppressed, or `None` when omitted. Each
+    /// interval is null when the generation did not reach its instants; Flare does
+    /// not report the content instant.
+    pub fn metrics_value(&self) -> Option<Value> {
+        let timing = match self.metrics.as_ref()? {
+            RequestMetrics::Suppressed => return Some(Value::Null),
+            RequestMetrics::Single(timing) => timing,
+        };
+        let ms = |from: u64, to: u64| to.saturating_sub(from) as f64 / 1e6;
+        let scheduled = timing.times.first_scheduled_ns;
+        let first = timing.times.first_token_ns;
+        let last = first.map(|_| timing.times.last_token_ns);
+        let generation = first.zip(last).map(|(first, last)| ms(first, last));
+        Some(json!({
+            "time_to_first_token_ms": scheduled.zip(first).map(|(s, f)| ms(s, f)),
+            "time_to_first_content_token_ms": Value::Null,
+            "generation_time_ms": generation,
+            "queue_time_ms": scheduled.map(|s| ms(timing.arrival_ns, s)),
+            "mean_itl_ms": generation
+                .filter(|_| timing.generated > 1)
+                .map(|g| g / f64::from(timing.generated - 1)),
+            "tokens_per_second": scheduled
+                .zip(last)
+                .map(|(s, l)| l.saturating_sub(s))
+                .filter(|ns| *ns > 0)
+                .map(|ns| f64::from(timing.generated) * 1e9 / ns as f64),
+        }))
     }
 
     /// Count raw generated tokens before text decoding can merge or hide them.
@@ -651,6 +712,9 @@ impl Encoder {
                         let mut frame = self.chunk(0, Value::Null, Value::Null);
                         frame.data["choices"] = json!([]);
                         frame.data["usage"] = self.usage_value();
+                        if let Some(metrics) = self.metrics_value() {
+                            frame.data["metrics"] = metrics;
+                        }
                         frames.push(frame);
                     }
                     frames.push(Frame {
@@ -665,7 +729,10 @@ impl Encoder {
                     frames.push(self.named("message_stop", json!({})));
                 }
                 Protocol::Responses => {
-                    let response = self.response();
+                    let mut response = self.response();
+                    if let Some(metrics) = self.metrics_value() {
+                        response["metrics"] = metrics;
+                    }
                     frames.push(self.named(
                         if reason == "length" {
                             "response.incomplete"

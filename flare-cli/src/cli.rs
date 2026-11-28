@@ -532,6 +532,7 @@ impl OrbitPush {
             scheduler_terminal_age_price: None,
             scheduler_checkpoint_extra_work_fraction: None,
             bypass_performance_check: false,
+            enable_per_request_metrics: false,
             serving: self.serving.clone(),
         }
     }
@@ -642,6 +643,11 @@ pub struct OrbitRun {
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
+    /// Add vLLM's per-request `metrics` timing object to OpenAI Chat, Completions,
+    /// and Responses output.
+    #[arg(long, help_heading = "Serving options")]
+    pub enable_per_request_metrics: bool,
+
     #[command(flatten)]
     pub serving: ServingOptions,
 }
@@ -689,6 +695,9 @@ impl OrbitRun {
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
         }
+        if self.enable_per_request_metrics {
+            options.push("--enable-per-request-metrics".into());
+        }
         options
     }
 
@@ -717,6 +726,7 @@ impl OrbitRun {
             scheduler_terminal_age_price: self.scheduler_terminal_age_price,
             scheduler_checkpoint_extra_work_fraction: self.scheduler_checkpoint_extra_work_fraction,
             bypass_performance_check: false,
+            enable_per_request_metrics: self.enable_per_request_metrics,
             serving: self.serving.clone(),
         }
     }
@@ -846,6 +856,11 @@ pub struct Run {
     /// Skip Linux PCIe TP>1 host performance checks (NVIDIA driver params and IOMMU) after GPU init.
     #[arg(long, help_heading = "Serving options")]
     pub bypass_performance_check: bool,
+
+    /// Add vLLM's per-request `metrics` timing object to OpenAI Chat, Completions,
+    /// and Responses output.
+    #[arg(long, help_heading = "Serving options")]
+    pub enable_per_request_metrics: bool,
 
     #[command(flatten)]
     pub serving: ServingOptions,
@@ -1357,6 +1372,32 @@ mod tests {
         }
         for value in ["0", "0.05", "1"] {
             assert!(Cli::try_parse_from(["flare", "run", "model", "--scheduler-checkpoint-extra-work-fraction", value]).is_ok());
+        }
+    }
+
+    #[test]
+    fn per_request_metrics_flag_is_off_by_default_and_reaches_rank_zero() {
+        assert!(!run(&["flare", "run", "model"]).enable_per_request_metrics);
+        assert!(run(&["flare", "run", "model", "--enable-per-request-metrics"]).enable_per_request_metrics);
+        for enabled in [false, true] {
+            let mut arguments = vec!["flare", "orbit", "run", "model"];
+            if enabled {
+                arguments.push("--enable-per-request-metrics");
+            }
+            let Command::Orbit(orbit) = Cli::try_parse_from(arguments).unwrap().command else {
+                panic!()
+            };
+            let OrbitCommand::Run(orbit) = orbit.command else {
+                panic!()
+            };
+            assert_eq!(orbit.run_args().enable_per_request_metrics, enabled);
+            // Rank zero parses the forwarded options as `flare run` options.
+            let mut forwarded = vec!["flare".to_string(), "run".into(), "model".into()];
+            forwarded.extend(orbit.rank_zero_options());
+            let Command::Run(rank_zero) = Cli::try_parse_from(forwarded).unwrap().command else {
+                panic!()
+            };
+            assert_eq!(rank_zero.enable_per_request_metrics, enabled);
         }
     }
 

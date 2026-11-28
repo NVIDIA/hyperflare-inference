@@ -343,10 +343,16 @@ requests read no per-token clock and emit no observation events.
 
 Observed terminal responses include `reused_prompt_tokens` and ordinary token
 usage. Timed responses also include one top-level `performance` object with
-`ingress_ns`, `enqueue_ns` and `reused_prompt_tokens`. Ingress is chat-handler
-entry after HTTP JSON decoding, before waiting for frontend preparation;
-enqueue is immediately before submitting the prepared request to the model
-queue. Both timestamps use the token timestamp origin.
+`ingress_ns`, `enqueue_ns`, `first_scheduled_ns` and `reused_prompt_tokens`.
+Ingress is chat-handler entry after HTTP JSON decoding, before waiting for
+frontend preparation; enqueue is immediately before submitting the prepared
+request to the model queue. `first_scheduled_ns` marks the earliest model step
+that included the request, when the worker reserves and packs that step before
+submitting it; a preempted request keeps its original value. It is null when no
+model step included the request. All three timestamps use the token timestamp
+origin, so `first_scheduled_ns - enqueue_ns` is the time the request waited
+for its first model step and `token_timestamps_ns[0] - first_scheduled_ns` is
+its time to first token.
 
 `stream_options.include_usage=true` emits a final usage-only SSE chunk with
 `choices=[]` before `[DONE]`; preceding chunks have `usage=null`. Otherwise an
