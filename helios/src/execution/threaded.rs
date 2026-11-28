@@ -412,7 +412,13 @@ impl DispatchRing {
     }
 }
 
-/// Coordinate peer pre-launch validation, rank-zero submission, and commit/cancel over `ring`.
+/// Coordinate peer pre-launch validation, rank-zero commit/cancel, and local submission over `ring`.
+///
+/// `local_submit` receives a `commit_peers` callback that publishes `Commit(epoch)` to peers
+/// once rank zero has validated its local state and before it invokes `cuGraphLaunch`. Large
+/// multi-GPU CUDA graphs can fill the GPU pushbuffer inside `cuGraphLaunch` while GPU 0 waits
+/// at its first collective barrier; publishing `Commit` first lets every peer enter
+/// `cuGraphLaunch` concurrently so barriers never deadlock behind rank zero's pushbuffer.
 ///
 /// # Safety
 /// Caller must be the sole producer and guarantee no peer still reads `ring.slots[*next_epoch & 1]`.
@@ -430,7 +436,7 @@ unsafe fn coordinate_step<F>(
     local_submit: F,
 ) -> Result<Option<Fence>>
 where
-    F: FnOnce() -> Result<Option<Fence>>,
+    F: FnOnce(&mut dyn FnMut()) -> Result<Option<Fence>>,
 {
     let epoch = *next_epoch;
     // SAFETY: Caller guarantees exclusive write access to `slots[epoch & 1]`.
@@ -448,13 +454,20 @@ where
             return Err(invalid("rank thread readiness deadline expired"));
         }
     }
-    match local_submit() {
-        Ok(Some(local_fence)) if local_fence == fence => {
+    let mut committed = false;
+    let mut publish_commit = || {
+        if !committed {
             ring.commit(epoch);
+            committed = true;
+        }
+    };
+    match local_submit(&mut publish_commit) {
+        Ok(Some(local_fence)) if local_fence == fence => {
+            publish_commit();
             *next_epoch += 1;
             Ok(Some(fence))
         }
-        Ok(None) => {
+        Ok(None) if !committed => {
             ring.cancel(epoch);
             match ring.wait_peer_acks(peer_count, (epoch << 1) | 1, timeout) {
                 Ok(()) => {
@@ -470,6 +483,10 @@ where
                     Err(invalid("rank cancel acknowledgement deadline expired"))
                 }
             }
+        }
+        Ok(None) => {
+            ring.request_drain();
+            Err(invalid("rank-zero submission cancelled after peer commit"))
         }
         Ok(Some(_)) => {
             ring.request_drain();
@@ -863,7 +880,16 @@ impl ThreadedExecutor {
                 uploads,
                 TIMEOUT,
                 || Self::surface_peer_error(peers),
-                || self.local.submit(graph, uploads, grammar),
+                |commit_peers| {
+                    let Some(validated) = self.local.validate_submission(graph, uploads, grammar)? else {
+                        return Ok(None);
+                    };
+                    if validated != fence {
+                        return Err(invalid("rank-zero reservation changed before commit"));
+                    }
+                    commit_peers();
+                    self.local.submit(graph, uploads, grammar)
+                },
             )
         };
         match coordinated {
@@ -1656,7 +1682,7 @@ mod tests {
                     &uploads,
                     Duration::from_secs(10),
                     || invalid("unexpected peer exit"),
-                    || Ok(Some(Fence(step))),
+                    |_| Ok(Some(Fence(step))),
                 )
                 .unwrap()
             };
@@ -1725,7 +1751,7 @@ mod tests {
                 &uploads,
                 Duration::from_secs(2),
                 || invalid("unexpected peer exit"),
-                || Ok(Some(Fence(1))),
+                |_| Ok(Some(Fence(1))),
             )
             .unwrap()
         };
@@ -1805,7 +1831,7 @@ mod tests {
                 &uploads,
                 Duration::from_secs(5),
                 || invalid("unexpected peer exit"),
-                || {
+                |_| {
                     local_launches += 1;
                     Ok(Some(Fence(1)))
                 },
@@ -1832,7 +1858,7 @@ mod tests {
                         .try_recv()
                         .unwrap_or_else(|_| invalid("rank thread disconnected"))
                 },
-                || {
+                |_| {
                     local_launches += 1;
                     Ok(Some(Fence(2)))
                 },
@@ -1917,7 +1943,7 @@ mod tests {
                     &uploads,
                     Duration::from_secs(5),
                     || invalid("unexpected peer exit"),
-                    || Ok(Some(Fence(1))),
+                    |_| Ok(Some(Fence(1))),
                 )
                 .unwrap()
             },
@@ -1944,7 +1970,7 @@ mod tests {
                     &uploads,
                     Duration::from_secs(5),
                     || invalid("unexpected peer exit"),
-                    || Ok(None),
+                    |_| Ok(None),
                 )
                 .unwrap()
             },
@@ -1967,7 +1993,7 @@ mod tests {
                     &uploads,
                     Duration::from_secs(5),
                     || invalid("unexpected peer exit"),
-                    || Ok(Some(Fence(2))),
+                    |_| Ok(Some(Fence(2))),
                 )
                 .unwrap()
             },
@@ -2151,7 +2177,7 @@ mod tests {
             unsafe {
                 coordinate_step(
                     &ring, PEERS, &mut next_epoch, Fence(1), 0, false, &u1,
-                    Duration::from_secs(5), || invalid("exit"), || Ok(Some(Fence(1))),
+                    Duration::from_secs(5), || invalid("exit"), |_| Ok(Some(Fence(1))),
                 )
                 .unwrap()
             },
@@ -2164,7 +2190,7 @@ mod tests {
             unsafe {
                 coordinate_step(
                     &ring, PEERS, &mut next_epoch, Fence(2), 1, false, &u2,
-                    Duration::from_secs(5), || invalid("exit"), || Ok(None),
+                    Duration::from_secs(5), || invalid("exit"), |_| Ok(None),
                 )
                 .unwrap()
             },
@@ -2177,7 +2203,7 @@ mod tests {
             unsafe {
                 coordinate_step(
                     &ring, PEERS, &mut next_epoch, Fence(2), 2, false, &u3,
-                    Duration::from_secs(5), || invalid("exit"), || Ok(Some(Fence(2))),
+                    Duration::from_secs(5), || invalid("exit"), |_| Ok(Some(Fence(2))),
                 )
                 .unwrap()
             },
@@ -2195,6 +2221,58 @@ mod tests {
         for peer_id in 0..PEERS {
             assert!(observed.contains(&(peer_id, Fence(1), 0x1111_2222_3333_4444)));
             assert!(observed.contains(&(peer_id, Fence(2), 0x9999_AAAA_BBBB_CCCC)));
+        }
+    }
+
+    #[test]
+    fn coordinate_step_commits_peers_before_local_launch_completes() {
+        // Simulates a large multi-GPU CUDA graph where rank zero's `cuGraphLaunch`
+        // blocks inside the CUDA driver until all peers have entered their own launch
+        // and satisfied the first in-graph collective barrier.
+        const PEERS: usize = 3;
+        let ring = Arc::new(DispatchRing::new(256, 4));
+        let barrier = Arc::new(std::sync::Barrier::new(PEERS + 1));
+        let mut workers = Vec::with_capacity(PEERS);
+        for peer_id in 0..PEERS {
+            let peer_ring = ring.clone();
+            let peer_barrier = barrier.clone();
+            workers.push(thread::spawn(move || {
+                assert_eq!(peer_ring.wait_next(1), DispatchEvent::Step);
+                peer_ring.mark_peer_ready(peer_id, 1);
+                assert_eq!(
+                    spin_wait_until(Duration::from_secs(5), || peer_ring.poll_decision(1)),
+                    Some(DecisionEvent::Commit),
+                );
+                peer_barrier.wait();
+            }));
+        }
+        let mut next_epoch = 1u64;
+        let bytes = 42u64.to_le_bytes();
+        let uploads = [Upload { buffer: "tokens", offset: 0, bytes: &bytes }];
+        let submitted = unsafe {
+            coordinate_step(
+                &ring,
+                PEERS,
+                &mut next_epoch,
+                Fence(1),
+                0,
+                false,
+                &uploads,
+                Duration::from_secs(5),
+                || invalid("exit"),
+                |commit_peers| {
+                    commit_peers();
+                    // Would deadlock if Commit had not been published before local launch.
+                    barrier.wait();
+                    Ok(Some(Fence(1)))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(submitted, Some(Fence(1)));
+        assert_eq!(next_epoch, 2);
+        for worker in workers {
+            worker.join().unwrap();
         }
     }
 
